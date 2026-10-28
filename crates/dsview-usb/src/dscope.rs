@@ -20,6 +20,13 @@ const SCOPE_BATCH_SAMPLES: usize = 65_536;
 const CAPTURE_COMPLETION_GRACE: Duration = Duration::from_secs(5);
 const VOLTAGE_RANGE: f32 = 10.0;
 const ADC_REFERENCE_SPAN: f32 = 235.0;
+const CALIBRATION_ZERO_BYTES: usize = 30;
+const CALIBRATION_VGA_BYTES: usize = 17;
+const CALIBRATION_FLASH_PAGE_STRIDE: u16 = 8;
+const CALIBRATION_ID_BASE: u8 = 0x40;
+const CALIBRATION_VDIV_INDEX: usize = 6;
+const NOMINAL_CENTER_OFFSET: u64 = 128;
+const OFFSET_PWM_SPAN: u64 = 780;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DsCopeCaptureConfig {
@@ -167,12 +174,13 @@ fn run_capture(
         session
             .initialize_dscope_frontend()
             .map_err(capture_error)?;
+        let calibration = DsCopeCalibration::load(session)?;
         session.enable_dscope_channels().map_err(capture_error)?;
-        configure_scope(session, config)?;
+        configure_scope(session, config, calibration)?;
         session
             .arm_capture(&config.encode_settings())
             .map_err(capture_error)?;
-        configure_scope_post_arm(session, config)?;
+        configure_scope_post_arm(session, config, calibration)?;
         let Some(capture) = read_prequeued_capture(session, config, context)? else {
             return Ok(());
         };
@@ -211,8 +219,9 @@ fn validate_device_ready(session: &UsbDeviceSession) -> Result<(), CaptureError>
 fn configure_scope(
     session: &UsbDeviceSession,
     config: DsCopeCaptureConfig,
+    calibration: DsCopeCalibration,
 ) -> Result<(), CaptureError> {
-    for command in dso_commands(config) {
+    for command in dso_commands(config, calibration) {
         session.write_dso_command(command).map_err(capture_error)?;
     }
     Ok(())
@@ -221,8 +230,9 @@ fn configure_scope(
 fn configure_scope_post_arm(
     session: &UsbDeviceSession,
     config: DsCopeCaptureConfig,
+    calibration: DsCopeCalibration,
 ) -> Result<(), CaptureError> {
-    let commands = dso_commands(config);
+    let commands = dso_commands(config, calibration);
     for index in [8, 3, 4, 5, 6] {
         session
             .write_dso_command(commands[index])
@@ -231,16 +241,17 @@ fn configure_scope_post_arm(
     Ok(())
 }
 
-fn dso_commands(config: DsCopeCaptureConfig) -> [u64; 14] {
-    let nominal_offset = (128_u64 << 32) + (128_u64 * 780 / 255) + 60;
+fn dso_commands(config: DsCopeCaptureConfig, calibration: DsCopeCalibration) -> [u64; 14] {
+    let channel_zero = calibration.channels[0];
+    let channel_one = calibration.channels[1];
     [
         0xa5a5_a500,
         0x0f00,
         0x0f80,
-        0x0006_9d08,
-        0x0006_9d88,
-        0x10 + (nominal_offset << 8),
-        0x90 + (nominal_offset << 8),
+        0x08 + u64::from(channel_zero.vga_gain),
+        0x88 + u64::from(channel_one.vga_gain),
+        offset_command(0x10, channel_zero.preoffset),
+        offset_command(0x90, channel_one.preoffset),
         0x18 + (u64::from(config.divider()) << 8),
         0x20,
         0x58,
@@ -249,6 +260,91 @@ fn dso_commands(config: DsCopeCaptureConfig) -> [u64; 14] {
         0x0080_8038,
         0x0840,
     ]
+}
+
+fn offset_command(command: u64, preoffset: u16) -> u64 {
+    let offset = (NOMINAL_CENTER_OFFSET << 32)
+        + (NOMINAL_CENTER_OFFSET * OFFSET_PWM_SPAN / 255)
+        + u64::from(preoffset);
+    command + (offset << 8)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DsCopeChannelCalibration {
+    preoffset: u16,
+    vga_gain: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DsCopeCalibration {
+    channels: [DsCopeChannelCalibration; CHANNEL_COUNT],
+}
+
+impl DsCopeCalibration {
+    fn load(session: &UsbDeviceSession) -> Result<Self, CaptureError> {
+        let mut channels = [DsCopeChannelCalibration {
+            preoffset: 0,
+            vga_gain: 0,
+        }; CHANNEL_COUNT];
+        for (channel, calibration) in channels.iter_mut().enumerate() {
+            let page = u16::try_from(channel).expect("channel index fits u16")
+                * CALIBRATION_FLASH_PAGE_STRIDE;
+            let mut zero_record = [0_u8; CALIBRATION_ZERO_BYTES];
+            let mut vga_record = [0_u8; CALIBRATION_VGA_BYTES];
+            session
+                .read_dscope_nvm(page, &mut zero_record)
+                .map_err(capture_error)?;
+            session
+                .read_dscope_nvm(page + 1, &mut vga_record)
+                .map_err(capture_error)?;
+            *calibration = parse_channel_calibration(channel, &zero_record, &vga_record)?;
+        }
+        Ok(Self { channels })
+    }
+
+    #[cfg(test)]
+    fn nominal() -> Self {
+        Self {
+            channels: [DsCopeChannelCalibration {
+                preoffset: 60,
+                vga_gain: 0x0006_9d00,
+            }; CHANNEL_COUNT],
+        }
+    }
+}
+
+fn parse_channel_calibration(
+    channel: usize,
+    zero_record: &[u8; CALIBRATION_ZERO_BYTES],
+    vga_record: &[u8; CALIBRATION_VGA_BYTES],
+) -> Result<DsCopeChannelCalibration, CaptureError> {
+    let record_stride = CALIBRATION_ZERO_BYTES + CALIBRATION_VGA_BYTES;
+    let calibration_id = CALIBRATION_ID_BASE
+        .checked_add(
+            u8::try_from(channel * record_stride)
+                .map_err(|_| CaptureError::new("DSCope calibration channel is out of range"))?,
+        )
+        .ok_or_else(|| CaptureError::new("DSCope calibration identity overflow"))?;
+    let vga_id = calibration_id + CALIBRATION_ZERO_BYTES as u8;
+    if zero_record[0] != calibration_id || vga_record[0] != vga_id {
+        return Err(CaptureError::new(format!(
+            "invalid DSCope channel {channel} factory calibration identity: zero 0x{:02x}, VGA 0x{:02x}; expected 0x{calibration_id:02x} and 0x{vga_id:02x}",
+            zero_record[0], vga_record[0]
+        )));
+    }
+
+    let table_offset = 1 + CALIBRATION_VDIV_INDEX * 2;
+    let preoffset = read_u16(zero_record, table_offset);
+    let vga_gain = u32::from(read_u16(vga_record, table_offset)) << 8;
+    if preoffset > 1_023 || vga_gain == 0 || vga_gain > 0x001f_ff00 {
+        return Err(CaptureError::new(format!(
+            "invalid DSCope channel {channel} 1 V/div calibration: preoffset {preoffset}, VGA gain 0x{vga_gain:08x}"
+        )));
+    }
+    Ok(DsCopeChannelCalibration {
+        preoffset,
+        vga_gain,
+    })
 }
 
 struct RawScopeCapture {
@@ -555,7 +651,7 @@ mod tests {
     #[test]
     fn generates_nominal_two_channel_dso_commands() {
         let config = DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, MAX_SAMPLE_COUNT).unwrap();
-        let commands = dso_commands(config);
+        let commands = dso_commands(config, DsCopeCalibration::nominal());
 
         assert_eq!(commands[0], 0xa5a5_a500);
         assert_eq!(commands[1], 0x0f00);
@@ -564,6 +660,55 @@ mod tests {
         assert_eq!(commands[4], 0x0006_9d88);
         assert_eq!(commands[7], 0x0001_f418);
         assert_eq!(commands[12], 0x0080_8038);
+    }
+
+    #[test]
+    fn applies_each_channels_factory_gain_and_offset() {
+        let config = DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, MAX_SAMPLE_COUNT).unwrap();
+        let calibration = DsCopeCalibration {
+            channels: [
+                DsCopeChannelCalibration {
+                    preoffset: 71,
+                    vga_gain: 0x0006_a100,
+                },
+                DsCopeChannelCalibration {
+                    preoffset: 83,
+                    vga_gain: 0x0006_9700,
+                },
+            ],
+        };
+
+        let commands = dso_commands(config, calibration);
+
+        assert_eq!(commands[3], 0x0006_a108);
+        assert_eq!(commands[4], 0x0006_9788);
+        assert_eq!(commands[5], offset_command(0x10, 71));
+        assert_eq!(commands[6], offset_command(0x90, 83));
+    }
+
+    #[test]
+    fn parses_factory_calibration_for_one_volt_range() {
+        let mut zero_record = [0_u8; CALIBRATION_ZERO_BYTES];
+        let mut vga_record = [0_u8; CALIBRATION_VGA_BYTES];
+        zero_record[0] = 0x6f;
+        vga_record[0] = 0x8d;
+        zero_record[13..15].copy_from_slice(&73_u16.to_le_bytes());
+        vga_record[13..15].copy_from_slice(&0x06a1_u16.to_le_bytes());
+
+        let calibration = parse_channel_calibration(1, &zero_record, &vga_record).unwrap();
+
+        assert_eq!(calibration.preoffset, 73);
+        assert_eq!(calibration.vga_gain, 0x0006_a100);
+    }
+
+    #[test]
+    fn rejects_mismatched_factory_calibration_records() {
+        let zero_record = [0xff_u8; CALIBRATION_ZERO_BYTES];
+        let vga_record = [0xff_u8; CALIBRATION_VGA_BYTES];
+
+        let error = parse_channel_calibration(0, &zero_record, &vga_record).unwrap_err();
+
+        assert!(error.to_string().contains("factory calibration identity"));
     }
 
     #[test]

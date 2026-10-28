@@ -75,7 +75,7 @@ fn capture_scope(resource_directory: &Path) -> Result<(), Box<dyn Error>> {
     let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
     let prepared = prepare_device(&device, &bitstream_path)?;
     println!(
-        "{} ready: firmware {}, HDL {}; requesting up to {} samples/channel from two channels at {} Hz, nominal 1 V/div",
+        "{} ready: firmware {}, HDL {}; requesting up to {} samples/channel from two channels at {} Hz, factory-calibrated 1 V/div",
         device.location.stable_id(),
         prepared.firmware,
         prepared.hdl,

@@ -14,8 +14,8 @@ The repository contains the first vertical slice of the new capture engine:
 - finite buffered capture from DSLogic U3Pro16 at supported 16-channel rates;
 - finite two-channel capture from DSCope U3P100 at 1 MHz.
 
-Loading DSCope factory calibration, simultaneous physical-device capture, and
-the graphical interface are the next milestones.
+Broader DSCope ranges and sample rates, simultaneous physical-device capture,
+and the graphical interface are the next milestones.
 
 Initial USB discovery supports DSLogic U3Pro16 (`2a0e:002a`) and DSCope U3P100 (`2a0e:002b`) at HighSpeed or SuperSpeed. Discovery is read-only; explicit preparation and capture commands perform the state-changing operations.
 
@@ -63,13 +63,12 @@ settings, validates the 1 KiB trigger header, transposes the channel-major
 64-sample wire blocks, and emits typed `LogicBatch` frames.
 
 `capture-scope <resource-directory>` prepares the first connected DSCope
-U3P100 and performs a finite two-channel capture at 1 MHz with nominal 1 V/div
-scaling. The driver configures the 1 GHz front-end clock and ADC, queues both
-USB reads before starting acquisition, validates the trigger header and
-measurement footer, and emits typed `ScopeBatch` frames. The device-reported
-valid length is authoritative and can be smaller than the requested one-million
-sample buffer. Voltage conversion currently uses nominal defaults; applying the
-instrument's stored factory calibration is planned next.
+U3P100 and performs a finite two-channel capture at 1 MHz with 1 V/div scaling.
+The driver configures the 1 GHz front-end clock and ADC, validates and applies
+each channel's factory VGA and offset calibration from flash, queues both USB
+reads before starting acquisition, validates the trigger header and measurement
+footer, and emits typed `ScopeBatch` frames. The device-reported valid length is
+authoritative and can be smaller than the requested one-million sample buffer.
 
 The USB transport also provides cancellable bulk-IN reads. It polls with a
 50 ms timeout, preserves partial transfers reported by libusb, retries timeout

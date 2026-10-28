@@ -25,6 +25,7 @@ const LED_DESTINATION: u8 = 5;
 const INTERRUPT_READY_DESTINATION: u8 = 6;
 const WORD_WIDTH_DESTINATION: u8 = 7;
 const BULK_WRITE_DESTINATION: u8 = 10;
+const NVM_DESTINATION: u8 = 12;
 const CAPTURE_START_DESTINATION: u8 = 8;
 const CAPTURE_STOP_DESTINATION: u8 = 9;
 const I2C_REGISTER_DESTINATION: u8 = 14;
@@ -517,6 +518,10 @@ impl UsbDeviceSession {
 
     pub(crate) fn write_dso_command(&self, command: u64) -> Result<(), UsbError> {
         self.write_control(I2C_DSO_DESTINATION, 0, &command.to_le_bytes())
+    }
+
+    pub(crate) fn read_dscope_nvm(&self, address: u16, data: &mut [u8]) -> Result<(), UsbError> {
+        self.read_control(NVM_DESTINATION, address, data)
     }
 
     pub(crate) fn enable_dscope_channels(&self) -> Result<(), UsbError> {

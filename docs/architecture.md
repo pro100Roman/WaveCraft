@@ -40,11 +40,11 @@ channel-major 64-sample bitmaps into `LogicBatch` sample words. Cancellation
 forces the FPGA read path ready before stopping it.
 
 The DSCope U3P100 driver implements an initial finite two-channel mode at 1 MHz.
-It configures the 1 GHz front-end clock and ADC, applies nominal 1 V/div setup,
-validates the trigger header and measurement footer, and converts interleaved
-ADC bytes into channel-major `ScopeBatch` voltages. It trusts the footer's valid
-sample length rather than padding to the requested buffer size. Factory
-calibration loading and broader sample-rate/range support remain future work;
-driver code stays independent of the UI.
+It configures the 1 GHz front-end clock and ADC, validates and applies the
+per-channel 1 V/div VGA and offset calibration stored in flash, validates the
+trigger header and measurement footer, and converts interleaved ADC bytes into
+channel-major `ScopeBatch` voltages. It trusts the footer's valid sample length
+rather than padding to the requested buffer size. Broader sample-rate/range
+support remains future work; driver code stays independent of the UI.
 
 The original GPL DSView implementation under `../DSView/libsigrok4DSL/hardware/DSL` is the behavior reference for vendor IDs, firmware loading, command transfers, and bulk endpoint framing.
