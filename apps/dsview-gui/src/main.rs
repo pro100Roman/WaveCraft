@@ -23,6 +23,7 @@ const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
 const LOGIC_CHANNEL_COUNT: usize = 16;
 const MAX_WAVEFORM_SAMPLES: usize = 8_192;
+const WAVEFORM_STATUS_HEIGHT: f32 = 20.0;
 const TIME_RULER_HEIGHT: f32 = 24.0;
 const SCOPE_HORIZONTAL_DIVISIONS: usize = 10;
 const SCOPE_VERTICAL_DIVISIONS: usize = 8;
@@ -1064,7 +1065,7 @@ fn configure_style(context: &egui::Context) {
 const WAVEFORM_CARD_CHROME_HEIGHT: f32 = 58.0;
 const COMBINED_DIVIDER_HEIGHT: f32 = 10.0;
 const MIN_LOGIC_PANE_HEIGHT: f32 = 260.0;
-const MIN_SCOPE_PANE_HEIGHT: f32 = 140.0;
+const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;
 
 fn waveform_card_fill(
     ui: &mut egui::Ui,
@@ -1226,10 +1227,15 @@ fn paint_plot_grid(ui: &egui::Ui, rect: Rect) {
     }
 }
 
-fn split_time_ruler(rect: Rect) -> (Rect, Rect) {
-    let ruler_bottom = (rect.top() + TIME_RULER_HEIGHT).min(rect.bottom());
+fn split_waveform_chrome(rect: Rect) -> (Rect, Rect, Rect) {
+    let status_bottom = (rect.top() + WAVEFORM_STATUS_HEIGHT).min(rect.bottom());
+    let ruler_bottom = (status_bottom + TIME_RULER_HEIGHT).min(rect.bottom());
     (
-        Rect::from_min_max(rect.left_top(), Pos2::new(rect.right(), ruler_bottom)),
+        Rect::from_min_max(rect.left_top(), Pos2::new(rect.right(), status_bottom)),
+        Rect::from_min_max(
+            Pos2::new(rect.left(), status_bottom),
+            Pos2::new(rect.right(), ruler_bottom),
+        ),
         Rect::from_min_max(Pos2::new(rect.left(), ruler_bottom), rect.right_bottom()),
     )
 }
@@ -1404,13 +1410,40 @@ fn update_waveform_viewport(
     }
 }
 
-fn paint_zoom_factor(painter: &egui::Painter, rect: Rect, viewport: WaveformViewport) {
+fn paint_waveform_status(
+    painter: &egui::Painter,
+    rect: Rect,
+    visible_samples: usize,
+    sample_rate_hz: u64,
+    viewport: WaveformViewport,
+) {
+    painter.rect_filled(rect, 4.0, PANEL.gamma_multiply(0.9));
+    painter.line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        Stroke::new(1.0_f32, GRID),
+    );
+    if sample_rate_hz > 0 {
+        let span = Duration::from_secs_f64(visible_samples as f64 / sample_rate_hz as f64);
+        let per_division =
+            Duration::from_secs_f64(span.as_secs_f64() / SCOPE_HORIZONTAL_DIVISIONS as f64);
+        painter.text(
+            rect.left_center() + Vec2::new(6.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            format!(
+                "SPAN {}  ·  {}/div",
+                format_duration(span),
+                format_duration(per_division)
+            ),
+            FontId::monospace(10.0),
+            TEXT_MUTED,
+        );
+    }
     painter.text(
-        rect.right_top() + Vec2::new(-6.0, 6.0),
-        egui::Align2::RIGHT_TOP,
-        format!("{:.1}×", viewport.zoom_factor()),
+        rect.right_center() + Vec2::new(-6.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        format!("ZOOM {:.1}×", viewport.zoom_factor()),
         FontId::monospace(10.0),
-        TEXT_MUTED,
+        ACCENT,
     );
 }
 
@@ -1428,7 +1461,7 @@ fn paint_logic(
         Pos2::new(rect.left() + label_width, rect.top()),
         rect.right_bottom(),
     );
-    let (time_ruler, plot) = split_time_ruler(waveform_area);
+    let (status_bar, time_ruler, plot) = split_waveform_chrome(waveform_area);
     paint_plot_grid(ui, plot);
     update_waveform_viewport(ui, waveform_area, "logic_waveform_zoom", viewport);
     let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
@@ -1530,8 +1563,6 @@ fn paint_logic(
     }
     if visible_count == 0 {
         paint_empty(painter, plot, "Waiting for logic samples");
-    } else {
-        paint_time_span(painter, plot, visible_count, waveforms.logic_rate_hz);
     }
     paint_waveform_time_scale(
         painter,
@@ -1541,7 +1572,21 @@ fn paint_logic(
         waveforms.logic_sample_offset,
         *viewport,
     );
-    paint_zoom_factor(painter, plot, *viewport);
+    paint_waveform_status(
+        painter,
+        status_bar,
+        if visible_count == 0 {
+            viewport.sample_range(MAX_WAVEFORM_SAMPLES).len()
+        } else {
+            visible_count
+        },
+        if waveforms.logic_rate_hz == 0 {
+            SAMPLE_RATE_HZ
+        } else {
+            waveforms.logic_rate_hz
+        },
+        *viewport,
+    );
 }
 
 fn scope_volts_per_div(minimum: f32, maximum: f32) -> f32 {
@@ -1673,14 +1718,11 @@ fn paint_scope_readouts(
     }
 
     if sample_rate_hz > 0 {
-        let seconds_per_div =
-            visible_samples as f64 / sample_rate_hz as f64 / SCOPE_HORIZONTAL_DIVISIONS as f64;
-        let time_per_div = format_duration(Duration::from_secs_f64(seconds_per_div));
         painter.text(
             rect.center_bottom() + Vec2::new(0.0, -6.0),
             egui::Align2::CENTER_BOTTOM,
             format!(
-                "AUTO  {time_per_div}/div  ·  {}  ·  {visible_samples} pts",
+                "AUTO  ·  {}  ·  {visible_samples} pts",
                 format_sample_rate(sample_rate_hz)
             ),
             FontId::monospace(10.0),
@@ -1697,7 +1739,7 @@ fn paint_scope(
 ) {
     paint_plot_background(ui, rect);
     let painter = ui.painter();
-    let (time_ruler, plot) = split_time_ruler(rect);
+    let (status_bar, time_ruler, plot) = split_waveform_chrome(rect);
     let scope_painter = painter.with_clip_rect(plot);
     paint_scope_graticule(&scope_painter, plot);
     update_waveform_viewport(ui, rect, "scope_waveform_zoom", viewport);
@@ -1729,7 +1771,13 @@ fn paint_scope(
             waveforms.scope_sample_offset,
             *viewport,
         );
-        paint_zoom_factor(&scope_painter, plot, *viewport);
+        paint_waveform_status(
+            painter,
+            status_bar,
+            idle_range.len(),
+            SAMPLE_RATE_HZ,
+            *viewport,
+        );
         return;
     }
 
@@ -1786,7 +1834,13 @@ fn paint_scope(
         waveforms.scope_sample_offset,
         *viewport,
     );
-    paint_zoom_factor(&scope_painter, plot, *viewport);
+    paint_waveform_status(
+        painter,
+        status_bar,
+        visible_count,
+        waveforms.scope_rate_hz,
+        *viewport,
+    );
 }
 
 fn paint_empty(painter: &egui::Painter, rect: Rect, text: &str) {
@@ -1795,20 +1849,6 @@ fn paint_empty(painter: &egui::Painter, rect: Rect, text: &str) {
         egui::Align2::CENTER_CENTER,
         text,
         FontId::proportional(14.0),
-        TEXT_MUTED,
-    );
-}
-
-fn paint_time_span(painter: &egui::Painter, rect: Rect, samples: usize, rate_hz: u64) {
-    if rate_hz == 0 {
-        return;
-    }
-    let span = Duration::from_secs_f64(samples as f64 / rate_hz as f64);
-    painter.text(
-        rect.right_bottom() + Vec2::new(-6.0, -6.0),
-        egui::Align2::RIGHT_BOTTOM,
-        format_duration(span),
-        FontId::monospace(10.0),
         TEXT_MUTED,
     );
 }
@@ -1893,8 +1933,20 @@ mod tests {
         assert!((scope - 400.0).abs() < f32::EPSILON);
 
         let (logic, scope) = combined_pane_heights(310.0, 0.99);
-        assert!((logic - 195.0).abs() < f32::EPSILON);
-        assert!((scope - 105.0).abs() < f32::EPSILON);
+        let minimum_scale = 300.0 / (MIN_LOGIC_PANE_HEIGHT + MIN_SCOPE_PANE_HEIGHT);
+        assert!((logic - MIN_LOGIC_PANE_HEIGHT * minimum_scale).abs() < 0.001);
+        assert!((scope - MIN_SCOPE_PANE_HEIGHT * minimum_scale).abs() < 0.001);
+    }
+
+    #[test]
+    fn waveform_status_is_positioned_above_the_time_ruler() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 300.0));
+        let (status, ruler, plot) = split_waveform_chrome(rect);
+
+        assert_eq!(status.top(), rect.top());
+        assert_eq!(status.bottom(), ruler.top());
+        assert_eq!(ruler.bottom(), plot.top());
+        assert_eq!(plot.bottom(), rect.bottom());
     }
 
     #[test]
