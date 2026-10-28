@@ -22,8 +22,11 @@ const CALIBRATION_ZERO_BYTES: usize = 30;
 const CALIBRATION_VGA_BYTES: usize = 17;
 const CALIBRATION_FLASH_PAGE_STRIDE: u16 = 8;
 const CALIBRATION_ID_BASE: u8 = 0x40;
-const NOMINAL_CENTER_OFFSET: u64 = 128;
 const OFFSET_PWM_SPAN: u64 = 780;
+
+pub const DSCOPE_VERTICAL_OFFSET_MIN: u16 = 10;
+pub const DSCOPE_VERTICAL_OFFSET_CENTER: u16 = 128;
+pub const DSCOPE_VERTICAL_OFFSET_MAX: u16 = 245;
 
 pub const DSCOPE_SAMPLE_RATES_HZ: [u64; 17] = [
     100_000,
@@ -70,6 +73,7 @@ pub struct DsCopeChannelConfig {
     volts_per_div_mv: u16,
     coupling: DsCopeCoupling,
     probe_attenuation: u8,
+    vertical_offset: u16,
 }
 
 impl Default for DsCopeChannelConfig {
@@ -79,6 +83,7 @@ impl Default for DsCopeChannelConfig {
             volts_per_div_mv: 1_000,
             coupling: DsCopeCoupling::Dc,
             probe_attenuation: 1,
+            vertical_offset: DSCOPE_VERTICAL_OFFSET_CENTER,
         }
     }
 }
@@ -104,12 +109,23 @@ impl DsCopeChannelConfig {
             volts_per_div_mv,
             coupling,
             probe_attenuation,
+            vertical_offset: DSCOPE_VERTICAL_OFFSET_CENTER,
         })
     }
 
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
+    }
+
+    pub fn with_vertical_offset(mut self, vertical_offset: u16) -> Result<Self, CaptureError> {
+        if !(DSCOPE_VERTICAL_OFFSET_MIN..=DSCOPE_VERTICAL_OFFSET_MAX).contains(&vertical_offset) {
+            return Err(CaptureError::new(format!(
+                "DSCope vertical offset must be between {DSCOPE_VERTICAL_OFFSET_MIN} and {DSCOPE_VERTICAL_OFFSET_MAX}; got {vertical_offset}"
+            )));
+        }
+        self.vertical_offset = vertical_offset;
+        Ok(self)
     }
 
     pub fn enabled(self) -> bool {
@@ -126,6 +142,10 @@ impl DsCopeChannelConfig {
 
     pub fn probe_attenuation(self) -> u8 {
         self.probe_attenuation
+    }
+
+    pub fn vertical_offset(self) -> u16 {
+        self.vertical_offset
     }
 
     fn calibration_index(self) -> usize {
@@ -449,8 +469,16 @@ fn dso_commands(config: DsCopeCaptureConfig, calibration: DsCopeCalibration) -> 
         coupling_command(config, 1, config.channels[1].coupling),
         0x08 + u64::from(channel_zero.vga_gain),
         0x88 + u64::from(channel_one.vga_gain),
-        offset_command(0x10, channel_zero.preoffset),
-        offset_command(0x90, channel_one.preoffset),
+        offset_command(
+            0x10,
+            config.channels[0].vertical_offset,
+            channel_zero.preoffset,
+        ),
+        offset_command(
+            0x90,
+            config.channels[1].vertical_offset,
+            channel_one.preoffset,
+        ),
         0x18 + (u64::from(config.divider()) << 8),
         0x20,
         0x58,
@@ -472,10 +500,10 @@ fn coupling_command(config: DsCopeCaptureConfig, channel: usize, coupling: DsCop
     command + ((channel as u64) << 7) + coupling.command_bit()
 }
 
-fn offset_command(command: u64, preoffset: u16) -> u64 {
-    let offset = (NOMINAL_CENTER_OFFSET << 32)
-        + (NOMINAL_CENTER_OFFSET * OFFSET_PWM_SPAN / 255)
-        + u64::from(preoffset);
+fn offset_command(command: u64, vertical_offset: u16, preoffset: u16) -> u64 {
+    let vertical_offset = u64::from(vertical_offset);
+    let offset =
+        (vertical_offset << 32) + (vertical_offset * OFFSET_PWM_SPAN / 255) + u64::from(preoffset);
     command + (offset << 8)
 }
 
@@ -972,8 +1000,59 @@ mod tests {
 
         assert_eq!(commands[3], 0x0006_a108);
         assert_eq!(commands[4], 0x0006_9788);
-        assert_eq!(commands[5], offset_command(0x10, 71));
-        assert_eq!(commands[6], offset_command(0x90, 83));
+        assert_eq!(
+            commands[5],
+            offset_command(0x10, DSCOPE_VERTICAL_OFFSET_CENTER, 71)
+        );
+        assert_eq!(
+            commands[6],
+            offset_command(0x90, DSCOPE_VERTICAL_OFFSET_CENTER, 83)
+        );
+    }
+
+    #[test]
+    fn applies_each_channels_configured_vertical_offset() {
+        let channels = [
+            DsCopeChannelConfig::default()
+                .with_vertical_offset(DSCOPE_VERTICAL_OFFSET_MIN)
+                .unwrap(),
+            DsCopeChannelConfig::default()
+                .with_vertical_offset(DSCOPE_VERTICAL_OFFSET_MAX)
+                .unwrap(),
+        ];
+        let config = DsCopeCaptureConfig::with_channel_configs(
+            1_000_000,
+            MAX_DUAL_CHANNEL_SAMPLE_COUNT,
+            channels,
+        )
+        .unwrap();
+        let calibration = DsCopeCalibration {
+            channels: [
+                DsCopeChannelCalibration {
+                    preoffset: 71,
+                    vga_gain: 0x0006_a100,
+                },
+                DsCopeChannelCalibration {
+                    preoffset: 83,
+                    vga_gain: 0x0006_9700,
+                },
+            ],
+        };
+
+        let commands = dso_commands(config, calibration);
+
+        assert_eq!(commands[5], 0x0000_0a00_0000_6510);
+        assert_eq!(commands[6], 0x0000_f500_0003_4090);
+    }
+
+    #[test]
+    fn rejects_vertical_offsets_outside_the_hardware_range() {
+        assert!(DsCopeChannelConfig::default()
+            .with_vertical_offset(DSCOPE_VERTICAL_OFFSET_MIN - 1)
+            .is_err());
+        assert!(DsCopeChannelConfig::default()
+            .with_vertical_offset(DSCOPE_VERTICAL_OFFSET_MAX + 1)
+            .is_err());
     }
 
     #[test]

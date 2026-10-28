@@ -15,7 +15,8 @@ mod transport;
 
 pub use dscope::{
     apply_dscope_configuration, DsCopeCaptureConfig, DsCopeCaptureSource, DsCopeChannelConfig,
-    DsCopeCoupling, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ, DSCOPE_VOLTS_PER_DIV_MV,
+    DsCopeCoupling, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ, DSCOPE_VERTICAL_OFFSET_CENTER,
+    DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
 };
 pub use dslogic::{DsLogicCaptureConfig, DsLogicCaptureSource};
 pub use prepare::{load_device_fpga, prepare_device, FpgaLoad, PreparedDevice};

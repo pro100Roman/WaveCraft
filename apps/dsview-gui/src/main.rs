@@ -9,7 +9,8 @@ use dsview_usb::{
     apply_dscope_configuration, discover_supported_devices, prepare_device, DeviceModel,
     DiscoveredDevice, DsCopeCaptureConfig, DsCopeCaptureSource, DsCopeChannelConfig,
     DsCopeCoupling, DsLogicCaptureConfig, DsLogicCaptureSource, LinkStatus, DSCOPE_SAMPLE_COUNTS,
-    DSCOPE_SAMPLE_RATES_HZ, DSCOPE_VOLTS_PER_DIV_MV,
+    DSCOPE_SAMPLE_RATES_HZ, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
+    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -65,6 +66,7 @@ struct ScopeChannelSettings {
     volts_per_div_mv: u16,
     coupling: DsCopeCoupling,
     probe_attenuation: u8,
+    vertical_offset: u16,
 }
 
 impl Default for ScopeChannelSettings {
@@ -74,6 +76,7 @@ impl Default for ScopeChannelSettings {
             volts_per_div_mv: 1_000,
             coupling: DsCopeCoupling::Dc,
             probe_attenuation: 1,
+            vertical_offset: DSCOPE_VERTICAL_OFFSET_CENTER,
         }
     }
 }
@@ -104,6 +107,8 @@ impl ScopeCaptureSettings {
                 source.coupling,
                 source.probe_attenuation,
             )
+            .map_err(|error| error.to_string())?
+            .with_vertical_offset(source.vertical_offset)
             .map_err(|error| error.to_string())?
             .with_enabled(source.enabled);
         }
@@ -149,6 +154,7 @@ impl ScopeCaptureSettings {
                     left.enabled != right.enabled
                         || left.volts_per_div_mv != right.volts_per_div_mv
                         || left.coupling != right.coupling
+                        || left.vertical_offset != right.vertical_offset
                 })
     }
 
@@ -161,6 +167,7 @@ impl ScopeCaptureSettings {
                 volts_per_div_mv: channel.volts_per_div_mv(),
                 coupling: channel.coupling(),
                 probe_attenuation: channel.probe_attenuation(),
+                vertical_offset: channel.vertical_offset(),
             }),
         }
     }
@@ -1358,6 +1365,10 @@ impl eframe::App for DsViewApp {
                 let mut logic_channel_colors = self.logic_channel_colors;
                 let mut logic_viewport = self.logic_viewport;
                 let mut scope_viewport = self.scope_viewport;
+                let mut scope_vertical_offsets = self
+                    .scope_settings
+                    .channels
+                    .map(|channel| channel.vertical_offset);
                 let scope_settings = self
                     .capture
                     .as_ref()
@@ -1396,7 +1407,11 @@ impl eframe::App for DsViewApp {
                                     rect,
                                     waveforms,
                                     &mut scope_viewport,
-                                    scope_settings,
+                                    ScopeWaveformOptions {
+                                        settings: scope_settings,
+                                        vertical_offsets: &mut scope_vertical_offsets,
+                                        offset_controls_enabled: capture_settings_enabled,
+                                    },
                                 )
                             },
                         );
@@ -1409,7 +1424,11 @@ impl eframe::App for DsViewApp {
                             &mut logic_channel_colors,
                             &mut logic_viewport,
                             &mut scope_viewport,
-                            scope_settings,
+                            ScopeWaveformOptions {
+                                settings: scope_settings,
+                                vertical_offsets: &mut scope_vertical_offsets,
+                                offset_controls_enabled: capture_settings_enabled,
+                            },
                         );
                     }
                     None => {}
@@ -1418,6 +1437,14 @@ impl eframe::App for DsViewApp {
                 self.logic_channel_colors = logic_channel_colors;
                 self.logic_viewport = logic_viewport;
                 self.scope_viewport = scope_viewport;
+                for (channel, vertical_offset) in self
+                    .scope_settings
+                    .channels
+                    .iter_mut()
+                    .zip(scope_vertical_offsets)
+                {
+                    channel.vertical_offset = vertical_offset;
+                }
             });
 
         let mut settings_open = self.settings_open;
@@ -1622,6 +1649,10 @@ fn start_gui_recording(
             format!("scope.ch{index}.probe_attenuation"),
             channel.probe_attenuation().to_string(),
         );
+        metadata.insert(
+            format!("scope.ch{index}.vertical_offset"),
+            channel.vertical_offset().to_string(),
+        );
     }
     RecordingWriter::new(BufWriter::new(file), devices, metadata).map_err(|error| error.to_string())
 }
@@ -1693,6 +1724,12 @@ const COMBINED_DIVIDER_HEIGHT: f32 = 10.0;
 const MIN_LOGIC_PANE_HEIGHT: f32 = 260.0;
 const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;
 
+struct ScopeWaveformOptions<'a> {
+    settings: ScopeCaptureSettings,
+    vertical_offsets: &'a mut [u16; 2],
+    offset_controls_enabled: bool,
+}
+
 fn waveform_card_fill(
     ui: &mut egui::Ui,
     title: &str,
@@ -1724,7 +1761,7 @@ fn combined_waveform_cards(
     logic_channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
     logic_viewport: &mut WaveformViewport,
     scope_viewport: &mut WaveformViewport,
-    scope_settings: ScopeCaptureSettings,
+    scope_options: ScopeWaveformOptions<'_>,
 ) {
     let available = ui.available_rect_before_wrap();
     let (logic_height, _) = combined_pane_heights(available.height(), *logic_ratio);
@@ -1789,7 +1826,7 @@ fn combined_waveform_cards(
         &mut scope_ui,
         "OSCILLOSCOPE",
         "DSCope · CH0 / CH1",
-        |ui, rect| paint_scope(ui, rect, waveforms, scope_viewport, scope_settings),
+        |ui, rect| paint_scope(ui, rect, waveforms, scope_viewport, scope_options),
     );
 
     let divider_color = if divider_response.hovered() || divider_response.dragged() {
@@ -2303,6 +2340,159 @@ fn paint_scope_graticule(painter: &egui::Painter, rect: Rect) {
     }
 }
 
+fn scope_vertical_offset_ratio(vertical_offset: u16) -> f32 {
+    let span = f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
+    f32::from(
+        vertical_offset.clamp(DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VERTICAL_OFFSET_MAX)
+            - DSCOPE_VERTICAL_OFFSET_MIN,
+    ) / span
+}
+
+fn scope_vertical_offset_y(rect: Rect, vertical_offset: u16) -> f32 {
+    egui::lerp(rect.y_range(), scope_vertical_offset_ratio(vertical_offset))
+}
+
+fn scope_vertical_offset_from_y(rect: Rect, y: f32) -> u16 {
+    let ratio = ((y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+    let span = f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
+    (f32::from(DSCOPE_VERTICAL_OFFSET_MIN) + ratio * span).round() as u16
+}
+
+fn scope_vertical_offset_divisions(rect: Rect, vertical_offset: u16) -> f32 {
+    let center_y = scope_vertical_offset_y(rect, DSCOPE_VERTICAL_OFFSET_CENTER);
+    (center_y - scope_vertical_offset_y(rect, vertical_offset)) / rect.height().max(1.0)
+        * SCOPE_VERTICAL_DIVISIONS as f32
+}
+
+fn scope_offset_arrow_at_pointer(
+    plot: Rect,
+    pointer_y: f32,
+    settings: ScopeCaptureSettings,
+    vertical_offsets: &[u16; 2],
+) -> Option<usize> {
+    const HIT_RADIUS: f32 = 16.0;
+    let mut closest: Option<(usize, f32)> = None;
+    for (channel, vertical_offset) in vertical_offsets.iter().copied().enumerate() {
+        if !settings.channels[channel].enabled {
+            continue;
+        }
+        let distance = (pointer_y - scope_vertical_offset_y(plot, vertical_offset)).abs();
+        let is_closer = match closest {
+            Some((_, closest_distance)) => distance < closest_distance,
+            None => true,
+        };
+        if is_closer {
+            closest = Some((channel, distance));
+        }
+    }
+    closest
+        .filter(|(_, distance)| *distance <= HIT_RADIUS)
+        .map(|(channel, _)| channel)
+}
+
+fn paint_scope_offset_arrows(
+    ui: &egui::Ui,
+    plot: Rect,
+    settings: ScopeCaptureSettings,
+    vertical_offsets: &mut [u16; 2],
+    controls_enabled: bool,
+) {
+    const ARROW_WIDTH: f32 = 12.0;
+    const ARROW_HALF_HEIGHT: f32 = 7.0;
+    const DOT_SPACING: f32 = 7.0;
+    let painter = ui.painter().with_clip_rect(plot);
+    let arrow_x = plot.left() + 2.0;
+    let interaction_rect = Rect::from_min_max(
+        plot.left_top(),
+        Pos2::new(
+            (plot.left() + ARROW_WIDTH + 4.0).min(plot.right()),
+            plot.bottom(),
+        ),
+    );
+    let interaction_id = ui.make_persistent_id("scope_vertical_offset_arrows");
+    let response = ui.interact(
+        interaction_rect,
+        interaction_id,
+        if controls_enabled {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
+    );
+    let hovered_channel = response.hover_pos().and_then(|pointer| {
+        scope_offset_arrow_at_pointer(plot, pointer.y, settings, vertical_offsets)
+    });
+    let response = if let Some(channel) = hovered_channel {
+        response
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text(format!(
+                "CH{channel} vertical offset: {:+.2} div\nDrag to move · double-click to center",
+                scope_vertical_offset_divisions(plot, vertical_offsets[channel])
+            ))
+    } else {
+        response
+    };
+
+    if controls_enabled {
+        if response.drag_started() {
+            let channel = response.interact_pointer_pos().and_then(|pointer| {
+                scope_offset_arrow_at_pointer(plot, pointer.y, settings, vertical_offsets)
+            });
+            ui.data_mut(|data| {
+                data.remove_temp::<usize>(interaction_id);
+                if let Some(channel) = channel {
+                    data.insert_temp(interaction_id, channel);
+                }
+            });
+        }
+        if response.double_clicked() {
+            if let Some(channel) = response.interact_pointer_pos().and_then(|pointer| {
+                scope_offset_arrow_at_pointer(plot, pointer.y, settings, vertical_offsets)
+            }) {
+                vertical_offsets[channel] = DSCOPE_VERTICAL_OFFSET_CENTER;
+            }
+        } else if response.dragged() {
+            let channel = ui.data(|data| data.get_temp::<usize>(interaction_id));
+            if let (Some(channel), Some(pointer)) = (channel, response.interact_pointer_pos()) {
+                vertical_offsets[channel] = scope_vertical_offset_from_y(plot, pointer.y);
+            }
+        }
+        if response.drag_stopped() {
+            ui.data_mut(|data| data.remove_temp::<usize>(interaction_id));
+        }
+    }
+
+    for (channel, color) in SCOPE_COLORS.iter().enumerate() {
+        if !settings.channels[channel].enabled {
+            continue;
+        }
+        let arrow_y = scope_vertical_offset_y(plot, vertical_offsets[channel]);
+        let mut x = plot.left();
+        while x <= plot.right() {
+            painter.circle_filled(Pos2::new(x, arrow_y), 0.8, color.gamma_multiply(0.35));
+            x += DOT_SPACING;
+        }
+    }
+
+    for channel in (0..SCOPE_COLORS.len()).rev() {
+        let display_color = if settings.channels[channel].enabled {
+            SCOPE_COLORS[channel]
+        } else {
+            TEXT_MUTED.gamma_multiply(0.45)
+        };
+        let arrow_y = scope_vertical_offset_y(plot, vertical_offsets[channel]);
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(arrow_x, arrow_y - ARROW_HALF_HEIGHT),
+                Pos2::new(arrow_x + ARROW_WIDTH, arrow_y),
+                Pos2::new(arrow_x, arrow_y + ARROW_HALF_HEIGHT),
+            ],
+            display_color,
+            Stroke::new(1.0_f32, BACKGROUND),
+        ));
+    }
+}
+
 fn paint_scope_readouts(
     painter: &egui::Painter,
     rect: Rect,
@@ -2319,7 +2509,7 @@ fn paint_scope_readouts(
         let scale = f32::from(channel_settings.volts_per_div_mv) / 1_000.0
             * f32::from(channel_settings.probe_attenuation);
         painter.text(
-            rect.left_top() + Vec2::new(8.0, 7.0 + visible_row as f32 * 14.0),
+            rect.left_top() + Vec2::new(26.0, 7.0 + visible_row as f32 * 14.0),
             egui::Align2::LEFT_TOP,
             format!(
                 "CH{}  {}/div  {}  {}×",
@@ -2332,23 +2522,6 @@ fn paint_scope_readouts(
             *color,
         );
         visible_row += 1;
-    }
-
-    let zero_y = rect.center().y;
-    for (channel, color) in SCOPE_COLORS.iter().enumerate() {
-        if !settings.channels[channel].enabled {
-            continue;
-        }
-        let x = rect.left() + 2.0 + channel as f32 * 8.0;
-        painter.add(egui::Shape::convex_polygon(
-            vec![
-                Pos2::new(x, zero_y - 4.0),
-                Pos2::new(x + 7.0, zero_y),
-                Pos2::new(x, zero_y + 4.0),
-            ],
-            *color,
-            Stroke::NONE,
-        ));
     }
 
     if sample_rate_hz > 0 {
@@ -2370,14 +2543,32 @@ fn paint_scope(
     rect: Rect,
     waveforms: &WaveformStore,
     viewport: &mut WaveformViewport,
-    settings: ScopeCaptureSettings,
+    scope_options: ScopeWaveformOptions<'_>,
 ) {
+    let ScopeWaveformOptions {
+        mut settings,
+        vertical_offsets,
+        offset_controls_enabled,
+    } = scope_options;
+    for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
+        channel.vertical_offset = vertical_offset;
+    }
     paint_plot_background(ui, rect);
     let painter = ui.painter();
     let (status_bar, time_ruler, plot) = split_waveform_chrome(rect);
     let scope_painter = painter.with_clip_rect(plot);
     paint_scope_graticule(&scope_painter, plot);
-    update_waveform_viewport(ui, rect, "scope_waveform_zoom", viewport);
+    update_waveform_viewport(ui, plot, "scope_waveform_zoom", viewport);
+    paint_scope_offset_arrows(
+        ui,
+        plot,
+        settings,
+        vertical_offsets,
+        offset_controls_enabled,
+    );
+    for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
+        channel.vertical_offset = vertical_offset;
+    }
 
     let sample_count = waveforms
         .scope_channels
@@ -2440,7 +2631,8 @@ fn paint_scope(
                     + index.saturating_sub(visible_range.start) as f32
                         / visible_count.saturating_sub(1).max(1) as f32
                         * plot.width();
-                let y = plot.center().y - channel[index] / voltage_span * plot.height();
+                let zero_y = scope_vertical_offset_y(plot, channel_settings.vertical_offset);
+                let y = zero_y - channel[index] / voltage_span * plot.height();
                 Pos2::new(x, y)
             })
             .collect::<Vec<_>>();
@@ -2689,12 +2881,14 @@ mod tests {
                     volts_per_div_mv: 100,
                     coupling: DsCopeCoupling::Ac,
                     probe_attenuation: 10,
+                    vertical_offset: 64,
                 },
                 ScopeChannelSettings {
                     enabled: false,
                     volts_per_div_mv: 2_000,
                     coupling: DsCopeCoupling::Dc,
                     probe_attenuation: 1,
+                    vertical_offset: 192,
                 },
             ],
         };
@@ -2705,9 +2899,11 @@ mod tests {
         assert_eq!(config.channels()[0].volts_per_div_mv(), 100);
         assert_eq!(config.channels()[0].coupling(), DsCopeCoupling::Ac);
         assert_eq!(config.channels()[0].probe_attenuation(), 10);
+        assert_eq!(config.channels()[0].vertical_offset(), 64);
         assert_eq!(config.channels()[1].volts_per_div_mv(), 2_000);
         assert_eq!(config.channels()[1].coupling(), DsCopeCoupling::Dc);
         assert_eq!(config.channels()[1].probe_attenuation(), 1);
+        assert_eq!(config.channels()[1].vertical_offset(), 192);
         assert!(!config.channels()[1].enabled());
         assert_eq!(ScopeCaptureSettings::from_capture_config(config), settings);
         assert_eq!(format_voltage(0.1), "100 mV");
@@ -2740,6 +2936,51 @@ mod tests {
 
         changed.channels[0].volts_per_div_mv = 100;
         assert!(changed.frontend_differs_from(original));
+
+        changed = original;
+        changed.channels[0].vertical_offset = 64;
+        assert!(changed.frontend_differs_from(original));
+    }
+
+    #[test]
+    fn scope_vertical_offset_maps_hardware_limits_to_the_plot() {
+        let rect = Rect::from_min_max(Pos2::new(0.0, 20.0), Pos2::new(100.0, 220.0));
+
+        assert_eq!(
+            scope_vertical_offset_y(rect, DSCOPE_VERTICAL_OFFSET_MIN),
+            rect.top()
+        );
+        assert_eq!(
+            scope_vertical_offset_y(rect, DSCOPE_VERTICAL_OFFSET_MAX),
+            rect.bottom()
+        );
+        assert_eq!(
+            scope_vertical_offset_from_y(rect, rect.top()),
+            DSCOPE_VERTICAL_OFFSET_MIN
+        );
+        assert_eq!(
+            scope_vertical_offset_from_y(rect, rect.bottom()),
+            DSCOPE_VERTICAL_OFFSET_MAX
+        );
+    }
+
+    #[test]
+    fn overlapping_scope_offset_arrows_remain_independently_selectable() {
+        let plot = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 200.0));
+        let settings = ScopeCaptureSettings::default();
+        let mut offsets = [DSCOPE_VERTICAL_OFFSET_CENTER; 2];
+        let center_y = scope_vertical_offset_y(plot, DSCOPE_VERTICAL_OFFSET_CENTER);
+
+        assert_eq!(
+            scope_offset_arrow_at_pointer(plot, center_y, settings, &offsets),
+            Some(0)
+        );
+
+        offsets[0] = DSCOPE_VERTICAL_OFFSET_MIN;
+        assert_eq!(
+            scope_offset_arrow_at_pointer(plot, center_y, settings, &offsets),
+            Some(1)
+        );
     }
 
     #[test]
