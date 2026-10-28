@@ -290,6 +290,30 @@ pub struct DsCopeCaptureSource {
     descriptor: DeviceDescriptor,
 }
 
+pub fn apply_dscope_configuration(
+    device: &DiscoveredDevice,
+    config: DsCopeCaptureConfig,
+) -> Result<(), CaptureError> {
+    if device.profile.model != DeviceModel::DsCopeU3P100 {
+        return Err(CaptureError::new(format!(
+            "{} is not a DSCope U3P100 oscilloscope",
+            device.location.stable_id()
+        )));
+    }
+    let session = UsbDeviceSession::open(device).map_err(capture_error)?;
+    let configuration_result = (|| {
+        validate_device_ready(&session)?;
+        session.stop_capture().map_err(capture_error)?;
+        configure_frontend(&session, config).map(|_| ())
+    })();
+    let close_result = session.close().map_err(capture_error);
+    combine_results(
+        configuration_result,
+        close_result,
+        "release the USB interface",
+    )
+}
+
 impl DsCopeCaptureSource {
     pub fn new(
         device: DiscoveredDevice,
@@ -335,15 +359,7 @@ fn run_capture(
     validate_device_ready(session)?;
     session.stop_capture().map_err(capture_error)?;
     let capture_result = (|| {
-        let enabled_channels = config.channels.map(|channel| channel.enabled);
-        session
-            .initialize_dscope_frontend(enabled_channels)
-            .map_err(capture_error)?;
-        let calibration = DsCopeCalibration::load(session, config)?;
-        session
-            .configure_dscope_channels(enabled_channels)
-            .map_err(capture_error)?;
-        configure_scope(session, config, calibration)?;
+        let calibration = configure_frontend(session, config)?;
         session
             .arm_capture(&config.encode_settings())
             .map_err(capture_error)?;
@@ -359,6 +375,22 @@ fn run_capture(
     }
     let stop_result = session.stop_capture().map_err(capture_error);
     combine_results(capture_result, stop_result, "stop the capture engine")
+}
+
+fn configure_frontend(
+    session: &UsbDeviceSession,
+    config: DsCopeCaptureConfig,
+) -> Result<DsCopeCalibration, CaptureError> {
+    let enabled_channels = config.channels.map(|channel| channel.enabled);
+    session
+        .initialize_dscope_frontend(enabled_channels)
+        .map_err(capture_error)?;
+    let calibration = DsCopeCalibration::load(session, config)?;
+    session
+        .configure_dscope_channels(enabled_channels)
+        .map_err(capture_error)?;
+    configure_scope(session, config, calibration)?;
+    Ok(calibration)
 }
 
 fn validate_device_ready(session: &UsbDeviceSession) -> Result<(), CaptureError> {

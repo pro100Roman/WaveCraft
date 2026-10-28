@@ -130,6 +130,12 @@ transfer layout, and sample-rate ceiling adapt to one or two enabled channels;
 the shared 2M-sample DSO memory is divided between enabled channels. Driver code
 stays independent of the UI.
 
+The GUI may apply an idle DSCope configuration without starting acquisition.
+This prepares the FPGA if needed, loads the selected per-range calibration, and
+writes the same front-end commands used immediately before capture. Active and
+completed waveform views retain their capture-time configuration rather than
+reinterpreting samples with settings intended for the next capture.
+
 The `capture-usb` development command places one physical DSLogic source and one
 physical DSCope source in the same `CaptureSession`. Both workers prepare and
 arm independently, synchronize immediately before their USB start commands,

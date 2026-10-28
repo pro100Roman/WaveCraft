@@ -155,7 +155,9 @@ coupling, probe attenuation, and hardware enablement for CH0 and CH1. Enabled
 channels support up to 500 MSa/s; disabling either channel raises the remaining
 channel's limit to 1 GSa/s. The
 shared 2M-sample memory provides up to 1M samples/channel in dual-channel mode
-or 2M in single-channel mode. Logic Analyzer and
+or 2M in single-channel mode. Input-range and coupling changes are applied to
+the selected DSCope front end while idle; existing waveforms retain the settings
+with which they were captured. Logic Analyzer and
 Oscilloscope tabs are
 created only for connected devices; the Combined tab appears when both models
 are present, and Refresh rebuilds the available tab set. Each waveform expands
