@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
@@ -29,6 +29,7 @@ const WAVEFORM_STATUS_HEIGHT: f32 = 20.0;
 const TIME_RULER_HEIGHT: f32 = 24.0;
 const SCOPE_HORIZONTAL_DIVISIONS: usize = 10;
 const SCOPE_VERTICAL_DIVISIONS: usize = 8;
+const SCOPE_CONFIGURATION_DEBOUNCE: Duration = Duration::from_millis(350);
 const BACKGROUND: Color32 = Color32::from_rgb(12, 17, 25);
 const PANEL: Color32 = Color32::from_rgb(20, 27, 38);
 const GRID: Color32 = Color32::from_rgb(43, 55, 72);
@@ -385,6 +386,7 @@ struct DsViewApp {
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
     logic_viewport: WaveformViewport,
     scope_viewport: WaveformViewport,
+    scope_configuration_due: Option<Instant>,
     pending: Option<Receiver<WorkerResult>>,
     capture: Option<ActiveCapture>,
     completed_capture: Option<CompletedCapture>,
@@ -408,6 +410,7 @@ impl DsViewApp {
             logic_channel_colors: default_logic_channel_colors(),
             logic_viewport: WaveformViewport::default(),
             scope_viewport: WaveformViewport::default(),
+            scope_configuration_due: None,
             pending: None,
             capture: None,
             completed_capture: None,
@@ -423,6 +426,7 @@ impl DsViewApp {
             return;
         }
         let (sender, receiver) = mpsc::channel();
+        self.scope_configuration_due = None;
         self.pending = Some(receiver);
         self.completed_capture = None;
         self.status = "Discovering USB instruments…".to_owned();
@@ -463,6 +467,7 @@ impl DsViewApp {
 
         let resource_directory = PathBuf::from(self.resource_directory.trim());
         let (sender, receiver) = mpsc::channel();
+        self.scope_configuration_due = None;
         self.pending = Some(receiver);
         self.completed_capture = None;
         self.status = format!("Preparing {} instrument(s)…", devices.len());
@@ -482,6 +487,7 @@ impl DsViewApp {
         if self.pending.is_some() || self.capture.is_some() {
             return;
         }
+        self.scope_configuration_due = None;
         let devices = self
             .devices
             .iter()
@@ -794,6 +800,112 @@ fn format_input_scale(volts_per_div_mv: u16) -> String {
     }
 }
 
+fn step_scope_input_range(current: u16, steps: i32) -> u16 {
+    let current_index = DSCOPE_VOLTS_PER_DIV_MV
+        .iter()
+        .position(|candidate| *candidate == current)
+        .unwrap_or(0) as i32;
+    let maximum_index = DSCOPE_VOLTS_PER_DIV_MV.len() as i32 - 1;
+    DSCOPE_VOLTS_PER_DIV_MV[(current_index + steps).clamp(0, maximum_index) as usize]
+}
+
+fn paint_scope_input_range_encoder(
+    ui: &mut egui::Ui,
+    channel_index: usize,
+    volts_per_div_mv: &mut u16,
+) -> bool {
+    let mut steps = 0;
+    ui.horizontal(|ui| {
+        let encoder_id = ui.make_persistent_id(("scope_range_encoder", channel_index));
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(58.0), Sense::click_and_drag());
+        let response = response
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text("Drag the knob vertically or scroll to rotate it");
+        if response.clicked() {
+            response.request_focus();
+        }
+        if response.hovered() {
+            let scroll_delta = ui.input_mut(|input| {
+                let delta = input.raw_scroll_delta.y;
+                input.raw_scroll_delta.y = 0.0;
+                delta
+            });
+            if scroll_delta.abs() > f32::EPSILON {
+                steps += scroll_delta.signum() as i32;
+            }
+        }
+        if response.dragged() {
+            let pointer_delta = ui.input(|input| input.pointer.delta());
+            let rotation_delta = pointer_delta.x - pointer_delta.y;
+            let drag_steps = ui.data_mut(|data| {
+                let accumulator = data.get_temp_mut_or_default::<f32>(encoder_id);
+                *accumulator += rotation_delta;
+                let whole_steps = (*accumulator / 12.0).trunc() as i32;
+                *accumulator -= whole_steps as f32 * 12.0;
+                whole_steps
+            });
+            steps += drag_steps;
+        }
+        if response.drag_stopped() {
+            ui.data_mut(|data| data.remove_temp::<f32>(encoder_id));
+        }
+        if response.has_focus() {
+            ui.input(|input| {
+                if input.key_pressed(egui::Key::ArrowUp) || input.key_pressed(egui::Key::ArrowRight)
+                {
+                    steps += 1;
+                }
+                if input.key_pressed(egui::Key::ArrowDown)
+                    || input.key_pressed(egui::Key::ArrowLeft)
+                {
+                    steps -= 1;
+                }
+            });
+        }
+
+        let current_index = DSCOPE_VOLTS_PER_DIV_MV
+            .iter()
+            .position(|candidate| *candidate == *volts_per_div_mv)
+            .unwrap_or(0);
+        let fraction = current_index as f32 / (DSCOPE_VOLTS_PER_DIV_MV.len() - 1) as f32;
+        let center = rect.center();
+        let radius = 22.0;
+        let painter = ui.painter();
+        painter.circle_filled(center, radius, PANEL.gamma_multiply(1.55));
+        painter.circle_stroke(
+            center,
+            radius,
+            Stroke::new(1.2_f32, GRID.gamma_multiply(1.8)),
+        );
+        for tick_index in 0..DSCOPE_VOLTS_PER_DIV_MV.len() {
+            let tick_fraction = tick_index as f32 / (DSCOPE_VOLTS_PER_DIV_MV.len() - 1) as f32;
+            let angle = std::f32::consts::PI * (0.75 + tick_fraction * 1.5);
+            let direction = Vec2::new(angle.cos(), angle.sin());
+            painter.line_segment(
+                [center + direction * 25.0, center + direction * 28.0],
+                Stroke::new(1.0_f32, TEXT_MUTED.gamma_multiply(0.75)),
+            );
+        }
+        let angle = std::f32::consts::PI * (0.75 + fraction * 1.5);
+        let direction = Vec2::new(angle.cos(), angle.sin());
+        painter.line_segment(
+            [center, center + direction * 16.0],
+            Stroke::new(2.8_f32, ACCENT),
+        );
+        painter.circle_filled(center, 2.5, ACCENT);
+
+        ui.vertical(|ui| {
+            ui.label(RichText::new(format_input_scale(*volts_per_div_mv)).strong());
+            ui.small(RichText::new("drag / scroll").color(TEXT_MUTED));
+        });
+    });
+
+    let next = step_scope_input_range(*volts_per_div_mv, steps);
+    let changed = next != *volts_per_div_mv;
+    *volts_per_div_mv = next;
+    changed
+}
+
 fn coupling_label(coupling: DsCopeCoupling) -> &'static str {
     match coupling {
         DsCopeCoupling::Dc => "DC",
@@ -823,26 +935,13 @@ fn paint_scope_channel_settings(
             )
             .on_hover_text("At least one oscilloscope channel must remain enabled");
             ui.add_enabled_ui(capture_settings_enabled && settings.enabled, |ui| {
-                egui::Grid::new(("scope_channel_settings", channel_index))
+                ui.label("Input range");
+                paint_scope_input_range_encoder(ui, channel_index, &mut settings.volts_per_div_mv);
+                ui.add_space(12.0);
+                egui::Grid::new(("scope_channel_secondary_settings", channel_index))
                     .num_columns(2)
                     .spacing([8.0, 5.0])
                     .show(ui, |ui| {
-                        ui.label("Input range");
-                        egui::ComboBox::from_id_salt(("scope_vdiv", channel_index))
-                            .selected_text(format_input_scale(settings.volts_per_div_mv))
-                            .show_ui(ui, |ui| {
-                                for value in DSCOPE_VOLTS_PER_DIV_MV {
-                                    ui.selectable_value(
-                                        &mut settings.volts_per_div_mv,
-                                        value,
-                                        format_input_scale(value),
-                                    );
-                                }
-                            })
-                            .response
-                            .on_hover_text("Configures the DSCope analog front-end range");
-                        ui.end_row();
-
                         ui.label("Coupling");
                         egui::ComboBox::from_id_salt(("scope_coupling", channel_index))
                             .selected_text(coupling_label(settings.coupling))
@@ -1413,17 +1512,27 @@ impl eframe::App for DsViewApp {
         if stop_clicked {
             self.stop_capture();
         }
+        if self
+            .scope_settings
+            .frontend_differs_from(scope_settings_before_ui)
+        {
+            self.scope_configuration_due = Some(Instant::now() + SCOPE_CONFIGURATION_DEBOUNCE);
+            self.status = "Adjusting DSCope input settings…".to_owned();
+        }
         if !refresh_clicked
             && !start_clicked
             && !stop_clicked
+            && !self.is_busy()
             && self
-                .scope_settings
-                .frontend_differs_from(scope_settings_before_ui)
+                .scope_configuration_due
+                .is_some_and(|due| Instant::now() >= due)
         {
             self.begin_scope_configuration();
         }
         if self.pending.is_some() || self.capture.is_some() {
             context.request_repaint_after(Duration::from_millis(16));
+        } else if let Some(due) = self.scope_configuration_due {
+            context.request_repaint_after(due.saturating_duration_since(Instant::now()));
         }
     }
 }
@@ -2631,5 +2740,13 @@ mod tests {
 
         changed.channels[0].volts_per_div_mv = 100;
         assert!(changed.frontend_differs_from(original));
+    }
+
+    #[test]
+    fn scope_input_range_encoder_steps_and_clamps_supported_ranges() {
+        assert_eq!(step_scope_input_range(100, 1), 200);
+        assert_eq!(step_scope_input_range(100, -1), 50);
+        assert_eq!(step_scope_input_range(10, -10), 10);
+        assert_eq!(step_scope_input_range(2_000, 10), 2_000);
     }
 }
