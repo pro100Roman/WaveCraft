@@ -787,13 +787,25 @@ fn default_resource_directory() -> String {
             candidates.push(executable_directory.join("resources/fpga"));
         }
     }
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("resources/fpga"),
+    );
     candidates.push(PathBuf::from("resources/fpga"));
-    candidates
+    let selected = candidates
         .into_iter()
-        .find(|candidate| candidate.is_dir())
-        .unwrap_or_else(|| PathBuf::from("resources/fpga"))
+        .find(|candidate| has_required_fpga_resources(candidate))
+        .unwrap_or_else(|| PathBuf::from("resources/fpga"));
+    selected
+        .canonicalize()
+        .unwrap_or(selected)
         .to_string_lossy()
         .into_owned()
+}
+
+fn has_required_fpga_resources(directory: &Path) -> bool {
+    directory.join("DSLogicU3Pro16.bin").is_file() && directory.join("DSCopeU3P100.bin").is_file()
 }
 
 fn start_gui_recording(path: &Path, devices: &[DeviceDescriptor]) -> Result<FileRecorder, String> {
@@ -1248,5 +1260,11 @@ mod tests {
         let (logic, scope) = combined_pane_heights(310.0, 0.99);
         assert!((logic - 160.0).abs() < f32::EPSILON);
         assert!((scope - 140.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn default_resource_directory_contains_both_bitstreams() {
+        let directory = PathBuf::from(default_resource_directory());
+        assert!(has_required_fpga_resources(&directory));
     }
 }
