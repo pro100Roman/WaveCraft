@@ -24,6 +24,9 @@ const SAMPLE_COUNT: u64 = 1_000_000;
 const LOGIC_CHANNEL_COUNT: usize = 16;
 const MAX_WAVEFORM_SAMPLES: usize = 8_192;
 const TIME_RULER_HEIGHT: f32 = 24.0;
+const SCOPE_HORIZONTAL_DIVISIONS: usize = 10;
+const SCOPE_VERTICAL_DIVISIONS: usize = 8;
+const DEFAULT_SCOPE_VOLTS_PER_DIV: f32 = 1.0;
 const BACKGROUND: Color32 = Color32::from_rgb(12, 17, 25);
 const PANEL: Color32 = Color32::from_rgb(20, 27, 38);
 const GRID: Color32 = Color32::from_rgb(43, 55, 72);
@@ -684,8 +687,11 @@ impl eframe::App for DsViewApp {
                             ui.label("Buffer");
                             ui.monospace("1M samples");
                             ui.end_row();
-                            ui.label("Scope range");
+                            ui.label("Scope input");
                             ui.monospace("1 V/div");
+                            ui.end_row();
+                            ui.label("Scope display");
+                            ui.monospace("Auto");
                             ui.end_row();
                         });
 
@@ -1521,6 +1527,151 @@ fn paint_logic(
     paint_zoom_factor(painter, plot, *viewport);
 }
 
+fn scope_volts_per_div(minimum: f32, maximum: f32) -> f32 {
+    let peak = minimum.abs().max(maximum.abs());
+    if !peak.is_finite() || peak <= f32::EPSILON {
+        return DEFAULT_SCOPE_VOLTS_PER_DIV;
+    }
+    let required = peak / (SCOPE_VERTICAL_DIVISIONS as f32 * 0.5 * 0.9);
+    let decade = 10.0_f32.powf(required.log10().floor());
+    let normalized = required / decade;
+    let step = if normalized <= 1.0 {
+        1.0
+    } else if normalized <= 2.0 {
+        2.0
+    } else if normalized <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    (step * decade).clamp(0.001, 5.0)
+}
+
+fn format_voltage(value: f32) -> String {
+    if value.abs() >= 1.0 {
+        format!("{value:.2} V")
+    } else if value.abs() >= 0.001 {
+        format!("{:.0} mV", value * 1_000.0)
+    } else {
+        format!("{:.0} µV", value * 1_000_000.0)
+    }
+}
+
+fn format_sample_rate(rate_hz: u64) -> String {
+    if rate_hz >= 1_000_000 {
+        format!("{:.2} MSa/s", rate_hz as f64 / 1_000_000.0)
+    } else if rate_hz >= 1_000 {
+        format!("{:.2} kSa/s", rate_hz as f64 / 1_000.0)
+    } else {
+        format!("{rate_hz} Sa/s")
+    }
+}
+
+fn paint_scope_graticule(painter: &egui::Painter, rect: Rect) {
+    for index in 0..=SCOPE_HORIZONTAL_DIVISIONS {
+        let x = egui::lerp(
+            rect.x_range(),
+            index as f32 / SCOPE_HORIZONTAL_DIVISIONS as f32,
+        );
+        let center = index == SCOPE_HORIZONTAL_DIVISIONS / 2;
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(
+                if center { 1.2_f32 } else { 0.8_f32 },
+                if center {
+                    TEXT_MUTED.gamma_multiply(0.45)
+                } else {
+                    GRID.gamma_multiply(0.8)
+                },
+            ),
+        );
+    }
+    for index in 0..=SCOPE_VERTICAL_DIVISIONS {
+        let y = egui::lerp(
+            rect.y_range(),
+            index as f32 / SCOPE_VERTICAL_DIVISIONS as f32,
+        );
+        let center = index == SCOPE_VERTICAL_DIVISIONS / 2;
+        painter.line_segment(
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            Stroke::new(
+                if center { 1.2_f32 } else { 0.8_f32 },
+                if center {
+                    TEXT_MUTED.gamma_multiply(0.45)
+                } else {
+                    GRID.gamma_multiply(0.8)
+                },
+            ),
+        );
+    }
+
+    let center = rect.center();
+    for index in 0..=SCOPE_HORIZONTAL_DIVISIONS * 5 {
+        let x = egui::lerp(
+            rect.x_range(),
+            index as f32 / (SCOPE_HORIZONTAL_DIVISIONS * 5) as f32,
+        );
+        painter.circle_filled(Pos2::new(x, center.y), 0.8, TEXT_MUTED.gamma_multiply(0.65));
+    }
+    for index in 0..=SCOPE_VERTICAL_DIVISIONS * 5 {
+        let y = egui::lerp(
+            rect.y_range(),
+            index as f32 / (SCOPE_VERTICAL_DIVISIONS * 5) as f32,
+        );
+        painter.circle_filled(Pos2::new(center.x, y), 0.8, TEXT_MUTED.gamma_multiply(0.65));
+    }
+}
+
+fn paint_scope_readouts(
+    painter: &egui::Painter,
+    rect: Rect,
+    volts_per_div: f32,
+    visible_samples: usize,
+    sample_rate_hz: u64,
+    channel_count: usize,
+) {
+    let scale = format_voltage(volts_per_div);
+    for (channel, color) in SCOPE_COLORS.iter().enumerate().take(channel_count) {
+        painter.text(
+            rect.left_top() + Vec2::new(8.0, 7.0 + channel as f32 * 14.0),
+            egui::Align2::LEFT_TOP,
+            format!("CH{}  {scale}/div  DC", channel + 1),
+            FontId::monospace(10.0),
+            *color,
+        );
+    }
+
+    let zero_y = rect.center().y;
+    for (channel, color) in SCOPE_COLORS.iter().enumerate() {
+        let x = rect.left() + 2.0 + channel as f32 * 8.0;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(x, zero_y - 4.0),
+                Pos2::new(x + 7.0, zero_y),
+                Pos2::new(x, zero_y + 4.0),
+            ],
+            *color,
+            Stroke::NONE,
+        ));
+    }
+
+    if sample_rate_hz > 0 {
+        let seconds_per_div =
+            visible_samples as f64 / sample_rate_hz as f64 / SCOPE_HORIZONTAL_DIVISIONS as f64;
+        let time_per_div = format_duration(Duration::from_secs_f64(seconds_per_div));
+        painter.text(
+            rect.center_bottom() + Vec2::new(0.0, -6.0),
+            egui::Align2::CENTER_BOTTOM,
+            format!(
+                "AUTO  {time_per_div}/div  ·  {}  ·  {visible_samples} pts",
+                format_sample_rate(sample_rate_hz)
+            ),
+            FontId::monospace(10.0),
+            TEXT_MUTED,
+        );
+    }
+}
+
 fn paint_scope(
     ui: &egui::Ui,
     rect: Rect,
@@ -1530,23 +1681,9 @@ fn paint_scope(
     paint_plot_background(ui, rect);
     let painter = ui.painter();
     let (time_ruler, plot) = split_time_ruler(rect);
-    paint_plot_grid(ui, plot);
+    let scope_painter = painter.with_clip_rect(plot);
+    paint_scope_graticule(&scope_painter, plot);
     update_waveform_viewport(ui, rect, "scope_waveform_zoom", viewport);
-    if waveforms.scope_channels.is_empty()
-        || waveforms.scope_channels.iter().all(VecDeque::is_empty)
-    {
-        paint_empty(painter, plot, "Waiting for oscilloscope samples");
-        paint_waveform_time_scale(
-            painter,
-            time_ruler,
-            0..0,
-            waveforms.scope_rate_hz,
-            waveforms.scope_sample_offset,
-            *viewport,
-        );
-        paint_zoom_factor(painter, plot, *viewport);
-        return;
-    }
 
     let sample_count = waveforms
         .scope_channels
@@ -1554,8 +1691,19 @@ fn paint_scope(
         .map(VecDeque::len)
         .min()
         .unwrap_or(0);
-    if sample_count == 0 {
-        paint_empty(painter, plot, "Waiting for oscilloscope samples");
+    let visible_range = viewport.sample_range(sample_count);
+    let visible_count = visible_range.len();
+    if visible_count == 0 {
+        let idle_range = viewport.sample_range(MAX_WAVEFORM_SAMPLES);
+        paint_scope_readouts(
+            &scope_painter,
+            plot,
+            DEFAULT_SCOPE_VOLTS_PER_DIV,
+            idle_range.len(),
+            SAMPLE_RATE_HZ,
+            SCOPE_COLORS.len(),
+        );
+        paint_empty(&scope_painter, plot, "Waiting for oscilloscope samples");
         paint_waveform_time_scale(
             painter,
             time_ruler,
@@ -1564,11 +1712,10 @@ fn paint_scope(
             waveforms.scope_sample_offset,
             *viewport,
         );
-        paint_zoom_factor(painter, plot, *viewport);
+        paint_zoom_factor(&scope_painter, plot, *viewport);
         return;
     }
-    let visible_range = viewport.sample_range(sample_count);
-    let visible_count = visible_range.len();
+
     let mut minimum = f32::INFINITY;
     let mut maximum = f32::NEG_INFINITY;
     for channel in &waveforms.scope_channels {
@@ -1577,10 +1724,8 @@ fn paint_scope(
             maximum = maximum.max(channel[index]);
         }
     }
-    let padding = ((maximum - minimum) * 0.12).max(0.02);
-    minimum -= padding;
-    maximum += padding;
-    let voltage_span = (maximum - minimum).max(f32::EPSILON);
+    let volts_per_div = scope_volts_per_div(minimum, maximum);
+    let voltage_span = volts_per_div * SCOPE_VERTICAL_DIVISIONS as f32;
     let step = (visible_count as f32 / plot.width().max(1.0))
         .floor()
         .max(1.0) as usize;
@@ -1594,30 +1739,28 @@ fn paint_scope(
                     + index.saturating_sub(visible_range.start) as f32
                         / visible_count.saturating_sub(1).max(1) as f32
                         * plot.width();
-                let y = plot.bottom() - (channel[index] - minimum) / voltage_span * plot.height();
+                let y = plot.center().y - channel[index] / voltage_span * plot.height();
                 Pos2::new(x, y)
             })
             .collect::<Vec<_>>();
         if points.len() > 1 {
             let color = SCOPE_COLORS[channel_index.min(SCOPE_COLORS.len() - 1)];
-            painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, color)));
+            scope_painter.add(egui::Shape::line(
+                points.clone(),
+                Stroke::new(4.0_f32, color.gamma_multiply(0.16)),
+            ));
+            scope_painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, color)));
         }
     }
-    painter.text(
-        plot.left_top() + Vec2::new(6.0, 6.0),
-        egui::Align2::LEFT_TOP,
-        format!("{maximum:.3} V"),
-        FontId::monospace(10.0),
-        TEXT_MUTED,
+
+    paint_scope_readouts(
+        &scope_painter,
+        plot,
+        volts_per_div,
+        visible_count,
+        waveforms.scope_rate_hz,
+        waveforms.scope_channels.len(),
     );
-    painter.text(
-        plot.left_bottom() + Vec2::new(6.0, -6.0),
-        egui::Align2::LEFT_BOTTOM,
-        format!("{minimum:.3} V"),
-        FontId::monospace(10.0),
-        TEXT_MUTED,
-    );
-    paint_time_span(painter, plot, visible_count, waveforms.scope_rate_hz);
     paint_waveform_time_scale(
         painter,
         time_ruler,
@@ -1626,7 +1769,7 @@ fn paint_scope(
         waveforms.scope_sample_offset,
         *viewport,
     );
-    paint_zoom_factor(painter, plot, *viewport);
+    paint_zoom_factor(&scope_painter, plot, *viewport);
 }
 
 fn paint_empty(painter: &egui::Painter, rect: Rect, text: &str) {
@@ -1797,5 +1940,14 @@ mod tests {
         zoomed.zoom(50.0, 0.5);
         let (range, _, _) = time_scale_window(0..0, 0, 0, zoomed);
         assert!(range.len() < MAX_WAVEFORM_SAMPLES);
+    }
+
+    #[test]
+    fn oscilloscope_auto_scale_uses_zero_centered_125_steps() {
+        assert_eq!(scope_volts_per_div(0.0, 0.0), 1.0);
+        assert!((scope_volts_per_div(0.255, 0.340) - 0.1).abs() < f32::EPSILON);
+        assert!((scope_volts_per_div(-1.2, 0.4) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(format_voltage(0.1), "100 mV");
+        assert_eq!(format_sample_rate(1_000_000), "1.00 MSa/s");
     }
 }
