@@ -1,4 +1,4 @@
-# My DSView
+# DSView
 
 A Rust reimplementation of DSView designed to capture from a logic analyzer and an oscilloscope concurrently. The original C/C++ application in `../DSView` is retained as a protocol and behavior reference.
 

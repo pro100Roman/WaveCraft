@@ -1,6 +1,6 @@
 # Capture Architecture
 
-My DSView models every physical instrument as an independent `CaptureSource`.
+DSView models every physical instrument as an independent `CaptureSource`.
 The `CaptureCoordinator` starts one worker per source, synchronizes prepared
 workers immediately before acquisition, and assigns all frames to one monotonic
 process timeline. This removes the original application's global “active

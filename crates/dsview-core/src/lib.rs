@@ -1,4 +1,4 @@
-//! Device-independent capture primitives for My DSView.
+//! Device-independent capture primitives for DSView.
 
 mod model;
 mod session;

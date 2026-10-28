@@ -1,8 +1,8 @@
 # FPGA resources
 
 These FPGA bitstreams are unmodified copies from the GPL-3.0-or-later DSView
-reference checkout at `../DSView/DSView/res`, relative to the My DSView
-repository root. My DSView loads them at runtime when preparing the matching
+reference checkout at `../DSView/DSView/res`, relative to this Rust DSView
+repository root. DSView loads them at runtime when preparing the matching
 instrument; they are not linked into the Rust binaries.
 
 | File | Device | SHA-256 |

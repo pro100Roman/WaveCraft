@@ -34,7 +34,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "My DSView",
+        "DSView",
         options,
         Box::new(|creation_context| Ok(Box::new(DsViewApp::new(creation_context)))),
     )
@@ -330,7 +330,7 @@ impl eframe::App for DsViewApp {
             )
             .show(context, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("MY DSVIEW").strong().size(18.0).color(ACCENT));
+                    ui.label(RichText::new("DSVIEW").strong().size(18.0).color(ACCENT));
                     ui.separator();
                     ui.label(RichText::new("USB capture workbench").color(TEXT_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
