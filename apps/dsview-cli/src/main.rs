@@ -1,8 +1,12 @@
 use dsview_core::{CaptureCoordinator, CaptureEvent, DeviceId};
 use dsview_sim::{SimulatedLogicAnalyzer, SimulatedOscilloscope};
-use dsview_usb::{discover_supported_devices, probe_device, LinkStatus};
+use dsview_usb::{
+    discover_supported_devices, probe_device, DiscoveredDevice, HardwareStatus, LinkStatus,
+    UsbDeviceSession,
+};
 use std::collections::HashMap;
 use std::error::Error;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
@@ -24,17 +28,114 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return probe_devices();
     }
+    if let [command, resource_directory] = arguments.as_slice() {
+        if command == "load-fpga" {
+            return load_fpgas(Path::new(resource_directory));
+        }
+    }
 
     let run_seconds = match arguments.as_slice() {
         [] => 2,
         [seconds] => seconds.parse::<u64>()?,
         [command, seconds] if command == "simulate" => seconds.parse::<u64>()?,
         _ => {
-            return Err("usage: dsview-cli [list | probe | simulate <seconds> | <seconds>]".into())
+            return Err(
+                "usage: dsview-cli [list | probe | load-fpga <resource-directory> | simulate <seconds> | <seconds>]"
+                    .into(),
+            )
         }
     };
 
     run_simulation(run_seconds)
+}
+
+fn load_fpgas(resource_directory: &Path) -> Result<(), Box<dyn Error>> {
+    let report = discover_supported_devices()?;
+    if report.devices.is_empty() {
+        println!("no supported instruments detected");
+        return Ok(());
+    }
+
+    let mut failures = 0_usize;
+    for device in report.devices {
+        let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
+        print!(
+            "{}: {} using {}: ",
+            device.location.stable_id(),
+            device.profile.display_name,
+            bitstream_path.display()
+        );
+        match load_device_fpga(&device, &bitstream_path) {
+            Ok(FpgaLoad::AlreadyConfigured(status)) => {
+                println!("already configured (status 0x{:02x})", status.raw);
+            }
+            Ok(FpgaLoad::Configured { bytes, status }) => {
+                println!(
+                    "configured with {bytes} bytes (status 0x{:02x})",
+                    status.raw
+                );
+            }
+            Err(error) => {
+                failures += 1;
+                eprintln!("failed\n  {error}");
+            }
+        }
+    }
+
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(format!("{failures} FPGA load(s) failed").into())
+    }
+}
+
+enum FpgaLoad {
+    AlreadyConfigured(HardwareStatus),
+    Configured {
+        bytes: usize,
+        status: HardwareStatus,
+    },
+}
+
+fn load_device_fpga(
+    device: &DiscoveredDevice,
+    bitstream_path: &Path,
+) -> Result<FpgaLoad, Box<dyn Error>> {
+    let session = UsbDeviceSession::open(device)?;
+    let load_result = (|| -> Result<FpgaLoad, Box<dyn Error>> {
+        let firmware = session.firmware_version()?;
+        if !firmware.is_compatible() {
+            return Err(format!(
+                "firmware {firmware} is incompatible; major version 2 is required"
+            )
+            .into());
+        }
+        let current_status = session.hardware_status()?;
+        if current_status.fpga_configured {
+            return Ok(FpgaLoad::AlreadyConfigured(current_status));
+        }
+        let bitstream = std::fs::read(bitstream_path).map_err(|error| {
+            format!(
+                "failed to read FPGA bitstream {}: {error}",
+                bitstream_path.display()
+            )
+        })?;
+        let status = session.configure_fpga(&bitstream)?;
+        Ok(FpgaLoad::Configured {
+            bytes: bitstream.len(),
+            status,
+        })
+    })();
+    let release_result = session.close();
+    match (load_result, release_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(Box::new(error)),
+        (Err(load_error), Err(release_error)) => Err(format!(
+            "{load_error}; additionally failed to release the interface: {release_error}"
+        )
+        .into()),
+    }
 }
 
 fn probe_devices() -> Result<(), Box<dyn Error>> {
@@ -75,6 +176,14 @@ fn probe_devices() -> Result<(), Box<dyn Error>> {
                     "  firmware {}, {compatibility}; interface claim and release succeeded",
                     probe.firmware_version
                 );
+                println!(
+                    "  hardware status 0x{:02x}: FPGA {}, initialized {}, GPIF {}, FIFO {}",
+                    probe.hardware_status.raw,
+                    status_word(probe.hardware_status.fpga_configured, "configured"),
+                    yes_no(probe.hardware_status.fpga_initialized),
+                    status_word(probe.hardware_status.gpif_done, "done"),
+                    status_word(probe.hardware_status.fifo_overflow, "overflow")
+                );
             }
             Err(error) => {
                 failures += 1;
@@ -87,6 +196,22 @@ fn probe_devices() -> Result<(), Box<dyn Error>> {
         Ok(())
     } else {
         Err(format!("{failures} device probe(s) failed").into())
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn status_word(value: bool, enabled: &'static str) -> &'static str {
+    if value {
+        enabled
+    } else {
+        "not set"
     }
 }
 

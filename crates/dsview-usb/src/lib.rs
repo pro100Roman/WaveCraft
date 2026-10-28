@@ -8,8 +8,10 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 mod probe;
+mod transport;
 
-pub use probe::{probe_device, DeviceProbe, FirmwareVersion, UsbEndpointInfo};
+pub use probe::{probe_device, DeviceProbe, UsbEndpointInfo};
+pub use transport::{FirmwareVersion, HardwareStatus, UsbDeviceSession};
 
 pub const DREAMSOURCELAB_VENDOR_ID: u16 = 0x2a0e;
 pub const USB_INTERFACE: u8 = 0;
