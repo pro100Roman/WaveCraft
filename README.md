@@ -25,9 +25,16 @@ Install Rust 1.75 or newer, then run:
 ```sh
 cargo run -p dsview-cli -- 2
 cargo run -p dsview-cli -- list
+cargo run -p dsview-cli -- probe
 ```
 
-The optional argument is the capture duration in seconds. Run all checks with:
+`list` performs read-only discovery. `probe` opens each supported instrument,
+validates its interface and bulk endpoints, reads the firmware version, and
+verifies that interface 0 can be claimed and released. It does not upload
+firmware or FPGA data and does not start acquisition.
+
+The optional numeric argument is the simulated capture duration in seconds.
+Run all checks with:
 
 ```sh
 cargo fmt --all --check
