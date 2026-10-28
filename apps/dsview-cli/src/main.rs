@@ -1,8 +1,9 @@
 use dsview_core::{CaptureCoordinator, CaptureEvent, DeviceId};
 use dsview_sim::{SimulatedLogicAnalyzer, SimulatedOscilloscope};
 use dsview_usb::{
-    discover_supported_devices, probe_device, DiscoveredDevice, FirmwareVersion, HardwareStatus,
-    HdlVersion, LinkStatus, UsbDeviceSession,
+    discover_supported_devices, probe_device, DeviceModel, DiscoveredDevice, DsLogicCaptureConfig,
+    DsLogicCaptureSource, FirmwareVersion, HardwareStatus, HdlVersion, LinkStatus,
+    UsbDeviceSession,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -32,7 +33,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         match command.as_str() {
             "load-fpga" => return load_fpgas(Path::new(resource_directory)),
             "prepare" => return prepare_devices(Path::new(resource_directory)),
+            "capture-logic" => {
+                return capture_logic(Path::new(resource_directory), 1);
+            }
             _ => {}
+        }
+    }
+    if let [command, resource_directory, seconds] = arguments.as_slice() {
+        if command == "capture-logic" {
+            return capture_logic(Path::new(resource_directory), seconds.parse()?);
         }
     }
 
@@ -42,13 +51,84 @@ fn main() -> Result<(), Box<dyn Error>> {
         [command, seconds] if command == "simulate" => seconds.parse::<u64>()?,
         _ => {
             return Err(
-                "usage: dsview-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | simulate <seconds> | <seconds>]"
+                "usage: dsview-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] | simulate <seconds> | <seconds>]"
                     .into(),
             )
         }
     };
 
     run_simulation(run_seconds)
+}
+
+fn capture_logic(resource_directory: &Path, seconds: u64) -> Result<(), Box<dyn Error>> {
+    if seconds == 0 {
+        return Err("capture duration must be at least one second".into());
+    }
+    const SAMPLE_RATE_HZ: u64 = 1_000_000;
+    let sample_count = SAMPLE_RATE_HZ
+        .checked_mul(seconds)
+        .ok_or("capture duration is too large")?;
+    let config = DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, sample_count)?;
+    let report = discover_supported_devices()?;
+    let device = report
+        .devices
+        .into_iter()
+        .find(|device| device.profile.model == DeviceModel::DsLogicU3Pro16)
+        .ok_or("no DSLogic U3Pro16 detected")?;
+
+    let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
+    let prepared = prepare_device(&device, &bitstream_path)?;
+    println!(
+        "{} ready: firmware {}, HDL {}; capturing {} samples at {} Hz",
+        device.location.stable_id(),
+        prepared.firmware,
+        prepared.hdl,
+        config.sample_count(),
+        config.sample_rate_hz()
+    );
+
+    let source = DsLogicCaptureSource::new(device, config)?;
+    let session = CaptureCoordinator::start(vec![Box::new(source)])?;
+    let deadline = Instant::now() + Duration::from_secs(seconds.saturating_add(10));
+    let mut stats = DeviceStats::default();
+    let mut stopped = false;
+    while !stopped {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            session.request_stop();
+            session.stop()?;
+            return Err(format!(
+                "logic capture did not finish within {} seconds",
+                seconds + 10
+            )
+            .into());
+        }
+        match session.recv_timeout(remaining.min(Duration::from_millis(250))) {
+            Ok(CaptureEvent::Frame(frame)) => {
+                stats.frames += 1;
+                stats.samples += frame.payload.sample_count() as u64;
+                stats.first_timestamp.get_or_insert(frame.captured_at);
+                stats.last_timestamp = Some(frame.captured_at);
+            }
+            Ok(CaptureEvent::SourceFailed { device_id, error }) => {
+                session.stop()?;
+                return Err(format!("capture source {device_id} failed: {error}").into());
+            }
+            Ok(CaptureEvent::SourceStopped { .. }) => stopped = true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => stopped = true,
+        }
+    }
+    session.stop()?;
+
+    println!(
+        "capture complete: {} frames, {} samples, timeline {:?}..{:?}",
+        stats.frames,
+        stats.samples,
+        stats.first_timestamp.unwrap_or_default(),
+        stats.last_timestamp.unwrap_or_default()
+    );
+    Ok(())
 }
 
 fn load_fpgas(resource_directory: &Path) -> Result<(), Box<dyn Error>> {

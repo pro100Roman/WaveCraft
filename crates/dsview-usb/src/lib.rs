@@ -7,9 +7,11 @@ use dsview_core::InstrumentKind;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+mod dslogic;
 mod probe;
 mod transport;
 
+pub use dslogic::{DsLogicCaptureConfig, DsLogicCaptureSource};
 pub use probe::{probe_device, DeviceProbe, UsbEndpointInfo};
 pub use transport::{
     BulkReadOutcome, FirmwareVersion, HardwareStatus, HdlVersion, UsbDeviceSession,

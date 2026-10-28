@@ -34,9 +34,10 @@ declaring an instrument ready for acquisition.
 
 Bulk-IN reads use short synchronous libusb timeouts so capture workers observe
 cancellation within 50 milliseconds while preserving partial transfers. The
-next driver step is model-specific arm/start/stop commands and buffer decoding.
-DSLogic and DSCope protocol implementations will translate USB buffers into the
-existing core batches. Driver code must not depend on the UI and must stop
-promptly when the capture context is cancelled.
+DSLogic U3Pro16 driver implements finite 16-channel buffered capture, including
+packed FPGA settings, arm/start/stop commands, trigger-header validation, and
+conversion of channel-major 64-sample bitmaps into `LogicBatch` sample words.
+Cancellation forces the FPGA read path ready before stopping it. The next
+hardware step is DSCope acquisition; driver code remains independent of the UI.
 
 The original GPL DSView implementation under `../DSView/libsigrok4DSL/hardware/DSL` is the behavior reference for vendor IDs, firmware loading, command transfers, and bulk endpoint framing.

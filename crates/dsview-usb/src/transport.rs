@@ -1,6 +1,11 @@
 use crate::{profile_for, topology_path, DiscoveredDevice, UsbError, USB_INTERFACE};
-use rusb::{request_type, Device, DeviceHandle, Direction, GlobalContext, Recipient, RequestType};
+use rusb::{
+    request_type, Device, DeviceHandle, Direction, GlobalContext, Recipient, RequestType,
+    UsbContext,
+};
+use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
+use std::ptr::NonNull;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,11 +25,15 @@ const LED_DESTINATION: u8 = 5;
 const INTERRUPT_READY_DESTINATION: u8 = 6;
 const WORD_WIDTH_DESTINATION: u8 = 7;
 const BULK_WRITE_DESTINATION: u8 = 10;
+const CAPTURE_START_DESTINATION: u8 = 8;
+const CAPTURE_STOP_DESTINATION: u8 = 9;
 const I2C_REGISTER_DESTINATION: u8 = 14;
 const I2C_STATUS_DESTINATION: u8 = 15;
 const REQUIRED_FIRMWARE_MAJOR: u8 = 2;
 const REQUIRED_HDL_VERSION: u8 = 0x0e;
 const CONTROL_REGISTER_ZERO: u16 = 0x70;
+const ANALOG_CONTROL_REGISTER: u16 = 0x48;
+const THRESHOLD_REGISTER: u16 = 0x78;
 const HDL_VERSION_OFFSET: usize = 4;
 const MAX_CONTROL_WRITE_DATA: usize = 60;
 const MAX_BITSTREAM_SIZE: usize = 0x00ff_ffff;
@@ -35,11 +44,13 @@ const GPIF_DONE_MASK: u8 = 1 << 7;
 const FPGA_DONE_MASK: u8 = 1 << 6;
 const FPGA_INITIALIZED_MASK: u8 = 1 << 5;
 const FIFO_OVERFLOW_MASK: u8 = 1 << 4;
+const SYSTEM_CLEARED_MASK: u8 = 1 << 3;
 const PROGRAM_HIGH: u8 = 1 << 2;
 const LED_GREEN: u8 = 1;
 const LED_RED: u8 = 1 << 1;
 const INTERRUPT_READY_HIGH: u8 = 1 << 7;
 const WORD_WIDTH_WIDE: u8 = 1;
+const FORCE_READY: u8 = 1 << 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FirmwareVersion {
@@ -81,12 +92,132 @@ pub struct HardwareStatus {
     pub fpga_configured: bool,
     pub fpga_initialized: bool,
     pub fifo_overflow: bool,
+    pub system_cleared: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BulkReadOutcome {
     Data(usize),
     Cancelled,
+}
+
+pub(crate) enum QueuedBulkReadOutcome {
+    Data(Vec<u8>),
+    Cancelled,
+}
+
+struct QueuedBulkReadState {
+    buffer: Vec<u8>,
+    completed: bool,
+    status: i32,
+    actual_length: usize,
+}
+
+pub(crate) struct QueuedBulkRead {
+    device_id: String,
+    transfer: Option<NonNull<rusb::ffi::libusb_transfer>>,
+    state: Box<QueuedBulkReadState>,
+}
+
+extern "system" fn queued_bulk_read_callback(transfer: *mut rusb::ffi::libusb_transfer) {
+    // SAFETY: queue_bulk_read stores a live Box<QueuedBulkReadState> in user_data
+    // and does not move or free it until libusb invokes this callback.
+    unsafe {
+        let state = &mut *((*transfer).user_data as *mut QueuedBulkReadState);
+        state.status = (*transfer).status;
+        state.actual_length = (*transfer).actual_length.max(0) as usize;
+        state.completed = true;
+    }
+}
+
+impl QueuedBulkRead {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.state.completed
+    }
+
+    pub(crate) fn cancel(&mut self) -> Result<(), UsbError> {
+        if self.state.completed {
+            return Ok(());
+        }
+        let transfer = self
+            .transfer
+            .expect("a queued bulk read owns its libusb transfer");
+        // SAFETY: transfer remains allocated until finish or Drop.
+        let result = unsafe { rusb::ffi::libusb_cancel_transfer(transfer.as_ptr()) };
+        if result == rusb::constants::LIBUSB_SUCCESS
+            || result == rusb::constants::LIBUSB_ERROR_NOT_FOUND
+        {
+            Ok(())
+        } else {
+            Err(UsbError::new(format!(
+                "failed to cancel queued capture read for {} (libusb error {result})",
+                self.device_id
+            )))
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<QueuedBulkReadOutcome, UsbError> {
+        if !self.state.completed {
+            return Err(UsbError::new(format!(
+                "queued capture read for {} has not completed",
+                self.device_id
+            )));
+        }
+        let transfer = self
+            .transfer
+            .take()
+            .expect("a queued bulk read owns its libusb transfer");
+        // SAFETY: the transfer completed and no callback can access it again.
+        unsafe { rusb::ffi::libusb_free_transfer(transfer.as_ptr()) };
+
+        match self.state.status {
+            rusb::constants::LIBUSB_TRANSFER_COMPLETED => {
+                if self.state.actual_length > self.state.buffer.len() {
+                    return Err(UsbError::new(format!(
+                        "queued capture read for {} exceeded its {}-byte buffer",
+                        self.device_id,
+                        self.state.buffer.len()
+                    )));
+                }
+                self.state.buffer.truncate(self.state.actual_length);
+                Ok(QueuedBulkReadOutcome::Data(std::mem::take(
+                    &mut self.state.buffer,
+                )))
+            }
+            rusb::constants::LIBUSB_TRANSFER_CANCELLED => Ok(QueuedBulkReadOutcome::Cancelled),
+            status => Err(UsbError::new(format!(
+                "queued capture read for {} failed with libusb transfer status {status}",
+                self.device_id
+            ))),
+        }
+    }
+}
+
+impl Drop for QueuedBulkRead {
+    fn drop(&mut self) {
+        let Some(transfer) = self.transfer.take() else {
+            return;
+        };
+        if self.state.completed {
+            // SAFETY: the completed transfer has no pending callback.
+            unsafe { rusb::ffi::libusb_free_transfer(transfer.as_ptr()) };
+        } else {
+            // A pending libusb callback still references state. Leaking both is
+            // safer than freeing callback-owned memory during error unwinding.
+            self.transfer = Some(transfer);
+            let state = std::mem::replace(
+                &mut self.state,
+                Box::new(QueuedBulkReadState {
+                    buffer: Vec::new(),
+                    completed: true,
+                    status: rusb::constants::LIBUSB_TRANSFER_CANCELLED,
+                    actual_length: 0,
+                }),
+            );
+            let _ = Box::into_raw(state);
+            self.transfer = None;
+        }
+    }
 }
 
 impl HardwareStatus {
@@ -97,6 +228,7 @@ impl HardwareStatus {
             fpga_configured: raw & FPGA_DONE_MASK != 0,
             fpga_initialized: raw & FPGA_INITIALIZED_MASK != 0,
             fifo_overflow: raw & FIFO_OVERFLOW_MASK != 0,
+            system_cleared: raw & SYSTEM_CLEARED_MASK != 0,
         }
     }
 }
@@ -197,6 +329,57 @@ impl UsbDeviceSession {
         .map_err(|error| usb_error(&self.device, "read capture data", error))
     }
 
+    pub(crate) fn queue_bulk_read(&self, size: usize) -> Result<QueuedBulkRead, UsbError> {
+        if size == 0 || size > i32::MAX as usize {
+            return Err(UsbError::new(format!(
+                "invalid queued bulk-read size {size} for {}",
+                self.device.location.stable_id()
+            )));
+        }
+        // SAFETY: libusb allocates an unsubmitted transfer owned by the wrapper below.
+        let transfer = NonNull::new(unsafe { rusb::ffi::libusb_alloc_transfer(0) })
+            .ok_or_else(|| UsbError::new("failed to allocate a libusb capture transfer"))?;
+        let mut state = Box::new(QueuedBulkReadState {
+            buffer: vec![0_u8; size],
+            completed: false,
+            status: rusb::constants::LIBUSB_TRANSFER_ERROR,
+            actual_length: 0,
+        });
+        // SAFETY: state is boxed at a stable address and remains owned by
+        // QueuedBulkRead until the transfer completes and is freed.
+        unsafe {
+            rusb::ffi::libusb_fill_bulk_transfer(
+                transfer.as_ptr(),
+                self.handle.as_raw(),
+                crate::BULK_IN_ENDPOINT,
+                state.buffer.as_mut_ptr(),
+                size as i32,
+                queued_bulk_read_callback,
+                (&mut *state as *mut QueuedBulkReadState).cast::<c_void>(),
+                0,
+            );
+            let result = rusb::ffi::libusb_submit_transfer(transfer.as_ptr());
+            if result != rusb::constants::LIBUSB_SUCCESS {
+                rusb::ffi::libusb_free_transfer(transfer.as_ptr());
+                return Err(UsbError::new(format!(
+                    "failed to submit queued capture read for {} (libusb error {result})",
+                    self.device.location.stable_id()
+                )));
+            }
+        }
+        Ok(QueuedBulkRead {
+            device_id: self.device.location.stable_id(),
+            transfer: Some(transfer),
+            state,
+        })
+    }
+
+    pub(crate) fn handle_usb_events(&self, timeout: Duration) -> Result<(), UsbError> {
+        GlobalContext::default()
+            .handle_events(Some(timeout))
+            .map_err(|error| usb_error(&self.device, "process queued capture transfers", error))
+    }
+
     /// Configure the instrument FPGA with the raw bitstream selected by its
     /// device profile.
     pub fn configure_fpga(&self, bitstream: &[u8]) -> Result<HardwareStatus, UsbError> {
@@ -206,6 +389,79 @@ impl UsbDeviceSession {
             self.recover_after_configuration_failure();
         }
         result
+    }
+
+    pub(crate) fn stop_capture(&self) -> Result<(), UsbError> {
+        self.write_control(CAPTURE_STOP_DESTINATION, 0, &[])
+    }
+
+    pub(crate) fn arm_capture(&self, settings: &[u8]) -> Result<(), UsbError> {
+        if settings.is_empty() || settings.len() % 2 != 0 {
+            return Err(UsbError::new(
+                "capture settings must contain a non-empty number of 16-bit words",
+            ));
+        }
+        let word_count = settings.len() / 2;
+        if word_count > MAX_BITSTREAM_SIZE {
+            return Err(UsbError::new(format!(
+                "capture settings are too large: {word_count} words"
+            )));
+        }
+
+        self.write_control(
+            BULK_WRITE_DESTINATION,
+            0,
+            &[
+                word_count as u8,
+                (word_count >> 8) as u8,
+                (word_count >> 16) as u8,
+            ],
+        )?;
+        self.wait_for_status("capture engine reset", |status| status.system_cleared)?;
+        self.write_bulk_exact(settings, "write capture settings")?;
+        self.write_control(INTERRUPT_READY_DESTINATION, 0, &[INTERRUPT_READY_HIGH])?;
+        self.wait_for_status("capture settings transfer", |status| status.gpif_done)?;
+        Ok(())
+    }
+
+    pub(crate) fn start_capture(&self) -> Result<(), UsbError> {
+        self.write_control(CAPTURE_START_DESTINATION, 0, &[])
+    }
+
+    pub(crate) fn force_capture_ready(&self) -> Result<(), UsbError> {
+        self.write_control(
+            I2C_REGISTER_DESTINATION,
+            CONTROL_REGISTER_ZERO,
+            &[FORCE_READY],
+        )
+    }
+
+    pub(crate) fn capture_progress(&self) -> Result<u32, UsbError> {
+        let mut progress = [0_u8; 4];
+        self.read_control(I2C_STATUS_DESTINATION, 0, &mut progress)?;
+        Ok(u32::from_le_bytes(progress))
+    }
+
+    pub(crate) fn initialize_dslogic_frontend(&self) -> Result<(), UsbError> {
+        // Match DSLogic's device-open path for the U3Pro16: a 1.0 V input
+        // threshold followed by the ADF4360 500 MHz clock configuration.
+        self.write_control(I2C_REGISTER_DESTINATION, THRESHOLD_REGISTER, &[0x2e])?;
+        self.write_control(
+            I2C_REGISTER_DESTINATION,
+            ANALOG_CONTROL_REGISTER + 2,
+            &[0x01],
+        )?;
+        for value in [0x01, 0x61, 0x00, 0x30] {
+            self.write_control(I2C_REGISTER_DESTINATION, ANALOG_CONTROL_REGISTER, &[value])?;
+        }
+        for value in [0x01, 0x40, 0xf1, 0x46] {
+            self.write_control(I2C_REGISTER_DESTINATION, ANALOG_CONTROL_REGISTER, &[value])?;
+        }
+        thread::sleep(Duration::from_millis(10));
+        for value in [0x01, 0x62, 0x3d, 0x40] {
+            self.write_control(I2C_REGISTER_DESTINATION, ANALOG_CONTROL_REGISTER, &[value])?;
+        }
+        Ok(())
     }
 
     pub fn close(mut self) -> Result<(), UsbError> {
@@ -271,17 +527,7 @@ impl UsbDeviceSession {
             &[size as u8, (size >> 8) as u8, (size >> 16) as u8],
         )?;
 
-        let written = self
-            .handle
-            .write_bulk(crate::BULK_OUT_ENDPOINT, bitstream, BULK_TIMEOUT)
-            .map_err(|error| usb_error(&self.device, "write the FPGA bitstream", error))?;
-        if written != bitstream.len() {
-            return Err(UsbError::new(format!(
-                "short FPGA bitstream write for {}: sent {written} of {} bytes",
-                self.device.location.stable_id(),
-                bitstream.len()
-            )));
-        }
+        self.write_bulk_exact(bitstream, "write the FPGA bitstream")?;
 
         self.write_control(INTERRUPT_READY_DESTINATION, 0, &[INTERRUPT_READY_HIGH])?;
         self.wait_for_status("FPGA bulk transfer", |status| status.gpif_done)?;
@@ -313,6 +559,21 @@ impl UsbDeviceSession {
                 "short control write for {}: sent {written} of {} bytes",
                 self.device.location.stable_id(),
                 command.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn write_bulk_exact(&self, data: &[u8], action: &str) -> Result<(), UsbError> {
+        let written = self
+            .handle
+            .write_bulk(crate::BULK_OUT_ENDPOINT, data, BULK_TIMEOUT)
+            .map_err(|error| usb_error(&self.device, action, error))?;
+        if written != data.len() {
+            return Err(UsbError::new(format!(
+                "short bulk write for {}: sent {written} of {} bytes while trying to {action}",
+                self.device.location.stable_id(),
+                data.len()
             )));
         }
         Ok(())
@@ -450,6 +711,9 @@ fn usb_error(discovered: &DiscoveredDevice, action: &str, error: rusb::Error) ->
         rusb::Error::Timeout => "the device did not respond before the timeout",
         rusb::Error::Overflow => "the USB transfer exceeded the supplied buffer",
         rusb::Error::Pipe => "the USB endpoint stalled",
+        rusb::Error::Other => {
+            "the operating system rejected the operation; close other instrument software or reconnect the device"
+        }
         _ => "USB communication failed",
     };
     UsbError::new(format!(
@@ -472,13 +736,18 @@ mod tests {
     #[test]
     fn decodes_hardware_status_bits() {
         let status = HardwareStatus::from_raw(
-            GPIF_DONE_MASK | FPGA_DONE_MASK | FPGA_INITIALIZED_MASK | FIFO_OVERFLOW_MASK,
+            GPIF_DONE_MASK
+                | FPGA_DONE_MASK
+                | FPGA_INITIALIZED_MASK
+                | FIFO_OVERFLOW_MASK
+                | SYSTEM_CLEARED_MASK,
         );
 
         assert!(status.gpif_done);
         assert!(status.fpga_configured);
         assert!(status.fpga_initialized);
         assert!(status.fifo_overflow);
+        assert!(status.system_cleared);
     }
 
     #[test]
@@ -489,6 +758,7 @@ mod tests {
         assert!(!status.fpga_configured);
         assert!(!status.fpga_initialized);
         assert!(!status.fifo_overflow);
+        assert!(!status.system_cleared);
     }
 
     #[test]
