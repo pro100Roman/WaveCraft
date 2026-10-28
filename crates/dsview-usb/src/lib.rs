@@ -9,11 +9,13 @@ use std::fmt::{Display, Formatter};
 
 mod dscope;
 mod dslogic;
+mod prepare;
 mod probe;
 mod transport;
 
 pub use dscope::{DsCopeCaptureConfig, DsCopeCaptureSource};
 pub use dslogic::{DsLogicCaptureConfig, DsLogicCaptureSource};
+pub use prepare::{load_device_fpga, prepare_device, FpgaLoad, PreparedDevice};
 pub use probe::{probe_device, DeviceProbe, UsbEndpointInfo};
 pub use transport::{
     BulkReadOutcome, FirmwareVersion, HardwareStatus, HdlVersion, UsbDeviceSession,

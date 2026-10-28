@@ -13,10 +13,11 @@ The repository contains the first vertical slice of the new capture engine:
 - simulated instruments and a CLI demonstrating simultaneous capture;
 - finite buffered capture from DSLogic U3Pro16 at supported 16-channel rates;
 - finite two-channel capture from DSCope U3P100 at 1 MHz;
-- concurrent physical capture from one DSLogic and one DSCope on a shared timeline.
+- concurrent physical capture from one DSLogic and one DSCope on a shared timeline;
+- a native desktop capture workbench with device selection and waveform views.
 
-Broader DSCope ranges and sample rates and the graphical interface are the next
-milestones.
+Broader DSCope ranges and sample rates, interactive timeline navigation,
+recording, and protocol decoders are the next milestones.
 
 Initial USB discovery supports DSLogic U3Pro16 (`2a0e:002a`) and DSCope U3P100 (`2a0e:002b`) at HighSpeed or SuperSpeed. Discovery is read-only; explicit preparation and capture commands perform the state-changing operations.
 
@@ -30,7 +31,7 @@ simulators.
 
 ## Run the simulator
 
-Install Rust 1.75 or newer, then run:
+Install Rust 1.76 or newer, then run:
 
 ```sh
 cargo run -p dsview-cli -- 2
@@ -84,6 +85,26 @@ and the observed software start skew. This skew is not a hardware
 synchronization guarantee; an external trigger or clock is still needed for
 exact sample alignment.
 
+## Run the desktop application
+
+Launch the native capture workbench with:
+
+```sh
+cargo run -p dsview-gui
+```
+
+The application discovers supported USB instruments without blocking the UI,
+lets you select any detected devices and edit the FPGA resource directory, then
+prepares and captures from the selected sources concurrently. It displays all
+16 digital channels, both calibrated scope channels, per-device sample totals,
+errors, and shared-timeline start skew. Waveform buffers retain the newest 8,192
+samples so rendering remains bounded.
+
+The GUI uses native window backends on macOS and Windows and enables both
+Wayland and X11 on Linux. Vendored libusb keeps the USB transport consistent
+across the three platforms. CI builds and tests the workspace on macOS, Ubuntu,
+and Windows, with a separate Rust 1.76 compatibility check.
+
 The USB transport also provides cancellable bulk-IN reads. It polls with a
 50 ms timeout, preserves partial transfers reported by libusb, retries timeout
 and interrupted operations, and distinguishes cancellation from USB failures.
@@ -108,6 +129,7 @@ cargo test --workspace
 - `crates/dsview-sim`: deterministic simulated logic and scope sources.
 - `crates/dsview-usb`: USB discovery, claimed sessions, control transport, FPGA loading, and DSLogic/DSCope capture.
 - `apps/dsview-cli`: simultaneous-capture development harness.
+- `apps/dsview-gui`: native device selection, capture controls, status, and waveform rendering.
 - `docs/architecture.md`: design constraints and planned hardware integration.
 
 The project is licensed under GPL-3.0-or-later to remain compatible with the original DSView codebase.

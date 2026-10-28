@@ -16,6 +16,12 @@ DSCope worker  ── scope batches ──┘
 
 Each frame contains a device ID, monotonically increasing sequence number, capture timestamp, sample rate, and typed payload. Digital samples are bit-packed into `u32`; scope samples are channel-major `f32` voltages.
 
+The native `dsview-gui` application consumes the same `CaptureSession` event
+stream as the CLI. USB discovery and device preparation run on background
+threads, while the UI polls typed capture events without blocking the window
+loop. It keeps bounded display buffers and paints digital and scope traces
+without introducing UI dependencies into the core or hardware crates.
+
 ## Synchronization
 
 Capture workers first pass a launch barrier, then initialize and arm their

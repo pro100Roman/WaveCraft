@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  msrv:
+    name: Rust 1.76
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.76.0
+
+      - name: Install Linux window-system dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libwayland-dev libxkbcommon-dev libxcb-render0-dev
+          libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev
+
+      - run: cargo check --workspace --locked
+
+  workspace:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install Linux window-system dependencies
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libwayland-dev libxkbcommon-dev libxcb-render0-dev
+          libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build --workspace --release

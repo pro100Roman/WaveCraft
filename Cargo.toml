@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/dsview-cli",
+    "apps/dsview-gui",
     "crates/dsview-core",
     "crates/dsview-sim",
     "crates/dsview-usb",
@@ -10,7 +11,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "GPL-3.0-or-later"
-rust-version = "1.75"
+rust-version = "1.76"
 
 [profile.release]
 debug = 1
