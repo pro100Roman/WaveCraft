@@ -1,12 +1,18 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use dsview_core::{
-    CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSession, CaptureSource, DeviceId,
+    CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSession, CaptureSource,
+    DeviceDescriptor, DeviceId,
 };
+use dsview_recording::{CompletionStatus, RecordingWriter};
 use dsview_usb::{
     discover_supported_devices, prepare_device, DeviceModel, DiscoveredDevice, DsCopeCaptureConfig,
     DsCopeCaptureSource, DsLogicCaptureConfig, DsLogicCaptureSource, LinkStatus,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -96,12 +102,17 @@ struct ActiveCapture {
     stats: HashMap<DeviceId, DeviceStats>,
     stopped: HashSet<DeviceId>,
     waveforms: WaveformStore,
+    recorder: Option<FileRecorder>,
+    recording_path: Option<String>,
 }
 
 struct CompletedCapture {
     stats: HashMap<DeviceId, DeviceStats>,
     waveforms: WaveformStore,
+    recording_path: Option<String>,
 }
+
+type FileRecorder = RecordingWriter<BufWriter<File>>;
 
 enum WorkerSuccess {
     Devices(Vec<DiscoveredDevice>),
@@ -112,6 +123,8 @@ type WorkerResult = Result<WorkerSuccess, String>;
 
 struct DsViewApp {
     resource_directory: String,
+    record_capture: bool,
+    recording_path: String,
     devices: Vec<DeviceEntry>,
     pending: Option<Receiver<WorkerResult>>,
     capture: Option<ActiveCapture>,
@@ -124,7 +137,9 @@ impl DsViewApp {
     fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         configure_style(&creation_context.egui_ctx);
         let mut app = Self {
-            resource_directory: "resources/fpga".to_owned(),
+            resource_directory: default_resource_directory(),
+            record_capture: false,
+            recording_path: "capture.dsv".to_owned(),
             devices: Vec::new(),
             pending: None,
             capture: None,
@@ -167,6 +182,10 @@ impl DsViewApp {
             self.last_error = Some("Select at least one supported instrument".to_owned());
             return;
         }
+        if self.record_capture && self.recording_path.trim().is_empty() {
+            self.last_error = Some("Enter a recording file path".to_owned());
+            return;
+        }
 
         let resource_directory = PathBuf::from(self.resource_directory.trim());
         let (sender, receiver) = mpsc::channel();
@@ -181,18 +200,29 @@ impl DsViewApp {
     }
 
     fn stop_capture(&mut self) {
-        let Some(active) = self.capture.take() else {
+        let Some(mut active) = self.capture.take() else {
             return;
         };
         self.status = "Stopping capture…".to_owned();
         let stop_result = active.session.stop();
+        let completion = if stop_result.is_ok() {
+            CompletionStatus::Cancelled
+        } else {
+            CompletionStatus::Failed
+        };
+        let recording_result = finish_gui_recording(&mut active.recorder, completion);
         self.completed_capture = Some(CompletedCapture {
             stats: active.stats,
             waveforms: active.waveforms,
+            recording_path: active.recording_path,
         });
-        match stop_result {
-            Ok(()) => self.status = "Capture stopped".to_owned(),
-            Err(error) => self.set_error(error.to_string()),
+        match (stop_result, recording_result) {
+            (Ok(()), Ok(())) => self.status = "Capture stopped".to_owned(),
+            (Err(error), Ok(())) => self.set_error(error.to_string()),
+            (Ok(()), Err(error)) => self.set_error(error),
+            (Err(stop_error), Err(recording_error)) => self.set_error(format!(
+                "{stop_error}; additionally failed to finish recording: {recording_error}"
+            )),
         }
     }
 
@@ -236,69 +266,133 @@ impl DsViewApp {
             }
             Ok(WorkerSuccess::Capture(session)) => {
                 let count = session.descriptors().len();
+                let recording_path = self
+                    .record_capture
+                    .then(|| self.recording_path.trim().to_owned());
+                let recorder = match recording_path.as_deref() {
+                    Some(path) => match start_gui_recording(Path::new(path), session.descriptors())
+                    {
+                        Ok(recorder) => Some(recorder),
+                        Err(error) => {
+                            let cleanup = session.stop().err();
+                            self.set_error(match cleanup {
+                                Some(cleanup) => {
+                                    format!("{error}; additionally failed to stop: {cleanup}")
+                                }
+                                None => error,
+                            });
+                            return;
+                        }
+                    },
+                    None => None,
+                };
                 self.capture = Some(ActiveCapture {
                     session,
                     stats: HashMap::new(),
                     stopped: HashSet::new(),
                     waveforms: WaveformStore::default(),
+                    recorder,
+                    recording_path: recording_path.clone(),
                 });
-                self.status = format!("Capturing from {count} instrument(s) at 1 MHz");
+                self.status = match recording_path {
+                    Some(path) => {
+                        format!("Capturing {count} instrument(s) to {path}")
+                    }
+                    None => format!("Capturing from {count} instrument(s) at 1 MHz"),
+                };
             }
             Err(error) => self.set_error(error),
         }
     }
 
     fn poll_capture(&mut self) {
-        let mut finish_status = None;
+        let mut finish_status = None::<(Result<String, String>, CompletionStatus)>;
         if let Some(active) = self.capture.as_mut() {
             loop {
                 match active.session.try_recv() {
-                    Ok(CaptureEvent::Frame(frame)) => {
-                        let entry = active.stats.entry(frame.device_id).or_default();
-                        entry.frames += 1;
-                        entry.samples += frame.payload.sample_count() as u64;
-                        entry.first_timestamp.get_or_insert(frame.captured_at);
-                        entry.last_timestamp = Some(frame.captured_at);
-                        active.waveforms.ingest(&frame.payload);
-                    }
-                    Ok(CaptureEvent::SourceFailed { device_id, error }) => {
-                        active.session.request_stop();
-                        finish_status = Some(Err(format!("{device_id}: {error}")));
-                        break;
-                    }
-                    Ok(CaptureEvent::SourceStopped { device_id }) => {
-                        active.stopped.insert(device_id);
-                        if active.stopped.len() == active.session.descriptors().len() {
-                            finish_status = Some(Ok("Capture complete".to_owned()));
-                            break;
+                    Ok(event) => {
+                        if let Some(recorder) = active.recorder.as_mut() {
+                            if let Err(error) = recorder.write_event(&event) {
+                                active.session.request_stop();
+                                finish_status = Some((
+                                    Err(format!("failed to write recording: {error}")),
+                                    CompletionStatus::Failed,
+                                ));
+                                break;
+                            }
+                        }
+                        match event {
+                            CaptureEvent::Frame(frame) => {
+                                let entry = active.stats.entry(frame.device_id).or_default();
+                                entry.frames += 1;
+                                entry.samples += frame.payload.sample_count() as u64;
+                                entry.first_timestamp.get_or_insert(frame.captured_at);
+                                entry.last_timestamp = Some(frame.captured_at);
+                                active.waveforms.ingest(&frame.payload);
+                            }
+                            CaptureEvent::SourceFailed { device_id, error } => {
+                                active.session.request_stop();
+                                finish_status = Some((
+                                    Err(format!("{device_id}: {error}")),
+                                    CompletionStatus::Failed,
+                                ));
+                                break;
+                            }
+                            CaptureEvent::SourceStopped { device_id } => {
+                                active.stopped.insert(device_id);
+                                if active.stopped.len() == active.session.descriptors().len() {
+                                    finish_status = Some((
+                                        Ok("Capture complete".to_owned()),
+                                        CompletionStatus::Complete,
+                                    ));
+                                    break;
+                                }
+                            }
                         }
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        finish_status = Some(Err("capture event stream disconnected".to_owned()));
+                        finish_status = Some((
+                            Err("capture event stream disconnected".to_owned()),
+                            CompletionStatus::Failed,
+                        ));
                         break;
                     }
                 }
             }
         }
 
-        if let Some(result) = finish_status {
-            if let Some(active) = self.capture.take() {
+        if let Some((result, completion)) = finish_status {
+            if let Some(mut active) = self.capture.take() {
                 let stop_result = active.session.stop();
-                match (result, stop_result) {
-                    (Ok(status), Ok(())) => self.status = status,
-                    (Err(error), Ok(())) => self.set_error(error),
-                    (Ok(_), Err(error)) => self.set_error(error.to_string()),
-                    (Err(primary), Err(cleanup)) => {
-                        self.set_error(format!(
-                            "{primary}; additionally failed to stop: {cleanup}"
-                        ));
-                    }
+                let recording_completion = if stop_result.is_ok() {
+                    completion
+                } else {
+                    CompletionStatus::Failed
+                };
+                let recording_result =
+                    finish_gui_recording(&mut active.recorder, recording_completion);
+                let mut error = result.as_ref().err().cloned();
+                if let Err(stop_error) = stop_result {
+                    append_error(&mut error, format!("failed to stop capture: {stop_error}"));
+                }
+                if let Err(recording_error) = recording_result {
+                    append_error(
+                        &mut error,
+                        format!("failed to finish recording: {recording_error}"),
+                    );
                 }
                 self.completed_capture = Some(CompletedCapture {
                     stats: active.stats,
                     waveforms: active.waveforms,
+                    recording_path: active.recording_path,
                 });
+                match error {
+                    Some(error) => self.set_error(error),
+                    None => {
+                        self.status = result.ok().unwrap_or_else(|| "Capture complete".to_owned());
+                    }
+                }
             }
         }
     }
@@ -360,90 +454,134 @@ impl eframe::App for DsViewApp {
                     .inner_margin(egui::Margin::same(14.0)),
             )
             .show(context, |ui| {
-                ui.label(
-                    RichText::new("CAPTURE RESOURCES")
-                        .strong()
-                        .color(TEXT_MUTED),
-                );
-                ui.add_space(8.0);
-                ui.label("FPGA resource directory");
-                ui.add_enabled(
-                    !self.is_busy(),
-                    egui::TextEdit::singleline(&mut self.resource_directory)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.small(
-                    RichText::new("Contains DSLogicU3Pro16.bin and DSCopeU3P100.bin")
-                        .color(TEXT_MUTED),
-                );
-                ui.add_space(18.0);
-                ui.label(RichText::new("INSTRUMENTS").strong().color(TEXT_MUTED));
-                ui.add_space(6.0);
-
-                if self.devices.is_empty() {
-                    ui.label(RichText::new("No supported devices").color(TEXT_MUTED));
-                }
-                for entry in &mut self.devices {
-                    ui.add_space(4.0);
-                    egui::Frame::none()
-                        .fill(BACKGROUND)
-                        .rounding(egui::Rounding::same(6.0))
-                        .inner_margin(egui::Margin::same(10.0))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.add_enabled(
-                                    self.capture.is_none() && self.pending.is_none(),
-                                    egui::Checkbox::new(
-                                        &mut entry.selected,
-                                        RichText::new(entry.device.profile.display_name).strong(),
-                                    ),
-                                );
-                            });
-                            ui.small(
-                                RichText::new(entry.device.location.stable_id()).color(TEXT_MUTED),
-                            );
-                            let (link_text, link_color) = match entry.device.link_status() {
-                                LinkStatus::Optimal => ("USB 3 · optimal", ACCENT),
-                                LinkStatus::ReducedPerformance => {
-                                    ("USB 2 · reduced performance", SCOPE_COLORS[0])
-                                }
-                                LinkStatus::Unsupported => {
-                                    ("Unsupported link speed", Color32::LIGHT_RED)
-                                }
-                            };
-                            ui.small(RichText::new(link_text).color(link_color));
-                        });
-                }
-
-                ui.add_space(18.0);
-                ui.label(RichText::new("CAPTURE MODE").strong().color(TEXT_MUTED));
-                ui.add_space(6.0);
-                egui::Grid::new("capture_config")
-                    .num_columns(2)
-                    .spacing([12.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("Sample rate");
-                        ui.monospace("1 MHz");
-                        ui.end_row();
-                        ui.label("Buffer");
-                        ui.monospace("1M samples");
-                        ui.end_row();
-                        ui.label("Scope range");
-                        ui.monospace("1 V/div");
-                        ui.end_row();
-                    });
-
-                if let Some(active) = &self.capture {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.label(
+                        RichText::new("CAPTURE RESOURCES")
+                            .strong()
+                            .color(TEXT_MUTED),
+                    );
+                    ui.add_space(8.0);
+                    ui.label("FPGA resource directory");
+                    ui.add_enabled(
+                        !self.is_busy(),
+                        egui::TextEdit::singleline(&mut self.resource_directory)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.small(
+                        RichText::new("Contains DSLogicU3Pro16.bin and DSCopeU3P100.bin")
+                            .color(TEXT_MUTED),
+                    );
+                    ui.add_space(14.0);
+                    ui.add_enabled(
+                        !self.is_busy(),
+                        egui::Checkbox::new(&mut self.record_capture, "Record complete capture"),
+                    );
+                    if self.record_capture {
+                        ui.label("Recording file");
+                        ui.add_enabled(
+                            !self.is_busy(),
+                            egui::TextEdit::singleline(&mut self.recording_path)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.small(
+                            RichText::new("Lossless .dsv file; existing files are not overwritten")
+                                .color(TEXT_MUTED),
+                        );
+                    }
                     ui.add_space(18.0);
-                    ui.label(RichText::new("SESSION").strong().color(TEXT_MUTED));
+                    ui.label(RichText::new("INSTRUMENTS").strong().color(TEXT_MUTED));
                     ui.add_space(6.0);
-                    for descriptor in active.session.descriptors() {
-                        let stats = active.stats.get(&descriptor.id);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("●").color(ACCENT));
-                            ui.label(&descriptor.name);
+
+                    if self.devices.is_empty() {
+                        ui.label(RichText::new("No supported devices").color(TEXT_MUTED));
+                    }
+                    for entry in &mut self.devices {
+                        ui.add_space(4.0);
+                        egui::Frame::none()
+                            .fill(BACKGROUND)
+                            .rounding(egui::Rounding::same(6.0))
+                            .inner_margin(egui::Margin::same(10.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add_enabled(
+                                        self.capture.is_none() && self.pending.is_none(),
+                                        egui::Checkbox::new(
+                                            &mut entry.selected,
+                                            RichText::new(entry.device.profile.display_name)
+                                                .strong(),
+                                        ),
+                                    );
+                                });
+                                ui.small(
+                                    RichText::new(entry.device.location.stable_id())
+                                        .color(TEXT_MUTED),
+                                );
+                                let (link_text, link_color) = match entry.device.link_status() {
+                                    LinkStatus::Optimal => ("USB 3 · optimal", ACCENT),
+                                    LinkStatus::ReducedPerformance => {
+                                        ("USB 2 · reduced performance", SCOPE_COLORS[0])
+                                    }
+                                    LinkStatus::Unsupported => {
+                                        ("Unsupported link speed", Color32::LIGHT_RED)
+                                    }
+                                };
+                                ui.small(RichText::new(link_text).color(link_color));
+                            });
+                    }
+
+                    ui.add_space(18.0);
+                    ui.label(RichText::new("CAPTURE MODE").strong().color(TEXT_MUTED));
+                    ui.add_space(6.0);
+                    egui::Grid::new("capture_config")
+                        .num_columns(2)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Sample rate");
+                            ui.monospace("1 MHz");
+                            ui.end_row();
+                            ui.label("Buffer");
+                            ui.monospace("1M samples");
+                            ui.end_row();
+                            ui.label("Scope range");
+                            ui.monospace("1 V/div");
+                            ui.end_row();
                         });
-                        if let Some(stats) = stats {
+
+                    if let Some(active) = &self.capture {
+                        ui.add_space(18.0);
+                        ui.label(RichText::new("SESSION").strong().color(TEXT_MUTED));
+                        ui.add_space(6.0);
+                        for descriptor in active.session.descriptors() {
+                            let stats = active.stats.get(&descriptor.id);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("●").color(ACCENT));
+                                ui.label(&descriptor.name);
+                            });
+                            if let Some(stats) = stats {
+                                ui.small(
+                                    RichText::new(format!(
+                                        "{} frames · {} samples",
+                                        stats.frames, stats.samples
+                                    ))
+                                    .color(TEXT_MUTED),
+                                );
+                            }
+                        }
+                        if let Some(skew) = capture_start_skew(&active.stats) {
+                            ui.add_space(6.0);
+                            ui.label(format!("Start skew: {skew:?}"));
+                        }
+                    } else if let Some(completed) = &self.completed_capture {
+                        ui.add_space(18.0);
+                        ui.label(RichText::new("LAST CAPTURE").strong().color(TEXT_MUTED));
+                        if let Some(path) = &completed.recording_path {
+                            ui.small(
+                                RichText::new(format!("Recording file: {path}")).color(ACCENT),
+                            );
+                        }
+                        for (device_id, stats) in &completed.stats {
+                            ui.add_space(4.0);
+                            ui.label(device_id.to_string());
                             ui.small(
                                 RichText::new(format!(
                                     "{} frames · {} samples",
@@ -452,30 +590,12 @@ impl eframe::App for DsViewApp {
                                 .color(TEXT_MUTED),
                             );
                         }
+                        if let Some(skew) = capture_start_skew(&completed.stats) {
+                            ui.add_space(6.0);
+                            ui.label(format!("Start skew: {skew:?}"));
+                        }
                     }
-                    if let Some(skew) = capture_start_skew(&active.stats) {
-                        ui.add_space(6.0);
-                        ui.label(format!("Start skew: {skew:?}"));
-                    }
-                } else if let Some(completed) = &self.completed_capture {
-                    ui.add_space(18.0);
-                    ui.label(RichText::new("LAST CAPTURE").strong().color(TEXT_MUTED));
-                    for (device_id, stats) in &completed.stats {
-                        ui.add_space(4.0);
-                        ui.label(device_id.to_string());
-                        ui.small(
-                            RichText::new(format!(
-                                "{} frames · {} samples",
-                                stats.frames, stats.samples
-                            ))
-                            .color(TEXT_MUTED),
-                        );
-                    }
-                    if let Some(skew) = capture_start_skew(&completed.stats) {
-                        ui.add_space(6.0);
-                        ui.label(format!("Start skew: {skew:?}"));
-                    }
-                }
+                });
             });
 
         egui::TopBottomPanel::bottom("status")
@@ -551,6 +671,77 @@ impl eframe::App for DsViewApp {
         if self.pending.is_some() || self.capture.is_some() {
             context.request_repaint_after(Duration::from_millis(16));
         }
+    }
+}
+
+fn default_resource_directory() -> String {
+    let mut candidates = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(executable_directory) = executable.parent() {
+            #[cfg(target_os = "macos")]
+            if executable_directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("MacOS")
+            {
+                if let Some(contents_directory) = executable_directory.parent() {
+                    candidates.push(contents_directory.join("Resources/fpga"));
+                }
+            }
+            candidates.push(executable_directory.join("resources/fpga"));
+        }
+    }
+    candidates.push(PathBuf::from("resources/fpga"));
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_dir())
+        .unwrap_or_else(|| PathBuf::from("resources/fpga"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn start_gui_recording(path: &Path, devices: &[DeviceDescriptor]) -> Result<FileRecorder, String> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "failed to create recording {} without overwriting an existing file: {error}",
+                path.display()
+            )
+        })?;
+    let mut metadata = BTreeMap::new();
+    metadata.insert("capture.command".to_owned(), "gui".to_owned());
+    metadata.insert(
+        "capture.sample_rate_hz".to_owned(),
+        SAMPLE_RATE_HZ.to_string(),
+    );
+    metadata.insert(
+        "capture.requested_sample_count".to_owned(),
+        SAMPLE_COUNT.to_string(),
+    );
+    metadata.insert("scope.volts_per_div".to_owned(), "1".to_owned());
+    RecordingWriter::new(BufWriter::new(file), devices, metadata).map_err(|error| error.to_string())
+}
+
+fn finish_gui_recording(
+    recorder: &mut Option<FileRecorder>,
+    status: CompletionStatus,
+) -> Result<(), String> {
+    if let Some(recorder) = recorder {
+        recorder.finish(status).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn append_error(error: &mut Option<String>, additional: String) {
+    match error {
+        Some(error) => {
+            error.push_str("; ");
+            error.push_str(&additional);
+        }
+        None => *error = Some(additional),
     }
 }
 

@@ -476,6 +476,7 @@ name = "dsview-cli"
 version = "0.1.0"
 dependencies = [
  "dsview-core",
+ "dsview-recording",
  "dsview-sim",
  "dsview-usb",
 ]
@@ -489,8 +490,17 @@ name = "dsview-gui"
 version = "0.1.0"
 dependencies = [
  "dsview-core",
+ "dsview-recording",
  "dsview-usb",
  "eframe",
+]
+
+[[package]]
+name = "dsview-recording"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "dsview-core",
 ]
 
 [[package]]

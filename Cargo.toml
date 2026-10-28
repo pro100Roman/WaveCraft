@@ -3,6 +3,7 @@ members = [
     "apps/dsview-cli",
     "apps/dsview-gui",
     "crates/dsview-core",
+    "crates/dsview-recording",
     "crates/dsview-sim",
     "crates/dsview-usb",
 ]

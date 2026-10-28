@@ -14,11 +14,11 @@ The repository contains the first vertical slice of the new capture engine:
 - finite buffered capture from DSLogic U3Pro16 at supported 16-channel rates;
 - finite two-channel capture from DSCope U3P100 at 1 MHz;
 - concurrent physical capture from one DSLogic and one DSCope on a shared timeline;
-- a native desktop capture workbench with device selection and waveform views.
+- a native desktop capture workbench with device selection and waveform views;
+- versioned, lossless full-capture recording from the GUI and CLI.
 
 Broader DSCope ranges and sample rates, interactive timeline navigation,
-recording, protocol decoders, and automation interfaces are the next
-milestones.
+protocol decoders, and structured automation interfaces are the next milestones.
 
 The required end state includes a cross-platform decoder plugin system. SPI
 and I2C will be first-party decoders, while third-party decoders run through a
@@ -58,6 +58,9 @@ cargo run -p dsview-cli -- prepare resources/fpga
 cargo run -p dsview-cli -- capture-logic resources/fpga 1
 cargo run -p dsview-cli -- capture-scope resources/fpga
 cargo run -p dsview-cli -- capture-usb resources/fpga
+cargo run -p dsview-cli -- capture-usb resources/fpga --output capture.dsv
+cargo run -p dsview-cli -- inspect capture.dsv
+cargo run -p dsview-cli -- simulate 1 --output simulated.dsv
 ```
 
 Here `<resource-directory>` contains `DSLogicU3Pro16.bin` and
@@ -102,6 +105,16 @@ and the observed software start skew. This skew is not a hardware
 synchronization guarantee; an external trigger or clock is still needed for
 exact sample alignment.
 
+All capture commands accept `--output <capture.dsv>`. The lossless recording
+contains every logic and scope sample received by the capture session, plus
+device descriptors, frame sequences, shared-timeline timestamps, capture
+metadata, source errors, and a completion footer. Frames are written
+incrementally with CRC-32 checksums, so recording memory stays bounded and
+truncated or corrupted files are rejected. Existing files are never
+overwritten. Use `inspect <capture.dsv>` to validate a recording and print its
+per-device totals without connected hardware. The format is documented in
+`docs/recording-format.md`.
+
 ## Run the desktop application
 
 Launch the native capture workbench with:
@@ -110,6 +123,23 @@ Launch the native capture workbench with:
 cargo run -p dsview-gui
 ```
 
+On macOS, build a Finder-launchable application bundle with:
+
+```sh
+bash scripts/package-macos.sh
+open target/release/bundle/osx/DSView.app
+```
+
+Double-clicking `DSView.app` launches the GUI without opening Terminal. The
+bundle includes the FPGA resources and the application locates them relative to
+its executable. Double-clicking the raw `target/release/dsview-gui` Unix binary
+will still open Terminal because it is not an application bundle.
+
+Windows builds use the GUI subsystem and therefore do not create a console
+window when launched normally. Linux desktop packages should install a
+launcher with `Terminal=false`; running the binary from a shell remains useful
+for diagnostics.
+
 The application discovers supported USB instruments without blocking the UI,
 lets you select any detected devices and edit the FPGA resource directory, then
 prepares and captures from the selected sources concurrently. It displays all
@@ -117,6 +147,10 @@ prepares and captures from the selected sources concurrently. It displays all
 errors, and shared-timeline start skew. Waveform buffers retain the newest 8,192
 samples so rendering remains bounded; this display limit does not truncate data
 written to a capture file.
+
+Enable **Record complete capture** and enter a `.dsv` path before starting to
+write the full session to disk. The GUI uses the same streaming recorder as the
+CLI and refuses to replace an existing file.
 
 The GUI uses native window backends on macOS and Windows and enables both
 Wayland and X11 on Linux. Vendored libusb keeps the USB transport consistent
@@ -144,6 +178,7 @@ cargo test --workspace
 ## Workspace layout
 
 - `crates/dsview-core`: device-independent capture types and concurrency.
+- `crates/dsview-recording`: versioned lossless capture writer and reader.
 - `crates/dsview-sim`: deterministic simulated logic and scope sources.
 - `crates/dsview-usb`: USB discovery, claimed sessions, control transport, FPGA loading, and DSLogic/DSCope capture.
 - `apps/dsview-cli`: simultaneous-capture development harness.

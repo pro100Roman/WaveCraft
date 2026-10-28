@@ -7,5 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 dsview-core = { path = "../../crates/dsview-core" }
+dsview-recording = { path = "../../crates/dsview-recording" }
 dsview-sim = { path = "../../crates/dsview-sim" }
 dsview-usb = { path = "../../crates/dsview-usb" }

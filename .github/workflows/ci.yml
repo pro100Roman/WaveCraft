@@ -47,3 +47,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --workspace --release
+
+      - name: Build macOS application bundle
+        if: runner.os == 'macOS'
+        run: bash scripts/package-macos.sh

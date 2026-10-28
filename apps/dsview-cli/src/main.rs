@@ -1,14 +1,21 @@
 use dsview_core::{CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSource, DeviceId};
+use dsview_recording::{CompletionStatus, RecordingReader, RecordingWriter, FORMAT_VERSION};
 use dsview_sim::{SimulatedLogicAnalyzer, SimulatedOscilloscope};
 use dsview_usb::{
     discover_supported_devices, load_device_fpga, prepare_device, probe_device, DeviceModel,
     DsCopeCaptureConfig, DsCopeCaptureSource, DsLogicCaptureConfig, DsLogicCaptureSource, FpgaLoad,
     LinkStatus,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+const USAGE: &str = "usage: dsview-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
+
+type FileRecorder = RecordingWriter<BufWriter<File>>;
 
 #[derive(Default)]
 struct DeviceStats {
@@ -20,49 +27,69 @@ struct DeviceStats {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if arguments.first().is_some_and(|argument| argument == "list") {
-        return list_devices();
-    }
-    if arguments
-        .first()
-        .is_some_and(|argument| argument == "probe")
-    {
-        return probe_devices();
-    }
-    if let [command, resource_directory] = arguments.as_slice() {
-        match command.as_str() {
-            "load-fpga" => return load_fpgas(Path::new(resource_directory)),
-            "prepare" => return prepare_devices(Path::new(resource_directory)),
-            "capture-logic" => {
-                return capture_logic(Path::new(resource_directory), 1);
-            }
-            "capture-scope" => return capture_scope(Path::new(resource_directory)),
-            "capture-usb" => return capture_usb(Path::new(resource_directory)),
-            _ => {}
+    match arguments.as_slice() {
+        [command] if command == "list" => return list_devices(),
+        [command] if command == "probe" => return probe_devices(),
+        [command, path] if command == "inspect" => return inspect_recording(Path::new(path)),
+        [command, resource_directory] if command == "load-fpga" => {
+            return load_fpgas(Path::new(resource_directory));
         }
-    }
-    if let [command, resource_directory, seconds] = arguments.as_slice() {
-        if command == "capture-logic" {
-            return capture_logic(Path::new(resource_directory), seconds.parse()?);
+        [command, resource_directory] if command == "prepare" => {
+            return prepare_devices(Path::new(resource_directory));
         }
+        [command, resource_directory] if command == "capture-logic" => {
+            return capture_logic(Path::new(resource_directory), 1, None);
+        }
+        [command, resource_directory, seconds] if command == "capture-logic" => {
+            return capture_logic(Path::new(resource_directory), seconds.parse()?, None);
+        }
+        [command, resource_directory, flag, output]
+            if command == "capture-logic" && flag == "--output" =>
+        {
+            return capture_logic(Path::new(resource_directory), 1, Some(Path::new(output)));
+        }
+        [command, resource_directory, seconds, flag, output]
+            if command == "capture-logic" && flag == "--output" =>
+        {
+            return capture_logic(
+                Path::new(resource_directory),
+                seconds.parse()?,
+                Some(Path::new(output)),
+            );
+        }
+        [command, resource_directory] if command == "capture-scope" => {
+            return capture_scope(Path::new(resource_directory), None);
+        }
+        [command, resource_directory, flag, output]
+            if command == "capture-scope" && flag == "--output" =>
+        {
+            return capture_scope(Path::new(resource_directory), Some(Path::new(output)));
+        }
+        [command, resource_directory] if command == "capture-usb" => {
+            return capture_usb(Path::new(resource_directory), None);
+        }
+        [command, resource_directory, flag, output]
+            if command == "capture-usb" && flag == "--output" =>
+        {
+            return capture_usb(Path::new(resource_directory), Some(Path::new(output)));
+        }
+        [command, seconds, flag, output] if command == "simulate" && flag == "--output" => {
+            return run_simulation(seconds.parse()?, Some(Path::new(output)));
+        }
+        _ => {}
     }
 
     let run_seconds = match arguments.as_slice() {
         [] => 2,
         [seconds] => seconds.parse::<u64>()?,
         [command, seconds] if command == "simulate" => seconds.parse::<u64>()?,
-        _ => {
-            return Err(
-                "usage: dsview-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] | capture-scope <resource-directory> | capture-usb <resource-directory> | simulate <seconds> | <seconds>]"
-                    .into(),
-            )
-        }
+        _ => return Err(USAGE.into()),
     };
 
-    run_simulation(run_seconds)
+    run_simulation(run_seconds, None)
 }
 
-fn capture_usb(resource_directory: &Path) -> Result<(), Box<dyn Error>> {
+fn capture_usb(resource_directory: &Path, output: Option<&Path>) -> Result<(), Box<dyn Error>> {
     const SAMPLE_RATE_HZ: u64 = 1_000_000;
     const SAMPLE_COUNT: u64 = 1_000_000;
     const CAPTURE_TIMEOUT: Duration = Duration::from_secs(11);
@@ -102,6 +129,9 @@ fn capture_usb(resource_directory: &Path) -> Result<(), Box<dyn Error>> {
         Box::new(DsCopeCaptureSource::new(scope_device, scope_config)?),
     ];
     let session = CaptureCoordinator::start(sources)?;
+    let mut metadata = capture_metadata("capture-usb", SAMPLE_RATE_HZ, SAMPLE_COUNT);
+    metadata.insert("scope.volts_per_div".to_owned(), "1".to_owned());
+    let mut recorder = start_recording(output, session.descriptors(), metadata)?;
     println!(
         "capturing concurrently from {} physical instruments at {SAMPLE_RATE_HZ} Hz",
         session.descriptors().len()
@@ -116,40 +146,58 @@ fn capture_usb(resource_directory: &Path) -> Result<(), Box<dyn Error>> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             session.request_stop();
-            session.stop()?;
+            let stop_result = session.stop();
+            finish_recording(&mut recorder, CompletionStatus::Cancelled)?;
+            stop_result?;
             return Err("concurrent USB capture did not finish within 11 seconds".into());
         }
         match session.recv_timeout(remaining.min(Duration::from_millis(250))) {
-            Ok(CaptureEvent::Frame(frame)) => {
-                let entry = stats.entry(frame.device_id).or_default();
-                entry.frames += 1;
-                entry.samples += frame.payload.sample_count() as u64;
-                entry.first_timestamp.get_or_insert(frame.captured_at);
-                entry.last_timestamp = Some(frame.captured_at);
-                if let CaptureBatch::Scope(batch) = frame.payload {
-                    for (index, channel) in batch.channels.iter().enumerate().take(2) {
-                        for value in channel {
-                            scope_min[index] = scope_min[index].min(*value);
-                            scope_max[index] = scope_max[index].max(*value);
+            Ok(event) => {
+                write_recording_event(&mut recorder, &event)?;
+                match event {
+                    CaptureEvent::Frame(frame) => {
+                        let entry = stats.entry(frame.device_id).or_default();
+                        entry.frames += 1;
+                        entry.samples += frame.payload.sample_count() as u64;
+                        entry.first_timestamp.get_or_insert(frame.captured_at);
+                        entry.last_timestamp = Some(frame.captured_at);
+                        if let CaptureBatch::Scope(batch) = frame.payload {
+                            for (index, channel) in batch.channels.iter().enumerate().take(2) {
+                                for value in channel {
+                                    scope_min[index] = scope_min[index].min(*value);
+                                    scope_max[index] = scope_max[index].max(*value);
+                                }
+                            }
                         }
+                    }
+                    CaptureEvent::SourceFailed { device_id, error } => {
+                        let stop_result = session.stop();
+                        finish_recording(&mut recorder, CompletionStatus::Failed)?;
+                        stop_result?;
+                        return Err(format!("capture source {device_id} failed: {error}").into());
+                    }
+                    CaptureEvent::SourceStopped { device_id } => {
+                        stopped.insert(device_id);
                     }
                 }
             }
-            Ok(CaptureEvent::SourceFailed { device_id, error }) => {
-                session.stop()?;
-                return Err(format!("capture source {device_id} failed: {error}").into());
-            }
-            Ok(CaptureEvent::SourceStopped { device_id }) => {
-                stopped.insert(device_id);
-            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                session.stop()?;
+                let stop_result = session.stop();
+                finish_recording(&mut recorder, CompletionStatus::Failed)?;
+                stop_result?;
                 return Err("concurrent USB capture event stream ended unexpectedly".into());
             }
         }
     }
-    session.stop()?;
+    let stop_result = session.stop();
+    let completion = if stop_result.is_ok() {
+        CompletionStatus::Complete
+    } else {
+        CompletionStatus::Failed
+    };
+    finish_recording(&mut recorder, completion)?;
+    stop_result?;
 
     let logic_stats = stats
         .get(&logic_id)
@@ -187,7 +235,132 @@ fn duration_difference(left: Duration, right: Duration) -> Duration {
     left.max(right) - left.min(right)
 }
 
-fn capture_scope(resource_directory: &Path) -> Result<(), Box<dyn Error>> {
+fn capture_metadata(
+    command: &str,
+    sample_rate_hz: u64,
+    sample_count: u64,
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("capture.command".to_owned(), command.to_owned());
+    metadata.insert(
+        "capture.sample_rate_hz".to_owned(),
+        sample_rate_hz.to_string(),
+    );
+    metadata.insert(
+        "capture.requested_sample_count".to_owned(),
+        sample_count.to_string(),
+    );
+    metadata
+}
+
+fn start_recording(
+    output: Option<&Path>,
+    devices: &[dsview_core::DeviceDescriptor],
+    metadata: BTreeMap<String, String>,
+) -> Result<Option<FileRecorder>, Box<dyn Error>> {
+    let Some(path) = output else {
+        return Ok(None);
+    };
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "failed to create capture file {} without overwriting an existing file: {error}",
+                path.display()
+            )
+        })?;
+    let recorder = RecordingWriter::new(BufWriter::new(file), devices, metadata)?;
+    println!("recording full capture to {}", path.display());
+    Ok(Some(recorder))
+}
+
+fn write_recording_event(
+    recorder: &mut Option<FileRecorder>,
+    event: &CaptureEvent,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(recorder) = recorder {
+        recorder.write_event(event)?;
+    }
+    Ok(())
+}
+
+fn finish_recording(
+    recorder: &mut Option<FileRecorder>,
+    status: CompletionStatus,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(recorder) = recorder {
+        recorder.finish(status)?;
+    }
+    Ok(())
+}
+
+fn inspect_recording(path: &Path) -> Result<(), Box<dyn Error>> {
+    let file = File::open(path)
+        .map_err(|error| format!("failed to open recording {}: {error}", path.display()))?;
+    let mut reader = RecordingReader::new(BufReader::new(file))?;
+    println!(
+        "DSView recording format {}, {} device(s)",
+        FORMAT_VERSION,
+        reader.header().devices.len()
+    );
+    for device in &reader.header().devices {
+        println!("  {}: {} ({:?})", device.id, device.name, device.kind);
+    }
+    for (key, value) in &reader.header().metadata {
+        println!("  {key}: {value}");
+    }
+
+    let mut stats = HashMap::<DeviceId, DeviceStats>::new();
+    let mut failures = Vec::new();
+    let mut stopped = HashSet::new();
+    while let Some(event) = reader.read_event()? {
+        match event {
+            CaptureEvent::Frame(frame) => {
+                let entry = stats.entry(frame.device_id).or_default();
+                entry.frames += 1;
+                entry.samples += frame.payload.sample_count() as u64;
+                entry.first_timestamp.get_or_insert(frame.captured_at);
+                entry.last_timestamp = Some(frame.captured_at);
+            }
+            CaptureEvent::SourceFailed { device_id, error } => {
+                failures.push(format!("{device_id}: {error}"));
+            }
+            CaptureEvent::SourceStopped { device_id } => {
+                stopped.insert(device_id);
+            }
+        }
+    }
+
+    let completion = reader
+        .completion_status()
+        .ok_or("recording has no completion status")?;
+    println!(
+        "completion: {completion:?}; {} source(s) stopped",
+        stopped.len()
+    );
+    for device in &reader.header().devices {
+        if let Some(device_stats) = stats.get(&device.id) {
+            println!(
+                "  {}: {} frames, {} samples, timeline {:?}..{:?}",
+                device.id,
+                device_stats.frames,
+                device_stats.samples,
+                device_stats.first_timestamp.unwrap_or_default(),
+                device_stats.last_timestamp.unwrap_or_default()
+            );
+        } else {
+            println!("  {}: no sample frames", device.id);
+        }
+    }
+    for failure in failures {
+        println!("  source failure: {failure}");
+    }
+    Ok(())
+}
+
+fn capture_scope(resource_directory: &Path, output: Option<&Path>) -> Result<(), Box<dyn Error>> {
     const SAMPLE_RATE_HZ: u64 = 1_000_000;
     const SAMPLE_COUNT: u64 = 1_000_000;
     let config = DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)?;
@@ -211,6 +384,9 @@ fn capture_scope(resource_directory: &Path) -> Result<(), Box<dyn Error>> {
 
     let source = DsCopeCaptureSource::new(device, config)?;
     let session = CaptureCoordinator::start(vec![Box::new(source)])?;
+    let mut metadata = capture_metadata("capture-scope", SAMPLE_RATE_HZ, SAMPLE_COUNT);
+    metadata.insert("scope.volts_per_div".to_owned(), "1".to_owned());
+    let mut recorder = start_recording(output, session.descriptors(), metadata)?;
     let deadline = Instant::now() + Duration::from_secs(11);
     let mut stats = DeviceStats::default();
     let mut channel_min = [f32::INFINITY; 2];
@@ -220,34 +396,55 @@ fn capture_scope(resource_directory: &Path) -> Result<(), Box<dyn Error>> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             session.request_stop();
-            session.stop()?;
+            let stop_result = session.stop();
+            finish_recording(&mut recorder, CompletionStatus::Cancelled)?;
+            stop_result?;
             return Err("scope capture did not finish within 11 seconds".into());
         }
         match session.recv_timeout(remaining.min(Duration::from_millis(250))) {
-            Ok(CaptureEvent::Frame(frame)) => {
-                stats.frames += 1;
-                stats.samples += frame.payload.sample_count() as u64;
-                stats.first_timestamp.get_or_insert(frame.captured_at);
-                stats.last_timestamp = Some(frame.captured_at);
-                if let CaptureBatch::Scope(batch) = frame.payload {
-                    for (index, channel) in batch.channels.iter().enumerate().take(2) {
-                        for value in channel {
-                            channel_min[index] = channel_min[index].min(*value);
-                            channel_max[index] = channel_max[index].max(*value);
+            Ok(event) => {
+                write_recording_event(&mut recorder, &event)?;
+                match event {
+                    CaptureEvent::Frame(frame) => {
+                        stats.frames += 1;
+                        stats.samples += frame.payload.sample_count() as u64;
+                        stats.first_timestamp.get_or_insert(frame.captured_at);
+                        stats.last_timestamp = Some(frame.captured_at);
+                        if let CaptureBatch::Scope(batch) = frame.payload {
+                            for (index, channel) in batch.channels.iter().enumerate().take(2) {
+                                for value in channel {
+                                    channel_min[index] = channel_min[index].min(*value);
+                                    channel_max[index] = channel_max[index].max(*value);
+                                }
+                            }
                         }
                     }
+                    CaptureEvent::SourceFailed { device_id, error } => {
+                        let stop_result = session.stop();
+                        finish_recording(&mut recorder, CompletionStatus::Failed)?;
+                        stop_result?;
+                        return Err(format!("capture source {device_id} failed: {error}").into());
+                    }
+                    CaptureEvent::SourceStopped { .. } => stopped = true,
                 }
             }
-            Ok(CaptureEvent::SourceFailed { device_id, error }) => {
-                session.stop()?;
-                return Err(format!("capture source {device_id} failed: {error}").into());
-            }
-            Ok(CaptureEvent::SourceStopped { .. }) => stopped = true,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => stopped = true,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let stop_result = session.stop();
+                finish_recording(&mut recorder, CompletionStatus::Failed)?;
+                stop_result?;
+                return Err("scope capture event stream ended unexpectedly".into());
+            }
         }
     }
-    session.stop()?;
+    let stop_result = session.stop();
+    let completion = if stop_result.is_ok() {
+        CompletionStatus::Complete
+    } else {
+        CompletionStatus::Failed
+    };
+    finish_recording(&mut recorder, completion)?;
+    stop_result?;
 
     println!(
         "capture complete: {} frames, {} samples/channel, CH0 {:.3}..{:.3} V, CH1 {:.3}..{:.3} V",
@@ -256,7 +453,11 @@ fn capture_scope(resource_directory: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn capture_logic(resource_directory: &Path, seconds: u64) -> Result<(), Box<dyn Error>> {
+fn capture_logic(
+    resource_directory: &Path,
+    seconds: u64,
+    output: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
     if seconds == 0 {
         return Err("capture duration must be at least one second".into());
     }
@@ -285,6 +486,8 @@ fn capture_logic(resource_directory: &Path, seconds: u64) -> Result<(), Box<dyn 
 
     let source = DsLogicCaptureSource::new(device, config)?;
     let session = CaptureCoordinator::start(vec![Box::new(source)])?;
+    let metadata = capture_metadata("capture-logic", SAMPLE_RATE_HZ, sample_count);
+    let mut recorder = start_recording(output, session.descriptors(), metadata)?;
     let deadline = Instant::now() + Duration::from_secs(seconds.saturating_add(10));
     let mut stats = DeviceStats::default();
     let mut stopped = false;
@@ -292,7 +495,9 @@ fn capture_logic(resource_directory: &Path, seconds: u64) -> Result<(), Box<dyn 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             session.request_stop();
-            session.stop()?;
+            let stop_result = session.stop();
+            finish_recording(&mut recorder, CompletionStatus::Cancelled)?;
+            stop_result?;
             return Err(format!(
                 "logic capture did not finish within {} seconds",
                 seconds + 10
@@ -300,22 +505,41 @@ fn capture_logic(resource_directory: &Path, seconds: u64) -> Result<(), Box<dyn 
             .into());
         }
         match session.recv_timeout(remaining.min(Duration::from_millis(250))) {
-            Ok(CaptureEvent::Frame(frame)) => {
-                stats.frames += 1;
-                stats.samples += frame.payload.sample_count() as u64;
-                stats.first_timestamp.get_or_insert(frame.captured_at);
-                stats.last_timestamp = Some(frame.captured_at);
+            Ok(event) => {
+                write_recording_event(&mut recorder, &event)?;
+                match event {
+                    CaptureEvent::Frame(frame) => {
+                        stats.frames += 1;
+                        stats.samples += frame.payload.sample_count() as u64;
+                        stats.first_timestamp.get_or_insert(frame.captured_at);
+                        stats.last_timestamp = Some(frame.captured_at);
+                    }
+                    CaptureEvent::SourceFailed { device_id, error } => {
+                        let stop_result = session.stop();
+                        finish_recording(&mut recorder, CompletionStatus::Failed)?;
+                        stop_result?;
+                        return Err(format!("capture source {device_id} failed: {error}").into());
+                    }
+                    CaptureEvent::SourceStopped { .. } => stopped = true,
+                }
             }
-            Ok(CaptureEvent::SourceFailed { device_id, error }) => {
-                session.stop()?;
-                return Err(format!("capture source {device_id} failed: {error}").into());
-            }
-            Ok(CaptureEvent::SourceStopped { .. }) => stopped = true,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => stopped = true,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let stop_result = session.stop();
+                finish_recording(&mut recorder, CompletionStatus::Failed)?;
+                stop_result?;
+                return Err("logic capture event stream ended unexpectedly".into());
+            }
         }
     }
-    session.stop()?;
+    let stop_result = session.stop();
+    let completion = if stop_result.is_ok() {
+        CompletionStatus::Complete
+    } else {
+        CompletionStatus::Failed
+    };
+    finish_recording(&mut recorder, completion)?;
+    stop_result?;
 
     println!(
         "capture complete: {} frames, {} samples, timeline {:?}..{:?}",
@@ -517,10 +741,17 @@ fn list_devices() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_simulation(run_seconds: u64) -> Result<(), Box<dyn Error>> {
+fn run_simulation(run_seconds: u64, output: Option<&Path>) -> Result<(), Box<dyn Error>> {
     let logic = SimulatedLogicAnalyzer::new("sim-logic-0", 100_000, 8, 1_024)?;
     let scope = SimulatedOscilloscope::new("sim-scope-0", 50_000, 2, 512)?;
     let session = CaptureCoordinator::start(vec![Box::new(logic), Box::new(scope)])?;
+    let mut metadata = BTreeMap::new();
+    metadata.insert("capture.command".to_owned(), "simulate".to_owned());
+    metadata.insert(
+        "capture.duration_seconds".to_owned(),
+        run_seconds.to_string(),
+    );
+    let mut recorder = start_recording(output, session.descriptors(), metadata)?;
 
     println!(
         "capturing from {} instruments for {run_seconds}s",
@@ -538,24 +769,39 @@ fn run_simulation(run_seconds: u64) -> Result<(), Box<dyn Error>> {
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match session.recv_timeout(remaining.min(Duration::from_millis(100))) {
-            Ok(CaptureEvent::Frame(frame)) => {
-                let entry = stats.entry(frame.device_id).or_default();
-                entry.frames += 1;
-                entry.samples += frame.payload.sample_count() as u64;
-                entry.first_timestamp.get_or_insert(frame.captured_at);
-                entry.last_timestamp = Some(frame.captured_at);
-            }
-            Ok(CaptureEvent::SourceFailed { device_id, error }) => {
-                return Err(format!("capture source {device_id} failed: {error}").into());
-            }
-            Ok(CaptureEvent::SourceStopped { device_id }) => {
-                println!("capture source {device_id} stopped");
+            Ok(event) => {
+                write_recording_event(&mut recorder, &event)?;
+                match event {
+                    CaptureEvent::Frame(frame) => {
+                        let entry = stats.entry(frame.device_id).or_default();
+                        entry.frames += 1;
+                        entry.samples += frame.payload.sample_count() as u64;
+                        entry.first_timestamp.get_or_insert(frame.captured_at);
+                        entry.last_timestamp = Some(frame.captured_at);
+                    }
+                    CaptureEvent::SourceFailed { device_id, error } => {
+                        let stop_result = session.stop();
+                        finish_recording(&mut recorder, CompletionStatus::Failed)?;
+                        stop_result?;
+                        return Err(format!("capture source {device_id} failed: {error}").into());
+                    }
+                    CaptureEvent::SourceStopped { device_id } => {
+                        println!("capture source {device_id} stopped");
+                    }
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    session.stop()?;
+    let stop_result = session.stop();
+    let completion = if stop_result.is_ok() {
+        CompletionStatus::Complete
+    } else {
+        CompletionStatus::Failed
+    };
+    finish_recording(&mut recorder, completion)?;
+    stop_result?;
 
     println!("capture summary:");
     for (device_id, device_stats) in stats {
