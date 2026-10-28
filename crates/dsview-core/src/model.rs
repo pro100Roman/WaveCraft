@@ -49,7 +49,8 @@ pub struct LogicBatch {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScopeBatch {
     pub sample_rate_hz: u64,
-    /// Channel-major voltage samples. All channels must have equal length.
+    /// Enabled channels in ascending physical-channel order. Samples are
+    /// channel-major and all channels must have equal length.
     pub channels: Vec<Vec<f32>>,
 }
 

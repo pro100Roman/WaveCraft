@@ -7,7 +7,9 @@ use dsview_core::{
 use dsview_recording::{CompletionStatus, RecordingWriter};
 use dsview_usb::{
     discover_supported_devices, prepare_device, DeviceModel, DiscoveredDevice, DsCopeCaptureConfig,
-    DsCopeCaptureSource, DsLogicCaptureConfig, DsLogicCaptureSource, LinkStatus,
+    DsCopeCaptureSource, DsCopeChannelConfig, DsCopeCoupling, DsLogicCaptureConfig,
+    DsLogicCaptureSource, LinkStatus, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
+    DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -27,7 +29,6 @@ const WAVEFORM_STATUS_HEIGHT: f32 = 20.0;
 const TIME_RULER_HEIGHT: f32 = 24.0;
 const SCOPE_HORIZONTAL_DIVISIONS: usize = 10;
 const SCOPE_VERTICAL_DIVISIONS: usize = 8;
-const DEFAULT_SCOPE_VOLTS_PER_DIV: f32 = 1.0;
 const BACKGROUND: Color32 = Color32::from_rgb(12, 17, 25);
 const PANEL: Color32 = Color32::from_rgb(20, 27, 38);
 const GRID: Color32 = Color32::from_rgb(43, 55, 72);
@@ -55,6 +56,82 @@ fn main() -> eframe::Result<()> {
 struct DeviceEntry {
     device: DiscoveredDevice,
     selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScopeChannelSettings {
+    enabled: bool,
+    volts_per_div_mv: u16,
+    coupling: DsCopeCoupling,
+    probe_attenuation: u8,
+}
+
+impl Default for ScopeChannelSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            volts_per_div_mv: 1_000,
+            coupling: DsCopeCoupling::Dc,
+            probe_attenuation: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScopeCaptureSettings {
+    sample_rate_hz: u64,
+    sample_count: u64,
+    channels: [ScopeChannelSettings; 2],
+}
+
+impl Default for ScopeCaptureSettings {
+    fn default() -> Self {
+        Self {
+            sample_rate_hz: SAMPLE_RATE_HZ,
+            sample_count: SAMPLE_COUNT,
+            channels: [ScopeChannelSettings::default(); 2],
+        }
+    }
+}
+
+impl ScopeCaptureSettings {
+    fn capture_config(self) -> Result<DsCopeCaptureConfig, String> {
+        let mut channels = [DsCopeChannelConfig::default(); 2];
+        for (destination, source) in channels.iter_mut().zip(self.channels) {
+            *destination = DsCopeChannelConfig::new(
+                source.volts_per_div_mv,
+                source.coupling,
+                source.probe_attenuation,
+            )
+            .map_err(|error| error.to_string())?
+            .with_enabled(source.enabled);
+        }
+        DsCopeCaptureConfig::with_channel_configs(self.sample_rate_hz, self.sample_count, channels)
+            .map_err(|error| error.to_string())
+    }
+
+    fn enabled_channel_count(self) -> usize {
+        self.channels
+            .iter()
+            .filter(|channel| channel.enabled)
+            .count()
+    }
+
+    fn maximum_sample_rate_hz(self) -> u64 {
+        if self.enabled_channel_count() == 1 {
+            1_000_000_000
+        } else {
+            500_000_000
+        }
+    }
+
+    fn maximum_sample_count(self) -> u64 {
+        if self.enabled_channel_count() == 1 {
+            2_000_000
+        } else {
+            1_000_000
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,7 +273,7 @@ impl WaveformViewport {
 }
 
 impl WaveformStore {
-    fn ingest(&mut self, batch: &CaptureBatch) {
+    fn ingest(&mut self, batch: &CaptureBatch, scope_channels: [bool; 2]) {
         match batch {
             CaptureBatch::Logic(logic) => {
                 self.logic_channels = logic.channel_count;
@@ -206,14 +283,18 @@ impl WaveformStore {
             }
             CaptureBatch::Scope(scope) => {
                 self.scope_rate_hz = scope.sample_rate_hz;
-                if self.scope_channels.len() != scope.channels.len() {
-                    self.scope_channels = vec![VecDeque::new(); scope.channels.len()];
+                if self.scope_channels.len() != scope_channels.len() {
+                    self.scope_channels = vec![VecDeque::new(); scope_channels.len()];
                     self.scope_sample_offset = 0;
                 }
                 let mut removed_samples = 0;
-                for (destination, source) in
-                    self.scope_channels.iter_mut().zip(scope.channels.iter())
-                {
+                for (source, physical_channel) in scope.channels.iter().zip(
+                    scope_channels
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, enabled)| enabled.then_some(index)),
+                ) {
+                    let destination = &mut self.scope_channels[physical_channel];
                     removed_samples =
                         removed_samples.max(extend_bounded(destination, source.iter().copied()));
                 }
@@ -232,6 +313,7 @@ fn extend_bounded<T>(destination: &mut VecDeque<T>, values: impl IntoIterator<It
 
 struct ActiveCapture {
     session: CaptureSession,
+    scope_config: DsCopeCaptureConfig,
     stats: HashMap<DeviceId, DeviceStats>,
     stopped: HashSet<DeviceId>,
     waveforms: WaveformStore,
@@ -249,7 +331,10 @@ type FileRecorder = RecordingWriter<BufWriter<File>>;
 
 enum WorkerSuccess {
     Devices(Vec<DiscoveredDevice>),
-    Capture(CaptureSession),
+    Capture {
+        session: CaptureSession,
+        scope_config: DsCopeCaptureConfig,
+    },
 }
 
 type WorkerResult = Result<WorkerSuccess, String>;
@@ -261,6 +346,7 @@ struct DsViewApp {
     recording_path: String,
     devices: Vec<DeviceEntry>,
     active_capture_settings_tab: CaptureSettingsTab,
+    scope_settings: ScopeCaptureSettings,
     active_waveform_tab: Option<WaveformTab>,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
@@ -283,6 +369,7 @@ impl DsViewApp {
             recording_path: "capture.dsv".to_owned(),
             devices: Vec::new(),
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
+            scope_settings: ScopeCaptureSettings::default(),
             active_waveform_tab: None,
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
@@ -333,6 +420,13 @@ impl DsViewApp {
             self.last_error = Some("Enter a recording file path".to_owned());
             return;
         }
+        let scope_config = match self.scope_settings.capture_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.last_error = Some(error);
+                return;
+            }
+        };
 
         let resource_directory = PathBuf::from(self.resource_directory.trim());
         let (sender, receiver) = mpsc::channel();
@@ -341,7 +435,12 @@ impl DsViewApp {
         self.status = format!("Preparing {} instrument(s)…", devices.len());
         self.last_error = None;
         thread::spawn(move || {
-            let result = start_capture(devices, &resource_directory).map(WorkerSuccess::Capture);
+            let result = start_capture(devices, &resource_directory, scope_config).map(|session| {
+                WorkerSuccess::Capture {
+                    session,
+                    scope_config,
+                }
+            });
             let _ = sender.send(result);
         });
     }
@@ -411,14 +510,20 @@ impl DsViewApp {
                     format!("Detected {} supported instrument(s)", self.devices.len())
                 };
             }
-            Ok(WorkerSuccess::Capture(session)) => {
+            Ok(WorkerSuccess::Capture {
+                session,
+                scope_config,
+            }) => {
                 let count = session.descriptors().len();
                 let recording_path = self
                     .record_capture
                     .then(|| self.recording_path.trim().to_owned());
                 let recorder = match recording_path.as_deref() {
-                    Some(path) => match start_gui_recording(Path::new(path), session.descriptors())
-                    {
+                    Some(path) => match start_gui_recording(
+                        Path::new(path),
+                        session.descriptors(),
+                        scope_config,
+                    ) {
                         Ok(recorder) => Some(recorder),
                         Err(error) => {
                             let cleanup = session.stop().err();
@@ -435,6 +540,7 @@ impl DsViewApp {
                 };
                 self.capture = Some(ActiveCapture {
                     session,
+                    scope_config,
                     stats: HashMap::new(),
                     stopped: HashSet::new(),
                     waveforms: WaveformStore::default(),
@@ -445,7 +551,7 @@ impl DsViewApp {
                     Some(path) => {
                         format!("Capturing {count} instrument(s) to {path}")
                     }
-                    None => format!("Capturing from {count} instrument(s) at 1 MHz"),
+                    None => format!("Capturing from {count} instrument(s)"),
                 };
             }
             Err(error) => self.set_error(error),
@@ -475,7 +581,13 @@ impl DsViewApp {
                                 entry.samples += frame.payload.sample_count() as u64;
                                 entry.first_timestamp.get_or_insert(frame.captured_at);
                                 entry.last_timestamp = Some(frame.captured_at);
-                                active.waveforms.ingest(&frame.payload);
+                                active.waveforms.ingest(
+                                    &frame.payload,
+                                    active
+                                        .scope_config
+                                        .channels()
+                                        .map(|channel| channel.enabled()),
+                                );
                             }
                             CaptureEvent::SourceFailed { device_id, error } => {
                                 active.session.request_stop();
@@ -581,11 +693,109 @@ impl DsViewApp {
     }
 }
 
-fn paint_capture_settings(ui: &mut egui::Ui, tab: CaptureSettingsTab) {
-    let (model, grid_id) = match tab {
-        CaptureSettingsTab::DsLogic => ("DSLogic U3Pro16", "dslogic_capture_settings"),
-        CaptureSettingsTab::DsCope => ("DSCope U3P100", "dscope_capture_settings"),
-    };
+fn format_sample_count(sample_count: u64) -> String {
+    if sample_count >= 1_000_000 {
+        format!("{}M samples", sample_count / 1_000_000)
+    } else if sample_count >= 1_000 {
+        format!("{}k samples", sample_count / 1_000)
+    } else {
+        format!("{sample_count} samples")
+    }
+}
+
+fn format_input_scale(volts_per_div_mv: u16) -> String {
+    if volts_per_div_mv >= 1_000 {
+        format!("{} V/div", volts_per_div_mv / 1_000)
+    } else {
+        format!("{volts_per_div_mv} mV/div")
+    }
+}
+
+fn coupling_label(coupling: DsCopeCoupling) -> &'static str {
+    match coupling {
+        DsCopeCoupling::Dc => "DC",
+        DsCopeCoupling::Ac => "AC",
+    }
+}
+
+fn paint_scope_channel_settings(
+    ui: &mut egui::Ui,
+    channel_index: usize,
+    settings: &mut ScopeChannelSettings,
+    other_channel_enabled: bool,
+    capture_settings_enabled: bool,
+) {
+    egui::Frame::none()
+        .fill(PANEL.gamma_multiply(0.72))
+        .rounding(egui::Rounding::same(5.0))
+        .inner_margin(egui::Margin::same(8.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let can_toggle_enable = !settings.enabled || other_channel_enabled;
+            let enable_control =
+                egui::Checkbox::new(&mut settings.enabled, format!("CH{channel_index} enabled"));
+            ui.add_enabled(
+                capture_settings_enabled && can_toggle_enable,
+                enable_control,
+            )
+            .on_hover_text("At least one oscilloscope channel must remain enabled");
+            ui.add_enabled_ui(capture_settings_enabled && settings.enabled, |ui| {
+                egui::Grid::new(("scope_channel_settings", channel_index))
+                    .num_columns(2)
+                    .spacing([8.0, 5.0])
+                    .show(ui, |ui| {
+                        ui.label("Scale");
+                        egui::ComboBox::from_id_salt(("scope_vdiv", channel_index))
+                            .selected_text(format_input_scale(settings.volts_per_div_mv))
+                            .show_ui(ui, |ui| {
+                                for value in DSCOPE_VOLTS_PER_DIV_MV {
+                                    ui.selectable_value(
+                                        &mut settings.volts_per_div_mv,
+                                        value,
+                                        format_input_scale(value),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Coupling");
+                        egui::ComboBox::from_id_salt(("scope_coupling", channel_index))
+                            .selected_text(coupling_label(settings.coupling))
+                            .show_ui(ui, |ui| {
+                                for coupling in [DsCopeCoupling::Dc, DsCopeCoupling::Ac] {
+                                    ui.selectable_value(
+                                        &mut settings.coupling,
+                                        coupling,
+                                        coupling_label(coupling),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Probe");
+                        egui::ComboBox::from_id_salt(("scope_probe", channel_index))
+                            .selected_text(format!("{}×", settings.probe_attenuation))
+                            .show_ui(ui, |ui| {
+                                for attenuation in [1, 10] {
+                                    ui.selectable_value(
+                                        &mut settings.probe_attenuation,
+                                        attenuation,
+                                        format!("{attenuation}×"),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                    });
+            });
+        });
+}
+
+fn paint_capture_settings(
+    ui: &mut egui::Ui,
+    tab: CaptureSettingsTab,
+    scope_settings: &mut ScopeCaptureSettings,
+    enabled: bool,
+) {
     let card_width = ui.available_width();
     egui::Frame::none()
         .fill(BACKGROUND)
@@ -594,42 +804,108 @@ fn paint_capture_settings(ui: &mut egui::Ui, tab: CaptureSettingsTab) {
         .show(ui, |ui| {
             let content_width = (card_width - 20.0).max(0.0);
             ui.set_width(content_width);
-            ui.label(RichText::new(model).strong());
+            ui.label(
+                RichText::new(match tab {
+                    CaptureSettingsTab::DsLogic => "DSLogic U3Pro16",
+                    CaptureSettingsTab::DsCope => "DSCope U3P100",
+                })
+                .strong(),
+            );
             ui.add_space(6.0);
-            egui::Grid::new(grid_id)
-                .num_columns(2)
-                .min_col_width(90.0)
-                .max_col_width(((content_width - 12.0) * 0.5).max(90.0))
-                .spacing([12.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Sample rate");
-                    ui.monospace("1 MHz");
-                    ui.end_row();
-                    ui.label("Buffer");
-                    ui.monospace("1M samples");
-                    ui.end_row();
-                    match tab {
-                        CaptureSettingsTab::DsLogic => {
+            match tab {
+                CaptureSettingsTab::DsLogic => {
+                    egui::Grid::new("dslogic_capture_settings")
+                        .num_columns(2)
+                        .min_col_width(90.0)
+                        .max_col_width(((content_width - 12.0) * 0.5).max(90.0))
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Sample rate");
+                            ui.monospace("1 MHz");
+                            ui.end_row();
+                            ui.label("Buffer");
+                            ui.monospace("1M samples");
+                            ui.end_row();
                             ui.label("Channels");
                             ui.monospace("D0–D15");
                             ui.end_row();
                             ui.label("Display");
                             ui.monospace("Per-channel colors");
                             ui.end_row();
-                        }
-                        CaptureSettingsTab::DsCope => {
-                            ui.label("Channels");
-                            ui.monospace("CH0 / CH1");
-                            ui.end_row();
-                            ui.label("Input scale");
-                            ui.monospace("1 V/div");
-                            ui.end_row();
-                            ui.label("Display scale");
-                            ui.monospace("Auto");
-                            ui.end_row();
+                        });
+                }
+                CaptureSettingsTab::DsCope => {
+                    let maximum_sample_rate_hz = scope_settings.maximum_sample_rate_hz();
+                    let maximum_sample_count = scope_settings.maximum_sample_count();
+                    if scope_settings.sample_rate_hz > maximum_sample_rate_hz {
+                        scope_settings.sample_rate_hz = maximum_sample_rate_hz;
+                    }
+                    if scope_settings.sample_count > maximum_sample_count {
+                        scope_settings.sample_count = maximum_sample_count;
+                    }
+                    ui.add_enabled_ui(enabled, |ui| {
+                        egui::Grid::new("dscope_common_capture_settings")
+                            .num_columns(2)
+                            .spacing([8.0, 5.0])
+                            .show(ui, |ui| {
+                                ui.label("Sample rate");
+                                egui::ComboBox::from_id_salt("scope_sample_rate")
+                                    .selected_text(format_sample_rate(
+                                        scope_settings.sample_rate_hz,
+                                    ))
+                                    .show_ui(ui, |ui| {
+                                        for rate in DSCOPE_SAMPLE_RATES_HZ
+                                            .into_iter()
+                                            .filter(|rate| *rate <= maximum_sample_rate_hz)
+                                        {
+                                            ui.selectable_value(
+                                                &mut scope_settings.sample_rate_hz,
+                                                rate,
+                                                format_sample_rate(rate),
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Buffer");
+                                egui::ComboBox::from_id_salt("scope_sample_count")
+                                    .selected_text(format_sample_count(scope_settings.sample_count))
+                                    .show_ui(ui, |ui| {
+                                        for count in DSCOPE_SAMPLE_COUNTS
+                                            .into_iter()
+                                            .filter(|count| *count <= maximum_sample_count)
+                                        {
+                                            ui.selectable_value(
+                                                &mut scope_settings.sample_count,
+                                                count,
+                                                format_sample_count(count),
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Maximum");
+                                ui.monospace(format_sample_rate(maximum_sample_rate_hz));
+                                ui.end_row();
+                            });
+                    });
+                    ui.add_space(8.0);
+                    let channel_count = scope_settings.channels.len();
+                    let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
+                    for (index, channel) in scope_settings.channels.iter_mut().enumerate() {
+                        paint_scope_channel_settings(
+                            ui,
+                            index,
+                            channel,
+                            channel_enabled[1 - index],
+                            enabled,
+                        );
+                        if index + 1 < channel_count {
+                            ui.add_space(6.0);
                         }
                     }
-                });
+                }
+            }
         });
 }
 
@@ -679,6 +955,7 @@ impl eframe::App for DsViewApp {
         let mut refresh_clicked = false;
         let mut start_clicked = false;
         let mut stop_clicked = false;
+        let capture_settings_enabled = !self.is_busy();
 
         egui::TopBottomPanel::top("toolbar")
             .frame(
@@ -741,7 +1018,12 @@ impl eframe::App for DsViewApp {
                             }
                         });
                         ui.add_space(6.0);
-                        paint_capture_settings(ui, self.active_capture_settings_tab);
+                        paint_capture_settings(
+                            ui,
+                            self.active_capture_settings_tab,
+                            &mut self.scope_settings,
+                            capture_settings_enabled,
+                        );
 
                         ui.add_space(14.0);
                         ui.label(RichText::new("RECORDING").strong().color(TEXT_MUTED));
@@ -890,6 +1172,7 @@ impl eframe::App for DsViewApp {
                 let mut logic_channel_colors = self.logic_channel_colors;
                 let mut logic_viewport = self.logic_viewport;
                 let mut scope_viewport = self.scope_viewport;
+                let scope_settings = self.scope_settings;
                 match self.active_waveform_tab {
                     Some(WaveformTab::LogicAnalyzer) => {
                         waveform_card_fill(
@@ -912,7 +1195,15 @@ impl eframe::App for DsViewApp {
                             ui,
                             "OSCILLOSCOPE",
                             "DSCope · CH0 / CH1",
-                            |ui, rect| paint_scope(ui, rect, waveforms, &mut scope_viewport),
+                            |ui, rect| {
+                                paint_scope(
+                                    ui,
+                                    rect,
+                                    waveforms,
+                                    &mut scope_viewport,
+                                    scope_settings,
+                                )
+                            },
                         );
                     }
                     Some(WaveformTab::Combined) => {
@@ -923,6 +1214,7 @@ impl eframe::App for DsViewApp {
                             &mut logic_channel_colors,
                             &mut logic_viewport,
                             &mut scope_viewport,
+                            scope_settings,
                         );
                     }
                     None => {}
@@ -1069,7 +1361,11 @@ fn has_required_fpga_resources(directory: &Path) -> bool {
     directory.join("DSLogicU3Pro16.bin").is_file() && directory.join("DSCopeU3P100.bin").is_file()
 }
 
-fn start_gui_recording(path: &Path, devices: &[DeviceDescriptor]) -> Result<FileRecorder, String> {
+fn start_gui_recording(
+    path: &Path,
+    devices: &[DeviceDescriptor],
+    scope_config: DsCopeCaptureConfig,
+) -> Result<FileRecorder, String> {
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1083,14 +1379,36 @@ fn start_gui_recording(path: &Path, devices: &[DeviceDescriptor]) -> Result<File
     let mut metadata = BTreeMap::new();
     metadata.insert("capture.command".to_owned(), "gui".to_owned());
     metadata.insert(
-        "capture.sample_rate_hz".to_owned(),
+        "logic.sample_rate_hz".to_owned(),
         SAMPLE_RATE_HZ.to_string(),
     );
+    metadata.insert("logic.sample_count".to_owned(), SAMPLE_COUNT.to_string());
     metadata.insert(
-        "capture.requested_sample_count".to_owned(),
-        SAMPLE_COUNT.to_string(),
+        "scope.sample_rate_hz".to_owned(),
+        scope_config.sample_rate_hz().to_string(),
     );
-    metadata.insert("scope.volts_per_div".to_owned(), "1".to_owned());
+    metadata.insert(
+        "scope.sample_count".to_owned(),
+        scope_config.sample_count().to_string(),
+    );
+    for (index, channel) in scope_config.channels().iter().enumerate() {
+        metadata.insert(
+            format!("scope.ch{index}.enabled"),
+            channel.enabled().to_string(),
+        );
+        metadata.insert(
+            format!("scope.ch{index}.volts_per_div_mv"),
+            channel.volts_per_div_mv().to_string(),
+        );
+        metadata.insert(
+            format!("scope.ch{index}.coupling"),
+            coupling_label(channel.coupling()).to_ascii_lowercase(),
+        );
+        metadata.insert(
+            format!("scope.ch{index}.probe_attenuation"),
+            channel.probe_attenuation().to_string(),
+        );
+    }
     RecordingWriter::new(BufWriter::new(file), devices, metadata).map_err(|error| error.to_string())
 }
 
@@ -1117,10 +1435,9 @@ fn append_error(error: &mut Option<String>, additional: String) {
 fn start_capture(
     devices: Vec<DiscoveredDevice>,
     resource_directory: &Path,
+    scope_config: DsCopeCaptureConfig,
 ) -> Result<CaptureSession, String> {
     let logic_config = DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)
-        .map_err(|error| error.to_string())?;
-    let scope_config = DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)
         .map_err(|error| error.to_string())?;
     let mut sources = Vec::<Box<dyn CaptureSource>>::with_capacity(devices.len());
     for device in devices {
@@ -1193,6 +1510,7 @@ fn combined_waveform_cards(
     logic_channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
     logic_viewport: &mut WaveformViewport,
     scope_viewport: &mut WaveformViewport,
+    scope_settings: ScopeCaptureSettings,
 ) {
     let available = ui.available_rect_before_wrap();
     let (logic_height, _) = combined_pane_heights(available.height(), *logic_ratio);
@@ -1257,7 +1575,7 @@ fn combined_waveform_cards(
         &mut scope_ui,
         "OSCILLOSCOPE",
         "DSCope · CH0 / CH1",
-        |ui, rect| paint_scope(ui, rect, waveforms, scope_viewport),
+        |ui, rect| paint_scope(ui, rect, waveforms, scope_viewport, scope_settings),
     );
 
     let divider_color = if divider_response.hovered() || divider_response.dragged() {
@@ -1694,26 +2012,6 @@ fn paint_logic(
     );
 }
 
-fn scope_volts_per_div(minimum: f32, maximum: f32) -> f32 {
-    let peak = minimum.abs().max(maximum.abs());
-    if !peak.is_finite() || peak <= f32::EPSILON {
-        return DEFAULT_SCOPE_VOLTS_PER_DIV;
-    }
-    let required = peak / (SCOPE_VERTICAL_DIVISIONS as f32 * 0.5 * 0.9);
-    let decade = 10.0_f32.powf(required.log10().floor());
-    let normalized = required / decade;
-    let step = if normalized <= 1.0 {
-        1.0
-    } else if normalized <= 2.0 {
-        2.0
-    } else if normalized <= 5.0 {
-        5.0
-    } else {
-        10.0
-    };
-    (step * decade).clamp(0.001, 5.0)
-}
-
 fn format_voltage(value: f32) -> String {
     if value.abs() >= 1.0 {
         format!("{value:.2} V")
@@ -1725,7 +2023,9 @@ fn format_voltage(value: f32) -> String {
 }
 
 fn format_sample_rate(rate_hz: u64) -> String {
-    if rate_hz >= 1_000_000 {
+    if rate_hz >= 1_000_000_000 {
+        format!("{:.2} GSa/s", rate_hz as f64 / 1_000_000_000.0)
+    } else if rate_hz >= 1_000_000 {
         format!("{:.2} MSa/s", rate_hz as f64 / 1_000_000.0)
     } else if rate_hz >= 1_000 {
         format!("{:.2} kSa/s", rate_hz as f64 / 1_000.0)
@@ -1792,24 +2092,39 @@ fn paint_scope_graticule(painter: &egui::Painter, rect: Rect) {
 fn paint_scope_readouts(
     painter: &egui::Painter,
     rect: Rect,
-    volts_per_div: f32,
     visible_samples: usize,
     sample_rate_hz: u64,
-    channel_count: usize,
+    settings: ScopeCaptureSettings,
 ) {
-    let scale = format_voltage(volts_per_div);
-    for (channel, color) in SCOPE_COLORS.iter().enumerate().take(channel_count) {
+    let mut visible_row = 0;
+    for (channel, color) in SCOPE_COLORS.iter().enumerate() {
+        let channel_settings = settings.channels[channel];
+        if !channel_settings.enabled {
+            continue;
+        }
+        let scale = f32::from(channel_settings.volts_per_div_mv) / 1_000.0
+            * f32::from(channel_settings.probe_attenuation);
         painter.text(
-            rect.left_top() + Vec2::new(8.0, 7.0 + channel as f32 * 14.0),
+            rect.left_top() + Vec2::new(8.0, 7.0 + visible_row as f32 * 14.0),
             egui::Align2::LEFT_TOP,
-            format!("CH{}  {scale}/div  DC", channel + 1),
+            format!(
+                "CH{}  {}/div  {}  {}×",
+                channel,
+                format_voltage(scale),
+                coupling_label(channel_settings.coupling),
+                channel_settings.probe_attenuation,
+            ),
             FontId::monospace(10.0),
             *color,
         );
+        visible_row += 1;
     }
 
     let zero_y = rect.center().y;
     for (channel, color) in SCOPE_COLORS.iter().enumerate() {
+        if !settings.channels[channel].enabled {
+            continue;
+        }
         let x = rect.left() + 2.0 + channel as f32 * 8.0;
         painter.add(egui::Shape::convex_polygon(
             vec![
@@ -1827,7 +2142,7 @@ fn paint_scope_readouts(
             rect.center_bottom() + Vec2::new(0.0, -6.0),
             egui::Align2::CENTER_BOTTOM,
             format!(
-                "AUTO  ·  {}  ·  {visible_samples} pts",
+                "RUN  ·  {}  ·  {visible_samples} pts",
                 format_sample_rate(sample_rate_hz)
             ),
             FontId::monospace(10.0),
@@ -1841,6 +2156,7 @@ fn paint_scope(
     rect: Rect,
     waveforms: &WaveformStore,
     viewport: &mut WaveformViewport,
+    settings: ScopeCaptureSettings,
 ) {
     paint_plot_background(ui, rect);
     let painter = ui.painter();
@@ -1852,6 +2168,9 @@ fn paint_scope(
     let sample_count = waveforms
         .scope_channels
         .iter()
+        .enumerate()
+        .filter(|(index, _)| settings.channels[*index].enabled)
+        .map(|(_, samples)| samples)
         .map(VecDeque::len)
         .min()
         .unwrap_or(0);
@@ -1862,17 +2181,16 @@ fn paint_scope(
         paint_scope_readouts(
             &scope_painter,
             plot,
-            DEFAULT_SCOPE_VOLTS_PER_DIV,
             idle_range.len(),
-            SAMPLE_RATE_HZ,
-            SCOPE_COLORS.len(),
+            settings.sample_rate_hz,
+            settings,
         );
         paint_empty(&scope_painter, plot, "Waiting for oscilloscope samples");
         paint_waveform_time_scale(
             painter,
             time_ruler,
             0..0,
-            waveforms.scope_rate_hz,
+            settings.sample_rate_hz,
             waveforms.scope_sample_offset,
             *viewport,
         );
@@ -1880,27 +2198,26 @@ fn paint_scope(
             painter,
             status_bar,
             idle_range.len(),
-            SAMPLE_RATE_HZ,
+            settings.sample_rate_hz,
             *viewport,
         );
         return;
     }
 
-    let mut minimum = f32::INFINITY;
-    let mut maximum = f32::NEG_INFINITY;
-    for channel in &waveforms.scope_channels {
-        for index in visible_range.clone() {
-            minimum = minimum.min(channel[index]);
-            maximum = maximum.max(channel[index]);
-        }
-    }
-    let volts_per_div = scope_volts_per_div(minimum, maximum);
-    let voltage_span = volts_per_div * SCOPE_VERTICAL_DIVISIONS as f32;
     let step = (visible_count as f32 / plot.width().max(1.0))
         .floor()
         .max(1.0) as usize;
 
     for (channel_index, channel) in waveforms.scope_channels.iter().enumerate() {
+        let Some(channel_settings) = settings.channels.get(channel_index).copied() else {
+            continue;
+        };
+        if !channel_settings.enabled {
+            continue;
+        }
+        let volts_per_div = f32::from(channel_settings.volts_per_div_mv) / 1_000.0
+            * f32::from(channel_settings.probe_attenuation);
+        let voltage_span = volts_per_div * SCOPE_VERTICAL_DIVISIONS as f32;
         let points = visible_range
             .clone()
             .step_by(step)
@@ -1926,10 +2243,9 @@ fn paint_scope(
     paint_scope_readouts(
         &scope_painter,
         plot,
-        volts_per_div,
         visible_count,
         waveforms.scope_rate_hz,
-        waveforms.scope_channels.len(),
+        settings,
     );
     paint_waveform_time_scale(
         painter,
@@ -1988,11 +2304,14 @@ mod tests {
     #[test]
     fn waveform_store_keeps_newest_samples_within_bound() {
         let mut store = WaveformStore::default();
-        store.ingest(&CaptureBatch::Logic(LogicBatch {
-            sample_rate_hz: 1_000,
-            channel_count: 2,
-            samples: (0..MAX_WAVEFORM_SAMPLES as u32 + 10).collect(),
-        }));
+        store.ingest(
+            &CaptureBatch::Logic(LogicBatch {
+                sample_rate_hz: 1_000,
+                channel_count: 2,
+                samples: (0..MAX_WAVEFORM_SAMPLES as u32 + 10).collect(),
+            }),
+            [true, true],
+        );
 
         assert_eq!(store.logic_samples.len(), MAX_WAVEFORM_SAMPLES);
         assert_eq!(store.logic_samples.front(), Some(&10));
@@ -2002,14 +2321,32 @@ mod tests {
     #[test]
     fn waveform_store_tracks_scope_channels() {
         let mut store = WaveformStore::default();
-        store.ingest(&CaptureBatch::Scope(ScopeBatch {
-            sample_rate_hz: 1_000_000,
-            channels: vec![vec![0.1, 0.2], vec![-0.1, -0.2]],
-        }));
+        store.ingest(
+            &CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000_000,
+                channels: vec![vec![0.1, 0.2], vec![-0.1, -0.2]],
+            }),
+            [true, true],
+        );
 
         assert_eq!(store.scope_rate_hz, 1_000_000);
         assert_eq!(store.scope_channels[0].back(), Some(&0.2));
         assert_eq!(store.scope_channels[1].back(), Some(&-0.2));
+    }
+
+    #[test]
+    fn waveform_store_preserves_single_scope_channel_identity() {
+        let mut store = WaveformStore::default();
+        store.ingest(
+            &CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000_000_000,
+                channels: vec![vec![0.1, 0.2]],
+            }),
+            [false, true],
+        );
+
+        assert!(store.scope_channels[0].is_empty());
+        assert_eq!(store.scope_channels[1].back(), Some(&0.2));
     }
 
     #[test]
@@ -2128,11 +2465,53 @@ mod tests {
     }
 
     #[test]
-    fn oscilloscope_auto_scale_uses_zero_centered_125_steps() {
-        assert_eq!(scope_volts_per_div(0.0, 0.0), 1.0);
-        assert!((scope_volts_per_div(0.255, 0.340) - 0.1).abs() < f32::EPSILON);
-        assert!((scope_volts_per_div(-1.2, 0.4) - 0.5).abs() < f32::EPSILON);
+    fn scope_settings_map_common_and_per_channel_configuration() {
+        let settings = ScopeCaptureSettings {
+            sample_rate_hz: 2_000_000,
+            sample_count: 250_000,
+            channels: [
+                ScopeChannelSettings {
+                    enabled: true,
+                    volts_per_div_mv: 100,
+                    coupling: DsCopeCoupling::Ac,
+                    probe_attenuation: 10,
+                },
+                ScopeChannelSettings {
+                    enabled: false,
+                    volts_per_div_mv: 2_000,
+                    coupling: DsCopeCoupling::Dc,
+                    probe_attenuation: 1,
+                },
+            ],
+        };
+
+        let config = settings.capture_config().unwrap();
+        assert_eq!(config.sample_rate_hz(), 2_000_000);
+        assert_eq!(config.sample_count(), 250_000);
+        assert_eq!(config.channels()[0].volts_per_div_mv(), 100);
+        assert_eq!(config.channels()[0].coupling(), DsCopeCoupling::Ac);
+        assert_eq!(config.channels()[0].probe_attenuation(), 10);
+        assert_eq!(config.channels()[1].volts_per_div_mv(), 2_000);
+        assert_eq!(config.channels()[1].coupling(), DsCopeCoupling::Dc);
+        assert_eq!(config.channels()[1].probe_attenuation(), 1);
+        assert!(!config.channels()[1].enabled());
         assert_eq!(format_voltage(0.1), "100 mV");
         assert_eq!(format_sample_rate(1_000_000), "1.00 MSa/s");
+        assert_eq!(format_sample_rate(1_000_000_000), "1.00 GSa/s");
+    }
+
+    #[test]
+    fn scope_limits_follow_the_enabled_channel_count() {
+        let mut settings = ScopeCaptureSettings::default();
+        assert_eq!(settings.maximum_sample_rate_hz(), 500_000_000);
+        assert_eq!(settings.maximum_sample_count(), 1_000_000);
+
+        settings.channels[1].enabled = false;
+        settings.sample_rate_hz = 1_000_000_000;
+        settings.sample_count = 2_000_000;
+
+        assert_eq!(settings.maximum_sample_rate_hz(), 1_000_000_000);
+        assert_eq!(settings.maximum_sample_count(), 2_000_000);
+        assert!(settings.capture_config().is_ok());
     }
 }

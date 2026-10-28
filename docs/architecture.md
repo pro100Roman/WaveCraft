@@ -118,13 +118,17 @@ arm/start/stop commands, trigger-header validation, and conversion of
 channel-major 64-sample bitmaps into `LogicBatch` sample words. Cancellation
 forces the FPGA read path ready before stopping it.
 
-The DSCope U3P100 driver implements an initial finite two-channel mode at 1 MHz.
-It configures the 1 GHz front-end clock and ADC, validates and applies the
-per-channel 1 V/div VGA and offset calibration stored in flash, validates the
-trigger header and measurement footer, and converts interleaved ADC bytes into
-channel-major `ScopeBatch` voltages. It trusts the footer's valid sample length
-rather than padding to the requested buffer size. Broader sample-rate/range
-support remains future work; driver code stays independent of the UI.
+The DSCope U3P100 driver implements finite one- or two-channel capture with
+selectable sample rate and buffer length. Each channel independently selects volts/div,
+AC/DC coupling, and probe attenuation. The driver configures the 1 GHz
+front-end clock and ADC, validates and applies the matching per-channel VGA and
+offset calibration stored in flash, validates the trigger header and
+measurement footer, and converts interleaved ADC bytes into channel-major
+`ScopeBatch` voltages. It trusts the footer's valid sample length rather than
+padding to the requested buffer size. The ADC routing, FPGA channel mask,
+transfer layout, and sample-rate ceiling adapt to one or two enabled channels;
+the shared 2M-sample DSO memory is divided between enabled channels. Driver code
+stays independent of the UI.
 
 The `capture-usb` development command places one physical DSLogic source and one
 physical DSCope source in the same `CaptureSession`. Both workers prepare and

@@ -468,7 +468,10 @@ impl UsbDeviceSession {
         Ok(())
     }
 
-    pub(crate) fn initialize_dscope_frontend(&self) -> Result<(), UsbError> {
+    pub(crate) fn initialize_dscope_frontend(
+        &self,
+        enabled_channels: [bool; 2],
+    ) -> Result<(), UsbError> {
         const ADC_DUAL_CHANNEL: &[(u16, &[u8])] = &[
             (ANALOG_CONTROL_REGISTER + 1, &[0x03, 0x01, 0x00]),
             (ANALOG_CONTROL_REGISTER, &[0x00, 0x02, 0x01, 0x31]),
@@ -482,6 +485,34 @@ impl UsbDeviceSession {
             (ANALOG_CONTROL_REGISTER, &[0x00, 0x00, 0x00, 0x55]),
             (ANALOG_CONTROL_REGISTER, &[0x00, 0x02, 0x00, 0x33]),
             (ANALOG_CONTROL_REGISTER, &[0x00, 0x33, 0x00, 0x2b]),
+        ];
+        const ADC_SINGLE_CHANNEL_ZERO: &[(u16, &[u8])] = &[
+            (ANALOG_CONTROL_REGISTER + 1, &[0x03, 0x01, 0x00]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x01, 0x00, 0x31]),
+            (ANALOG_CONTROL_REGISTER + 1, &[0x01]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x02, 0x02, 0x3a]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x02, 0x02, 0x3b]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x00, 0x00, 0x42]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x34, 0x00, 0x50]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x22, 0x02, 0x11]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x7f, 0x00, 0x24]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x00, 0x00, 0x55]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x02, 0x00, 0x33]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x00, 0x03, 0x2b]),
+        ];
+        const ADC_SINGLE_CHANNEL_ONE: &[(u16, &[u8])] = &[
+            (ANALOG_CONTROL_REGISTER + 1, &[0x03, 0x01, 0x00]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x01, 0x00, 0x31]),
+            (ANALOG_CONTROL_REGISTER + 1, &[0x01]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x10, 0x10, 0x3a]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x10, 0x10, 0x3b]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x00, 0x00, 0x42]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x34, 0x00, 0x50]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x22, 0x02, 0x11]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x00, 0x00, 0x24]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x00, 0x00, 0x55]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x02, 0x00, 0x33]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x00, 0x03, 0x2b]),
         ];
         self.write_control(
             I2C_REGISTER_DESTINATION,
@@ -498,7 +529,17 @@ impl UsbDeviceSession {
             self.write_control(I2C_REGISTER_DESTINATION, ANALOG_CONTROL_REGISTER, &[value])?;
         }
 
-        for (register, values) in ADC_DUAL_CHANNEL {
+        let adc_configuration = match enabled_channels {
+            [true, true] => ADC_DUAL_CHANNEL,
+            [true, false] => ADC_SINGLE_CHANNEL_ZERO,
+            [false, true] => ADC_SINGLE_CHANNEL_ONE,
+            [false, false] => {
+                return Err(UsbError::new(
+                    "cannot initialize the DSCope front-end without an enabled channel",
+                ))
+            }
+        };
+        for (register, values) in adc_configuration {
             for value in *values {
                 self.write_control(I2C_REGISTER_DESTINATION, *register, &[*value])?;
             }
@@ -524,9 +565,22 @@ impl UsbDeviceSession {
         self.read_control(NVM_DESTINATION, address, data)
     }
 
-    pub(crate) fn enable_dscope_channels(&self) -> Result<(), UsbError> {
-        self.write_control(DSO_CHANNEL_ZERO_ENABLE_DESTINATION, 0, &[1 << 7])?;
-        self.write_control(DSO_CHANNEL_ONE_ENABLE_DESTINATION, 0, &[1 << 5])
+    pub(crate) fn configure_dscope_channels(
+        &self,
+        enabled_channels: [bool; 2],
+    ) -> Result<(), UsbError> {
+        let channel_zero = if enabled_channels[0] {
+            1 << 7
+        } else {
+            !(1 << 7)
+        };
+        let channel_one = if enabled_channels[1] {
+            1 << 5
+        } else {
+            !(1 << 5)
+        };
+        self.write_control(DSO_CHANNEL_ZERO_ENABLE_DESTINATION, 0, &[channel_zero])?;
+        self.write_control(DSO_CHANNEL_ONE_ENABLE_DESTINATION, 0, &[channel_one])
     }
 
     pub fn close(mut self) -> Result<(), UsbError> {

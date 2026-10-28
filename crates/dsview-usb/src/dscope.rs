@@ -7,10 +7,9 @@ use dsview_core::{
 use std::time::{Duration, Instant};
 
 const CHANNEL_COUNT: usize = 2;
-const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const HARDWARE_SAMPLE_RATE_HZ: u64 = 1_000_000_000;
 const SAMPLE_ALIGNMENT: u64 = 1_024;
-const MAX_SAMPLE_COUNT: u64 = 1_000_000;
+const MAX_TOTAL_SAMPLE_COUNT: u64 = 2_000_000;
 const SETTINGS_BYTES: usize = 372;
 const TRIGGER_HEADER_BYTES: usize = 1_024;
 const MEASUREMENT_FOOTER_BYTES: usize = 1_024;
@@ -18,37 +17,173 @@ const TRIGGER_CHECK_ID: u32 = 0x5555_5555;
 const DSO_PACKET_ID: u16 = 0xa500;
 const SCOPE_BATCH_SAMPLES: usize = 65_536;
 const CAPTURE_COMPLETION_GRACE: Duration = Duration::from_secs(5);
-const VOLTAGE_RANGE: f32 = 10.0;
 const ADC_REFERENCE_SPAN: f32 = 235.0;
 const CALIBRATION_ZERO_BYTES: usize = 30;
 const CALIBRATION_VGA_BYTES: usize = 17;
 const CALIBRATION_FLASH_PAGE_STRIDE: u16 = 8;
 const CALIBRATION_ID_BASE: u8 = 0x40;
-const CALIBRATION_VDIV_INDEX: usize = 6;
 const NOMINAL_CENTER_OFFSET: u64 = 128;
 const OFFSET_PWM_SPAN: u64 = 780;
+
+pub const DSCOPE_SAMPLE_RATES_HZ: [u64; 17] = [
+    100_000,
+    200_000,
+    400_000,
+    500_000,
+    1_000_000,
+    2_000_000,
+    4_000_000,
+    5_000_000,
+    10_000_000,
+    20_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000,
+    125_000_000,
+    250_000_000,
+    500_000_000,
+    1_000_000_000,
+];
+pub const DSCOPE_SAMPLE_COUNTS: [u64; 7] = [
+    10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000,
+];
+pub const DSCOPE_VOLTS_PER_DIV_MV: [u16; 8] = [10, 20, 50, 100, 200, 500, 1_000, 2_000];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DsCopeCoupling {
+    Dc,
+    Ac,
+}
+
+impl DsCopeCoupling {
+    fn command_bit(self) -> u64 {
+        match self {
+            Self::Dc => 0x100,
+            Self::Ac => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DsCopeChannelConfig {
+    enabled: bool,
+    volts_per_div_mv: u16,
+    coupling: DsCopeCoupling,
+    probe_attenuation: u8,
+}
+
+impl Default for DsCopeChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            volts_per_div_mv: 1_000,
+            coupling: DsCopeCoupling::Dc,
+            probe_attenuation: 1,
+        }
+    }
+}
+
+impl DsCopeChannelConfig {
+    pub fn new(
+        volts_per_div_mv: u16,
+        coupling: DsCopeCoupling,
+        probe_attenuation: u8,
+    ) -> Result<Self, CaptureError> {
+        if !DSCOPE_VOLTS_PER_DIV_MV.contains(&volts_per_div_mv) {
+            return Err(CaptureError::new(format!(
+                "unsupported DSCope volts/div value: {volts_per_div_mv} mV"
+            )));
+        }
+        if !matches!(probe_attenuation, 1 | 10) {
+            return Err(CaptureError::new(format!(
+                "unsupported DSCope probe attenuation: {probe_attenuation}x"
+            )));
+        }
+        Ok(Self {
+            enabled: true,
+            volts_per_div_mv,
+            coupling,
+            probe_attenuation,
+        })
+    }
+
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    pub fn volts_per_div_mv(self) -> u16 {
+        self.volts_per_div_mv
+    }
+
+    pub fn coupling(self) -> DsCopeCoupling {
+        self.coupling
+    }
+
+    pub fn probe_attenuation(self) -> u8 {
+        self.probe_attenuation
+    }
+
+    fn calibration_index(self) -> usize {
+        DSCOPE_VOLTS_PER_DIV_MV
+            .iter()
+            .position(|candidate| *candidate == self.volts_per_div_mv)
+            .expect("validated volts/div value is present")
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DsCopeCaptureConfig {
     sample_rate_hz: u64,
     sample_count: u64,
+    channels: [DsCopeChannelConfig; CHANNEL_COUNT],
 }
 
 impl DsCopeCaptureConfig {
     pub fn new(sample_rate_hz: u64, sample_count: u64) -> Result<Self, CaptureError> {
-        if sample_rate_hz != SAMPLE_RATE_HZ {
+        Self::with_channel_configs(
+            sample_rate_hz,
+            sample_count,
+            [DsCopeChannelConfig::default(); CHANNEL_COUNT],
+        )
+    }
+
+    pub fn with_channel_configs(
+        sample_rate_hz: u64,
+        sample_count: u64,
+        channels: [DsCopeChannelConfig; CHANNEL_COUNT],
+    ) -> Result<Self, CaptureError> {
+        if !DSCOPE_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
             return Err(CaptureError::new(format!(
-                "the initial DSCope U3P100 driver supports only {SAMPLE_RATE_HZ} Hz"
+                "unsupported DSCope U3P100 sample rate: {sample_rate_hz} Hz"
             )));
         }
-        if !(SAMPLE_ALIGNMENT..=MAX_SAMPLE_COUNT).contains(&sample_count) {
+        let enabled_channel_count = channels.iter().filter(|channel| channel.enabled).count();
+        if enabled_channel_count == 0 {
+            return Err(CaptureError::new(
+                "DSCope U3P100 capture requires at least one enabled channel",
+            ));
+        }
+        let maximum_rate_hz = HARDWARE_SAMPLE_RATE_HZ / enabled_channel_count as u64;
+        if sample_rate_hz > maximum_rate_hz {
             return Err(CaptureError::new(format!(
-                "DSCope U3P100 sample count must be between {SAMPLE_ALIGNMENT} and {MAX_SAMPLE_COUNT}"
+                "DSCope U3P100 supports at most {maximum_rate_hz} Hz with {enabled_channel_count} enabled channel(s)"
+            )));
+        }
+        let maximum_sample_count = MAX_TOTAL_SAMPLE_COUNT / enabled_channel_count as u64;
+        if !(SAMPLE_ALIGNMENT..=maximum_sample_count).contains(&sample_count) {
+            return Err(CaptureError::new(format!(
+                "DSCope U3P100 sample count must be between {SAMPLE_ALIGNMENT} and {maximum_sample_count} with {enabled_channel_count} enabled channel(s)"
             )));
         }
         Ok(Self {
             sample_rate_hz,
             sample_count,
+            channels,
         })
     }
 
@@ -60,17 +195,38 @@ impl DsCopeCaptureConfig {
         self.sample_count
     }
 
+    pub fn channels(self) -> [DsCopeChannelConfig; CHANNEL_COUNT] {
+        self.channels
+    }
+
+    pub fn enabled_channel_count(self) -> usize {
+        self.channels
+            .iter()
+            .filter(|channel| channel.enabled)
+            .count()
+    }
+
+    fn enabled_channel_indices(self) -> impl Iterator<Item = usize> {
+        self.channels
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, channel)| channel.enabled.then_some(index))
+    }
+
     fn armed_sample_count(self) -> u64 {
         self.sample_count.div_ceil(SAMPLE_ALIGNMENT) * SAMPLE_ALIGNMENT
     }
 
     fn divider(self) -> u32 {
-        HARDWARE_SAMPLE_RATE_HZ.div_ceil(self.sample_rate_hz * CHANNEL_COUNT as u64) as u32
+        HARDWARE_SAMPLE_RATE_HZ.div_ceil(self.sample_rate_hz * self.enabled_channel_count() as u64)
+            as u32
     }
 
     fn encode_settings(self) -> Vec<u8> {
         let armed_samples = self.armed_sample_count();
-        let capture_count = armed_samples >> 4;
+        let channel_count = self.enabled_channel_count() as u64;
+        let channel_ratio = CHANNEL_COUNT as u64 / channel_count;
+        let capture_count = (armed_samples / channel_ratio) >> 4;
         let divider = self.divider();
         let mut bytes = Vec::with_capacity(SETTINGS_BYTES);
         push_u32(&mut bytes, 0xf5a5_f5a5);
@@ -86,12 +242,20 @@ impl DsCopeCaptureConfig {
         push_u16(&mut bytes, 64);
         push_u16(&mut bytes, 0);
         push_u16(&mut bytes, 0x0701);
-        push_u16(&mut bytes, (CHANNEL_COUNT as u16) << 8);
+        push_u16(&mut bytes, (channel_count as u16) << 8);
         push_u16(&mut bytes, 0x0802);
-        push_u16(&mut bytes, self.sample_count as u16);
-        push_u16(&mut bytes, (self.sample_count >> 16) as u16);
+        let dso_count = self.sample_count / channel_ratio;
+        push_u16(&mut bytes, dso_count as u16);
+        push_u16(&mut bytes, (dso_count >> 16) as u16);
         push_u16(&mut bytes, 0x0a02);
-        push_u16(&mut bytes, 0b11);
+        let channel_mask = self
+            .channels
+            .iter()
+            .enumerate()
+            .fold(0_u16, |mask, (index, channel)| {
+                mask | (u16::from(channel.enabled) << index)
+            });
+        push_u16(&mut bytes, channel_mask);
         push_u16(&mut bytes, 0);
         push_u16(&mut bytes, 0x0c01);
         push_u16(&mut bytes, 0);
@@ -171,11 +335,14 @@ fn run_capture(
     validate_device_ready(session)?;
     session.stop_capture().map_err(capture_error)?;
     let capture_result = (|| {
+        let enabled_channels = config.channels.map(|channel| channel.enabled);
         session
-            .initialize_dscope_frontend()
+            .initialize_dscope_frontend(enabled_channels)
             .map_err(capture_error)?;
-        let calibration = DsCopeCalibration::load(session)?;
-        session.enable_dscope_channels().map_err(capture_error)?;
+        let calibration = DsCopeCalibration::load(session, config)?;
+        session
+            .configure_dscope_channels(enabled_channels)
+            .map_err(capture_error)?;
         configure_scope(session, config, calibration)?;
         session
             .arm_capture(&config.encode_settings())
@@ -246,8 +413,8 @@ fn dso_commands(config: DsCopeCaptureConfig, calibration: DsCopeCalibration) -> 
     let channel_one = calibration.channels[1];
     [
         0xa5a5_a500,
-        0x0f00,
-        0x0f80,
+        coupling_command(config, 0, config.channels[0].coupling),
+        coupling_command(config, 1, config.channels[1].coupling),
         0x08 + u64::from(channel_zero.vga_gain),
         0x88 + u64::from(channel_one.vga_gain),
         offset_command(0x10, channel_zero.preoffset),
@@ -260,6 +427,17 @@ fn dso_commands(config: DsCopeCaptureConfig, calibration: DsCopeCalibration) -> 
         0x0080_8038,
         0x0840,
     ]
+}
+
+fn coupling_command(config: DsCopeCaptureConfig, channel: usize, coupling: DsCopeCoupling) -> u64 {
+    let command = if config.enabled_channel_count() == CHANNEL_COUNT {
+        0x0e00
+    } else if config.channels[0].enabled {
+        0x1600
+    } else {
+        0x1a00
+    };
+    command + ((channel as u64) << 7) + coupling.command_bit()
 }
 
 fn offset_command(command: u64, preoffset: u16) -> u64 {
@@ -281,7 +459,7 @@ struct DsCopeCalibration {
 }
 
 impl DsCopeCalibration {
-    fn load(session: &UsbDeviceSession) -> Result<Self, CaptureError> {
+    fn load(session: &UsbDeviceSession, config: DsCopeCaptureConfig) -> Result<Self, CaptureError> {
         let mut channels = [DsCopeChannelCalibration {
             preoffset: 0,
             vga_gain: 0,
@@ -297,7 +475,12 @@ impl DsCopeCalibration {
             session
                 .read_dscope_nvm(page + 1, &mut vga_record)
                 .map_err(capture_error)?;
-            *calibration = parse_channel_calibration(channel, &zero_record, &vga_record)?;
+            *calibration = parse_channel_calibration(
+                channel,
+                config.channels[channel].calibration_index(),
+                &zero_record,
+                &vga_record,
+            )?;
         }
         Ok(Self { channels })
     }
@@ -315,6 +498,7 @@ impl DsCopeCalibration {
 
 fn parse_channel_calibration(
     channel: usize,
+    vdiv_index: usize,
     zero_record: &[u8; CALIBRATION_ZERO_BYTES],
     vga_record: &[u8; CALIBRATION_VGA_BYTES],
 ) -> Result<DsCopeChannelCalibration, CaptureError> {
@@ -333,12 +517,18 @@ fn parse_channel_calibration(
         )));
     }
 
-    let table_offset = 1 + CALIBRATION_VDIV_INDEX * 2;
+    if vdiv_index >= DSCOPE_VOLTS_PER_DIV_MV.len() {
+        return Err(CaptureError::new(format!(
+            "DSCope volts/div calibration index {vdiv_index} is out of range"
+        )));
+    }
+    let table_offset = 1 + vdiv_index * 2;
     let preoffset = read_u16(zero_record, table_offset);
     let vga_gain = u32::from(read_u16(vga_record, table_offset)) << 8;
     if preoffset > 1_023 || vga_gain == 0 || vga_gain > 0x001f_ff00 {
         return Err(CaptureError::new(format!(
-            "invalid DSCope channel {channel} 1 V/div calibration: preoffset {preoffset}, VGA gain 0x{vga_gain:08x}"
+            "invalid DSCope channel {channel} {} mV/div calibration: preoffset {preoffset}, VGA gain 0x{vga_gain:08x}",
+            DSCOPE_VOLTS_PER_DIV_MV[vdiv_index]
         )));
     }
     Ok(DsCopeChannelCalibration {
@@ -360,7 +550,7 @@ fn read_prequeued_capture(
 ) -> Result<Option<RawScopeCapture>, CaptureError> {
     let payload_bytes = usize::try_from(config.armed_sample_count())
         .ok()
-        .and_then(|samples| samples.checked_mul(CHANNEL_COUNT))
+        .and_then(|samples| samples.checked_mul(config.enabled_channel_count()))
         .and_then(|bytes| bytes.checked_add(MEASUREMENT_FOOTER_BYTES))
         .ok_or_else(|| CaptureError::new("requested DSCope payload is too large"))?;
     let mut header_read = session
@@ -473,15 +663,19 @@ fn decode_capture(
     context: &CaptureContext,
 ) -> Result<(), CaptureError> {
     validate_trigger_header(&capture.trigger_header)?;
+    let enabled_channel_count = config.enabled_channel_count();
+    let enabled_channel_indices = config.enabled_channel_indices().collect::<Vec<_>>();
     let measurement_offset = usize::try_from(config.armed_sample_count())
         .expect("validated sample count fits usize")
-        * CHANNEL_COUNT;
+        * enabled_channel_count;
     let measurement = ScopeMeasurement::decode(&capture.payload[measurement_offset..], config)?;
     let sample_count = usize::try_from(measurement.sample_count)
         .expect("32-bit measurement sample count fits usize");
+    // The hardware trigger offset is expressed in two-byte ADC words even in
+    // single-channel interleaved mode.
     let data_start = usize::from(measurement.trigger_offset) * CHANNEL_COUNT;
     let data_bytes = sample_count
-        .checked_mul(CHANNEL_COUNT)
+        .checked_mul(enabled_channel_count)
         .and_then(|bytes| data_start.checked_add(bytes))
         .ok_or_else(|| CaptureError::new("DSCope sample window is too large"))?;
     if data_bytes > measurement_offset {
@@ -492,17 +686,22 @@ fn decode_capture(
 
     let samples = &capture.payload[data_start..data_bytes];
     for (sequence, chunk) in samples
-        .chunks(SCOPE_BATCH_SAMPLES * CHANNEL_COUNT)
+        .chunks(SCOPE_BATCH_SAMPLES * enabled_channel_count)
         .enumerate()
     {
         let frame_sample_offset = sequence * SCOPE_BATCH_SAMPLES;
-        let mut channels = vec![
-            Vec::with_capacity(chunk.len() / CHANNEL_COUNT),
-            Vec::with_capacity(chunk.len() / CHANNEL_COUNT),
-        ];
-        for pair in chunk.chunks_exact(CHANNEL_COUNT) {
-            channels[0].push(raw_to_volts(pair[0], measurement.hardware_offsets[0]));
-            channels[1].push(raw_to_volts(pair[1], measurement.hardware_offsets[1]));
+        let samples_per_channel = chunk.len() / enabled_channel_count;
+        let mut channels = vec![Vec::with_capacity(samples_per_channel); enabled_channel_count];
+        for wire_samples in chunk.chunks_exact(enabled_channel_count) {
+            for (wire_index, physical_channel) in
+                enabled_channel_indices.iter().copied().enumerate()
+            {
+                channels[wire_index].push(raw_to_volts(
+                    wire_samples[wire_index],
+                    measurement.hardware_offsets[physical_channel],
+                    config.channels[physical_channel],
+                ));
+            }
         }
         let captured_at = capture.capture_origin
             + Duration::from_secs_f64(frame_sample_offset as f64 / config.sample_rate_hz as f64);
@@ -543,13 +742,17 @@ impl ScopeMeasurement {
         if read_u16(footer, 0) != DSO_PACKET_ID {
             return Err(CaptureError::new("invalid DSCope measurement packet ID"));
         }
-        let sample_count = read_u32(footer, 4) & 0x0fff_ffff;
+        let valid_length = read_u32(footer, 4) & 0x0fff_ffff;
         let divider = read_u32(footer, 8) & 0x00ff_ffff;
-        if divider != config.divider() || sample_count == 0 {
+        if divider != config.divider() || valid_length == 0 {
             return Err(CaptureError::new(format!(
-                "invalid DSCope measurement metadata: divider {divider}, samples {sample_count}"
+                "invalid DSCope measurement metadata: divider {divider}, valid length {valid_length}"
             )));
         }
+        let channel_ratio = CHANNEL_COUNT / config.enabled_channel_count();
+        let sample_count = valid_length
+            .checked_mul(channel_ratio as u32)
+            .ok_or_else(|| CaptureError::new("DSCope valid sample length overflowed"))?;
         Ok(Self {
             sample_count: sample_count.min(config.sample_count as u32),
             trigger_offset: footer[11] & 0x07,
@@ -558,8 +761,10 @@ impl ScopeMeasurement {
     }
 }
 
-fn raw_to_volts(raw: u8, hardware_offset: u8) -> f32 {
-    (f32::from(hardware_offset) - f32::from(raw)) * VOLTAGE_RANGE / ADC_REFERENCE_SPAN
+fn raw_to_volts(raw: u8, hardware_offset: u8, channel: DsCopeChannelConfig) -> f32 {
+    let input_span = f32::from(channel.volts_per_div_mv) / 1_000.0 * 10.0;
+    (f32::from(hardware_offset) - f32::from(raw)) * input_span / ADC_REFERENCE_SPAN
+        * f32::from(channel.probe_attenuation)
 }
 
 fn capture_timeout_error(session: &UsbDeviceSession) -> CaptureError {
@@ -627,16 +832,40 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 mod tests {
     use super::*;
 
+    const MAX_DUAL_CHANNEL_SAMPLE_COUNT: u64 = MAX_TOTAL_SAMPLE_COUNT / 2;
+
     #[test]
-    fn validates_conservative_scope_configuration() {
-        assert!(DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, MAX_SAMPLE_COUNT).is_ok());
-        assert!(DsCopeCaptureConfig::new(2_000_000, MAX_SAMPLE_COUNT).is_err());
-        assert!(DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, 1).is_err());
+    fn validates_sample_rate_against_enabled_channel_count() {
+        assert!(DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).is_ok());
+        assert!(DsCopeCaptureConfig::new(500_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).is_ok());
+        assert!(DsCopeCaptureConfig::new(1_000_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).is_err());
+        assert!(DsCopeCaptureConfig::new(1_000_000, MAX_TOTAL_SAMPLE_COUNT).is_err());
+        let single_channel = [
+            DsCopeChannelConfig::default(),
+            DsCopeChannelConfig::default().with_enabled(false),
+        ];
+        assert!(DsCopeCaptureConfig::with_channel_configs(
+            1_000_000_000,
+            MAX_TOTAL_SAMPLE_COUNT,
+            single_channel,
+        )
+        .is_ok());
+        assert!(DsCopeCaptureConfig::new(3_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).is_err());
+        assert!(DsCopeCaptureConfig::new(1_000_000, 1).is_err());
+        assert!(DsCopeCaptureConfig::with_channel_configs(
+            1_000_000,
+            MAX_TOTAL_SAMPLE_COUNT,
+            [
+                DsCopeChannelConfig::default().with_enabled(false),
+                DsCopeChannelConfig::default().with_enabled(false),
+            ],
+        )
+        .is_err());
     }
 
     #[test]
     fn encodes_dso_mode_and_capture_counts() {
-        let config = DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, MAX_SAMPLE_COUNT).unwrap();
+        let config = DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).unwrap();
         let settings = config.encode_settings();
 
         assert_eq!(settings.len(), SETTINGS_BYTES);
@@ -644,14 +873,17 @@ mod tests {
         assert_eq!(read_u16(&settings, 6), 1 << 4);
         assert_eq!(read_u16(&settings, 10), 500);
         assert_eq!(read_u16(&settings, 28), 0x0200);
-        assert_eq!(read_u16(&settings, 32), MAX_SAMPLE_COUNT as u16);
+        assert_eq!(
+            read_u16(&settings, 32),
+            MAX_DUAL_CHANNEL_SAMPLE_COUNT as u16
+        );
         assert_eq!(read_u16(&settings, 38), 0b11);
         assert_eq!(read_u32(&settings, 368), 0xfa5a_fa5a);
     }
 
     #[test]
     fn generates_nominal_two_channel_dso_commands() {
-        let config = DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, MAX_SAMPLE_COUNT).unwrap();
+        let config = DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).unwrap();
         let commands = dso_commands(config, DsCopeCalibration::nominal());
 
         assert_eq!(commands[0], 0xa5a5_a500);
@@ -664,8 +896,33 @@ mod tests {
     }
 
     #[test]
+    fn encodes_one_channel_gigasample_capture() {
+        let channels = [
+            DsCopeChannelConfig::default().with_enabled(false),
+            DsCopeChannelConfig::default(),
+        ];
+        let config = DsCopeCaptureConfig::with_channel_configs(
+            1_000_000_000,
+            MAX_TOTAL_SAMPLE_COUNT,
+            channels,
+        )
+        .unwrap();
+        let settings = config.encode_settings();
+        let commands = dso_commands(config, DsCopeCalibration::nominal());
+
+        assert_eq!(config.enabled_channel_count(), 1);
+        assert_eq!(config.divider(), 1);
+        assert_eq!(read_u16(&settings, 10), 1);
+        assert_eq!(read_u16(&settings, 28), 0x0100);
+        assert_eq!(read_u16(&settings, 38), 0b10);
+        assert_eq!(commands[1], 0x1b00);
+        assert_eq!(commands[2], 0x1b80);
+        assert_eq!(commands[7], 0x0118);
+    }
+
+    #[test]
     fn applies_each_channels_factory_gain_and_offset() {
-        let config = DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, MAX_SAMPLE_COUNT).unwrap();
+        let config = DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).unwrap();
         let calibration = DsCopeCalibration {
             channels: [
                 DsCopeChannelCalibration {
@@ -696,7 +953,7 @@ mod tests {
         zero_record[13..15].copy_from_slice(&73_u16.to_le_bytes());
         vga_record[13..15].copy_from_slice(&0x06a1_u16.to_le_bytes());
 
-        let calibration = parse_channel_calibration(1, &zero_record, &vga_record).unwrap();
+        let calibration = parse_channel_calibration(1, 6, &zero_record, &vga_record).unwrap();
 
         assert_eq!(calibration.preoffset, 73);
         assert_eq!(calibration.vga_gain, 0x0006_a100);
@@ -707,14 +964,14 @@ mod tests {
         let zero_record = [0xff_u8; CALIBRATION_ZERO_BYTES];
         let vga_record = [0xff_u8; CALIBRATION_VGA_BYTES];
 
-        let error = parse_channel_calibration(0, &zero_record, &vga_record).unwrap_err();
+        let error = parse_channel_calibration(0, 6, &zero_record, &vga_record).unwrap_err();
 
         assert!(error.to_string().contains("factory calibration identity"));
     }
 
     #[test]
     fn parses_measurement_footer_and_converts_voltage() {
-        let config = DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, MAX_SAMPLE_COUNT).unwrap();
+        let config = DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).unwrap();
         let mut footer = [0_u8; MEASUREMENT_FOOTER_BYTES];
         footer[0..2].copy_from_slice(&DSO_PACKET_ID.to_le_bytes());
         footer[4..8].copy_from_slice(&100_u32.to_le_bytes());
@@ -728,7 +985,44 @@ mod tests {
         assert_eq!(measurement.sample_count, 100);
         assert_eq!(measurement.trigger_offset, 3);
         assert_eq!(measurement.hardware_offsets, [128, 130]);
-        assert_eq!(raw_to_volts(128, 128), 0.0);
-        assert!(raw_to_volts(100, 128) > 1.19);
+        let channel = DsCopeChannelConfig::default();
+        assert_eq!(raw_to_volts(128, 128, channel), 0.0);
+        assert!(raw_to_volts(100, 128, channel) > 1.19);
+    }
+
+    #[test]
+    fn expands_single_channel_measurement_valid_length() {
+        let channels = [
+            DsCopeChannelConfig::default().with_enabled(false),
+            DsCopeChannelConfig::default(),
+        ];
+        let config =
+            DsCopeCaptureConfig::with_channel_configs(1_000_000_000, 10_000, channels).unwrap();
+        let mut footer = [0_u8; MEASUREMENT_FOOTER_BYTES];
+        footer[0..2].copy_from_slice(&DSO_PACKET_ID.to_le_bytes());
+        footer[4..8].copy_from_slice(&100_u32.to_le_bytes());
+        footer[8..12].copy_from_slice(&config.divider().to_le_bytes());
+
+        let measurement = ScopeMeasurement::decode(&footer, config).unwrap();
+
+        assert_eq!(measurement.sample_count, 200);
+    }
+
+    #[test]
+    fn applies_channel_coupling_scale_and_probe_attenuation() {
+        let channels = [
+            DsCopeChannelConfig::new(100, DsCopeCoupling::Ac, 10).unwrap(),
+            DsCopeChannelConfig::new(2_000, DsCopeCoupling::Dc, 1).unwrap(),
+        ];
+        let config =
+            DsCopeCaptureConfig::with_channel_configs(2_000_000, 250_000, channels).unwrap();
+        let commands = dso_commands(config, DsCopeCalibration::nominal());
+
+        assert_eq!(commands[1], 0x0e00);
+        assert_eq!(commands[2], 0x0f80);
+        assert_eq!(config.divider(), 250);
+        assert_eq!(config.channels(), channels);
+        assert!(raw_to_volts(100, 128, channels[0]) > 1.19);
+        assert!(raw_to_volts(100, 128, channels[1]) > 2.38);
     }
 }

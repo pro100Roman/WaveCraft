@@ -12,13 +12,14 @@ The repository contains the first vertical slice of the new capture engine:
 - coordinated cancellation and worker cleanup;
 - simulated instruments and a CLI demonstrating simultaneous capture;
 - finite buffered capture from DSLogic U3Pro16 at supported 16-channel rates;
-- finite two-channel capture from DSCope U3P100 at 1 MHz;
+- finite one- or two-channel capture from DSCope U3P100 with configurable sampling and
+  per-channel front-end settings;
 - concurrent physical capture from one DSLogic and one DSCope on a shared timeline;
 - a native desktop capture workbench with device selection and waveform views;
 - versioned, lossless full-capture recording from the GUI and CLI.
 
-Broader DSCope ranges and sample rates, interactive timeline navigation,
-protocol decoders, and structured automation interfaces are the next milestones.
+Broader DSCope sample-rate validation, interactive timeline navigation, protocol
+decoders, and structured automation interfaces are the next milestones.
 
 The required end state includes a cross-platform decoder plugin system. SPI
 and I2C will be first-party decoders, while third-party decoders run through a
@@ -148,7 +149,13 @@ present and can restore the bundled resource location. The application displays
 all 16 digital channels, both calibrated scope channels, per-device sample
 totals, errors, and shared-timeline start skew. Capture Setup provides separate
 DSLogic and DSCope settings tabs while recording controls remain shared across
-the synchronized session in a fixed-width sidebar. Logic Analyzer and
+the synchronized session in a fixed-width sidebar. DSCope settings provide a
+common sample rate and capture buffer plus independent volts/div, AC/DC
+coupling, probe attenuation, and hardware enablement for CH0 and CH1. Enabled
+channels support up to 500 MSa/s; disabling either channel raises the remaining
+channel's limit to 1 GSa/s. The
+shared 2M-sample memory provides up to 1M samples/channel in dual-channel mode
+or 2M in single-channel mode. Logic Analyzer and
 Oscilloscope tabs are
 created only for connected devices; the Combined tab appears when both models
 are present, and Refresh rebuilds the available tab set. Each waveform expands
@@ -164,9 +171,9 @@ are independent, including in the Combined tab. Each waveform always has a top
 status strip showing time span, time/div, and zoom ratio, followed by a time
 ruler that remains visible before capture, tracks the visible zoom window, and
 divides every major interval into five minor ticks. The oscilloscope uses a
-conventional 10×8 graticule, zero-centered
-1–2–5 auto volts/div scaling, channel ground markers, measurement readouts, and
-illuminated channel traces.
+conventional 10×8 graticule, zero-centered per-channel volts/div scaling,
+channel ground markers, configured front-end readouts, and illuminated channel
+traces.
 
 Enable **Record complete capture** and enter a `.dsv` path before starting to
 write the full session to disk. The GUI uses the same streaming recorder as the

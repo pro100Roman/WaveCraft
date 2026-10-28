@@ -13,7 +13,10 @@ mod prepare;
 mod probe;
 mod transport;
 
-pub use dscope::{DsCopeCaptureConfig, DsCopeCaptureSource};
+pub use dscope::{
+    DsCopeCaptureConfig, DsCopeCaptureSource, DsCopeChannelConfig, DsCopeCoupling,
+    DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ, DSCOPE_VOLTS_PER_DIV_MV,
+};
 pub use dslogic::{DsLogicCaptureConfig, DsLogicCaptureSource};
 pub use prepare::{load_device_fpga, prepare_device, FpgaLoad, PreparedDevice};
 pub use probe::{probe_device, DeviceProbe, UsbEndpointInfo};
