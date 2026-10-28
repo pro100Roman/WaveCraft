@@ -53,16 +53,17 @@ Install Rust 1.76 or newer, then run:
 cargo run -p dsview-cli -- 2
 cargo run -p dsview-cli -- list
 cargo run -p dsview-cli -- probe
-cargo run -p dsview-cli -- load-fpga ../DSView/DSView/res
-cargo run -p dsview-cli -- prepare ../DSView/DSView/res
-cargo run -p dsview-cli -- capture-logic ../DSView/DSView/res 1
-cargo run -p dsview-cli -- capture-scope ../DSView/DSView/res
-cargo run -p dsview-cli -- capture-usb ../DSView/DSView/res
+cargo run -p dsview-cli -- load-fpga resources/fpga
+cargo run -p dsview-cli -- prepare resources/fpga
+cargo run -p dsview-cli -- capture-logic resources/fpga 1
+cargo run -p dsview-cli -- capture-scope resources/fpga
+cargo run -p dsview-cli -- capture-usb resources/fpga
 ```
 
-Here `<resource-directory>` is the original DSView resource directory containing
-`DSLogicU3Pro16.bin` and `DSCopeU3P100.bin`. In this checkout it is available at
-`../DSView/DSView/res`; only preparation and hardware-capture commands need it.
+Here `<resource-directory>` contains `DSLogicU3Pro16.bin` and
+`DSCopeU3P100.bin`. Unmodified copies from the original DSView project are
+included under `resources/fpga`; only preparation and hardware-capture commands
+need them.
 
 `list` performs read-only discovery. `probe` opens each supported instrument,
 validates its interface and bulk endpoints, reads the firmware version, and

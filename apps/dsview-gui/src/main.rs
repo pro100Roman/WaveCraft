@@ -124,7 +124,7 @@ impl DsViewApp {
     fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         configure_style(&creation_context.egui_ctx);
         let mut app = Self {
-            resource_directory: "../DSView/DSView/res".to_owned(),
+            resource_directory: "resources/fpga".to_owned(),
             devices: Vec::new(),
             pending: None,
             capture: None,
