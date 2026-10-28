@@ -141,8 +141,10 @@ launcher with `Terminal=false`; running the binary from a shell remains useful
 for diagnostics.
 
 The application discovers supported USB instruments without blocking the UI,
-lets you select any detected devices and edit the FPGA resource directory, then
-prepares and captures from the selected sources concurrently. It displays all
+lets you select any detected devices, then prepares and captures from the
+selected sources concurrently. The FPGA resource directory is managed from
+**App → Settings…**, which validates that both required bitstreams are present
+and can restore the bundled resource location. The application displays all
 16 digital channels, both calibrated scope channels, per-device sample totals,
 errors, and shared-timeline start skew. Logic Analyzer and Oscilloscope tabs are
 created only for connected devices; the Combined tab appears when both models

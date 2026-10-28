@@ -233,6 +233,7 @@ type WorkerResult = Result<WorkerSuccess, String>;
 
 struct DsViewApp {
     resource_directory: String,
+    settings_open: bool,
     record_capture: bool,
     recording_path: String,
     devices: Vec<DeviceEntry>,
@@ -253,6 +254,7 @@ impl DsViewApp {
         configure_style(&creation_context.egui_ctx);
         let mut app = Self {
             resource_directory: default_resource_directory(),
+            settings_open: false,
             record_capture: false,
             recording_path: "capture.dsv".to_owned(),
             devices: Vec::new(),
@@ -574,6 +576,13 @@ impl eframe::App for DsViewApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("DSVIEW").strong().size(18.0).color(ACCENT));
                     ui.separator();
+                    ui.menu_button("App", |ui| {
+                        if ui.button("Settings…").clicked() {
+                            self.settings_open = true;
+                            ui.close_menu();
+                        }
+                    });
+                    ui.separator();
                     ui.label(RichText::new("USB capture workbench").color(TEXT_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         stop_clicked = ui
@@ -603,23 +612,8 @@ impl eframe::App for DsViewApp {
             )
             .show(context, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.label(
-                        RichText::new("CAPTURE RESOURCES")
-                            .strong()
-                            .color(TEXT_MUTED),
-                    );
+                    ui.label(RichText::new("CAPTURE OUTPUT").strong().color(TEXT_MUTED));
                     ui.add_space(8.0);
-                    ui.label("FPGA resource directory");
-                    ui.add_enabled(
-                        !self.is_busy(),
-                        egui::TextEdit::singleline(&mut self.resource_directory)
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.small(
-                        RichText::new("Contains DSLogicU3Pro16.bin and DSCopeU3P100.bin")
-                            .color(TEXT_MUTED),
-                    );
-                    ui.add_space(14.0);
                     ui.add_enabled(
                         !self.is_busy(),
                         egui::Checkbox::new(&mut self.record_capture, "Record complete capture"),
@@ -860,6 +854,65 @@ impl eframe::App for DsViewApp {
                 self.logic_viewport = logic_viewport;
                 self.scope_viewport = scope_viewport;
             });
+
+        let mut settings_open = self.settings_open;
+        let mut close_settings = false;
+        egui::Window::new("Settings")
+            .open(&mut settings_open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .show(context, |ui| {
+                ui.label(RichText::new("FPGA RESOURCES").strong().color(ACCENT));
+                ui.add_space(8.0);
+                ui.label("Resource directory");
+                ui.add_enabled(
+                    !self.is_busy(),
+                    egui::TextEdit::singleline(&mut self.resource_directory)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.small(
+                    RichText::new("Contains DSLogicU3Pro16.bin and DSCopeU3P100.bin")
+                        .color(TEXT_MUTED),
+                );
+                ui.add_space(10.0);
+
+                let resource_directory = Path::new(self.resource_directory.trim());
+                if has_required_fpga_resources(resource_directory) {
+                    ui.label(RichText::new("✓ Required FPGA bitstreams found").color(ACCENT));
+                } else {
+                    ui.label(
+                        RichText::new("Required FPGA bitstreams were not found in this directory")
+                            .color(Color32::LIGHT_RED),
+                    );
+                }
+
+                if self.is_busy() {
+                    ui.small(
+                        RichText::new("Settings are locked while an operation is running")
+                            .color(TEXT_MUTED),
+                    );
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.is_busy(), egui::Button::new("Use bundled resources"))
+                        .clicked()
+                    {
+                        self.resource_directory = default_resource_directory();
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close_settings = true;
+                        }
+                    });
+                });
+            });
+        if close_settings {
+            settings_open = false;
+        }
+        self.settings_open = settings_open;
 
         if refresh_clicked {
             self.begin_refresh();
