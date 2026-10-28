@@ -1447,6 +1447,15 @@ fn paint_waveform_status(
     );
 }
 
+fn paint_logic_zero_reference(painter: &egui::Painter, plot: Rect, y: f32, channel_color: Color32) {
+    const DOT_SPACING: f32 = 7.0;
+    let mut x = plot.left();
+    while x <= plot.right() {
+        painter.circle_filled(Pos2::new(x, y), 0.7, channel_color.gamma_multiply(0.3));
+        x += DOT_SPACING;
+    }
+}
+
 fn paint_logic(
     ui: &egui::Ui,
     rect: Rect,
@@ -1482,6 +1491,7 @@ fn paint_logic(
             ],
             Stroke::new(0.6_f32, GRID.gamma_multiply(0.45)),
         );
+        paint_logic_zero_reference(painter, plot, low, *channel_color);
         let label_rect = Rect::from_min_max(
             Pos2::new(rect.left(), lane_top),
             Pos2::new(plot.left(), lane_top + lane_height),
