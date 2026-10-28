@@ -1303,28 +1303,45 @@ fn paint_time_scale(
         return;
     }
 
-    const TICK_INTERVALS: usize = 10;
+    const MAJOR_INTERVALS: usize = 10;
+    const SUBDIVISIONS_PER_INTERVAL: usize = 5;
     let first_sample = sample_offset as f64 + visible_range.start as f64;
     let last_sample = sample_offset as f64 + visible_range.end.saturating_sub(1) as f64;
     let maximum_seconds = last_sample / sample_rate_hz as f64;
     let (unit, multiplier) = time_scale_unit(maximum_seconds);
     let label_stride = if rect.width() >= 650.0 { 2 } else { 5 };
-    let label_step = (last_sample - first_sample) / TICK_INTERVALS as f64 * label_stride as f64
+    let label_step = (last_sample - first_sample) / MAJOR_INTERVALS as f64 * label_stride as f64
         / sample_rate_hz as f64
         * multiplier;
     let precision = time_scale_precision(label_step);
+    let total_subdivisions = MAJOR_INTERVALS * SUBDIVISIONS_PER_INTERVAL;
 
-    for index in 0..=TICK_INTERVALS {
-        let fraction = index as f32 / TICK_INTERVALS as f32;
+    for index in 0..=total_subdivisions {
+        let fraction = index as f32 / total_subdivisions as f32;
         let x = egui::lerp(rect.x_range(), fraction);
-        let is_labelled = index % label_stride == 0;
-        let tick_height = if is_labelled { 7.0 } else { 4.0 };
+        let is_major = index % SUBDIVISIONS_PER_INTERVAL == 0;
+        let major_index = index / SUBDIVISIONS_PER_INTERVAL;
+        let is_labelled = is_major && major_index % label_stride == 0;
+        let tick_height = if is_labelled {
+            7.0
+        } else if is_major {
+            5.0
+        } else {
+            2.5
+        };
         painter.line_segment(
             [
                 Pos2::new(x, rect.bottom() - tick_height),
                 Pos2::new(x, rect.bottom()),
             ],
-            Stroke::new(1.0_f32, TEXT_MUTED),
+            Stroke::new(
+                if is_major { 1.0_f32 } else { 0.7_f32 },
+                if is_major {
+                    TEXT_MUTED
+                } else {
+                    TEXT_MUTED.gamma_multiply(0.55)
+                },
+            ),
         );
 
         if is_labelled {
@@ -1332,7 +1349,7 @@ fn paint_time_scale(
             let seconds = sample / sample_rate_hz as f64;
             let alignment = if index == 0 {
                 egui::Align2::LEFT_TOP
-            } else if index == TICK_INTERVALS {
+            } else if index == total_subdivisions {
                 egui::Align2::RIGHT_TOP
             } else {
                 egui::Align2::CENTER_TOP

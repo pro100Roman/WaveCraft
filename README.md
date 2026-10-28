@@ -158,7 +158,8 @@ clicked. Scroll over either waveform to zoom its time axis around the pointer;
 double-click the waveform to reset it. The logic and oscilloscope zoom levels
 are independent, including in the Combined tab. Each waveform always has a top
 time ruler, including before capture, that updates to match its visible zoom
-window. The oscilloscope uses a conventional 10×8 graticule, zero-centered
+window and divides every major interval into five minor ticks. The oscilloscope
+uses a conventional 10×8 graticule, zero-centered
 1–2–5 auto volts/div scaling, channel ground markers, measurement readouts, and
 illuminated channel traces.
 
