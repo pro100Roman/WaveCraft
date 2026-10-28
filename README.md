@@ -150,7 +150,9 @@ are present, and Refresh rebuilds the available tab set. Each waveform expands
 with the main window; Combined provides a draggable horizontal divider for
 adjusting the DSLogic/DSCope height ratio. Waveform buffers retain the newest
 8,192 samples so rendering remains bounded; this display limit does not truncate
-data written to a capture file.
+data written to a capture file. DSLogic labels D0–D15 remain visible before
+capture, use distinct waveform colors, and open a per-channel color picker when
+clicked.
 
 Enable **Record complete capture** and enter a `.dsv` path before starting to
 write the full session to disk. The GUI uses the same streaming recorder as the

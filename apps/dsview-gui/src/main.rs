@@ -20,13 +20,13 @@ use std::time::Duration;
 
 const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
+const LOGIC_CHANNEL_COUNT: usize = 16;
 const MAX_WAVEFORM_SAMPLES: usize = 8_192;
 const BACKGROUND: Color32 = Color32::from_rgb(12, 17, 25);
 const PANEL: Color32 = Color32::from_rgb(20, 27, 38);
 const GRID: Color32 = Color32::from_rgb(43, 55, 72);
 const TEXT_MUTED: Color32 = Color32::from_rgb(145, 160, 180);
 const ACCENT: Color32 = Color32::from_rgb(70, 210, 185);
-const LOGIC_COLOR: Color32 = Color32::from_rgb(90, 220, 145);
 const SCOPE_COLORS: [Color32; 2] = [
     Color32::from_rgb(255, 204, 74),
     Color32::from_rgb(99, 179, 255),
@@ -80,6 +80,27 @@ fn waveform_tabs(has_logic_analyzer: bool, has_oscilloscope: bool) -> Vec<Wavefo
         tabs.push(WaveformTab::Combined);
     }
     tabs
+}
+
+fn default_logic_channel_colors() -> [Color32; LOGIC_CHANNEL_COUNT] {
+    [
+        Color32::from_rgb(90, 220, 145),
+        Color32::from_rgb(255, 204, 74),
+        Color32::from_rgb(74, 210, 230),
+        Color32::from_rgb(238, 112, 214),
+        Color32::from_rgb(255, 145, 77),
+        Color32::from_rgb(99, 179, 255),
+        Color32::from_rgb(180, 230, 80),
+        Color32::from_rgb(255, 120, 160),
+        Color32::from_rgb(70, 210, 185),
+        Color32::from_rgb(245, 177, 66),
+        Color32::from_rgb(174, 130, 255),
+        Color32::from_rgb(100, 205, 255),
+        Color32::from_rgb(245, 100, 100),
+        Color32::from_rgb(105, 235, 190),
+        Color32::from_rgb(225, 215, 90),
+        Color32::from_rgb(195, 155, 255),
+    ]
 }
 
 #[derive(Default)]
@@ -159,6 +180,7 @@ struct DsViewApp {
     devices: Vec<DeviceEntry>,
     active_waveform_tab: Option<WaveformTab>,
     combined_logic_ratio: f32,
+    logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
     pending: Option<Receiver<WorkerResult>>,
     capture: Option<ActiveCapture>,
     completed_capture: Option<CompletedCapture>,
@@ -176,6 +198,7 @@ impl DsViewApp {
             devices: Vec::new(),
             active_waveform_tab: None,
             combined_logic_ratio: 0.55,
+            logic_channel_colors: default_logic_channel_colors(),
             pending: None,
             capture: None,
             completed_capture: None,
@@ -730,13 +753,14 @@ impl eframe::App for DsViewApp {
                     })
                     .unwrap_or(&empty_waveforms);
                 let mut combined_logic_ratio = self.combined_logic_ratio;
+                let mut logic_channel_colors = self.logic_channel_colors;
                 match self.active_waveform_tab {
                     Some(WaveformTab::LogicAnalyzer) => {
                         waveform_card_fill(
                             ui,
                             "DIGITAL",
                             "DSLogic · channels 0–15",
-                            |ui, rect| paint_logic(ui, rect, waveforms),
+                            |ui, rect| paint_logic(ui, rect, waveforms, &mut logic_channel_colors),
                         );
                     }
                     Some(WaveformTab::Oscilloscope) => {
@@ -748,11 +772,17 @@ impl eframe::App for DsViewApp {
                         );
                     }
                     Some(WaveformTab::Combined) => {
-                        combined_waveform_cards(ui, waveforms, &mut combined_logic_ratio);
+                        combined_waveform_cards(
+                            ui,
+                            waveforms,
+                            &mut combined_logic_ratio,
+                            &mut logic_channel_colors,
+                        );
                     }
                     None => {}
                 }
                 self.combined_logic_ratio = combined_logic_ratio;
+                self.logic_channel_colors = logic_channel_colors;
             });
 
         if refresh_clicked {
@@ -898,7 +928,8 @@ fn configure_style(context: &egui::Context) {
 
 const WAVEFORM_CARD_CHROME_HEIGHT: f32 = 58.0;
 const COMBINED_DIVIDER_HEIGHT: f32 = 10.0;
-const MIN_COMBINED_PANE_HEIGHT: f32 = 140.0;
+const MIN_LOGIC_PANE_HEIGHT: f32 = 260.0;
+const MIN_SCOPE_PANE_HEIGHT: f32 = 140.0;
 
 fn waveform_card_fill(
     ui: &mut egui::Ui,
@@ -915,13 +946,21 @@ fn combined_pane_heights(total_height: f32, logic_ratio: f32) -> (f32, f32) {
     if usable_height == 0.0 {
         return (0.0, 0.0);
     }
-    let minimum = MIN_COMBINED_PANE_HEIGHT.min(usable_height * 0.5);
-    let logic_height =
-        (usable_height * logic_ratio.clamp(0.0, 1.0)).clamp(minimum, usable_height - minimum);
+    let minimum_total = MIN_LOGIC_PANE_HEIGHT + MIN_SCOPE_PANE_HEIGHT;
+    let minimum_scale = (usable_height / minimum_total).min(1.0);
+    let minimum_logic_height = MIN_LOGIC_PANE_HEIGHT * minimum_scale;
+    let minimum_scope_height = MIN_SCOPE_PANE_HEIGHT * minimum_scale;
+    let logic_height = (usable_height * logic_ratio.clamp(0.0, 1.0))
+        .clamp(minimum_logic_height, usable_height - minimum_scope_height);
     (logic_height, usable_height - logic_height)
 }
 
-fn combined_waveform_cards(ui: &mut egui::Ui, waveforms: &WaveformStore, logic_ratio: &mut f32) {
+fn combined_waveform_cards(
+    ui: &mut egui::Ui,
+    waveforms: &WaveformStore,
+    logic_ratio: &mut f32,
+    logic_channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
+) {
     let available = ui.available_rect_before_wrap();
     let (logic_height, _) = combined_pane_heights(available.height(), *logic_ratio);
     let divider_y = available.top() + logic_height;
@@ -942,10 +981,12 @@ fn combined_waveform_cards(ui: &mut egui::Ui, waveforms: &WaveformStore, logic_r
     if divider_response.dragged() {
         if let Some(pointer) = divider_response.interact_pointer_pos() {
             let usable_height = (available.height() - COMBINED_DIVIDER_HEIGHT).max(1.0);
-            let minimum = MIN_COMBINED_PANE_HEIGHT.min(usable_height * 0.5);
-            let minimum_ratio = minimum / usable_height;
+            let minimum_total = MIN_LOGIC_PANE_HEIGHT + MIN_SCOPE_PANE_HEIGHT;
+            let minimum_scale = (usable_height / minimum_total).min(1.0);
+            let minimum_logic_ratio = MIN_LOGIC_PANE_HEIGHT * minimum_scale / usable_height;
+            let minimum_scope_ratio = MIN_SCOPE_PANE_HEIGHT * minimum_scale / usable_height;
             *logic_ratio = ((pointer.y - available.top()) / usable_height)
-                .clamp(minimum_ratio, 1.0 - minimum_ratio);
+                .clamp(minimum_logic_ratio, 1.0 - minimum_scope_ratio);
         }
     }
 
@@ -970,7 +1011,7 @@ fn combined_waveform_cards(ui: &mut egui::Ui, waveforms: &WaveformStore, logic_r
         &mut logic_ui,
         "DIGITAL",
         "DSLogic · channels 0–15",
-        |ui, rect| paint_logic(ui, rect, waveforms),
+        |ui, rect| paint_logic(ui, rect, waveforms, logic_channel_colors),
     );
 
     let mut scope_ui = ui.new_child(
@@ -1044,36 +1085,88 @@ fn paint_plot_background(ui: &egui::Ui, rect: Rect) {
     }
 }
 
-fn paint_logic(ui: &egui::Ui, rect: Rect, waveforms: &WaveformStore) {
+fn paint_logic(
+    ui: &egui::Ui,
+    rect: Rect,
+    waveforms: &WaveformStore,
+    channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
+) {
     paint_plot_background(ui, rect);
     let painter = ui.painter();
-    if waveforms.logic_samples.is_empty() {
-        paint_empty(painter, rect, "Waiting for logic samples");
-        return;
-    }
-
-    let channel_count = usize::from(waveforms.logic_channels.min(16));
-    let label_width = 38.0;
+    let label_width = 42.0;
     let plot = Rect::from_min_max(
         Pos2::new(rect.left() + label_width, rect.top()),
         rect.right_bottom(),
     );
-    let lane_height = plot.height() / channel_count.max(1) as f32;
+    let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
     let sample_count = waveforms.logic_samples.len();
     let step = (sample_count as f32 / plot.width().max(1.0))
         .floor()
         .max(1.0) as usize;
-    for channel in 0..channel_count {
+    for (channel, channel_color) in channel_colors.iter_mut().enumerate() {
         let lane_top = plot.top() + channel as f32 * lane_height;
         let high = lane_top + lane_height * 0.25;
         let low = lane_top + lane_height * 0.75;
+        painter.line_segment(
+            [
+                Pos2::new(plot.left(), lane_top),
+                Pos2::new(plot.right(), lane_top),
+            ],
+            Stroke::new(0.6_f32, GRID.gamma_multiply(0.45)),
+        );
+        let label_rect = Rect::from_min_max(
+            Pos2::new(rect.left(), lane_top),
+            Pos2::new(plot.left(), lane_top + lane_height),
+        );
+        let label_response = ui
+            .interact(
+                label_rect,
+                ui.make_persistent_id(("logic_channel_label", channel)),
+                Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!("Click to change D{channel} color"));
+        if label_response.hovered() {
+            painter.rect_filled(
+                label_rect.shrink(1.0),
+                3.0,
+                channel_color.gamma_multiply(0.18),
+            );
+        }
         painter.text(
             Pos2::new(rect.left() + 4.0, lane_top + lane_height * 0.5),
             egui::Align2::LEFT_CENTER,
             format!("D{channel}"),
             FontId::monospace(10.0),
-            TEXT_MUTED,
+            *channel_color,
         );
+
+        let popup_id = ui.make_persistent_id(("logic_channel_color_popup", channel));
+        if label_response.clicked() {
+            ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+        }
+        egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            &label_response,
+            egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+            |popup_ui| {
+                popup_ui.set_min_width(280.0);
+                popup_ui.label(RichText::new(format!("D{channel} color")).strong());
+                egui::color_picker::color_picker_color32(
+                    popup_ui,
+                    channel_color,
+                    egui::color_picker::Alpha::Opaque,
+                );
+                if popup_ui.button("Reset color").clicked() {
+                    *channel_color = default_logic_channel_colors()[channel];
+                }
+            },
+        );
+
+        if sample_count == 0 {
+            continue;
+        }
         let mut points = Vec::new();
         let mut previous_y = None;
         for index in (0..sample_count).step_by(step) {
@@ -1092,10 +1185,17 @@ fn paint_logic(ui: &egui::Ui, rect: Rect, waveforms: &WaveformStore) {
             previous_y = Some(y);
         }
         if points.len() > 1 {
-            painter.add(egui::Shape::line(points, Stroke::new(1.2_f32, LOGIC_COLOR)));
+            painter.add(egui::Shape::line(
+                points,
+                Stroke::new(1.2_f32, *channel_color),
+            ));
         }
     }
-    paint_time_span(painter, rect, sample_count, waveforms.logic_rate_hz);
+    if sample_count == 0 {
+        paint_empty(painter, plot, "Waiting for logic samples");
+    } else {
+        paint_time_span(painter, plot, sample_count, waveforms.logic_rate_hz);
+    }
 }
 
 fn paint_scope(ui: &egui::Ui, rect: Rect, waveforms: &WaveformStore) {
@@ -1258,13 +1358,21 @@ mod tests {
         assert!((scope - 400.0).abs() < f32::EPSILON);
 
         let (logic, scope) = combined_pane_heights(310.0, 0.99);
-        assert!((logic - 160.0).abs() < f32::EPSILON);
-        assert!((scope - 140.0).abs() < f32::EPSILON);
+        assert!((logic - 195.0).abs() < f32::EPSILON);
+        assert!((scope - 105.0).abs() < f32::EPSILON);
     }
 
     #[test]
     fn default_resource_directory_contains_both_bitstreams() {
         let directory = PathBuf::from(default_resource_directory());
         assert!(has_required_fpga_resources(&directory));
+    }
+
+    #[test]
+    fn every_logic_channel_has_a_distinct_default_color() {
+        let colors = default_logic_channel_colors();
+        for (index, color) in colors.iter().enumerate() {
+            assert!(!colors[..index].contains(color));
+        }
     }
 }
