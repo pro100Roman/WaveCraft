@@ -13,6 +13,7 @@ use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, V
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -120,6 +121,54 @@ struct WaveformStore {
     scope_rate_hz: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WaveformViewport {
+    start: f32,
+    span: f32,
+}
+
+impl Default for WaveformViewport {
+    fn default() -> Self {
+        Self {
+            start: 0.0,
+            span: 1.0,
+        }
+    }
+}
+
+impl WaveformViewport {
+    const MIN_SPAN: f32 = 1.0 / 256.0;
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn zoom(&mut self, scroll_delta: f32, cursor_fraction: f32) {
+        if scroll_delta == 0.0 {
+            return;
+        }
+        let cursor_fraction = cursor_fraction.clamp(0.0, 1.0);
+        let anchor = self.start + cursor_fraction * self.span;
+        let new_span = (self.span * (-scroll_delta * 0.01).exp()).clamp(Self::MIN_SPAN, 1.0);
+        self.start = (anchor - cursor_fraction * new_span).clamp(0.0, 1.0 - new_span);
+        self.span = new_span;
+    }
+
+    fn sample_range(self, sample_count: usize) -> Range<usize> {
+        if sample_count == 0 {
+            return 0..0;
+        }
+        let start = ((self.start * sample_count as f32).floor() as usize).min(sample_count - 1);
+        let mut end = ((self.start + self.span) * sample_count as f32).ceil() as usize;
+        end = end.clamp(start + 1, sample_count);
+        start..end
+    }
+
+    fn zoom_factor(self) -> f32 {
+        1.0 / self.span
+    }
+}
+
 impl WaveformStore {
     fn ingest(&mut self, batch: &CaptureBatch) {
         match batch {
@@ -181,6 +230,8 @@ struct DsViewApp {
     active_waveform_tab: Option<WaveformTab>,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
+    logic_viewport: WaveformViewport,
+    scope_viewport: WaveformViewport,
     pending: Option<Receiver<WorkerResult>>,
     capture: Option<ActiveCapture>,
     completed_capture: Option<CompletedCapture>,
@@ -199,6 +250,8 @@ impl DsViewApp {
             active_waveform_tab: None,
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
+            logic_viewport: WaveformViewport::default(),
+            scope_viewport: WaveformViewport::default(),
             pending: None,
             capture: None,
             completed_capture: None,
@@ -754,13 +807,23 @@ impl eframe::App for DsViewApp {
                     .unwrap_or(&empty_waveforms);
                 let mut combined_logic_ratio = self.combined_logic_ratio;
                 let mut logic_channel_colors = self.logic_channel_colors;
+                let mut logic_viewport = self.logic_viewport;
+                let mut scope_viewport = self.scope_viewport;
                 match self.active_waveform_tab {
                     Some(WaveformTab::LogicAnalyzer) => {
                         waveform_card_fill(
                             ui,
                             "DIGITAL",
                             "DSLogic · channels 0–15",
-                            |ui, rect| paint_logic(ui, rect, waveforms, &mut logic_channel_colors),
+                            |ui, rect| {
+                                paint_logic(
+                                    ui,
+                                    rect,
+                                    waveforms,
+                                    &mut logic_channel_colors,
+                                    &mut logic_viewport,
+                                )
+                            },
                         );
                     }
                     Some(WaveformTab::Oscilloscope) => {
@@ -768,7 +831,7 @@ impl eframe::App for DsViewApp {
                             ui,
                             "OSCILLOSCOPE",
                             "DSCope · CH0 / CH1",
-                            |ui, rect| paint_scope(ui, rect, waveforms),
+                            |ui, rect| paint_scope(ui, rect, waveforms, &mut scope_viewport),
                         );
                     }
                     Some(WaveformTab::Combined) => {
@@ -777,12 +840,16 @@ impl eframe::App for DsViewApp {
                             waveforms,
                             &mut combined_logic_ratio,
                             &mut logic_channel_colors,
+                            &mut logic_viewport,
+                            &mut scope_viewport,
                         );
                     }
                     None => {}
                 }
                 self.combined_logic_ratio = combined_logic_ratio;
                 self.logic_channel_colors = logic_channel_colors;
+                self.logic_viewport = logic_viewport;
+                self.scope_viewport = scope_viewport;
             });
 
         if refresh_clicked {
@@ -960,6 +1027,8 @@ fn combined_waveform_cards(
     waveforms: &WaveformStore,
     logic_ratio: &mut f32,
     logic_channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
+    logic_viewport: &mut WaveformViewport,
+    scope_viewport: &mut WaveformViewport,
 ) {
     let available = ui.available_rect_before_wrap();
     let (logic_height, _) = combined_pane_heights(available.height(), *logic_ratio);
@@ -1011,7 +1080,7 @@ fn combined_waveform_cards(
         &mut logic_ui,
         "DIGITAL",
         "DSLogic · channels 0–15",
-        |ui, rect| paint_logic(ui, rect, waveforms, logic_channel_colors),
+        |ui, rect| paint_logic(ui, rect, waveforms, logic_channel_colors, logic_viewport),
     );
 
     let mut scope_ui = ui.new_child(
@@ -1024,7 +1093,7 @@ fn combined_waveform_cards(
         &mut scope_ui,
         "OSCILLOSCOPE",
         "DSCope · CH0 / CH1",
-        |ui, rect| paint_scope(ui, rect, waveforms),
+        |ui, rect| paint_scope(ui, rect, waveforms, scope_viewport),
     );
 
     let divider_color = if divider_response.hovered() || divider_response.dragged() {
@@ -1085,11 +1154,48 @@ fn paint_plot_background(ui: &egui::Ui, rect: Rect) {
     }
 }
 
+fn update_waveform_viewport(
+    ui: &egui::Ui,
+    rect: Rect,
+    id_salt: &'static str,
+    viewport: &mut WaveformViewport,
+) {
+    let response = ui
+        .interact(rect, ui.make_persistent_id(id_salt), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::ZoomIn)
+        .on_hover_text("Scroll to zoom · double-click to reset");
+    if response.double_clicked() {
+        viewport.reset();
+    }
+    if response.hovered() {
+        let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
+        if scroll_delta != 0.0 {
+            let pointer_fraction = response
+                .hover_pos()
+                .map(|pointer| (pointer.x - rect.left()) / rect.width().max(1.0))
+                .unwrap_or(0.5);
+            viewport.zoom(scroll_delta, pointer_fraction);
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+fn paint_zoom_factor(painter: &egui::Painter, rect: Rect, viewport: WaveformViewport) {
+    painter.text(
+        rect.right_top() + Vec2::new(-6.0, 6.0),
+        egui::Align2::RIGHT_TOP,
+        format!("{:.1}×", viewport.zoom_factor()),
+        FontId::monospace(10.0),
+        TEXT_MUTED,
+    );
+}
+
 fn paint_logic(
     ui: &egui::Ui,
     rect: Rect,
     waveforms: &WaveformStore,
     channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
+    viewport: &mut WaveformViewport,
 ) {
     paint_plot_background(ui, rect);
     let painter = ui.painter();
@@ -1098,9 +1204,12 @@ fn paint_logic(
         Pos2::new(rect.left() + label_width, rect.top()),
         rect.right_bottom(),
     );
+    update_waveform_viewport(ui, plot, "logic_waveform_zoom", viewport);
     let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
     let sample_count = waveforms.logic_samples.len();
-    let step = (sample_count as f32 / plot.width().max(1.0))
+    let visible_range = viewport.sample_range(sample_count);
+    let visible_count = visible_range.len();
+    let step = (visible_count as f32 / plot.width().max(1.0))
         .floor()
         .max(1.0) as usize;
     for (channel, channel_color) in channel_colors.iter_mut().enumerate() {
@@ -1164,12 +1273,12 @@ fn paint_logic(
             },
         );
 
-        if sample_count == 0 {
+        if visible_count == 0 {
             continue;
         }
         let mut points = Vec::new();
         let mut previous_y = None;
-        for index in (0..sample_count).step_by(step) {
+        for index in visible_range.clone().step_by(step) {
             let sample = waveforms.logic_samples[index];
             let y = if sample & (1_u32 << channel) != 0 {
                 high
@@ -1177,7 +1286,9 @@ fn paint_logic(
                 low
             };
             let x = plot.left()
-                + index as f32 / sample_count.saturating_sub(1).max(1) as f32 * plot.width();
+                + index.saturating_sub(visible_range.start) as f32
+                    / visible_count.saturating_sub(1).max(1) as f32
+                    * plot.width();
             if let Some(previous_y) = previous_y {
                 points.push(Pos2::new(x, previous_y));
             }
@@ -1191,44 +1302,69 @@ fn paint_logic(
             ));
         }
     }
-    if sample_count == 0 {
+    if visible_count == 0 {
         paint_empty(painter, plot, "Waiting for logic samples");
     } else {
-        paint_time_span(painter, plot, sample_count, waveforms.logic_rate_hz);
+        paint_time_span(painter, plot, visible_count, waveforms.logic_rate_hz);
     }
+    paint_zoom_factor(painter, plot, *viewport);
 }
 
-fn paint_scope(ui: &egui::Ui, rect: Rect, waveforms: &WaveformStore) {
+fn paint_scope(
+    ui: &egui::Ui,
+    rect: Rect,
+    waveforms: &WaveformStore,
+    viewport: &mut WaveformViewport,
+) {
     paint_plot_background(ui, rect);
     let painter = ui.painter();
+    update_waveform_viewport(ui, rect, "scope_waveform_zoom", viewport);
     if waveforms.scope_channels.is_empty()
         || waveforms.scope_channels.iter().all(VecDeque::is_empty)
     {
         paint_empty(painter, rect, "Waiting for oscilloscope samples");
+        paint_zoom_factor(painter, rect, *viewport);
         return;
     }
 
+    let sample_count = waveforms
+        .scope_channels
+        .iter()
+        .map(VecDeque::len)
+        .min()
+        .unwrap_or(0);
+    if sample_count == 0 {
+        paint_empty(painter, rect, "Waiting for oscilloscope samples");
+        paint_zoom_factor(painter, rect, *viewport);
+        return;
+    }
+    let visible_range = viewport.sample_range(sample_count);
+    let visible_count = visible_range.len();
     let mut minimum = f32::INFINITY;
     let mut maximum = f32::NEG_INFINITY;
-    for value in waveforms.scope_channels.iter().flatten() {
-        minimum = minimum.min(*value);
-        maximum = maximum.max(*value);
+    for channel in &waveforms.scope_channels {
+        for index in visible_range.clone() {
+            minimum = minimum.min(channel[index]);
+            maximum = maximum.max(channel[index]);
+        }
     }
     let padding = ((maximum - minimum) * 0.12).max(0.02);
     minimum -= padding;
     maximum += padding;
     let voltage_span = (maximum - minimum).max(f32::EPSILON);
-    let sample_count = waveforms.scope_channels.first().map_or(0, VecDeque::len);
-    let step = (sample_count as f32 / rect.width().max(1.0))
+    let step = (visible_count as f32 / rect.width().max(1.0))
         .floor()
         .max(1.0) as usize;
 
     for (channel_index, channel) in waveforms.scope_channels.iter().enumerate() {
-        let points = (0..channel.len())
+        let points = visible_range
+            .clone()
             .step_by(step)
             .map(|index| {
                 let x = rect.left()
-                    + index as f32 / channel.len().saturating_sub(1).max(1) as f32 * rect.width();
+                    + index.saturating_sub(visible_range.start) as f32
+                        / visible_count.saturating_sub(1).max(1) as f32
+                        * rect.width();
                 let y = rect.bottom() - (channel[index] - minimum) / voltage_span * rect.height();
                 Pos2::new(x, y)
             })
@@ -1252,7 +1388,8 @@ fn paint_scope(ui: &egui::Ui, rect: Rect, waveforms: &WaveformStore) {
         FontId::monospace(10.0),
         TEXT_MUTED,
     );
-    paint_time_span(painter, rect, sample_count, waveforms.scope_rate_hz);
+    paint_time_span(painter, rect, visible_count, waveforms.scope_rate_hz);
+    paint_zoom_factor(painter, rect, *viewport);
 }
 
 fn paint_empty(painter: &egui::Painter, rect: Rect, text: &str) {
@@ -1374,5 +1511,27 @@ mod tests {
         for (index, color) in colors.iter().enumerate() {
             assert!(!colors[..index].contains(color));
         }
+    }
+
+    #[test]
+    fn waveform_zoom_preserves_the_sample_under_the_pointer() {
+        let mut viewport = WaveformViewport::default();
+
+        viewport.zoom(50.0, 0.25);
+
+        assert!(viewport.span < 1.0);
+        assert!((viewport.start + viewport.span * 0.25 - 0.25).abs() < 0.000_001);
+        assert!(viewport.sample_range(1_000).len() < 1_000);
+    }
+
+    #[test]
+    fn waveform_zoom_out_is_clamped_to_the_full_capture() {
+        let mut viewport = WaveformViewport::default();
+        viewport.zoom(50.0, 0.75);
+
+        viewport.zoom(-10_000.0, 0.75);
+
+        assert_eq!(viewport, WaveformViewport::default());
+        assert_eq!(viewport.sample_range(1_000), 0..1_000);
     }
 }

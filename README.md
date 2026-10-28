@@ -152,7 +152,9 @@ adjusting the DSLogic/DSCope height ratio. Waveform buffers retain the newest
 8,192 samples so rendering remains bounded; this display limit does not truncate
 data written to a capture file. DSLogic labels D0–D15 remain visible before
 capture, use distinct waveform colors, and open a per-channel color picker when
-clicked.
+clicked. Scroll over either waveform to zoom its time axis around the pointer;
+double-click the waveform to reset it. The logic and oscilloscope zoom levels
+are independent, including in the Combined tab.
 
 Enable **Record complete capture** and enter a `.dsv` path before starting to
 write the full session to disk. The GUI uses the same streaming recorder as the
