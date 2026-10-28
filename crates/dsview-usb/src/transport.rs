@@ -10,6 +10,7 @@ const CONTROL_READ: u8 = 0xb2;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_READ_DELAY: Duration = Duration::from_millis(10);
 const BULK_TIMEOUT: Duration = Duration::from_secs(3);
+const BULK_READ_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 const FIRMWARE_VERSION_DESTINATION: u8 = 0;
@@ -80,6 +81,12 @@ pub struct HardwareStatus {
     pub fpga_configured: bool,
     pub fpga_initialized: bool,
     pub fifo_overflow: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BulkReadOutcome {
+    Data(usize),
+    Cancelled,
 }
 
 impl HardwareStatus {
@@ -165,6 +172,29 @@ impl UsbDeviceSession {
         let mut status_window = [0_u8; HDL_VERSION_OFFSET + 1];
         self.read_control(I2C_STATUS_DESTINATION, 0, &mut status_window)?;
         Ok(HdlVersion(status_window[HDL_VERSION_OFFSET]))
+    }
+
+    /// Wait for one bulk-IN transfer while polling cancellation at least every
+    /// 50 milliseconds. USB timeouts and interrupted system calls are retried.
+    pub fn read_bulk_cancellable(
+        &self,
+        buffer: &mut [u8],
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<BulkReadOutcome, UsbError> {
+        if buffer.is_empty() {
+            return Err(UsbError::new(
+                "bulk read buffer must contain at least one byte",
+            ));
+        }
+        poll_bulk_read(
+            |buffer, timeout| {
+                self.handle
+                    .read_bulk(crate::BULK_IN_ENDPOINT, buffer, timeout)
+            },
+            buffer,
+            cancelled,
+        )
+        .map_err(|error| usb_error(&self.device, "read capture data", error))
     }
 
     /// Configure the instrument FPGA with the raw bitstream selected by its
@@ -393,6 +423,23 @@ fn validate_bitstream(bitstream: &[u8]) -> Result<(), UsbError> {
     Ok(())
 }
 
+fn poll_bulk_read(
+    mut read: impl FnMut(&mut [u8], Duration) -> Result<usize, rusb::Error>,
+    buffer: &mut [u8],
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<BulkReadOutcome, rusb::Error> {
+    loop {
+        if cancelled() {
+            return Ok(BulkReadOutcome::Cancelled);
+        }
+        match read(buffer, BULK_READ_POLL_TIMEOUT) {
+            Ok(bytes_read) => return Ok(BulkReadOutcome::Data(bytes_read)),
+            Err(rusb::Error::Timeout | rusb::Error::Interrupted) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn usb_error(discovered: &DiscoveredDevice, action: &str, error: rusb::Error) -> UsbError {
     let guidance = match error {
         rusb::Error::Access => "permission denied; check the device access rules",
@@ -401,6 +448,8 @@ fn usb_error(discovered: &DiscoveredDevice, action: &str, error: rusb::Error) ->
         rusb::Error::NotFound => "the requested interface or endpoint was not found",
         rusb::Error::NotSupported => "the host USB backend does not support this operation",
         rusb::Error::Timeout => "the device did not respond before the timeout",
+        rusb::Error::Overflow => "the USB transfer exceeded the supplied buffer",
+        rusb::Error::Pipe => "the USB endpoint stalled",
         _ => "USB communication failed",
     };
     UsbError::new(format!(
@@ -412,6 +461,8 @@ fn usb_error(discovered: &DiscoveredDevice, action: &str, error: rusb::Error) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
 
     #[test]
     fn encodes_control_read_header_in_protocol_order() {
@@ -467,5 +518,85 @@ mod tests {
     fn rejects_empty_or_malformed_bitstreams() {
         assert!(validate_bitstream(&[]).is_err());
         assert!(validate_bitstream(&[0; 32]).is_err());
+    }
+
+    #[test]
+    fn cancels_bulk_read_without_touching_usb() {
+        let attempts = Cell::new(0);
+        let mut buffer = [0_u8; 8];
+
+        let outcome = poll_bulk_read(
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Ok(0)
+            },
+            &mut buffer,
+            || true,
+        )
+        .expect("cancellation should succeed");
+
+        assert_eq!(outcome, BulkReadOutcome::Cancelled);
+        assert_eq!(attempts.get(), 0);
+    }
+
+    #[test]
+    fn retries_transient_bulk_read_errors_before_data() {
+        let mut results = VecDeque::from([
+            Err(rusb::Error::Timeout),
+            Err(rusb::Error::Interrupted),
+            Ok(3),
+        ]);
+        let mut buffer = [0_u8; 8];
+
+        let outcome = poll_bulk_read(
+            |buffer, timeout| {
+                assert_eq!(timeout, BULK_READ_POLL_TIMEOUT);
+                let result = results.pop_front().expect("script should have a result");
+                if result.is_ok() {
+                    buffer[..3].copy_from_slice(&[1, 2, 3]);
+                }
+                result
+            },
+            &mut buffer,
+            || false,
+        )
+        .expect("transient errors should be retried");
+
+        assert_eq!(outcome, BulkReadOutcome::Data(3));
+        assert_eq!(&buffer[..3], &[1, 2, 3]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn notices_cancellation_after_bulk_timeout() {
+        let cancellation_checks = Cell::new(0);
+        let attempts = Cell::new(0);
+        let mut buffer = [0_u8; 8];
+
+        let outcome = poll_bulk_read(
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err(rusb::Error::Timeout)
+            },
+            &mut buffer,
+            || {
+                cancellation_checks.set(cancellation_checks.get() + 1);
+                cancellation_checks.get() >= 2
+            },
+        )
+        .expect("cancellation should succeed");
+
+        assert_eq!(outcome, BulkReadOutcome::Cancelled);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn propagates_hard_bulk_read_errors() {
+        let mut buffer = [0_u8; 8];
+
+        let error = poll_bulk_read(|_, _| Err(rusb::Error::NoDevice), &mut buffer, || false)
+            .expect_err("disconnect should fail");
+
+        assert_eq!(error, rusb::Error::NoDevice);
     }
 }

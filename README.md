@@ -49,6 +49,15 @@ restores safe control-line values if configuration fails.
 path and requires compatible firmware `2.x`, a configured FPGA, and HDL version
 `0x0e`. A successful result means the instrument is ready for acquisition.
 
+The USB transport also provides cancellable bulk-IN reads. It polls with a
+50 ms timeout, preserves partial transfers reported by libusb, retries timeout
+and interrupted operations, and distinguishes cancellation from USB failures.
+The opt-in hardware check is:
+
+```sh
+cargo test -p dsview-usb --test hardware -- --ignored --nocapture
+```
+
 The optional numeric argument is the simulated capture duration in seconds.
 Run all checks with:
 

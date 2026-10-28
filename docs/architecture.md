@@ -32,9 +32,11 @@ model-specific FPGA bitstream with bounded waits and exact transfer checks.
 The idempotent preparation path then validates FPGA HDL version `0x0e` before
 declaring an instrument ready for acquisition.
 
-The next driver step is cancellable bulk transfers. DSLogic and DSCope protocol
-implementations will translate USB buffers into the existing core batches.
-Driver code must not depend on the UI and must stop promptly when the capture
-context is cancelled.
+Bulk-IN reads use short synchronous libusb timeouts so capture workers observe
+cancellation within 50 milliseconds while preserving partial transfers. The
+next driver step is model-specific arm/start/stop commands and buffer decoding.
+DSLogic and DSCope protocol implementations will translate USB buffers into the
+existing core batches. Driver code must not depend on the UI and must stop
+promptly when the capture context is cancelled.
 
 The original GPL DSView implementation under `../DSView/libsigrok4DSL/hardware/DSL` is the behavior reference for vendor IDs, firmware loading, command transfers, and bulk endpoint framing.
