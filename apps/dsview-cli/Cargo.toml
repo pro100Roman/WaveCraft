@@ -1,0 +1,11 @@
+[package]
+name = "dsview-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dsview-core = { path = "../../crates/dsview-core" }
+dsview-sim = { path = "../../crates/dsview-sim" }
+dsview-usb = { path = "../../crates/dsview-usb" }
