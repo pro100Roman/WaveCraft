@@ -51,6 +51,37 @@ struct DeviceEntry {
     selected: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaveformTab {
+    LogicAnalyzer,
+    Oscilloscope,
+    Combined,
+}
+
+impl WaveformTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LogicAnalyzer => "Logic Analyzer",
+            Self::Oscilloscope => "Oscilloscope",
+            Self::Combined => "Combined",
+        }
+    }
+}
+
+fn waveform_tabs(has_logic_analyzer: bool, has_oscilloscope: bool) -> Vec<WaveformTab> {
+    let mut tabs = Vec::with_capacity(3);
+    if has_logic_analyzer {
+        tabs.push(WaveformTab::LogicAnalyzer);
+    }
+    if has_oscilloscope {
+        tabs.push(WaveformTab::Oscilloscope);
+    }
+    if has_logic_analyzer && has_oscilloscope {
+        tabs.push(WaveformTab::Combined);
+    }
+    tabs
+}
+
 #[derive(Default)]
 struct DeviceStats {
     frames: u64,
@@ -126,6 +157,8 @@ struct DsViewApp {
     record_capture: bool,
     recording_path: String,
     devices: Vec<DeviceEntry>,
+    active_waveform_tab: Option<WaveformTab>,
+    combined_logic_ratio: f32,
     pending: Option<Receiver<WorkerResult>>,
     capture: Option<ActiveCapture>,
     completed_capture: Option<CompletedCapture>,
@@ -141,6 +174,8 @@ impl DsViewApp {
             record_capture: false,
             recording_path: "capture.dsv".to_owned(),
             devices: Vec::new(),
+            active_waveform_tab: None,
+            combined_logic_ratio: 0.55,
             pending: None,
             capture: None,
             completed_capture: None,
@@ -402,6 +437,33 @@ impl DsViewApp {
         self.last_error = Some(error);
     }
 
+    fn available_waveform_tabs(&self) -> Vec<WaveformTab> {
+        let has_logic_analyzer = self
+            .devices
+            .iter()
+            .any(|entry| entry.device.profile.model == DeviceModel::DsLogicU3Pro16);
+        let has_oscilloscope = self
+            .devices
+            .iter()
+            .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100);
+        waveform_tabs(has_logic_analyzer, has_oscilloscope)
+    }
+
+    fn reconcile_waveform_tab(&mut self) {
+        let available = self.available_waveform_tabs();
+        if self
+            .active_waveform_tab
+            .is_some_and(|active| available.contains(&active))
+        {
+            return;
+        }
+        self.active_waveform_tab = if available.contains(&WaveformTab::Combined) {
+            Some(WaveformTab::Combined)
+        } else {
+            available.first().copied()
+        };
+    }
+
     fn is_busy(&self) -> bool {
         self.pending.is_some() || self.capture.is_some()
     }
@@ -410,6 +472,7 @@ impl DsViewApp {
 impl eframe::App for DsViewApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
+        self.reconcile_waveform_tab();
         self.poll_capture();
 
         let mut refresh_clicked = false;
@@ -629,34 +692,67 @@ impl eframe::App for DsViewApp {
                     .inner_margin(egui::Margin::same(16.0)),
             )
             .show(context, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let empty_waveforms = WaveformStore::default();
-                    let waveforms = self
-                        .capture
-                        .as_ref()
-                        .map(|active| &active.waveforms)
-                        .or_else(|| {
-                            self.completed_capture
-                                .as_ref()
-                                .map(|capture| &capture.waveforms)
-                        })
-                        .unwrap_or(&empty_waveforms);
-                    waveform_card(
-                        ui,
-                        "DIGITAL",
-                        "DSLogic · channels 0–15",
-                        330.0,
-                        |ui, rect| paint_logic(ui, rect, waveforms),
-                    );
-                    ui.add_space(14.0);
-                    waveform_card(
-                        ui,
-                        "OSCILLOSCOPE",
-                        "DSCope · CH0 / CH1",
-                        280.0,
-                        |ui, rect| paint_scope(ui, rect, waveforms),
-                    );
+                let available_tabs = self.available_waveform_tabs();
+                if available_tabs.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new(
+                                "Connect a supported logic analyzer or oscilloscope, then Refresh",
+                            )
+                            .color(TEXT_MUTED),
+                        );
+                    });
+                    return;
+                }
+
+                ui.horizontal(|ui| {
+                    for tab in &available_tabs {
+                        if ui
+                            .selectable_label(self.active_waveform_tab == Some(*tab), tab.label())
+                            .clicked()
+                        {
+                            self.active_waveform_tab = Some(*tab);
+                        }
+                    }
                 });
+                ui.separator();
+                ui.add_space(8.0);
+
+                let empty_waveforms = WaveformStore::default();
+                let waveforms = self
+                    .capture
+                    .as_ref()
+                    .map(|active| &active.waveforms)
+                    .or_else(|| {
+                        self.completed_capture
+                            .as_ref()
+                            .map(|capture| &capture.waveforms)
+                    })
+                    .unwrap_or(&empty_waveforms);
+                let mut combined_logic_ratio = self.combined_logic_ratio;
+                match self.active_waveform_tab {
+                    Some(WaveformTab::LogicAnalyzer) => {
+                        waveform_card_fill(
+                            ui,
+                            "DIGITAL",
+                            "DSLogic · channels 0–15",
+                            |ui, rect| paint_logic(ui, rect, waveforms),
+                        );
+                    }
+                    Some(WaveformTab::Oscilloscope) => {
+                        waveform_card_fill(
+                            ui,
+                            "OSCILLOSCOPE",
+                            "DSCope · CH0 / CH1",
+                            |ui, rect| paint_scope(ui, rect, waveforms),
+                        );
+                    }
+                    Some(WaveformTab::Combined) => {
+                        combined_waveform_cards(ui, waveforms, &mut combined_logic_ratio);
+                    }
+                    None => {}
+                }
+                self.combined_logic_ratio = combined_logic_ratio;
             });
 
         if refresh_clicked {
@@ -786,6 +882,111 @@ fn configure_style(context: &egui::Context) {
     visuals.widgets.active.bg_fill = ACCENT.gamma_multiply(0.6);
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 61, 77);
     context.set_visuals(visuals);
+}
+
+const WAVEFORM_CARD_CHROME_HEIGHT: f32 = 58.0;
+const COMBINED_DIVIDER_HEIGHT: f32 = 10.0;
+const MIN_COMBINED_PANE_HEIGHT: f32 = 140.0;
+
+fn waveform_card_fill(
+    ui: &mut egui::Ui,
+    title: &str,
+    subtitle: &str,
+    paint: impl FnOnce(&egui::Ui, Rect),
+) {
+    let plot_height = (ui.available_height() - WAVEFORM_CARD_CHROME_HEIGHT).max(64.0);
+    waveform_card(ui, title, subtitle, plot_height, paint);
+}
+
+fn combined_pane_heights(total_height: f32, logic_ratio: f32) -> (f32, f32) {
+    let usable_height = (total_height - COMBINED_DIVIDER_HEIGHT).max(0.0);
+    if usable_height == 0.0 {
+        return (0.0, 0.0);
+    }
+    let minimum = MIN_COMBINED_PANE_HEIGHT.min(usable_height * 0.5);
+    let logic_height =
+        (usable_height * logic_ratio.clamp(0.0, 1.0)).clamp(minimum, usable_height - minimum);
+    (logic_height, usable_height - logic_height)
+}
+
+fn combined_waveform_cards(ui: &mut egui::Ui, waveforms: &WaveformStore, logic_ratio: &mut f32) {
+    let available = ui.available_rect_before_wrap();
+    let (logic_height, _) = combined_pane_heights(available.height(), *logic_ratio);
+    let divider_y = available.top() + logic_height;
+    let divider_hit_rect = Rect::from_min_max(
+        Pos2::new(available.left(), divider_y),
+        Pos2::new(
+            available.right(),
+            (divider_y + COMBINED_DIVIDER_HEIGHT).min(available.bottom()),
+        ),
+    );
+    let divider_response = ui
+        .interact(
+            divider_hit_rect,
+            ui.make_persistent_id("combined_waveform_divider"),
+            Sense::drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    if divider_response.dragged() {
+        if let Some(pointer) = divider_response.interact_pointer_pos() {
+            let usable_height = (available.height() - COMBINED_DIVIDER_HEIGHT).max(1.0);
+            let minimum = MIN_COMBINED_PANE_HEIGHT.min(usable_height * 0.5);
+            let minimum_ratio = minimum / usable_height;
+            *logic_ratio = ((pointer.y - available.top()) / usable_height)
+                .clamp(minimum_ratio, 1.0 - minimum_ratio);
+        }
+    }
+
+    let (logic_height, scope_height) = combined_pane_heights(available.height(), *logic_ratio);
+    let logic_rect = Rect::from_min_size(available.min, Vec2::new(available.width(), logic_height));
+    let scope_rect = Rect::from_min_size(
+        Pos2::new(
+            available.left(),
+            logic_rect.bottom() + COMBINED_DIVIDER_HEIGHT,
+        ),
+        Vec2::new(available.width(), scope_height),
+    );
+    ui.advance_cursor_after_rect(available);
+
+    let mut logic_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("combined_logic_waveform")
+            .max_rect(logic_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    waveform_card_fill(
+        &mut logic_ui,
+        "DIGITAL",
+        "DSLogic · channels 0–15",
+        |ui, rect| paint_logic(ui, rect, waveforms),
+    );
+
+    let mut scope_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("combined_scope_waveform")
+            .max_rect(scope_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    waveform_card_fill(
+        &mut scope_ui,
+        "OSCILLOSCOPE",
+        "DSCope · CH0 / CH1",
+        |ui, rect| paint_scope(ui, rect, waveforms),
+    );
+
+    let divider_color = if divider_response.hovered() || divider_response.dragged() {
+        ACCENT
+    } else {
+        GRID
+    };
+    let divider_center = logic_rect.bottom() + COMBINED_DIVIDER_HEIGHT * 0.5;
+    ui.painter().line_segment(
+        [
+            Pos2::new(available.left(), divider_center),
+            Pos2::new(available.right(), divider_center),
+        ],
+        Stroke::new(2.0_f32, divider_color),
+    );
 }
 
 fn waveform_card(
@@ -1017,5 +1218,35 @@ mod tests {
         assert_eq!(store.scope_rate_hz, 1_000_000);
         assert_eq!(store.scope_channels[0].back(), Some(&0.2));
         assert_eq!(store.scope_channels[1].back(), Some(&-0.2));
+    }
+
+    #[test]
+    fn waveform_tabs_require_their_connected_devices() {
+        assert!(waveform_tabs(false, false).is_empty());
+        assert_eq!(waveform_tabs(true, false), vec![WaveformTab::LogicAnalyzer]);
+        assert_eq!(waveform_tabs(false, true), vec![WaveformTab::Oscilloscope]);
+        assert_eq!(
+            waveform_tabs(true, true),
+            vec![
+                WaveformTab::LogicAnalyzer,
+                WaveformTab::Oscilloscope,
+                WaveformTab::Combined,
+            ]
+        );
+    }
+
+    #[test]
+    fn combined_panes_scale_with_window_and_respect_ratio() {
+        let (logic, scope) = combined_pane_heights(610.0, 0.6);
+        assert!((logic - 360.0).abs() < f32::EPSILON);
+        assert!((scope - 240.0).abs() < f32::EPSILON);
+
+        let (logic, scope) = combined_pane_heights(1_010.0, 0.6);
+        assert!((logic - 600.0).abs() < f32::EPSILON);
+        assert!((scope - 400.0).abs() < f32::EPSILON);
+
+        let (logic, scope) = combined_pane_heights(310.0, 0.99);
+        assert!((logic - 160.0).abs() < f32::EPSILON);
+        assert!((scope - 140.0).abs() < f32::EPSILON);
     }
 }

@@ -144,9 +144,13 @@ The application discovers supported USB instruments without blocking the UI,
 lets you select any detected devices and edit the FPGA resource directory, then
 prepares and captures from the selected sources concurrently. It displays all
 16 digital channels, both calibrated scope channels, per-device sample totals,
-errors, and shared-timeline start skew. Waveform buffers retain the newest 8,192
-samples so rendering remains bounded; this display limit does not truncate data
-written to a capture file.
+errors, and shared-timeline start skew. Logic Analyzer and Oscilloscope tabs are
+created only for connected devices; the Combined tab appears when both models
+are present, and Refresh rebuilds the available tab set. Each waveform expands
+with the main window; Combined provides a draggable horizontal divider for
+adjusting the DSLogic/DSCope height ratio. Waveform buffers retain the newest
+8,192 samples so rendering remains bounded; this display limit does not truncate
+data written to a capture file.
 
 Enable **Record complete capture** and enter a `.dsv` path before starting to
 write the full session to disk. The GUI uses the same streaming recorder as the
