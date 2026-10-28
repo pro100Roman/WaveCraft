@@ -29,10 +29,12 @@ sessions, and the vendor control transport. It initially targets DSLogic U3Pro16
 OUT endpoint `0x02` and bulk IN endpoint `0x86` reserved for the acquisition
 layer. The current transport reads firmware and hardware status and loads the
 model-specific FPGA bitstream with bounded waits and exact transfer checks.
+The idempotent preparation path then validates FPGA HDL version `0x0e` before
+declaring an instrument ready for acquisition.
 
-The next driver step is HDL-version validation followed by cancellable bulk
-transfers. DSLogic and DSCope protocol implementations will translate USB
-buffers into the existing core batches. Driver code must not depend on the UI
-and must stop promptly when the capture context is cancelled.
+The next driver step is cancellable bulk transfers. DSLogic and DSCope protocol
+implementations will translate USB buffers into the existing core batches.
+Driver code must not depend on the UI and must stop promptly when the capture
+context is cancelled.
 
 The original GPL DSView implementation under `../DSView/libsigrok4DSL/hardware/DSL` is the behavior reference for vendor IDs, firmware loading, command transfers, and bulk endpoint framing.

@@ -1,8 +1,8 @@
 use dsview_core::{CaptureCoordinator, CaptureEvent, DeviceId};
 use dsview_sim::{SimulatedLogicAnalyzer, SimulatedOscilloscope};
 use dsview_usb::{
-    discover_supported_devices, probe_device, DiscoveredDevice, HardwareStatus, LinkStatus,
-    UsbDeviceSession,
+    discover_supported_devices, probe_device, DiscoveredDevice, FirmwareVersion, HardwareStatus,
+    HdlVersion, LinkStatus, UsbDeviceSession,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -29,8 +29,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         return probe_devices();
     }
     if let [command, resource_directory] = arguments.as_slice() {
-        if command == "load-fpga" {
-            return load_fpgas(Path::new(resource_directory));
+        match command.as_str() {
+            "load-fpga" => return load_fpgas(Path::new(resource_directory)),
+            "prepare" => return prepare_devices(Path::new(resource_directory)),
+            _ => {}
         }
     }
 
@@ -40,7 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         [command, seconds] if command == "simulate" => seconds.parse::<u64>()?,
         _ => {
             return Err(
-                "usage: dsview-cli [list | probe | load-fpga <resource-directory> | simulate <seconds> | <seconds>]"
+                "usage: dsview-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | simulate <seconds> | <seconds>]"
                     .into(),
             )
         }
@@ -101,38 +103,125 @@ fn load_device_fpga(
     device: &DiscoveredDevice,
     bitstream_path: &Path,
 ) -> Result<FpgaLoad, Box<dyn Error>> {
-    let session = UsbDeviceSession::open(device)?;
-    let load_result = (|| -> Result<FpgaLoad, Box<dyn Error>> {
-        let firmware = session.firmware_version()?;
-        if !firmware.is_compatible() {
-            return Err(format!(
-                "firmware {firmware} is incompatible; major version 2 is required"
-            )
-            .into());
+    with_device_session(device, |session| {
+        require_compatible_firmware(session)?;
+        ensure_fpga_configured(session, bitstream_path)
+    })
+}
+
+fn prepare_devices(resource_directory: &Path) -> Result<(), Box<dyn Error>> {
+    let report = discover_supported_devices()?;
+    if report.devices.is_empty() {
+        println!("no supported instruments detected");
+        return Ok(());
+    }
+
+    let mut failures = 0_usize;
+    for device in report.devices {
+        let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
+        print!(
+            "{}: {}: ",
+            device.location.stable_id(),
+            device.profile.display_name
+        );
+        match prepare_device(&device, &bitstream_path) {
+            Ok(prepared) => {
+                let fpga = match prepared.fpga {
+                    FpgaLoad::AlreadyConfigured(_) => "FPGA already configured".to_owned(),
+                    FpgaLoad::Configured { bytes, .. } => {
+                        format!("FPGA loaded with {bytes} bytes")
+                    }
+                };
+                println!(
+                    "ready; firmware {}, HDL {}, {fpga}",
+                    prepared.firmware, prepared.hdl
+                );
+            }
+            Err(error) => {
+                failures += 1;
+                eprintln!("failed\n  {error}");
+            }
         }
-        let current_status = session.hardware_status()?;
-        if current_status.fpga_configured {
-            return Ok(FpgaLoad::AlreadyConfigured(current_status));
+    }
+
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(format!("{failures} device preparation(s) failed").into())
+    }
+}
+
+struct PreparedDevice {
+    firmware: FirmwareVersion,
+    hdl: HdlVersion,
+    fpga: FpgaLoad,
+}
+
+fn prepare_device(
+    device: &DiscoveredDevice,
+    bitstream_path: &Path,
+) -> Result<PreparedDevice, Box<dyn Error>> {
+    with_device_session(device, |session| {
+        let firmware = require_compatible_firmware(session)?;
+        let fpga = ensure_fpga_configured(session, bitstream_path)?;
+        let hdl = session.hdl_version()?;
+        if !hdl.is_compatible() {
+            return Err(format!("HDL {hdl} is incompatible; version 0x0e is required").into());
         }
-        let bitstream = std::fs::read(bitstream_path).map_err(|error| {
-            format!(
-                "failed to read FPGA bitstream {}: {error}",
-                bitstream_path.display()
-            )
-        })?;
-        let status = session.configure_fpga(&bitstream)?;
-        Ok(FpgaLoad::Configured {
-            bytes: bitstream.len(),
-            status,
+        Ok(PreparedDevice {
+            firmware,
+            hdl,
+            fpga,
         })
-    })();
+    })
+}
+
+fn require_compatible_firmware(
+    session: &UsbDeviceSession,
+) -> Result<FirmwareVersion, Box<dyn Error>> {
+    let firmware = session.firmware_version()?;
+    if !firmware.is_compatible() {
+        return Err(
+            format!("firmware {firmware} is incompatible; major version 2 is required").into(),
+        );
+    }
+    Ok(firmware)
+}
+
+fn ensure_fpga_configured(
+    session: &UsbDeviceSession,
+    bitstream_path: &Path,
+) -> Result<FpgaLoad, Box<dyn Error>> {
+    let current_status = session.hardware_status()?;
+    if current_status.fpga_configured {
+        return Ok(FpgaLoad::AlreadyConfigured(current_status));
+    }
+    let bitstream = std::fs::read(bitstream_path).map_err(|error| {
+        format!(
+            "failed to read FPGA bitstream {}: {error}",
+            bitstream_path.display()
+        )
+    })?;
+    let status = session.configure_fpga(&bitstream)?;
+    Ok(FpgaLoad::Configured {
+        bytes: bitstream.len(),
+        status,
+    })
+}
+
+fn with_device_session<T>(
+    device: &DiscoveredDevice,
+    operation: impl FnOnce(&UsbDeviceSession) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    let session = UsbDeviceSession::open(device)?;
+    let operation_result = operation(&session);
     let release_result = session.close();
-    match (load_result, release_result) {
+    match (operation_result, release_result) {
         (Ok(result), Ok(())) => Ok(result),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(error)) => Err(Box::new(error)),
-        (Err(load_error), Err(release_error)) => Err(format!(
-            "{load_error}; additionally failed to release the interface: {release_error}"
+        (Err(operation_error), Err(release_error)) => Err(format!(
+            "{operation_error}; additionally failed to release the interface: {release_error}"
         )
         .into()),
     }

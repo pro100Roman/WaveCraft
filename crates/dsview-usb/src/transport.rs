@@ -19,7 +19,12 @@ const LED_DESTINATION: u8 = 5;
 const INTERRUPT_READY_DESTINATION: u8 = 6;
 const WORD_WIDTH_DESTINATION: u8 = 7;
 const BULK_WRITE_DESTINATION: u8 = 10;
+const I2C_REGISTER_DESTINATION: u8 = 14;
+const I2C_STATUS_DESTINATION: u8 = 15;
 const REQUIRED_FIRMWARE_MAJOR: u8 = 2;
+const REQUIRED_HDL_VERSION: u8 = 0x0e;
+const CONTROL_REGISTER_ZERO: u16 = 0x70;
+const HDL_VERSION_OFFSET: usize = 4;
 const MAX_CONTROL_WRITE_DATA: usize = 60;
 const MAX_BITSTREAM_SIZE: usize = 0x00ff_ffff;
 const BITSTREAM_SYNC_OFFSET: usize = 16;
@@ -50,6 +55,21 @@ impl FirmwareVersion {
 impl Display for FirmwareVersion {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}.{}", self.major, self.minor)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HdlVersion(pub u8);
+
+impl HdlVersion {
+    pub fn is_compatible(self) -> bool {
+        self.0 == REQUIRED_HDL_VERSION
+    }
+}
+
+impl Display for HdlVersion {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "0x{:02x}", self.0)
     }
 }
 
@@ -127,6 +147,24 @@ impl UsbDeviceSession {
         let mut status = [0_u8; 1];
         self.read_control(HARDWARE_STATUS_DESTINATION, 0, &mut status)?;
         Ok(HardwareStatus::from_raw(status[0]))
+    }
+
+    /// Read the HDL version exposed by a configured FPGA.
+    pub fn hdl_version(&self) -> Result<HdlVersion, UsbError> {
+        let status = self.hardware_status()?;
+        if !status.fpga_configured {
+            return Err(UsbError::new(format!(
+                "cannot read the HDL version from {} before its FPGA is configured",
+                self.device.location.stable_id()
+            )));
+        }
+
+        // Match the original driver: clear CTR0 before reading the I2C status
+        // window that contains the HDL version byte.
+        self.write_control(I2C_REGISTER_DESTINATION, CONTROL_REGISTER_ZERO, &[0])?;
+        let mut status_window = [0_u8; HDL_VERSION_OFFSET + 1];
+        self.read_control(I2C_STATUS_DESTINATION, 0, &mut status_window)?;
+        Ok(HdlVersion(status_window[HDL_VERSION_OFFSET]))
     }
 
     /// Configure the instrument FPGA with the raw bitstream selected by its
@@ -407,6 +445,13 @@ mod tests {
         assert!(FirmwareVersion { major: 2, minor: 0 }.is_compatible());
         assert!(!FirmwareVersion { major: 1, minor: 9 }.is_compatible());
         assert!(!FirmwareVersion { major: 3, minor: 0 }.is_compatible());
+    }
+
+    #[test]
+    fn checks_hdl_version_compatibility() {
+        assert!(HdlVersion(0x0e).is_compatible());
+        assert!(!HdlVersion(0x0d).is_compatible());
+        assert_eq!(HdlVersion(0x0e).to_string(), "0x0e");
     }
 
     #[test]

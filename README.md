@@ -31,6 +31,7 @@ cargo run -p dsview-cli -- 2
 cargo run -p dsview-cli -- list
 cargo run -p dsview-cli -- probe
 cargo run -p dsview-cli -- load-fpga ../DSView/DSView/res
+cargo run -p dsview-cli -- prepare ../DSView/DSView/res
 ```
 
 `list` performs read-only discovery. `probe` opens each supported instrument,
@@ -43,6 +44,10 @@ upload firmware or FPGA data and does not start acquisition.
 the device reports that its FPGA is not configured. The loader validates the
 raw Xilinx header, bounds every status wait, checks exact transfer lengths, and
 restores safe control-line values if configuration fails.
+
+`prepare <resource-directory>` performs the complete idempotent initialization
+path and requires compatible firmware `2.x`, a configured FPGA, and HDL version
+`0x0e`. A successful result means the instrument is ready for acquisition.
 
 The optional numeric argument is the simulated capture duration in seconds.
 Run all checks with:
