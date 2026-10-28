@@ -22,6 +22,69 @@ threads, while the UI polls typed capture events without blocking the window
 loop. It keeps bounded display buffers and paints digital and scope traces
 without introducing UI dependencies into the core or hardware crates.
 
+## Protocol decoding and plugins
+
+Protocol decoding is a consumer of capture data, never a hardware-driver
+responsibility. A decoder receives channel mappings, sample-rate metadata, and
+ordered logic chunks, then emits typed events containing a decoder ID, sample
+range, summary, and structured fields. The sample range is authoritative so
+the GUI, recorder, CLI, and automation API can all place the same decoded event
+on the capture timeline.
+
+First-party SPI and I2C decoders will implement the same decoder contract as
+third-party extensions. External plugins use a versioned, out-of-process
+protocol rather than Rust dynamic libraries. This avoids an unstable Rust ABI,
+works consistently on macOS, Linux, and Windows, permits Python plugins, and
+isolates plugin crashes from capture workers and the GUI. The transport uses
+framed messages with JSON metadata and bounded binary logic chunks; protocol
+version negotiation, capabilities, configuration schemas, cancellation,
+timeouts, and maximum message sizes are mandatory parts of the contract.
+
+Plugin discovery is manifest-based. Manifests declare the executable, protocol
+version, decoder IDs, channel requirements, and configuration schema. The host
+validates manifests before launch, requires explicit enablement, captures
+plugin diagnostics separately from protocol output, and terminates plugins
+that violate framing, resource, or timeout limits. Decoders must be testable
+against deterministic recorded logic without USB hardware.
+
+## CLI and automation API
+
+GUI actions call an application service layer shared with automation clients;
+the GUI must not own device-control policy. The CLI exposes discovery,
+preparation, capture, recording, and decoding with stable command names,
+explicit device IDs, documented exit codes, and schema-versioned JSON or
+NDJSON. Machine output goes to stdout and diagnostics go to stderr. Raw sample
+data is written to a versioned recording or explicitly requested stream rather
+than embedded in a final human-readable summary.
+
+Recording subscribes directly to the capture event stream and writes every
+frame incrementally; it never reads back from the GUI's bounded display
+buffers. The primary recording format preserves all logic sample words, all
+scope channel samples, device descriptors, sample rates, frame sequences,
+shared-timeline timestamps, capture configuration, calibration identity, start
+skew, errors, and clean or interrupted completion state. Streaming writes keep
+memory bounded, and per-chunk lengths and checksums make truncated or corrupted
+files detectable. Unknown metadata fields remain skippable for forward
+compatibility.
+
+The native recording is the lossless source of truth. Optional VCD, CSV, or
+other interchange exporters operate from that recording and may intentionally
+represent only compatible signal types; they must never silently replace or
+truncate the complete native data set.
+
+The initial Python integration invokes the CLI as a subprocess and consumes
+NDJSON incrementally, which works without a resident service or platform-
+specific bindings. A later local daemon can expose the same service operations
+for long-running sessions and live streaming, with a thin Python package as a
+convenience client. The daemon must bind locally by default, support explicit
+cancellation and backpressure, and preserve the same device, capture, decoder,
+and error schemas as the CLI.
+
+Automation compatibility is a public contract: schema changes require a
+version bump, unknown fields must be tolerated, and integration tests must run
+representative Python clients against simulated devices on all supported
+operating systems.
+
 ## Synchronization
 
 Capture workers first pass a launch barrier, then initialize and arm their

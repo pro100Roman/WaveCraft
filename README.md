@@ -17,7 +17,23 @@ The repository contains the first vertical slice of the new capture engine:
 - a native desktop capture workbench with device selection and waveform views.
 
 Broader DSCope ranges and sample rates, interactive timeline navigation,
-recording, and protocol decoders are the next milestones.
+recording, protocol decoders, and automation interfaces are the next
+milestones.
+
+The required end state includes a cross-platform decoder plugin system. SPI
+and I2C will be first-party decoders, while third-party decoders run through a
+versioned out-of-process protocol so they can be implemented independently in
+Rust, Python, or another language without sharing the application's native ABI.
+Decoded events remain aligned to source sample ranges and the shared capture
+timeline.
+
+Hardware discovery, configuration, capture, recording, and decoding must also
+be controllable without the GUI. The CLI will provide stable JSON/NDJSON output
+and complete raw capture recording suitable for `subprocess` automation. The
+recording path receives every captured frame and is independent of the GUI's
+bounded waveform display cache. A local service API and thin Python client can
+reuse the same application command layer for long-lived and streaming
+workflows; automation must never depend on parsing human-readable status text.
 
 Initial USB discovery supports DSLogic U3Pro16 (`2a0e:002a`) and DSCope U3P100 (`2a0e:002b`) at HighSpeed or SuperSpeed. Discovery is read-only; explicit preparation and capture commands perform the state-changing operations.
 
@@ -98,7 +114,8 @@ lets you select any detected devices and edit the FPGA resource directory, then
 prepares and captures from the selected sources concurrently. It displays all
 16 digital channels, both calibrated scope channels, per-device sample totals,
 errors, and shared-timeline start skew. Waveform buffers retain the newest 8,192
-samples so rendering remains bounded.
+samples so rendering remains bounded; this display limit does not truncate data
+written to a capture file.
 
 The GUI uses native window backends on macOS and Windows and enables both
 Wayland and X11 on Linux. Vendored libusb keeps the USB transport consistent
