@@ -1,6 +1,10 @@
 # Capture Architecture
 
-My DSView models every physical instrument as an independent `CaptureSource`. The `CaptureCoordinator` starts one worker per source behind a shared barrier and assigns all frames to one monotonic process timeline. This removes the original application's global “active device” restriction.
+My DSView models every physical instrument as an independent `CaptureSource`.
+The `CaptureCoordinator` starts one worker per source, synchronizes prepared
+workers immediately before acquisition, and assigns all frames to one monotonic
+process timeline. This removes the original application's global “active
+device” restriction.
 
 ## Data flow
 
@@ -14,7 +18,13 @@ Each frame contains a device ID, monotonically increasing sequence number, captu
 
 ## Synchronization
 
-The start barrier minimizes software start skew, while timestamps make remaining skew visible. USB completion time is not a hardware sample timestamp. Exact cross-device alignment will require either:
+Capture workers first pass a launch barrier, then initialize and arm their
+devices independently. A cancellable second-phase gate releases every worker
+only after all devices are ready to issue their hardware start commands. This
+minimizes software start skew without allowing a preparation failure to strand
+another worker at the gate. Timestamps make the remaining skew visible. USB
+completion time is not a hardware sample timestamp. Exact cross-device
+alignment will require either:
 
 - a shared external trigger recorded by both instruments; or
 - a supported hardware clock/trigger link.
@@ -46,5 +56,11 @@ trigger header and measurement footer, and converts interleaved ADC bytes into
 channel-major `ScopeBatch` voltages. It trusts the footer's valid sample length
 rather than padding to the requested buffer size. Broader sample-rate/range
 support remains future work; driver code stays independent of the UI.
+
+The `capture-usb` development command places one physical DSLogic source and one
+physical DSCope source in the same `CaptureSession`. Both workers prepare and
+arm independently, synchronize immediately before their USB start commands,
+emit on the common monotonic timeline, and stop independently. The reported
+software start skew remains distinct from exact hardware sample alignment.
 
 The original GPL DSView implementation under `../DSView/libsigrok4DSL/hardware/DSL` is the behavior reference for vendor IDs, firmware loading, command transfers, and bulk endpoint framing.

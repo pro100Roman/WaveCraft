@@ -327,6 +327,7 @@ fn read_prequeued_capture(
         }
     };
 
+    context.synchronize_start()?;
     let capture_origin = context.elapsed();
     if let Err(error) = session.start_capture() {
         let _ = header_read.cancel();

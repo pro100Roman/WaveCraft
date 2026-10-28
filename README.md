@@ -12,10 +12,11 @@ The repository contains the first vertical slice of the new capture engine:
 - coordinated cancellation and worker cleanup;
 - simulated instruments and a CLI demonstrating simultaneous capture;
 - finite buffered capture from DSLogic U3Pro16 at supported 16-channel rates;
-- finite two-channel capture from DSCope U3P100 at 1 MHz.
+- finite two-channel capture from DSCope U3P100 at 1 MHz;
+- concurrent physical capture from one DSLogic and one DSCope on a shared timeline.
 
-Broader DSCope ranges and sample rates, simultaneous physical-device capture,
-and the graphical interface are the next milestones.
+Broader DSCope ranges and sample rates and the graphical interface are the next
+milestones.
 
 Initial USB discovery supports DSLogic U3Pro16 (`2a0e:002a`) and DSCope U3P100 (`2a0e:002b`) at HighSpeed or SuperSpeed. Discovery is read-only; explicit preparation and capture commands perform the state-changing operations.
 
@@ -39,7 +40,12 @@ cargo run -p dsview-cli -- load-fpga ../DSView/DSView/res
 cargo run -p dsview-cli -- prepare ../DSView/DSView/res
 cargo run -p dsview-cli -- capture-logic ../DSView/DSView/res 1
 cargo run -p dsview-cli -- capture-scope ../DSView/DSView/res
+cargo run -p dsview-cli -- capture-usb ../DSView/DSView/res
 ```
+
+Here `<resource-directory>` is the original DSView resource directory containing
+`DSLogicU3Pro16.bin` and `DSCopeU3P100.bin`. In this checkout it is available at
+`../DSView/DSView/res`; only preparation and hardware-capture commands need it.
 
 `list` performs read-only discovery. `probe` opens each supported instrument,
 validates its interface and bulk endpoints, reads the firmware version, and
@@ -69,6 +75,14 @@ each channel's factory VGA and offset calibration from flash, queues both USB
 reads before starting acquisition, validates the trigger header and measurement
 footer, and emits typed `ScopeBatch` frames. The device-reported valid length is
 authoritative and can be smaller than the requested one-million sample buffer.
+
+`capture-usb <resource-directory>` prepares one instrument of each model. Each
+worker initializes and arms its device independently, then waits at a
+failure-safe gate immediately before issuing the hardware start command. The
+command reports per-device frame and sample totals, voltage ranges, timelines,
+and the observed software start skew. This skew is not a hardware
+synchronization guarantee; an external trigger or clock is still needed for
+exact sample alignment.
 
 The USB transport also provides cancellable bulk-IN reads. It polls with a
 50 ms timeout, preserves partial transfers reported by libusb, retries timeout

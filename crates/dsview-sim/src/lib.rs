@@ -47,6 +47,7 @@ impl CaptureSource for SimulatedLogicAnalyzer {
     fn run(self: Box<Self>, context: CaptureContext) -> Result<(), CaptureError> {
         let batch_period =
             Duration::from_secs_f64(self.batch_size as f64 / self.sample_rate_hz as f64);
+        context.synchronize_start()?;
         let mut deadline = Instant::now();
         let mut sample_index = 0_u64;
         let mut sequence = 0_u64;
@@ -124,6 +125,7 @@ impl CaptureSource for SimulatedOscilloscope {
     fn run(self: Box<Self>, context: CaptureContext) -> Result<(), CaptureError> {
         let batch_period =
             Duration::from_secs_f64(self.batch_size as f64 / self.sample_rate_hz as f64);
+        context.synchronize_start()?;
         let mut deadline = Instant::now();
         let mut sample_index = 0_u64;
         let mut sequence = 0_u64;

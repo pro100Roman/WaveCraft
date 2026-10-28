@@ -124,8 +124,10 @@ impl From<String> for CaptureError {
 
 /// Blocking capture producer run on its own worker thread.
 ///
-/// Implementations should periodically check `context.is_cancelled()` and use
-/// the shared context timestamp for every emitted frame.
+/// Implementations should complete device preparation, call
+/// `context.synchronize_start()` immediately before starting acquisition, then
+/// periodically check `context.is_cancelled()` and use the shared context
+/// timestamp for every emitted frame.
 pub trait CaptureSource: Send + 'static {
     fn descriptor(&self) -> DeviceDescriptor;
 
