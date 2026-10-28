@@ -141,12 +141,15 @@ launcher with `Terminal=false`; running the binary from a shell remains useful
 for diagnostics.
 
 The application discovers supported USB instruments without blocking the UI,
-lets you select any detected devices, then prepares and captures from the
-selected sources concurrently. The FPGA resource directory is managed from
-**App → Settings…**, which validates that both required bitstreams are present
-and can restore the bundled resource location. The application displays all
-16 digital channels, both calibrated scope channels, per-device sample totals,
-errors, and shared-timeline start skew. Logic Analyzer and Oscilloscope tabs are
+then prepares and captures from the selected sources concurrently. Instrument
+discovery, refresh, and selection are managed from **App → Settings…** alongside
+the FPGA resource directory, which validates that both required bitstreams are
+present and can restore the bundled resource location. The application displays
+all 16 digital channels, both calibrated scope channels, per-device sample
+totals, errors, and shared-timeline start skew. Capture Setup provides separate
+DSLogic and DSCope settings tabs while recording controls remain shared across
+the synchronized session in a fixed-width sidebar. Logic Analyzer and
+Oscilloscope tabs are
 created only for connected devices; the Combined tab appears when both models
 are present, and Refresh rebuilds the available tab set. Each waveform expands
 with the main window; Combined provides a draggable horizontal divider for

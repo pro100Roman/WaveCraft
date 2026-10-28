@@ -58,6 +58,25 @@ struct DeviceEntry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureSettingsTab {
+    DsLogic,
+    DsCope,
+}
+
+impl CaptureSettingsTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DsLogic => "DSLogic",
+            Self::DsCope => "DSCope",
+        }
+    }
+}
+
+fn capture_settings_tabs() -> [CaptureSettingsTab; 2] {
+    [CaptureSettingsTab::DsLogic, CaptureSettingsTab::DsCope]
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WaveformTab {
     LogicAnalyzer,
     Oscilloscope,
@@ -241,6 +260,7 @@ struct DsViewApp {
     record_capture: bool,
     recording_path: String,
     devices: Vec<DeviceEntry>,
+    active_capture_settings_tab: CaptureSettingsTab,
     active_waveform_tab: Option<WaveformTab>,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
@@ -262,6 +282,7 @@ impl DsViewApp {
             record_capture: false,
             recording_path: "capture.dsv".to_owned(),
             devices: Vec::new(),
+            active_capture_settings_tab: CaptureSettingsTab::DsLogic,
             active_waveform_tab: None,
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
@@ -560,6 +581,95 @@ impl DsViewApp {
     }
 }
 
+fn paint_capture_settings(ui: &mut egui::Ui, tab: CaptureSettingsTab) {
+    let (model, grid_id) = match tab {
+        CaptureSettingsTab::DsLogic => ("DSLogic U3Pro16", "dslogic_capture_settings"),
+        CaptureSettingsTab::DsCope => ("DSCope U3P100", "dscope_capture_settings"),
+    };
+    let card_width = ui.available_width();
+    egui::Frame::none()
+        .fill(BACKGROUND)
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::same(10.0))
+        .show(ui, |ui| {
+            let content_width = (card_width - 20.0).max(0.0);
+            ui.set_width(content_width);
+            ui.label(RichText::new(model).strong());
+            ui.add_space(6.0);
+            egui::Grid::new(grid_id)
+                .num_columns(2)
+                .min_col_width(90.0)
+                .max_col_width(((content_width - 12.0) * 0.5).max(90.0))
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Sample rate");
+                    ui.monospace("1 MHz");
+                    ui.end_row();
+                    ui.label("Buffer");
+                    ui.monospace("1M samples");
+                    ui.end_row();
+                    match tab {
+                        CaptureSettingsTab::DsLogic => {
+                            ui.label("Channels");
+                            ui.monospace("D0–D15");
+                            ui.end_row();
+                            ui.label("Display");
+                            ui.monospace("Per-channel colors");
+                            ui.end_row();
+                        }
+                        CaptureSettingsTab::DsCope => {
+                            ui.label("Channels");
+                            ui.monospace("CH0 / CH1");
+                            ui.end_row();
+                            ui.label("Input scale");
+                            ui.monospace("1 V/div");
+                            ui.end_row();
+                            ui.label("Display scale");
+                            ui.monospace("Auto");
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+}
+
+fn paint_instrument_settings(
+    ui: &mut egui::Ui,
+    devices: &mut [DeviceEntry],
+    selection_enabled: bool,
+) {
+    if devices.is_empty() {
+        ui.label(RichText::new("No supported devices").color(TEXT_MUTED));
+        return;
+    }
+
+    for entry in devices {
+        ui.add_space(4.0);
+        egui::Frame::none()
+            .fill(BACKGROUND)
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.add_enabled(
+                    selection_enabled,
+                    egui::Checkbox::new(
+                        &mut entry.selected,
+                        RichText::new(entry.device.profile.display_name).strong(),
+                    ),
+                );
+                ui.small(RichText::new(entry.device.location.stable_id()).color(TEXT_MUTED));
+                let (link_text, link_color) = match entry.device.link_status() {
+                    LinkStatus::Optimal => ("USB 3 · optimal", ACCENT),
+                    LinkStatus::ReducedPerformance => {
+                        ("USB 2 · reduced performance", SCOPE_COLORS[0])
+                    }
+                    LinkStatus::Unsupported => ("Unsupported link speed", Color32::LIGHT_RED),
+                };
+                ui.small(RichText::new(link_text).color(link_color));
+            });
+    }
+}
+
 impl eframe::App for DsViewApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
@@ -605,108 +715,93 @@ impl eframe::App for DsViewApp {
                 });
             });
 
-        egui::SidePanel::left("devices")
-            .resizable(true)
-            .default_width(300.0)
-            .width_range(250.0..=420.0)
+        egui::SidePanel::left("capture_setup_fixed")
+            .resizable(false)
+            .exact_width(300.0)
             .frame(
                 egui::Frame::none()
                     .fill(PANEL)
                     .inner_margin(egui::Margin::same(14.0)),
             )
             .show(context, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.label(RichText::new("CAPTURE OUTPUT").strong().color(TEXT_MUTED));
-                    ui.add_space(8.0);
-                    ui.add_enabled(
-                        !self.is_busy(),
-                        egui::Checkbox::new(&mut self.record_capture, "Record complete capture"),
-                    );
-                    if self.record_capture {
-                        ui.label("Recording file");
+                let content_width = ui.available_width();
+                egui::ScrollArea::vertical()
+                    .max_width(content_width)
+                    .show(ui, |ui| {
+                        ui.set_width(content_width);
+                        ui.label(RichText::new("CAPTURE SETUP").strong().color(TEXT_MUTED));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            for tab in capture_settings_tabs() {
+                                ui.selectable_value(
+                                    &mut self.active_capture_settings_tab,
+                                    tab,
+                                    tab.label(),
+                                );
+                            }
+                        });
+                        ui.add_space(6.0);
+                        paint_capture_settings(ui, self.active_capture_settings_tab);
+
+                        ui.add_space(14.0);
+                        ui.label(RichText::new("RECORDING").strong().color(TEXT_MUTED));
+                        ui.add_space(6.0);
                         ui.add_enabled(
                             !self.is_busy(),
-                            egui::TextEdit::singleline(&mut self.recording_path)
-                                .desired_width(f32::INFINITY),
+                            egui::Checkbox::new(
+                                &mut self.record_capture,
+                                "Record complete capture",
+                            ),
                         );
-                        ui.small(
-                            RichText::new("Lossless .dsv file; existing files are not overwritten")
+                        if self.record_capture {
+                            ui.label("Recording file");
+                            ui.add_enabled(
+                                !self.is_busy(),
+                                egui::TextEdit::singleline(&mut self.recording_path)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.small(
+                                RichText::new(
+                                    "Lossless .dsv file; existing files are not overwritten",
+                                )
                                 .color(TEXT_MUTED),
-                        );
-                    }
-                    ui.add_space(18.0);
-                    ui.label(RichText::new("INSTRUMENTS").strong().color(TEXT_MUTED));
-                    ui.add_space(6.0);
-
-                    if self.devices.is_empty() {
-                        ui.label(RichText::new("No supported devices").color(TEXT_MUTED));
-                    }
-                    for entry in &mut self.devices {
-                        ui.add_space(4.0);
-                        egui::Frame::none()
-                            .fill(BACKGROUND)
-                            .rounding(egui::Rounding::same(6.0))
-                            .inner_margin(egui::Margin::same(10.0))
-                            .show(ui, |ui| {
+                            );
+                        }
+                        if let Some(active) = &self.capture {
+                            ui.add_space(18.0);
+                            ui.label(RichText::new("SESSION").strong().color(TEXT_MUTED));
+                            ui.add_space(6.0);
+                            for descriptor in active.session.descriptors() {
+                                let stats = active.stats.get(&descriptor.id);
                                 ui.horizontal(|ui| {
-                                    ui.add_enabled(
-                                        self.capture.is_none() && self.pending.is_none(),
-                                        egui::Checkbox::new(
-                                            &mut entry.selected,
-                                            RichText::new(entry.device.profile.display_name)
-                                                .strong(),
-                                        ),
-                                    );
+                                    ui.label(RichText::new("●").color(ACCENT));
+                                    ui.label(&descriptor.name);
                                 });
-                                ui.small(
-                                    RichText::new(entry.device.location.stable_id())
+                                if let Some(stats) = stats {
+                                    ui.small(
+                                        RichText::new(format!(
+                                            "{} frames · {} samples",
+                                            stats.frames, stats.samples
+                                        ))
                                         .color(TEXT_MUTED),
+                                    );
+                                }
+                            }
+                            if let Some(skew) = capture_start_skew(&active.stats) {
+                                ui.add_space(6.0);
+                                ui.label(format!("Start skew: {skew:?}"));
+                            }
+                        } else if let Some(completed) = &self.completed_capture {
+                            ui.add_space(18.0);
+                            ui.label(RichText::new("LAST CAPTURE").strong().color(TEXT_MUTED));
+                            if let Some(path) = &completed.recording_path {
+                                ui.small(
+                                    RichText::new(format!("Recording file: {path}")).color(ACCENT),
                                 );
-                                let (link_text, link_color) = match entry.device.link_status() {
-                                    LinkStatus::Optimal => ("USB 3 · optimal", ACCENT),
-                                    LinkStatus::ReducedPerformance => {
-                                        ("USB 2 · reduced performance", SCOPE_COLORS[0])
-                                    }
-                                    LinkStatus::Unsupported => {
-                                        ("Unsupported link speed", Color32::LIGHT_RED)
-                                    }
-                                };
-                                ui.small(RichText::new(link_text).color(link_color));
-                            });
-                    }
-
-                    ui.add_space(18.0);
-                    ui.label(RichText::new("CAPTURE MODE").strong().color(TEXT_MUTED));
-                    ui.add_space(6.0);
-                    egui::Grid::new("capture_config")
-                        .num_columns(2)
-                        .spacing([12.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Sample rate");
-                            ui.monospace("1 MHz");
-                            ui.end_row();
-                            ui.label("Buffer");
-                            ui.monospace("1M samples");
-                            ui.end_row();
-                            ui.label("Scope input");
-                            ui.monospace("1 V/div");
-                            ui.end_row();
-                            ui.label("Scope display");
-                            ui.monospace("Auto");
-                            ui.end_row();
-                        });
-
-                    if let Some(active) = &self.capture {
-                        ui.add_space(18.0);
-                        ui.label(RichText::new("SESSION").strong().color(TEXT_MUTED));
-                        ui.add_space(6.0);
-                        for descriptor in active.session.descriptors() {
-                            let stats = active.stats.get(&descriptor.id);
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("●").color(ACCENT));
-                                ui.label(&descriptor.name);
-                            });
-                            if let Some(stats) = stats {
+                            }
+                            for (device_id, stats) in &completed.stats {
+                                ui.add_space(4.0);
+                                ui.label(device_id.to_string());
                                 ui.small(
                                     RichText::new(format!(
                                         "{} frames · {} samples",
@@ -715,36 +810,12 @@ impl eframe::App for DsViewApp {
                                     .color(TEXT_MUTED),
                                 );
                             }
+                            if let Some(skew) = capture_start_skew(&completed.stats) {
+                                ui.add_space(6.0);
+                                ui.label(format!("Start skew: {skew:?}"));
+                            }
                         }
-                        if let Some(skew) = capture_start_skew(&active.stats) {
-                            ui.add_space(6.0);
-                            ui.label(format!("Start skew: {skew:?}"));
-                        }
-                    } else if let Some(completed) = &self.completed_capture {
-                        ui.add_space(18.0);
-                        ui.label(RichText::new("LAST CAPTURE").strong().color(TEXT_MUTED));
-                        if let Some(path) = &completed.recording_path {
-                            ui.small(
-                                RichText::new(format!("Recording file: {path}")).color(ACCENT),
-                            );
-                        }
-                        for (device_id, stats) in &completed.stats {
-                            ui.add_space(4.0);
-                            ui.label(device_id.to_string());
-                            ui.small(
-                                RichText::new(format!(
-                                    "{} frames · {} samples",
-                                    stats.frames, stats.samples
-                                ))
-                                .color(TEXT_MUTED),
-                            );
-                        }
-                        if let Some(skew) = capture_start_skew(&completed.stats) {
-                            ui.add_space(6.0);
-                            ui.label(format!("Start skew: {skew:?}"));
-                        }
-                    }
-                });
+                    });
             });
 
         egui::TopBottomPanel::bottom("status")
@@ -864,51 +935,75 @@ impl eframe::App for DsViewApp {
 
         let mut settings_open = self.settings_open;
         let mut close_settings = false;
+        let settings_locked = self.is_busy();
         egui::Window::new("Settings")
             .open(&mut settings_open)
             .collapsible(false)
-            .resizable(false)
-            .default_width(520.0)
+            .resizable(true)
+            .default_size([560.0, 620.0])
+            .min_width(480.0)
             .show(context, |ui| {
-                ui.label(RichText::new("FPGA RESOURCES").strong().color(ACCENT));
-                ui.add_space(8.0);
-                ui.label("Resource directory");
-                ui.add_enabled(
-                    !self.is_busy(),
-                    egui::TextEdit::singleline(&mut self.resource_directory)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.small(
-                    RichText::new("Contains DSLogicU3Pro16.bin and DSCopeU3P100.bin")
-                        .color(TEXT_MUTED),
-                );
-                ui.add_space(10.0);
-
-                let resource_directory = Path::new(self.resource_directory.trim());
-                if has_required_fpga_resources(resource_directory) {
-                    ui.label(RichText::new("✓ Required FPGA bitstreams found").color(ACCENT));
-                } else {
-                    ui.label(
-                        RichText::new("Required FPGA bitstreams were not found in this directory")
-                            .color(Color32::LIGHT_RED),
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.label(RichText::new("FPGA RESOURCES").strong().color(ACCENT));
+                    ui.add_space(8.0);
+                    ui.label("Resource directory");
+                    ui.add_enabled(
+                        !settings_locked,
+                        egui::TextEdit::singleline(&mut self.resource_directory)
+                            .desired_width(f32::INFINITY),
                     );
-                }
-
-                if self.is_busy() {
                     ui.small(
-                        RichText::new("Settings are locked while an operation is running")
+                        RichText::new("Contains DSLogicU3Pro16.bin and DSCopeU3P100.bin")
                             .color(TEXT_MUTED),
                     );
-                }
+                    ui.add_space(10.0);
 
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
+                    let resource_directory = Path::new(self.resource_directory.trim());
+                    if has_required_fpga_resources(resource_directory) {
+                        ui.label(RichText::new("✓ Required FPGA bitstreams found").color(ACCENT));
+                    } else {
+                        ui.label(
+                            RichText::new(
+                                "Required FPGA bitstreams were not found in this directory",
+                            )
+                            .color(Color32::LIGHT_RED),
+                        );
+                    }
+
+                    ui.add_space(10.0);
                     if ui
-                        .add_enabled(!self.is_busy(), egui::Button::new("Use bundled resources"))
+                        .add_enabled(!settings_locked, egui::Button::new("Use bundled resources"))
                         .clicked()
                     {
                         self.resource_directory = default_resource_directory();
                     }
+
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("INSTRUMENTS").strong().color(ACCENT));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(!settings_locked, egui::Button::new("↻ Refresh"))
+                                .clicked()
+                            {
+                                refresh_clicked = true;
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    paint_instrument_settings(ui, &mut self.devices, !settings_locked);
+
+                    if settings_locked {
+                        ui.add_space(8.0);
+                        ui.small(
+                            RichText::new("Settings are locked while an operation is running")
+                                .color(TEXT_MUTED),
+                        );
+                    }
+
+                    ui.add_space(16.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Close").clicked() {
                             close_settings = true;
@@ -1930,6 +2025,17 @@ mod tests {
                 WaveformTab::Combined,
             ]
         );
+    }
+
+    #[test]
+    fn capture_setup_has_separate_device_settings_tabs() {
+        let tabs = capture_settings_tabs();
+
+        assert_eq!(
+            tabs,
+            [CaptureSettingsTab::DsLogic, CaptureSettingsTab::DsCope]
+        );
+        assert_eq!(tabs.map(CaptureSettingsTab::label), ["DSLogic", "DSCope"]);
     }
 
     #[test]
