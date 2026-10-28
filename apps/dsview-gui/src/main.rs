@@ -23,6 +23,7 @@ const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
 const LOGIC_CHANNEL_COUNT: usize = 16;
 const MAX_WAVEFORM_SAMPLES: usize = 8_192;
+const TIME_RULER_HEIGHT: f32 = 24.0;
 const BACKGROUND: Color32 = Color32::from_rgb(12, 17, 25);
 const PANEL: Color32 = Color32::from_rgb(20, 27, 38);
 const GRID: Color32 = Color32::from_rgb(43, 55, 72);
@@ -117,8 +118,10 @@ struct WaveformStore {
     logic_samples: VecDeque<u32>,
     logic_channels: u8,
     logic_rate_hz: u64,
+    logic_sample_offset: u64,
     scope_channels: Vec<VecDeque<f32>>,
     scope_rate_hz: u64,
+    scope_sample_offset: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -175,27 +178,33 @@ impl WaveformStore {
             CaptureBatch::Logic(logic) => {
                 self.logic_channels = logic.channel_count;
                 self.logic_rate_hz = logic.sample_rate_hz;
-                extend_bounded(&mut self.logic_samples, logic.samples.iter().copied());
+                self.logic_sample_offset +=
+                    extend_bounded(&mut self.logic_samples, logic.samples.iter().copied()) as u64;
             }
             CaptureBatch::Scope(scope) => {
                 self.scope_rate_hz = scope.sample_rate_hz;
                 if self.scope_channels.len() != scope.channels.len() {
                     self.scope_channels = vec![VecDeque::new(); scope.channels.len()];
+                    self.scope_sample_offset = 0;
                 }
+                let mut removed_samples = 0;
                 for (destination, source) in
                     self.scope_channels.iter_mut().zip(scope.channels.iter())
                 {
-                    extend_bounded(destination, source.iter().copied());
+                    removed_samples =
+                        removed_samples.max(extend_bounded(destination, source.iter().copied()));
                 }
+                self.scope_sample_offset += removed_samples as u64;
             }
         }
     }
 }
 
-fn extend_bounded<T>(destination: &mut VecDeque<T>, values: impl IntoIterator<Item = T>) {
+fn extend_bounded<T>(destination: &mut VecDeque<T>, values: impl IntoIterator<Item = T>) -> usize {
     destination.extend(values);
     let excess = destination.len().saturating_sub(MAX_WAVEFORM_SAMPLES);
     destination.drain(..excess);
+    excess
 }
 
 struct ActiveCapture {
@@ -1138,6 +1147,10 @@ fn waveform_card(
 fn paint_plot_background(ui: &egui::Ui, rect: Rect) {
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, BACKGROUND);
+}
+
+fn paint_plot_grid(ui: &egui::Ui, rect: Rect) {
+    let painter = ui.painter();
     for index in 0..=10 {
         let x = egui::lerp(rect.x_range(), index as f32 / 10.0);
         painter.line_segment(
@@ -1152,6 +1165,141 @@ fn paint_plot_background(ui: &egui::Ui, rect: Rect) {
             Stroke::new(1.0_f32, GRID.gamma_multiply(0.55)),
         );
     }
+}
+
+fn split_time_ruler(rect: Rect) -> (Rect, Rect) {
+    let ruler_bottom = (rect.top() + TIME_RULER_HEIGHT).min(rect.bottom());
+    (
+        Rect::from_min_max(rect.left_top(), Pos2::new(rect.right(), ruler_bottom)),
+        Rect::from_min_max(Pos2::new(rect.left(), ruler_bottom), rect.right_bottom()),
+    )
+}
+
+fn time_scale_unit(maximum_seconds: f64) -> (&'static str, f64) {
+    if maximum_seconds >= 1.0 {
+        ("s", 1.0)
+    } else if maximum_seconds >= 1.0e-3 {
+        ("ms", 1.0e3)
+    } else if maximum_seconds >= 1.0e-6 {
+        ("µs", 1.0e6)
+    } else {
+        ("ns", 1.0e9)
+    }
+}
+
+fn time_scale_precision(label_step: f64) -> usize {
+    if !label_step.is_finite() || label_step <= 0.0 {
+        return 3;
+    }
+    if label_step >= 10.0 {
+        0
+    } else if label_step >= 1.0 {
+        1
+    } else {
+        ((-label_step.log10().floor()) as usize + 1).min(9)
+    }
+}
+
+fn time_scale_window(
+    visible_range: Range<usize>,
+    sample_rate_hz: u64,
+    sample_offset: u64,
+    viewport: WaveformViewport,
+) -> (Range<usize>, u64, u64) {
+    if visible_range.is_empty() {
+        (
+            viewport.sample_range(MAX_WAVEFORM_SAMPLES),
+            if sample_rate_hz == 0 {
+                SAMPLE_RATE_HZ
+            } else {
+                sample_rate_hz
+            },
+            0,
+        )
+    } else {
+        (visible_range, sample_rate_hz, sample_offset)
+    }
+}
+
+fn paint_time_scale(
+    painter: &egui::Painter,
+    rect: Rect,
+    visible_range: Range<usize>,
+    sample_rate_hz: u64,
+    sample_offset: u64,
+) {
+    painter.rect_filled(rect, 4.0, PANEL.gamma_multiply(0.72));
+    painter.line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        Stroke::new(1.0_f32, GRID),
+    );
+    if visible_range.is_empty() || sample_rate_hz == 0 {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "TIME",
+            FontId::monospace(9.0),
+            TEXT_MUTED,
+        );
+        return;
+    }
+
+    const TICK_INTERVALS: usize = 10;
+    let first_sample = sample_offset as f64 + visible_range.start as f64;
+    let last_sample = sample_offset as f64 + visible_range.end.saturating_sub(1) as f64;
+    let maximum_seconds = last_sample / sample_rate_hz as f64;
+    let (unit, multiplier) = time_scale_unit(maximum_seconds);
+    let label_stride = if rect.width() >= 650.0 { 2 } else { 5 };
+    let label_step = (last_sample - first_sample) / TICK_INTERVALS as f64 * label_stride as f64
+        / sample_rate_hz as f64
+        * multiplier;
+    let precision = time_scale_precision(label_step);
+
+    for index in 0..=TICK_INTERVALS {
+        let fraction = index as f32 / TICK_INTERVALS as f32;
+        let x = egui::lerp(rect.x_range(), fraction);
+        let is_labelled = index % label_stride == 0;
+        let tick_height = if is_labelled { 7.0 } else { 4.0 };
+        painter.line_segment(
+            [
+                Pos2::new(x, rect.bottom() - tick_height),
+                Pos2::new(x, rect.bottom()),
+            ],
+            Stroke::new(1.0_f32, TEXT_MUTED),
+        );
+
+        if is_labelled {
+            let sample = first_sample + (last_sample - first_sample) * fraction as f64;
+            let seconds = sample / sample_rate_hz as f64;
+            let alignment = if index == 0 {
+                egui::Align2::LEFT_TOP
+            } else if index == TICK_INTERVALS {
+                egui::Align2::RIGHT_TOP
+            } else {
+                egui::Align2::CENTER_TOP
+            };
+            painter.text(
+                Pos2::new(x, rect.top() + 2.0),
+                alignment,
+                format!("{:.*} {unit}", precision, seconds * multiplier),
+                FontId::monospace(9.0),
+                TEXT_MUTED,
+            );
+        }
+    }
+}
+
+fn paint_waveform_time_scale(
+    painter: &egui::Painter,
+    rect: Rect,
+    visible_range: Range<usize>,
+    sample_rate_hz: u64,
+    sample_offset: u64,
+    viewport: WaveformViewport,
+) {
+    let (visible_range, sample_rate_hz, sample_offset) =
+        time_scale_window(visible_range, sample_rate_hz, sample_offset, viewport);
+    paint_time_scale(painter, rect, visible_range, sample_rate_hz, sample_offset);
 }
 
 fn update_waveform_viewport(
@@ -1200,11 +1348,13 @@ fn paint_logic(
     paint_plot_background(ui, rect);
     let painter = ui.painter();
     let label_width = 42.0;
-    let plot = Rect::from_min_max(
+    let waveform_area = Rect::from_min_max(
         Pos2::new(rect.left() + label_width, rect.top()),
         rect.right_bottom(),
     );
-    update_waveform_viewport(ui, plot, "logic_waveform_zoom", viewport);
+    let (time_ruler, plot) = split_time_ruler(waveform_area);
+    paint_plot_grid(ui, plot);
+    update_waveform_viewport(ui, waveform_area, "logic_waveform_zoom", viewport);
     let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
     let sample_count = waveforms.logic_samples.len();
     let visible_range = viewport.sample_range(sample_count);
@@ -1307,6 +1457,14 @@ fn paint_logic(
     } else {
         paint_time_span(painter, plot, visible_count, waveforms.logic_rate_hz);
     }
+    paint_waveform_time_scale(
+        painter,
+        time_ruler,
+        visible_range,
+        waveforms.logic_rate_hz,
+        waveforms.logic_sample_offset,
+        *viewport,
+    );
     paint_zoom_factor(painter, plot, *viewport);
 }
 
@@ -1318,12 +1476,22 @@ fn paint_scope(
 ) {
     paint_plot_background(ui, rect);
     let painter = ui.painter();
+    let (time_ruler, plot) = split_time_ruler(rect);
+    paint_plot_grid(ui, plot);
     update_waveform_viewport(ui, rect, "scope_waveform_zoom", viewport);
     if waveforms.scope_channels.is_empty()
         || waveforms.scope_channels.iter().all(VecDeque::is_empty)
     {
-        paint_empty(painter, rect, "Waiting for oscilloscope samples");
-        paint_zoom_factor(painter, rect, *viewport);
+        paint_empty(painter, plot, "Waiting for oscilloscope samples");
+        paint_waveform_time_scale(
+            painter,
+            time_ruler,
+            0..0,
+            waveforms.scope_rate_hz,
+            waveforms.scope_sample_offset,
+            *viewport,
+        );
+        paint_zoom_factor(painter, plot, *viewport);
         return;
     }
 
@@ -1334,8 +1502,16 @@ fn paint_scope(
         .min()
         .unwrap_or(0);
     if sample_count == 0 {
-        paint_empty(painter, rect, "Waiting for oscilloscope samples");
-        paint_zoom_factor(painter, rect, *viewport);
+        paint_empty(painter, plot, "Waiting for oscilloscope samples");
+        paint_waveform_time_scale(
+            painter,
+            time_ruler,
+            0..0,
+            waveforms.scope_rate_hz,
+            waveforms.scope_sample_offset,
+            *viewport,
+        );
+        paint_zoom_factor(painter, plot, *viewport);
         return;
     }
     let visible_range = viewport.sample_range(sample_count);
@@ -1352,7 +1528,7 @@ fn paint_scope(
     minimum -= padding;
     maximum += padding;
     let voltage_span = (maximum - minimum).max(f32::EPSILON);
-    let step = (visible_count as f32 / rect.width().max(1.0))
+    let step = (visible_count as f32 / plot.width().max(1.0))
         .floor()
         .max(1.0) as usize;
 
@@ -1361,11 +1537,11 @@ fn paint_scope(
             .clone()
             .step_by(step)
             .map(|index| {
-                let x = rect.left()
+                let x = plot.left()
                     + index.saturating_sub(visible_range.start) as f32
                         / visible_count.saturating_sub(1).max(1) as f32
-                        * rect.width();
-                let y = rect.bottom() - (channel[index] - minimum) / voltage_span * rect.height();
+                        * plot.width();
+                let y = plot.bottom() - (channel[index] - minimum) / voltage_span * plot.height();
                 Pos2::new(x, y)
             })
             .collect::<Vec<_>>();
@@ -1375,21 +1551,29 @@ fn paint_scope(
         }
     }
     painter.text(
-        rect.left_top() + Vec2::new(6.0, 6.0),
+        plot.left_top() + Vec2::new(6.0, 6.0),
         egui::Align2::LEFT_TOP,
         format!("{maximum:.3} V"),
         FontId::monospace(10.0),
         TEXT_MUTED,
     );
     painter.text(
-        rect.left_bottom() + Vec2::new(6.0, -6.0),
+        plot.left_bottom() + Vec2::new(6.0, -6.0),
         egui::Align2::LEFT_BOTTOM,
         format!("{minimum:.3} V"),
         FontId::monospace(10.0),
         TEXT_MUTED,
     );
-    paint_time_span(painter, rect, visible_count, waveforms.scope_rate_hz);
-    paint_zoom_factor(painter, rect, *viewport);
+    paint_time_span(painter, plot, visible_count, waveforms.scope_rate_hz);
+    paint_waveform_time_scale(
+        painter,
+        time_ruler,
+        visible_range,
+        waveforms.scope_rate_hz,
+        waveforms.scope_sample_offset,
+        *viewport,
+    );
+    paint_zoom_factor(painter, plot, *viewport);
 }
 
 fn paint_empty(painter: &egui::Painter, rect: Rect, text: &str) {
@@ -1454,6 +1638,7 @@ mod tests {
 
         assert_eq!(store.logic_samples.len(), MAX_WAVEFORM_SAMPLES);
         assert_eq!(store.logic_samples.front(), Some(&10));
+        assert_eq!(store.logic_sample_offset, 10);
     }
 
     #[test]
@@ -1533,5 +1718,31 @@ mod tests {
 
         assert_eq!(viewport, WaveformViewport::default());
         assert_eq!(viewport.sample_range(1_000), 0..1_000);
+    }
+
+    #[test]
+    fn time_scale_selects_readable_units_for_the_visible_window() {
+        assert_eq!(time_scale_unit(2.0), ("s", 1.0));
+        assert_eq!(time_scale_unit(0.002), ("ms", 1.0e3));
+        assert_eq!(time_scale_unit(0.000_002), ("µs", 1.0e6));
+        assert_eq!(time_scale_unit(0.000_000_002), ("ns", 1.0e9));
+        assert_eq!(time_scale_precision(12.0), 0);
+        assert_eq!(time_scale_precision(1.2), 1);
+        assert_eq!(time_scale_precision(0.008), 4);
+    }
+
+    #[test]
+    fn idle_time_scale_uses_the_configured_display_window() {
+        let viewport = WaveformViewport::default();
+        let (range, rate_hz, offset) = time_scale_window(0..0, 0, 99, viewport);
+
+        assert_eq!(range, 0..MAX_WAVEFORM_SAMPLES);
+        assert_eq!(rate_hz, SAMPLE_RATE_HZ);
+        assert_eq!(offset, 0);
+
+        let mut zoomed = viewport;
+        zoomed.zoom(50.0, 0.5);
+        let (range, _, _) = time_scale_window(0..0, 0, 0, zoomed);
+        assert!(range.len() < MAX_WAVEFORM_SAMPLES);
     }
 }
