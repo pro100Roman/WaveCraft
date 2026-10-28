@@ -1,7 +1,7 @@
 //! USB discovery and profiles for the initial supported hardware.
 //!
-//! Discovery uses operating-system inventory APIs and never opens, claims, or
-//! modifies a device. Direct libusb transport belongs to the acquisition layer.
+//! Discovery uses libusb and never opens, claims, or modifies a device. Device
+//! handles and direct USB transport belong to the acquisition layer.
 
 use dsview_core::InstrumentKind;
 use std::error::Error;
@@ -96,7 +96,7 @@ pub fn profile_for(vendor_id: u16, product_id: u16) -> Option<&'static DevicePro
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceLocation {
-    /// OS-specific physical topology or sysfs identifier.
+    /// Libusb bus and physical port topology, or a bus/address fallback.
     pub platform_path: String,
 }
 
@@ -193,141 +193,51 @@ pub fn discover_supported_devices() -> Result<DiscoveryReport, UsbError> {
     Ok(DiscoveryReport { devices })
 }
 
-#[cfg(target_os = "macos")]
 fn discover_raw_devices() -> Result<Vec<RawUsbDevice>, UsbError> {
-    use std::process::Command;
-
-    let output = Command::new("ioreg")
-        .args(["-p", "IOUSB", "-l", "-w", "0"])
-        .output()
-        .map_err(|error| UsbError::new(format!("failed to run ioreg: {error}")))?;
-    if !output.status.success() {
-        return Err(UsbError::new(format!(
-            "ioreg failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(parse_macos_ioreg(&String::from_utf8_lossy(&output.stdout)))
-}
-
-#[cfg(target_os = "linux")]
-fn discover_raw_devices() -> Result<Vec<RawUsbDevice>, UsbError> {
-    use std::fs;
-    use std::path::Path;
-
-    let root = Path::new("/sys/bus/usb/devices");
-    let entries = fs::read_dir(root)
-        .map_err(|error| UsbError::new(format!("failed to read {}: {error}", root.display())))?;
+    let usb_devices = rusb::devices()
+        .map_err(|error| UsbError::new(format!("failed to enumerate USB devices: {error}")))?;
     let mut devices = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(vendor_id) = read_hex_file(&path.join("idVendor")) else {
+    for device in usb_devices.iter() {
+        let Ok(descriptor) = device.device_descriptor() else {
             continue;
         };
-        let Some(product_id) = read_hex_file(&path.join("idProduct")) else {
+        if profile_for(descriptor.vendor_id(), descriptor.product_id()).is_none() {
             continue;
-        };
-        let speed_mbps = fs::read_to_string(path.join("speed"))
-            .ok()
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .unwrap_or_default();
+        }
+
+        let ports = device.port_numbers().unwrap_or_default();
         devices.push(RawUsbDevice {
-            vendor_id,
-            product_id,
-            speed: speed_from_mbps(speed_mbps),
-            platform_path: entry.file_name().to_string_lossy().into_owned(),
+            vendor_id: descriptor.vendor_id(),
+            product_id: descriptor.product_id(),
+            speed: speed_class(device.speed()),
+            platform_path: topology_path(device.bus_number(), device.address(), &ports),
         });
     }
     Ok(devices)
 }
 
-#[cfg(target_os = "linux")]
-fn read_hex_file(path: &std::path::Path) -> Option<u16> {
-    let value = std::fs::read_to_string(path).ok()?;
-    u16::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn discover_raw_devices() -> Result<Vec<RawUsbDevice>, UsbError> {
-    Err(UsbError::new(
-        "USB inventory is not implemented for this operating system",
-    ))
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn speed_from_mbps(speed_mbps: f64) -> UsbSpeedClass {
-    if speed_mbps >= 5_000.0 {
-        UsbSpeedClass::SuperSpeed
-    } else if speed_mbps >= 480.0 {
-        UsbSpeedClass::HighSpeed
-    } else if speed_mbps >= 12.0 {
-        UsbSpeedClass::FullSpeed
-    } else if speed_mbps > 0.0 {
-        UsbSpeedClass::LowSpeed
-    } else {
-        UsbSpeedClass::Unknown
+fn speed_class(speed: rusb::Speed) -> UsbSpeedClass {
+    match speed {
+        rusb::Speed::Low => UsbSpeedClass::LowSpeed,
+        rusb::Speed::Full => UsbSpeedClass::FullSpeed,
+        rusb::Speed::High => UsbSpeedClass::HighSpeed,
+        rusb::Speed::Super | rusb::Speed::SuperPlus => UsbSpeedClass::SuperSpeed,
+        rusb::Speed::Unknown => UsbSpeedClass::Unknown,
+        _ => UsbSpeedClass::Unknown,
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn parse_macos_ioreg(inventory: &str) -> Vec<RawUsbDevice> {
-    #[derive(Default)]
-    struct PendingDevice {
-        vendor_id: Option<u16>,
-        product_id: Option<u16>,
-        link_speed_bps: Option<u64>,
-        location: Option<String>,
+fn topology_path(bus: u8, address: u8, ports: &[u8]) -> String {
+    if ports.is_empty() {
+        return format!("bus-{bus:03}-address-{address:03}");
     }
 
-    fn finish(pending: &mut PendingDevice, devices: &mut Vec<RawUsbDevice>) {
-        if let (Some(vendor_id), Some(product_id)) = (pending.vendor_id, pending.product_id) {
-            devices.push(RawUsbDevice {
-                vendor_id,
-                product_id,
-                speed: pending
-                    .link_speed_bps
-                    .map(|speed| speed_from_mbps(speed as f64 / 1_000_000.0))
-                    .unwrap_or(UsbSpeedClass::Unknown),
-                platform_path: pending
-                    .location
-                    .take()
-                    .unwrap_or_else(|| format!("unknown-{vendor_id:04x}-{product_id:04x}")),
-            });
-        }
-        *pending = PendingDevice::default();
-    }
-
-    let mut devices = Vec::new();
-    let mut pending = PendingDevice::default();
-    for line in inventory.lines().map(str::trim) {
-        if line.contains("+-o ") || line.starts_with("+-o ") {
-            finish(&mut pending, &mut devices);
-            if line.contains("<class IOUSBHostDevice") {
-                pending.location = line
-                    .split('@')
-                    .nth(1)
-                    .and_then(|value| value.split_whitespace().next())
-                    .map(str::to_owned);
-            }
-        } else if pending.location.is_some() {
-            if let Some(value) = ioreg_integer_property(line, "idProduct") {
-                pending.product_id = u16::try_from(value).ok();
-            } else if let Some(value) = ioreg_integer_property(line, "idVendor") {
-                pending.vendor_id = u16::try_from(value).ok();
-            } else if let Some(value) = ioreg_integer_property(line, "UsbLinkSpeed") {
-                pending.link_speed_bps = Some(value);
-            }
-        }
-    }
-    finish(&mut pending, &mut devices);
-    devices
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn ioreg_integer_property(line: &str, property: &str) -> Option<u64> {
-    let marker = format!("\"{property}\" = ");
-    let value_start = line.find(&marker)? + marker.len();
-    line[value_start..].trim().parse().ok()
+    let port_path = ports
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("bus-{bus:03}-ports-{port_path}")
 }
 
 #[cfg(test)]
@@ -361,38 +271,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_macos_ioreg_inventory() {
-        let inventory = r#"
-            |   +-o USB-based DSL Instrument v2@00210000 <class IOUSBHostDevice>
-            |   | {
-            |   |   "UsbLinkSpeed" = 5000000000
-            |   |   "idProduct" = 43
-            |   |   "idVendor" = 10766
-            |   | }
-            |   +-o USB-based DSL Instrument v2@00220000 <class IOUSBHostDevice>
-            |       {
-            |         "UsbLinkSpeed" = 480000000
-            |         "idProduct" = 42
-            |         "idVendor" = 10766
-            |       }
-        "#;
-
-        let devices = parse_macos_ioreg(inventory);
-        assert_eq!(devices.len(), 2);
-        assert_eq!(devices[0].product_id, 0x002b);
-        assert_eq!(devices[0].speed, UsbSpeedClass::SuperSpeed);
-        assert_eq!(devices[0].platform_path, "00210000");
-        assert_eq!(devices[1].product_id, 0x002a);
-        assert_eq!(devices[1].speed, UsbSpeedClass::HighSpeed);
+    fn builds_stable_topology_path_when_ports_are_available() {
+        assert_eq!(topology_path(3, 9, &[1, 4, 2]), "bus-003-ports-1.4.2");
+        assert_eq!(topology_path(3, 9, &[]), "bus-003-address-009");
     }
 
     #[test]
-    fn classifies_supported_link_speeds() {
-        assert_eq!(speed_from_mbps(5_000.0), UsbSpeedClass::SuperSpeed);
-        assert_eq!(speed_from_mbps(480.0), UsbSpeedClass::HighSpeed);
-        assert_eq!(speed_from_mbps(12.0), UsbSpeedClass::FullSpeed);
-        assert_eq!(speed_from_mbps(1.5), UsbSpeedClass::LowSpeed);
-        assert_eq!(speed_from_mbps(0.0), UsbSpeedClass::Unknown);
+    fn maps_libusb_link_speeds() {
+        assert_eq!(
+            speed_class(rusb::Speed::SuperPlus),
+            UsbSpeedClass::SuperSpeed
+        );
+        assert_eq!(speed_class(rusb::Speed::Super), UsbSpeedClass::SuperSpeed);
+        assert_eq!(speed_class(rusb::Speed::High), UsbSpeedClass::HighSpeed);
+        assert_eq!(speed_class(rusb::Speed::Full), UsbSpeedClass::FullSpeed);
+        assert_eq!(speed_class(rusb::Speed::Low), UsbSpeedClass::LowSpeed);
+        assert_eq!(speed_class(rusb::Speed::Unknown), UsbSpeedClass::Unknown);
     }
 
     #[test]
