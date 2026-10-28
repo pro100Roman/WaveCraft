@@ -32,12 +32,19 @@ model-specific FPGA bitstream with bounded waits and exact transfer checks.
 The idempotent preparation path then validates FPGA HDL version `0x0e` before
 declaring an instrument ready for acquisition.
 
-Bulk-IN reads use short synchronous libusb timeouts so capture workers observe
-cancellation within 50 milliseconds while preserving partial transfers. The
-DSLogic U3Pro16 driver implements finite 16-channel buffered capture, including
-packed FPGA settings, arm/start/stop commands, trigger-header validation, and
-conversion of channel-major 64-sample bitmaps into `LogicBatch` sample words.
-Cancellation forces the FPGA read path ready before stopping it. The next
-hardware step is DSCope acquisition; driver code remains independent of the UI.
+Bulk-IN acquisition uses queued asynchronous libusb transfers so reads are
+already pending when an instrument starts. The DSLogic U3Pro16 driver implements
+finite 16-channel buffered capture, including packed FPGA settings,
+arm/start/stop commands, trigger-header validation, and conversion of
+channel-major 64-sample bitmaps into `LogicBatch` sample words. Cancellation
+forces the FPGA read path ready before stopping it.
+
+The DSCope U3P100 driver implements an initial finite two-channel mode at 1 MHz.
+It configures the 1 GHz front-end clock and ADC, applies nominal 1 V/div setup,
+validates the trigger header and measurement footer, and converts interleaved
+ADC bytes into channel-major `ScopeBatch` voltages. It trusts the footer's valid
+sample length rather than padding to the requested buffer size. Factory
+calibration loading and broader sample-rate/range support remain future work;
+driver code stays independent of the UI.
 
 The original GPL DSView implementation under `../DSView/libsigrok4DSL/hardware/DSL` is the behavior reference for vendor IDs, firmware loading, command transfers, and bulk endpoint framing.

@@ -29,6 +29,9 @@ const CAPTURE_START_DESTINATION: u8 = 8;
 const CAPTURE_STOP_DESTINATION: u8 = 9;
 const I2C_REGISTER_DESTINATION: u8 = 14;
 const I2C_STATUS_DESTINATION: u8 = 15;
+const I2C_DSO_DESTINATION: u8 = 13;
+const DSO_CHANNEL_ZERO_ENABLE_DESTINATION: u8 = 16;
+const DSO_CHANNEL_ONE_ENABLE_DESTINATION: u8 = 19;
 const REQUIRED_FIRMWARE_MAJOR: u8 = 2;
 const REQUIRED_HDL_VERSION: u8 = 0x0e;
 const CONTROL_REGISTER_ZERO: u16 = 0x70;
@@ -462,6 +465,63 @@ impl UsbDeviceSession {
             self.write_control(I2C_REGISTER_DESTINATION, ANALOG_CONTROL_REGISTER, &[value])?;
         }
         Ok(())
+    }
+
+    pub(crate) fn initialize_dscope_frontend(&self) -> Result<(), UsbError> {
+        const ADC_DUAL_CHANNEL: &[(u16, &[u8])] = &[
+            (ANALOG_CONTROL_REGISTER + 1, &[0x03, 0x01, 0x00]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x02, 0x01, 0x31]),
+            (ANALOG_CONTROL_REGISTER + 1, &[0x01]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x02, 0x02, 0x3a]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x10, 0x10, 0x3b]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x00, 0x00, 0x42]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x34, 0x00, 0x50]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x22, 0x02, 0x11]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x11, 0x00, 0x24]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x00, 0x00, 0x55]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x02, 0x00, 0x33]),
+            (ANALOG_CONTROL_REGISTER, &[0x00, 0x33, 0x00, 0x2b]),
+        ];
+        self.write_control(
+            I2C_REGISTER_DESTINATION,
+            ANALOG_CONTROL_REGISTER + 2,
+            &[0x01],
+        )?;
+        for values in [[0x01, 0x61, 0x00, 0x30], [0x01, 0x40, 0xf1, 0x46]] {
+            for value in values {
+                self.write_control(I2C_REGISTER_DESTINATION, ANALOG_CONTROL_REGISTER, &[value])?;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+        for value in [0x01, 0x62, 0x3d, 0x00] {
+            self.write_control(I2C_REGISTER_DESTINATION, ANALOG_CONTROL_REGISTER, &[value])?;
+        }
+
+        for (register, values) in ADC_DUAL_CHANNEL {
+            for value in *values {
+                self.write_control(I2C_REGISTER_DESTINATION, *register, &[*value])?;
+            }
+        }
+
+        // Default fine-gain calibration is unity on all four ADC branches.
+        for branch in 0_u8..4 {
+            for value in [0x00, 0x00, 0x00, 0x34 + branch] {
+                self.write_control(I2C_REGISTER_DESTINATION, ANALOG_CONTROL_REGISTER, &[value])?;
+            }
+        }
+        for register in (ANALOG_CONTROL_REGISTER + 3)..=(ANALOG_CONTROL_REGISTER + 6) {
+            self.write_control(I2C_REGISTER_DESTINATION, register, &[0])?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_dso_command(&self, command: u64) -> Result<(), UsbError> {
+        self.write_control(I2C_DSO_DESTINATION, 0, &command.to_le_bytes())
+    }
+
+    pub(crate) fn enable_dscope_channels(&self) -> Result<(), UsbError> {
+        self.write_control(DSO_CHANNEL_ZERO_ENABLE_DESTINATION, 0, &[1 << 7])?;
+        self.write_control(DSO_CHANNEL_ONE_ENABLE_DESTINATION, 0, &[1 << 5])
     }
 
     pub fn close(mut self) -> Result<(), UsbError> {

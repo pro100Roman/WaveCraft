@@ -7,10 +7,12 @@ use dsview_core::InstrumentKind;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+mod dscope;
 mod dslogic;
 mod probe;
 mod transport;
 
+pub use dscope::{DsCopeCaptureConfig, DsCopeCaptureSource};
 pub use dslogic::{DsLogicCaptureConfig, DsLogicCaptureSource};
 pub use probe::{probe_device, DeviceProbe, UsbEndpointInfo};
 pub use transport::{

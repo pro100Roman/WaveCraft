@@ -1,9 +1,9 @@
-use dsview_core::{CaptureCoordinator, CaptureEvent, DeviceId};
+use dsview_core::{CaptureBatch, CaptureCoordinator, CaptureEvent, DeviceId};
 use dsview_sim::{SimulatedLogicAnalyzer, SimulatedOscilloscope};
 use dsview_usb::{
-    discover_supported_devices, probe_device, DeviceModel, DiscoveredDevice, DsLogicCaptureConfig,
-    DsLogicCaptureSource, FirmwareVersion, HardwareStatus, HdlVersion, LinkStatus,
-    UsbDeviceSession,
+    discover_supported_devices, probe_device, DeviceModel, DiscoveredDevice, DsCopeCaptureConfig,
+    DsCopeCaptureSource, DsLogicCaptureConfig, DsLogicCaptureSource, FirmwareVersion,
+    HardwareStatus, HdlVersion, LinkStatus, UsbDeviceSession,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "capture-logic" => {
                 return capture_logic(Path::new(resource_directory), 1);
             }
+            "capture-scope" => return capture_scope(Path::new(resource_directory)),
             _ => {}
         }
     }
@@ -51,13 +52,82 @@ fn main() -> Result<(), Box<dyn Error>> {
         [command, seconds] if command == "simulate" => seconds.parse::<u64>()?,
         _ => {
             return Err(
-                "usage: dsview-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] | simulate <seconds> | <seconds>]"
+                "usage: dsview-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] | capture-scope <resource-directory> | simulate <seconds> | <seconds>]"
                     .into(),
             )
         }
     };
 
     run_simulation(run_seconds)
+}
+
+fn capture_scope(resource_directory: &Path) -> Result<(), Box<dyn Error>> {
+    const SAMPLE_RATE_HZ: u64 = 1_000_000;
+    const SAMPLE_COUNT: u64 = 1_000_000;
+    let config = DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)?;
+    let report = discover_supported_devices()?;
+    let device = report
+        .devices
+        .into_iter()
+        .find(|device| device.profile.model == DeviceModel::DsCopeU3P100)
+        .ok_or("no DSCope U3P100 detected")?;
+
+    let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
+    let prepared = prepare_device(&device, &bitstream_path)?;
+    println!(
+        "{} ready: firmware {}, HDL {}; requesting up to {} samples/channel from two channels at {} Hz, nominal 1 V/div",
+        device.location.stable_id(),
+        prepared.firmware,
+        prepared.hdl,
+        config.sample_count(),
+        config.sample_rate_hz()
+    );
+
+    let source = DsCopeCaptureSource::new(device, config)?;
+    let session = CaptureCoordinator::start(vec![Box::new(source)])?;
+    let deadline = Instant::now() + Duration::from_secs(11);
+    let mut stats = DeviceStats::default();
+    let mut channel_min = [f32::INFINITY; 2];
+    let mut channel_max = [f32::NEG_INFINITY; 2];
+    let mut stopped = false;
+    while !stopped {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            session.request_stop();
+            session.stop()?;
+            return Err("scope capture did not finish within 11 seconds".into());
+        }
+        match session.recv_timeout(remaining.min(Duration::from_millis(250))) {
+            Ok(CaptureEvent::Frame(frame)) => {
+                stats.frames += 1;
+                stats.samples += frame.payload.sample_count() as u64;
+                stats.first_timestamp.get_or_insert(frame.captured_at);
+                stats.last_timestamp = Some(frame.captured_at);
+                if let CaptureBatch::Scope(batch) = frame.payload {
+                    for (index, channel) in batch.channels.iter().enumerate().take(2) {
+                        for value in channel {
+                            channel_min[index] = channel_min[index].min(*value);
+                            channel_max[index] = channel_max[index].max(*value);
+                        }
+                    }
+                }
+            }
+            Ok(CaptureEvent::SourceFailed { device_id, error }) => {
+                session.stop()?;
+                return Err(format!("capture source {device_id} failed: {error}").into());
+            }
+            Ok(CaptureEvent::SourceStopped { .. }) => stopped = true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => stopped = true,
+        }
+    }
+    session.stop()?;
+
+    println!(
+        "capture complete: {} frames, {} samples/channel, CH0 {:.3}..{:.3} V, CH1 {:.3}..{:.3} V",
+        stats.frames, stats.samples, channel_min[0], channel_max[0], channel_min[1], channel_max[1]
+    );
+    Ok(())
 }
 
 fn capture_logic(resource_directory: &Path, seconds: u64) -> Result<(), Box<dyn Error>> {
