@@ -18,10 +18,31 @@ pub enum DeviceModel {
     DsCopeU3P100,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum UsbSpeedClass {
+    Unknown,
+    LowSpeed,
+    FullSpeed,
     HighSpeed,
     SuperSpeed,
+}
+
+impl UsbSpeedClass {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown USB speed",
+            Self::LowSpeed => "USB LowSpeed (1.5 Mb/s)",
+            Self::FullSpeed => "USB FullSpeed (12 Mb/s)",
+            Self::HighSpeed => "USB 2 HighSpeed (480 Mb/s)",
+            Self::SuperSpeed => "USB 3 SuperSpeed (5 Gb/s or faster)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkStatus {
+    Optimal,
+    ReducedPerformance,
     Unsupported,
 }
 
@@ -35,6 +56,8 @@ pub struct DeviceProfile {
     pub firmware_name: &'static str,
     pub fpga_bitstream_name: &'static str,
     pub channel_count: u8,
+    pub minimum_speed: UsbSpeedClass,
+    pub recommended_speed: UsbSpeedClass,
 }
 
 pub const DSLOGIC_U3PRO16: DeviceProfile = DeviceProfile {
@@ -46,6 +69,8 @@ pub const DSLOGIC_U3PRO16: DeviceProfile = DeviceProfile {
     firmware_name: "DSLogicU3Pro16.fw",
     fpga_bitstream_name: "DSLogicU3Pro16.bin",
     channel_count: 16,
+    minimum_speed: UsbSpeedClass::HighSpeed,
+    recommended_speed: UsbSpeedClass::SuperSpeed,
 };
 
 pub const DSCOPE_U3P100: DeviceProfile = DeviceProfile {
@@ -57,18 +82,13 @@ pub const DSCOPE_U3P100: DeviceProfile = DeviceProfile {
     firmware_name: "DSCopeU3P100.fw",
     fpga_bitstream_name: "DSCopeU3P100.bin",
     channel_count: 2,
+    minimum_speed: UsbSpeedClass::HighSpeed,
+    recommended_speed: UsbSpeedClass::SuperSpeed,
 };
 
 pub const SUPPORTED_PROFILES: &[DeviceProfile] = &[DSLOGIC_U3PRO16, DSCOPE_U3P100];
 
-pub fn profile_for(
-    vendor_id: u16,
-    product_id: u16,
-    speed: UsbSpeedClass,
-) -> Option<&'static DeviceProfile> {
-    if speed == UsbSpeedClass::Unsupported {
-        return None;
-    }
+pub fn profile_for(vendor_id: u16, product_id: u16) -> Option<&'static DeviceProfile> {
     SUPPORTED_PROFILES
         .iter()
         .find(|profile| profile.vendor_id == vendor_id && profile.product_id == product_id)
@@ -102,6 +122,18 @@ pub struct DiscoveredDevice {
     pub profile: &'static DeviceProfile,
     pub location: DeviceLocation,
     pub speed: UsbSpeedClass,
+}
+
+impl DiscoveredDevice {
+    pub fn link_status(&self) -> LinkStatus {
+        if self.speed >= self.profile.recommended_speed {
+            LinkStatus::Optimal
+        } else if self.speed >= self.profile.minimum_speed {
+            LinkStatus::ReducedPerformance
+        } else {
+            LinkStatus::Unsupported
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -143,7 +175,7 @@ pub fn discover_supported_devices() -> Result<DiscoveryReport, UsbError> {
     let mut devices = discover_raw_devices()?
         .into_iter()
         .filter_map(|raw| {
-            let profile = profile_for(raw.vendor_id, raw.product_id, raw.speed)?;
+            let profile = profile_for(raw.vendor_id, raw.product_id)?;
             Some(DiscoveredDevice {
                 profile,
                 location: DeviceLocation {
@@ -165,19 +197,17 @@ pub fn discover_supported_devices() -> Result<DiscoveryReport, UsbError> {
 fn discover_raw_devices() -> Result<Vec<RawUsbDevice>, UsbError> {
     use std::process::Command;
 
-    let output = Command::new("system_profiler")
-        .args(["SPUSBDataType", "-detailLevel", "mini"])
+    let output = Command::new("ioreg")
+        .args(["-p", "IOUSB", "-l", "-w", "0"])
         .output()
-        .map_err(|error| UsbError::new(format!("failed to run system_profiler: {error}")))?;
+        .map_err(|error| UsbError::new(format!("failed to run ioreg: {error}")))?;
     if !output.status.success() {
         return Err(UsbError::new(format!(
-            "system_profiler failed: {}",
+            "ioreg failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(parse_macos_usb_inventory(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    Ok(parse_macos_ioreg(&String::from_utf8_lossy(&output.stdout)))
 }
 
 #[cfg(target_os = "linux")]
@@ -199,7 +229,7 @@ fn discover_raw_devices() -> Result<Vec<RawUsbDevice>, UsbError> {
         };
         let speed_mbps = fs::read_to_string(path.join("speed"))
             .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok())
+            .and_then(|value| value.trim().parse::<f64>().ok())
             .unwrap_or_default();
         devices.push(RawUsbDevice {
             vendor_id,
@@ -224,24 +254,28 @@ fn discover_raw_devices() -> Result<Vec<RawUsbDevice>, UsbError> {
     ))
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn speed_from_mbps(speed_mbps: u32) -> UsbSpeedClass {
-    if speed_mbps >= 5_000 {
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn speed_from_mbps(speed_mbps: f64) -> UsbSpeedClass {
+    if speed_mbps >= 5_000.0 {
         UsbSpeedClass::SuperSpeed
-    } else if speed_mbps >= 480 {
+    } else if speed_mbps >= 480.0 {
         UsbSpeedClass::HighSpeed
+    } else if speed_mbps >= 12.0 {
+        UsbSpeedClass::FullSpeed
+    } else if speed_mbps > 0.0 {
+        UsbSpeedClass::LowSpeed
     } else {
-        UsbSpeedClass::Unsupported
+        UsbSpeedClass::Unknown
     }
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn parse_macos_usb_inventory(inventory: &str) -> Vec<RawUsbDevice> {
+fn parse_macos_ioreg(inventory: &str) -> Vec<RawUsbDevice> {
     #[derive(Default)]
     struct PendingDevice {
         vendor_id: Option<u16>,
         product_id: Option<u16>,
-        speed: Option<UsbSpeedClass>,
+        link_speed_bps: Option<u64>,
         location: Option<String>,
     }
 
@@ -250,7 +284,10 @@ fn parse_macos_usb_inventory(inventory: &str) -> Vec<RawUsbDevice> {
             devices.push(RawUsbDevice {
                 vendor_id,
                 product_id,
-                speed: pending.speed.unwrap_or(UsbSpeedClass::Unsupported),
+                speed: pending
+                    .link_speed_bps
+                    .map(|speed| speed_from_mbps(speed as f64 / 1_000_000.0))
+                    .unwrap_or(UsbSpeedClass::Unknown),
                 platform_path: pending
                     .location
                     .take()
@@ -263,21 +300,23 @@ fn parse_macos_usb_inventory(inventory: &str) -> Vec<RawUsbDevice> {
     let mut devices = Vec::new();
     let mut pending = PendingDevice::default();
     for line in inventory.lines().map(str::trim) {
-        if let Some(value) = line.strip_prefix("Product ID:") {
+        if line.contains("+-o ") || line.starts_with("+-o ") {
             finish(&mut pending, &mut devices);
-            pending.product_id = parse_prefixed_hex(value);
-        } else if let Some(value) = line.strip_prefix("Vendor ID:") {
-            pending.vendor_id = parse_prefixed_hex(value);
-        } else if let Some(value) = line.strip_prefix("Speed:") {
-            pending.speed = Some(if value.contains("5 Gb/s") || value.contains("10 Gb/s") {
-                UsbSpeedClass::SuperSpeed
-            } else if value.contains("480 Mb/s") {
-                UsbSpeedClass::HighSpeed
-            } else {
-                UsbSpeedClass::Unsupported
-            });
-        } else if let Some(value) = line.strip_prefix("Location ID:") {
-            pending.location = value.split('/').next().map(str::trim).map(str::to_owned);
+            if line.contains("<class IOUSBHostDevice") {
+                pending.location = line
+                    .split('@')
+                    .nth(1)
+                    .and_then(|value| value.split_whitespace().next())
+                    .map(str::to_owned);
+            }
+        } else if pending.location.is_some() {
+            if let Some(value) = ioreg_integer_property(line, "idProduct") {
+                pending.product_id = u16::try_from(value).ok();
+            } else if let Some(value) = ioreg_integer_property(line, "idVendor") {
+                pending.vendor_id = u16::try_from(value).ok();
+            } else if let Some(value) = ioreg_integer_property(line, "UsbLinkSpeed") {
+                pending.link_speed_bps = Some(value);
+            }
         }
     }
     finish(&mut pending, &mut devices);
@@ -285,9 +324,10 @@ fn parse_macos_usb_inventory(inventory: &str) -> Vec<RawUsbDevice> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn parse_prefixed_hex(value: &str) -> Option<u16> {
-    let token = value.split_whitespace().next()?;
-    u16::from_str_radix(token.trim_start_matches("0x"), 16).ok()
+fn ioreg_integer_property(line: &str, property: &str) -> Option<u64> {
+    let marker = format!("\"{property}\" = ");
+    let value_start = line.find(&marker)? + marker.len();
+    line[value_start..].trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -297,25 +337,18 @@ mod tests {
     #[test]
     fn matches_requested_models_at_usb_two_and_three_speeds() {
         assert_eq!(
-            profile_for(DREAMSOURCELAB_VENDOR_ID, 0x002a, UsbSpeedClass::HighSpeed),
+            profile_for(DREAMSOURCELAB_VENDOR_ID, 0x002a),
             Some(&DSLOGIC_U3PRO16)
         );
         assert_eq!(
-            profile_for(DREAMSOURCELAB_VENDOR_ID, 0x002b, UsbSpeedClass::SuperSpeed),
+            profile_for(DREAMSOURCELAB_VENDOR_ID, 0x002b),
             Some(&DSCOPE_U3P100)
         );
     }
 
     #[test]
-    fn rejects_unknown_devices_and_slow_connections() {
-        assert_eq!(
-            profile_for(DREAMSOURCELAB_VENDOR_ID, 0xffff, UsbSpeedClass::SuperSpeed),
-            None
-        );
-        assert_eq!(
-            profile_for(DREAMSOURCELAB_VENDOR_ID, 0x002a, UsbSpeedClass::Unsupported),
-            None
-        );
+    fn rejects_unknown_devices() {
+        assert_eq!(profile_for(DREAMSOURCELAB_VENDOR_ID, 0xffff), None);
     }
 
     #[test]
@@ -328,33 +361,63 @@ mod tests {
     }
 
     #[test]
-    fn parses_macos_inventory() {
+    fn parses_macos_ioreg_inventory() {
         let inventory = r#"
-            DSLogic U3Pro16:
-              Product ID: 0x002a
-              Vendor ID: 0x2a0e
-              Speed: Up to 5 Gb/s
-              Location ID: 0x02100000 / 2
-
-            DSCope U3P100:
-              Product ID: 0x002b
-              Vendor ID: 0x2a0e
-              Speed: Up to 480 Mb/s
-              Location ID: 0x02200000 / 3
+            |   +-o USB-based DSL Instrument v2@00210000 <class IOUSBHostDevice>
+            |   | {
+            |   |   "UsbLinkSpeed" = 5000000000
+            |   |   "idProduct" = 43
+            |   |   "idVendor" = 10766
+            |   | }
+            |   +-o USB-based DSL Instrument v2@00220000 <class IOUSBHostDevice>
+            |       {
+            |         "UsbLinkSpeed" = 480000000
+            |         "idProduct" = 42
+            |         "idVendor" = 10766
+            |       }
         "#;
 
-        let devices = parse_macos_usb_inventory(inventory);
+        let devices = parse_macos_ioreg(inventory);
         assert_eq!(devices.len(), 2);
-        assert_eq!(devices[0].product_id, 0x002a);
+        assert_eq!(devices[0].product_id, 0x002b);
         assert_eq!(devices[0].speed, UsbSpeedClass::SuperSpeed);
-        assert_eq!(devices[1].product_id, 0x002b);
+        assert_eq!(devices[0].platform_path, "00210000");
+        assert_eq!(devices[1].product_id, 0x002a);
         assert_eq!(devices[1].speed, UsbSpeedClass::HighSpeed);
     }
 
     #[test]
     fn classifies_supported_link_speeds() {
-        assert_eq!(speed_from_mbps(480), UsbSpeedClass::HighSpeed);
-        assert_eq!(speed_from_mbps(5_000), UsbSpeedClass::SuperSpeed);
-        assert_eq!(speed_from_mbps(12), UsbSpeedClass::Unsupported);
+        assert_eq!(speed_from_mbps(5_000.0), UsbSpeedClass::SuperSpeed);
+        assert_eq!(speed_from_mbps(480.0), UsbSpeedClass::HighSpeed);
+        assert_eq!(speed_from_mbps(12.0), UsbSpeedClass::FullSpeed);
+        assert_eq!(speed_from_mbps(1.5), UsbSpeedClass::LowSpeed);
+        assert_eq!(speed_from_mbps(0.0), UsbSpeedClass::Unknown);
+    }
+
+    #[test]
+    fn warns_when_u3_device_uses_a_usb_two_link() {
+        let device = DiscoveredDevice {
+            profile: &DSLOGIC_U3PRO16,
+            location: DeviceLocation {
+                platform_path: "test".to_owned(),
+            },
+            speed: UsbSpeedClass::HighSpeed,
+        };
+
+        assert_eq!(device.link_status(), LinkStatus::ReducedPerformance);
+    }
+
+    #[test]
+    fn rejects_links_slower_than_usb_two_high_speed() {
+        let device = DiscoveredDevice {
+            profile: &DSCOPE_U3P100,
+            location: DeviceLocation {
+                platform_path: "test".to_owned(),
+            },
+            speed: UsbSpeedClass::FullSpeed,
+        };
+
+        assert_eq!(device.link_status(), LinkStatus::Unsupported);
     }
 }

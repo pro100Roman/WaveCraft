@@ -16,6 +16,8 @@ USB capture support and the graphical interface are the next milestones.
 
 Initial USB discovery supports DSLogic U3Pro16 (`2a0e:002a`) and DSCope U3P100 (`2a0e:002b`) at HighSpeed or SuperSpeed. Discovery is read-only; firmware upload and acquisition are not enabled yet.
 
+The device listing reports the negotiated USB link speed. USB 3 SuperSpeed is recommended; USB 2 HighSpeed produces a reduced-performance warning, and slower links are reported as unsupported.
+
 ## Run the simulator
 
 Install Rust 1.75 or newer, then run:

@@ -1,6 +1,6 @@
 use dsview_core::{CaptureCoordinator, CaptureEvent, DeviceId};
 use dsview_sim::{SimulatedLogicAnalyzer, SimulatedOscilloscope};
-use dsview_usb::discover_supported_devices;
+use dsview_usb::{discover_supported_devices, LinkStatus};
 use std::collections::HashMap;
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -36,12 +36,26 @@ fn list_devices() -> Result<(), Box<dyn Error>> {
     }
     for device in report.devices {
         println!(
-            "{}: {} at {} ({:?})",
+            "{}: {} at {} ({})",
             device.location.stable_id(),
             device.profile.display_name,
             device.location.platform_path,
-            device.speed
+            device.speed.description()
         );
+        match device.link_status() {
+            LinkStatus::Optimal => {}
+            LinkStatus::ReducedPerformance => eprintln!(
+                "warning: {} is using {}; connect it to a USB 3 port with a USB 3 cable for full capture performance",
+                device.profile.display_name,
+                device.speed.description()
+            ),
+            LinkStatus::Unsupported => eprintln!(
+                "error: {} is using {}; {} or faster is required, and USB 3 is recommended",
+                device.profile.display_name,
+                device.speed.description(),
+                device.profile.minimum_speed.description()
+            ),
+        }
     }
     Ok(())
 }
