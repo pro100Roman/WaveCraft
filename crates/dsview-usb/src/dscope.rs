@@ -388,7 +388,7 @@ impl DsCopeChannelConfig {
                 "unsupported DSCope volts/div value: {volts_per_div_mv} mV"
             )));
         }
-        if !matches!(probe_attenuation, 1 | 10) {
+        if !matches!(probe_attenuation, 1 | 10 | 100) {
             return Err(CaptureError::new(format!(
                 "unsupported DSCope probe attenuation: {probe_attenuation}x"
             )));
@@ -2197,7 +2197,7 @@ mod tests {
     #[test]
     fn applies_channel_coupling_scale_and_probe_attenuation() {
         let channels = [
-            DsCopeChannelConfig::new(100, DsCopeCoupling::Ac, 10).unwrap(),
+            DsCopeChannelConfig::new(100, DsCopeCoupling::Ac, 100).unwrap(),
             DsCopeChannelConfig::new(2_000, DsCopeCoupling::Dc, 1).unwrap(),
         ];
         let config =
@@ -2208,7 +2208,7 @@ mod tests {
         assert_eq!(commands[2], 0x0f80);
         assert_eq!(config.divider(), 250);
         assert_eq!(config.channels(), channels);
-        assert!(raw_to_volts(100, 128, channels[0]) > 1.19);
+        assert!(raw_to_volts(100, 128, channels[0]) > 11.9);
         assert!(raw_to_volts(100, 128, channels[1]) > 2.38);
     }
 }

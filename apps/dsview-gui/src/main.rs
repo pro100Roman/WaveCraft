@@ -297,7 +297,8 @@ impl ScopeCaptureSettings {
             .iter()
             .zip(other.channels)
             .any(|(left, right)| {
-                left.volts_per_div_mv != right.volts_per_div_mv
+                left.enabled != right.enabled
+                    || left.volts_per_div_mv != right.volts_per_div_mv
                     || left.vertical_offset != right.vertical_offset
             })
     }
@@ -1765,8 +1766,7 @@ fn paint_scope_channel_settings(
     settings: &mut ScopeChannelSettings,
     channel_color: &mut Color32,
     other_channel_enabled: bool,
-    capture_settings_enabled: bool,
-    input_range_enabled: bool,
+    availability: CaptureSettingsAvailability,
 ) {
     egui::Frame::none()
         .fill(PANEL.gamma_multiply(0.72))
@@ -1778,11 +1778,11 @@ fn paint_scope_channel_settings(
             let enable_control =
                 egui::Checkbox::new(&mut settings.enabled, format!("CH{channel_index} enabled"));
             ui.add_enabled(
-                capture_settings_enabled && can_toggle_enable,
+                availability.channel_enable && can_toggle_enable,
                 enable_control,
             )
             .on_hover_text("At least one oscilloscope channel must remain enabled");
-            ui.add_enabled_ui(input_range_enabled && settings.enabled, |ui| {
+            ui.add_enabled_ui(availability.input_range && settings.enabled, |ui| {
                 ui.label("Input range");
                 paint_scope_input_range_encoder(
                     ui,
@@ -1792,7 +1792,7 @@ fn paint_scope_channel_settings(
                 );
             });
             ui.add_space(12.0);
-            ui.add_enabled_ui(capture_settings_enabled && settings.enabled, |ui| {
+            ui.add_enabled_ui(availability.capture && settings.enabled, |ui| {
                 egui::Grid::new(("scope_channel_secondary_settings", channel_index))
                     .num_columns(2)
                     .spacing([8.0, 5.0])
@@ -1815,7 +1815,7 @@ fn paint_scope_channel_settings(
                         egui::ComboBox::from_id_salt(("scope_probe", channel_index))
                             .selected_text(format!("{}×", settings.probe_attenuation))
                             .show_ui(ui, |ui| {
-                                for attenuation in [1, 10] {
+                                for attenuation in [1, 10, 100] {
                                     ui.selectable_value(
                                         &mut settings.probe_attenuation,
                                         attenuation,
@@ -1833,6 +1833,7 @@ fn paint_scope_channel_settings(
 struct CaptureSettingsAvailability {
     capture: bool,
     trigger: bool,
+    channel_enable: bool,
     input_range: bool,
 }
 
@@ -2003,13 +2004,6 @@ fn paint_capture_settings(
                     ui.add_space(8.0);
                     let channel_count = scope_settings.channels.len();
                     let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
-                    paint_scope_trigger_settings(
-                        ui,
-                        &mut scope_settings.trigger,
-                        channel_enabled,
-                        availability.trigger,
-                    );
-                    ui.add_space(8.0);
                     for (index, channel) in scope_settings.channels.iter_mut().enumerate() {
                         paint_scope_channel_settings(
                             ui,
@@ -2017,13 +2011,20 @@ fn paint_capture_settings(
                             channel,
                             &mut scope_channel_colors[index],
                             channel_enabled[1 - index],
-                            availability.capture,
-                            availability.input_range,
+                            availability,
                         );
                         if index + 1 < channel_count {
                             ui.add_space(6.0);
                         }
                     }
+                    ui.add_space(8.0);
+                    let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
+                    paint_scope_trigger_settings(
+                        ui,
+                        &mut scope_settings.trigger,
+                        channel_enabled,
+                        availability.trigger,
+                    );
                 }
             }
         });
@@ -2207,6 +2208,7 @@ impl eframe::App for DsViewApp {
                                 CaptureSettingsAvailability {
                                     capture: capture_settings_enabled,
                                     trigger: trigger_controls_enabled,
+                                    channel_enable: frontend_controls_enabled,
                                     input_range: frontend_controls_enabled,
                                 },
                                 &mut calibration_action,
@@ -4360,24 +4362,6 @@ fn paint_scope(
     }
     *time_per_division_seconds =
         viewport.time_per_division(display_sample_count, display_sample_rate_hz);
-    paint_scope_offset_arrows(
-        ui,
-        plot,
-        settings,
-        channel_colors,
-        vertical_offsets,
-        trigger_settings,
-        offset_controls_enabled,
-    );
-    paint_scope_trigger_level(
-        ui,
-        plot,
-        settings,
-        trigger_settings,
-        channel_colors,
-        vertical_offsets,
-        trigger_controls_enabled,
-    );
     for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
         channel.vertical_offset = vertical_offset;
     }
@@ -4396,6 +4380,24 @@ fn paint_scope(
             channel_colors,
         );
         paint_empty(&scope_painter, plot, "Waiting for oscilloscope samples");
+        paint_scope_offset_arrows(
+            ui,
+            plot,
+            settings,
+            channel_colors,
+            vertical_offsets,
+            trigger_settings,
+            offset_controls_enabled,
+        );
+        paint_scope_trigger_level(
+            ui,
+            plot,
+            settings,
+            trigger_settings,
+            channel_colors,
+            vertical_offsets,
+            trigger_controls_enabled,
+        );
         paint_waveform_time_scale(
             painter,
             time_ruler,
@@ -4457,6 +4459,26 @@ fn paint_scope(
         }
     }
 
+    // Keep channel and trigger references in the foreground so dense or bright
+    // waveforms never obscure their arrows, labels, or dotted level lines.
+    paint_scope_offset_arrows(
+        ui,
+        plot,
+        settings,
+        channel_colors,
+        vertical_offsets,
+        trigger_settings,
+        offset_controls_enabled,
+    );
+    paint_scope_trigger_level(
+        ui,
+        plot,
+        settings,
+        trigger_settings,
+        channel_colors,
+        vertical_offsets,
+        trigger_controls_enabled,
+    );
     paint_scope_readouts(
         &scope_painter,
         plot,
@@ -4830,7 +4852,7 @@ mod tests {
                     enabled: true,
                     volts_per_div_mv: 100,
                     coupling: DsCopeCoupling::Ac,
-                    probe_attenuation: 10,
+                    probe_attenuation: 100,
                     vertical_offset: 64,
                 },
                 ScopeChannelSettings {
@@ -4860,7 +4882,7 @@ mod tests {
         assert_eq!(config.sample_count(), 250_000);
         assert_eq!(config.channels()[0].volts_per_div_mv(), 100);
         assert_eq!(config.channels()[0].coupling(), DsCopeCoupling::Ac);
-        assert_eq!(config.channels()[0].probe_attenuation(), 10);
+        assert_eq!(config.channels()[0].probe_attenuation(), 100);
         assert_eq!(config.channels()[0].vertical_offset(), 64);
         assert_eq!(config.channels()[1].volts_per_div_mv(), 2_000);
         assert_eq!(config.channels()[1].coupling(), DsCopeCoupling::Dc);
@@ -4904,6 +4926,12 @@ mod tests {
         changed.channels[0].probe_attenuation = 10;
         assert!(!changed.frontend_differs_from(original));
 
+        changed = original;
+        changed.channels[1].enabled = false;
+        assert!(changed.frontend_differs_from(original));
+        assert!(changed.runtime_frontend_differs_from(original));
+
+        changed = original;
         changed.channels[0].volts_per_div_mv = 100;
         assert!(changed.frontend_differs_from(original));
         assert!(changed.runtime_frontend_differs_from(original));
