@@ -306,7 +306,6 @@ struct ScopeFftSettings {
     channel: usize,
     length: usize,
     window: ScopeFftWindow,
-    max_frequency_hz: Option<u64>,
 }
 
 impl Default for ScopeFftSettings {
@@ -316,7 +315,6 @@ impl Default for ScopeFftSettings {
             channel: 0,
             length: 16_384,
             window: ScopeFftWindow::Hann,
-            max_frequency_hz: None,
         }
     }
 }
@@ -1942,7 +1940,6 @@ fn paint_scope_function_settings(
     ui: &mut egui::Ui,
     settings: &mut ScopeFunctionSettings,
     channels: [bool; 2],
-    sample_rate_hz: u64,
 ) {
     settings.clamp_to_channels(channels);
     egui::CollapsingHeader::new(RichText::new("Function").strong())
@@ -2041,31 +2038,6 @@ fn paint_scope_function_settings(
                                     );
                                 }
                             });
-                        ui.end_row();
-
-                        ui.label("Max frequency");
-                        ui.horizontal(|ui| {
-                            let nyquist_hz = (sample_rate_hz / 2).max(1);
-                            let mut maximum_hz = settings
-                                .fft
-                                .max_frequency_hz
-                                .unwrap_or(nyquist_hz)
-                                .clamp(1, nyquist_hz);
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut maximum_hz, 1..=nyquist_hz)
-                                        .logarithmic(true)
-                                        .custom_formatter(|value, _| format_frequency(value)),
-                                )
-                                .changed()
-                            {
-                                settings.fft.max_frequency_hz =
-                                    (maximum_hz < nyquist_hz).then_some(maximum_hz);
-                            }
-                            if ui.small_button("Full").clicked() {
-                                settings.fft.max_frequency_hz = None;
-                            }
-                        });
                         ui.end_row();
                     });
                 ui.small(RichText::new("Magnitude in dBV").color(TEXT_MUTED));
@@ -2340,12 +2312,7 @@ fn paint_capture_settings(
                         availability.trigger,
                     );
                     ui.add_space(8.0);
-                    paint_scope_function_settings(
-                        ui,
-                        scope_function_settings,
-                        channel_enabled,
-                        scope_settings.sample_rate_hz,
-                    );
+                    paint_scope_function_settings(ui, scope_function_settings, channel_enabled);
                 }
             }
         });
@@ -4781,14 +4748,6 @@ fn fft_bin_at_x(plot: Rect, x: f32, first_bin: usize, last_bin: usize) -> usize 
     first_bin + (fraction * (last_bin - first_bin) as f32).round() as usize
 }
 
-fn fft_max_frequency_hz(settings: ScopeFftSettings, sample_rate_hz: u64) -> f64 {
-    let nyquist_hz = (sample_rate_hz / 2).max(1);
-    settings
-        .max_frequency_hz
-        .unwrap_or(nyquist_hz)
-        .clamp(1, nyquist_hz) as f64
-}
-
 fn update_scope_fft_viewport(
     ui: &egui::Ui,
     rect: Rect,
@@ -4857,10 +4816,8 @@ fn paint_scope_fft(
     }
 
     let nyquist = waveforms.scope_rate_hz as f64 / 2.0;
-    let max_frequency_hz = fft_max_frequency_hz(settings, waveforms.scope_rate_hz);
     let last_bin = spectrum.len() - 1;
-    let max_bin =
-        ((max_frequency_hz / nyquist * last_bin as f64).floor() as usize).clamp(1, last_bin);
+    let max_bin = last_bin;
     let response = update_scope_fft_viewport(ui, rect, fft_viewport, max_bin);
     let first_visible_bin = (fft_viewport.start * max_bin as f32).floor() as usize;
     let last_visible_bin = ((fft_viewport.start + fft_viewport.span) * max_bin as f32)
@@ -4897,8 +4854,8 @@ fn paint_scope_fft(
     }
 
     let fft_length = (spectrum.len() - 1) * 2;
-    let start_frequency_hz = max_frequency_hz * fft_viewport.start as f64;
-    let end_frequency_hz = max_frequency_hz * (fft_viewport.start + fft_viewport.span) as f64;
+    let start_frequency_hz = nyquist * fft_viewport.start as f64;
+    let end_frequency_hz = nyquist * (fft_viewport.start + fft_viewport.span) as f64;
     painter.text(
         rect.left_top() + Vec2::new(8.0, 7.0),
         egui::Align2::LEFT_TOP,
@@ -5417,7 +5374,6 @@ mod tests {
                 channel: 0,
                 length: 4_096,
                 window: ScopeFftWindow::Blackman,
-                max_frequency_hz: Some(100_000),
             },
         };
 
@@ -5427,7 +5383,6 @@ mod tests {
         assert_eq!(settings.math.right_channel, 1);
         assert_eq!(settings.fft.channel, 1);
         assert_eq!(settings.fft.window, ScopeFftWindow::Blackman);
-        assert_eq!(settings.fft.max_frequency_hz, Some(100_000));
     }
 
     #[test]
@@ -5516,18 +5471,6 @@ mod tests {
 
         viewport.zoom(-1.0, 0.5, 0.01);
         assert_eq!(viewport, ScopeFftViewport::default());
-    }
-
-    #[test]
-    fn scope_fft_max_frequency_is_limited_by_nyquist() {
-        let mut settings = ScopeFftSettings::default();
-        assert_eq!(fft_max_frequency_hz(settings, 1_000_000), 500_000.0);
-
-        settings.max_frequency_hz = Some(125_000);
-        assert_eq!(fft_max_frequency_hz(settings, 1_000_000), 125_000.0);
-
-        settings.max_frequency_hz = Some(750_000);
-        assert_eq!(fft_max_frequency_hz(settings, 1_000_000), 500_000.0);
     }
 
     #[test]
