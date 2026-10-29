@@ -263,10 +263,50 @@ impl Default for ScopeMathSettings {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeFftWindow {
+    Rectangular,
+    Hann,
+    Hamming,
+    Blackman,
+    FlatTop,
+}
+
+impl ScopeFftWindow {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rectangular => "Rectangular",
+            Self::Hann => "Hann",
+            Self::Hamming => "Hamming",
+            Self::Blackman => "Blackman",
+            Self::FlatTop => "Flat Top",
+        }
+    }
+
+    fn coefficient(self, index: usize, length: usize) -> f64 {
+        if self == Self::Rectangular || length <= 1 {
+            return 1.0;
+        }
+        let phase = std::f64::consts::TAU * index as f64 / (length - 1) as f64;
+        match self {
+            Self::Rectangular => 1.0,
+            Self::Hann => 0.5 * (1.0 - phase.cos()),
+            Self::Hamming => 0.54 - 0.46 * phase.cos(),
+            Self::Blackman => 0.426_59 - 0.496_56 * phase.cos() + 0.076_849 * (2.0 * phase).cos(),
+            Self::FlatTop => {
+                1.0 - 1.93 * phase.cos() + 1.29 * (2.0 * phase).cos() - 0.388 * (3.0 * phase).cos()
+                    + 0.028 * (4.0 * phase).cos()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ScopeFftSettings {
     enabled: bool,
     channel: usize,
     length: usize,
+    window: ScopeFftWindow,
+    max_frequency_hz: Option<u64>,
 }
 
 impl Default for ScopeFftSettings {
@@ -275,6 +315,8 @@ impl Default for ScopeFftSettings {
             enabled: false,
             channel: 0,
             length: 16_384,
+            window: ScopeFftWindow::Hann,
+            max_frequency_hz: None,
         }
     }
 }
@@ -713,6 +755,45 @@ impl WaveformViewport {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScopeFftViewport {
+    start: f32,
+    span: f32,
+}
+
+impl Default for ScopeFftViewport {
+    fn default() -> Self {
+        Self {
+            start: 0.0,
+            span: 1.0,
+        }
+    }
+}
+
+impl ScopeFftViewport {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn zoom(&mut self, scroll_delta: f32, pointer_fraction: f32, minimum_span: f32) {
+        if scroll_delta == 0.0 {
+            return;
+        }
+        let pointer_fraction = pointer_fraction.clamp(0.0, 1.0);
+        let anchor = self.start + pointer_fraction * self.span;
+        let factor = if scroll_delta > 0.0 { 0.8 } else { 1.25 };
+        self.span = (self.span * factor).clamp(minimum_span, 1.0);
+        self.start = (anchor - pointer_fraction * self.span).clamp(0.0, 1.0 - self.span);
+    }
+
+    fn pan(&mut self, delta_x: f32, plot_width: f32) {
+        if plot_width <= 0.0 {
+            return;
+        }
+        self.start = (self.start - delta_x / plot_width * self.span).clamp(0.0, 1.0 - self.span);
+    }
+}
+
 fn apply_time_per_division(
     viewport: &mut WaveformViewport,
     sample_count: usize,
@@ -863,6 +944,7 @@ struct DsViewApp {
     scope_channel_colors: [Color32; 2],
     logic_viewport: WaveformViewport,
     scope_viewport: WaveformViewport,
+    scope_fft_viewport: ScopeFftViewport,
     scope_time_per_division_seconds: Option<f64>,
     scope_capture_restart_requested: bool,
     scope_configuration_due: Option<Instant>,
@@ -894,6 +976,7 @@ impl DsViewApp {
             scope_channel_colors: SCOPE_COLORS,
             logic_viewport: WaveformViewport::default(),
             scope_viewport: WaveformViewport::default(),
+            scope_fft_viewport: ScopeFftViewport::default(),
             scope_time_per_division_seconds: Some(DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS),
             scope_capture_restart_requested: false,
             scope_configuration_due: None,
@@ -1859,6 +1942,7 @@ fn paint_scope_function_settings(
     ui: &mut egui::Ui,
     settings: &mut ScopeFunctionSettings,
     channels: [bool; 2],
+    sample_rate_hz: u64,
 ) {
     settings.clamp_to_channels(channels);
     egui::CollapsingHeader::new(RichText::new("Function").strong())
@@ -1938,8 +2022,53 @@ fn paint_scope_function_settings(
                                 }
                             });
                         ui.end_row();
+
+                        ui.label("Window");
+                        egui::ComboBox::from_id_salt("scope_fft_window")
+                            .selected_text(settings.fft.window.label())
+                            .show_ui(ui, |ui| {
+                                for window in [
+                                    ScopeFftWindow::Rectangular,
+                                    ScopeFftWindow::Hann,
+                                    ScopeFftWindow::Hamming,
+                                    ScopeFftWindow::Blackman,
+                                    ScopeFftWindow::FlatTop,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut settings.fft.window,
+                                        window,
+                                        window.label(),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Max frequency");
+                        ui.horizontal(|ui| {
+                            let nyquist_hz = (sample_rate_hz / 2).max(1);
+                            let mut maximum_hz = settings
+                                .fft
+                                .max_frequency_hz
+                                .unwrap_or(nyquist_hz)
+                                .clamp(1, nyquist_hz);
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut maximum_hz, 1..=nyquist_hz)
+                                        .logarithmic(true)
+                                        .custom_formatter(|value, _| format_frequency(value)),
+                                )
+                                .changed()
+                            {
+                                settings.fft.max_frequency_hz =
+                                    (maximum_hz < nyquist_hz).then_some(maximum_hz);
+                            }
+                            if ui.small_button("Full").clicked() {
+                                settings.fft.max_frequency_hz = None;
+                            }
+                        });
+                        ui.end_row();
                     });
-                ui.small(RichText::new("Hann window · magnitude in dBV").color(TEXT_MUTED));
+                ui.small(RichText::new("Magnitude in dBV").color(TEXT_MUTED));
             });
         });
 }
@@ -2211,7 +2340,12 @@ fn paint_capture_settings(
                         availability.trigger,
                     );
                     ui.add_space(8.0);
-                    paint_scope_function_settings(ui, scope_function_settings, channel_enabled);
+                    paint_scope_function_settings(
+                        ui,
+                        scope_function_settings,
+                        channel_enabled,
+                        scope_settings.sample_rate_hz,
+                    );
                 }
             }
         });
@@ -2503,6 +2637,7 @@ impl eframe::App for DsViewApp {
                 let mut logic_channel_colors = self.logic_channel_colors;
                 let mut logic_viewport = self.logic_viewport;
                 let mut scope_viewport = self.scope_viewport;
+                let mut scope_fft_viewport = self.scope_fft_viewport;
                 let mut scope_time_per_division_seconds = self.scope_time_per_division_seconds;
                 let mut scope_vertical_offsets = self
                     .scope_settings
@@ -2542,6 +2677,7 @@ impl eframe::App for DsViewApp {
                                     rect,
                                     waveforms,
                                     &mut scope_viewport,
+                                    &mut scope_fft_viewport,
                                     ScopeWaveformOptions {
                                         settings: scope_settings,
                                         function_settings: self.scope_function_settings,
@@ -2563,8 +2699,11 @@ impl eframe::App for DsViewApp {
                             waveforms,
                             &mut combined_logic_ratio,
                             &mut logic_channel_colors,
-                            &mut logic_viewport,
-                            &mut scope_viewport,
+                            CombinedWaveformViewports {
+                                logic: &mut logic_viewport,
+                                scope: &mut scope_viewport,
+                                fft: &mut scope_fft_viewport,
+                            },
                             ScopeWaveformOptions {
                                 settings: scope_settings,
                                 function_settings: self.scope_function_settings,
@@ -2583,6 +2722,7 @@ impl eframe::App for DsViewApp {
                 self.logic_channel_colors = logic_channel_colors;
                 self.logic_viewport = logic_viewport;
                 self.scope_viewport = scope_viewport;
+                self.scope_fft_viewport = scope_fft_viewport;
                 self.scope_time_per_division_seconds = scope_time_per_division_seconds;
                 for (channel, vertical_offset) in self
                     .scope_settings
@@ -3152,15 +3292,25 @@ fn combined_pane_heights(total_height: f32, logic_ratio: f32) -> (f32, f32) {
     (logic_height, usable_height - logic_height)
 }
 
+struct CombinedWaveformViewports<'a> {
+    logic: &'a mut WaveformViewport,
+    scope: &'a mut WaveformViewport,
+    fft: &'a mut ScopeFftViewport,
+}
+
 fn combined_waveform_cards(
     ui: &mut egui::Ui,
     waveforms: &WaveformStore,
     logic_ratio: &mut f32,
     logic_channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
-    logic_viewport: &mut WaveformViewport,
-    scope_viewport: &mut WaveformViewport,
+    viewports: CombinedWaveformViewports<'_>,
     scope_options: ScopeWaveformOptions<'_>,
 ) {
+    let CombinedWaveformViewports {
+        logic: logic_viewport,
+        scope: scope_viewport,
+        fft: scope_fft_viewport,
+    } = viewports;
     let available = ui.available_rect_before_wrap();
     let (logic_height, _) = combined_pane_heights(available.height(), *logic_ratio);
     let divider_y = available.top() + logic_height;
@@ -3224,7 +3374,16 @@ fn combined_waveform_cards(
         &mut scope_ui,
         "OSCILLOSCOPE",
         "DSCope · CH0 / CH1",
-        |ui, rect| paint_scope(ui, rect, waveforms, scope_viewport, scope_options),
+        |ui, rect| {
+            paint_scope(
+                ui,
+                rect,
+                waveforms,
+                scope_viewport,
+                scope_fft_viewport,
+                scope_options,
+            )
+        },
     );
 
     let divider_color = if divider_response.hovered() || divider_response.dragged() {
@@ -4568,6 +4727,7 @@ fn scope_fft_spectrum(
     samples: &VecDeque<f32>,
     visible_range: Range<usize>,
     requested_length: usize,
+    window_type: ScopeFftWindow,
 ) -> Vec<f32> {
     let available = visible_range.len().min(requested_length);
     if available < 8 {
@@ -4578,8 +4738,7 @@ fn scope_fft_spectrum(
     let mut values = Vec::with_capacity(length);
     let mut window_sum = 0.0;
     for index in 0..length {
-        let window =
-            0.5 * (1.0 - (std::f64::consts::TAU * index as f64 / (length - 1) as f64).cos());
+        let window = window_type.coefficient(index, length);
         window_sum += window;
         values.push((f64::from(samples[start + index]) * window, 0.0));
     }
@@ -4612,11 +4771,73 @@ fn format_frequency(frequency_hz: f64) -> String {
     }
 }
 
+fn fft_frequency_at_x(plot: Rect, x: f32, start_frequency_hz: f64, end_frequency_hz: f64) -> f64 {
+    let fraction = ((x - plot.left()) / plot.width().max(1.0)).clamp(0.0, 1.0);
+    start_frequency_hz + fraction as f64 * (end_frequency_hz - start_frequency_hz)
+}
+
+fn fft_bin_at_x(plot: Rect, x: f32, first_bin: usize, last_bin: usize) -> usize {
+    let fraction = ((x - plot.left()) / plot.width().max(1.0)).clamp(0.0, 1.0);
+    first_bin + (fraction * (last_bin - first_bin) as f32).round() as usize
+}
+
+fn fft_max_frequency_hz(settings: ScopeFftSettings, sample_rate_hz: u64) -> f64 {
+    let nyquist_hz = (sample_rate_hz / 2).max(1);
+    settings
+        .max_frequency_hz
+        .unwrap_or(nyquist_hz)
+        .clamp(1, nyquist_hz) as f64
+}
+
+fn update_scope_fft_viewport(
+    ui: &egui::Ui,
+    rect: Rect,
+    viewport: &mut ScopeFftViewport,
+    max_bin: usize,
+) -> egui::Response {
+    let minimum_span = (10.0 / max_bin as f32).clamp(0.001, 1.0);
+    viewport.span = viewport.span.clamp(minimum_span, 1.0);
+    viewport.start = viewport.start.clamp(0.0, 1.0 - viewport.span);
+
+    let response = ui.interact(
+        rect,
+        ui.make_persistent_id("scope_fft_viewport"),
+        Sense::click_and_drag(),
+    );
+    let cursor = if response.dragged_by(egui::PointerButton::Primary) {
+        egui::CursorIcon::Grabbing
+    } else {
+        egui::CursorIcon::Crosshair
+    };
+    let response = response.on_hover_cursor(cursor);
+    if response.double_clicked() {
+        viewport.reset();
+    }
+    if response.dragged_by(egui::PointerButton::Primary) {
+        let delta_x = ui.input(|input| input.pointer.delta().x);
+        viewport.pan(delta_x, rect.width());
+        ui.ctx().request_repaint();
+    }
+    if response.hovered() {
+        let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
+        if scroll_delta != 0.0 {
+            let pointer_fraction = response
+                .hover_pos()
+                .map(|pointer| (pointer.x - rect.left()) / rect.width().max(1.0))
+                .unwrap_or(0.5);
+            viewport.zoom(scroll_delta, pointer_fraction, minimum_span);
+            ui.ctx().request_repaint();
+        }
+    }
+    response
+}
+
 fn paint_scope_fft(
     ui: &egui::Ui,
     rect: Rect,
     waveforms: &WaveformStore,
     viewport: WaveformViewport,
+    fft_viewport: &mut ScopeFftViewport,
     settings: ScopeFftSettings,
 ) {
     const MIN_DBV: f32 = -120.0;
@@ -4629,13 +4850,24 @@ fn paint_scope_fft(
         return;
     };
     let visible_range = viewport.sample_range(samples.len());
-    let spectrum = scope_fft_spectrum(samples, visible_range, settings.length);
+    let spectrum = scope_fft_spectrum(samples, visible_range, settings.length, settings.window);
     if spectrum.len() < 2 || waveforms.scope_rate_hz == 0 {
         paint_empty(&painter, rect, "Waiting for FFT source samples");
         return;
     }
 
-    let usable_bins = &spectrum[1..];
+    let nyquist = waveforms.scope_rate_hz as f64 / 2.0;
+    let max_frequency_hz = fft_max_frequency_hz(settings, waveforms.scope_rate_hz);
+    let last_bin = spectrum.len() - 1;
+    let max_bin =
+        ((max_frequency_hz / nyquist * last_bin as f64).floor() as usize).clamp(1, last_bin);
+    let response = update_scope_fft_viewport(ui, rect, fft_viewport, max_bin);
+    let first_visible_bin = (fft_viewport.start * max_bin as f32).floor() as usize;
+    let last_visible_bin = ((fft_viewport.start + fft_viewport.span) * max_bin as f32)
+        .ceil()
+        .clamp((first_visible_bin + 1) as f32, max_bin as f32) as usize;
+    let first_trace_bin = first_visible_bin.max(1);
+    let usable_bins = &spectrum[first_trace_bin..=last_visible_bin];
     let bins_per_pixel = (usable_bins.len() as f32 / rect.width().max(1.0))
         .ceil()
         .max(1.0) as usize;
@@ -4643,9 +4875,11 @@ fn paint_scope_fft(
         .chunks(bins_per_pixel)
         .enumerate()
         .map(|(chunk_index, chunk)| {
-            let bin = 1 + chunk_index * bins_per_pixel;
+            let bin = first_trace_bin + chunk_index * bins_per_pixel;
             let value = chunk.iter().copied().fold(MIN_DBV, f32::max);
-            let x = rect.left() + bin as f32 / (spectrum.len() - 1) as f32 * rect.width();
+            let x = rect.left()
+                + (bin - first_visible_bin) as f32 / (last_visible_bin - first_visible_bin) as f32
+                    * rect.width();
             let y = rect.bottom()
                 - ((value.clamp(MIN_DBV, MAX_DBV) - MIN_DBV) / (MAX_DBV - MIN_DBV)) * rect.height();
             Pos2::new(x, y)
@@ -4663,32 +4897,37 @@ fn paint_scope_fft(
     }
 
     let fft_length = (spectrum.len() - 1) * 2;
-    let nyquist = waveforms.scope_rate_hz as f64 / 2.0;
+    let start_frequency_hz = max_frequency_hz * fft_viewport.start as f64;
+    let end_frequency_hz = max_frequency_hz * (fft_viewport.start + fft_viewport.span) as f64;
     painter.text(
         rect.left_top() + Vec2::new(8.0, 7.0),
         egui::Align2::LEFT_TOP,
-        format!("FFT · CH{} · Hann · {fft_length} pts", settings.channel),
+        format!(
+            "FFT · CH{} · {} · {fft_length} pts",
+            settings.channel,
+            settings.window.label(),
+        ),
         FontId::monospace(10.0),
         SCOPE_COLORS[settings.channel],
     );
     painter.text(
         rect.left_bottom() + Vec2::new(5.0, -4.0),
         egui::Align2::LEFT_BOTTOM,
-        "0 Hz",
+        format_frequency(start_frequency_hz),
         FontId::monospace(9.0),
         TEXT_MUTED,
     );
     painter.text(
         rect.center_bottom() + Vec2::new(0.0, -4.0),
         egui::Align2::CENTER_BOTTOM,
-        format_frequency(nyquist * 0.5),
+        format_frequency((start_frequency_hz + end_frequency_hz) * 0.5),
         FontId::monospace(9.0),
         TEXT_MUTED,
     );
     painter.text(
         rect.right_bottom() + Vec2::new(-5.0, -4.0),
         egui::Align2::RIGHT_BOTTOM,
-        format_frequency(nyquist),
+        format_frequency(end_frequency_hz),
         FontId::monospace(9.0),
         TEXT_MUTED,
     );
@@ -4706,6 +4945,23 @@ fn paint_scope_fft(
         FontId::monospace(9.0),
         TEXT_MUTED,
     );
+
+    if let Some(pointer) = response.hover_pos() {
+        let frequency = fft_frequency_at_x(rect, pointer.x, start_frequency_hz, end_frequency_hz);
+        let bin = fft_bin_at_x(rect, pointer.x, first_visible_bin, last_visible_bin);
+        let magnitude_dbv = spectrum[bin];
+        painter.line_segment(
+            [
+                Pos2::new(pointer.x, rect.top()),
+                Pos2::new(pointer.x, rect.bottom()),
+            ],
+            Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.75)),
+        );
+        response.on_hover_text(format!(
+            "Frequency: {}\nMagnitude: {magnitude_dbv:.2} dBV\nScroll to zoom · drag to pan · double-click to reset",
+            format_frequency(frequency),
+        ));
+    }
 }
 
 fn paint_scope(
@@ -4713,6 +4969,7 @@ fn paint_scope(
     rect: Rect,
     waveforms: &WaveformStore,
     viewport: &mut WaveformViewport,
+    fft_viewport: &mut ScopeFftViewport,
     scope_options: ScopeWaveformOptions<'_>,
 ) {
     let fft_settings = scope_options.function_settings.fft;
@@ -4731,7 +4988,14 @@ fn paint_scope(
         Vec2::new(rect.width(), fft_height),
     );
     paint_scope_time_domain(ui, time_rect, waveforms, viewport, scope_options);
-    paint_scope_fft(ui, fft_rect, waveforms, *viewport, fft_settings);
+    paint_scope_fft(
+        ui,
+        fft_rect,
+        waveforms,
+        *viewport,
+        fft_viewport,
+        fft_settings,
+    );
 }
 
 fn paint_scope_time_domain(
@@ -5152,6 +5416,8 @@ mod tests {
                 enabled: true,
                 channel: 0,
                 length: 4_096,
+                window: ScopeFftWindow::Blackman,
+                max_frequency_hz: Some(100_000),
             },
         };
 
@@ -5160,6 +5426,8 @@ mod tests {
         assert_eq!(settings.math.left_channel, 1);
         assert_eq!(settings.math.right_channel, 1);
         assert_eq!(settings.fft.channel, 1);
+        assert_eq!(settings.fft.window, ScopeFftWindow::Blackman);
+        assert_eq!(settings.fft.max_frequency_hz, Some(100_000));
     }
 
     #[test]
@@ -5172,7 +5440,7 @@ mod tests {
             })
             .collect::<VecDeque<_>>();
 
-        let spectrum = scope_fft_spectrum(&samples, 0..length, length);
+        let spectrum = scope_fft_spectrum(&samples, 0..length, length, ScopeFftWindow::Hann);
         let peak_bin = spectrum
             .iter()
             .enumerate()
@@ -5183,6 +5451,83 @@ mod tests {
 
         assert_eq!(peak_bin, tone_bin);
         assert!((spectrum[peak_bin] + 3.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn scope_fft_supports_vendor_window_types() {
+        let samples = (0..1_024)
+            .map(|index| (std::f32::consts::TAU * 32.0 * index as f32 / 1_024.0).sin())
+            .collect::<VecDeque<_>>();
+
+        for window in [
+            ScopeFftWindow::Rectangular,
+            ScopeFftWindow::Hann,
+            ScopeFftWindow::Hamming,
+            ScopeFftWindow::Blackman,
+            ScopeFftWindow::FlatTop,
+        ] {
+            let spectrum = scope_fft_spectrum(&samples, 0..1_024, 1_024, window);
+            assert_eq!(spectrum.len(), 513);
+            assert!(spectrum.iter().all(|magnitude| magnitude.is_finite()));
+            assert_eq!(
+                spectrum
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .max_by(|left, right| left.1.total_cmp(right.1))
+                    .map(|(bin, _)| bin),
+                Some(32),
+            );
+        }
+    }
+
+    #[test]
+    fn scope_fft_mouse_position_maps_to_frequency() {
+        let plot = Rect::from_min_size(Pos2::new(100.0, 20.0), Vec2::new(800.0, 200.0));
+
+        assert_eq!(fft_frequency_at_x(plot, 100.0, 0.0, 500_000.0), 0.0);
+        assert_eq!(fft_frequency_at_x(plot, 500.0, 0.0, 500_000.0), 250_000.0);
+        assert_eq!(fft_frequency_at_x(plot, 900.0, 0.0, 500_000.0), 500_000.0);
+        assert_eq!(fft_frequency_at_x(plot, 950.0, 0.0, 500_000.0), 500_000.0);
+        assert_eq!(
+            fft_frequency_at_x(plot, 100.0, 100_000.0, 200_000.0),
+            100_000.0
+        );
+        assert_eq!(
+            fft_frequency_at_x(plot, 900.0, 100_000.0, 200_000.0),
+            200_000.0
+        );
+        assert_eq!(fft_bin_at_x(plot, 100.0, 128, 256), 128);
+        assert_eq!(fft_bin_at_x(plot, 500.0, 128, 256), 192);
+        assert_eq!(fft_bin_at_x(plot, 900.0, 128, 256), 256);
+        assert_eq!(fft_bin_at_x(plot, 950.0, 128, 256), 256);
+    }
+
+    #[test]
+    fn scope_fft_viewport_zooms_at_pointer_and_pans() {
+        let mut viewport = ScopeFftViewport::default();
+
+        viewport.zoom(1.0, 0.25, 0.01);
+        assert!((viewport.span - 0.8).abs() < f32::EPSILON);
+        assert!((viewport.start - 0.05).abs() < f32::EPSILON);
+
+        viewport.pan(-100.0, 1_000.0);
+        assert!((viewport.start - 0.13).abs() < f32::EPSILON);
+
+        viewport.zoom(-1.0, 0.5, 0.01);
+        assert_eq!(viewport, ScopeFftViewport::default());
+    }
+
+    #[test]
+    fn scope_fft_max_frequency_is_limited_by_nyquist() {
+        let mut settings = ScopeFftSettings::default();
+        assert_eq!(fft_max_frequency_hz(settings, 1_000_000), 500_000.0);
+
+        settings.max_frequency_hz = Some(125_000);
+        assert_eq!(fft_max_frequency_hz(settings, 1_000_000), 125_000.0);
+
+        settings.max_frequency_hz = Some(750_000);
+        assert_eq!(fft_max_frequency_hz(settings, 1_000_000), 500_000.0);
     }
 
     #[test]
