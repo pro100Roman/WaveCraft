@@ -549,6 +549,7 @@ fn decode_frame(payload: &[u8]) -> Result<CaptureFrame, RecordingError> {
             }
             CaptureBatch::Scope(ScopeBatch {
                 sample_rate_hz,
+                trigger_sample_index: None,
                 channels,
             })
         }
@@ -770,6 +771,7 @@ mod tests {
             captured_at: Duration::new(2, 678),
             payload: CaptureBatch::Scope(ScopeBatch {
                 sample_rate_hz: 1_000_000,
+                trigger_sample_index: None,
                 channels: vec![vec![0.25, -0.5], vec![1.0, -1.0]],
             }),
         })
@@ -841,6 +843,7 @@ mod tests {
             captured_at: Duration::ZERO,
             payload: CaptureBatch::Scope(ScopeBatch {
                 sample_rate_hz: 1_000,
+                trigger_sample_index: None,
                 channels: vec![vec![0.0], vec![0.0, 1.0]],
             }),
         });

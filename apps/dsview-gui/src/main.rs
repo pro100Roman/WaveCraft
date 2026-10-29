@@ -402,6 +402,7 @@ struct WaveformStore {
     scope_channels: Vec<VecDeque<f32>>,
     scope_rate_hz: u64,
     scope_sample_offset: u64,
+    scope_trigger_sample_index: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -456,6 +457,25 @@ impl WaveformViewport {
         self.start =
             (sample_anchor - new_fraction.clamp(0.0, 1.0) * self.span).clamp(0.0, 1.0 - self.span);
     }
+
+    fn align_sample_to_screen(&mut self, sample_fraction: f32, screen_fraction: f32) {
+        self.start = (sample_fraction.clamp(0.0, 1.0)
+            - screen_fraction.clamp(0.0, 1.0) * self.span)
+            .clamp(0.0, 1.0 - self.span);
+    }
+
+    fn zoom_sample_at_screen(
+        &mut self,
+        scroll_delta: f32,
+        sample_fraction: f32,
+        screen_fraction: f32,
+    ) {
+        if scroll_delta == 0.0 {
+            return;
+        }
+        self.span = (self.span * (-scroll_delta * 0.01).exp()).clamp(Self::MIN_SPAN, 1.0);
+        self.align_sample_to_screen(sample_fraction, screen_fraction);
+    }
 }
 
 impl WaveformStore {
@@ -472,6 +492,9 @@ impl WaveformStore {
                 if self.scope_channels.len() != scope_channels.len() {
                     self.scope_channels = vec![VecDeque::new(); scope_channels.len()];
                     self.scope_sample_offset = 0;
+                }
+                if let Some(trigger_sample_index) = scope.trigger_sample_index {
+                    self.scope_trigger_sample_index = Some(trigger_sample_index);
                 }
                 let mut removed_samples = 0;
                 for (source, physical_channel) in scope.channels.iter().zip(
@@ -2770,7 +2793,7 @@ fn update_waveform_viewport(
     rect: Rect,
     id_salt: &'static str,
     viewport: &mut WaveformViewport,
-    zoom_anchor: Option<f32>,
+    zoom_anchor: Option<(f32, f32)>,
 ) {
     let response = ui
         .interact(rect, ui.make_persistent_id(id_salt), Sense::click())
@@ -2782,13 +2805,15 @@ fn update_waveform_viewport(
     if response.hovered() {
         let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
         if scroll_delta != 0.0 {
-            let anchor_fraction = zoom_anchor.unwrap_or_else(|| {
-                response
+            if let Some((sample_fraction, screen_fraction)) = zoom_anchor {
+                viewport.zoom_sample_at_screen(scroll_delta, sample_fraction, screen_fraction);
+            } else {
+                let pointer_fraction = response
                     .hover_pos()
                     .map(|pointer| (pointer.x - rect.left()) / rect.width().max(1.0))
-                    .unwrap_or(0.5)
-            });
-            viewport.zoom(scroll_delta, anchor_fraction);
+                    .unwrap_or(0.5);
+                viewport.zoom(scroll_delta, pointer_fraction);
+            }
             ui.ctx().request_repaint();
         }
     }
@@ -3198,11 +3223,10 @@ fn paint_scope_offset_arrows(
     }
 
     for channel in (0..channel_colors.len()).rev() {
-        let display_color = if settings.channels[channel].enabled {
-            channel_colors[channel]
-        } else {
-            TEXT_MUTED.gamma_multiply(0.45)
-        };
+        if !settings.channels[channel].enabled {
+            continue;
+        }
+        let display_color = channel_colors[channel];
         let arrow_y = scope_vertical_offset_y(plot, vertical_offsets[channel]);
         let body_right = arrow_x + ARROW_BODY_WIDTH;
         painter.add(egui::Shape::convex_polygon(
@@ -3327,6 +3351,70 @@ fn scope_trigger_level_from_y(plot: Rect, y: f32) -> u8 {
     let reference_span = f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
     let level = (f32::from(DSCOPE_VERTICAL_OFFSET_MIN) + ratio * reference_span).round() as u8;
     level.clamp(DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_LEVEL_MAX)
+}
+
+fn scope_trigger_channels(settings: ScopeTriggerSettings) -> &'static [usize] {
+    match settings.source {
+        DsCopeTriggerSource::Auto if settings.auto_channel == 0 => &[0],
+        DsCopeTriggerSource::Auto => &[1],
+        DsCopeTriggerSource::ChannelZero => &[0],
+        DsCopeTriggerSource::ChannelOne => &[1],
+        DsCopeTriggerSource::ChannelZeroAndOne | DsCopeTriggerSource::ChannelZeroOrOne => &[0, 1],
+    }
+}
+
+fn scope_trigger_threshold_voltage(channel: ScopeChannelSettings, trigger_level: u8) -> f32 {
+    let trigger_ratio = f32::from(u16::from(trigger_level) - DSCOPE_VERTICAL_OFFSET_MIN)
+        / f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
+    let zero_ratio = scope_vertical_offset_ratio(channel.vertical_offset);
+    let voltage_span = f32::from(channel.volts_per_div_mv) / 1_000.0
+        * SCOPE_VERTICAL_DIVISIONS as f32
+        * f32::from(channel.probe_attenuation);
+    (zero_ratio - trigger_ratio) * voltage_span
+}
+
+fn scope_trigger_crossing_sample(
+    waveforms: &WaveformStore,
+    settings: ScopeCaptureSettings,
+    trigger: ScopeTriggerSettings,
+) -> Option<f32> {
+    const TRIGGER_SEARCH_SAMPLES: usize = 2;
+    let trigger_sample = waveforms.scope_trigger_sample_index?;
+    let local_trigger =
+        usize::try_from(trigger_sample.checked_sub(waveforms.scope_sample_offset)?).ok()?;
+    let mut closest_crossing = None::<f32>;
+
+    for &channel_index in scope_trigger_channels(trigger) {
+        let channel_settings = settings.channels[channel_index];
+        if !channel_settings.enabled {
+            continue;
+        }
+        let samples = waveforms.scope_channels.get(channel_index)?;
+        let threshold = scope_trigger_threshold_voltage(channel_settings, trigger.level);
+        for distance in 0..TRIGGER_SEARCH_SAMPLES {
+            let right = local_trigger.checked_sub(distance)?;
+            let left = right.checked_sub(1)?;
+            let (&left_value, &right_value) = (samples.get(left)?, samples.get(right)?);
+            let crosses = match trigger.slope {
+                DsCopeTriggerSlope::Rising => left_value <= threshold && right_value >= threshold,
+                DsCopeTriggerSlope::Falling => left_value >= threshold && right_value <= threshold,
+            };
+            if !crosses {
+                continue;
+            }
+            let delta = right_value - left_value;
+            let interpolation = if delta.abs() <= f32::EPSILON {
+                0.0
+            } else {
+                ((threshold - left_value) / delta).clamp(0.0, 1.0)
+            };
+            let crossing = waveforms.scope_sample_offset as f32 + left as f32 + interpolation;
+            closest_crossing =
+                Some(closest_crossing.map_or(crossing, |current| current.max(crossing)));
+            break;
+        }
+    }
+    closest_crossing
 }
 
 fn scope_trigger_position_x(plot: Rect, position_percent: u8) -> f32 {
@@ -3567,17 +3655,41 @@ fn paint_scope(
     for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
         channel.vertical_offset = vertical_offset;
     }
+    let sample_count = waveforms
+        .scope_channels
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| settings.channels[*index].enabled)
+        .map(|(_, samples)| samples)
+        .map(VecDeque::len)
+        .min()
+        .unwrap_or(0);
     paint_plot_background(ui, rect);
     let painter = ui.painter();
     let (status_bar, time_ruler, plot) = split_waveform_chrome(rect);
     let scope_painter = painter.with_clip_rect(plot);
     paint_scope_graticule(&scope_painter, plot);
+    let trigger_sample_fraction =
+        scope_trigger_crossing_sample(waveforms, settings, *trigger_settings)
+            .or_else(|| {
+                waveforms
+                    .scope_trigger_sample_index
+                    .map(|sample| sample as f32)
+            })
+            .map(|sample| {
+                (sample - waveforms.scope_sample_offset as f32) / sample_count.max(1) as f32
+            })
+            .unwrap_or_else(|| f32::from(settings.trigger.position_percent) / 100.0);
+    let trigger_screen_fraction = f32::from(trigger_settings.position_percent) / 100.0;
+    if viewport.span < 1.0 {
+        viewport.align_sample_to_screen(trigger_sample_fraction, trigger_screen_fraction);
+    }
     update_waveform_viewport(
         ui,
         plot,
         "scope_waveform_zoom",
         viewport,
-        Some(f32::from(trigger_settings.position_percent) / 100.0),
+        Some((trigger_sample_fraction, trigger_screen_fraction)),
     );
     paint_scope_offset_arrows(
         ui,
@@ -3599,15 +3711,6 @@ fn paint_scope(
     }
     settings.trigger = *trigger_settings;
 
-    let sample_count = waveforms
-        .scope_channels
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| settings.channels[*index].enabled)
-        .map(|(_, samples)| samples)
-        .map(VecDeque::len)
-        .min()
-        .unwrap_or(0);
     let visible_range = viewport.sample_range(sample_count);
     let visible_count = visible_range.len();
     if visible_count == 0 {
@@ -3777,12 +3880,14 @@ mod tests {
         store.ingest(
             &CaptureBatch::Scope(ScopeBatch {
                 sample_rate_hz: 1_000_000,
+                trigger_sample_index: Some(1),
                 channels: vec![vec![0.1, 0.2], vec![-0.1, -0.2]],
             }),
             [true, true],
         );
 
         assert_eq!(store.scope_rate_hz, 1_000_000);
+        assert_eq!(store.scope_trigger_sample_index, Some(1));
         assert_eq!(store.scope_channels[0].back(), Some(&0.2));
         assert_eq!(store.scope_channels[1].back(), Some(&-0.2));
     }
@@ -3793,6 +3898,7 @@ mod tests {
         store.ingest(
             &CaptureBatch::Scope(ScopeBatch {
                 sample_rate_hz: 1_000_000_000,
+                trigger_sample_index: None,
                 channels: vec![vec![0.1, 0.2]],
             }),
             [false, true],
@@ -4076,6 +4182,36 @@ mod tests {
     }
 
     #[test]
+    fn scope_trigger_anchor_interpolates_the_threshold_crossing() {
+        let mut waveforms = WaveformStore {
+            scope_channels: vec![
+                VecDeque::from(vec![-1.0, -1.0, 1.0, 1.0]),
+                VecDeque::from(vec![0.0; 4]),
+            ],
+            scope_trigger_sample_index: Some(3),
+            ..WaveformStore::default()
+        };
+        let settings = ScopeCaptureSettings::default();
+        let mut trigger = ScopeTriggerSettings {
+            source: DsCopeTriggerSource::ChannelZero,
+            slope: DsCopeTriggerSlope::Rising,
+            ..ScopeTriggerSettings::default()
+        };
+
+        assert_eq!(
+            scope_trigger_crossing_sample(&waveforms, settings, trigger),
+            Some(1.5)
+        );
+
+        waveforms.scope_channels[0] = VecDeque::from(vec![1.0, 1.0, -1.0, -1.0]);
+        trigger.slope = DsCopeTriggerSlope::Falling;
+        assert_eq!(
+            scope_trigger_crossing_sample(&waveforms, settings, trigger),
+            Some(1.5)
+        );
+    }
+
+    #[test]
     fn scope_trigger_position_maps_between_percent_and_plot_x() {
         let plot = Rect::from_min_max(Pos2::new(100.0, 20.0), Pos2::new(900.0, 420.0));
 
@@ -4097,6 +4233,13 @@ mod tests {
         viewport.move_screen_anchor(0.5, 0.25);
         assert!((viewport.start - 0.375).abs() < f32::EPSILON);
         assert!(((0.5 - viewport.start) / viewport.span - 0.25).abs() < f32::EPSILON);
+
+        let mut hardware_anchored = WaveformViewport::default();
+        hardware_anchored.zoom_sample_at_screen(100.0, 0.503, 0.5);
+        assert!(hardware_anchored.span < 1.0);
+        assert!(
+            ((0.503 - hardware_anchored.start) / hardware_anchored.span - 0.5).abs() < f32::EPSILON
+        );
     }
 
     #[test]
@@ -4124,7 +4267,7 @@ mod tests {
     #[test]
     fn overlapping_scope_offset_arrows_remain_independently_selectable() {
         let plot = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 200.0));
-        let settings = ScopeCaptureSettings::default();
+        let mut settings = ScopeCaptureSettings::default();
         let mut offsets = [DSCOPE_VERTICAL_OFFSET_CENTER; 2];
         let center_y = scope_vertical_offset_y(plot, DSCOPE_VERTICAL_OFFSET_CENTER);
 
@@ -4137,6 +4280,19 @@ mod tests {
         assert_eq!(
             scope_offset_arrow_at_pointer(plot, center_y, settings, &offsets),
             Some(1)
+        );
+
+        settings.channels[0].enabled = false;
+        offsets[0] = DSCOPE_VERTICAL_OFFSET_CENTER;
+        assert_eq!(
+            scope_offset_arrow_at_pointer(plot, center_y, settings, &offsets),
+            Some(1)
+        );
+
+        settings.channels[1].enabled = false;
+        assert_eq!(
+            scope_offset_arrow_at_pointer(plot, center_y, settings, &offsets),
+            None
         );
     }
 

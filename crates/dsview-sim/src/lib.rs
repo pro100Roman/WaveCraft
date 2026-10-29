@@ -150,6 +150,7 @@ impl CaptureSource for SimulatedOscilloscope {
                 captured_at,
                 CaptureBatch::Scope(ScopeBatch {
                     sample_rate_hz: self.sample_rate_hz,
+                    trigger_sample_index: None,
                     channels,
                 }),
             )?;

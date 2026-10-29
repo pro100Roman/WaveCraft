@@ -304,6 +304,7 @@ mod tests {
                 }),
                 InstrumentKind::Oscilloscope => CaptureBatch::Scope(ScopeBatch {
                     sample_rate_hz: 1_000,
+                    trigger_sample_index: None,
                     channels: vec![vec![0.0, 1.0]],
                 }),
             };

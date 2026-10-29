@@ -1430,7 +1430,7 @@ fn decode_capture(
     config: DsCopeCaptureConfig,
     context: &CaptureContext,
 ) -> Result<(), CaptureError> {
-    validate_trigger_header(&capture.trigger_header)?;
+    let trigger_sample_index = decode_trigger_sample_index(&capture.trigger_header, config)?;
     let enabled_channel_count = config.enabled_channel_count();
     let enabled_channel_indices = config.enabled_channel_indices().collect::<Vec<_>>();
     let measurement_offset = usize::try_from(config.armed_sample_count())
@@ -1478,6 +1478,7 @@ fn decode_capture(
             captured_at,
             CaptureBatch::Scope(ScopeBatch {
                 sample_rate_hz: config.sample_rate_hz,
+                trigger_sample_index: (sequence == 0).then_some(trigger_sample_index),
                 channels,
             }),
         )?;
@@ -1490,6 +1491,25 @@ fn validate_trigger_header(header: &[u8]) -> Result<(), CaptureError> {
         return Err(CaptureError::new("invalid DSCope trigger header"));
     }
     Ok(())
+}
+
+fn decode_trigger_sample_index(
+    header: &[u8],
+    config: DsCopeCaptureConfig,
+) -> Result<u64, CaptureError> {
+    validate_trigger_header(header)?;
+    let raw_position = u64::from(read_u32(header, 4));
+    let sample_index = raw_position
+        .checked_mul(CHANNEL_COUNT as u64)
+        .map(|position| position / config.enabled_channel_count() as u64)
+        .ok_or_else(|| CaptureError::new("DSCope trigger position overflowed"))?;
+    if sample_index >= config.sample_count {
+        return Err(CaptureError::new(format!(
+            "DSCope trigger sample {sample_index} is outside the {}-sample capture",
+            config.sample_count
+        )));
+    }
+    Ok(sample_index)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1926,6 +1946,34 @@ mod tests {
 
         footer[8..12].copy_from_slice(&(config.divider() + 1).to_le_bytes());
         assert!(!ScopeMeasurement::is_ready(&footer, config));
+    }
+
+    #[test]
+    fn converts_hardware_trigger_position_to_per_channel_sample_index() {
+        let dual_channel =
+            DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).unwrap();
+        let mut header = [0_u8; TRIGGER_HEADER_BYTES];
+        header[0..4].copy_from_slice(&TRIGGER_CHECK_ID.to_le_bytes());
+        header[4..8].copy_from_slice(&500_000_u32.to_le_bytes());
+
+        assert_eq!(
+            decode_trigger_sample_index(&header, dual_channel).unwrap(),
+            500_000
+        );
+
+        let single_channel = DsCopeCaptureConfig::with_channel_configs(
+            1_000_000_000,
+            MAX_TOTAL_SAMPLE_COUNT,
+            [
+                DsCopeChannelConfig::default(),
+                DsCopeChannelConfig::default().with_enabled(false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            decode_trigger_sample_index(&header, single_channel).unwrap(),
+            1_000_000
+        );
     }
 
     #[test]

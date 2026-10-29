@@ -49,6 +49,9 @@ pub struct LogicBatch {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScopeBatch {
     pub sample_rate_hz: u64,
+    /// Per-channel sample index reported by the hardware trigger header. This
+    /// is present on the first batch of a finite triggered capture.
+    pub trigger_sample_index: Option<u64>,
     /// Enabled channels in ascending physical-channel order. Samples are
     /// channel-major and all channels must have equal length.
     pub channels: Vec<Vec<f32>>,
