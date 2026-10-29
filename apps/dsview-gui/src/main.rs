@@ -534,7 +534,6 @@ struct CompletedCapture {
     stats: HashMap<DeviceId, DeviceStats>,
     waveforms: WaveformStore,
     recording_path: Option<String>,
-    scope_config: DsCopeCaptureConfig,
 }
 
 type FileRecorder = RecordingWriter<BufWriter<File>>;
@@ -837,7 +836,6 @@ impl DsViewApp {
             stats: active.stats,
             waveforms: active.waveforms,
             recording_path: active.recording_path,
-            scope_config: active.scope_config,
         });
         match (stop_result, recording_result) {
             (Ok(()), Ok(())) => self.status = "Capture stopped".to_owned(),
@@ -1037,7 +1035,6 @@ impl DsViewApp {
                     stats: active.stats,
                     waveforms: active.waveforms,
                     recording_path: active.recording_path,
-                    scope_config: active.scope_config,
                 });
                 match error {
                     Some(error) => self.set_error(error),
@@ -1933,11 +1930,6 @@ impl eframe::App for DsViewApp {
                     .capture
                     .as_ref()
                     .map(|active| ScopeCaptureSettings::from_capture_config(active.scope_config))
-                    .or_else(|| {
-                        self.completed_capture.as_ref().map(|capture| {
-                            ScopeCaptureSettings::from_capture_config(capture.scope_config)
-                        })
-                    })
                     .unwrap_or(self.scope_settings);
                 match self.active_waveform_tab {
                     Some(WaveformTab::LogicAnalyzer) => {
@@ -3103,6 +3095,13 @@ fn scope_vertical_offset_from_y(rect: Rect, y: f32) -> u16 {
     (f32::from(DSCOPE_VERTICAL_OFFSET_MIN) + ratio * span).round() as u16
 }
 
+fn scope_sample_y(plot: Rect, channel: ScopeChannelSettings, voltage: f32) -> f32 {
+    let volts_per_div =
+        f32::from(channel.volts_per_div_mv) / 1_000.0 * f32::from(channel.probe_attenuation);
+    let voltage_span = volts_per_div * SCOPE_VERTICAL_DIVISIONS as f32;
+    scope_vertical_offset_y(plot, channel.vertical_offset) - voltage / voltage_span * plot.height()
+}
+
 fn scope_vertical_offset_divisions(rect: Rect, vertical_offset: u16) -> f32 {
     let center_y = scope_vertical_offset_y(rect, DSCOPE_VERTICAL_OFFSET_CENTER);
     (center_y - scope_vertical_offset_y(rect, vertical_offset)) / rect.height().max(1.0)
@@ -3761,9 +3760,6 @@ fn paint_scope(
         if !channel_settings.enabled {
             continue;
         }
-        let volts_per_div = f32::from(channel_settings.volts_per_div_mv) / 1_000.0
-            * f32::from(channel_settings.probe_attenuation);
-        let voltage_span = volts_per_div * SCOPE_VERTICAL_DIVISIONS as f32;
         let points = visible_range
             .clone()
             .step_by(step)
@@ -3772,8 +3768,7 @@ fn paint_scope(
                     + index.saturating_sub(visible_range.start) as f32
                         / visible_count.saturating_sub(1).max(1) as f32
                         * plot.width();
-                let zero_y = scope_vertical_offset_y(plot, channel_settings.vertical_offset);
-                let y = zero_y - channel[index] / voltage_span * plot.height();
+                let y = scope_sample_y(plot, channel_settings, channel[index]);
                 Pos2::new(x, y)
             })
             .collect::<Vec<_>>();
@@ -4262,6 +4257,26 @@ mod tests {
             scope_vertical_offset_from_y(rect, rect.bottom()),
             DSCOPE_VERTICAL_OFFSET_MAX
         );
+    }
+
+    #[test]
+    fn scope_input_range_rescales_captured_volts() {
+        let plot = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1_000.0, 800.0));
+        let one_volt_per_div = ScopeChannelSettings {
+            volts_per_div_mv: 1_000,
+            ..ScopeChannelSettings::default()
+        };
+        let half_volt_per_div = ScopeChannelSettings {
+            volts_per_div_mv: 500,
+            ..one_volt_per_div
+        };
+        let zero_y = scope_sample_y(plot, one_volt_per_div, 0.0);
+        let one_volt_y = scope_sample_y(plot, one_volt_per_div, 1.0);
+        let half_volt_range_y = scope_sample_y(plot, half_volt_per_div, 1.0);
+
+        let pixels_per_division = plot.height() / SCOPE_VERTICAL_DIVISIONS as f32;
+        assert!((zero_y - one_volt_y - pixels_per_division).abs() < 0.001);
+        assert!((zero_y - half_volt_range_y - pixels_per_division * 2.0).abs() < 0.001);
     }
 
     #[test]
