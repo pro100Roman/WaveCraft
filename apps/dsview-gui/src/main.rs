@@ -294,11 +294,14 @@ impl ScopeCaptureSettings {
             || self.trigger.hardware_differs_from(other.trigger)
     }
 
-    fn input_ranges_differ_from(self, other: Self) -> bool {
+    fn runtime_frontend_differs_from(self, other: Self) -> bool {
         self.channels
             .iter()
             .zip(other.channels)
-            .any(|(left, right)| left.volts_per_div_mv != right.volts_per_div_mv)
+            .any(|(left, right)| {
+                left.volts_per_div_mv != right.volts_per_div_mv
+                    || left.vertical_offset != right.vertical_offset
+            })
     }
 
     fn from_capture_config(config: DsCopeCaptureConfig) -> Self {
@@ -492,7 +495,7 @@ fn scope_trigger_controls_are_enabled(
     !background_operation_pending && active_capture_supports_runtime_trigger.unwrap_or(true)
 }
 
-fn scope_input_range_controls_are_enabled(
+fn scope_frontend_controls_are_enabled(
     background_operation_pending: bool,
     capture_run_requested: bool,
     selected_scope_device: bool,
@@ -1145,7 +1148,7 @@ impl DsViewApp {
                     self.scope_capture_restart_requested = false;
                     match session.stop() {
                         Ok(()) => {
-                            self.status = "Reconfiguring oscilloscope input range…".to_owned();
+                            self.status = "Reconfiguring oscilloscope frontend…".to_owned();
                             self.begin_capture(mode);
                         }
                         Err(error) => self.set_error(error.to_string()),
@@ -1365,7 +1368,7 @@ impl DsViewApp {
             if let Some(mut active) = self.capture.take() {
                 let mode = active.mode;
                 let preserve_display_until_complete = active.preserve_display_until_complete;
-                let restart_for_input_range =
+                let restart_for_frontend =
                     self.scope_capture_restart_requested && self.capture_run_requested;
                 self.scope_capture_restart_requested = false;
                 let stop_result = active.session.stop();
@@ -1386,7 +1389,7 @@ impl DsViewApp {
                         format!("failed to finish recording: {recording_error}"),
                     );
                 }
-                let update_completed_capture = if restart_for_input_range {
+                let update_completed_capture = if restart_for_frontend {
                     !preserve_display_until_complete
                 } else {
                     completion == CompletionStatus::Complete || !preserve_display_until_complete
@@ -1400,7 +1403,7 @@ impl DsViewApp {
                     });
                 }
                 let repeat = error.is_none()
-                    && (restart_for_input_range
+                    && (restart_for_frontend
                         || should_rearm_acquisition(
                             mode,
                             self.capture_run_requested,
@@ -1412,8 +1415,8 @@ impl DsViewApp {
                 }
                 match error {
                     Some(error) => self.set_error(error),
-                    None if restart_for_input_range => {
-                        self.status = "Reconfiguring oscilloscope input range…".to_owned();
+                    None if restart_for_frontend => {
+                        self.status = "Reconfiguring oscilloscope frontend…".to_owned();
                     }
                     None => {
                         self.status = result.ok().unwrap_or_else(|| "Capture complete".to_owned());
@@ -2128,7 +2131,7 @@ impl eframe::App for DsViewApp {
                 .as_ref()
                 .map(|active| !active.scope_trigger_controls.is_empty()),
         );
-        let input_range_controls_enabled = scope_input_range_controls_are_enabled(
+        let frontend_controls_enabled = scope_frontend_controls_are_enabled(
             self.pending.is_some(),
             self.capture_run_requested,
             selected_scope_device,
@@ -2244,7 +2247,7 @@ impl eframe::App for DsViewApp {
                                 CaptureSettingsAvailability {
                                     capture: capture_settings_enabled,
                                     trigger: trigger_controls_enabled,
-                                    input_range: input_range_controls_enabled,
+                                    input_range: frontend_controls_enabled,
                                 },
                                 &mut calibration_action,
                             );
@@ -2444,7 +2447,7 @@ impl eframe::App for DsViewApp {
                                         trigger_settings: &mut scope_trigger_settings,
                                         time_per_division_seconds:
                                             &mut scope_time_per_division_seconds,
-                                        offset_controls_enabled: capture_settings_enabled,
+                                        offset_controls_enabled: frontend_controls_enabled,
                                         trigger_controls_enabled,
                                     },
                                 )
@@ -2465,7 +2468,7 @@ impl eframe::App for DsViewApp {
                                 vertical_offsets: &mut scope_vertical_offsets,
                                 trigger_settings: &mut scope_trigger_settings,
                                 time_per_division_seconds: &mut scope_time_per_division_seconds,
-                                offset_controls_enabled: capture_settings_enabled,
+                                offset_controls_enabled: frontend_controls_enabled,
                                 trigger_controls_enabled,
                             },
                         );
@@ -2700,6 +2703,7 @@ impl eframe::App for DsViewApp {
         if stop_clicked {
             self.capture_run_requested = false;
             self.scope_capture_restart_requested = false;
+            self.scope_configuration_due = None;
             if self.capture.is_some() {
                 self.stop_capture();
             } else if self.pending.is_some() {
@@ -2719,20 +2723,16 @@ impl eframe::App for DsViewApp {
         if let Some(values) = save_manual_values {
             self.begin_save_manual_calibration(values);
         }
-        let input_range_changed = self
+        let runtime_frontend_changed = self
             .scope_settings
-            .input_ranges_differ_from(scope_settings_before_ui);
+            .runtime_frontend_differs_from(scope_settings_before_ui);
         let trigger_changed = self
             .scope_settings
             .trigger
             .hardware_differs_from(scope_settings_before_ui.trigger);
-        if input_range_changed && self.capture_run_requested && selected_scope_device {
-            self.scope_capture_restart_requested = true;
-            self.scope_configuration_due = None;
-            if let Some(active) = self.capture.as_ref() {
-                active.session.request_stop();
-            }
-            self.status = "Reconfiguring oscilloscope input range…".to_owned();
+        if runtime_frontend_changed && self.capture_run_requested && selected_scope_device {
+            self.scope_configuration_due = Some(Instant::now() + SCOPE_CONFIGURATION_DEBOUNCE);
+            self.status = "Adjusting oscilloscope frontend…".to_owned();
             self.last_error = None;
         } else if trigger_changed && self.capture.is_some() {
             let update_result = self
@@ -2768,15 +2768,20 @@ impl eframe::App for DsViewApp {
             self.scope_configuration_due = Some(Instant::now() + SCOPE_CONFIGURATION_DEBOUNCE);
             self.status = "Adjusting DSCope configuration…".to_owned();
         }
-        if !refresh_clicked
-            && start_mode.is_none()
-            && !stop_clicked
-            && !self.is_busy()
-            && self
-                .scope_configuration_due
-                .is_some_and(|due| Instant::now() >= due)
-        {
-            self.begin_scope_configuration();
+        let scope_configuration_is_due = self
+            .scope_configuration_due
+            .is_some_and(|due| Instant::now() >= due);
+        if !refresh_clicked && start_mode.is_none() && !stop_clicked && scope_configuration_is_due {
+            if self.capture_run_requested && selected_scope_device {
+                self.scope_configuration_due = None;
+                self.scope_capture_restart_requested = true;
+                if let Some(active) = self.capture.as_ref() {
+                    active.session.request_stop();
+                }
+                self.status = "Reconfiguring oscilloscope frontend…".to_owned();
+            } else if !self.is_busy() {
+                self.begin_scope_configuration();
+            }
         }
         if self.pending.is_some() || self.capture.is_some() {
             context.request_repaint_after(Duration::from_millis(16));
@@ -4580,9 +4585,9 @@ mod tests {
             false,
             Some(false)
         ));
-        assert!(scope_input_range_controls_are_enabled(true, true, true));
-        assert!(!scope_input_range_controls_are_enabled(true, false, true));
-        assert!(scope_input_range_controls_are_enabled(false, false, false));
+        assert!(scope_frontend_controls_are_enabled(true, true, true));
+        assert!(!scope_frontend_controls_are_enabled(true, false, true));
+        assert!(scope_frontend_controls_are_enabled(false, false, false));
     }
 
     #[test]
@@ -4913,12 +4918,17 @@ mod tests {
 
         changed.channels[0].volts_per_div_mv = 100;
         assert!(changed.frontend_differs_from(original));
-        assert!(changed.input_ranges_differ_from(original));
+        assert!(changed.runtime_frontend_differs_from(original));
 
         changed = original;
         changed.channels[0].vertical_offset = 64;
         assert!(changed.frontend_differs_from(original));
-        assert!(!changed.input_ranges_differ_from(original));
+        assert!(changed.runtime_frontend_differs_from(original));
+
+        changed = original;
+        changed.channels[0].coupling = DsCopeCoupling::Ac;
+        assert!(changed.frontend_differs_from(original));
+        assert!(!changed.runtime_frontend_differs_from(original));
 
         changed = original;
         changed.trigger.holdoff_unit = TriggerHoldoffUnit::Seconds;
