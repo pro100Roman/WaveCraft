@@ -4,9 +4,9 @@ mod measurements;
 
 use dsview_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSession, CaptureSource,
-    DeviceDescriptor, DeviceId,
+    DeviceDescriptor, DeviceId, InstrumentKind,
 };
-use dsview_recording::{CompletionStatus, RecordingWriter};
+use dsview_recording::{CompletionStatus, RecordingReader, RecordingWriter};
 use dsview_usb::{
     apply_dscope_configuration, auto_calibrate_dscope, discover_supported_devices, prepare_device,
     read_dscope_calibration, write_dscope_calibration, DeviceModel, DiscoveredDevice,
@@ -21,13 +21,14 @@ use dsview_usb::{
     DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+use image::ImageFormat;
 use measurements::{
     calculate_scope_measurements, ScopeMeasurementResults, ScopeMeasurementSettings,
     SCOPE_MEASUREMENT_KINDS,
 };
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter, Read};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,6 +75,145 @@ fn toolbar_action_button(label: &str, color: Color32) -> egui::Button<'static> {
     egui::Button::new(label.to_owned())
         .fill(color.gamma_multiply(0.24))
         .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.85)))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingSnapshot {
+    plot_rect: Rect,
+    pixels_per_point: f32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SnapshotImage {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+fn crop_snapshot_image(
+    screenshot: &egui::ColorImage,
+    plot_rect: Rect,
+    pixels_per_point: f32,
+) -> Result<SnapshotImage, String> {
+    if screenshot.size[0] == 0 || screenshot.size[1] == 0 {
+        return Err("the captured image is empty".to_owned());
+    }
+    if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+        return Err("the display scale is invalid".to_owned());
+    }
+
+    let image_width = screenshot.size[0];
+    let image_height = screenshot.size[1];
+    let left = (plot_rect.left() * pixels_per_point).floor().max(0.0) as usize;
+    let top = (plot_rect.top() * pixels_per_point).floor().max(0.0) as usize;
+    let right = (plot_rect.right() * pixels_per_point)
+        .ceil()
+        .clamp(0.0, image_width as f32) as usize;
+    let bottom = (plot_rect.bottom() * pixels_per_point)
+        .ceil()
+        .clamp(0.0, image_height as f32) as usize;
+    let left = left.min(image_width);
+    let top = top.min(image_height);
+    if right <= left || bottom <= top {
+        return Err("the waveform plot is outside the captured image".to_owned());
+    }
+
+    let width = right - left;
+    let height = bottom - top;
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in top..bottom {
+        let row_start = y * image_width + left;
+        let row_end = row_start + width;
+        for pixel in &screenshot.pixels[row_start..row_end] {
+            rgba.extend_from_slice(&pixel.to_srgba_unmultiplied());
+        }
+    }
+
+    Ok(SnapshotImage {
+        width: width as u32,
+        height: height as u32,
+        rgba,
+    })
+}
+
+fn available_snapshot_path(directory: &Path) -> PathBuf {
+    let default_path = directory.join("dsview-snapshot.png");
+    if !default_path.exists() {
+        return default_path;
+    }
+    for index in 2_u32.. {
+        let path = directory.join(format!("dsview-snapshot-{index}.png"));
+        if !path.exists() {
+            return path;
+        }
+    }
+    unreachable!("the snapshot file suffix cannot be exhausted")
+}
+
+fn save_snapshot_image(directory: &Path, snapshot: &SnapshotImage) -> Result<PathBuf, String> {
+    let path = available_snapshot_path(directory);
+    image::save_buffer_with_format(
+        &path,
+        &snapshot.rgba,
+        snapshot.width,
+        snapshot.height,
+        image::ColorType::Rgba8,
+        ImageFormat::Png,
+    )
+    .map_err(|error| format!("could not save {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+fn normalize_recording_path(mut path: PathBuf) -> PathBuf {
+    let has_dsv_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("dsv"))
+        .unwrap_or(false);
+    if !has_dsv_extension {
+        path.set_extension("dsv");
+    }
+    path
+}
+
+fn available_recording_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("capture");
+    for index in 2_u32.. {
+        let candidate = parent.join(format!("{stem}-{index}.dsv"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("the recording file suffix cannot be exhausted")
+}
+
+fn choose_recording_save_path(current_path: &str) -> Option<PathBuf> {
+    let default_name = Path::new(current_path.trim())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("capture.dsv");
+    rfd::FileDialog::new()
+        .set_title("Save complete DSView capture")
+        .add_filter("DSView capture", &["dsv"])
+        .set_file_name(default_name)
+        .save_file()
+        .map(normalize_recording_path)
+        .map(available_recording_path)
+}
+
+fn choose_recording_to_open() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Open DSView capture")
+        .add_filter("DSView capture", &["dsv"])
+        .pick_file()
 }
 
 fn main() -> eframe::Result<()> {
@@ -1035,10 +1175,21 @@ struct ActiveCapture {
     stopped: HashSet<DeviceId>,
     waveforms: WaveformStore,
     recorder: Option<FileRecorder>,
+    recording_path: Option<PathBuf>,
+    has_logic: bool,
+    has_scope: bool,
 }
 
 struct CompletedCapture {
     waveforms: WaveformStore,
+    has_logic: bool,
+    has_scope: bool,
+}
+
+struct LoadedRecording {
+    capture: CompletedCapture,
+    scope_settings: Option<ScopeCaptureSettings>,
+    completion: CompletionStatus,
 }
 
 type FileRecorder = RecordingWriter<BufWriter<File>>;
@@ -1056,6 +1207,10 @@ enum WorkerSuccess {
     ScopeAutoCalibrated,
     ScopeCalibrationLoaded(DsCopeCalibrationValues),
     ScopeCalibrationSaved,
+    RecordingLoaded {
+        path: PathBuf,
+        recording: LoadedRecording,
+    },
 }
 
 type WorkerResult = Result<WorkerSuccess, String>;
@@ -1085,6 +1240,8 @@ struct DsViewApp {
     scope_fft_viewport: ScopeFftViewport,
     scope_measurement_caches: [ScopeMeasurementCache; 2],
     scope_measurement_window_positions: [Vec2; 2],
+    snapshot_plot_rect: Option<Rect>,
+    pending_snapshot: Option<PendingSnapshot>,
     scope_time_per_division_seconds: Option<f64>,
     scope_capture_restart_requested: bool,
     scope_configuration_due: Option<Instant>,
@@ -1123,6 +1280,8 @@ impl DsViewApp {
             scope_fft_viewport: ScopeFftViewport::default(),
             scope_measurement_caches: [ScopeMeasurementCache::default(); 2],
             scope_measurement_window_positions: [Vec2::new(1.0, 0.0), Vec2::new(0.0, 0.0)],
+            snapshot_plot_rect: None,
+            pending_snapshot: None,
             scope_time_per_division_seconds: Some(DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS),
             scope_capture_restart_requested: false,
             scope_configuration_due: None,
@@ -1134,6 +1293,72 @@ impl DsViewApp {
         };
         app.begin_refresh();
         app
+    }
+
+    fn finish_pending_snapshot(&mut self, context: &egui::Context) {
+        if self.pending_snapshot.is_none() {
+            return;
+        }
+        let screenshot = context.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        let Some(screenshot) = screenshot else {
+            return;
+        };
+        let pending = self
+            .pending_snapshot
+            .take()
+            .expect("pending snapshot was checked above");
+        let snapshot = match crop_snapshot_image(
+            screenshot.as_ref(),
+            pending.plot_rect,
+            pending.pixels_per_point,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.status = "Snapshot failed".to_owned();
+                self.last_error = Some(format!("Snapshot failed: {error}"));
+                return;
+            }
+        };
+
+        let Some(directory) = rfd::FileDialog::new()
+            .set_title("Select snapshot directory")
+            .pick_folder()
+        else {
+            self.status = "Snapshot canceled".to_owned();
+            return;
+        };
+        match save_snapshot_image(&directory, &snapshot) {
+            Ok(path) => {
+                self.status = format!("Snapshot saved to {}", path.display());
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.status = "Snapshot failed".to_owned();
+                self.last_error = Some(format!("Snapshot failed: {error}"));
+            }
+        }
+    }
+
+    fn begin_open_recording(&mut self, path: PathBuf) {
+        if self.is_busy() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.pending = Some(receiver);
+        self.capture_run_requested = false;
+        self.scope_configuration_due = None;
+        self.status = format!("Opening capture {}…", path.display());
+        self.last_error = None;
+        thread::spawn(move || {
+            let result = load_gui_recording(&path)
+                .map(|recording| WorkerSuccess::RecordingLoaded { path, recording });
+            let _ = sender.send(result);
+        });
     }
 
     fn begin_refresh(&mut self) {
@@ -1421,13 +1646,26 @@ impl DsViewApp {
             CompletionStatus::Failed
         };
         let recording_result = finish_gui_recording(&mut active.recorder, completion);
+        let recording_path = active.recording_path.take();
+        if recording_path.is_some() {
+            self.record_capture = false;
+        }
+        let has_logic = active.has_logic;
+        let has_scope = active.has_scope;
         if !active.preserve_display_until_complete {
             self.completed_capture = Some(CompletedCapture {
                 waveforms: active.waveforms,
+                has_logic,
+                has_scope,
             });
         }
         match (stop_result, recording_result) {
-            (Ok(()), Ok(())) => self.status = "Capture stopped".to_owned(),
+            (Ok(()), Ok(())) => {
+                self.status = recording_path.map_or_else(
+                    || "Capture stopped".to_owned(),
+                    |path| format!("Capture stopped · recording saved to {}", path.display()),
+                );
+            }
             (Err(error), Ok(())) => self.set_error(error.to_string()),
             (Ok(()), Err(error)) => self.set_error(error),
             (Err(stop_error), Err(recording_error)) => self.set_error(format!(
@@ -1545,28 +1783,34 @@ impl DsViewApp {
                 let count = session.descriptors().len();
                 let recording_path = self
                     .record_capture
-                    .then(|| self.recording_path.trim().to_owned());
+                    .then(|| PathBuf::from(self.recording_path.trim()));
                 let recorder = match recording_path.as_deref() {
-                    Some(path) => match start_gui_recording(
-                        Path::new(path),
-                        session.descriptors(),
-                        scope_config,
-                    ) {
-                        Ok(recorder) => Some(recorder),
-                        Err(error) => {
-                            let cleanup = session.stop().err();
-                            self.set_error(match cleanup {
-                                Some(cleanup) => {
-                                    format!("{error}; additionally failed to stop: {cleanup}")
-                                }
-                                None => error,
-                            });
-                            return;
+                    Some(path) => {
+                        match start_gui_recording(path, session.descriptors(), scope_config) {
+                            Ok(recorder) => Some(recorder),
+                            Err(error) => {
+                                let cleanup = session.stop().err();
+                                self.set_error(match cleanup {
+                                    Some(cleanup) => {
+                                        format!("{error}; additionally failed to stop: {cleanup}")
+                                    }
+                                    None => error,
+                                });
+                                return;
+                            }
                         }
-                    },
+                    }
                     None => None,
                 };
-                let has_scope = !scope_trigger_controls.is_empty();
+                let has_logic = session
+                    .descriptors()
+                    .iter()
+                    .any(|device| device.kind == InstrumentKind::LogicAnalyzer);
+                let has_scope = session
+                    .descriptors()
+                    .iter()
+                    .any(|device| device.kind == InstrumentKind::Oscilloscope);
+                let has_scope_trigger = !scope_trigger_controls.is_empty();
                 let preserve_display_until_complete =
                     mode == AcquisitionMode::Run && self.completed_capture.is_some();
                 let waveforms = WaveformStore {
@@ -1583,13 +1827,20 @@ impl DsViewApp {
                     stopped: HashSet::new(),
                     waveforms,
                     recorder,
+                    recording_path: recording_path.clone(),
+                    has_logic,
+                    has_scope,
                 });
                 self.status = match (mode, recording_path) {
                     (AcquisitionMode::Single, Some(path)) => {
-                        format!("Single acquisition from {count} instrument(s) to {path}")
+                        format!(
+                            "Single acquisition from {count} instrument(s) to {}",
+                            path.display()
+                        )
                     }
                     (AcquisitionMode::Single, None) => {
-                        if has_scope && scope_config.trigger().source() != DsCopeTriggerSource::Auto
+                        if has_scope_trigger
+                            && scope_config.trigger().source() != DsCopeTriggerSource::Auto
                         {
                             "Single · waiting for trigger".to_owned()
                         } else {
@@ -1597,16 +1848,41 @@ impl DsViewApp {
                         }
                     }
                     (AcquisitionMode::Run, _) => {
-                        if has_scope && scope_config.trigger().source() == DsCopeTriggerSource::Auto
+                        if has_scope_trigger
+                            && scope_config.trigger().source() == DsCopeTriggerSource::Auto
                         {
                             "Run · Auto trigger".to_owned()
-                        } else if has_scope {
+                        } else if has_scope_trigger {
                             "Run · waiting for trigger".to_owned()
                         } else {
                             format!("Run acquisition from {count} instrument(s)")
                         }
                     }
                 };
+            }
+            Ok(WorkerSuccess::RecordingLoaded { path, recording }) => {
+                let LoadedRecording {
+                    capture,
+                    scope_settings,
+                    completion,
+                } = recording;
+                if let Some(scope_settings) = scope_settings {
+                    self.scope_settings = scope_settings;
+                    self.scope_auto_sample_rate = false;
+                }
+                self.completed_capture = Some(capture);
+                self.record_capture = false;
+                self.logic_viewport.reset();
+                self.scope_viewport.reset();
+                self.scope_fft_viewport.reset();
+                self.scope_measurement_caches = [ScopeMeasurementCache::default(); 2];
+                self.scope_time_per_division_seconds = None;
+                self.status = format!(
+                    "Opened {} · {} recording",
+                    path.display(),
+                    recording_completion_label(completion)
+                );
+                self.last_error = None;
             }
             Ok(WorkerSuccess::ScopeConfigured(device_count)) => {
                 self.status =
@@ -1702,6 +1978,9 @@ impl DsViewApp {
             if let Some(mut active) = self.capture.take() {
                 let mode = active.mode;
                 let preserve_display_until_complete = active.preserve_display_until_complete;
+                let recording_path = active.recording_path.take();
+                let has_logic = active.has_logic;
+                let has_scope = active.has_scope;
                 let restart_for_frontend =
                     self.scope_capture_restart_requested && self.capture_run_requested;
                 self.scope_capture_restart_requested = false;
@@ -1731,6 +2010,8 @@ impl DsViewApp {
                 if update_completed_capture {
                     self.completed_capture = Some(CompletedCapture {
                         waveforms: active.waveforms,
+                        has_logic,
+                        has_scope,
                     });
                 }
                 if error.is_none() && self.manual_calibration_load_requested {
@@ -1755,13 +2036,20 @@ impl DsViewApp {
                 if !repeat {
                     self.capture_run_requested = false;
                 }
+                if recording_path.is_some() {
+                    self.record_capture = false;
+                }
                 match error {
                     Some(error) => self.set_error(error),
                     None if restart_for_frontend => {
                         self.status = "Reconfiguring oscilloscope frontend…".to_owned();
                     }
                     None => {
-                        self.status = result.ok().unwrap_or_else(|| "Capture complete".to_owned());
+                        let capture_status =
+                            result.ok().unwrap_or_else(|| "Capture complete".to_owned());
+                        self.status = recording_path.map_or(capture_status.clone(), |path| {
+                            format!("{capture_status} · recording saved to {}", path.display())
+                        });
                     }
                 }
                 if repeat {
@@ -1781,14 +2069,25 @@ impl DsViewApp {
     }
 
     fn available_waveform_tabs(&self) -> Vec<WaveformTab> {
-        let has_logic_analyzer = self
-            .devices
-            .iter()
-            .any(|entry| entry.device.profile.model == DeviceModel::DsLogicU3Pro16);
-        let has_oscilloscope = self
-            .devices
-            .iter()
-            .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100);
+        let displayed_capture = self
+            .capture
+            .as_ref()
+            .map(|capture| (capture.has_logic, capture.has_scope))
+            .or_else(|| {
+                self.completed_capture
+                    .as_ref()
+                    .map(|capture| (capture.has_logic, capture.has_scope))
+            });
+        let (has_logic_analyzer, has_oscilloscope) = displayed_capture.unwrap_or_else(|| {
+            (
+                self.devices
+                    .iter()
+                    .any(|entry| entry.device.profile.model == DeviceModel::DsLogicU3Pro16),
+                self.devices
+                    .iter()
+                    .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100),
+            )
+        });
         waveform_tabs(has_logic_analyzer, has_oscilloscope)
     }
 
@@ -2764,8 +3063,14 @@ impl eframe::App for DsViewApp {
         self.reconcile_capture_settings_tab();
         self.reconcile_waveform_tab();
         self.poll_capture();
+        self.finish_pending_snapshot(context);
 
         let mut refresh_clicked = false;
+        let mut snapshot_clicked = false;
+        let mut record_now_clicked = false;
+        let mut choose_recording_path_clicked = false;
+        let mut recording_path_required = false;
+        let mut open_recording_clicked = false;
         let mut start_mode = None;
         let mut stop_clicked = false;
         let mut calibration_action = None;
@@ -2811,6 +3116,13 @@ impl eframe::App for DsViewApp {
                     ui.label(RichText::new("DSVIEW").strong().size(18.0).color(ACCENT));
                     ui.separator();
                     ui.menu_button("App", |ui| {
+                        if ui
+                            .add_enabled(!self.is_busy(), egui::Button::new("Open capture…"))
+                            .clicked()
+                        {
+                            open_recording_clicked = true;
+                            ui.close_menu();
+                        }
                         if ui.button("Settings…").clicked() {
                             self.settings_open = true;
                             ui.close_menu();
@@ -2857,12 +3169,33 @@ impl eframe::App for DsViewApp {
                         {
                             start_mode = Some(AcquisitionMode::Single);
                         }
+                        if ui
+                            .add_enabled(
+                                !self.is_busy() && device_selected,
+                                toolbar_action_button("● Record", Color32::LIGHT_RED),
+                            )
+                            .on_hover_text("Record a complete Single capture to a .dsv file")
+                            .clicked()
+                        {
+                            record_now_clicked = true;
+                        }
                         refresh_clicked = ui
                             .add_enabled(
                                 !self.is_busy(),
                                 toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
                             )
                             .clicked();
+                        if ui
+                            .add_enabled(
+                                self.snapshot_plot_rect.is_some()
+                                    && self.pending_snapshot.is_none(),
+                                toolbar_action_button("📷", TEXT_MUTED),
+                            )
+                            .on_hover_text("Save the visible waveform plot as a PNG snapshot")
+                            .clicked()
+                        {
+                            snapshot_clicked = true;
+                        }
                     });
                 });
             });
@@ -2931,26 +3264,44 @@ impl eframe::App for DsViewApp {
                         ui.add_space(14.0);
                         ui.label(RichText::new("RECORDING").strong().color(TEXT_MUTED));
                         ui.add_space(6.0);
-                        ui.add_enabled(
+                        let recording_toggle = ui.add_enabled(
                             !self.is_busy(),
                             egui::Checkbox::new(
                                 &mut self.record_capture,
-                                "Record complete capture",
+                                "Record next Single capture",
                             ),
                         );
+                        if recording_toggle.changed() && self.record_capture {
+                            choose_recording_path_clicked = true;
+                            recording_path_required = true;
+                        }
                         if self.record_capture {
-                            ui.label("Recording file");
-                            ui.add_enabled(
-                                !self.is_busy(),
-                                egui::TextEdit::singleline(&mut self.recording_path)
-                                    .desired_width(f32::INFINITY),
-                            );
+                            ui.label("DSView recording file");
+                            ui.horizontal(|ui| {
+                                ui.add_enabled(
+                                    false,
+                                    egui::TextEdit::singleline(&mut self.recording_path)
+                                        .desired_width((ui.available_width() - 72.0).max(80.0)),
+                                );
+                                if ui
+                                    .add_enabled(!self.is_busy(), egui::Button::new("Change…"))
+                                    .clicked()
+                                {
+                                    choose_recording_path_clicked = true;
+                                }
+                            });
                             ui.small(
                                 RichText::new(
-                                    "Single mode · lossless .dsv file · existing files are not overwritten",
+                                    "Lossless .dsv · full Single capture · existing files are not overwritten",
                                 )
                                 .color(TEXT_MUTED),
                             );
+                        }
+                        if ui
+                            .add_enabled(!self.is_busy(), egui::Button::new("Open capture…"))
+                            .clicked()
+                        {
+                            open_recording_clicked = true;
                         }
                     });
             });
@@ -2979,6 +3330,7 @@ impl eframe::App for DsViewApp {
                 });
             });
 
+        let mut snapshot_plot_rect = None;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -3047,7 +3399,7 @@ impl eframe::App for DsViewApp {
                     .unwrap_or(self.scope_settings);
                 match self.active_waveform_tab {
                     Some(WaveformTab::LogicAnalyzer) => {
-                        waveform_card_fill(
+                        snapshot_plot_rect = Some(waveform_card_fill(
                             ui,
                             "DIGITAL",
                             "DSLogic · channels 0–15",
@@ -3060,10 +3412,10 @@ impl eframe::App for DsViewApp {
                                     &mut logic_viewport,
                                 )
                             },
-                        );
+                        ));
                     }
                     Some(WaveformTab::Oscilloscope) => {
-                        waveform_card_fill(
+                        snapshot_plot_rect = Some(waveform_card_fill(
                             ui,
                             "OSCILLOSCOPE",
                             "DSCope · CH0 / CH1",
@@ -3092,10 +3444,10 @@ impl eframe::App for DsViewApp {
                                     },
                                 )
                             },
-                        );
+                        ));
                     }
                     Some(WaveformTab::Combined) => {
-                        combined_waveform_cards(
+                        snapshot_plot_rect = Some(combined_waveform_cards(
                             ui,
                             waveforms,
                             &mut combined_logic_ratio,
@@ -3120,7 +3472,7 @@ impl eframe::App for DsViewApp {
                                 offset_controls_enabled: frontend_controls_enabled,
                                 trigger_controls_enabled,
                             },
-                        );
+                        ));
                     }
                     None => {}
                 }
@@ -3155,6 +3507,17 @@ impl eframe::App for DsViewApp {
                 }
                 self.scope_settings.trigger = scope_trigger_settings;
             });
+        self.snapshot_plot_rect = snapshot_plot_rect;
+        if snapshot_clicked {
+            if let Some(plot_rect) = snapshot_plot_rect {
+                self.pending_snapshot = Some(PendingSnapshot {
+                    plot_rect,
+                    pixels_per_point: context.pixels_per_point(),
+                });
+                self.status = "Preparing snapshot…".to_owned();
+                context.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            }
+        }
 
         let mut settings_open = self.settings_open;
         let mut close_settings = false;
@@ -3378,11 +3741,39 @@ impl eframe::App for DsViewApp {
             self.manual_calibration = None;
         }
 
+        if record_now_clicked {
+            if let Some(path) = choose_recording_save_path(&self.recording_path) {
+                self.recording_path = path.to_string_lossy().into_owned();
+                self.record_capture = true;
+                start_mode = Some(AcquisitionMode::Single);
+            }
+        } else if choose_recording_path_clicked {
+            match choose_recording_save_path(&self.recording_path) {
+                Some(path) => {
+                    self.recording_path = path.to_string_lossy().into_owned();
+                    self.record_capture = true;
+                    self.status = format!(
+                        "The next Single capture will be recorded to {}",
+                        path.display()
+                    );
+                    self.last_error = None;
+                }
+                None if recording_path_required => self.record_capture = false,
+                None => {}
+            }
+        }
+        if open_recording_clicked {
+            if let Some(path) = choose_recording_to_open() {
+                self.begin_open_recording(path);
+            }
+        }
         if refresh_clicked {
             self.begin_refresh();
         }
-        if let Some(mode) = start_mode {
-            self.begin_capture(mode);
+        if !open_recording_clicked {
+            if let Some(mode) = start_mode {
+                self.begin_capture(mode);
+            }
         }
         if stop_clicked {
             self.capture_run_requested = false;
@@ -3658,6 +4049,198 @@ fn finish_gui_recording(
     Ok(())
 }
 
+fn recording_metadata_value<T: std::str::FromStr>(
+    metadata: &BTreeMap<String, String>,
+    key: &str,
+) -> Option<T> {
+    metadata.get(key)?.parse().ok()
+}
+
+fn scope_settings_from_recording_metadata(
+    metadata: &BTreeMap<String, String>,
+) -> ScopeCaptureSettings {
+    let mut settings = ScopeCaptureSettings::default();
+    if let Some(sample_rate_hz) = recording_metadata_value::<u64>(metadata, "scope.sample_rate_hz")
+    {
+        if DSCOPE_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
+            settings.sample_rate_hz = sample_rate_hz;
+        }
+    }
+    if let Some(sample_count) = recording_metadata_value::<u64>(metadata, "scope.sample_count") {
+        if DSCOPE_SAMPLE_COUNTS.contains(&sample_count) {
+            settings.sample_count = sample_count;
+        }
+    }
+    for (index, channel) in settings.channels.iter_mut().enumerate() {
+        if let Some(enabled) =
+            recording_metadata_value::<bool>(metadata, &format!("scope.ch{index}.enabled"))
+        {
+            channel.enabled = enabled;
+        }
+        if let Some(volts_per_div_mv) =
+            recording_metadata_value::<u16>(metadata, &format!("scope.ch{index}.volts_per_div_mv"))
+        {
+            if DSCOPE_VOLTS_PER_DIV_MV.contains(&volts_per_div_mv) {
+                channel.volts_per_div_mv = volts_per_div_mv;
+            }
+        }
+        if let Some(coupling) = metadata.get(&format!("scope.ch{index}.coupling")) {
+            channel.coupling = if coupling.eq_ignore_ascii_case("ac") {
+                DsCopeCoupling::Ac
+            } else {
+                DsCopeCoupling::Dc
+            };
+        }
+        if let Some(probe_attenuation) =
+            recording_metadata_value::<u8>(metadata, &format!("scope.ch{index}.probe_attenuation"))
+        {
+            if matches!(probe_attenuation, 1 | 10 | 100) {
+                channel.probe_attenuation = probe_attenuation;
+            }
+        }
+        if let Some(vertical_offset) =
+            recording_metadata_value::<u16>(metadata, &format!("scope.ch{index}.vertical_offset"))
+        {
+            if (DSCOPE_VERTICAL_OFFSET_MIN..=DSCOPE_VERTICAL_OFFSET_MAX).contains(&vertical_offset)
+            {
+                channel.vertical_offset = vertical_offset;
+            }
+        }
+    }
+
+    if let Some(position_percent) =
+        recording_metadata_value::<u8>(metadata, "scope.trigger.position_percent")
+    {
+        if (DSCOPE_TRIGGER_POSITION_MIN_PERCENT..=DSCOPE_TRIGGER_POSITION_MAX_PERCENT)
+            .contains(&position_percent)
+        {
+            settings.trigger.position_percent = position_percent;
+        }
+    }
+    if let Some(source) = metadata.get("scope.trigger.source") {
+        settings.trigger.source = match source.as_str() {
+            "ch0" => DsCopeTriggerSource::ChannelZero,
+            "ch1" => DsCopeTriggerSource::ChannelOne,
+            "ch0_and_ch1" => DsCopeTriggerSource::ChannelZeroAndOne,
+            "ch0_or_ch1" => DsCopeTriggerSource::ChannelZeroOrOne,
+            _ => DsCopeTriggerSource::Auto,
+        };
+    }
+    if let Some(auto_channel) =
+        recording_metadata_value::<u8>(metadata, "scope.trigger.auto_channel")
+    {
+        if auto_channel <= 1 {
+            settings.trigger.auto_channel = auto_channel;
+        }
+    }
+    if let Some(slope) = metadata.get("scope.trigger.slope") {
+        settings.trigger.slope = if slope == "falling" {
+            DsCopeTriggerSlope::Falling
+        } else {
+            DsCopeTriggerSlope::Rising
+        };
+    }
+    if let Some(holdoff_ns) = recording_metadata_value::<u64>(metadata, "scope.trigger.holdoff_ns")
+    {
+        settings.trigger.holdoff_ns = holdoff_ns.min(DSCOPE_TRIGGER_HOLDOFF_MAX_NS);
+    }
+    if let Some(noise_sensitivity) =
+        recording_metadata_value::<u8>(metadata, "scope.trigger.noise_sensitivity")
+    {
+        settings.trigger.noise_sensitivity =
+            noise_sensitivity.min(DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX);
+    }
+    for (index, level) in settings.trigger.levels.iter_mut().enumerate() {
+        if let Some(recorded_level) =
+            recording_metadata_value::<u8>(metadata, &format!("scope.trigger.ch{index}.level"))
+        {
+            *level = recorded_level.clamp(DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_LEVEL_MAX);
+        }
+    }
+    settings
+        .trigger
+        .clamp_to_channels(settings.channels.map(|channel| channel.enabled));
+    settings
+}
+
+fn read_gui_recording(input: impl Read) -> Result<LoadedRecording, String> {
+    let mut reader = RecordingReader::new(input).map_err(|error| error.to_string())?;
+    let header = reader.header().clone();
+    let has_scope_channel_metadata = (0..2).any(|index| {
+        header
+            .metadata
+            .contains_key(&format!("scope.ch{index}.enabled"))
+    });
+    let mut scope_settings = scope_settings_from_recording_metadata(&header.metadata);
+    let mut enabled_scope_channels = scope_settings.channels.map(|channel| channel.enabled);
+    if !enabled_scope_channels.into_iter().any(|enabled| enabled) {
+        enabled_scope_channels = [true, true];
+        scope_settings.channels[0].enabled = true;
+        scope_settings.channels[1].enabled = true;
+    }
+    let mut waveforms = WaveformStore {
+        scope_capacity: (scope_settings.sample_count as usize).min(MAX_WAVEFORM_SAMPLES),
+        ..WaveformStore::default()
+    };
+    while let Some(event) = reader.read_event().map_err(|error| error.to_string())? {
+        if let CaptureEvent::Frame(frame) = event {
+            waveforms.ingest(&frame.payload, enabled_scope_channels);
+        }
+    }
+    let completion = reader
+        .completion_status()
+        .ok_or_else(|| "recording has no completion status".to_owned())?;
+    let has_logic = header
+        .devices
+        .iter()
+        .any(|device| device.kind == InstrumentKind::LogicAnalyzer)
+        || waveforms.logic_channels > 0;
+    let has_scope = header
+        .devices
+        .iter()
+        .any(|device| device.kind == InstrumentKind::Oscilloscope)
+        || waveforms.scope_rate_hz > 0;
+    if has_scope && !has_scope_channel_metadata {
+        for (channel, samples) in scope_settings
+            .channels
+            .iter_mut()
+            .zip(&waveforms.scope_channels)
+        {
+            channel.enabled = !samples.is_empty();
+        }
+        scope_settings
+            .trigger
+            .clamp_to_channels(scope_settings.channels.map(|channel| channel.enabled));
+    }
+    if !has_logic && !has_scope {
+        return Err("recording does not contain a supported capture".to_owned());
+    }
+    Ok(LoadedRecording {
+        capture: CompletedCapture {
+            waveforms,
+            has_logic,
+            has_scope,
+        },
+        scope_settings: has_scope.then_some(scope_settings),
+        completion,
+    })
+}
+
+fn load_gui_recording(path: &Path) -> Result<LoadedRecording, String> {
+    let file = File::open(path)
+        .map_err(|error| format!("failed to open recording {}: {error}", path.display()))?;
+    read_gui_recording(BufReader::new(file))
+        .map_err(|error| format!("failed to read recording {}: {error}", path.display()))
+}
+
+fn recording_completion_label(completion: CompletionStatus) -> &'static str {
+    match completion {
+        CompletionStatus::Complete => "complete",
+        CompletionStatus::Cancelled => "cancelled",
+        CompletionStatus::Failed => "failed",
+    }
+}
+
 fn append_error(error: &mut Option<String>, additional: String) {
     match error {
         Some(error) => {
@@ -3761,9 +4344,9 @@ fn waveform_card_fill(
     title: &str,
     subtitle: &str,
     paint: impl FnOnce(&egui::Ui, Rect),
-) {
+) -> Rect {
     let plot_height = (ui.available_height() - WAVEFORM_CARD_CHROME_HEIGHT).max(64.0);
-    waveform_card(ui, title, subtitle, plot_height, paint);
+    waveform_card(ui, title, subtitle, plot_height, paint)
 }
 
 fn combined_pane_heights(total_height: f32, logic_ratio: f32) -> (f32, f32) {
@@ -3793,7 +4376,7 @@ fn combined_waveform_cards(
     logic_channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
     viewports: CombinedWaveformViewports<'_>,
     scope_options: ScopeWaveformOptions<'_>,
-) {
+) -> Rect {
     let CombinedWaveformViewports {
         logic: logic_viewport,
         scope: scope_viewport,
@@ -3845,7 +4428,7 @@ fn combined_waveform_cards(
             .max_rect(logic_rect)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
-    waveform_card_fill(
+    let logic_plot_rect = waveform_card_fill(
         &mut logic_ui,
         "DIGITAL",
         "DSLogic · channels 0–15",
@@ -3858,7 +4441,7 @@ fn combined_waveform_cards(
             .max_rect(scope_rect)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
-    waveform_card_fill(
+    let scope_plot_rect = waveform_card_fill(
         &mut scope_ui,
         "OSCILLOSCOPE",
         "DSCope · CH0 / CH1",
@@ -3887,6 +4470,7 @@ fn combined_waveform_cards(
         ],
         Stroke::new(2.0_f32, divider_color),
     );
+    logic_plot_rect.union(scope_plot_rect)
 }
 
 fn waveform_card(
@@ -3895,7 +4479,7 @@ fn waveform_card(
     subtitle: &str,
     height: f32,
     paint: impl FnOnce(&egui::Ui, Rect),
-) {
+) -> Rect {
     egui::Frame::none()
         .fill(PANEL)
         .stroke(Stroke::new(1.0_f32, GRID))
@@ -3910,7 +4494,9 @@ fn waveform_card(
             let size = Vec2::new(ui.available_width(), height);
             let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
             paint(ui, rect);
-        });
+            rect
+        })
+        .inner
 }
 
 fn paint_plot_background(ui: &egui::Ui, rect: Rect) {
@@ -6171,7 +6757,147 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsview_core::{LogicBatch, ScopeBatch};
+    use dsview_core::{CaptureFrame, LogicBatch, ScopeBatch};
+    use std::io::Cursor;
+
+    #[test]
+    fn gui_recording_reader_restores_full_capture_and_scope_settings() {
+        let descriptors = vec![
+            DeviceDescriptor {
+                id: DeviceId::new("logic-test"),
+                name: "Logic test".to_owned(),
+                kind: InstrumentKind::LogicAnalyzer,
+            },
+            DeviceDescriptor {
+                id: DeviceId::new("scope-test"),
+                name: "Scope test".to_owned(),
+                kind: InstrumentKind::Oscilloscope,
+            },
+        ];
+        let mut metadata = BTreeMap::new();
+        metadata.insert("scope.sample_rate_hz".to_owned(), "1000000".to_owned());
+        metadata.insert("scope.sample_count".to_owned(), "1000000".to_owned());
+        metadata.insert("scope.ch0.enabled".to_owned(), "false".to_owned());
+        metadata.insert("scope.ch1.enabled".to_owned(), "true".to_owned());
+        metadata.insert("scope.ch1.volts_per_div_mv".to_owned(), "500".to_owned());
+        metadata.insert("scope.ch1.coupling".to_owned(), "ac".to_owned());
+        metadata.insert("scope.ch1.probe_attenuation".to_owned(), "10".to_owned());
+        let mut bytes = Vec::new();
+        {
+            let mut writer = RecordingWriter::new(&mut bytes, &descriptors, metadata)
+                .expect("recording header is valid");
+            writer
+                .write_event(&CaptureEvent::Frame(CaptureFrame {
+                    device_id: DeviceId::new("logic-test"),
+                    sequence: 0,
+                    captured_at: Duration::ZERO,
+                    payload: CaptureBatch::Logic(LogicBatch {
+                        sample_rate_hz: 2_000_000,
+                        channel_count: 4,
+                        samples: vec![1, 2, 3],
+                    }),
+                }))
+                .expect("logic frame is valid");
+            writer
+                .write_event(&CaptureEvent::Frame(CaptureFrame {
+                    device_id: DeviceId::new("scope-test"),
+                    sequence: 0,
+                    captured_at: Duration::ZERO,
+                    payload: CaptureBatch::Scope(ScopeBatch {
+                        sample_rate_hz: 1_000_000,
+                        trigger_sample_index: Some(1),
+                        channels: vec![vec![0.25, -0.5]],
+                    }),
+                }))
+                .expect("scope frame is valid");
+            writer
+                .finish(CompletionStatus::Complete)
+                .expect("recording footer is valid");
+        }
+
+        let loaded = read_gui_recording(Cursor::new(bytes)).expect("recording should reopen");
+
+        assert_eq!(loaded.completion, CompletionStatus::Complete);
+        assert!(loaded.capture.has_logic);
+        assert!(loaded.capture.has_scope);
+        assert_eq!(loaded.capture.waveforms.logic_rate_hz, 2_000_000);
+        assert_eq!(
+            loaded.capture.waveforms.logic_samples,
+            VecDeque::from(vec![1, 2, 3])
+        );
+        assert!(loaded.capture.waveforms.scope_channels[0].is_empty());
+        assert_eq!(
+            loaded.capture.waveforms.scope_channels[1],
+            VecDeque::from(vec![0.25, -0.5])
+        );
+        let scope_settings = loaded.scope_settings.expect("scope metadata should load");
+        assert!(!scope_settings.channels[0].enabled);
+        assert!(scope_settings.channels[1].enabled);
+        assert_eq!(scope_settings.channels[1].volts_per_div_mv, 500);
+        assert_eq!(scope_settings.channels[1].coupling, DsCopeCoupling::Ac);
+        assert_eq!(scope_settings.channels[1].probe_attenuation, 10);
+    }
+
+    #[test]
+    fn recording_paths_use_the_dsv_extension() {
+        assert_eq!(
+            normalize_recording_path(PathBuf::from("capture")),
+            PathBuf::from("capture.dsv")
+        );
+        assert_eq!(
+            normalize_recording_path(PathBuf::from("capture.DSV")),
+            PathBuf::from("capture.DSV")
+        );
+        assert_eq!(
+            normalize_recording_path(PathBuf::from("capture.txt")),
+            PathBuf::from("capture.dsv")
+        );
+    }
+
+    #[test]
+    fn snapshot_crop_uses_plot_bounds_and_display_scale() {
+        let mut screenshot = egui::ColorImage::new([8, 6], Color32::BLACK);
+        for (index, pixel) in screenshot.pixels.iter_mut().enumerate() {
+            *pixel = Color32::from_rgb(index as u8, 0, 0);
+        }
+
+        let snapshot = crop_snapshot_image(
+            &screenshot,
+            Rect::from_min_max(Pos2::new(1.0, 0.5), Pos2::new(3.0, 2.5)),
+            2.0,
+        )
+        .expect("the plot is inside the screenshot");
+
+        assert_eq!(snapshot.width, 4);
+        assert_eq!(snapshot.height, 4);
+        let red_values = snapshot
+            .rgba
+            .chunks_exact(4)
+            .map(|pixel| pixel[0])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            red_values,
+            vec![10, 11, 12, 13, 18, 19, 20, 21, 26, 27, 28, 29, 34, 35, 36, 37]
+        );
+    }
+
+    #[test]
+    fn snapshot_crop_rejects_invalid_bounds_and_scale() {
+        let screenshot = egui::ColorImage::new([4, 3], Color32::BLACK);
+
+        assert!(crop_snapshot_image(
+            &screenshot,
+            Rect::from_min_max(Pos2::new(5.0, 1.0), Pos2::new(6.0, 2.0)),
+            1.0,
+        )
+        .is_err());
+        assert!(crop_snapshot_image(
+            &screenshot,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(2.0, 2.0)),
+            0.0,
+        )
+        .is_err());
+    }
 
     #[test]
     fn acquisition_modes_rearm_only_successful_continuous_runs() {
