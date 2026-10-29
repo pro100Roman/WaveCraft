@@ -61,6 +61,12 @@ const SCOPE_COLORS: [Color32; 2] = [
 const MATH_COLOR: Color32 = Color32::from_rgb(213, 126, 255);
 const FFT_LENGTHS: [usize; 5] = [1_024, 2_048, 4_096, 8_192, 16_384];
 
+fn toolbar_action_button(label: &str, color: Color32) -> egui::Button<'static> {
+    egui::Button::new(label.to_owned())
+        .fill(color.gamma_multiply(0.24))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.85)))
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -2562,11 +2568,11 @@ impl eframe::App for DsViewApp {
                                     || (!self.is_busy()
                                         && device_selected
                                         && !self.record_capture),
-                                egui::Button::new(if acquisition_active {
-                                    "■ Stop"
+                                if acquisition_active {
+                                    toolbar_action_button("■ Stop", Color32::LIGHT_RED)
                                 } else {
-                                    "▶ Run"
-                                }),
+                                    toolbar_action_button("▶ Run", ACCENT)
+                                },
                             )
                             .on_hover_text(if acquisition_active {
                                 "Stop the active acquisition"
@@ -2584,7 +2590,7 @@ impl eframe::App for DsViewApp {
                         if ui
                             .add_enabled(
                                 !self.is_busy() && device_selected,
-                                egui::Button::new("▶ Single"),
+                                toolbar_action_button("▶ Single", SCOPE_COLORS[0]),
                             )
                             .on_hover_text("Wait for one trigger, acquire once, then stop")
                             .clicked()
@@ -2592,7 +2598,10 @@ impl eframe::App for DsViewApp {
                             start_mode = Some(AcquisitionMode::Single);
                         }
                         refresh_clicked = ui
-                            .add_enabled(!self.is_busy(), egui::Button::new("↻ Refresh"))
+                            .add_enabled(
+                                !self.is_busy(),
+                                toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
+                            )
                             .clicked();
                     });
                 });
