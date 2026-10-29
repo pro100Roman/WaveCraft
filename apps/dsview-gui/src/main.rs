@@ -3316,6 +3316,97 @@ fn scope_trigger_level_from_y(plot: Rect, y: f32) -> u8 {
     level.clamp(DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_LEVEL_MAX)
 }
 
+fn scope_trigger_position_x(plot: Rect, position_percent: u8) -> f32 {
+    egui::lerp(plot.x_range(), f32::from(position_percent) / 100.0)
+}
+
+fn scope_trigger_position_from_x(plot: Rect, x: f32) -> u8 {
+    let ratio = ((x - plot.left()) / plot.width().max(1.0)).clamp(0.0, 1.0);
+    (ratio * 100.0).round().clamp(
+        f32::from(DSCOPE_TRIGGER_POSITION_MIN_PERCENT),
+        f32::from(DSCOPE_TRIGGER_POSITION_MAX_PERCENT),
+    ) as u8
+}
+
+fn paint_scope_trigger_position(
+    ui: &egui::Ui,
+    time_ruler: Rect,
+    plot: Rect,
+    settings: &mut ScopeTriggerSettings,
+    controls_enabled: bool,
+) {
+    const COLOR: Color32 = Color32::from_rgb(235, 72, 72);
+    const ARROW_HALF_WIDTH: f32 = 10.0;
+    const ARROW_HEIGHT: f32 = 19.0;
+    const ARROW_SHOULDER_HEIGHT: f32 = 9.0;
+    const DOT_SPACING: f32 = 7.0;
+
+    let x = scope_trigger_position_x(plot, settings.position_percent);
+    let arrow_top = plot.top() - ARROW_HEIGHT;
+    let marker_rect = Rect::from_min_max(
+        Pos2::new(x - ARROW_HALF_WIDTH - 4.0, arrow_top - 3.0),
+        Pos2::new(x + ARROW_HALF_WIDTH + 4.0, plot.top() + 8.0),
+    );
+    let response = ui.interact(
+        marker_rect,
+        ui.make_persistent_id("scope_trigger_position"),
+        if controls_enabled {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
+    );
+    let response = if controls_enabled {
+        response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+    } else {
+        response
+    }
+    .on_hover_text(format!(
+        "Horizontal trigger position: {}%\nDrag to move · double-click to center",
+        settings.position_percent
+    ));
+
+    if controls_enabled {
+        if response.double_clicked() {
+            settings.position_percent = 50;
+        } else if response.dragged() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                settings.position_percent = scope_trigger_position_from_x(plot, pointer.x);
+            }
+        }
+    }
+
+    let x = scope_trigger_position_x(plot, settings.position_percent);
+    let clip_rect = Rect::from_min_max(
+        Pos2::new(plot.left(), time_ruler.top()),
+        plot.right_bottom(),
+    );
+    let painter = ui.painter().with_clip_rect(clip_rect);
+    let mut y = plot.top();
+    while y <= plot.bottom() {
+        painter.circle_filled(Pos2::new(x, y), 0.85, COLOR.gamma_multiply(0.62));
+        y += DOT_SPACING;
+    }
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(x - ARROW_HALF_WIDTH, plot.top() - ARROW_HEIGHT),
+            Pos2::new(x + ARROW_HALF_WIDTH, plot.top() - ARROW_HEIGHT),
+            Pos2::new(x + ARROW_HALF_WIDTH, plot.top() - ARROW_SHOULDER_HEIGHT),
+            Pos2::new(x, plot.top()),
+            Pos2::new(x - ARROW_HALF_WIDTH, plot.top() - ARROW_SHOULDER_HEIGHT),
+        ],
+        COLOR,
+        Stroke::new(1.0_f32, BACKGROUND),
+    ));
+    painter.text(
+        Pos2::new(x, plot.top() - ARROW_HEIGHT + 5.5),
+        egui::Align2::CENTER_CENTER,
+        "T",
+        FontId::monospace(9.0),
+        marker_text_color(COLOR),
+    );
+}
+
 fn paint_scope_trigger_level(
     ui: &egui::Ui,
     plot: Rect,
@@ -3518,6 +3609,13 @@ fn paint_scope(
             settings.sample_rate_hz,
             *viewport,
         );
+        paint_scope_trigger_position(
+            ui,
+            time_ruler,
+            plot,
+            trigger_settings,
+            offset_controls_enabled,
+        );
         return;
     }
 
@@ -3580,6 +3678,13 @@ fn paint_scope(
         visible_count,
         waveforms.scope_rate_hz,
         *viewport,
+    );
+    paint_scope_trigger_position(
+        ui,
+        time_ruler,
+        plot,
+        trigger_settings,
+        offset_controls_enabled,
     );
 }
 
@@ -3939,6 +4044,22 @@ mod tests {
         assert_eq!(scope_trigger_color(trigger, custom_colors), Color32::RED);
         trigger.source = DsCopeTriggerSource::ChannelOne;
         assert_eq!(scope_trigger_color(trigger, custom_colors), Color32::BLUE);
+    }
+
+    #[test]
+    fn scope_trigger_position_maps_between_percent_and_plot_x() {
+        let plot = Rect::from_min_max(Pos2::new(100.0, 20.0), Pos2::new(900.0, 420.0));
+
+        assert!((scope_trigger_position_x(plot, 50) - 500.0).abs() < f32::EPSILON);
+        assert_eq!(scope_trigger_position_from_x(plot, 500.0), 50);
+        assert_eq!(
+            scope_trigger_position_from_x(plot, plot.left()),
+            DSCOPE_TRIGGER_POSITION_MIN_PERCENT
+        );
+        assert_eq!(
+            scope_trigger_position_from_x(plot, plot.right()),
+            DSCOPE_TRIGGER_POSITION_MAX_PERCENT
+        );
     }
 
     #[test]
