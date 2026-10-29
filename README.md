@@ -118,16 +118,39 @@ per-device totals without connected hardware. The format is documented in
 
 ## Run the desktop application
 
-Launch the native capture workbench with:
+Install Rust 1.76 or newer and run these commands from the workspace root.
+Build an unoptimized development executable with:
+
+```sh
+cargo build -p dsview-gui
+```
+
+Launch the development build directly through Cargo with:
 
 ```sh
 cargo run -p dsview-gui
 ```
 
-On macOS, build a Finder-launchable application bundle with:
+Build the optimized release executable with:
 
 ```sh
-bash scripts/package-macos.sh
+cargo build -p dsview-gui --release
+```
+
+The release executable is written to `target/release/dsview-gui` on macOS and
+Linux, or `target/release/dsview-gui.exe` on Windows.
+
+On macOS, build a self-contained, Finder-launchable release application bundle
+with:
+
+```sh
+./scripts/package-macos.sh
+```
+
+The bundle is written to `target/release/bundle/osx/DSView.app`. Launch it by
+double-clicking it in Finder or from a shell with:
+
+```sh
 open target/release/bundle/osx/DSView.app
 ```
 

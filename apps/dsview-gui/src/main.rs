@@ -35,13 +35,11 @@ const LOGIC_CHANNEL_COUNT: usize = 16;
 // number of painted points. This also keeps the hardware trigger region in the
 // waveform instead of displaying only the final tail of a capture.
 const MAX_WAVEFORM_SAMPLES: usize = 2_000_000;
-// Auto/Roll is not limited to one hardware acquisition. Divide this display
-// memory budget across enabled scope channels and evict the oldest samples.
-const SCOPE_ROLLING_MEMORY_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 const WAVEFORM_STATUS_HEIGHT: f32 = 20.0;
 const TIME_RULER_HEIGHT: f32 = 24.0;
 const SCOPE_HORIZONTAL_DIVISIONS: usize = 10;
 const SCOPE_VERTICAL_DIVISIONS: usize = 8;
+const SCOPE_ADC_VERTICAL_DIVISIONS: f32 = 10.0;
 const SCOPE_CONFIGURATION_DEBOUNCE: Duration = Duration::from_millis(350);
 const TOOLTIP_DELAY_SECONDS: f32 = 0.1;
 const TIMEBASE_STEPS_SECONDS: [f64; 30] = [
@@ -471,18 +469,6 @@ fn should_rearm_acquisition(
     mode.runs_continuously() && run_requested && completion == CompletionStatus::Complete && !failed
 }
 
-fn uses_rolling_waveform_buffer(
-    mode: AcquisitionMode,
-    has_scope: bool,
-    trigger_source: DsCopeTriggerSource,
-) -> bool {
-    mode == AcquisitionMode::Run && has_scope && trigger_source == DsCopeTriggerSource::Auto
-}
-
-fn scope_rolling_sample_capacity(enabled_channel_count: usize) -> usize {
-    SCOPE_ROLLING_MEMORY_BUDGET_BYTES / enabled_channel_count.max(1) / std::mem::size_of::<f32>()
-}
-
 fn scope_trigger_controls_are_enabled(
     background_operation_pending: bool,
     capture_run_requested: bool,
@@ -575,13 +561,17 @@ impl WaveformViewport {
 
     fn move_screen_anchor(&mut self, old_fraction: f32, new_fraction: f32) {
         let sample_anchor = self.start + old_fraction.clamp(0.0, 1.0) * self.span;
-        self.start = self.clamp_start(sample_anchor - new_fraction.clamp(0.0, 1.0) * self.span);
+        self.start = sample_anchor - new_fraction.clamp(0.0, 1.0) * self.span;
         self.anchor_locked = true;
     }
 
     fn align_sample_to_screen(&mut self, sample_fraction: f32, screen_fraction: f32) {
         self.start =
             self.clamp_start(sample_fraction - screen_fraction.clamp(0.0, 1.0) * self.span);
+    }
+
+    fn align_trigger_to_screen(&mut self, sample_fraction: f32, screen_fraction: f32) {
+        self.start = sample_fraction - screen_fraction.clamp(0.0, 1.0) * self.span;
     }
 
     fn clamp_start(self, start: f32) -> f32 {
@@ -734,7 +724,6 @@ struct ActiveCapture {
     session: CaptureSession,
     mode: AcquisitionMode,
     preserve_display_until_complete: bool,
-    accumulate_waveforms: bool,
     scope_config: DsCopeCaptureConfig,
     scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     stats: HashMap<DeviceId, DeviceStats>,
@@ -748,7 +737,6 @@ struct CompletedCapture {
     stats: HashMap<DeviceId, DeviceStats>,
     waveforms: WaveformStore,
     recording_path: Option<String>,
-    rolling: bool,
 }
 
 type FileRecorder = RecordingWriter<BufWriter<File>>;
@@ -1080,7 +1068,6 @@ impl DsViewApp {
                 stats: active.stats,
                 waveforms: active.waveforms,
                 recording_path: active.recording_path,
-                rolling: active.accumulate_waveforms,
             });
         }
         match (stop_result, recording_result) {
@@ -1223,33 +1210,16 @@ impl DsViewApp {
                     None => None,
                 };
                 let has_scope = !scope_trigger_controls.is_empty();
-                let accumulate_waveforms =
-                    uses_rolling_waveform_buffer(mode, has_scope, scope_config.trigger().source());
-                let previous_is_rolling = self
-                    .completed_capture
-                    .as_ref()
-                    .is_some_and(|capture| capture.rolling);
-                let preserve_display_until_complete = mode == AcquisitionMode::Run
-                    && self.completed_capture.is_some()
-                    && !(accumulate_waveforms && previous_is_rolling);
-                let mut waveforms = if accumulate_waveforms && previous_is_rolling {
-                    self.completed_capture
-                        .take()
-                        .map(|capture| capture.waveforms)
-                        .unwrap_or_default()
-                } else {
-                    WaveformStore::default()
-                };
-                waveforms.scope_capacity = if accumulate_waveforms {
-                    scope_rolling_sample_capacity(scope_config.enabled_channel_count())
-                } else {
-                    scope_config.sample_count() as usize
+                let preserve_display_until_complete =
+                    mode == AcquisitionMode::Run && self.completed_capture.is_some();
+                let waveforms = WaveformStore {
+                    scope_capacity: scope_config.sample_count() as usize,
+                    ..WaveformStore::default()
                 };
                 self.capture = Some(ActiveCapture {
                     session,
                     mode,
                     preserve_display_until_complete,
-                    accumulate_waveforms,
                     scope_config,
                     scope_trigger_controls,
                     stats: HashMap::new(),
@@ -1273,7 +1243,7 @@ impl DsViewApp {
                     (AcquisitionMode::Run, _) => {
                         if has_scope && scope_config.trigger().source() == DsCopeTriggerSource::Auto
                         {
-                            "Run · Auto/Roll".to_owned()
+                            "Run · Auto trigger".to_owned()
                         } else if has_scope {
                             "Run · waiting for trigger".to_owned()
                         } else {
@@ -1399,7 +1369,6 @@ impl DsViewApp {
                         stats: active.stats,
                         waveforms: active.waveforms,
                         recording_path: active.recording_path,
-                        rolling: active.accumulate_waveforms,
                     });
                 }
                 let repeat = error.is_none()
@@ -1916,8 +1885,6 @@ fn paint_capture_settings(
                 CaptureSettingsTab::DsCope => {
                     let maximum_sample_rate_hz = scope_settings.maximum_sample_rate_hz();
                     let maximum_sample_count = scope_settings.maximum_sample_count();
-                    let rolling_sample_capacity =
-                        scope_rolling_sample_capacity(scope_settings.enabled_channel_count());
                     if scope_settings.sample_rate_hz > maximum_sample_rate_hz {
                         scope_settings.sample_rate_hz = maximum_sample_rate_hz;
                     }
@@ -1967,13 +1934,6 @@ fn paint_capture_settings(
 
                                 ui.label("Maximum");
                                 ui.monospace(format_sample_rate(maximum_sample_rate_hz));
-                                ui.end_row();
-
-                                ui.label("Run buffer");
-                                ui.monospace(format!(
-                                    "{} / ch",
-                                    format_sample_count(rolling_sample_capacity as u64)
-                                ));
                                 ui.end_row();
                             });
                     });
@@ -3885,10 +3845,12 @@ fn marker_text_color(marker_color: Color32) -> Color32 {
     }
 }
 
-fn scope_trigger_level_y(plot: Rect, level: u8) -> f32 {
-    let reference_span = f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
-    let ratio = f32::from(u16::from(level) - DSCOPE_VERTICAL_OFFSET_MIN) / reference_span;
-    egui::lerp(plot.y_range(), ratio)
+fn scope_trigger_level_y(plot: Rect, channel: ScopeChannelSettings, trigger_level: u8) -> f32 {
+    scope_sample_y(
+        plot,
+        channel,
+        scope_trigger_threshold_voltage(channel, trigger_level),
+    )
 }
 
 fn shift_scope_trigger_level(level: u8, old_offset: u16, new_offset: u16) -> u8 {
@@ -3898,11 +3860,18 @@ fn shift_scope_trigger_level(level: u8, old_offset: u16, new_offset: u16) -> u8 
     ) as u8
 }
 
-fn scope_trigger_level_from_y(plot: Rect, y: f32) -> u8 {
-    let ratio = ((y - plot.top()) / plot.height().max(1.0)).clamp(0.0, 1.0);
+fn scope_trigger_level_from_y(plot: Rect, y: f32, channel: ScopeChannelSettings) -> u8 {
+    let zero_y = scope_vertical_offset_y(plot, channel.vertical_offset);
+    let screen_divisions = (y - zero_y) / plot.height().max(1.0) * SCOPE_VERTICAL_DIVISIONS as f32;
     let reference_span = f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
-    let level = (f32::from(DSCOPE_VERTICAL_OFFSET_MIN) + ratio * reference_span).round() as u8;
-    level.clamp(DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_LEVEL_MAX)
+    let level = (f32::from(channel.vertical_offset)
+        + screen_divisions / SCOPE_ADC_VERTICAL_DIVISIONS * reference_span)
+        .round()
+        .clamp(
+            f32::from(DSCOPE_TRIGGER_LEVEL_MIN),
+            f32::from(DSCOPE_TRIGGER_LEVEL_MAX),
+        );
+    level as u8
 }
 
 fn scope_trigger_channels(settings: ScopeTriggerSettings) -> &'static [usize] {
@@ -3916,13 +3885,11 @@ fn scope_trigger_channels(settings: ScopeTriggerSettings) -> &'static [usize] {
 }
 
 fn scope_trigger_threshold_voltage(channel: ScopeChannelSettings, trigger_level: u8) -> f32 {
-    let trigger_ratio = f32::from(u16::from(trigger_level) - DSCOPE_VERTICAL_OFFSET_MIN)
-        / f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
-    let zero_ratio = scope_vertical_offset_ratio(channel.vertical_offset);
-    let voltage_span = f32::from(channel.volts_per_div_mv) / 1_000.0
-        * SCOPE_VERTICAL_DIVISIONS as f32
+    let reference_span = f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
+    let input_span = f32::from(channel.volts_per_div_mv) / 1_000.0
+        * SCOPE_ADC_VERTICAL_DIVISIONS
         * f32::from(channel.probe_attenuation);
-    (zero_ratio - trigger_ratio) * voltage_span
+    (f32::from(channel.vertical_offset) - f32::from(trigger_level)) / reference_span * input_span
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3936,27 +3903,65 @@ fn scope_trigger_crossing_sample(
     settings: ScopeCaptureSettings,
     trigger: ScopeTriggerSettings,
 ) -> Option<ScopeTriggerCrossing> {
-    const TRIGGER_SEARCH_SAMPLES: usize = 2;
-    let trigger_sample = waveforms.scope_trigger_sample_index?;
-    let local_trigger =
-        usize::try_from(trigger_sample.checked_sub(waveforms.scope_sample_offset)?).ok()?;
-    let mut closest_crossing = None::<ScopeTriggerCrossing>;
+    // The FPGA trigger pointer may lead or trail the analog threshold crossing
+    // slightly because of the ADC/trigger pipeline and the footer byte offset.
+    // Select the closest matching edge instead of requiring it to be exactly
+    // one sample before the reported position.
+    const TRIGGER_SEARCH_RADIUS: usize = 512;
+    let hardware_trigger = waveforms
+        .scope_trigger_sample_index
+        .and_then(|trigger_sample| trigger_sample.checked_sub(waveforms.scope_sample_offset))
+        .and_then(|trigger_sample| usize::try_from(trigger_sample).ok());
+    if hardware_trigger.is_none() && trigger.source != DsCopeTriggerSource::Auto {
+        return None;
+    }
+    let mut closest_crossing = None::<(ScopeTriggerCrossing, f32)>;
 
     for &channel_index in scope_trigger_channels(trigger) {
         let channel_settings = settings.channels[channel_index];
         if !channel_settings.enabled {
             continue;
         }
-        let samples = waveforms.scope_channels.get(channel_index)?;
+        let Some(samples) = waveforms.scope_channels.get(channel_index) else {
+            continue;
+        };
+        if samples.len() < 2 {
+            continue;
+        }
+        let reference_sample = match hardware_trigger {
+            Some(sample) if sample < samples.len() => sample as f32,
+            Some(_) => continue,
+            None => f32::from(trigger.position_percent) / 100.0 * (samples.len() - 1) as f32,
+        };
         let threshold =
             scope_trigger_threshold_voltage(channel_settings, trigger.levels[channel_index]);
-        for distance in 0..TRIGGER_SEARCH_SAMPLES {
-            let right = local_trigger.checked_sub(distance)?;
-            let left = right.checked_sub(1)?;
-            let (&left_value, &right_value) = (samples.get(left)?, samples.get(right)?);
+        let (first_left, last_left) = if trigger.source == DsCopeTriggerSource::Auto {
+            // Auto capture can return a free-running frame without setting the
+            // hardware trigger flag. If that frame nevertheless contains the
+            // requested edge, lock it to the trigger position just like a
+            // hardware-triggered frame. Only free-run when no edge exists.
+            (0, samples.len() - 1)
+        } else {
+            let sample = hardware_trigger.expect("non-auto trigger requires a hardware position");
+            (
+                sample.saturating_sub(TRIGGER_SEARCH_RADIUS),
+                sample
+                    .saturating_add(TRIGGER_SEARCH_RADIUS)
+                    .min(samples.len() - 1),
+            )
+        };
+        for left in first_left..last_left {
+            let right = left + 1;
+            let (left_value, right_value) = (samples[left], samples[right]);
             let crosses = match trigger.slope {
-                DsCopeTriggerSlope::Rising => left_value <= threshold && right_value >= threshold,
-                DsCopeTriggerSlope::Falling => left_value >= threshold && right_value <= threshold,
+                DsCopeTriggerSlope::Rising => {
+                    (left_value < threshold && right_value >= threshold)
+                        || (left_value <= threshold && right_value > threshold)
+                }
+                DsCopeTriggerSlope::Falling => {
+                    (left_value > threshold && right_value <= threshold)
+                        || (left_value >= threshold && right_value < threshold)
+                }
             };
             if !crosses {
                 continue;
@@ -3967,18 +3972,17 @@ fn scope_trigger_crossing_sample(
             } else {
                 ((threshold - left_value) / delta).clamp(0.0, 1.0)
             };
-            let crossing = waveforms.scope_sample_offset as f32 + left as f32 + interpolation;
             let crossing = ScopeTriggerCrossing {
-                sample: crossing,
+                sample: waveforms.scope_sample_offset as f32 + left as f32 + interpolation,
                 channel_index,
             };
-            if closest_crossing.map_or(true, |current| crossing.sample > current.sample) {
-                closest_crossing = Some(crossing);
+            let distance = (left as f32 + interpolation - reference_sample).abs();
+            if closest_crossing.map_or(true, |(_, current_distance)| distance < current_distance) {
+                closest_crossing = Some((crossing, distance));
             }
-            break;
         }
     }
-    closest_crossing
+    closest_crossing.map(|(crossing, _)| crossing)
 }
 
 fn scope_sample_fraction(sample: f32, sample_offset: u64, sample_count: usize) -> f32 {
@@ -4163,7 +4167,7 @@ fn paint_scope_trigger_level(
             scope_trigger_threshold_voltage(channel_settings, settings.levels[channel]);
         let arrow_x = plot.right() - 2.0;
         let arrow_width = ARROW_BODY_WIDTH + ARROW_TIP_WIDTH;
-        let arrow_y = scope_trigger_level_y(plot, settings.levels[channel]);
+        let arrow_y = scope_trigger_level_y(plot, channel_settings, settings.levels[channel]);
         let hit_rect = Rect::from_center_size(
             Pos2::new(arrow_x - arrow_width * 0.5, arrow_y),
             Vec2::new(arrow_width + 4.0, ARROW_HALF_HEIGHT * 2.0 + 10.0),
@@ -4195,12 +4199,13 @@ fn paint_scope_trigger_level(
                 ) as u8;
             } else if response.dragged() {
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    settings.levels[channel] = scope_trigger_level_from_y(plot, pointer.y);
+                    settings.levels[channel] =
+                        scope_trigger_level_from_y(plot, pointer.y, channel_settings);
                 }
             }
         }
 
-        let arrow_y = scope_trigger_level_y(plot, settings.levels[channel]);
+        let arrow_y = scope_trigger_level_y(plot, channel_settings, settings.levels[channel]);
         let mut x = plot.left();
         while x <= plot.right() {
             painter.circle_filled(Pos2::new(x, arrow_y), 0.8, color.gamma_multiply(0.45));
@@ -4336,8 +4341,8 @@ fn paint_scope(
         .map(|sample| scope_sample_fraction(sample, waveforms.scope_sample_offset, sample_count))
         .unwrap_or_else(|| f32::from(settings.trigger.position_percent) / 100.0);
     let trigger_screen_fraction = f32::from(trigger_settings.position_percent) / 100.0;
-    if viewport.anchor_locked && (viewport.span - 1.0).abs() > f32::EPSILON {
-        viewport.align_sample_to_screen(trigger_sample_fraction, trigger_screen_fraction);
+    if viewport.anchor_locked {
+        viewport.align_trigger_to_screen(trigger_sample_fraction, trigger_screen_fraction);
     }
     let viewport_panned = update_waveform_viewport(
         ui,
@@ -4550,23 +4555,6 @@ mod tests {
             CompletionStatus::Complete,
             false,
         ));
-        assert!(uses_rolling_waveform_buffer(
-            AcquisitionMode::Run,
-            true,
-            DsCopeTriggerSource::Auto,
-        ));
-        assert!(!uses_rolling_waveform_buffer(
-            AcquisitionMode::Run,
-            true,
-            DsCopeTriggerSource::ChannelZero,
-        ));
-        assert!(!uses_rolling_waveform_buffer(
-            AcquisitionMode::Single,
-            true,
-            DsCopeTriggerSource::Auto,
-        ));
-        assert_eq!(scope_rolling_sample_capacity(1), 33_554_432);
-        assert_eq!(scope_rolling_sample_capacity(2), 16_777_216);
     }
 
     #[test]
@@ -4968,15 +4956,19 @@ mod tests {
     #[test]
     fn scope_trigger_levels_use_vendor_limits_and_follow_channel_offsets() {
         let plot = Rect::from_min_max(Pos2::new(0.0, 20.0), Pos2::new(100.0, 220.0));
+        let channel = ScopeChannelSettings::default();
 
+        assert_eq!(scope_trigger_level_from_y(plot, plot.top(), channel), 34);
         assert_eq!(
-            scope_trigger_level_from_y(plot, plot.top()),
-            DSCOPE_TRIGGER_LEVEL_MIN
+            scope_trigger_level_from_y(plot, plot.bottom(), channel),
+            222
         );
         assert_eq!(
-            scope_trigger_level_from_y(plot, plot.bottom()),
-            DSCOPE_TRIGGER_LEVEL_MAX
+            scope_trigger_level_from_y(plot, scope_trigger_level_y(plot, channel, 128), channel),
+            128
         );
+        assert!((scope_trigger_threshold_voltage(channel, 128)).abs() < f32::EPSILON);
+        assert!((scope_trigger_threshold_voltage(channel, 104) - 1.021_276_6).abs() < 0.000_001);
         assert_eq!(shift_scope_trigger_level(128, 128, 160), 160);
         assert_eq!(shift_scope_trigger_level(220, 128, 160), 232);
         assert_eq!(shift_scope_trigger_level(32, 128, 96), 24);
@@ -5024,6 +5016,66 @@ mod tests {
                 sample: 1.5,
                 channel_index: 0,
             })
+        );
+    }
+
+    #[test]
+    fn scope_trigger_anchor_selects_the_nearest_matching_edge() {
+        let mut samples = vec![-1.0; 32];
+        samples[11..16].fill(1.0);
+        samples[21..].fill(1.0);
+        let waveforms = WaveformStore {
+            scope_channels: vec![VecDeque::from(samples), VecDeque::from(vec![0.0; 32])],
+            scope_trigger_sample_index: Some(19),
+            ..WaveformStore::default()
+        };
+        let trigger = ScopeTriggerSettings {
+            source: DsCopeTriggerSource::ChannelZero,
+            slope: DsCopeTriggerSlope::Rising,
+            ..ScopeTriggerSettings::default()
+        };
+
+        assert_eq!(
+            scope_trigger_crossing_sample(&waveforms, ScopeCaptureSettings::default(), trigger),
+            Some(ScopeTriggerCrossing {
+                sample: 20.5,
+                channel_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn scope_auto_trigger_locks_a_free_running_frame_when_it_contains_an_edge() {
+        let mut samples = vec![-1.0; 32];
+        samples[11..16].fill(1.0);
+        samples[21..].fill(1.0);
+        let mut waveforms = WaveformStore {
+            scope_channels: vec![VecDeque::from(samples), VecDeque::from(vec![0.0; 32])],
+            scope_trigger_sample_index: None,
+            ..WaveformStore::default()
+        };
+        let trigger = ScopeTriggerSettings {
+            position_percent: 65,
+            source: DsCopeTriggerSource::Auto,
+            auto_channel: 0,
+            slope: DsCopeTriggerSlope::Rising,
+            ..ScopeTriggerSettings::default()
+        };
+
+        assert_eq!(
+            scope_trigger_crossing_sample(&waveforms, ScopeCaptureSettings::default(), trigger),
+            Some(ScopeTriggerCrossing {
+                sample: 20.5,
+                channel_index: 0,
+            })
+        );
+
+        waveforms.scope_channels[0]
+            .iter_mut()
+            .for_each(|sample| *sample = 0.0);
+        assert_eq!(
+            scope_trigger_crossing_sample(&waveforms, ScopeCaptureSettings::default(), trigger),
+            None
         );
     }
 
@@ -5087,6 +5139,11 @@ mod tests {
         viewport.move_screen_anchor(0.5, 0.25);
         assert!((viewport.start - 0.375).abs() < f32::EPSILON);
         assert!(((0.5 - viewport.start) / viewport.span - 0.25).abs() < f32::EPSILON);
+
+        let mut full_span = WaveformViewport::default();
+        full_span.align_trigger_to_screen(0.75, 0.5);
+        assert!((full_span.start - 0.25).abs() < f32::EPSILON);
+        assert!(((0.75 - full_span.start) / full_span.span - 0.5).abs() < f32::EPSILON);
 
         let mut hardware_anchored = WaveformViewport::default();
         hardware_anchored.step_timebase_at_sample(1.0, 1_000_000, 1_000_000, 0.503, 0.5);

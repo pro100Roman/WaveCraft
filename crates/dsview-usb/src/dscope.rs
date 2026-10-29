@@ -1555,13 +1555,16 @@ fn decode_capture(
     config: DsCopeCaptureConfig,
     context: &CaptureContext,
 ) -> Result<(), CaptureError> {
-    let trigger_sample_index = decode_trigger_sample_index(&capture.trigger_header, config)?;
     let enabled_channel_count = config.enabled_channel_count();
     let enabled_channel_indices = config.enabled_channel_indices().collect::<Vec<_>>();
     let measurement_offset = usize::try_from(config.armed_sample_count())
         .expect("validated sample count fits usize")
         * enabled_channel_count;
     let measurement = ScopeMeasurement::decode(&capture.payload[measurement_offset..], config)?;
+    let trigger_sample_index = measurement
+        .triggered
+        .then(|| decode_trigger_sample_index(&capture.trigger_header, config))
+        .transpose()?;
     let sample_count = usize::try_from(measurement.sample_count)
         .expect("32-bit measurement sample count fits usize");
     // The hardware trigger offset is expressed in two-byte ADC words even in
@@ -1603,7 +1606,11 @@ fn decode_capture(
             captured_at,
             CaptureBatch::Scope(ScopeBatch {
                 sample_rate_hz: config.sample_rate_hz,
-                trigger_sample_index: (sequence == 0).then_some(trigger_sample_index),
+                trigger_sample_index: if sequence == 0 {
+                    trigger_sample_index
+                } else {
+                    None
+                },
                 channels,
             }),
         )?;
@@ -1640,6 +1647,7 @@ fn decode_trigger_sample_index(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ScopeMeasurement {
     sample_count: u32,
+    triggered: bool,
     trigger_offset: u8,
     hardware_offsets: [u8; CHANNEL_COUNT],
 }
@@ -1675,6 +1683,7 @@ impl ScopeMeasurement {
             .ok_or_else(|| CaptureError::new("DSCope valid sample length overflowed"))?;
         Ok(Self {
             sample_count: sample_count.min(config.sample_count as u32),
+            triggered: read_u32(footer, 8) & 0x4000_0000 != 0,
             trigger_offset: footer[11] & 0x07,
             hardware_offsets: [footer[102], footer[166]],
         })
@@ -2112,11 +2121,15 @@ mod tests {
         let measurement = ScopeMeasurement::decode(&footer, config).unwrap();
 
         assert_eq!(measurement.sample_count, 100);
+        assert!(!measurement.triggered);
         assert_eq!(measurement.trigger_offset, 3);
         assert_eq!(measurement.hardware_offsets, [128, 130]);
         let channel = DsCopeChannelConfig::default();
         assert_eq!(raw_to_volts(128, 128, channel), 0.0);
         assert!(raw_to_volts(100, 128, channel) > 1.19);
+
+        footer[8..12].copy_from_slice(&(config.divider() | 0x4000_0000).to_le_bytes());
+        assert!(ScopeMeasurement::decode(&footer, config).unwrap().triggered);
     }
 
     #[test]
