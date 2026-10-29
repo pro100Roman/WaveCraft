@@ -425,6 +425,7 @@ struct WaveformStore {
 struct WaveformViewport {
     start: f32,
     span: f32,
+    anchor_locked: bool,
 }
 
 impl Default for WaveformViewport {
@@ -432,6 +433,7 @@ impl Default for WaveformViewport {
         Self {
             start: 0.0,
             span: 1.0,
+            anchor_locked: true,
         }
     }
 }
@@ -492,6 +494,7 @@ impl WaveformViewport {
     fn move_screen_anchor(&mut self, old_fraction: f32, new_fraction: f32) {
         let sample_anchor = self.start + old_fraction.clamp(0.0, 1.0) * self.span;
         self.start = self.clamp_start(sample_anchor - new_fraction.clamp(0.0, 1.0) * self.span);
+        self.anchor_locked = true;
     }
 
     fn align_sample_to_screen(&mut self, sample_fraction: f32, screen_fraction: f32) {
@@ -503,6 +506,19 @@ impl WaveformViewport {
         let first = 0.0_f32.min(1.0 - self.span);
         let last = 0.0_f32.max(1.0 - self.span);
         start.clamp(first, last)
+    }
+
+    fn pan_by_screen_delta(&mut self, delta_x: f32, plot_width: f32) -> bool {
+        if delta_x == 0.0 || plot_width <= 0.0 {
+            return false;
+        }
+        let previous_start = self.start;
+        self.start = self.clamp_start(self.start - delta_x / plot_width * self.span);
+        if (self.start - previous_start).abs() <= f32::EPSILON {
+            return false;
+        }
+        self.anchor_locked = false;
+        true
     }
 
     fn step_timebase_at_sample(
@@ -2948,17 +2964,34 @@ fn update_waveform_viewport(
     sample_rate_hz: u64,
     zoom_anchor: Option<(f32, f32)>,
 ) {
-    let response = ui
-        .interact(rect, ui.make_persistent_id(id_salt), Sense::click())
-        .on_hover_cursor(egui::CursorIcon::ZoomIn)
-        .on_hover_text("Scroll to step timebase · double-click to reset");
+    let response = ui.interact(
+        rect,
+        ui.make_persistent_id(id_salt),
+        Sense::click_and_drag(),
+    );
+    let cursor = if response.dragged_by(egui::PointerButton::Primary) {
+        egui::CursorIcon::Grabbing
+    } else {
+        egui::CursorIcon::Grab
+    };
+    let response = response
+        .on_hover_cursor(cursor)
+        .on_hover_text("Drag to pan · scroll to step timebase · double-click to reset");
     if response.double_clicked() {
         viewport.reset();
+    }
+    if response.dragged_by(egui::PointerButton::Primary) {
+        let delta_x = ui.input(|input| input.pointer.delta().x);
+        if viewport.pan_by_screen_delta(delta_x, rect.width()) {
+            ui.ctx().request_repaint();
+        }
     }
     if response.hovered() {
         let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
         if scroll_delta != 0.0 {
-            if let Some((sample_fraction, screen_fraction)) = zoom_anchor {
+            if let Some((sample_fraction, screen_fraction)) =
+                zoom_anchor.filter(|_| viewport.anchor_locked)
+            {
                 viewport.step_timebase_at_sample(
                     scroll_delta,
                     sample_count,
@@ -3902,7 +3935,7 @@ fn paint_scope(
         .map(|sample| scope_sample_fraction(sample, waveforms.scope_sample_offset, sample_count))
         .unwrap_or_else(|| f32::from(settings.trigger.position_percent) / 100.0);
     let trigger_screen_fraction = f32::from(trigger_settings.position_percent) / 100.0;
-    if (viewport.span - 1.0).abs() > f32::EPSILON {
+    if viewport.anchor_locked && (viewport.span - 1.0).abs() > f32::EPSILON {
         viewport.align_sample_to_screen(trigger_sample_fraction, trigger_screen_fraction);
     }
     update_waveform_viewport(
@@ -4477,6 +4510,7 @@ mod tests {
         let viewport = WaveformViewport {
             start: 0.25,
             span: 0.5,
+            ..WaveformViewport::default()
         };
 
         assert!((scope_sample_fraction(1_050.0, 1_000, 101) - 0.5).abs() < f32::EPSILON);
@@ -4519,6 +4553,7 @@ mod tests {
         let mut viewport = WaveformViewport {
             start: 0.25,
             span: 0.5,
+            ..WaveformViewport::default()
         };
         viewport.move_screen_anchor(0.5, 0.25);
         assert!((viewport.start - 0.375).abs() < f32::EPSILON);
@@ -4530,6 +4565,23 @@ mod tests {
         assert!(
             ((0.503 - hardware_anchored.start) / hardware_anchored.span - 0.5).abs() < f32::EPSILON
         );
+    }
+
+    #[test]
+    fn waveform_pan_tracks_mouse_motion_and_clamps_to_capture() {
+        let mut viewport = WaveformViewport {
+            start: 0.25,
+            span: 0.5,
+            ..WaveformViewport::default()
+        };
+
+        assert!(viewport.pan_by_screen_delta(-100.0, 1_000.0));
+        assert!((viewport.start - 0.3).abs() < 0.000_001);
+        assert!(!viewport.anchor_locked);
+
+        assert!(viewport.pan_by_screen_delta(10_000.0, 1_000.0));
+        assert_eq!(viewport.start, 0.0);
+        assert!(!viewport.pan_by_screen_delta(1.0, 1_000.0));
     }
 
     #[test]
