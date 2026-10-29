@@ -22,7 +22,10 @@ const CALIBRATION_ZERO_BYTES: usize = 30;
 const CALIBRATION_VGA_BYTES: usize = 17;
 const CALIBRATION_FLASH_PAGE_STRIDE: u16 = 8;
 const CALIBRATION_ID_BASE: u8 = 0x40;
+#[cfg(test)]
 const OFFSET_PWM_SPAN: u64 = 780;
+const CALIBRATION_VPOS_TRANS_OFFSET: usize = 19;
+const CALIBRATION_COMB_COMP_OFFSET: usize = 21;
 const INTERNAL_TEST_MODE_BIT: u16 = 1 << 15;
 
 pub const DSCOPE_VERTICAL_OFFSET_MIN: u16 = 10;
@@ -65,6 +68,8 @@ pub const DSCOPE_VOLTS_PER_DIV_MV: [u16; 8] = [10, 20, 50, 100, 200, 500, 1_000,
 pub struct DsCopeCalibrationValues {
     preoffsets: [[u16; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
     vga_gains: [[u16; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+    vpos_trans: [u16; CHANNEL_COUNT],
+    comb_comp: [u8; CHANNEL_COUNT],
 }
 
 impl DsCopeCalibrationValues {
@@ -802,6 +807,8 @@ fn read_calibration_values(
     let mut values = DsCopeCalibrationValues {
         preoffsets: [[0; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
         vga_gains: [[0; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+        vpos_trans: [0; CHANNEL_COUNT],
+        comb_comp: [0; CHANNEL_COUNT],
     };
     for channel in 0..CHANNEL_COUNT {
         let (zero_record, vga_record) = read_calibration_records(session, channel)?;
@@ -810,6 +817,8 @@ fn read_calibration_values(
             values.preoffsets[channel][range] = calibration.preoffset;
             values.vga_gains[channel][range] = (calibration.vga_gain >> 8) as u16;
         }
+        values.vpos_trans[channel] = read_u16(&zero_record, CALIBRATION_VPOS_TRANS_OFFSET);
+        values.comb_comp[channel] = zero_record[CALIBRATION_COMB_COMP_OFFSET];
     }
     Ok(values)
 }
@@ -1022,12 +1031,14 @@ fn dso_commands(config: DsCopeCaptureConfig, calibration: DsCopeCalibration) -> 
         offset_command(
             0x10,
             config.channels[0].vertical_offset,
-            channel_zero.preoffset,
+            channel_zero,
+            config.enabled_channel_count() == 1,
         ),
         offset_command(
             0x90,
             config.channels[1].vertical_offset,
-            channel_one.preoffset,
+            channel_one,
+            config.enabled_channel_count() == 1,
         ),
         0x18 + (u64::from(config.divider()) << 8),
         0x20 + (config.trigger_position_samples() << 8),
@@ -1050,10 +1061,20 @@ fn coupling_command(config: DsCopeCaptureConfig, channel: usize, coupling: DsCop
     command + ((channel as u64) << 7) + coupling.command_bit()
 }
 
-fn offset_command(command: u64, vertical_offset: u16, preoffset: u16) -> u64 {
-    let vertical_offset = u64::from(vertical_offset);
-    let offset =
-        (vertical_offset << 32) + (vertical_offset * OFFSET_PWM_SPAN / 255) + u64::from(preoffset);
+fn offset_command(
+    command: u64,
+    vertical_offset: u16,
+    calibration: DsCopeChannelCalibration,
+    single_channel: bool,
+) -> u64 {
+    let mut compensated_offset = f64::from(vertical_offset);
+    if single_channel && calibration.comb_comp != 0 {
+        let exponent = 24.0 * f64::from(calibration.comb_comp) / 20.0 / 4_096.0;
+        let comb_offset = 0.57 / (10_f64.powf(exponent) - 1.0);
+        compensated_offset += (f64::from(vertical_offset) - 128.0) / comb_offset;
+    }
+    let pwm_offset = (compensated_offset / 255.0 * f64::from(calibration.vpos_trans)) as u64;
+    let offset = (u64::from(vertical_offset) << 32) + pwm_offset + u64::from(calibration.preoffset);
     command + (offset << 8)
 }
 
@@ -1061,6 +1082,8 @@ fn offset_command(command: u64, vertical_offset: u16, preoffset: u16) -> u64 {
 struct DsCopeChannelCalibration {
     preoffset: u16,
     vga_gain: u32,
+    vpos_trans: u16,
+    comb_comp: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1073,6 +1096,8 @@ impl DsCopeCalibration {
         let mut channels = [DsCopeChannelCalibration {
             preoffset: 0,
             vga_gain: 0,
+            vpos_trans: 0,
+            comb_comp: 0,
         }; CHANNEL_COUNT];
         for (channel, calibration) in channels.iter_mut().enumerate() {
             let page = u16::try_from(channel).expect("channel index fits u16")
@@ -1100,6 +1125,8 @@ impl DsCopeCalibration {
             channels: std::array::from_fn(|channel| DsCopeChannelCalibration {
                 preoffset: values.preoffsets[channel][range],
                 vga_gain: u32::from(values.vga_gains[channel][range]) << 8,
+                vpos_trans: values.vpos_trans[channel],
+                comb_comp: values.comb_comp[channel],
             }),
         }
     }
@@ -1110,6 +1137,8 @@ impl DsCopeCalibration {
             channels: [DsCopeChannelCalibration {
                 preoffset: 60,
                 vga_gain: 0x0006_9d00,
+                vpos_trans: OFFSET_PWM_SPAN as u16,
+                comb_comp: 0,
             }; CHANNEL_COUNT],
         }
     }
@@ -1228,15 +1257,24 @@ fn parse_channel_calibration(
     let table_offset = 1 + vdiv_index * 2;
     let preoffset = read_u16(zero_record, table_offset);
     let vga_gain = u32::from(read_u16(vga_record, table_offset)) << 8;
-    if preoffset > 1_023 || vga_gain == 0 || vga_gain > 0x001f_ff00 {
+    let vpos_trans = read_u16(zero_record, CALIBRATION_VPOS_TRANS_OFFSET);
+    let comb_comp = zero_record[CALIBRATION_COMB_COMP_OFFSET];
+    if preoffset > 1_023
+        || vga_gain == 0
+        || vga_gain > 0x001f_ff00
+        || vpos_trans == 0
+        || vpos_trans > 4_095
+    {
         return Err(CaptureError::new(format!(
-            "invalid DSCope channel {channel} {} mV/div calibration: preoffset {preoffset}, VGA gain 0x{vga_gain:08x}",
+            "invalid DSCope channel {channel} {} mV/div calibration: preoffset {preoffset}, VGA gain 0x{vga_gain:08x}, vertical transform {vpos_trans}",
             DSCOPE_VOLTS_PER_DIV_MV[vdiv_index]
         )));
     }
     Ok(DsCopeChannelCalibration {
         preoffset,
         vga_gain,
+        vpos_trans,
+        comb_comp,
     })
 }
 
@@ -1689,6 +1727,8 @@ mod tests {
         let mut values = DsCopeCalibrationValues {
             preoffsets: [[60; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
             vga_gains: [[0x100; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+            vpos_trans: [OFFSET_PWM_SPAN as u16; CHANNEL_COUNT],
+            comb_comp: [0; CHANNEL_COUNT],
         };
 
         values.set_preoffset(1, 7, 1_023).unwrap();
@@ -1819,10 +1859,14 @@ mod tests {
                 DsCopeChannelCalibration {
                     preoffset: 71,
                     vga_gain: 0x0006_a100,
+                    vpos_trans: OFFSET_PWM_SPAN as u16,
+                    comb_comp: 0,
                 },
                 DsCopeChannelCalibration {
                     preoffset: 83,
                     vga_gain: 0x0006_9700,
+                    vpos_trans: OFFSET_PWM_SPAN as u16,
+                    comb_comp: 0,
                 },
             ],
         };
@@ -1833,11 +1877,21 @@ mod tests {
         assert_eq!(commands[4], 0x0006_9788);
         assert_eq!(
             commands[5],
-            offset_command(0x10, DSCOPE_VERTICAL_OFFSET_CENTER, 71)
+            offset_command(
+                0x10,
+                DSCOPE_VERTICAL_OFFSET_CENTER,
+                calibration.channels[0],
+                false,
+            )
         );
         assert_eq!(
             commands[6],
-            offset_command(0x90, DSCOPE_VERTICAL_OFFSET_CENTER, 83)
+            offset_command(
+                0x90,
+                DSCOPE_VERTICAL_OFFSET_CENTER,
+                calibration.channels[1],
+                false,
+            )
         );
     }
 
@@ -1862,10 +1916,14 @@ mod tests {
                 DsCopeChannelCalibration {
                     preoffset: 71,
                     vga_gain: 0x0006_a100,
+                    vpos_trans: OFFSET_PWM_SPAN as u16,
+                    comb_comp: 0,
                 },
                 DsCopeChannelCalibration {
                     preoffset: 83,
                     vga_gain: 0x0006_9700,
+                    vpos_trans: OFFSET_PWM_SPAN as u16,
+                    comb_comp: 0,
                 },
             ],
         };
@@ -1874,6 +1932,27 @@ mod tests {
 
         assert_eq!(commands[5], 0x0000_0a00_0000_6510);
         assert_eq!(commands[6], 0x0000_f500_0003_4090);
+    }
+
+    #[test]
+    fn applies_calibrated_vertical_transform_and_single_channel_compensation() {
+        let calibration = DsCopeChannelCalibration {
+            preoffset: 60,
+            vga_gain: 0x0006_9d00,
+            vpos_trans: 812,
+            comb_comp: 9,
+        };
+        let dual_channel = offset_command(0x10, DSCOPE_VERTICAL_OFFSET_CENTER, calibration, false);
+        let expected_pwm = u64::from(DSCOPE_VERTICAL_OFFSET_CENTER) * 812 / 255;
+        let expected_offset = (u64::from(DSCOPE_VERTICAL_OFFSET_CENTER) << 32)
+            + expected_pwm
+            + u64::from(calibration.preoffset);
+
+        assert_eq!(dual_channel, 0x10 + (expected_offset << 8));
+        assert_ne!(
+            offset_command(0x10, 200, calibration, true),
+            offset_command(0x10, 200, calibration, false)
+        );
     }
 
     #[test]
@@ -1893,12 +1972,17 @@ mod tests {
         zero_record[0] = 0x6f;
         vga_record[0] = 0x8d;
         zero_record[13..15].copy_from_slice(&73_u16.to_le_bytes());
+        zero_record[CALIBRATION_VPOS_TRANS_OFFSET..CALIBRATION_VPOS_TRANS_OFFSET + 2]
+            .copy_from_slice(&812_u16.to_le_bytes());
+        zero_record[CALIBRATION_COMB_COMP_OFFSET] = 9;
         vga_record[13..15].copy_from_slice(&0x06a1_u16.to_le_bytes());
 
         let calibration = parse_channel_calibration(1, 6, &zero_record, &vga_record).unwrap();
 
         assert_eq!(calibration.preoffset, 73);
         assert_eq!(calibration.vga_gain, 0x0006_a100);
+        assert_eq!(calibration.vpos_trans, 812);
+        assert_eq!(calibration.comb_comp, 9);
     }
 
     #[test]
