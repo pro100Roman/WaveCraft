@@ -57,6 +57,8 @@ const SCOPE_COLORS: [Color32; 2] = [
     Color32::from_rgb(255, 204, 74),
     Color32::from_rgb(99, 179, 255),
 ];
+const MATH_COLOR: Color32 = Color32::from_rgb(213, 126, 255);
+const FFT_LENGTHS: [usize; 5] = [1_024, 2_048, 4_096, 8_192, 16_384];
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -199,6 +201,102 @@ impl ScopeTriggerSettings {
             || self.holdoff_ns != other.holdoff_ns
             || self.noise_sensitivity != other.noise_sensitivity
             || self.levels != other.levels
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeMathOperation {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+impl ScopeMathOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Add => "Add",
+            Self::Subtract => "Subtract",
+            Self::Multiply => "Multiply",
+            Self::Divide => "Divide",
+        }
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Add => "+",
+            Self::Subtract => "−",
+            Self::Multiply => "×",
+            Self::Divide => "÷",
+        }
+    }
+
+    fn apply(self, left: f32, right: f32) -> Option<f32> {
+        let value = match self {
+            Self::Add => left + right,
+            Self::Subtract => left - right,
+            Self::Multiply => left * right,
+            Self::Divide if right.abs() > f32::EPSILON => left / right,
+            Self::Divide => return None,
+        };
+        value.is_finite().then_some(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScopeMathSettings {
+    enabled: bool,
+    operation: ScopeMathOperation,
+    left_channel: usize,
+    right_channel: usize,
+}
+
+impl Default for ScopeMathSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            operation: ScopeMathOperation::Add,
+            left_channel: 0,
+            right_channel: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScopeFftSettings {
+    enabled: bool,
+    channel: usize,
+    length: usize,
+}
+
+impl Default for ScopeFftSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel: 0,
+            length: 16_384,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ScopeFunctionSettings {
+    math: ScopeMathSettings,
+    fft: ScopeFftSettings,
+}
+
+impl ScopeFunctionSettings {
+    fn clamp_to_channels(&mut self, channels: [bool; 2]) {
+        let fallback = if channels[0] { 0 } else { 1 };
+        if !channels[self.math.left_channel] {
+            self.math.left_channel = fallback;
+        }
+        if !channels[self.math.right_channel] {
+            self.math.right_channel = fallback;
+        }
+        if !channels[self.fft.channel] {
+            self.fft.channel = fallback;
+        }
     }
 }
 
@@ -758,6 +856,7 @@ struct DsViewApp {
     devices: Vec<DeviceEntry>,
     active_capture_settings_tab: CaptureSettingsTab,
     scope_settings: ScopeCaptureSettings,
+    scope_function_settings: ScopeFunctionSettings,
     active_waveform_tab: Option<WaveformTab>,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
@@ -788,6 +887,7 @@ impl DsViewApp {
             devices: Vec::new(),
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
             scope_settings: ScopeCaptureSettings::default(),
+            scope_function_settings: ScopeFunctionSettings::default(),
             active_waveform_tab: None,
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
@@ -1738,6 +1838,112 @@ fn paint_scope_trigger_settings(
         });
 }
 
+fn paint_scope_channel_picker(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    channel: &mut usize,
+    channels: [bool; 2],
+) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(format!("CH{channel}"))
+        .show_ui(ui, |ui| {
+            for (index, enabled) in channels.into_iter().enumerate() {
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.selectable_value(channel, index, format!("CH{index}"));
+                });
+            }
+        });
+}
+
+fn paint_scope_function_settings(
+    ui: &mut egui::Ui,
+    settings: &mut ScopeFunctionSettings,
+    channels: [bool; 2],
+) {
+    settings.clamp_to_channels(channels);
+    egui::CollapsingHeader::new(RichText::new("Function").strong())
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.checkbox(&mut settings.math.enabled, "Math");
+            ui.add_enabled_ui(settings.math.enabled, |ui| {
+                egui::Grid::new("dscope_math_settings")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Operation");
+                        egui::ComboBox::from_id_salt("scope_math_operation")
+                            .selected_text(settings.math.operation.label())
+                            .show_ui(ui, |ui| {
+                                for operation in [
+                                    ScopeMathOperation::Add,
+                                    ScopeMathOperation::Subtract,
+                                    ScopeMathOperation::Multiply,
+                                    ScopeMathOperation::Divide,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut settings.math.operation,
+                                        operation,
+                                        operation.label(),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("First source");
+                        paint_scope_channel_picker(
+                            ui,
+                            "scope_math_left_channel",
+                            &mut settings.math.left_channel,
+                            channels,
+                        );
+                        ui.end_row();
+
+                        ui.label("Second source");
+                        paint_scope_channel_picker(
+                            ui,
+                            "scope_math_right_channel",
+                            &mut settings.math.right_channel,
+                            channels,
+                        );
+                        ui.end_row();
+                    });
+            });
+
+            ui.add_space(6.0);
+            ui.checkbox(&mut settings.fft.enabled, "FFT");
+            ui.add_enabled_ui(settings.fft.enabled, |ui| {
+                egui::Grid::new("dscope_fft_settings")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Source");
+                        paint_scope_channel_picker(
+                            ui,
+                            "scope_fft_channel",
+                            &mut settings.fft.channel,
+                            channels,
+                        );
+                        ui.end_row();
+
+                        ui.label("Length");
+                        egui::ComboBox::from_id_salt("scope_fft_length")
+                            .selected_text(settings.fft.length.to_string())
+                            .show_ui(ui, |ui| {
+                                for length in FFT_LENGTHS {
+                                    ui.selectable_value(
+                                        &mut settings.fft.length,
+                                        length,
+                                        length.to_string(),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                    });
+                ui.small(RichText::new("Hann window · magnitude in dBV").color(TEXT_MUTED));
+            });
+        });
+}
+
 fn paint_scope_channel_settings(
     ui: &mut egui::Ui,
     channel_index: usize,
@@ -1819,6 +2025,7 @@ fn paint_capture_settings(
     ui: &mut egui::Ui,
     tab: CaptureSettingsTab,
     scope_settings: &mut ScopeCaptureSettings,
+    scope_function_settings: &mut ScopeFunctionSettings,
     scope_channel_colors: &mut [Color32; 2],
     availability: CaptureSettingsAvailability,
     calibration_action: &mut Option<ScopeCalibrationAction>,
@@ -2003,6 +2210,8 @@ fn paint_capture_settings(
                         channel_enabled,
                         availability.trigger,
                     );
+                    ui.add_space(8.0);
+                    paint_scope_function_settings(ui, scope_function_settings, channel_enabled);
                 }
             }
         });
@@ -2182,6 +2391,7 @@ impl eframe::App for DsViewApp {
                                 ui,
                                 self.active_capture_settings_tab,
                                 &mut self.scope_settings,
+                                &mut self.scope_function_settings,
                                 &mut self.scope_channel_colors,
                                 CaptureSettingsAvailability {
                                     capture: capture_settings_enabled,
@@ -2334,6 +2544,7 @@ impl eframe::App for DsViewApp {
                                     &mut scope_viewport,
                                     ScopeWaveformOptions {
                                         settings: scope_settings,
+                                        function_settings: self.scope_function_settings,
                                         channel_colors: self.scope_channel_colors,
                                         vertical_offsets: &mut scope_vertical_offsets,
                                         trigger_settings: &mut scope_trigger_settings,
@@ -2356,6 +2567,7 @@ impl eframe::App for DsViewApp {
                             &mut scope_viewport,
                             ScopeWaveformOptions {
                                 settings: scope_settings,
+                                function_settings: self.scope_function_settings,
                                 channel_colors: self.scope_channel_colors,
                                 vertical_offsets: &mut scope_vertical_offsets,
                                 trigger_settings: &mut scope_trigger_settings,
@@ -2907,6 +3119,7 @@ const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;
 
 struct ScopeWaveformOptions<'a> {
     settings: ScopeCaptureSettings,
+    function_settings: ScopeFunctionSettings,
     channel_colors: [Color32; 2],
     vertical_offsets: &'a mut [u16; 2],
     trigger_settings: &'a mut ScopeTriggerSettings,
@@ -4211,7 +4424,317 @@ fn paint_scope_readouts(
     }
 }
 
+fn scope_math_value(
+    waveforms: &WaveformStore,
+    settings: ScopeMathSettings,
+    sample_index: usize,
+) -> Option<f32> {
+    let left = *waveforms
+        .scope_channels
+        .get(settings.left_channel)?
+        .get(sample_index)?;
+    let right = *waveforms
+        .scope_channels
+        .get(settings.right_channel)?
+        .get(sample_index)?;
+    settings.operation.apply(left, right)
+}
+
+fn scope_math_unit(operation: ScopeMathOperation) -> &'static str {
+    match operation {
+        ScopeMathOperation::Add | ScopeMathOperation::Subtract => "V",
+        ScopeMathOperation::Multiply => "V²",
+        ScopeMathOperation::Divide => "ratio",
+    }
+}
+
+struct ScopeMathPaintOptions {
+    viewport: WaveformViewport,
+    sample_count: usize,
+    visible_range: Range<usize>,
+    step: usize,
+    settings: ScopeMathSettings,
+}
+
+fn paint_scope_math_trace(
+    painter: &egui::Painter,
+    plot: Rect,
+    waveforms: &WaveformStore,
+    options: ScopeMathPaintOptions,
+) {
+    let ScopeMathPaintOptions {
+        viewport,
+        sample_count,
+        visible_range,
+        step,
+        settings,
+    } = options;
+    if !settings.enabled || visible_range.is_empty() {
+        return;
+    }
+    let mut indices = visible_range
+        .clone()
+        .step_by(step.max(1))
+        .collect::<Vec<_>>();
+    if let Some(last) = visible_range.end.checked_sub(1) {
+        indices.push(last);
+    }
+    indices.sort_unstable();
+    indices.dedup();
+
+    let samples = indices
+        .into_iter()
+        .filter_map(|index| {
+            scope_math_value(waveforms, settings, index).map(|value| (index, value))
+        })
+        .collect::<Vec<_>>();
+    let maximum = samples
+        .iter()
+        .map(|(_, value)| value.abs())
+        .fold(0.0_f32, f32::max)
+        .max(f32::EPSILON);
+    let points = samples
+        .into_iter()
+        .map(|(index, value)| {
+            let x = waveform_sample_x(plot, viewport, index as f32, sample_count);
+            let y = plot.center().y - value / maximum * plot.height() * 0.44;
+            Pos2::new(x, y)
+        })
+        .collect::<Vec<_>>();
+    if points.len() > 1 {
+        painter.add(egui::Shape::line(
+            points.clone(),
+            Stroke::new(4.0_f32, MATH_COLOR.gamma_multiply(0.16)),
+        ));
+        painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, MATH_COLOR)));
+    }
+    painter.text(
+        plot.right_top() + Vec2::new(-8.0, 7.0),
+        egui::Align2::RIGHT_TOP,
+        format!(
+            "M  CH{} {} CH{}  auto ±{:.3} {}",
+            settings.left_channel,
+            settings.operation.symbol(),
+            settings.right_channel,
+            maximum,
+            scope_math_unit(settings.operation),
+        ),
+        FontId::monospace(10.0),
+        MATH_COLOR,
+    );
+}
+
+fn fft_in_place(values: &mut [(f64, f64)]) {
+    let count = values.len();
+    let mut target = 0;
+    for source in 1..count {
+        let mut bit = count >> 1;
+        while target & bit != 0 {
+            target ^= bit;
+            bit >>= 1;
+        }
+        target ^= bit;
+        if source < target {
+            values.swap(source, target);
+        }
+    }
+
+    let mut width = 2;
+    while width <= count {
+        let angle = -std::f64::consts::TAU / width as f64;
+        let base = (angle.cos(), angle.sin());
+        for start in (0..count).step_by(width) {
+            let mut twiddle = (1.0, 0.0);
+            for offset in 0..width / 2 {
+                let even = values[start + offset];
+                let odd = values[start + offset + width / 2];
+                let rotated = (
+                    odd.0 * twiddle.0 - odd.1 * twiddle.1,
+                    odd.0 * twiddle.1 + odd.1 * twiddle.0,
+                );
+                values[start + offset] = (even.0 + rotated.0, even.1 + rotated.1);
+                values[start + offset + width / 2] = (even.0 - rotated.0, even.1 - rotated.1);
+                twiddle = (
+                    twiddle.0 * base.0 - twiddle.1 * base.1,
+                    twiddle.0 * base.1 + twiddle.1 * base.0,
+                );
+            }
+        }
+        width *= 2;
+    }
+}
+
+fn scope_fft_spectrum(
+    samples: &VecDeque<f32>,
+    visible_range: Range<usize>,
+    requested_length: usize,
+) -> Vec<f32> {
+    let available = visible_range.len().min(requested_length);
+    if available < 8 {
+        return Vec::new();
+    }
+    let length = 1_usize << (usize::BITS - 1 - available.leading_zeros());
+    let start = visible_range.start + (visible_range.len() - length) / 2;
+    let mut values = Vec::with_capacity(length);
+    let mut window_sum = 0.0;
+    for index in 0..length {
+        let window =
+            0.5 * (1.0 - (std::f64::consts::TAU * index as f64 / (length - 1) as f64).cos());
+        window_sum += window;
+        values.push((f64::from(samples[start + index]) * window, 0.0));
+    }
+    fft_in_place(&mut values);
+
+    values[..=length / 2]
+        .iter()
+        .enumerate()
+        .map(|(bin, (real, imaginary))| {
+            let factor = if bin == 0 || bin == length / 2 {
+                1.0
+            } else {
+                2.0_f64.sqrt()
+            };
+            let magnitude = (real * real + imaginary * imaginary).sqrt() * factor / window_sum;
+            (20.0 * magnitude.max(1.0e-12).log10()) as f32
+        })
+        .collect()
+}
+
+fn format_frequency(frequency_hz: f64) -> String {
+    if frequency_hz >= 1.0e9 {
+        format!("{:.2} GHz", frequency_hz / 1.0e9)
+    } else if frequency_hz >= 1.0e6 {
+        format!("{:.2} MHz", frequency_hz / 1.0e6)
+    } else if frequency_hz >= 1.0e3 {
+        format!("{:.2} kHz", frequency_hz / 1.0e3)
+    } else {
+        format!("{frequency_hz:.1} Hz")
+    }
+}
+
+fn paint_scope_fft(
+    ui: &egui::Ui,
+    rect: Rect,
+    waveforms: &WaveformStore,
+    viewport: WaveformViewport,
+    settings: ScopeFftSettings,
+) {
+    const MIN_DBV: f32 = -120.0;
+    const MAX_DBV: f32 = 20.0;
+    paint_plot_background(ui, rect);
+    let painter = ui.painter().with_clip_rect(rect);
+    paint_plot_grid(ui, rect);
+    let Some(samples) = waveforms.scope_channels.get(settings.channel) else {
+        paint_empty(&painter, rect, "Waiting for FFT source samples");
+        return;
+    };
+    let visible_range = viewport.sample_range(samples.len());
+    let spectrum = scope_fft_spectrum(samples, visible_range, settings.length);
+    if spectrum.len() < 2 || waveforms.scope_rate_hz == 0 {
+        paint_empty(&painter, rect, "Waiting for FFT source samples");
+        return;
+    }
+
+    let usable_bins = &spectrum[1..];
+    let bins_per_pixel = (usable_bins.len() as f32 / rect.width().max(1.0))
+        .ceil()
+        .max(1.0) as usize;
+    let points = usable_bins
+        .chunks(bins_per_pixel)
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            let bin = 1 + chunk_index * bins_per_pixel;
+            let value = chunk.iter().copied().fold(MIN_DBV, f32::max);
+            let x = rect.left() + bin as f32 / (spectrum.len() - 1) as f32 * rect.width();
+            let y = rect.bottom()
+                - ((value.clamp(MIN_DBV, MAX_DBV) - MIN_DBV) / (MAX_DBV - MIN_DBV)) * rect.height();
+            Pos2::new(x, y)
+        })
+        .collect::<Vec<_>>();
+    if points.len() > 1 {
+        painter.add(egui::Shape::line(
+            points.clone(),
+            Stroke::new(4.0_f32, SCOPE_COLORS[settings.channel].gamma_multiply(0.16)),
+        ));
+        painter.add(egui::Shape::line(
+            points,
+            Stroke::new(1.5_f32, SCOPE_COLORS[settings.channel]),
+        ));
+    }
+
+    let fft_length = (spectrum.len() - 1) * 2;
+    let nyquist = waveforms.scope_rate_hz as f64 / 2.0;
+    painter.text(
+        rect.left_top() + Vec2::new(8.0, 7.0),
+        egui::Align2::LEFT_TOP,
+        format!("FFT · CH{} · Hann · {fft_length} pts", settings.channel),
+        FontId::monospace(10.0),
+        SCOPE_COLORS[settings.channel],
+    );
+    painter.text(
+        rect.left_bottom() + Vec2::new(5.0, -4.0),
+        egui::Align2::LEFT_BOTTOM,
+        "0 Hz",
+        FontId::monospace(9.0),
+        TEXT_MUTED,
+    );
+    painter.text(
+        rect.center_bottom() + Vec2::new(0.0, -4.0),
+        egui::Align2::CENTER_BOTTOM,
+        format_frequency(nyquist * 0.5),
+        FontId::monospace(9.0),
+        TEXT_MUTED,
+    );
+    painter.text(
+        rect.right_bottom() + Vec2::new(-5.0, -4.0),
+        egui::Align2::RIGHT_BOTTOM,
+        format_frequency(nyquist),
+        FontId::monospace(9.0),
+        TEXT_MUTED,
+    );
+    painter.text(
+        rect.right_top() + Vec2::new(-5.0, 5.0),
+        egui::Align2::RIGHT_TOP,
+        format!("{MAX_DBV:.0} dBV"),
+        FontId::monospace(9.0),
+        TEXT_MUTED,
+    );
+    painter.text(
+        rect.right_bottom() + Vec2::new(-5.0, -18.0),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("{MIN_DBV:.0} dBV"),
+        FontId::monospace(9.0),
+        TEXT_MUTED,
+    );
+}
+
 fn paint_scope(
+    ui: &egui::Ui,
+    rect: Rect,
+    waveforms: &WaveformStore,
+    viewport: &mut WaveformViewport,
+    scope_options: ScopeWaveformOptions<'_>,
+) {
+    let fft_settings = scope_options.function_settings.fft;
+    if !fft_settings.enabled {
+        paint_scope_time_domain(ui, rect, waveforms, viewport, scope_options);
+        return;
+    }
+
+    const FFT_GAP: f32 = 8.0;
+    let desired_fft_height = (rect.height() * 0.36).clamp(80.0, 220.0);
+    let fft_height = desired_fft_height.min((rect.height() - FFT_GAP - 64.0).max(32.0));
+    let time_height = (rect.height() - FFT_GAP - fft_height).max(0.0);
+    let time_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), time_height));
+    let fft_rect = Rect::from_min_size(
+        Pos2::new(rect.left(), time_rect.bottom() + FFT_GAP),
+        Vec2::new(rect.width(), fft_height),
+    );
+    paint_scope_time_domain(ui, time_rect, waveforms, viewport, scope_options);
+    paint_scope_fft(ui, fft_rect, waveforms, *viewport, fft_settings);
+}
+
+fn paint_scope_time_domain(
     ui: &egui::Ui,
     rect: Rect,
     waveforms: &WaveformStore,
@@ -4220,6 +4743,7 @@ fn paint_scope(
 ) {
     let ScopeWaveformOptions {
         mut settings,
+        function_settings,
         channel_colors,
         vertical_offsets,
         trigger_settings,
@@ -4388,6 +4912,19 @@ fn paint_scope(
             scope_painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, color)));
         }
     }
+
+    paint_scope_math_trace(
+        &scope_painter,
+        plot,
+        waveforms,
+        ScopeMathPaintOptions {
+            viewport: *viewport,
+            sample_count,
+            visible_range: visible_range.clone(),
+            step,
+            settings: function_settings.math,
+        },
+    );
 
     // Keep channel and trigger references in the foreground so dense or bright
     // waveforms never obscure their arrows, labels, or dotted level lines.
@@ -4591,6 +5128,61 @@ mod tests {
 
         assert!(store.scope_channels[0].is_empty());
         assert_eq!(store.scope_channels[1].back(), Some(&0.2));
+    }
+
+    #[test]
+    fn scope_math_operations_use_captured_channel_values() {
+        assert_eq!(ScopeMathOperation::Add.apply(6.0, 2.0), Some(8.0));
+        assert_eq!(ScopeMathOperation::Subtract.apply(6.0, 2.0), Some(4.0));
+        assert_eq!(ScopeMathOperation::Multiply.apply(6.0, 2.0), Some(12.0));
+        assert_eq!(ScopeMathOperation::Divide.apply(6.0, 2.0), Some(3.0));
+        assert_eq!(ScopeMathOperation::Divide.apply(6.0, 0.0), None);
+    }
+
+    #[test]
+    fn scope_function_sources_follow_enabled_channels() {
+        let mut settings = ScopeFunctionSettings {
+            math: ScopeMathSettings {
+                enabled: true,
+                operation: ScopeMathOperation::Subtract,
+                left_channel: 0,
+                right_channel: 0,
+            },
+            fft: ScopeFftSettings {
+                enabled: true,
+                channel: 0,
+                length: 4_096,
+            },
+        };
+
+        settings.clamp_to_channels([false, true]);
+
+        assert_eq!(settings.math.left_channel, 1);
+        assert_eq!(settings.math.right_channel, 1);
+        assert_eq!(settings.fft.channel, 1);
+    }
+
+    #[test]
+    fn scope_fft_finds_the_input_tone() {
+        let length = 1_024;
+        let tone_bin = 64;
+        let samples = (0..length)
+            .map(|index| {
+                (std::f32::consts::TAU * tone_bin as f32 * index as f32 / length as f32).sin()
+            })
+            .collect::<VecDeque<_>>();
+
+        let spectrum = scope_fft_spectrum(&samples, 0..length, length);
+        let peak_bin = spectrum
+            .iter()
+            .enumerate()
+            .skip(1)
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(bin, _)| bin)
+            .unwrap();
+
+        assert_eq!(peak_bin, tone_bin);
+        assert!((spectrum[peak_bin] + 3.0).abs() < 0.1);
     }
 
     #[test]
