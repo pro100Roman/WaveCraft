@@ -43,7 +43,20 @@ pub const DSCOPE_TRIGGER_LEVEL_MIN: u8 = 24;
 pub const DSCOPE_TRIGGER_LEVEL_CENTER: u8 = 128;
 pub const DSCOPE_TRIGGER_LEVEL_MAX: u8 = 232;
 
-pub const DSCOPE_SAMPLE_RATES_HZ: [u64; 17] = [
+pub const DSCOPE_SAMPLE_RATES_HZ: [u64; 30] = [
+    10,
+    20,
+    50,
+    100,
+    200,
+    500,
+    1_000,
+    2_000,
+    5_000,
+    10_000,
+    20_000,
+    40_000,
+    50_000,
     100_000,
     200_000,
     400_000,
@@ -1966,6 +1979,7 @@ mod tests {
 
     #[test]
     fn validates_sample_rate_against_enabled_channel_count() {
+        assert!(DsCopeCaptureConfig::new(10, MAX_DUAL_CHANNEL_SAMPLE_COUNT).is_ok());
         assert!(DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).is_ok());
         assert!(DsCopeCaptureConfig::new(500_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).is_ok());
         assert!(DsCopeCaptureConfig::new(1_000_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).is_err());

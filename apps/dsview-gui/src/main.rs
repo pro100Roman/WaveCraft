@@ -408,6 +408,21 @@ impl ScopeCaptureSettings {
         }
     }
 
+    fn sample_rate_for_timebase(self, time_per_division_seconds: f64) -> u64 {
+        if !time_per_division_seconds.is_finite() || time_per_division_seconds <= 0.0 {
+            return self.sample_rate_hz;
+        }
+        let requested_rate = self.sample_count as f64
+            / (time_per_division_seconds * SCOPE_HORIZONTAL_DIVISIONS as f64);
+        let maximum_rate = self.maximum_sample_rate_hz();
+        DSCOPE_SAMPLE_RATES_HZ
+            .iter()
+            .rev()
+            .copied()
+            .find(|rate| *rate <= maximum_rate && *rate as f64 <= requested_rate * (1.0 + 1.0e-9))
+            .unwrap_or(DSCOPE_SAMPLE_RATES_HZ[0])
+    }
+
     fn clamp_to_channel_limits(&mut self) {
         self.sample_rate_hz = self.sample_rate_hz.min(self.maximum_sample_rate_hz());
         self.sample_count = self.sample_count.min(self.maximum_sample_count());
@@ -673,7 +688,7 @@ impl WaveformViewport {
         sample_count: usize,
         sample_rate_hz: u64,
         cursor_fraction: f32,
-    ) {
+    ) -> bool {
         let cursor_fraction = cursor_fraction.clamp(0.0, 1.0);
         let sample_fraction = self.start + cursor_fraction * self.span;
         self.step_timebase_at_sample(
@@ -682,7 +697,7 @@ impl WaveformViewport {
             sample_rate_hz,
             sample_fraction,
             cursor_fraction,
-        );
+        )
     }
 
     fn sample_range(self, sample_count: usize) -> Range<usize> {
@@ -745,15 +760,15 @@ impl WaveformViewport {
         sample_rate_hz: u64,
         sample_fraction: f32,
         screen_fraction: f32,
-    ) {
+    ) -> bool {
         if scroll_delta == 0.0 {
-            return;
+            return false;
         }
         let Some(current_timebase) = self.time_per_division(sample_count, sample_rate_hz) else {
-            return;
+            return false;
         };
         let Some(timebase) = adjacent_timebase(current_timebase, scroll_delta > 0.0) else {
-            return;
+            return false;
         };
         let full_duration = sample_count as f64 / sample_rate_hz as f64;
         let minimum_span = (1.0 / sample_count as f64).min(1.0);
@@ -763,6 +778,7 @@ impl WaveformViewport {
         self.span = (timebase * SCOPE_HORIZONTAL_DIVISIONS as f64 / full_duration)
             .clamp(minimum_span, maximum_span.max(minimum_span)) as f32;
         self.align_sample_to_screen(sample_fraction, screen_fraction);
+        true
     }
 }
 
@@ -2713,6 +2729,7 @@ impl eframe::App for DsViewApp {
                 let mut scope_viewport = self.scope_viewport;
                 let mut scope_fft_viewport = self.scope_fft_viewport;
                 let mut scope_time_per_division_seconds = self.scope_time_per_division_seconds;
+                let mut scope_timebase_changed = false;
                 let mut scope_vertical_offsets = self
                     .scope_settings
                     .channels
@@ -2760,6 +2777,7 @@ impl eframe::App for DsViewApp {
                                         trigger_settings: &mut scope_trigger_settings,
                                         time_per_division_seconds:
                                             &mut scope_time_per_division_seconds,
+                                        timebase_changed: &mut scope_timebase_changed,
                                         offset_controls_enabled: frontend_controls_enabled,
                                         trigger_controls_enabled,
                                     },
@@ -2785,6 +2803,7 @@ impl eframe::App for DsViewApp {
                                 vertical_offsets: &mut scope_vertical_offsets,
                                 trigger_settings: &mut scope_trigger_settings,
                                 time_per_division_seconds: &mut scope_time_per_division_seconds,
+                                timebase_changed: &mut scope_timebase_changed,
                                 offset_controls_enabled: frontend_controls_enabled,
                                 trigger_controls_enabled,
                             },
@@ -2798,6 +2817,13 @@ impl eframe::App for DsViewApp {
                 self.scope_viewport = scope_viewport;
                 self.scope_fft_viewport = scope_fft_viewport;
                 self.scope_time_per_division_seconds = scope_time_per_division_seconds;
+                if scope_timebase_changed {
+                    if let Some(time_per_division) = scope_time_per_division_seconds {
+                        self.scope_settings.sample_rate_hz = self
+                            .scope_settings
+                            .sample_rate_for_timebase(time_per_division);
+                    }
+                }
                 for (channel, vertical_offset) in self
                     .scope_settings
                     .channels
@@ -3401,6 +3427,7 @@ struct ScopeWaveformOptions<'a> {
     vertical_offsets: &'a mut [u16; 2],
     trigger_settings: &'a mut ScopeTriggerSettings,
     time_per_division_seconds: &'a mut Option<f64>,
+    timebase_changed: &'a mut bool,
     offset_controls_enabled: bool,
     trigger_controls_enabled: bool,
 }
@@ -3746,8 +3773,9 @@ fn update_waveform_viewport(
     sample_count: usize,
     sample_rate_hz: u64,
     zoom_anchor: Option<(f32, f32)>,
-) -> bool {
+) -> (bool, bool) {
     let mut panned = false;
+    let mut timebase_changed = false;
     let response = ui.interact(
         rect,
         ui.make_persistent_id(id_salt),
@@ -3758,11 +3786,11 @@ fn update_waveform_viewport(
     } else {
         egui::CursorIcon::Grab
     };
-    let response = response
-        .on_hover_cursor(cursor)
-        .on_hover_text("Drag to pan · scroll to step timebase · double-click to reset");
+    let response = response.on_hover_cursor(cursor);
     if response.double_clicked() {
+        let previous = *viewport;
         viewport.reset();
+        timebase_changed = *viewport != previous;
     }
     if response.dragged_by(egui::PointerButton::Primary) {
         let delta_x = ui.input(|input| input.pointer.delta().x);
@@ -3777,7 +3805,7 @@ fn update_waveform_viewport(
             if let Some((sample_fraction, screen_fraction)) =
                 zoom_anchor.filter(|_| viewport.anchor_locked)
             {
-                viewport.step_timebase_at_sample(
+                timebase_changed = viewport.step_timebase_at_sample(
                     scroll_delta,
                     sample_count,
                     sample_rate_hz,
@@ -3789,7 +3817,7 @@ fn update_waveform_viewport(
                     .hover_pos()
                     .map(|pointer| (pointer.x - rect.left()) / rect.width().max(1.0))
                     .unwrap_or(0.5);
-                viewport.step_timebase(
+                timebase_changed = viewport.step_timebase(
                     scroll_delta,
                     sample_count,
                     sample_rate_hz,
@@ -3799,7 +3827,7 @@ fn update_waveform_viewport(
             ui.ctx().request_repaint();
         }
     }
-    panned
+    (panned, timebase_changed)
 }
 
 fn paint_waveform_status(
@@ -5139,6 +5167,7 @@ fn paint_scope_time_domain(
         vertical_offsets,
         trigger_settings,
         time_per_division_seconds,
+        timebase_changed,
         offset_controls_enabled,
         trigger_controls_enabled,
     } = scope_options;
@@ -5191,7 +5220,7 @@ fn paint_scope_time_domain(
     if viewport.anchor_locked {
         viewport.align_trigger_to_screen(trigger_sample_fraction, trigger_screen_fraction);
     }
-    let viewport_panned = update_waveform_viewport(
+    let (viewport_panned, viewport_timebase_changed) = update_waveform_viewport(
         ui,
         plot,
         "scope_waveform_zoom",
@@ -5200,6 +5229,7 @@ fn paint_scope_time_domain(
         display_sample_rate_hz,
         Some((trigger_sample_fraction, trigger_screen_fraction)),
     );
+    *timebase_changed |= viewport_timebase_changed;
     if viewport_panned {
         trigger_settings.position_percent =
             scope_trigger_position_in_view(trigger_sample_fraction, *viewport);
@@ -5759,7 +5789,7 @@ mod tests {
     fn waveform_zoom_preserves_the_sample_under_the_pointer() {
         let mut viewport = WaveformViewport::default();
 
-        viewport.step_timebase(1.0, 1_000_000, 1_000_000, 0.25);
+        assert!(viewport.step_timebase(1.0, 1_000_000, 1_000_000, 0.25));
 
         assert!((viewport.span - 0.5).abs() < f32::EPSILON);
         assert!((viewport.start + viewport.span * 0.25 - 0.25).abs() < 0.000_001);
@@ -5841,6 +5871,25 @@ mod tests {
         assert!((viewport.time_per_division(1_000_000, 1_000_000).unwrap() - 10.0).abs() < 0.001);
         assert!((viewport.span - 100.0).abs() < 0.001);
         assert_eq!(viewport.sample_range(1_000_000), 0..1_000_000);
+        assert!(!viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.5));
+    }
+
+    #[test]
+    fn scope_timebase_selects_the_vendor_floor_sample_rate() {
+        let mut settings = ScopeCaptureSettings::default();
+
+        assert_eq!(settings.sample_rate_for_timebase(1.0e-3), 100_000_000);
+        assert_eq!(settings.sample_rate_for_timebase(500.0e-6), 125_000_000);
+        assert_eq!(settings.sample_rate_for_timebase(200.0e-6), 500_000_000);
+        assert_eq!(settings.sample_rate_for_timebase(10.0), 10_000);
+        assert_eq!(
+            settings.sample_rate_for_timebase(f64::NAN),
+            settings.sample_rate_hz
+        );
+
+        settings.channels[1].enabled = false;
+        settings.sample_count = 2_000_000;
+        assert_eq!(settings.sample_rate_for_timebase(200.0e-6), 1_000_000_000);
     }
 
     #[test]
