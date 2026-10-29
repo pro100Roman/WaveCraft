@@ -968,6 +968,7 @@ struct DsViewApp {
     devices: Vec<DeviceEntry>,
     active_capture_settings_tab: CaptureSettingsTab,
     scope_settings: ScopeCaptureSettings,
+    scope_auto_sample_rate: bool,
     scope_function_settings: ScopeFunctionSettings,
     active_waveform_tab: Option<WaveformTab>,
     combined_logic_ratio: f32,
@@ -1002,6 +1003,7 @@ impl DsViewApp {
             devices: Vec::new(),
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
             scope_settings: ScopeCaptureSettings::default(),
+            scope_auto_sample_rate: true,
             scope_function_settings: ScopeFunctionSettings::default(),
             active_waveform_tab: None,
             combined_logic_ratio: 0.55,
@@ -2219,21 +2221,31 @@ fn paint_scope_channel_settings(
 #[derive(Clone, Copy)]
 struct CaptureSettingsAvailability {
     capture: bool,
+    sample_rate: bool,
     trigger: bool,
     channel_enable: bool,
     input_range: bool,
     manual_calibration: bool,
 }
 
+struct ScopeCaptureSettingsEditor<'a> {
+    settings: &'a mut ScopeCaptureSettings,
+    auto_sample_rate: &'a mut bool,
+}
+
 fn paint_capture_settings(
     ui: &mut egui::Ui,
     tab: CaptureSettingsTab,
-    scope_settings: &mut ScopeCaptureSettings,
+    scope_editor: ScopeCaptureSettingsEditor<'_>,
     scope_function_settings: &mut ScopeFunctionSettings,
     scope_channel_colors: &mut [Color32; 2],
     availability: CaptureSettingsAvailability,
     calibration_action: &mut Option<ScopeCalibrationAction>,
 ) {
+    let ScopeCaptureSettingsEditor {
+        settings: scope_settings,
+        auto_sample_rate: scope_auto_sample_rate,
+    } = scope_editor;
     let card_width = ui.available_width();
     egui::Frame::none()
         .fill(BACKGROUND)
@@ -2281,31 +2293,43 @@ fn paint_capture_settings(
                     if scope_settings.sample_count > maximum_sample_count {
                         scope_settings.sample_count = maximum_sample_count;
                     }
-                    ui.add_enabled_ui(availability.capture, |ui| {
-                        egui::Grid::new("dscope_common_capture_settings")
-                            .num_columns(2)
-                            .spacing([8.0, 5.0])
-                            .show(ui, |ui| {
-                                ui.label("Sample rate");
-                                egui::ComboBox::from_id_salt("scope_sample_rate")
-                                    .selected_text(format_sample_rate(
-                                        scope_settings.sample_rate_hz,
-                                    ))
-                                    .show_ui(ui, |ui| {
-                                        for rate in DSCOPE_SAMPLE_RATES_HZ
-                                            .into_iter()
-                                            .filter(|rate| *rate <= maximum_sample_rate_hz)
-                                        {
-                                            ui.selectable_value(
-                                                &mut scope_settings.sample_rate_hz,
-                                                rate,
-                                                format_sample_rate(rate),
-                                            );
-                                        }
-                                    });
-                                ui.end_row();
+                    egui::Grid::new("dscope_common_capture_settings")
+                        .num_columns(2)
+                        .spacing([8.0, 5.0])
+                        .show(ui, |ui| {
+                            ui.label("Sample rate");
+                            ui.horizontal(|ui| {
+                                ui.add_enabled_ui(
+                                    availability.sample_rate && !*scope_auto_sample_rate,
+                                    |ui| {
+                                        egui::ComboBox::from_id_salt("scope_sample_rate")
+                                            .width(100.0)
+                                            .selected_text(format_sample_rate(
+                                                scope_settings.sample_rate_hz,
+                                            ))
+                                            .show_ui(ui, |ui| {
+                                                for rate in DSCOPE_SAMPLE_RATES_HZ
+                                                    .into_iter()
+                                                    .filter(|rate| *rate <= maximum_sample_rate_hz)
+                                                {
+                                                    ui.selectable_value(
+                                                        &mut scope_settings.sample_rate_hz,
+                                                        rate,
+                                                        format_sample_rate(rate),
+                                                    );
+                                                }
+                                            });
+                                    },
+                                );
+                                ui.add_enabled(
+                                    availability.sample_rate,
+                                    egui::Checkbox::new(scope_auto_sample_rate, "Auto"),
+                                );
+                            });
+                            ui.end_row();
 
-                                ui.label("Buffer");
+                            ui.label("Buffer");
+                            ui.add_enabled_ui(availability.capture, |ui| {
                                 egui::ComboBox::from_id_salt("scope_sample_count")
                                     .selected_text(format_sample_count(scope_settings.sample_count))
                                     .show_ui(ui, |ui| {
@@ -2320,13 +2344,13 @@ fn paint_capture_settings(
                                             );
                                         }
                                     });
-                                ui.end_row();
-
-                                ui.label("Maximum");
-                                ui.monospace(format_sample_rate(maximum_sample_rate_hz));
-                                ui.end_row();
                             });
-                    });
+                            ui.end_row();
+
+                            ui.label("Maximum");
+                            ui.monospace(format_sample_rate(maximum_sample_rate_hz));
+                            ui.end_row();
+                        });
                     ui.add_space(8.0);
                     egui::CollapsingHeader::new(RichText::new("Options").strong())
                         .default_open(false)
@@ -2504,6 +2528,7 @@ impl eframe::App for DsViewApp {
             selected_scope_device,
         ) && !(self.record_capture && self.is_busy());
         let scope_settings_before_ui = self.scope_settings;
+        let scope_auto_sample_rate_before_ui = self.scope_auto_sample_rate;
         let manual_calibration_before_ui =
             self.manual_calibration.as_ref().map(|editor| editor.values);
         let manual_calibration_range_before_ui =
@@ -2613,11 +2638,15 @@ impl eframe::App for DsViewApp {
                             paint_capture_settings(
                                 ui,
                                 self.active_capture_settings_tab,
-                                &mut self.scope_settings,
+                                ScopeCaptureSettingsEditor {
+                                    settings: &mut self.scope_settings,
+                                    auto_sample_rate: &mut self.scope_auto_sample_rate,
+                                },
                                 &mut self.scope_function_settings,
                                 &mut self.scope_channel_colors,
                                 CaptureSettingsAvailability {
                                     capture: capture_settings_enabled,
+                                    sample_rate: frontend_controls_enabled,
                                     trigger: trigger_controls_enabled,
                                     channel_enable: frontend_controls_enabled,
                                     input_range: frontend_controls_enabled,
@@ -2817,7 +2846,12 @@ impl eframe::App for DsViewApp {
                 self.scope_viewport = scope_viewport;
                 self.scope_fft_viewport = scope_fft_viewport;
                 self.scope_time_per_division_seconds = scope_time_per_division_seconds;
-                if scope_timebase_changed {
+                let automatic_sample_rate_inputs_changed = scope_timebase_changed
+                    || (!scope_auto_sample_rate_before_ui && self.scope_auto_sample_rate)
+                    || self.scope_settings.sample_count != scope_settings_before_ui.sample_count
+                    || self.scope_settings.enabled_channel_count()
+                        != scope_settings_before_ui.enabled_channel_count();
+                if self.scope_auto_sample_rate && automatic_sample_rate_inputs_changed {
                     if let Some(time_per_division) = scope_time_per_division_seconds {
                         self.scope_settings.sample_rate_hz = self
                             .scope_settings
