@@ -72,7 +72,7 @@ pub struct DsCopeCalibrationValues {
     preoffsets: [[u16; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
     vga_gains: [[u16; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
     vpos_trans: [u16; CHANNEL_COUNT],
-    comb_comp: [u8; CHANNEL_COUNT],
+    comb_comp: [i8; CHANNEL_COUNT],
     fine_gain_codes: [[u8; 4]; CHANNEL_COUNT],
     comb_fine_gain_codes: [[u8; 4]; CHANNEL_COUNT],
 }
@@ -105,6 +105,10 @@ impl DsCopeCalibrationValues {
             .get(channel)
             .and_then(|values| values.get(range))
             .copied()
+    }
+
+    pub fn comb_comp(self, channel: usize) -> Option<i8> {
+        self.comb_comp.get(channel).copied()
     }
 
     pub fn set_preoffset(
@@ -144,6 +148,20 @@ impl DsCopeCalibrationValues {
             .and_then(|values| values.get_mut(range))
             .ok_or_else(|| CaptureError::new("DSCope calibration selection is out of range"))?;
         *destination = value;
+        Ok(())
+    }
+
+    pub fn set_comb_comp(&mut self, channel: usize, value: i16) -> Result<(), CaptureError> {
+        if !(-127..=127).contains(&value) {
+            return Err(CaptureError::new(format!(
+                "DSCope calibration VCOMB must be between -127 and 127; got {value}"
+            )));
+        }
+        let destination = self
+            .comb_comp
+            .get_mut(channel)
+            .ok_or_else(|| CaptureError::new("DSCope calibration channel is out of range"))?;
+        *destination = value as i8;
         Ok(())
     }
 }
@@ -674,13 +692,28 @@ fn validate_trigger_channels(
 pub struct DsCopeCaptureSource {
     device: DiscoveredDevice,
     config: DsCopeCaptureConfig,
+    calibration_values: Option<DsCopeCalibrationValues>,
     descriptor: DeviceDescriptor,
     runtime_trigger_receiver: Option<Receiver<DsCopeTriggerConfig>>,
+    runtime_calibration_receiver: Option<Receiver<DsCopeCalibrationValues>>,
 }
 
 #[derive(Clone)]
 pub struct DsCopeRuntimeTriggerControl {
     sender: Sender<DsCopeTriggerConfig>,
+}
+
+#[derive(Clone)]
+pub struct DsCopeRuntimeCalibrationControl {
+    sender: Sender<DsCopeCalibrationValues>,
+}
+
+impl DsCopeRuntimeCalibrationControl {
+    pub fn update(&self, values: DsCopeCalibrationValues) -> Result<(), CaptureError> {
+        self.sender
+            .send(values)
+            .map_err(|_| CaptureError::new("DSCope capture is no longer running"))
+    }
 }
 
 impl DsCopeRuntimeTriggerControl {
@@ -705,7 +738,7 @@ pub fn apply_dscope_configuration(
     let configuration_result = (|| {
         validate_device_ready(&session)?;
         session.stop_capture().map_err(capture_error)?;
-        configure_frontend(&session, config).map(|_| ())
+        configure_frontend(&session, config, None).map(|_| ())
     })();
     let close_result = session.close().map_err(capture_error);
     combine_results(
@@ -784,7 +817,7 @@ pub fn auto_calibrate_dscope(device: &DiscoveredDevice) -> Result<(), CaptureErr
 
             let mut converged = false;
             for _ in 0..MAX_ADJUSTMENTS_PER_RANGE {
-                let calibration = DsCopeCalibration::from_values(values, range);
+                let calibration = DsCopeCalibration::from_values(values, [range; CHANNEL_COUNT]);
                 configure_adc_fine_gains(&session, config, calibration)?;
                 configure_scope(&session, config, calibration)?;
                 session
@@ -872,7 +905,7 @@ fn read_calibration_values(
             values.vga_gains[channel][range] = (calibration.vga_gain >> 8) as u16;
         }
         values.vpos_trans[channel] = read_u16(&zero_record, CALIBRATION_VPOS_TRANS_OFFSET);
-        values.comb_comp[channel] = zero_record[CALIBRATION_COMB_COMP_OFFSET];
+        values.comb_comp[channel] = zero_record[CALIBRATION_COMB_COMP_OFFSET] as i8;
         values.fine_gain_codes[channel].copy_from_slice(
             &zero_record[CALIBRATION_FINE_GAIN_OFFSET..CALIBRATION_COMB_FINE_GAIN_OFFSET],
         );
@@ -915,6 +948,7 @@ fn write_calibration_values(
             vga_record[offset..offset + 2]
                 .copy_from_slice(&values.vga_gains[channel][range].to_le_bytes());
         }
+        zero_record[CALIBRATION_COMB_COMP_OFFSET] = values.comb_comp[channel] as u8;
         records.push((zero_record, vga_record));
     }
 
@@ -967,9 +1001,16 @@ impl DsCopeCaptureSource {
         Ok(Self {
             device,
             config,
+            calibration_values: None,
             descriptor,
             runtime_trigger_receiver: None,
+            runtime_calibration_receiver: None,
         })
+    }
+
+    pub fn with_calibration_values(mut self, values: DsCopeCalibrationValues) -> Self {
+        self.calibration_values = Some(values);
+        self
     }
 
     pub fn with_runtime_trigger_control(
@@ -980,6 +1021,12 @@ impl DsCopeCaptureSource {
         let (sender, receiver) = mpsc::channel();
         source.runtime_trigger_receiver = Some(receiver);
         Ok((source, DsCopeRuntimeTriggerControl { sender }))
+    }
+
+    pub fn with_runtime_calibration_control(mut self) -> (Self, DsCopeRuntimeCalibrationControl) {
+        let (sender, receiver) = mpsc::channel();
+        self.runtime_calibration_receiver = Some(receiver);
+        (self, DsCopeRuntimeCalibrationControl { sender })
     }
 }
 
@@ -993,8 +1040,10 @@ impl CaptureSource for DsCopeCaptureSource {
         let capture_result = run_capture(
             &session,
             self.config,
+            self.calibration_values,
             &context,
             self.runtime_trigger_receiver.as_ref(),
+            self.runtime_calibration_receiver.as_ref(),
         );
         let close_result = session.close().map_err(capture_error);
         combine_results(capture_result, close_result, "release the USB interface")
@@ -1004,13 +1053,15 @@ impl CaptureSource for DsCopeCaptureSource {
 fn run_capture(
     session: &UsbDeviceSession,
     mut config: DsCopeCaptureConfig,
+    calibration_values: Option<DsCopeCalibrationValues>,
     context: &CaptureContext,
     runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
+    runtime_calibration_receiver: Option<&Receiver<DsCopeCalibrationValues>>,
 ) -> Result<(), CaptureError> {
     validate_device_ready(session)?;
     session.stop_capture().map_err(capture_error)?;
     let capture_result = (|| {
-        let calibration = configure_frontend(session, config)?;
+        let mut calibration = configure_frontend(session, config, calibration_values)?;
         session
             .arm_capture(&config.encode_settings())
             .map_err(capture_error)?;
@@ -1018,9 +1069,10 @@ fn run_capture(
         let Some(capture) = read_prequeued_capture(
             session,
             &mut config,
-            calibration,
+            &mut calibration,
             context,
             runtime_trigger_receiver,
+            runtime_calibration_receiver,
         )?
         else {
             return Ok(());
@@ -1038,6 +1090,7 @@ fn run_capture(
 fn configure_frontend(
     session: &UsbDeviceSession,
     config: DsCopeCaptureConfig,
+    calibration_values: Option<DsCopeCalibrationValues>,
 ) -> Result<DsCopeCalibration, CaptureError> {
     let enabled_channels = config.channels.map(|channel| channel.enabled);
     session
@@ -1046,7 +1099,13 @@ fn configure_frontend(
     session
         .set_dscope_bandwidth_limit(config.bandwidth_limit)
         .map_err(capture_error)?;
-    let calibration = DsCopeCalibration::load(session, config)?;
+    let calibration = match calibration_values {
+        Some(values) => DsCopeCalibration::from_values(
+            values,
+            config.channels.map(DsCopeChannelConfig::calibration_index),
+        ),
+        None => DsCopeCalibration::load(session, config)?,
+    };
     configure_adc_fine_gains(session, config, calibration)?;
     session
         .configure_dscope_channels(enabled_channels)
@@ -1150,11 +1209,11 @@ fn dso_commands(config: DsCopeCaptureConfig, calibration: DsCopeCalibration) -> 
 
 fn vga_command(command: u64, calibration: DsCopeChannelCalibration, single_channel: bool) -> u64 {
     let interleaving_compensation = if single_channel {
-        u64::from(calibration.comb_comp) << 8
+        i64::from(calibration.comb_comp) << 8
     } else {
         0
     };
-    command + u64::from(calibration.vga_gain) + interleaving_compensation
+    (command + u64::from(calibration.vga_gain)).wrapping_add_signed(interleaving_compensation)
 }
 
 fn coupling_command(config: DsCopeCaptureConfig, channel: usize, coupling: DsCopeCoupling) -> u64 {
@@ -1190,7 +1249,7 @@ struct DsCopeChannelCalibration {
     preoffset: u16,
     vga_gain: u32,
     vpos_trans: u16,
-    comb_comp: u8,
+    comb_comp: i8,
     fine_gain_codes: [u8; 4],
     comb_fine_gain_codes: [u8; 4],
 }
@@ -1231,11 +1290,11 @@ impl DsCopeCalibration {
         Ok(Self { channels })
     }
 
-    fn from_values(values: DsCopeCalibrationValues, range: usize) -> Self {
+    fn from_values(values: DsCopeCalibrationValues, ranges: [usize; CHANNEL_COUNT]) -> Self {
         Self {
             channels: std::array::from_fn(|channel| DsCopeChannelCalibration {
-                preoffset: values.preoffsets[channel][range],
-                vga_gain: u32::from(values.vga_gains[channel][range]) << 8,
+                preoffset: values.preoffsets[channel][ranges[channel]],
+                vga_gain: u32::from(values.vga_gains[channel][ranges[channel]]) << 8,
                 vpos_trans: values.vpos_trans[channel],
                 comb_comp: values.comb_comp[channel],
                 fine_gain_codes: values.fine_gain_codes[channel],
@@ -1383,7 +1442,7 @@ fn parse_channel_calibration(
     let preoffset = read_u16(zero_record, table_offset);
     let vga_gain = u32::from(read_u16(vga_record, table_offset)) << 8;
     let vpos_trans = read_u16(zero_record, CALIBRATION_VPOS_TRANS_OFFSET);
-    let comb_comp = zero_record[CALIBRATION_COMB_COMP_OFFSET];
+    let comb_comp = zero_record[CALIBRATION_COMB_COMP_OFFSET] as i8;
     let fine_gain_codes = zero_record
         [CALIBRATION_FINE_GAIN_OFFSET..CALIBRATION_COMB_FINE_GAIN_OFFSET]
         .try_into()
@@ -1422,9 +1481,10 @@ struct RawScopeCapture {
 fn read_prequeued_capture(
     session: &UsbDeviceSession,
     config: &mut DsCopeCaptureConfig,
-    calibration: DsCopeCalibration,
+    calibration: &mut DsCopeCalibration,
     context: &CaptureContext,
     runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
+    runtime_calibration_receiver: Option<&Receiver<DsCopeCalibrationValues>>,
 ) -> Result<Option<RawScopeCapture>, CaptureError> {
     let payload_bytes = usize::try_from(config.armed_sample_count())
         .ok()
@@ -1461,7 +1521,13 @@ fn read_prequeued_capture(
 
     let mut cancelled = false;
     while !header_read.is_complete() || !payload_read.is_complete() {
-        apply_pending_runtime_trigger(session, config, calibration, runtime_trigger_receiver)?;
+        apply_pending_runtime_controls(
+            session,
+            config,
+            calibration,
+            runtime_trigger_receiver,
+            runtime_calibration_receiver,
+        )?;
         if !cancelled && context.is_cancelled() {
             cancelled = true;
             let _ = session.force_capture_ready();
@@ -1495,7 +1561,13 @@ fn read_prequeued_capture(
     // There is intentionally no acquisition deadline: an armed oscilloscope
     // waits for its trigger until the caller explicitly stops the capture.
     loop {
-        apply_pending_runtime_trigger(session, config, calibration, runtime_trigger_receiver)?;
+        apply_pending_runtime_controls(
+            session,
+            config,
+            calibration,
+            runtime_trigger_receiver,
+            runtime_calibration_receiver,
+        )?;
         let footer = &payload[payload_bytes - MEASUREMENT_FOOTER_BYTES..];
         if ScopeMeasurement::is_ready(footer, *config) {
             return Ok(Some(RawScopeCapture {
@@ -1513,7 +1585,13 @@ fn read_prequeued_capture(
             .queue_bulk_read(payload_bytes)
             .map_err(capture_error)?;
         while !next_payload_read.is_complete() {
-            apply_pending_runtime_trigger(session, config, calibration, runtime_trigger_receiver)?;
+            apply_pending_runtime_controls(
+                session,
+                config,
+                calibration,
+                runtime_trigger_receiver,
+                runtime_calibration_receiver,
+            )?;
             if context.is_cancelled() {
                 let _ = session.force_capture_ready();
                 next_payload_read.cancel().map_err(capture_error)?;
@@ -1546,6 +1624,18 @@ fn latest_runtime_trigger(receiver: &Receiver<DsCopeTriggerConfig>) -> Option<Ds
     }
 }
 
+fn latest_runtime_calibration(
+    receiver: &Receiver<DsCopeCalibrationValues>,
+) -> Option<DsCopeCalibrationValues> {
+    let mut latest = None;
+    loop {
+        match receiver.try_recv() {
+            Ok(values) => latest = Some(values),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return latest,
+        }
+    }
+}
+
 fn apply_runtime_trigger(
     session: &UsbDeviceSession,
     config: DsCopeCaptureConfig,
@@ -1562,16 +1652,38 @@ fn apply_runtime_trigger(
     Ok(updated)
 }
 
-fn apply_pending_runtime_trigger(
+fn apply_runtime_calibration(
+    session: &UsbDeviceSession,
+    config: DsCopeCaptureConfig,
+    values: DsCopeCalibrationValues,
+) -> Result<DsCopeCalibration, CaptureError> {
+    let ranges = config.channels.map(DsCopeChannelConfig::calibration_index);
+    for (channel, range) in ranges.into_iter().enumerate() {
+        values.settable_value(channel, range)?;
+    }
+    let calibration = DsCopeCalibration::from_values(values, ranges);
+    let commands = dso_commands(config, calibration);
+    for index in [3, 4, 5, 6] {
+        session
+            .write_dso_command(commands[index])
+            .map_err(capture_error)?;
+    }
+    Ok(calibration)
+}
+
+fn apply_pending_runtime_controls(
     session: &UsbDeviceSession,
     config: &mut DsCopeCaptureConfig,
-    calibration: DsCopeCalibration,
-    receiver: Option<&Receiver<DsCopeTriggerConfig>>,
+    calibration: &mut DsCopeCalibration,
+    trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
+    calibration_receiver: Option<&Receiver<DsCopeCalibrationValues>>,
 ) -> Result<(), CaptureError> {
-    let Some(trigger) = receiver.and_then(latest_runtime_trigger) else {
-        return Ok(());
-    };
-    *config = apply_runtime_trigger(session, *config, calibration, trigger)?;
+    if let Some(values) = calibration_receiver.and_then(latest_runtime_calibration) {
+        *calibration = apply_runtime_calibration(session, *config, values)?;
+    }
+    if let Some(trigger) = trigger_receiver.and_then(latest_runtime_trigger) {
+        *config = apply_runtime_trigger(session, *config, *calibration, trigger)?;
+    }
     Ok(())
 }
 
@@ -1830,6 +1942,29 @@ mod tests {
     }
 
     #[test]
+    fn runtime_calibration_queue_coalesces_to_the_latest_values() {
+        let (sender, receiver) = mpsc::channel();
+        let first = DsCopeCalibrationValues {
+            preoffsets: [[60; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+            vga_gains: [[0x069d; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+            vpos_trans: [780; CHANNEL_COUNT],
+            comb_comp: [0; CHANNEL_COUNT],
+            fine_gain_codes: [[0; 4]; CHANNEL_COUNT],
+            comb_fine_gain_codes: [[0; 4]; CHANNEL_COUNT],
+        };
+        let mut latest = first;
+        latest.set_preoffset(0, 0, 123).unwrap();
+        latest.set_vga_gain(1, 0, 0x06a1).unwrap();
+        latest.set_comb_comp(1, -9).unwrap();
+
+        sender.send(first).unwrap();
+        sender.send(latest).unwrap();
+
+        assert_eq!(latest_runtime_calibration(&receiver), Some(latest));
+        assert_eq!(latest_runtime_calibration(&receiver), None);
+    }
+
+    #[test]
     fn validates_sample_rate_against_enabled_channel_count() {
         assert!(DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).is_ok());
         assert!(DsCopeCaptureConfig::new(500_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).is_ok());
@@ -1897,11 +2032,41 @@ mod tests {
 
         values.set_preoffset(1, 7, 1_023).unwrap();
         values.set_vga_gain(1, 7, 0x1fff).unwrap();
+        values.set_comb_comp(1, -127).unwrap();
         assert_eq!(values.preoffset(1, 7), Some(1_023));
         assert_eq!(values.vga_gain(1, 7), Some(0x1fff));
+        assert_eq!(values.comb_comp(1), Some(-127));
         assert!(values.set_preoffset(0, 0, 1_024).is_err());
         assert!(values.set_vga_gain(0, 0, 0).is_err());
+        assert!(values.set_comb_comp(0, -128).is_err());
+        assert!(values.set_comb_comp(0, 128).is_err());
         assert!(values.set_preoffset(2, 0, 1).is_err());
+        assert!(values.set_comb_comp(2, 0).is_err());
+    }
+
+    #[test]
+    fn builds_runtime_calibration_from_each_channels_active_range() {
+        let mut values = DsCopeCalibrationValues {
+            preoffsets: [[60; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+            vga_gains: [[0x100; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+            vpos_trans: [780, 781],
+            comb_comp: [-9, 13],
+            fine_gain_codes: [[1; 4], [2; 4]],
+            comb_fine_gain_codes: [[3; 4], [4; 4]],
+        };
+        values.set_preoffset(0, 1, 71).unwrap();
+        values.set_vga_gain(0, 1, 0x06a1).unwrap();
+        values.set_preoffset(1, 6, 83).unwrap();
+        values.set_vga_gain(1, 6, 0x0697).unwrap();
+
+        let calibration = DsCopeCalibration::from_values(values, [1, 6]);
+
+        assert_eq!(calibration.channels[0].preoffset, 71);
+        assert_eq!(calibration.channels[0].vga_gain, 0x0006_a100);
+        assert_eq!(calibration.channels[0].comb_comp, -9);
+        assert_eq!(calibration.channels[1].preoffset, 83);
+        assert_eq!(calibration.channels[1].vga_gain, 0x0006_9700);
+        assert_eq!(calibration.channels[1].comb_comp, 13);
     }
 
     #[test]
@@ -2159,7 +2324,7 @@ mod tests {
                     preoffset: 60,
                     vga_gain: 0x0006_a100,
                     vpos_trans: OFFSET_PWM_SPAN as u16,
-                    comb_comp: 13,
+                    comb_comp: -13,
                     fine_gain_codes: [0; 4],
                     comb_fine_gain_codes: [0; 4],
                 },
@@ -2193,7 +2358,7 @@ mod tests {
         assert_eq!(dual_commands[3], 0x0006_9d08);
         assert_eq!(dual_commands[4], 0x0006_a188);
         assert_eq!(channel_zero_commands[3], 0x0006_a608);
-        assert_eq!(channel_one_commands[4], 0x0006_ae88);
+        assert_eq!(channel_one_commands[4], 0x0006_9488);
     }
 
     #[test]
@@ -2215,7 +2380,7 @@ mod tests {
         zero_record[13..15].copy_from_slice(&73_u16.to_le_bytes());
         zero_record[CALIBRATION_VPOS_TRANS_OFFSET..CALIBRATION_VPOS_TRANS_OFFSET + 2]
             .copy_from_slice(&812_u16.to_le_bytes());
-        zero_record[CALIBRATION_COMB_COMP_OFFSET] = 9;
+        zero_record[CALIBRATION_COMB_COMP_OFFSET] = (-9_i8) as u8;
         zero_record[CALIBRATION_FINE_GAIN_OFFSET..CALIBRATION_COMB_FINE_GAIN_OFFSET]
             .copy_from_slice(&[1, 2, 3, 4]);
         zero_record[CALIBRATION_COMB_FINE_GAIN_OFFSET..CALIBRATION_ZERO_BYTES]
@@ -2227,7 +2392,7 @@ mod tests {
         assert_eq!(calibration.preoffset, 73);
         assert_eq!(calibration.vga_gain, 0x0006_a100);
         assert_eq!(calibration.vpos_trans, 812);
-        assert_eq!(calibration.comb_comp, 9);
+        assert_eq!(calibration.comb_comp, -9);
         assert_eq!(calibration.fine_gain_codes, [1, 2, 3, 4]);
         assert_eq!(calibration.comb_fine_gain_codes, [5, 6, 7, 8]);
         assert_eq!(

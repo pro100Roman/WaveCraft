@@ -9,13 +9,14 @@ use dsview_usb::{
     apply_dscope_configuration, auto_calibrate_dscope, discover_supported_devices, prepare_device,
     read_dscope_calibration, write_dscope_calibration, DeviceModel, DiscoveredDevice,
     DsCopeBandwidthLimit, DsCopeCalibrationValues, DsCopeCaptureConfig, DsCopeCaptureSource,
-    DsCopeChannelConfig, DsCopeCoupling, DsCopeOperationMode, DsCopeRuntimeTriggerControl,
-    DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig,
-    DsLogicCaptureSource, LinkStatus, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
-    DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
-    DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
-    DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
-    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
+    DsCopeChannelConfig, DsCopeCoupling, DsCopeOperationMode, DsCopeRuntimeCalibrationControl,
+    DsCopeRuntimeTriggerControl, DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource,
+    DsLogicCaptureConfig, DsLogicCaptureSource, LinkStatus, DSCOPE_SAMPLE_COUNTS,
+    DSCOPE_SAMPLE_RATES_HZ, DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_MAX,
+    DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
+    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
+    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
+    DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -621,6 +622,18 @@ fn scope_frontend_controls_are_enabled(
     !background_operation_pending || (capture_run_requested && selected_scope_device)
 }
 
+fn manual_calibration_control_is_enabled(
+    background_operation_pending: bool,
+    selected_scope_device: bool,
+    editor_open: bool,
+    active_mode: Option<AcquisitionMode>,
+) -> bool {
+    !background_operation_pending
+        && selected_scope_device
+        && !editor_open
+        && active_mode.map_or(true, AcquisitionMode::runs_continuously)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct WaveformViewport {
     start: f32,
@@ -897,6 +910,7 @@ struct ActiveCapture {
     preserve_display_until_complete: bool,
     scope_config: DsCopeCaptureConfig,
     scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
+    scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
     stopped: HashSet<DeviceId>,
     waveforms: WaveformStore,
     recorder: Option<FileRecorder>,
@@ -915,6 +929,7 @@ enum WorkerSuccess {
         mode: AcquisitionMode,
         scope_config: DsCopeCaptureConfig,
         scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
+        scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
     },
     ScopeConfigured(usize),
     ScopeAutoCalibrated,
@@ -929,6 +944,8 @@ struct DsViewApp {
     settings_open: bool,
     auto_calibration_confirmation_open: bool,
     manual_calibration: Option<ManualCalibrationEditor>,
+    manual_calibration_load_requested: bool,
+    manual_calibration_save_requested: Option<DsCopeCalibrationValues>,
     record_capture: bool,
     recording_path: String,
     capture_run_requested: bool,
@@ -961,6 +978,8 @@ impl DsViewApp {
             settings_open: false,
             auto_calibration_confirmation_open: false,
             manual_calibration: None,
+            manual_calibration_load_requested: false,
+            manual_calibration_save_requested: None,
             record_capture: false,
             recording_path: "capture.dsv".to_owned(),
             capture_run_requested: false,
@@ -1042,6 +1061,7 @@ impl DsViewApp {
                 return;
             }
         };
+        let calibration_values = self.manual_calibration.as_ref().map(|editor| editor.values);
 
         self.capture_run_requested = true;
         let resource_directory = PathBuf::from(self.resource_directory.trim());
@@ -1057,13 +1077,18 @@ impl DsViewApp {
         };
         self.last_error = None;
         thread::spawn(move || {
-            let result = start_capture(devices, &resource_directory, scope_config).map(|started| {
-                WorkerSuccess::Capture {
-                    session: started.session,
-                    mode,
-                    scope_config,
-                    scope_trigger_controls: started.scope_trigger_controls,
-                }
+            let result = start_capture(
+                devices,
+                &resource_directory,
+                scope_config,
+                calibration_values,
+            )
+            .map(|started| WorkerSuccess::Capture {
+                session: started.session,
+                mode,
+                scope_config,
+                scope_trigger_controls: started.scope_trigger_controls,
+                scope_calibration_controls: started.scope_calibration_controls,
             });
             let _ = sender.send(result);
         });
@@ -1188,6 +1213,24 @@ impl DsViewApp {
         });
     }
 
+    fn request_manual_calibration(&mut self) {
+        if self.pending.is_some() || self.manual_calibration.is_some() {
+            return;
+        }
+        if let Some(active) = self.capture.as_ref() {
+            if active.mode != AcquisitionMode::Run {
+                return;
+            }
+            self.manual_calibration_load_requested = true;
+            self.scope_capture_restart_requested = false;
+            active.session.request_stop();
+            self.status = "Loading calibration while continuous acquisition pauses…".to_owned();
+            self.last_error = None;
+        } else {
+            self.begin_manual_calibration();
+        }
+    }
+
     fn begin_save_manual_calibration(&mut self, values: DsCopeCalibrationValues) {
         if self.is_busy() {
             return;
@@ -1219,6 +1262,21 @@ impl DsViewApp {
             })();
             let _ = sender.send(result);
         });
+    }
+
+    fn request_save_manual_calibration(&mut self, values: DsCopeCalibrationValues) {
+        if self.pending.is_some() {
+            return;
+        }
+        if let Some(active) = self.capture.as_ref() {
+            self.manual_calibration_save_requested = Some(values);
+            self.scope_capture_restart_requested = false;
+            active.session.request_stop();
+            self.status = "Pausing acquisition to save calibration…".to_owned();
+            self.last_error = None;
+        } else {
+            self.begin_save_manual_calibration(values);
+        }
     }
 
     fn stop_capture(&mut self) {
@@ -1292,6 +1350,7 @@ impl DsViewApp {
                 mode,
                 mut scope_config,
                 scope_trigger_controls,
+                scope_calibration_controls,
             }) => {
                 if !self.capture_run_requested {
                     match session.stop() {
@@ -1391,6 +1450,7 @@ impl DsViewApp {
                     preserve_display_until_complete,
                     scope_config,
                     scope_trigger_controls,
+                    scope_calibration_controls,
                     stopped: HashSet::new(),
                     waveforms,
                     recorder,
@@ -1427,12 +1487,25 @@ impl DsViewApp {
                 self.status = "DSCope auto calibration completed and verified".to_owned();
             }
             Ok(WorkerSuccess::ScopeCalibrationLoaded(values)) => {
-                self.manual_calibration = Some(ManualCalibrationEditor { values, range: 0 });
+                let range = DSCOPE_VOLTS_PER_DIV_MV
+                    .iter()
+                    .position(|value| *value == self.scope_settings.channels[0].volts_per_div_mv)
+                    .unwrap_or(0);
+                for channel in &mut self.scope_settings.channels {
+                    channel.volts_per_div_mv = DSCOPE_VOLTS_PER_DIV_MV[range];
+                }
+                self.manual_calibration = Some(ManualCalibrationEditor { values, range });
                 self.status = "Loaded DSCope calibration values".to_owned();
+                if self.capture_run_requested {
+                    self.begin_capture(AcquisitionMode::Run);
+                }
             }
             Ok(WorkerSuccess::ScopeCalibrationSaved) => {
                 self.manual_calibration = None;
                 self.status = "DSCope manual calibration saved and verified".to_owned();
+                if self.capture_run_requested {
+                    self.begin_capture(AcquisitionMode::Run);
+                }
             }
             Err(error) => self.set_error(error),
         }
@@ -1531,6 +1604,17 @@ impl DsViewApp {
                         waveforms: active.waveforms,
                     });
                 }
+                if error.is_none() && self.manual_calibration_load_requested {
+                    self.manual_calibration_load_requested = false;
+                    self.begin_manual_calibration();
+                    return;
+                }
+                if error.is_none() {
+                    if let Some(values) = self.manual_calibration_save_requested.take() {
+                        self.begin_save_manual_calibration(values);
+                        return;
+                    }
+                }
                 let repeat = error.is_none()
                     && (restart_for_frontend
                         || should_rearm_acquisition(
@@ -1561,6 +1645,8 @@ impl DsViewApp {
     fn set_error(&mut self, error: String) {
         self.capture_run_requested = false;
         self.scope_capture_restart_requested = false;
+        self.manual_calibration_load_requested = false;
+        self.manual_calibration_save_requested = None;
         self.status = "Operation failed".to_owned();
         self.last_error = Some(error);
     }
@@ -2120,6 +2206,7 @@ struct CaptureSettingsAvailability {
     trigger: bool,
     channel_enable: bool,
     input_range: bool,
+    manual_calibration: bool,
 }
 
 fn paint_capture_settings(
@@ -2275,16 +2362,25 @@ fn paint_capture_settings(
                                             });
                                         ui.end_row();
                                     });
-                                ui.add_space(6.0);
-                                ui.label(RichText::new("Calibration").color(TEXT_MUTED));
-                                ui.horizontal(|ui| {
-                                    if ui.button("Auto…").clicked() {
-                                        *calibration_action = Some(ScopeCalibrationAction::Auto);
-                                    }
-                                    if ui.button("Manual…").clicked() {
-                                        *calibration_action = Some(ScopeCalibrationAction::Manual);
-                                    }
-                                });
+                            });
+                            ui.add_space(6.0);
+                            ui.label(RichText::new("Calibration").color(TEXT_MUTED));
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(availability.capture, egui::Button::new("Auto…"))
+                                    .clicked()
+                                {
+                                    *calibration_action = Some(ScopeCalibrationAction::Auto);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        availability.manual_calibration,
+                                        egui::Button::new("Manual…"),
+                                    )
+                                    .clicked()
+                                {
+                                    *calibration_action = Some(ScopeCalibrationAction::Manual);
+                                }
                             });
                         });
                     ui.add_space(8.0);
@@ -2372,6 +2468,12 @@ impl eframe::App for DsViewApp {
             .devices
             .iter()
             .any(|entry| entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100);
+        let manual_calibration_enabled = manual_calibration_control_is_enabled(
+            self.pending.is_some(),
+            selected_scope_device,
+            self.manual_calibration.is_some(),
+            self.capture.as_ref().map(|active| active.mode),
+        );
         let trigger_controls_enabled = scope_trigger_controls_are_enabled(
             self.pending.is_some(),
             self.capture_run_requested,
@@ -2386,6 +2488,10 @@ impl eframe::App for DsViewApp {
             selected_scope_device,
         ) && !(self.record_capture && self.is_busy());
         let scope_settings_before_ui = self.scope_settings;
+        let manual_calibration_before_ui =
+            self.manual_calibration.as_ref().map(|editor| editor.values);
+        let manual_calibration_range_before_ui =
+            self.manual_calibration.as_ref().map(|editor| editor.range);
 
         egui::TopBottomPanel::top("toolbar")
             .frame(
@@ -2499,6 +2605,7 @@ impl eframe::App for DsViewApp {
                                     trigger: trigger_controls_enabled,
                                     channel_enable: frontend_controls_enabled,
                                     input_range: frontend_controls_enabled,
+                                    manual_calibration: manual_calibration_enabled,
                                 },
                                 &mut calibration_action,
                             );
@@ -2820,6 +2927,7 @@ impl eframe::App for DsViewApp {
 
         let mut save_manual_values = None;
         let mut close_manual = false;
+        let manual_calibration_actions_enabled = self.pending.is_none();
         if let Some(editor) = self.manual_calibration.as_mut() {
             let mut manual_open = true;
             egui::Window::new("DSCope Manual Calibration")
@@ -2829,7 +2937,7 @@ impl eframe::App for DsViewApp {
                 .default_width(430.0)
                 .show(context, |ui| {
                     ui.label(
-                        "Adjust the stored offset and VGA gain for one input range. Changes reach device NVM only after Save.",
+                        "Adjust VGAIN and VOFF for the selected input range. VCOMB is shared by all ranges of a channel. Active acquisition previews edits; device NVM changes only after Save.",
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -2855,22 +2963,12 @@ impl eframe::App for DsViewApp {
                     for channel in 0..2 {
                         ui.group(|ui| {
                             ui.label(RichText::new(format!("CH{channel}")).strong());
-                            let mut offset = editor
-                                .values
-                                .preoffset(channel, editor.range)
-                                .expect("manual calibration selection is valid");
-                            ui.horizontal(|ui| {
-                                ui.label("Offset");
-                                ui.add(egui::Slider::new(&mut offset, 0..=1_023));
-                            });
-                            let _ = editor.values.set_preoffset(channel, editor.range, offset);
-
                             let mut gain = editor
                                 .values
                                 .vga_gain(channel, editor.range)
                                 .expect("manual calibration selection is valid");
                             ui.horizontal(|ui| {
-                                ui.label("VGA gain");
+                                ui.label("VGAIN");
                                 ui.add(
                                     egui::DragValue::new(&mut gain)
                                         .range(1..=0x1fff)
@@ -2878,6 +2976,28 @@ impl eframe::App for DsViewApp {
                                 );
                             });
                             let _ = editor.values.set_vga_gain(channel, editor.range, gain);
+
+                            let mut offset = editor
+                                .values
+                                .preoffset(channel, editor.range)
+                                .expect("manual calibration selection is valid");
+                            ui.horizontal(|ui| {
+                                ui.label("VOFF");
+                                ui.add(egui::Slider::new(&mut offset, 0..=1_023));
+                            });
+                            let _ = editor.values.set_preoffset(channel, editor.range, offset);
+
+                            let mut comb = i16::from(
+                                editor
+                                    .values
+                                    .comb_comp(channel)
+                                    .expect("manual calibration channel is valid"),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label("VCOMB");
+                                ui.add(egui::Slider::new(&mut comb, -127..=127));
+                            });
+                            let _ = editor.values.set_comb_comp(channel, comb);
                         });
                         ui.add_space(6.0);
                     }
@@ -2892,7 +3012,13 @@ impl eframe::App for DsViewApp {
                         if ui.button("Cancel").clicked() {
                             close_manual = true;
                         }
-                        if ui.button("Save to device").clicked() {
+                        if ui
+                            .add_enabled(
+                                manual_calibration_actions_enabled,
+                                egui::Button::new("Save to device"),
+                            )
+                            .clicked()
+                        {
                             save_manual_values = Some(editor.values);
                         }
                     });
@@ -2925,15 +3051,28 @@ impl eframe::App for DsViewApp {
             Some(ScopeCalibrationAction::Auto) => {
                 self.auto_calibration_confirmation_open = true;
             }
-            Some(ScopeCalibrationAction::Manual) => self.begin_manual_calibration(),
+            Some(ScopeCalibrationAction::Manual) => self.request_manual_calibration(),
             None => {}
         }
         if auto_confirmed {
             self.begin_auto_calibration();
         }
         if let Some(values) = save_manual_values {
-            self.begin_save_manual_calibration(values);
+            self.request_save_manual_calibration(values);
         }
+        let manual_calibration_range_after_ui =
+            self.manual_calibration.as_ref().map(|editor| editor.range);
+        if manual_calibration_range_after_ui != manual_calibration_range_before_ui {
+            if let Some(range) = manual_calibration_range_after_ui {
+                let volts_per_div_mv = DSCOPE_VOLTS_PER_DIV_MV[range];
+                for channel in &mut self.scope_settings.channels {
+                    channel.volts_per_div_mv = volts_per_div_mv;
+                }
+            }
+        }
+        let manual_calibration_changed =
+            self.manual_calibration.as_ref().map(|editor| editor.values)
+                != manual_calibration_before_ui;
         let runtime_frontend_changed = self
             .scope_settings
             .runtime_frontend_differs_from(scope_settings_before_ui);
@@ -2941,9 +3080,30 @@ impl eframe::App for DsViewApp {
             .scope_settings
             .trigger
             .hardware_differs_from(scope_settings_before_ui.trigger);
-        if runtime_frontend_changed && self.capture_run_requested && selected_scope_device {
+        let mut runtime_calibration_applied = false;
+        if manual_calibration_changed && !runtime_frontend_changed && self.capture_run_requested {
+            if let (Some(values), Some(active)) = (
+                self.manual_calibration.as_ref().map(|editor| editor.values),
+                self.capture.as_ref(),
+            ) {
+                runtime_calibration_applied = active
+                    .scope_calibration_controls
+                    .iter()
+                    .all(|control| control.update(values).is_ok());
+            }
+        }
+        let manual_calibration_requires_restart =
+            manual_calibration_changed && !runtime_calibration_applied;
+        if (runtime_frontend_changed || manual_calibration_requires_restart)
+            && self.capture_run_requested
+            && selected_scope_device
+        {
             self.scope_configuration_due = Some(Instant::now() + SCOPE_CONFIGURATION_DEBOUNCE);
             self.status = "Adjusting oscilloscope frontend…".to_owned();
+            self.last_error = None;
+        } else if runtime_calibration_applied {
+            self.scope_configuration_due = None;
+            self.status = "Applying manual calibration during capture…".to_owned();
             self.last_error = None;
         } else if trigger_changed && self.capture.is_some() {
             let update_result = self
@@ -3164,17 +3324,20 @@ fn append_error(error: &mut Option<String>, additional: String) {
 struct StartedCapture {
     session: CaptureSession,
     scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
+    scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
 }
 
 fn start_capture(
     devices: Vec<DiscoveredDevice>,
     resource_directory: &Path,
     scope_config: DsCopeCaptureConfig,
+    calibration_values: Option<DsCopeCalibrationValues>,
 ) -> Result<StartedCapture, String> {
     let logic_config = DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)
         .map_err(|error| error.to_string())?;
     let mut sources = Vec::<Box<dyn CaptureSource>>::with_capacity(devices.len());
     let mut scope_trigger_controls = Vec::new();
+    let mut scope_calibration_controls = Vec::new();
     for device in devices {
         if device.link_status() == LinkStatus::Unsupported {
             return Err(format!(
@@ -3193,8 +3356,14 @@ fn start_capture(
                 let (source, control) =
                     DsCopeCaptureSource::with_runtime_trigger_control(device, scope_config)
                         .map_err(|error| error.to_string())?;
+                let source = match calibration_values {
+                    Some(values) => source.with_calibration_values(values),
+                    None => source,
+                };
+                let (source, calibration_control) = source.with_runtime_calibration_control();
                 sources.push(Box::new(source));
                 scope_trigger_controls.push(control);
+                scope_calibration_controls.push(calibration_control);
             }
         }
     }
@@ -3202,6 +3371,7 @@ fn start_capture(
     Ok(StartedCapture {
         session,
         scope_trigger_controls,
+        scope_calibration_controls,
     })
 }
 
@@ -5274,6 +5444,37 @@ mod tests {
         assert!(scope_frontend_controls_are_enabled(true, true, true));
         assert!(!scope_frontend_controls_are_enabled(true, false, true));
         assert!(scope_frontend_controls_are_enabled(false, false, false));
+    }
+
+    #[test]
+    fn manual_calibration_stays_available_during_continuous_capture() {
+        assert!(manual_calibration_control_is_enabled(
+            false,
+            true,
+            false,
+            Some(AcquisitionMode::Run)
+        ));
+        assert!(manual_calibration_control_is_enabled(
+            false, true, false, None
+        ));
+        assert!(!manual_calibration_control_is_enabled(
+            true,
+            true,
+            false,
+            Some(AcquisitionMode::Run)
+        ));
+        assert!(!manual_calibration_control_is_enabled(
+            false,
+            true,
+            false,
+            Some(AcquisitionMode::Single)
+        ));
+        assert!(!manual_calibration_control_is_enabled(
+            false,
+            true,
+            true,
+            Some(AcquisitionMode::Run)
+        ));
     }
 
     #[test]
