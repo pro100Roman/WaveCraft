@@ -507,6 +507,7 @@ struct DsViewApp {
     active_waveform_tab: Option<WaveformTab>,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
+    scope_channel_colors: [Color32; 2],
     logic_viewport: WaveformViewport,
     scope_viewport: WaveformViewport,
     scope_configuration_due: Option<Instant>,
@@ -531,6 +532,7 @@ impl DsViewApp {
             active_waveform_tab: None,
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
+            scope_channel_colors: SCOPE_COLORS,
             logic_viewport: WaveformViewport::default(),
             scope_viewport: WaveformViewport::default(),
             scope_configuration_due: None,
@@ -936,6 +938,7 @@ fn paint_scope_input_range_encoder(
     ui: &mut egui::Ui,
     channel_index: usize,
     volts_per_div_mv: &mut u16,
+    channel_color: &mut Color32,
 ) -> bool {
     let mut steps = 0;
     ui.horizontal(|ui| {
@@ -943,9 +946,15 @@ fn paint_scope_input_range_encoder(
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(58.0), Sense::click_and_drag());
         let response = response
             .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-            .on_hover_text("Drag the knob vertically or scroll to rotate it");
+            .on_hover_text(
+                "Drag the knob vertically or scroll to rotate it · double-click to change color",
+            );
         if response.clicked() {
             response.request_focus();
+        }
+        let popup_id = ui.make_persistent_id(("scope_channel_color_popup", channel_index));
+        if response.double_clicked() {
+            ui.memory_mut(|memory| memory.toggle_popup(popup_id));
         }
         if response.hovered() {
             let scroll_delta = ui.input_mut(|input| {
@@ -994,11 +1003,11 @@ fn paint_scope_input_range_encoder(
         let center = rect.center();
         let radius = 22.0;
         let painter = ui.painter();
-        painter.circle_filled(center, radius, PANEL.gamma_multiply(1.55));
+        painter.circle_filled(center, radius, channel_color.gamma_multiply(0.14));
         painter.circle_stroke(
             center,
             radius,
-            Stroke::new(1.2_f32, GRID.gamma_multiply(1.8)),
+            Stroke::new(1.4_f32, channel_color.gamma_multiply(0.7)),
         );
         for tick_index in 0..DSCOPE_VOLTS_PER_DIV_MV.len() {
             let tick_fraction = tick_index as f32 / (DSCOPE_VOLTS_PER_DIV_MV.len() - 1) as f32;
@@ -1006,21 +1015,44 @@ fn paint_scope_input_range_encoder(
             let direction = Vec2::new(angle.cos(), angle.sin());
             painter.line_segment(
                 [center + direction * 25.0, center + direction * 28.0],
-                Stroke::new(1.0_f32, TEXT_MUTED.gamma_multiply(0.75)),
+                Stroke::new(1.0_f32, channel_color.gamma_multiply(0.55)),
             );
         }
         let angle = std::f32::consts::PI * (0.75 + fraction * 1.5);
         let direction = Vec2::new(angle.cos(), angle.sin());
         painter.line_segment(
             [center, center + direction * 16.0],
-            Stroke::new(2.8_f32, ACCENT),
+            Stroke::new(2.8_f32, *channel_color),
         );
-        painter.circle_filled(center, 2.5, ACCENT);
+        painter.circle_filled(center, 2.5, *channel_color);
 
         ui.vertical(|ui| {
-            ui.label(RichText::new(format_input_scale(*volts_per_div_mv)).strong());
+            ui.label(
+                RichText::new(format_input_scale(*volts_per_div_mv))
+                    .strong()
+                    .color(*channel_color),
+            );
             ui.small(RichText::new("drag / scroll").color(TEXT_MUTED));
         });
+
+        egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            &response,
+            egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+            |popup_ui| {
+                popup_ui.set_min_width(280.0);
+                popup_ui.label(RichText::new(format!("CH{channel_index} color")).strong());
+                egui::color_picker::color_picker_color32(
+                    popup_ui,
+                    channel_color,
+                    egui::color_picker::Alpha::Opaque,
+                );
+                if popup_ui.button("Reset color").clicked() {
+                    *channel_color = SCOPE_COLORS[channel_index];
+                }
+            },
+        );
     });
 
     let next = step_scope_input_range(*volts_per_div_mv, steps);
@@ -1190,6 +1222,7 @@ fn paint_scope_channel_settings(
     ui: &mut egui::Ui,
     channel_index: usize,
     settings: &mut ScopeChannelSettings,
+    channel_color: &mut Color32,
     other_channel_enabled: bool,
     capture_settings_enabled: bool,
 ) {
@@ -1209,7 +1242,12 @@ fn paint_scope_channel_settings(
             .on_hover_text("At least one oscilloscope channel must remain enabled");
             ui.add_enabled_ui(capture_settings_enabled && settings.enabled, |ui| {
                 ui.label("Input range");
-                paint_scope_input_range_encoder(ui, channel_index, &mut settings.volts_per_div_mv);
+                paint_scope_input_range_encoder(
+                    ui,
+                    channel_index,
+                    &mut settings.volts_per_div_mv,
+                    channel_color,
+                );
                 ui.add_space(12.0);
                 egui::Grid::new(("scope_channel_secondary_settings", channel_index))
                     .num_columns(2)
@@ -1251,6 +1289,7 @@ fn paint_capture_settings(
     ui: &mut egui::Ui,
     tab: CaptureSettingsTab,
     scope_settings: &mut ScopeCaptureSettings,
+    scope_channel_colors: &mut [Color32; 2],
     enabled: bool,
 ) {
     let card_width = ui.available_width();
@@ -1361,6 +1400,7 @@ fn paint_capture_settings(
                             ui,
                             index,
                             channel,
+                            &mut scope_channel_colors[index],
                             channel_enabled[1 - index],
                             enabled,
                         );
@@ -1488,6 +1528,7 @@ impl eframe::App for DsViewApp {
                             ui,
                             self.active_capture_settings_tab,
                             &mut self.scope_settings,
+                            &mut self.scope_channel_colors,
                             capture_settings_enabled,
                         );
 
@@ -1683,6 +1724,7 @@ impl eframe::App for DsViewApp {
                                     &mut scope_viewport,
                                     ScopeWaveformOptions {
                                         settings: scope_settings,
+                                        channel_colors: self.scope_channel_colors,
                                         vertical_offsets: &mut scope_vertical_offsets,
                                         trigger_settings: &mut scope_trigger_settings,
                                         offset_controls_enabled: capture_settings_enabled,
@@ -1701,6 +1743,7 @@ impl eframe::App for DsViewApp {
                             &mut scope_viewport,
                             ScopeWaveformOptions {
                                 settings: scope_settings,
+                                channel_colors: self.scope_channel_colors,
                                 vertical_offsets: &mut scope_vertical_offsets,
                                 trigger_settings: &mut scope_trigger_settings,
                                 offset_controls_enabled: capture_settings_enabled,
@@ -2043,6 +2086,7 @@ const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;
 
 struct ScopeWaveformOptions<'a> {
     settings: ScopeCaptureSettings,
+    channel_colors: [Color32; 2],
     vertical_offsets: &'a mut [u16; 2],
     trigger_settings: &'a mut ScopeTriggerSettings,
     offset_controls_enabled: bool,
@@ -2712,6 +2756,7 @@ fn paint_scope_offset_arrows(
     ui: &egui::Ui,
     plot: Rect,
     settings: ScopeCaptureSettings,
+    channel_colors: [Color32; 2],
     vertical_offsets: &mut [u16; 2],
     controls_enabled: bool,
 ) {
@@ -2780,7 +2825,7 @@ fn paint_scope_offset_arrows(
         }
     }
 
-    for (channel, color) in SCOPE_COLORS.iter().enumerate() {
+    for (channel, color) in channel_colors.iter().enumerate() {
         if !settings.channels[channel].enabled {
             continue;
         }
@@ -2792,9 +2837,9 @@ fn paint_scope_offset_arrows(
         }
     }
 
-    for channel in (0..SCOPE_COLORS.len()).rev() {
+    for channel in (0..channel_colors.len()).rev() {
         let display_color = if settings.channels[channel].enabled {
-            SCOPE_COLORS[channel]
+            channel_colors[channel]
         } else {
             TEXT_MUTED.gamma_multiply(0.45)
         };
@@ -2811,15 +2856,80 @@ fn paint_scope_offset_arrows(
     }
 }
 
-const COMBINED_TRIGGER_COLOR: Color32 = Color32::from_rgb(75, 220, 120);
+fn color_to_hsv(color: Color32) -> (f32, f32, f32) {
+    let red = f32::from(color.r()) / 255.0;
+    let green = f32::from(color.g()) / 255.0;
+    let blue = f32::from(color.b()) / 255.0;
+    let maximum = red.max(green).max(blue);
+    let minimum = red.min(green).min(blue);
+    let delta = maximum - minimum;
+    let hue = if delta <= f32::EPSILON {
+        0.0
+    } else if maximum == red {
+        ((green - blue) / delta).rem_euclid(6.0) / 6.0
+    } else if maximum == green {
+        ((blue - red) / delta + 2.0) / 6.0
+    } else {
+        ((red - green) / delta + 4.0) / 6.0
+    };
+    let saturation = if maximum <= f32::EPSILON {
+        0.0
+    } else {
+        delta / maximum
+    };
+    (hue, saturation, maximum)
+}
 
-fn scope_trigger_color(settings: ScopeTriggerSettings) -> Color32 {
+fn color_from_hsv(hue: f32, saturation: f32, value: f32) -> Color32 {
+    let hue = hue.rem_euclid(1.0) * 6.0;
+    let chroma = value * saturation;
+    let secondary = chroma * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
+    let (red, green, blue) = match hue as u8 {
+        0 => (chroma, secondary, 0.0),
+        1 => (secondary, chroma, 0.0),
+        2 => (0.0, chroma, secondary),
+        3 => (0.0, secondary, chroma),
+        4 => (secondary, 0.0, chroma),
+        _ => (chroma, 0.0, secondary),
+    };
+    let offset = value - chroma;
+    Color32::from_rgb(
+        ((red + offset) * 255.0).round() as u8,
+        ((green + offset) * 255.0).round() as u8,
+        ((blue + offset) * 255.0).round() as u8,
+    )
+}
+
+fn mix_scope_channel_colors(channel_colors: [Color32; 2]) -> Color32 {
+    let (first_hue, first_saturation, first_value) = color_to_hsv(channel_colors[0]);
+    let (second_hue, second_saturation, second_value) = color_to_hsv(channel_colors[1]);
+    let hue = if first_saturation <= f32::EPSILON {
+        second_hue
+    } else if second_saturation <= f32::EPSILON {
+        first_hue
+    } else {
+        let mut delta = second_hue - first_hue;
+        if delta > 0.5 {
+            delta -= 1.0;
+        } else if delta < -0.5 {
+            delta += 1.0;
+        }
+        (first_hue + delta * 0.5).rem_euclid(1.0)
+    };
+    color_from_hsv(
+        hue,
+        (first_saturation + second_saturation) * 0.5,
+        (first_value + second_value) * 0.5,
+    )
+}
+
+fn scope_trigger_color(settings: ScopeTriggerSettings, channel_colors: [Color32; 2]) -> Color32 {
     match settings.source {
-        DsCopeTriggerSource::Auto => SCOPE_COLORS[usize::from(settings.auto_channel)],
-        DsCopeTriggerSource::ChannelZero => SCOPE_COLORS[0],
-        DsCopeTriggerSource::ChannelOne => SCOPE_COLORS[1],
+        DsCopeTriggerSource::Auto => channel_colors[usize::from(settings.auto_channel)],
+        DsCopeTriggerSource::ChannelZero => channel_colors[0],
+        DsCopeTriggerSource::ChannelOne => channel_colors[1],
         DsCopeTriggerSource::ChannelZeroAndOne | DsCopeTriggerSource::ChannelZeroOrOne => {
-            COMBINED_TRIGGER_COLOR
+            mix_scope_channel_colors(channel_colors)
         }
     }
 }
@@ -2841,13 +2951,14 @@ fn paint_scope_trigger_level(
     ui: &egui::Ui,
     plot: Rect,
     settings: &mut ScopeTriggerSettings,
+    channel_colors: [Color32; 2],
     controls_enabled: bool,
 ) {
     const ARROW_WIDTH: f32 = 12.0;
     const ARROW_HALF_HEIGHT: f32 = 7.0;
     const DOT_SPACING: f32 = 7.0;
     let painter = ui.painter().with_clip_rect(plot);
-    let color = scope_trigger_color(*settings);
+    let color = scope_trigger_color(*settings, channel_colors);
     let arrow_x = plot.right() - 2.0;
     let arrow_y = scope_trigger_level_y(plot, settings.level);
     let hit_rect = Rect::from_center_size(
@@ -2906,9 +3017,10 @@ fn paint_scope_readouts(
     visible_samples: usize,
     sample_rate_hz: u64,
     settings: ScopeCaptureSettings,
+    channel_colors: [Color32; 2],
 ) {
     let mut visible_row = 0;
-    for (channel, color) in SCOPE_COLORS.iter().enumerate() {
+    for (channel, color) in channel_colors.iter().enumerate() {
         let channel_settings = settings.channels[channel];
         if !channel_settings.enabled {
             continue;
@@ -2954,6 +3066,7 @@ fn paint_scope(
 ) {
     let ScopeWaveformOptions {
         mut settings,
+        channel_colors,
         vertical_offsets,
         trigger_settings,
         offset_controls_enabled,
@@ -2971,10 +3084,17 @@ fn paint_scope(
         ui,
         plot,
         settings,
+        channel_colors,
         vertical_offsets,
         offset_controls_enabled,
     );
-    paint_scope_trigger_level(ui, plot, trigger_settings, offset_controls_enabled);
+    paint_scope_trigger_level(
+        ui,
+        plot,
+        trigger_settings,
+        channel_colors,
+        offset_controls_enabled,
+    );
     for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
         channel.vertical_offset = vertical_offset;
     }
@@ -2999,6 +3119,7 @@ fn paint_scope(
             idle_range.len(),
             settings.sample_rate_hz,
             settings,
+            channel_colors,
         );
         paint_empty(&scope_painter, plot, "Waiting for oscilloscope samples");
         paint_waveform_time_scale(
@@ -3047,7 +3168,7 @@ fn paint_scope(
             })
             .collect::<Vec<_>>();
         if points.len() > 1 {
-            let color = SCOPE_COLORS[channel_index.min(SCOPE_COLORS.len() - 1)];
+            let color = channel_colors[channel_index.min(channel_colors.len() - 1)];
             scope_painter.add(egui::Shape::line(
                 points.clone(),
                 Stroke::new(4.0_f32, color.gamma_multiply(0.16)),
@@ -3062,6 +3183,7 @@ fn paint_scope(
         visible_count,
         waveforms.scope_rate_hz,
         settings,
+        channel_colors,
     );
     paint_waveform_time_scale(
         painter,
@@ -3407,15 +3529,23 @@ mod tests {
             scope_trigger_level_from_y(plot, plot.bottom()),
             DSCOPE_TRIGGER_LEVEL_MAX
         );
-        assert_eq!(scope_trigger_color(trigger), SCOPE_COLORS[0]);
+        assert_eq!(scope_trigger_color(trigger, SCOPE_COLORS), SCOPE_COLORS[0]);
 
         trigger.source = DsCopeTriggerSource::ChannelOne;
-        assert_eq!(scope_trigger_color(trigger), SCOPE_COLORS[1]);
+        assert_eq!(scope_trigger_color(trigger, SCOPE_COLORS), SCOPE_COLORS[1]);
 
         trigger.source = DsCopeTriggerSource::ChannelZeroAndOne;
-        assert_eq!(scope_trigger_color(trigger), COMBINED_TRIGGER_COLOR);
+        let mixed_color = scope_trigger_color(trigger, SCOPE_COLORS);
+        assert!(mixed_color.g() > mixed_color.r());
+        assert!(mixed_color.g() > mixed_color.b());
         trigger.source = DsCopeTriggerSource::ChannelZeroOrOne;
-        assert_eq!(scope_trigger_color(trigger), COMBINED_TRIGGER_COLOR);
+        assert_eq!(scope_trigger_color(trigger, SCOPE_COLORS), mixed_color);
+
+        let custom_colors = [Color32::RED, Color32::BLUE];
+        trigger.source = DsCopeTriggerSource::ChannelZero;
+        assert_eq!(scope_trigger_color(trigger, custom_colors), Color32::RED);
+        trigger.source = DsCopeTriggerSource::ChannelOne;
+        assert_eq!(scope_trigger_color(trigger, custom_colors), Color32::BLUE);
     }
 
     #[test]

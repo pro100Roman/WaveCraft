@@ -161,7 +161,9 @@ shared 2M-sample memory provides up to 1M samples/channel in dual-channel mode
 or 2M in single-channel mode. Front-end and trigger changes are applied to the
 selected DSCope while idle; existing waveforms retain the settings with which
 they were captured. Each input range uses a rotary-style encoder that
-supports vertical mouse dragging, the mouse wheel, and arrow keys. Logic Analyzer and
+supports vertical mouse dragging, the mouse wheel, and arrow keys. Double-clicking
+a scope encoder opens its channel color picker; the selected color is shared by
+the encoder, trace, offset reference, readout, and trigger indication. Logic Analyzer and
 Oscilloscope tabs are
 created only for connected devices; the Combined tab appears when both models
 are present, and Refresh rebuilds the available tab set. Each waveform expands
@@ -181,7 +183,8 @@ conventional 10×8 graticule, zero-centered per-channel volts/div scaling,
 channel ground markers, configured front-end readouts, and illuminated channel
 traces. A draggable trigger-level arrow on the right edge drives the hardware
 threshold and its dotted horizontal reference; it uses the selected channel's
-color, or green for combined CH0/CH1 triggering.
+color, or a live mix of both channel colors for combined CH0/CH1 triggering
+(green with the defaults).
 
 Enable **Record complete capture** and enter a `.dsv` path before starting to
 write the full session to disk. The GUI uses the same streaming recorder as the
