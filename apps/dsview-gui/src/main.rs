@@ -294,6 +294,13 @@ impl ScopeCaptureSettings {
             || self.trigger.hardware_differs_from(other.trigger)
     }
 
+    fn input_ranges_differ_from(self, other: Self) -> bool {
+        self.channels
+            .iter()
+            .zip(other.channels)
+            .any(|(left, right)| left.volts_per_div_mv != right.volts_per_div_mv)
+    }
+
     fn from_capture_config(config: DsCopeCaptureConfig) -> Self {
         Self {
             sample_rate_hz: config.sample_rate_hz(),
@@ -483,6 +490,14 @@ fn scope_trigger_controls_are_enabled(
         return true;
     }
     !background_operation_pending && active_capture_supports_runtime_trigger.unwrap_or(true)
+}
+
+fn scope_input_range_controls_are_enabled(
+    background_operation_pending: bool,
+    capture_run_requested: bool,
+    selected_scope_device: bool,
+) -> bool {
+    !background_operation_pending || (capture_run_requested && selected_scope_device)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -769,6 +784,7 @@ struct DsViewApp {
     logic_viewport: WaveformViewport,
     scope_viewport: WaveformViewport,
     scope_time_per_division_seconds: Option<f64>,
+    scope_capture_restart_requested: bool,
     scope_configuration_due: Option<Instant>,
     pending: Option<Receiver<WorkerResult>>,
     capture: Option<ActiveCapture>,
@@ -798,6 +814,7 @@ impl DsViewApp {
             logic_viewport: WaveformViewport::default(),
             scope_viewport: WaveformViewport::default(),
             scope_time_per_division_seconds: None,
+            scope_capture_restart_requested: false,
             scope_configuration_due: None,
             pending: None,
             capture: None,
@@ -815,6 +832,7 @@ impl DsViewApp {
         }
         let (sender, receiver) = mpsc::channel();
         self.capture_run_requested = false;
+        self.scope_capture_restart_requested = false;
         self.scope_configuration_due = None;
         self.pending = Some(receiver);
         self.completed_capture = None;
@@ -1123,6 +1141,17 @@ impl DsViewApp {
                     }
                     return;
                 }
+                if self.scope_capture_restart_requested {
+                    self.scope_capture_restart_requested = false;
+                    match session.stop() {
+                        Ok(()) => {
+                            self.status = "Reconfiguring oscilloscope input range…".to_owned();
+                            self.begin_capture(mode);
+                        }
+                        Err(error) => self.set_error(error.to_string()),
+                    }
+                    return;
+                }
                 if !scope_trigger_controls.is_empty() {
                     let desired_trigger = match self.scope_settings.trigger.capture_config() {
                         Ok(trigger) => trigger,
@@ -1336,6 +1365,9 @@ impl DsViewApp {
             if let Some(mut active) = self.capture.take() {
                 let mode = active.mode;
                 let preserve_display_until_complete = active.preserve_display_until_complete;
+                let restart_for_input_range =
+                    self.scope_capture_restart_requested && self.capture_run_requested;
+                self.scope_capture_restart_requested = false;
                 let stop_result = active.session.stop();
                 let recording_completion = if stop_result.is_ok() {
                     completion
@@ -1354,7 +1386,12 @@ impl DsViewApp {
                         format!("failed to finish recording: {recording_error}"),
                     );
                 }
-                if completion == CompletionStatus::Complete || !preserve_display_until_complete {
+                let update_completed_capture = if restart_for_input_range {
+                    !preserve_display_until_complete
+                } else {
+                    completion == CompletionStatus::Complete || !preserve_display_until_complete
+                };
+                if update_completed_capture {
                     self.completed_capture = Some(CompletedCapture {
                         stats: active.stats,
                         waveforms: active.waveforms,
@@ -1362,17 +1399,22 @@ impl DsViewApp {
                         rolling: active.accumulate_waveforms,
                     });
                 }
-                let repeat = should_rearm_acquisition(
-                    mode,
-                    self.capture_run_requested,
-                    completion,
-                    error.is_some(),
-                );
+                let repeat = error.is_none()
+                    && (restart_for_input_range
+                        || should_rearm_acquisition(
+                            mode,
+                            self.capture_run_requested,
+                            completion,
+                            false,
+                        ));
                 if !repeat {
                     self.capture_run_requested = false;
                 }
                 match error {
                     Some(error) => self.set_error(error),
+                    None if restart_for_input_range => {
+                        self.status = "Reconfiguring oscilloscope input range…".to_owned();
+                    }
                     None => {
                         self.status = result.ok().unwrap_or_else(|| "Capture complete".to_owned());
                     }
@@ -1386,6 +1428,7 @@ impl DsViewApp {
 
     fn set_error(&mut self, error: String) {
         self.capture_run_requested = false;
+        self.scope_capture_restart_requested = false;
         self.status = "Operation failed".to_owned();
         self.last_error = Some(error);
     }
@@ -1751,6 +1794,7 @@ fn paint_scope_channel_settings(
     channel_color: &mut Color32,
     other_channel_enabled: bool,
     capture_settings_enabled: bool,
+    input_range_enabled: bool,
 ) {
     egui::Frame::none()
         .fill(PANEL.gamma_multiply(0.72))
@@ -1766,7 +1810,7 @@ fn paint_scope_channel_settings(
                 enable_control,
             )
             .on_hover_text("At least one oscilloscope channel must remain enabled");
-            ui.add_enabled_ui(capture_settings_enabled && settings.enabled, |ui| {
+            ui.add_enabled_ui(input_range_enabled && settings.enabled, |ui| {
                 ui.label("Input range");
                 paint_scope_input_range_encoder(
                     ui,
@@ -1774,7 +1818,9 @@ fn paint_scope_channel_settings(
                     &mut settings.volts_per_div_mv,
                     channel_color,
                 );
-                ui.add_space(12.0);
+            });
+            ui.add_space(12.0);
+            ui.add_enabled_ui(capture_settings_enabled && settings.enabled, |ui| {
                 egui::Grid::new(("scope_channel_secondary_settings", channel_index))
                     .num_columns(2)
                     .spacing([8.0, 5.0])
@@ -1811,13 +1857,19 @@ fn paint_scope_channel_settings(
         });
 }
 
+#[derive(Clone, Copy)]
+struct CaptureSettingsAvailability {
+    capture: bool,
+    trigger: bool,
+    input_range: bool,
+}
+
 fn paint_capture_settings(
     ui: &mut egui::Ui,
     tab: CaptureSettingsTab,
     scope_settings: &mut ScopeCaptureSettings,
     scope_channel_colors: &mut [Color32; 2],
-    enabled: bool,
-    trigger_enabled: bool,
+    availability: CaptureSettingsAvailability,
     calibration_action: &mut Option<ScopeCalibrationAction>,
 ) {
     let card_width = ui.available_width();
@@ -1869,7 +1921,7 @@ fn paint_capture_settings(
                     if scope_settings.sample_count > maximum_sample_count {
                         scope_settings.sample_count = maximum_sample_count;
                     }
-                    ui.add_enabled_ui(enabled, |ui| {
+                    ui.add_enabled_ui(availability.capture, |ui| {
                         egui::Grid::new("dscope_common_capture_settings")
                             .num_columns(2)
                             .spacing([8.0, 5.0])
@@ -1926,7 +1978,7 @@ fn paint_capture_settings(
                     egui::CollapsingHeader::new(RichText::new("Options").strong())
                         .default_open(false)
                         .show(ui, |ui| {
-                            ui.add_enabled_ui(enabled, |ui| {
+                            ui.add_enabled_ui(availability.capture, |ui| {
                                 egui::Grid::new("dscope_options")
                                     .num_columns(2)
                                     .spacing([8.0, 6.0])
@@ -1992,7 +2044,7 @@ fn paint_capture_settings(
                         ui,
                         &mut scope_settings.trigger,
                         channel_enabled,
-                        trigger_enabled,
+                        availability.trigger,
                     );
                     ui.add_space(8.0);
                     for (index, channel) in scope_settings.channels.iter_mut().enumerate() {
@@ -2002,7 +2054,8 @@ fn paint_capture_settings(
                             channel,
                             &mut scope_channel_colors[index],
                             channel_enabled[1 - index],
-                            enabled,
+                            availability.capture,
+                            availability.input_range,
                         );
                         if index + 1 < channel_count {
                             ui.add_space(6.0);
@@ -2075,6 +2128,11 @@ impl eframe::App for DsViewApp {
                 .as_ref()
                 .map(|active| !active.scope_trigger_controls.is_empty()),
         );
+        let input_range_controls_enabled = scope_input_range_controls_are_enabled(
+            self.pending.is_some(),
+            self.capture_run_requested,
+            selected_scope_device,
+        ) && !(self.record_capture && self.is_busy());
         let scope_settings_before_ui = self.scope_settings;
 
         egui::TopBottomPanel::top("toolbar")
@@ -2183,8 +2241,11 @@ impl eframe::App for DsViewApp {
                                 self.active_capture_settings_tab,
                                 &mut self.scope_settings,
                                 &mut self.scope_channel_colors,
-                                capture_settings_enabled,
-                                trigger_controls_enabled,
+                                CaptureSettingsAvailability {
+                                    capture: capture_settings_enabled,
+                                    trigger: trigger_controls_enabled,
+                                    input_range: input_range_controls_enabled,
+                                },
                                 &mut calibration_action,
                             );
                         }
@@ -2638,6 +2699,7 @@ impl eframe::App for DsViewApp {
         }
         if stop_clicked {
             self.capture_run_requested = false;
+            self.scope_capture_restart_requested = false;
             if self.capture.is_some() {
                 self.stop_capture();
             } else if self.pending.is_some() {
@@ -2657,11 +2719,22 @@ impl eframe::App for DsViewApp {
         if let Some(values) = save_manual_values {
             self.begin_save_manual_calibration(values);
         }
+        let input_range_changed = self
+            .scope_settings
+            .input_ranges_differ_from(scope_settings_before_ui);
         let trigger_changed = self
             .scope_settings
             .trigger
             .hardware_differs_from(scope_settings_before_ui.trigger);
-        if trigger_changed && self.capture.is_some() {
+        if input_range_changed && self.capture_run_requested && selected_scope_device {
+            self.scope_capture_restart_requested = true;
+            self.scope_configuration_due = None;
+            if let Some(active) = self.capture.as_ref() {
+                active.session.request_stop();
+            }
+            self.status = "Reconfiguring oscilloscope input range…".to_owned();
+            self.last_error = None;
+        } else if trigger_changed && self.capture.is_some() {
             let update_result = self
                 .scope_settings
                 .trigger
@@ -4507,6 +4580,9 @@ mod tests {
             false,
             Some(false)
         ));
+        assert!(scope_input_range_controls_are_enabled(true, true, true));
+        assert!(!scope_input_range_controls_are_enabled(true, false, true));
+        assert!(scope_input_range_controls_are_enabled(false, false, false));
     }
 
     #[test]
@@ -4837,10 +4913,12 @@ mod tests {
 
         changed.channels[0].volts_per_div_mv = 100;
         assert!(changed.frontend_differs_from(original));
+        assert!(changed.input_ranges_differ_from(original));
 
         changed = original;
         changed.channels[0].vertical_offset = 64;
         assert!(changed.frontend_differs_from(original));
+        assert!(!changed.input_ranges_differ_from(original));
 
         changed = original;
         changed.trigger.holdoff_unit = TriggerHoldoffUnit::Seconds;
