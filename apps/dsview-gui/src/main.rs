@@ -2732,7 +2732,7 @@ fn scope_offset_arrow_at_pointer(
     settings: ScopeCaptureSettings,
     vertical_offsets: &[u16; 2],
 ) -> Option<usize> {
-    const HIT_RADIUS: f32 = 16.0;
+    const HIT_RADIUS: f32 = 18.0;
     let mut closest: Option<(usize, f32)> = None;
     for (channel, vertical_offset) in vertical_offsets.iter().copied().enumerate() {
         if !settings.channels[channel].enabled {
@@ -2760,15 +2760,17 @@ fn paint_scope_offset_arrows(
     vertical_offsets: &mut [u16; 2],
     controls_enabled: bool,
 ) {
-    const ARROW_WIDTH: f32 = 12.0;
-    const ARROW_HALF_HEIGHT: f32 = 7.0;
+    const ARROW_BODY_WIDTH: f32 = 15.0;
+    const ARROW_TIP_WIDTH: f32 = 8.0;
+    const ARROW_HALF_HEIGHT: f32 = 9.0;
     const DOT_SPACING: f32 = 7.0;
     let painter = ui.painter().with_clip_rect(plot);
     let arrow_x = plot.left() + 2.0;
+    let arrow_width = ARROW_BODY_WIDTH + ARROW_TIP_WIDTH;
     let interaction_rect = Rect::from_min_max(
         plot.left_top(),
         Pos2::new(
-            (plot.left() + ARROW_WIDTH + 4.0).min(plot.right()),
+            (plot.left() + arrow_width + 4.0).min(plot.right()),
             plot.bottom(),
         ),
     );
@@ -2844,15 +2846,37 @@ fn paint_scope_offset_arrows(
             TEXT_MUTED.gamma_multiply(0.45)
         };
         let arrow_y = scope_vertical_offset_y(plot, vertical_offsets[channel]);
+        let body_right = arrow_x + ARROW_BODY_WIDTH;
         painter.add(egui::Shape::convex_polygon(
             vec![
                 Pos2::new(arrow_x, arrow_y - ARROW_HALF_HEIGHT),
-                Pos2::new(arrow_x + ARROW_WIDTH, arrow_y),
+                Pos2::new(body_right, arrow_y - ARROW_HALF_HEIGHT),
+                Pos2::new(body_right + ARROW_TIP_WIDTH, arrow_y),
+                Pos2::new(body_right, arrow_y + ARROW_HALF_HEIGHT),
                 Pos2::new(arrow_x, arrow_y + ARROW_HALF_HEIGHT),
             ],
             display_color,
             Stroke::new(1.0_f32, BACKGROUND),
         ));
+        painter.text(
+            Pos2::new(arrow_x + ARROW_BODY_WIDTH * 0.5, arrow_y),
+            egui::Align2::CENTER_CENTER,
+            channel.to_string(),
+            FontId::monospace(10.0),
+            marker_text_color(display_color),
+        );
+    }
+}
+
+fn marker_text_color(marker_color: Color32) -> Color32 {
+    let luminance = (299 * u32::from(marker_color.r())
+        + 587 * u32::from(marker_color.g())
+        + 114 * u32::from(marker_color.b()))
+        / 1_000;
+    if luminance >= 140 {
+        BACKGROUND
+    } else {
+        Color32::WHITE
     }
 }
 
@@ -2954,16 +2978,18 @@ fn paint_scope_trigger_level(
     channel_colors: [Color32; 2],
     controls_enabled: bool,
 ) {
-    const ARROW_WIDTH: f32 = 12.0;
-    const ARROW_HALF_HEIGHT: f32 = 7.0;
+    const ARROW_BODY_WIDTH: f32 = 15.0;
+    const ARROW_TIP_WIDTH: f32 = 8.0;
+    const ARROW_HALF_HEIGHT: f32 = 9.0;
     const DOT_SPACING: f32 = 7.0;
     let painter = ui.painter().with_clip_rect(plot);
     let color = scope_trigger_color(*settings, channel_colors);
     let arrow_x = plot.right() - 2.0;
+    let arrow_width = ARROW_BODY_WIDTH + ARROW_TIP_WIDTH;
     let arrow_y = scope_trigger_level_y(plot, settings.level);
     let hit_rect = Rect::from_center_size(
-        Pos2::new(arrow_x - ARROW_WIDTH * 0.5, arrow_y),
-        Vec2::new(ARROW_WIDTH + 4.0, ARROW_HALF_HEIGHT * 2.0 + 10.0),
+        Pos2::new(arrow_x - arrow_width * 0.5, arrow_y),
+        Vec2::new(arrow_width + 4.0, ARROW_HALF_HEIGHT * 2.0 + 10.0),
     );
     let response = ui.interact(
         hit_rect,
@@ -3000,15 +3026,25 @@ fn paint_scope_trigger_level(
         painter.circle_filled(Pos2::new(x, arrow_y), 0.8, color.gamma_multiply(0.45));
         x += DOT_SPACING;
     }
+    let body_left = arrow_x - ARROW_BODY_WIDTH;
     painter.add(egui::Shape::convex_polygon(
         vec![
             Pos2::new(arrow_x, arrow_y - ARROW_HALF_HEIGHT),
-            Pos2::new(arrow_x - ARROW_WIDTH, arrow_y),
+            Pos2::new(body_left, arrow_y - ARROW_HALF_HEIGHT),
+            Pos2::new(body_left - ARROW_TIP_WIDTH, arrow_y),
+            Pos2::new(body_left, arrow_y + ARROW_HALF_HEIGHT),
             Pos2::new(arrow_x, arrow_y + ARROW_HALF_HEIGHT),
         ],
         color,
         Stroke::new(1.0_f32, BACKGROUND),
     ));
+    painter.text(
+        Pos2::new(arrow_x - ARROW_BODY_WIDTH * 0.5, arrow_y),
+        egui::Align2::CENTER_CENTER,
+        "T",
+        FontId::monospace(10.0),
+        marker_text_color(color),
+    );
 }
 
 fn paint_scope_readouts(
