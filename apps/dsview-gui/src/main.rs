@@ -35,6 +35,9 @@ const LOGIC_CHANNEL_COUNT: usize = 16;
 // number of painted points. This also keeps the hardware trigger region in the
 // waveform instead of displaying only the final tail of a capture.
 const MAX_WAVEFORM_SAMPLES: usize = 2_000_000;
+// Auto/Roll is not limited to one hardware acquisition. Divide this display
+// memory budget across enabled scope channels and evict the oldest samples.
+const SCOPE_ROLLING_MEMORY_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 const WAVEFORM_STATUS_HEIGHT: f32 = 20.0;
 const TIME_RULER_HEIGHT: f32 = 24.0;
 const SCOPE_HORIZONTAL_DIVISIONS: usize = 10;
@@ -409,7 +412,6 @@ struct DeviceStats {
     last_timestamp: Option<Duration>,
 }
 
-#[derive(Default)]
 struct WaveformStore {
     logic_samples: VecDeque<u32>,
     logic_channels: u8,
@@ -419,6 +421,23 @@ struct WaveformStore {
     scope_rate_hz: u64,
     scope_sample_offset: u64,
     scope_trigger_sample_index: Option<u64>,
+    scope_capacity: usize,
+}
+
+impl Default for WaveformStore {
+    fn default() -> Self {
+        Self {
+            logic_samples: VecDeque::new(),
+            logic_channels: 0,
+            logic_rate_hz: 0,
+            logic_sample_offset: 0,
+            scope_channels: Vec::new(),
+            scope_rate_hz: 0,
+            scope_sample_offset: 0,
+            scope_trigger_sample_index: None,
+            scope_capacity: MAX_WAVEFORM_SAMPLES,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -440,6 +459,30 @@ fn should_rearm_acquisition(
     failed: bool,
 ) -> bool {
     mode.runs_continuously() && run_requested && completion == CompletionStatus::Complete && !failed
+}
+
+fn uses_rolling_waveform_buffer(
+    mode: AcquisitionMode,
+    has_scope: bool,
+    trigger_source: DsCopeTriggerSource,
+) -> bool {
+    mode == AcquisitionMode::Run && has_scope && trigger_source == DsCopeTriggerSource::Auto
+}
+
+fn scope_rolling_sample_capacity(enabled_channel_count: usize) -> usize {
+    SCOPE_ROLLING_MEMORY_BUDGET_BYTES / enabled_channel_count.max(1) / std::mem::size_of::<f32>()
+}
+
+fn scope_trigger_controls_are_enabled(
+    background_operation_pending: bool,
+    capture_run_requested: bool,
+    selected_scope_device: bool,
+    active_capture_supports_runtime_trigger: Option<bool>,
+) -> bool {
+    if capture_run_requested && selected_scope_device {
+        return true;
+    }
+    !background_operation_pending && active_capture_supports_runtime_trigger.unwrap_or(true)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -570,6 +613,27 @@ impl WaveformViewport {
     }
 }
 
+fn apply_time_per_division(
+    viewport: &mut WaveformViewport,
+    sample_count: usize,
+    sample_rate_hz: u64,
+    time_per_division_seconds: f64,
+) {
+    if sample_count == 0 || sample_rate_hz == 0 || !time_per_division_seconds.is_finite() {
+        return;
+    }
+    let new_span =
+        (time_per_division_seconds * SCOPE_HORIZONTAL_DIVISIONS as f64 * sample_rate_hz as f64
+            / sample_count as f64)
+            .max(1.0 / sample_count as f64) as f32;
+    if (new_span - viewport.span).abs() <= f32::EPSILON {
+        return;
+    }
+    let center_sample_fraction = viewport.start + viewport.span * 0.5;
+    viewport.span = new_span;
+    viewport.start = viewport.clamp_start(center_sample_fraction - new_span * 0.5);
+}
+
 fn adjacent_timebase(current_seconds: f64, zoom_in: bool) -> Option<f64> {
     const COMPARISON_EPSILON: f64 = 1.0e-6;
     if zoom_in {
@@ -601,8 +665,17 @@ impl WaveformStore {
                     self.scope_channels = vec![VecDeque::new(); scope_channels.len()];
                     self.scope_sample_offset = 0;
                 }
+                let capture_start = self.scope_sample_offset
+                    + self
+                        .scope_channels
+                        .iter()
+                        .zip(scope_channels)
+                        .filter_map(|(samples, enabled)| enabled.then_some(samples.len() as u64))
+                        .min()
+                        .unwrap_or(0);
                 if let Some(trigger_sample_index) = scope.trigger_sample_index {
-                    self.scope_trigger_sample_index = Some(trigger_sample_index);
+                    self.scope_trigger_sample_index =
+                        Some(capture_start.saturating_add(trigger_sample_index));
                 }
                 let mut removed_samples = 0;
                 for (source, physical_channel) in scope.channels.iter().zip(
@@ -612,8 +685,11 @@ impl WaveformStore {
                         .filter_map(|(index, enabled)| enabled.then_some(index)),
                 ) {
                     let destination = &mut self.scope_channels[physical_channel];
-                    removed_samples =
-                        removed_samples.max(extend_bounded(destination, source.iter().copied()));
+                    removed_samples = removed_samples.max(extend_bounded_to(
+                        destination,
+                        source.iter().copied(),
+                        self.scope_capacity,
+                    ));
                 }
                 self.scope_sample_offset += removed_samples as u64;
             }
@@ -622,8 +698,16 @@ impl WaveformStore {
 }
 
 fn extend_bounded<T>(destination: &mut VecDeque<T>, values: impl IntoIterator<Item = T>) -> usize {
+    extend_bounded_to(destination, values, MAX_WAVEFORM_SAMPLES)
+}
+
+fn extend_bounded_to<T>(
+    destination: &mut VecDeque<T>,
+    values: impl IntoIterator<Item = T>,
+    capacity: usize,
+) -> usize {
     destination.extend(values);
-    let excess = destination.len().saturating_sub(MAX_WAVEFORM_SAMPLES);
+    let excess = destination.len().saturating_sub(capacity);
     destination.drain(..excess);
     excess
 }
@@ -632,6 +716,7 @@ struct ActiveCapture {
     session: CaptureSession,
     mode: AcquisitionMode,
     preserve_display_until_complete: bool,
+    accumulate_waveforms: bool,
     scope_config: DsCopeCaptureConfig,
     scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     stats: HashMap<DeviceId, DeviceStats>,
@@ -645,6 +730,7 @@ struct CompletedCapture {
     stats: HashMap<DeviceId, DeviceStats>,
     waveforms: WaveformStore,
     recording_path: Option<String>,
+    rolling: bool,
 }
 
 type FileRecorder = RecordingWriter<BufWriter<File>>;
@@ -682,6 +768,7 @@ struct DsViewApp {
     scope_channel_colors: [Color32; 2],
     logic_viewport: WaveformViewport,
     scope_viewport: WaveformViewport,
+    scope_time_per_division_seconds: Option<f64>,
     scope_configuration_due: Option<Instant>,
     pending: Option<Receiver<WorkerResult>>,
     capture: Option<ActiveCapture>,
@@ -710,6 +797,7 @@ impl DsViewApp {
             scope_channel_colors: SCOPE_COLORS,
             logic_viewport: WaveformViewport::default(),
             scope_viewport: WaveformViewport::default(),
+            scope_time_per_division_seconds: None,
             scope_configuration_due: None,
             pending: None,
             capture: None,
@@ -971,6 +1059,7 @@ impl DsViewApp {
                 stats: active.stats,
                 waveforms: active.waveforms,
                 recording_path: active.recording_path,
+                rolling: active.accumulate_waveforms,
             });
         }
         match (stop_result, recording_result) {
@@ -1024,7 +1113,7 @@ impl DsViewApp {
             Ok(WorkerSuccess::Capture {
                 session,
                 mode,
-                scope_config,
+                mut scope_config,
                 scope_trigger_controls,
             }) => {
                 if !self.capture_run_requested {
@@ -1033,6 +1122,49 @@ impl DsViewApp {
                         Err(error) => self.set_error(error.to_string()),
                     }
                     return;
+                }
+                if !scope_trigger_controls.is_empty() {
+                    let desired_trigger = match self.scope_settings.trigger.capture_config() {
+                        Ok(trigger) => trigger,
+                        Err(error) => {
+                            let cleanup = session.stop().err();
+                            self.set_error(match cleanup {
+                                Some(cleanup) => {
+                                    format!("{error}; additionally failed to stop: {cleanup}")
+                                }
+                                None => error,
+                            });
+                            return;
+                        }
+                    };
+                    if desired_trigger != scope_config.trigger() {
+                        let update_result = scope_config
+                            .with_trigger_config(desired_trigger)
+                            .map_err(|error| error.to_string())
+                            .and_then(|updated_config| {
+                                for control in &scope_trigger_controls {
+                                    control
+                                        .update(desired_trigger)
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                Ok(updated_config)
+                            });
+                        match update_result {
+                            Ok(updated_config) => scope_config = updated_config,
+                            Err(error) => {
+                                let cleanup = session.stop().err();
+                                self.set_error(match cleanup {
+                                    Some(cleanup) => format!(
+                                        "failed to apply the latest trigger settings: {error}; additionally failed to stop: {cleanup}"
+                                    ),
+                                    None => format!(
+                                        "failed to apply the latest trigger settings: {error}"
+                                    ),
+                                });
+                                return;
+                            }
+                        }
+                    }
                 }
                 let count = session.descriptors().len();
                 let recording_path = self
@@ -1059,17 +1191,38 @@ impl DsViewApp {
                     None => None,
                 };
                 let has_scope = !scope_trigger_controls.is_empty();
-                let preserve_display_until_complete =
-                    mode == AcquisitionMode::Run && self.completed_capture.is_some();
+                let accumulate_waveforms =
+                    uses_rolling_waveform_buffer(mode, has_scope, scope_config.trigger().source());
+                let previous_is_rolling = self
+                    .completed_capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.rolling);
+                let preserve_display_until_complete = mode == AcquisitionMode::Run
+                    && self.completed_capture.is_some()
+                    && !(accumulate_waveforms && previous_is_rolling);
+                let mut waveforms = if accumulate_waveforms && previous_is_rolling {
+                    self.completed_capture
+                        .take()
+                        .map(|capture| capture.waveforms)
+                        .unwrap_or_default()
+                } else {
+                    WaveformStore::default()
+                };
+                waveforms.scope_capacity = if accumulate_waveforms {
+                    scope_rolling_sample_capacity(scope_config.enabled_channel_count())
+                } else {
+                    scope_config.sample_count() as usize
+                };
                 self.capture = Some(ActiveCapture {
                     session,
                     mode,
                     preserve_display_until_complete,
+                    accumulate_waveforms,
                     scope_config,
                     scope_trigger_controls,
                     stats: HashMap::new(),
                     stopped: HashSet::new(),
-                    waveforms: WaveformStore::default(),
+                    waveforms,
                     recorder,
                     recording_path: recording_path.clone(),
                 });
@@ -1206,6 +1359,7 @@ impl DsViewApp {
                         stats: active.stats,
                         waveforms: active.waveforms,
                         recording_path: active.recording_path,
+                        rolling: active.accumulate_waveforms,
                     });
                 }
                 let repeat = should_rearm_acquisition(
@@ -1707,6 +1861,8 @@ fn paint_capture_settings(
                 CaptureSettingsTab::DsCope => {
                     let maximum_sample_rate_hz = scope_settings.maximum_sample_rate_hz();
                     let maximum_sample_count = scope_settings.maximum_sample_count();
+                    let rolling_sample_capacity =
+                        scope_rolling_sample_capacity(scope_settings.enabled_channel_count());
                     if scope_settings.sample_rate_hz > maximum_sample_rate_hz {
                         scope_settings.sample_rate_hz = maximum_sample_rate_hz;
                     }
@@ -1756,6 +1912,13 @@ fn paint_capture_settings(
 
                                 ui.label("Maximum");
                                 ui.monospace(format_sample_rate(maximum_sample_rate_hz));
+                                ui.end_row();
+
+                                ui.label("Run buffer");
+                                ui.monospace(format!(
+                                    "{} / ch",
+                                    format_sample_count(rolling_sample_capacity as u64)
+                                ));
                                 ui.end_row();
                             });
                     });
@@ -1900,11 +2063,18 @@ impl eframe::App for DsViewApp {
         let mut stop_clicked = false;
         let mut calibration_action = None;
         let capture_settings_enabled = !self.is_busy();
-        let trigger_controls_enabled = self.pending.is_none()
-            && self
-                .capture
+        let selected_scope_device = self
+            .devices
+            .iter()
+            .any(|entry| entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100);
+        let trigger_controls_enabled = scope_trigger_controls_are_enabled(
+            self.pending.is_some(),
+            self.capture_run_requested,
+            selected_scope_device,
+            self.capture
                 .as_ref()
-                .map_or(true, |active| !active.scope_trigger_controls.is_empty());
+                .map(|active| !active.scope_trigger_controls.is_empty()),
+        );
         let scope_settings_before_ui = self.scope_settings;
 
         egui::TopBottomPanel::top("toolbar")
@@ -2167,6 +2337,7 @@ impl eframe::App for DsViewApp {
                 let mut logic_channel_colors = self.logic_channel_colors;
                 let mut logic_viewport = self.logic_viewport;
                 let mut scope_viewport = self.scope_viewport;
+                let mut scope_time_per_division_seconds = self.scope_time_per_division_seconds;
                 let mut scope_vertical_offsets = self
                     .scope_settings
                     .channels
@@ -2210,6 +2381,8 @@ impl eframe::App for DsViewApp {
                                         channel_colors: self.scope_channel_colors,
                                         vertical_offsets: &mut scope_vertical_offsets,
                                         trigger_settings: &mut scope_trigger_settings,
+                                        time_per_division_seconds:
+                                            &mut scope_time_per_division_seconds,
                                         offset_controls_enabled: capture_settings_enabled,
                                         trigger_controls_enabled,
                                     },
@@ -2230,6 +2403,7 @@ impl eframe::App for DsViewApp {
                                 channel_colors: self.scope_channel_colors,
                                 vertical_offsets: &mut scope_vertical_offsets,
                                 trigger_settings: &mut scope_trigger_settings,
+                                time_per_division_seconds: &mut scope_time_per_division_seconds,
                                 offset_controls_enabled: capture_settings_enabled,
                                 trigger_controls_enabled,
                             },
@@ -2241,6 +2415,7 @@ impl eframe::App for DsViewApp {
                 self.logic_channel_colors = logic_channel_colors;
                 self.logic_viewport = logic_viewport;
                 self.scope_viewport = scope_viewport;
+                self.scope_time_per_division_seconds = scope_time_per_division_seconds;
                 for (channel, vertical_offset) in self
                     .scope_settings
                     .channels
@@ -2765,6 +2940,7 @@ struct ScopeWaveformOptions<'a> {
     channel_colors: [Color32; 2],
     vertical_offsets: &'a mut [u16; 2],
     trigger_settings: &'a mut ScopeTriggerSettings,
+    time_per_division_seconds: &'a mut Option<f64>,
     offset_controls_enabled: bool,
     trigger_controls_enabled: bool,
 }
@@ -3091,7 +3267,8 @@ fn update_waveform_viewport(
     sample_count: usize,
     sample_rate_hz: u64,
     zoom_anchor: Option<(f32, f32)>,
-) {
+) -> bool {
+    let mut panned = false;
     let response = ui.interact(
         rect,
         ui.make_persistent_id(id_salt),
@@ -3111,6 +3288,7 @@ fn update_waveform_viewport(
     if response.dragged_by(egui::PointerButton::Primary) {
         let delta_x = ui.input(|input| input.pointer.delta().x);
         if viewport.pan_by_screen_delta(delta_x, rect.width()) {
+            panned = true;
             ui.ctx().request_repaint();
         }
     }
@@ -3142,6 +3320,7 @@ fn update_waveform_viewport(
             ui.ctx().request_repaint();
         }
     }
+    panned
 }
 
 fn paint_waveform_status(
@@ -3784,6 +3963,16 @@ fn scope_trigger_position_from_x(plot: Rect, x: f32) -> u8 {
     ) as u8
 }
 
+fn scope_trigger_position_in_view(trigger_sample_fraction: f32, viewport: WaveformViewport) -> u8 {
+    let position_percent =
+        ((trigger_sample_fraction - viewport.start) / viewport.span.max(f32::EPSILON) * 100.0)
+            .round() as i32;
+    position_percent.clamp(
+        i32::from(DSCOPE_TRIGGER_POSITION_MIN_PERCENT),
+        i32::from(DSCOPE_TRIGGER_POSITION_MAX_PERCENT),
+    ) as u8
+}
+
 fn paint_scope_trigger_position(
     ui: &egui::Ui,
     time_ruler: Rect,
@@ -3817,10 +4006,7 @@ fn paint_scope_trigger_position(
     } else {
         response
     }
-    .on_hover_text(format!(
-        "Horizontal trigger position: {}%\nDrag to move · double-click to center",
-        settings.position_percent
-    ));
+    .on_hover_text(format!("{}%", settings.position_percent));
 
     if controls_enabled {
         let old_position = settings.position_percent;
@@ -4022,6 +4208,7 @@ fn paint_scope(
         channel_colors,
         vertical_offsets,
         trigger_settings,
+        time_per_division_seconds,
         offset_controls_enabled,
         trigger_controls_enabled,
     } = scope_options;
@@ -4047,6 +4234,14 @@ fn paint_scope(
     } else {
         waveforms.scope_rate_hz
     };
+    if let Some(selected_timebase) = *time_per_division_seconds {
+        apply_time_per_division(
+            viewport,
+            display_sample_count,
+            display_sample_rate_hz,
+            selected_timebase,
+        );
+    }
     paint_plot_background(ui, rect);
     let painter = ui.painter();
     let (status_bar, time_ruler, plot) = split_waveform_chrome(rect);
@@ -4066,7 +4261,7 @@ fn paint_scope(
     if viewport.anchor_locked && (viewport.span - 1.0).abs() > f32::EPSILON {
         viewport.align_sample_to_screen(trigger_sample_fraction, trigger_screen_fraction);
     }
-    update_waveform_viewport(
+    let viewport_panned = update_waveform_viewport(
         ui,
         plot,
         "scope_waveform_zoom",
@@ -4075,6 +4270,13 @@ fn paint_scope(
         display_sample_rate_hz,
         Some((trigger_sample_fraction, trigger_screen_fraction)),
     );
+    if viewport_panned {
+        trigger_settings.position_percent =
+            scope_trigger_position_in_view(trigger_sample_fraction, *viewport);
+        viewport.anchor_locked = true;
+    }
+    *time_per_division_seconds =
+        viewport.time_per_division(display_sample_count, display_sample_rate_hz);
     paint_scope_offset_arrows(
         ui,
         plot,
@@ -4270,6 +4472,41 @@ mod tests {
             CompletionStatus::Complete,
             false,
         ));
+        assert!(uses_rolling_waveform_buffer(
+            AcquisitionMode::Run,
+            true,
+            DsCopeTriggerSource::Auto,
+        ));
+        assert!(!uses_rolling_waveform_buffer(
+            AcquisitionMode::Run,
+            true,
+            DsCopeTriggerSource::ChannelZero,
+        ));
+        assert!(!uses_rolling_waveform_buffer(
+            AcquisitionMode::Single,
+            true,
+            DsCopeTriggerSource::Auto,
+        ));
+        assert_eq!(scope_rolling_sample_capacity(1), 33_554_432);
+        assert_eq!(scope_rolling_sample_capacity(2), 16_777_216);
+    }
+
+    #[test]
+    fn trigger_controls_stay_enabled_while_continuous_capture_rearms() {
+        assert!(scope_trigger_controls_are_enabled(true, true, true, None));
+        assert!(scope_trigger_controls_are_enabled(
+            false,
+            true,
+            true,
+            Some(true)
+        ));
+        assert!(!scope_trigger_controls_are_enabled(true, false, true, None));
+        assert!(!scope_trigger_controls_are_enabled(
+            false,
+            true,
+            false,
+            Some(false)
+        ));
     }
 
     #[test]
@@ -4305,6 +4542,30 @@ mod tests {
         assert_eq!(store.scope_trigger_sample_index, Some(1));
         assert_eq!(store.scope_channels[0].back(), Some(&0.2));
         assert_eq!(store.scope_channels[1].back(), Some(&-0.2));
+    }
+
+    #[test]
+    fn waveform_store_keeps_trigger_coordinates_across_appended_captures() {
+        let mut store = WaveformStore {
+            scope_capacity: 3,
+            ..WaveformStore::default()
+        };
+        for (trigger_sample_index, samples) in
+            [(Some(1), vec![0.0, 1.0]), (Some(0), vec![2.0, 3.0])]
+        {
+            store.ingest(
+                &CaptureBatch::Scope(ScopeBatch {
+                    sample_rate_hz: 1_000_000,
+                    trigger_sample_index,
+                    channels: vec![samples.clone(), samples],
+                }),
+                [true, true],
+            );
+        }
+
+        assert_eq!(store.scope_channels[0], VecDeque::from(vec![1.0, 2.0, 3.0]));
+        assert_eq!(store.scope_trigger_sample_index, Some(2));
+        assert_eq!(store.scope_sample_offset, 1);
     }
 
     #[test]
@@ -4425,6 +4686,24 @@ mod tests {
 
         assert_eq!(viewport, WaveformViewport::default());
         assert_eq!(viewport.sample_range(1_000), 0..1_000);
+    }
+
+    #[test]
+    fn scope_timebase_does_not_change_with_capture_length() {
+        let mut viewport = WaveformViewport {
+            start: 0.25,
+            span: 0.5,
+            ..WaveformViewport::default()
+        };
+        let selected_timebase = viewport.time_per_division(1_000_000, 1_000_000).unwrap();
+
+        apply_time_per_division(&mut viewport, 250_000, 1_000_000, selected_timebase);
+
+        assert!((viewport.span - 2.0).abs() < f32::EPSILON);
+        assert!(
+            (viewport.time_per_division(250_000, 1_000_000).unwrap() - selected_timebase).abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]
@@ -4711,6 +4990,12 @@ mod tests {
             span: 0.5,
             ..WaveformViewport::default()
         };
+        assert_eq!(scope_trigger_position_in_view(0.5, viewport), 50);
+        assert!(viewport.pan_by_screen_delta(-100.0, 1_000.0));
+        assert_eq!(scope_trigger_position_in_view(0.5, viewport), 40);
+
+        viewport.start = 0.25;
+        viewport.anchor_locked = true;
         viewport.move_screen_anchor(0.5, 0.25);
         assert!((viewport.start - 0.375).abs() < f32::EPSILON);
         assert!(((0.5 - viewport.start) / viewport.span - 0.25).abs() < f32::EPSILON);
