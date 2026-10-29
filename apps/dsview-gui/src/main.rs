@@ -12,10 +12,10 @@ use dsview_usb::{
     DsCopeChannelConfig, DsCopeCoupling, DsCopeOperationMode, DsCopeTriggerConfig,
     DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig, DsLogicCaptureSource,
     LinkStatus, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ, DSCOPE_TRIGGER_HOLDOFF_MAX_NS,
-    DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
-    DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
-    DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
-    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
+    DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
+    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
+    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
+    DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -40,6 +40,7 @@ const TIME_RULER_HEIGHT: f32 = 24.0;
 const SCOPE_HORIZONTAL_DIVISIONS: usize = 10;
 const SCOPE_VERTICAL_DIVISIONS: usize = 8;
 const SCOPE_CONFIGURATION_DEBOUNCE: Duration = Duration::from_millis(350);
+const TOOLTIP_DELAY_SECONDS: f32 = 0.1;
 const BACKGROUND: Color32 = Color32::from_rgb(12, 17, 25);
 const PANEL: Color32 = Color32::from_rgb(20, 27, 38);
 const GRID: Color32 = Color32::from_rgb(43, 55, 72);
@@ -124,7 +125,7 @@ struct ScopeTriggerSettings {
     holdoff_ns: u64,
     holdoff_unit: TriggerHoldoffUnit,
     noise_sensitivity: u8,
-    level: u8,
+    levels: [u8; 2],
 }
 
 impl Default for ScopeTriggerSettings {
@@ -140,7 +141,7 @@ impl ScopeTriggerSettings {
             .and_then(|trigger| trigger.with_auto_channel(self.auto_channel))
             .and_then(|trigger| trigger.with_holdoff_ns(self.holdoff_ns))
             .and_then(|trigger| trigger.with_noise_sensitivity(self.noise_sensitivity))
-            .and_then(|trigger| trigger.with_level(self.level))
+            .and_then(|trigger| trigger.with_levels(self.levels))
             .map_err(|error| error.to_string())
     }
 
@@ -160,7 +161,7 @@ impl ScopeTriggerSettings {
             holdoff_ns: config.holdoff_ns(),
             holdoff_unit,
             noise_sensitivity: config.noise_sensitivity(),
-            level: config.level(),
+            levels: config.levels(),
         }
     }
 
@@ -190,7 +191,7 @@ impl ScopeTriggerSettings {
             || self.slope != other.slope
             || self.holdoff_ns != other.holdoff_ns
             || self.noise_sensitivity != other.noise_sensitivity
-            || self.level != other.level
+            || self.levels != other.levels
     }
 }
 
@@ -1370,17 +1371,6 @@ fn paint_scope_trigger_settings(
                             });
                         ui.end_row();
 
-                        ui.label("Horizontal position");
-                        ui.add(
-                            egui::Slider::new(
-                                &mut settings.position_percent,
-                                DSCOPE_TRIGGER_POSITION_MIN_PERCENT
-                                    ..=DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
-                            )
-                            .suffix("%"),
-                        );
-                        ui.end_row();
-
                         ui.label("Holdoff");
                         ui.horizontal(|ui| {
                             let multiplier = settings.holdoff_unit.nanoseconds();
@@ -2407,6 +2397,12 @@ fn start_gui_recording(
         "scope.trigger.level".to_owned(),
         trigger.level().to_string(),
     );
+    for (channel, level) in trigger.levels().into_iter().enumerate() {
+        metadata.insert(
+            format!("scope.trigger.ch{channel}.level"),
+            level.to_string(),
+        );
+    }
     for (index, channel) in scope_config.channels().iter().enumerate() {
         metadata.insert(
             format!("scope.ch{index}.enabled"),
@@ -2492,6 +2488,9 @@ fn configure_style(context: &egui::Context) {
     visuals.widgets.active.bg_fill = ACCENT.gamma_multiply(0.6);
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 61, 77);
     context.set_visuals(visuals);
+    context.style_mut(|style| {
+        style.interaction.tooltip_delay = TOOLTIP_DELAY_SECONDS;
+    });
 }
 
 const WAVEFORM_CARD_CHROME_HEIGHT: f32 = 58.0;
@@ -3055,6 +3054,16 @@ fn format_voltage(value: f32) -> String {
     }
 }
 
+fn format_trigger_voltage(value: f32) -> String {
+    if value.abs() >= 1.0 {
+        format!("{value:.2} V")
+    } else if value.abs() >= 0.1 {
+        format!("{:.0} mV", value * 1_000.0)
+    } else {
+        format!("{:.2} mV", value * 1_000.0)
+    }
+}
+
 fn format_sample_rate(rate_hz: u64) -> String {
     if rate_hz >= 1_000_000_000 {
         format!("{:.2} GSa/s", rate_hz as f64 / 1_000_000_000.0)
@@ -3185,6 +3194,7 @@ fn paint_scope_offset_arrows(
     settings: ScopeCaptureSettings,
     channel_colors: [Color32; 2],
     vertical_offsets: &mut [u16; 2],
+    trigger_settings: &mut ScopeTriggerSettings,
     controls_enabled: bool,
 ) {
     const ARROW_BODY_WIDTH: f32 = 15.0;
@@ -3226,6 +3236,7 @@ fn paint_scope_offset_arrows(
     };
 
     if controls_enabled {
+        let previous_offsets = *vertical_offsets;
         if response.drag_started() {
             let channel = response.interact_pointer_pos().and_then(|pointer| {
                 scope_offset_arrow_at_pointer(plot, pointer.y, settings, vertical_offsets)
@@ -3251,6 +3262,15 @@ fn paint_scope_offset_arrows(
         }
         if response.drag_stopped() {
             ui.data_mut(|data| data.remove_temp::<usize>(interaction_id));
+        }
+        for channel in 0..vertical_offsets.len() {
+            if vertical_offsets[channel] != previous_offsets[channel] {
+                trigger_settings.levels[channel] = shift_scope_trigger_level(
+                    trigger_settings.levels[channel],
+                    previous_offsets[channel],
+                    vertical_offsets[channel],
+                );
+            }
         }
     }
 
@@ -3306,88 +3326,17 @@ fn marker_text_color(marker_color: Color32) -> Color32 {
     }
 }
 
-fn color_to_hsv(color: Color32) -> (f32, f32, f32) {
-    let red = f32::from(color.r()) / 255.0;
-    let green = f32::from(color.g()) / 255.0;
-    let blue = f32::from(color.b()) / 255.0;
-    let maximum = red.max(green).max(blue);
-    let minimum = red.min(green).min(blue);
-    let delta = maximum - minimum;
-    let hue = if delta <= f32::EPSILON {
-        0.0
-    } else if maximum == red {
-        ((green - blue) / delta).rem_euclid(6.0) / 6.0
-    } else if maximum == green {
-        ((blue - red) / delta + 2.0) / 6.0
-    } else {
-        ((red - green) / delta + 4.0) / 6.0
-    };
-    let saturation = if maximum <= f32::EPSILON {
-        0.0
-    } else {
-        delta / maximum
-    };
-    (hue, saturation, maximum)
-}
-
-fn color_from_hsv(hue: f32, saturation: f32, value: f32) -> Color32 {
-    let hue = hue.rem_euclid(1.0) * 6.0;
-    let chroma = value * saturation;
-    let secondary = chroma * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
-    let (red, green, blue) = match hue as u8 {
-        0 => (chroma, secondary, 0.0),
-        1 => (secondary, chroma, 0.0),
-        2 => (0.0, chroma, secondary),
-        3 => (0.0, secondary, chroma),
-        4 => (secondary, 0.0, chroma),
-        _ => (chroma, 0.0, secondary),
-    };
-    let offset = value - chroma;
-    Color32::from_rgb(
-        ((red + offset) * 255.0).round() as u8,
-        ((green + offset) * 255.0).round() as u8,
-        ((blue + offset) * 255.0).round() as u8,
-    )
-}
-
-fn mix_scope_channel_colors(channel_colors: [Color32; 2]) -> Color32 {
-    let (first_hue, first_saturation, first_value) = color_to_hsv(channel_colors[0]);
-    let (second_hue, second_saturation, second_value) = color_to_hsv(channel_colors[1]);
-    let hue = if first_saturation <= f32::EPSILON {
-        second_hue
-    } else if second_saturation <= f32::EPSILON {
-        first_hue
-    } else {
-        let mut delta = second_hue - first_hue;
-        if delta > 0.5 {
-            delta -= 1.0;
-        } else if delta < -0.5 {
-            delta += 1.0;
-        }
-        (first_hue + delta * 0.5).rem_euclid(1.0)
-    };
-    color_from_hsv(
-        hue,
-        (first_saturation + second_saturation) * 0.5,
-        (first_value + second_value) * 0.5,
-    )
-}
-
-fn scope_trigger_color(settings: ScopeTriggerSettings, channel_colors: [Color32; 2]) -> Color32 {
-    match settings.source {
-        DsCopeTriggerSource::Auto => channel_colors[usize::from(settings.auto_channel)],
-        DsCopeTriggerSource::ChannelZero => channel_colors[0],
-        DsCopeTriggerSource::ChannelOne => channel_colors[1],
-        DsCopeTriggerSource::ChannelZeroAndOne | DsCopeTriggerSource::ChannelZeroOrOne => {
-            mix_scope_channel_colors(channel_colors)
-        }
-    }
-}
-
 fn scope_trigger_level_y(plot: Rect, level: u8) -> f32 {
     let reference_span = f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
     let ratio = f32::from(u16::from(level) - DSCOPE_VERTICAL_OFFSET_MIN) / reference_span;
     egui::lerp(plot.y_range(), ratio)
+}
+
+fn shift_scope_trigger_level(level: u8, old_offset: u16, new_offset: u16) -> u8 {
+    (i32::from(level) + i32::from(new_offset) - i32::from(old_offset)).clamp(
+        i32::from(DSCOPE_TRIGGER_LEVEL_MIN),
+        i32::from(DSCOPE_TRIGGER_LEVEL_MAX),
+    ) as u8
 }
 
 fn scope_trigger_level_from_y(plot: Rect, y: f32) -> u8 {
@@ -3440,7 +3389,8 @@ fn scope_trigger_crossing_sample(
             continue;
         }
         let samples = waveforms.scope_channels.get(channel_index)?;
-        let threshold = scope_trigger_threshold_voltage(channel_settings, trigger.level);
+        let threshold =
+            scope_trigger_threshold_voltage(channel_settings, trigger.levels[channel_index]);
         for distance in 0..TRIGGER_SEARCH_SAMPLES {
             let right = local_trigger.checked_sub(distance)?;
             let left = right.checked_sub(1)?;
@@ -3622,77 +3572,94 @@ fn paint_scope_trigger_position(
 fn paint_scope_trigger_level(
     ui: &egui::Ui,
     plot: Rect,
+    scope_settings: ScopeCaptureSettings,
     settings: &mut ScopeTriggerSettings,
     channel_colors: [Color32; 2],
+    vertical_offsets: &[u16; 2],
     controls_enabled: bool,
 ) {
-    const ARROW_BODY_WIDTH: f32 = 15.0;
+    const ARROW_BODY_WIDTH: f32 = 19.0;
     const ARROW_TIP_WIDTH: f32 = 8.0;
     const ARROW_HALF_HEIGHT: f32 = 9.0;
     const DOT_SPACING: f32 = 7.0;
     let painter = ui.painter().with_clip_rect(plot);
-    let color = scope_trigger_color(*settings, channel_colors);
-    let arrow_x = plot.right() - 2.0;
-    let arrow_width = ARROW_BODY_WIDTH + ARROW_TIP_WIDTH;
-    let arrow_y = scope_trigger_level_y(plot, settings.level);
-    let hit_rect = Rect::from_center_size(
-        Pos2::new(arrow_x - arrow_width * 0.5, arrow_y),
-        Vec2::new(arrow_width + 4.0, ARROW_HALF_HEIGHT * 2.0 + 10.0),
-    );
-    let response = ui.interact(
-        hit_rect,
-        ui.make_persistent_id("scope_trigger_level"),
-        if controls_enabled {
-            Sense::click_and_drag()
-        } else {
-            Sense::hover()
-        },
-    );
-    let response = if controls_enabled {
-        response.on_hover_cursor(egui::CursorIcon::ResizeVertical)
-    } else {
-        response
-    }
-    .on_hover_text(format!(
-        "Trigger level: {}\nDrag to move · double-click to center",
-        settings.level
-    ));
+    let active_channels = scope_trigger_channels(*settings)
+        .iter()
+        .copied()
+        .filter(|channel| scope_settings.channels[*channel].enabled)
+        .collect::<Vec<_>>();
 
-    if controls_enabled {
-        if response.double_clicked() {
-            settings.level = DSCOPE_TRIGGER_LEVEL_CENTER;
-        } else if response.dragged() {
-            if let Some(pointer) = response.interact_pointer_pos() {
-                settings.level = scope_trigger_level_from_y(plot, pointer.y);
+    for channel in active_channels.iter().copied() {
+        let color = channel_colors[channel];
+        let mut channel_settings = scope_settings.channels[channel];
+        channel_settings.vertical_offset = vertical_offsets[channel];
+        let trigger_voltage =
+            scope_trigger_threshold_voltage(channel_settings, settings.levels[channel]);
+        let arrow_x = plot.right() - 2.0;
+        let arrow_width = ARROW_BODY_WIDTH + ARROW_TIP_WIDTH;
+        let arrow_y = scope_trigger_level_y(plot, settings.levels[channel]);
+        let hit_rect = Rect::from_center_size(
+            Pos2::new(arrow_x - arrow_width * 0.5, arrow_y),
+            Vec2::new(arrow_width + 4.0, ARROW_HALF_HEIGHT * 2.0 + 10.0),
+        );
+        let response = ui.interact(
+            hit_rect,
+            ui.make_persistent_id(("scope_trigger_level", channel)),
+            if controls_enabled {
+                Sense::click_and_drag()
+            } else {
+                Sense::hover()
+            },
+        );
+        let response = if controls_enabled {
+            response.on_hover_cursor(egui::CursorIcon::ResizeVertical)
+        } else {
+            response
+        }
+        .on_hover_text(format!(
+            "Trigger level: {}",
+            format_trigger_voltage(trigger_voltage)
+        ));
+
+        if controls_enabled {
+            if response.double_clicked() {
+                settings.levels[channel] = vertical_offsets[channel].clamp(
+                    u16::from(DSCOPE_TRIGGER_LEVEL_MIN),
+                    u16::from(DSCOPE_TRIGGER_LEVEL_MAX),
+                ) as u8;
+            } else if response.dragged() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    settings.levels[channel] = scope_trigger_level_from_y(plot, pointer.y);
+                }
             }
         }
-    }
 
-    let arrow_y = scope_trigger_level_y(plot, settings.level);
-    let mut x = plot.left();
-    while x <= plot.right() {
-        painter.circle_filled(Pos2::new(x, arrow_y), 0.8, color.gamma_multiply(0.45));
-        x += DOT_SPACING;
+        let arrow_y = scope_trigger_level_y(plot, settings.levels[channel]);
+        let mut x = plot.left();
+        while x <= plot.right() {
+            painter.circle_filled(Pos2::new(x, arrow_y), 0.8, color.gamma_multiply(0.45));
+            x += DOT_SPACING;
+        }
+        let body_left = arrow_x - ARROW_BODY_WIDTH;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(arrow_x, arrow_y - ARROW_HALF_HEIGHT),
+                Pos2::new(body_left, arrow_y - ARROW_HALF_HEIGHT),
+                Pos2::new(body_left - ARROW_TIP_WIDTH, arrow_y),
+                Pos2::new(body_left, arrow_y + ARROW_HALF_HEIGHT),
+                Pos2::new(arrow_x, arrow_y + ARROW_HALF_HEIGHT),
+            ],
+            color,
+            Stroke::new(1.0_f32, BACKGROUND),
+        ));
+        painter.text(
+            Pos2::new(arrow_x - ARROW_BODY_WIDTH * 0.5, arrow_y),
+            egui::Align2::CENTER_CENTER,
+            format!("T{channel}"),
+            FontId::monospace(9.0),
+            marker_text_color(color),
+        );
     }
-    let body_left = arrow_x - ARROW_BODY_WIDTH;
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            Pos2::new(arrow_x, arrow_y - ARROW_HALF_HEIGHT),
-            Pos2::new(body_left, arrow_y - ARROW_HALF_HEIGHT),
-            Pos2::new(body_left - ARROW_TIP_WIDTH, arrow_y),
-            Pos2::new(body_left, arrow_y + ARROW_HALF_HEIGHT),
-            Pos2::new(arrow_x, arrow_y + ARROW_HALF_HEIGHT),
-        ],
-        color,
-        Stroke::new(1.0_f32, BACKGROUND),
-    ));
-    painter.text(
-        Pos2::new(arrow_x - ARROW_BODY_WIDTH * 0.5, arrow_y),
-        egui::Align2::CENTER_CENTER,
-        "T",
-        FontId::monospace(10.0),
-        marker_text_color(color),
-    );
 }
 
 fn paint_scope_readouts(
@@ -3799,13 +3766,16 @@ fn paint_scope(
         settings,
         channel_colors,
         vertical_offsets,
+        trigger_settings,
         offset_controls_enabled,
     );
     paint_scope_trigger_level(
         ui,
         plot,
+        settings,
         trigger_settings,
         channel_colors,
+        vertical_offsets,
         offset_controls_enabled,
     );
     for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
@@ -4166,7 +4136,7 @@ mod tests {
                 holdoff_ns: 250_000,
                 holdoff_unit: TriggerHoldoffUnit::Microseconds,
                 noise_sensitivity: 12,
-                level: 64,
+                levels: [64, 192],
             },
             operation_mode: DsCopeOperationMode::InternalTest,
             bandwidth_limit: DsCopeBandwidthLimit::Mhz20,
@@ -4189,7 +4159,7 @@ mod tests {
         assert_eq!(config.trigger().slope(), DsCopeTriggerSlope::Falling);
         assert_eq!(config.trigger().holdoff_ns(), 250_000);
         assert_eq!(config.trigger().noise_sensitivity(), 12);
-        assert_eq!(config.trigger().level(), 64);
+        assert_eq!(config.trigger().levels(), [64, 192]);
         assert_eq!(config.operation_mode(), DsCopeOperationMode::InternalTest);
         assert_eq!(config.bandwidth_limit(), DsCopeBandwidthLimit::Mhz20);
         assert_eq!(ScopeCaptureSettings::from_capture_config(config), settings);
@@ -4236,7 +4206,7 @@ mod tests {
         assert!(changed.frontend_differs_from(original));
 
         changed = original;
-        changed.trigger.level = 64;
+        changed.trigger.levels[0] = 64;
         assert!(changed.frontend_differs_from(original));
 
         changed = original;
@@ -4264,9 +4234,8 @@ mod tests {
     }
 
     #[test]
-    fn scope_trigger_level_uses_vendor_limits_and_source_colors() {
+    fn scope_trigger_levels_use_vendor_limits_and_follow_channel_offsets() {
         let plot = Rect::from_min_max(Pos2::new(0.0, 20.0), Pos2::new(100.0, 220.0));
-        let mut trigger = ScopeTriggerSettings::default();
 
         assert_eq!(
             scope_trigger_level_from_y(plot, plot.top()),
@@ -4276,23 +4245,18 @@ mod tests {
             scope_trigger_level_from_y(plot, plot.bottom()),
             DSCOPE_TRIGGER_LEVEL_MAX
         );
-        assert_eq!(scope_trigger_color(trigger, SCOPE_COLORS), SCOPE_COLORS[0]);
+        assert_eq!(shift_scope_trigger_level(128, 128, 160), 160);
+        assert_eq!(shift_scope_trigger_level(220, 128, 160), 232);
+        assert_eq!(shift_scope_trigger_level(32, 128, 96), 24);
+        assert_eq!(format_trigger_voltage(0.0), "0.00 mV");
+        assert_eq!(format_trigger_voltage(0.125), "125 mV");
+        assert_eq!(format_trigger_voltage(-1.25), "-1.25 V");
 
-        trigger.source = DsCopeTriggerSource::ChannelOne;
-        assert_eq!(scope_trigger_color(trigger, SCOPE_COLORS), SCOPE_COLORS[1]);
-
-        trigger.source = DsCopeTriggerSource::ChannelZeroAndOne;
-        let mixed_color = scope_trigger_color(trigger, SCOPE_COLORS);
-        assert!(mixed_color.g() > mixed_color.r());
-        assert!(mixed_color.g() > mixed_color.b());
-        trigger.source = DsCopeTriggerSource::ChannelZeroOrOne;
-        assert_eq!(scope_trigger_color(trigger, SCOPE_COLORS), mixed_color);
-
-        let custom_colors = [Color32::RED, Color32::BLUE];
-        trigger.source = DsCopeTriggerSource::ChannelZero;
-        assert_eq!(scope_trigger_color(trigger, custom_colors), Color32::RED);
-        trigger.source = DsCopeTriggerSource::ChannelOne;
-        assert_eq!(scope_trigger_color(trigger, custom_colors), Color32::BLUE);
+        let trigger = ScopeTriggerSettings {
+            source: DsCopeTriggerSource::ChannelZeroAndOne,
+            ..ScopeTriggerSettings::default()
+        };
+        assert_eq!(scope_trigger_channels(trigger), &[0, 1]);
     }
 
     #[test]

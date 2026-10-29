@@ -216,7 +216,7 @@ pub struct DsCopeTriggerConfig {
     slope: DsCopeTriggerSlope,
     holdoff_ns: u64,
     noise_sensitivity: u8,
-    level: u8,
+    levels: [u8; CHANNEL_COUNT],
 }
 
 impl Default for DsCopeTriggerConfig {
@@ -228,7 +228,7 @@ impl Default for DsCopeTriggerConfig {
             slope: DsCopeTriggerSlope::Rising,
             holdoff_ns: 0,
             noise_sensitivity: 8,
-            level: DSCOPE_TRIGGER_LEVEL_CENTER,
+            levels: [DSCOPE_TRIGGER_LEVEL_CENTER; CHANNEL_COUNT],
         }
     }
 }
@@ -285,12 +285,27 @@ impl DsCopeTriggerConfig {
     }
 
     pub fn with_level(mut self, level: u8) -> Result<Self, CaptureError> {
-        if !(DSCOPE_TRIGGER_LEVEL_MIN..=DSCOPE_TRIGGER_LEVEL_MAX).contains(&level) {
+        validate_trigger_level(level)?;
+        self.levels = [level; CHANNEL_COUNT];
+        Ok(self)
+    }
+
+    pub fn with_channel_level(mut self, channel: usize, level: u8) -> Result<Self, CaptureError> {
+        if channel >= CHANNEL_COUNT {
             return Err(CaptureError::new(format!(
-                "DSCope trigger level must be between {DSCOPE_TRIGGER_LEVEL_MIN} and {DSCOPE_TRIGGER_LEVEL_MAX}; got {level}"
+                "DSCope trigger level channel must be 0 or 1; got {channel}"
             )));
         }
-        self.level = level;
+        validate_trigger_level(level)?;
+        self.levels[channel] = level;
+        Ok(self)
+    }
+
+    pub fn with_levels(mut self, levels: [u8; CHANNEL_COUNT]) -> Result<Self, CaptureError> {
+        for level in levels {
+            validate_trigger_level(level)?;
+        }
+        self.levels = levels;
         Ok(self)
     }
 
@@ -318,9 +333,26 @@ impl DsCopeTriggerConfig {
         self.noise_sensitivity
     }
 
-    pub fn level(self) -> u8 {
-        self.level
+    pub fn levels(self) -> [u8; CHANNEL_COUNT] {
+        self.levels
     }
+
+    pub fn level(self) -> u8 {
+        self.levels[0]
+    }
+
+    pub fn channel_level(self, channel: usize) -> Option<u8> {
+        self.levels.get(channel).copied()
+    }
+}
+
+fn validate_trigger_level(level: u8) -> Result<(), CaptureError> {
+    if !(DSCOPE_TRIGGER_LEVEL_MIN..=DSCOPE_TRIGGER_LEVEL_MAX).contains(&level) {
+        return Err(CaptureError::new(format!(
+            "DSCope trigger level must be between {DSCOPE_TRIGGER_LEVEL_MIN} and {DSCOPE_TRIGGER_LEVEL_MAX}; got {level}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1045,7 +1077,7 @@ fn dso_commands(config: DsCopeCaptureConfig, calibration: DsCopeCalibration) -> 
         0x58 + (trigger.holdoff_ns << 8),
         0x28 + (u64::from(trigger.slope.command_value()) << 8),
         0x30 + (u64::from(trigger_source) << 8),
-        0x38 + (u64::from(trigger.level) << 8) + (u64::from(trigger.level) << 16),
+        0x38 + (u64::from(trigger.levels[0]) << 8) + (u64::from(trigger.levels[1]) << 16),
         0x40 + (u64::from(trigger.noise_sensitivity) << 8),
     ]
 }
@@ -1774,7 +1806,7 @@ mod tests {
         .unwrap()
         .with_noise_sensitivity(12)
         .unwrap()
-        .with_level(64)
+        .with_levels([64, 192])
         .unwrap();
         let config = DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT)
             .unwrap()
@@ -1787,12 +1819,23 @@ mod tests {
         assert_eq!(commands[9], 0x58 + (250_000 << 8));
         assert_eq!(commands[10], 0x0128);
         assert_eq!(commands[11], 0x1330);
-        assert_eq!(commands[12], 0x0040_4038);
+        assert_eq!(commands[12], 0x00c0_4038);
+        assert_eq!(config.trigger().levels(), [64, 192]);
+        assert_eq!(config.trigger().level(), 64);
+        assert_eq!(config.trigger().channel_level(0), Some(64));
+        assert_eq!(config.trigger().channel_level(1), Some(192));
         assert_eq!(commands[13], 0x0c40);
     }
 
     #[test]
     fn validates_trigger_ranges_and_enabled_channels() {
+        assert_eq!(
+            DsCopeTriggerConfig::default()
+                .with_channel_level(1, 192)
+                .unwrap()
+                .levels(),
+            [DSCOPE_TRIGGER_LEVEL_CENTER, 192]
+        );
         assert!(DsCopeTriggerConfig::default()
             .with_position_percent(0)
             .is_err());
@@ -1811,6 +1854,9 @@ mod tests {
             .is_err());
         assert!(DsCopeTriggerConfig::default()
             .with_level(DSCOPE_TRIGGER_LEVEL_MAX + 1)
+            .is_err());
+        assert!(DsCopeTriggerConfig::default()
+            .with_channel_level(2, DSCOPE_TRIGGER_LEVEL_CENTER)
             .is_err());
 
         let channels = [
