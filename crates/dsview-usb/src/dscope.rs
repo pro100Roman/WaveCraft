@@ -27,6 +27,8 @@ const CALIBRATION_ID_BASE: u8 = 0x40;
 const OFFSET_PWM_SPAN: u64 = 780;
 const CALIBRATION_VPOS_TRANS_OFFSET: usize = 19;
 const CALIBRATION_COMB_COMP_OFFSET: usize = 21;
+const CALIBRATION_FINE_GAIN_OFFSET: usize = 22;
+const CALIBRATION_COMB_FINE_GAIN_OFFSET: usize = 26;
 const INTERNAL_TEST_MODE_BIT: u16 = 1 << 15;
 
 pub const DSCOPE_VERTICAL_OFFSET_MIN: u16 = 10;
@@ -71,6 +73,8 @@ pub struct DsCopeCalibrationValues {
     vga_gains: [[u16; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
     vpos_trans: [u16; CHANNEL_COUNT],
     comb_comp: [u8; CHANNEL_COUNT],
+    fine_gain_codes: [[u8; 4]; CHANNEL_COUNT],
+    comb_fine_gain_codes: [[u8; 4]; CHANNEL_COUNT],
 }
 
 impl DsCopeCalibrationValues {
@@ -781,6 +785,7 @@ pub fn auto_calibrate_dscope(device: &DiscoveredDevice) -> Result<(), CaptureErr
             let mut converged = false;
             for _ in 0..MAX_ADJUSTMENTS_PER_RANGE {
                 let calibration = DsCopeCalibration::from_values(values, range);
+                configure_adc_fine_gains(&session, config, calibration)?;
                 configure_scope(&session, config, calibration)?;
                 session
                     .arm_capture(&config.encode_settings())
@@ -856,6 +861,8 @@ fn read_calibration_values(
         vga_gains: [[0; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
         vpos_trans: [0; CHANNEL_COUNT],
         comb_comp: [0; CHANNEL_COUNT],
+        fine_gain_codes: [[0; 4]; CHANNEL_COUNT],
+        comb_fine_gain_codes: [[0; 4]; CHANNEL_COUNT],
     };
     for channel in 0..CHANNEL_COUNT {
         let (zero_record, vga_record) = read_calibration_records(session, channel)?;
@@ -866,6 +873,12 @@ fn read_calibration_values(
         }
         values.vpos_trans[channel] = read_u16(&zero_record, CALIBRATION_VPOS_TRANS_OFFSET);
         values.comb_comp[channel] = zero_record[CALIBRATION_COMB_COMP_OFFSET];
+        values.fine_gain_codes[channel].copy_from_slice(
+            &zero_record[CALIBRATION_FINE_GAIN_OFFSET..CALIBRATION_COMB_FINE_GAIN_OFFSET],
+        );
+        values.comb_fine_gain_codes[channel].copy_from_slice(
+            &zero_record[CALIBRATION_COMB_FINE_GAIN_OFFSET..CALIBRATION_ZERO_BYTES],
+        );
     }
     Ok(values)
 }
@@ -1034,11 +1047,24 @@ fn configure_frontend(
         .set_dscope_bandwidth_limit(config.bandwidth_limit)
         .map_err(capture_error)?;
     let calibration = DsCopeCalibration::load(session, config)?;
+    configure_adc_fine_gains(session, config, calibration)?;
     session
         .configure_dscope_channels(enabled_channels)
         .map_err(capture_error)?;
     configure_scope(session, config, calibration)?;
     Ok(calibration)
+}
+
+fn configure_adc_fine_gains(
+    session: &UsbDeviceSession,
+    config: DsCopeCaptureConfig,
+    calibration: DsCopeCalibration,
+) -> Result<(), CaptureError> {
+    session
+        .configure_dscope_adc_fine_gains(
+            calibration.adc_fine_gain_codes(config.enabled_channel_count() == 1),
+        )
+        .map_err(capture_error)
 }
 
 fn validate_device_ready(session: &UsbDeviceSession) -> Result<(), CaptureError> {
@@ -1091,25 +1117,26 @@ fn configure_scope_post_arm(
 fn dso_commands(config: DsCopeCaptureConfig, calibration: DsCopeCalibration) -> [u64; 14] {
     let channel_zero = calibration.channels[0];
     let channel_one = calibration.channels[1];
+    let single_channel = config.enabled_channel_count() == 1;
     let trigger = config.trigger;
     let trigger_source = (trigger.auto_channel << 4) | trigger.source.command_value();
     [
         0xa5a5_a500,
         coupling_command(config, 0, config.channels[0].coupling),
         coupling_command(config, 1, config.channels[1].coupling),
-        0x08 + u64::from(channel_zero.vga_gain),
-        0x88 + u64::from(channel_one.vga_gain),
+        vga_command(0x08, channel_zero, single_channel),
+        vga_command(0x88, channel_one, single_channel),
         offset_command(
             0x10,
             config.channels[0].vertical_offset,
             channel_zero,
-            config.enabled_channel_count() == 1,
+            single_channel,
         ),
         offset_command(
             0x90,
             config.channels[1].vertical_offset,
             channel_one,
-            config.enabled_channel_count() == 1,
+            single_channel,
         ),
         0x18 + (u64::from(config.divider()) << 8),
         0x20 + (config.trigger_position_samples() << 8),
@@ -1119,6 +1146,15 @@ fn dso_commands(config: DsCopeCaptureConfig, calibration: DsCopeCalibration) -> 
         0x38 + (u64::from(trigger.levels[0]) << 8) + (u64::from(trigger.levels[1]) << 16),
         0x40 + (u64::from(trigger.noise_sensitivity) << 8),
     ]
+}
+
+fn vga_command(command: u64, calibration: DsCopeChannelCalibration, single_channel: bool) -> u64 {
+    let interleaving_compensation = if single_channel {
+        u64::from(calibration.comb_comp) << 8
+    } else {
+        0
+    };
+    command + u64::from(calibration.vga_gain) + interleaving_compensation
 }
 
 fn coupling_command(config: DsCopeCaptureConfig, channel: usize, coupling: DsCopeCoupling) -> u64 {
@@ -1155,6 +1191,8 @@ struct DsCopeChannelCalibration {
     vga_gain: u32,
     vpos_trans: u16,
     comb_comp: u8,
+    fine_gain_codes: [u8; 4],
+    comb_fine_gain_codes: [u8; 4],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1169,6 +1207,8 @@ impl DsCopeCalibration {
             vga_gain: 0,
             vpos_trans: 0,
             comb_comp: 0,
+            fine_gain_codes: [0; 4],
+            comb_fine_gain_codes: [0; 4],
         }; CHANNEL_COUNT];
         for (channel, calibration) in channels.iter_mut().enumerate() {
             let page = u16::try_from(channel).expect("channel index fits u16")
@@ -1198,6 +1238,8 @@ impl DsCopeCalibration {
                 vga_gain: u32::from(values.vga_gains[channel][range]) << 8,
                 vpos_trans: values.vpos_trans[channel],
                 comb_comp: values.comb_comp[channel],
+                fine_gain_codes: values.fine_gain_codes[channel],
+                comb_fine_gain_codes: values.comb_fine_gain_codes[channel],
             }),
         }
     }
@@ -1210,8 +1252,20 @@ impl DsCopeCalibration {
                 vga_gain: 0x0006_9d00,
                 vpos_trans: OFFSET_PWM_SPAN as u16,
                 comb_comp: 0,
+                fine_gain_codes: [0; 4],
+                comb_fine_gain_codes: [0; 4],
             }; CHANNEL_COUNT],
         }
+    }
+
+    fn adc_fine_gain_codes(self, single_channel: bool) -> [[u8; 4]; CHANNEL_COUNT] {
+        self.channels.map(|channel| {
+            if single_channel {
+                channel.comb_fine_gain_codes
+            } else {
+                channel.fine_gain_codes
+            }
+        })
     }
 }
 
@@ -1330,6 +1384,14 @@ fn parse_channel_calibration(
     let vga_gain = u32::from(read_u16(vga_record, table_offset)) << 8;
     let vpos_trans = read_u16(zero_record, CALIBRATION_VPOS_TRANS_OFFSET);
     let comb_comp = zero_record[CALIBRATION_COMB_COMP_OFFSET];
+    let fine_gain_codes = zero_record
+        [CALIBRATION_FINE_GAIN_OFFSET..CALIBRATION_COMB_FINE_GAIN_OFFSET]
+        .try_into()
+        .expect("factory fine-gain calibration contains four bytes");
+    let comb_fine_gain_codes = zero_record
+        [CALIBRATION_COMB_FINE_GAIN_OFFSET..CALIBRATION_ZERO_BYTES]
+        .try_into()
+        .expect("factory interleaving fine-gain calibration contains four bytes");
     if preoffset > 1_023
         || vga_gain == 0
         || vga_gain > 0x001f_ff00
@@ -1346,6 +1408,8 @@ fn parse_channel_calibration(
         vga_gain,
         vpos_trans,
         comb_comp,
+        fine_gain_codes,
+        comb_fine_gain_codes,
     })
 }
 
@@ -1827,6 +1891,8 @@ mod tests {
             vga_gains: [[0x100; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
             vpos_trans: [OFFSET_PWM_SPAN as u16; CHANNEL_COUNT],
             comb_comp: [0; CHANNEL_COUNT],
+            fine_gain_codes: [[0; 4]; CHANNEL_COUNT],
+            comb_fine_gain_codes: [[0; 4]; CHANNEL_COUNT],
         };
 
         values.set_preoffset(1, 7, 1_023).unwrap();
@@ -1973,12 +2039,16 @@ mod tests {
                     vga_gain: 0x0006_a100,
                     vpos_trans: OFFSET_PWM_SPAN as u16,
                     comb_comp: 0,
+                    fine_gain_codes: [0; 4],
+                    comb_fine_gain_codes: [0; 4],
                 },
                 DsCopeChannelCalibration {
                     preoffset: 83,
                     vga_gain: 0x0006_9700,
                     vpos_trans: OFFSET_PWM_SPAN as u16,
                     comb_comp: 0,
+                    fine_gain_codes: [0; 4],
+                    comb_fine_gain_codes: [0; 4],
                 },
             ],
         };
@@ -2030,12 +2100,16 @@ mod tests {
                     vga_gain: 0x0006_a100,
                     vpos_trans: OFFSET_PWM_SPAN as u16,
                     comb_comp: 0,
+                    fine_gain_codes: [0; 4],
+                    comb_fine_gain_codes: [0; 4],
                 },
                 DsCopeChannelCalibration {
                     preoffset: 83,
                     vga_gain: 0x0006_9700,
                     vpos_trans: OFFSET_PWM_SPAN as u16,
                     comb_comp: 0,
+                    fine_gain_codes: [0; 4],
+                    comb_fine_gain_codes: [0; 4],
                 },
             ],
         };
@@ -2053,6 +2127,8 @@ mod tests {
             vga_gain: 0x0006_9d00,
             vpos_trans: 812,
             comb_comp: 9,
+            fine_gain_codes: [0; 4],
+            comb_fine_gain_codes: [0; 4],
         };
         let dual_channel = offset_command(0x10, DSCOPE_VERTICAL_OFFSET_CENTER, calibration, false);
         let expected_pwm = u64::from(DSCOPE_VERTICAL_OFFSET_CENTER) * 812 / 255;
@@ -2065,6 +2141,59 @@ mod tests {
             offset_command(0x10, 200, calibration, true),
             offset_command(0x10, 200, calibration, false)
         );
+    }
+
+    #[test]
+    fn applies_interleaving_gain_compensation_for_either_single_channel() {
+        let calibration = DsCopeCalibration {
+            channels: [
+                DsCopeChannelCalibration {
+                    preoffset: 60,
+                    vga_gain: 0x0006_9d00,
+                    vpos_trans: OFFSET_PWM_SPAN as u16,
+                    comb_comp: 9,
+                    fine_gain_codes: [0; 4],
+                    comb_fine_gain_codes: [0; 4],
+                },
+                DsCopeChannelCalibration {
+                    preoffset: 60,
+                    vga_gain: 0x0006_a100,
+                    vpos_trans: OFFSET_PWM_SPAN as u16,
+                    comb_comp: 13,
+                    fine_gain_codes: [0; 4],
+                    comb_fine_gain_codes: [0; 4],
+                },
+            ],
+        };
+        let dual_channel =
+            DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).unwrap();
+        let channel_zero_only = DsCopeCaptureConfig::with_channel_configs(
+            1_000_000,
+            100_000,
+            [
+                DsCopeChannelConfig::default(),
+                DsCopeChannelConfig::default().with_enabled(false),
+            ],
+        )
+        .unwrap();
+        let channel_one_only = DsCopeCaptureConfig::with_channel_configs(
+            1_000_000,
+            100_000,
+            [
+                DsCopeChannelConfig::default().with_enabled(false),
+                DsCopeChannelConfig::default(),
+            ],
+        )
+        .unwrap();
+
+        let dual_commands = dso_commands(dual_channel, calibration);
+        let channel_zero_commands = dso_commands(channel_zero_only, calibration);
+        let channel_one_commands = dso_commands(channel_one_only, calibration);
+
+        assert_eq!(dual_commands[3], 0x0006_9d08);
+        assert_eq!(dual_commands[4], 0x0006_a188);
+        assert_eq!(channel_zero_commands[3], 0x0006_a608);
+        assert_eq!(channel_one_commands[4], 0x0006_ae88);
     }
 
     #[test]
@@ -2087,6 +2216,10 @@ mod tests {
         zero_record[CALIBRATION_VPOS_TRANS_OFFSET..CALIBRATION_VPOS_TRANS_OFFSET + 2]
             .copy_from_slice(&812_u16.to_le_bytes());
         zero_record[CALIBRATION_COMB_COMP_OFFSET] = 9;
+        zero_record[CALIBRATION_FINE_GAIN_OFFSET..CALIBRATION_COMB_FINE_GAIN_OFFSET]
+            .copy_from_slice(&[1, 2, 3, 4]);
+        zero_record[CALIBRATION_COMB_FINE_GAIN_OFFSET..CALIBRATION_ZERO_BYTES]
+            .copy_from_slice(&[5, 6, 7, 8]);
         vga_record[13..15].copy_from_slice(&0x06a1_u16.to_le_bytes());
 
         let calibration = parse_channel_calibration(1, 6, &zero_record, &vga_record).unwrap();
@@ -2095,6 +2228,22 @@ mod tests {
         assert_eq!(calibration.vga_gain, 0x0006_a100);
         assert_eq!(calibration.vpos_trans, 812);
         assert_eq!(calibration.comb_comp, 9);
+        assert_eq!(calibration.fine_gain_codes, [1, 2, 3, 4]);
+        assert_eq!(calibration.comb_fine_gain_codes, [5, 6, 7, 8]);
+        assert_eq!(
+            DsCopeCalibration {
+                channels: [calibration; CHANNEL_COUNT]
+            }
+            .adc_fine_gain_codes(false),
+            [[1, 2, 3, 4]; CHANNEL_COUNT]
+        );
+        assert_eq!(
+            DsCopeCalibration {
+                channels: [calibration; CHANNEL_COUNT]
+            }
+            .adc_fine_gain_codes(true),
+            [[5, 6, 7, 8]; CHANNEL_COUNT]
+        );
     }
 
     #[test]

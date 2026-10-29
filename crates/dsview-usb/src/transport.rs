@@ -545,14 +545,27 @@ impl UsbDeviceSession {
             }
         }
 
-        // Default fine-gain calibration is unity on all four ADC branches.
-        for branch in 0_u8..4 {
-            for value in [0x00, 0x00, 0x00, 0x34 + branch] {
+        // Start from unity. Factory fine-gain values are applied after the
+        // channel calibration record has been read.
+        for command in dscope_adc_fine_gain_commands([[0; 4]; 2]) {
+            for value in command {
                 self.write_control(I2C_REGISTER_DESTINATION, ANALOG_CONTROL_REGISTER, &[value])?;
             }
         }
         for register in (ANALOG_CONTROL_REGISTER + 3)..=(ANALOG_CONTROL_REGISTER + 6) {
             self.write_control(I2C_REGISTER_DESTINATION, register, &[0])?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn configure_dscope_adc_fine_gains(
+        &self,
+        gain_codes: [[u8; 4]; 2],
+    ) -> Result<(), UsbError> {
+        for command in dscope_adc_fine_gain_commands(gain_codes) {
+            for value in command {
+                self.write_control(I2C_REGISTER_DESTINATION, ANALOG_CONTROL_REGISTER, &[value])?;
+            }
         }
         Ok(())
     }
@@ -805,6 +818,19 @@ fn control_read_header(destination: u8, offset: u16, size: u8) -> [u8; 4] {
     [destination, offset_low, offset_high, size]
 }
 
+fn dscope_adc_fine_gain_commands(gain_codes: [[u8; 4]; 2]) -> [[u8; 4]; 4] {
+    std::array::from_fn(|branch| {
+        let channel = branch / 2;
+        let pair = (branch % 2) * 2;
+        [
+            0,
+            gain_codes[channel][pair],
+            gain_codes[channel][pair + 1],
+            0x34 + branch as u8,
+        ]
+    })
+}
+
 fn validate_bitstream(bitstream: &[u8]) -> Result<(), UsbError> {
     if bitstream.len() > MAX_BITSTREAM_SIZE {
         return Err(UsbError::new(format!(
@@ -873,6 +899,19 @@ mod tests {
     #[test]
     fn encodes_control_read_header_in_protocol_order() {
         assert_eq!(control_read_header(0x12, 0x3456, 7), [0x12, 0x56, 0x34, 7]);
+    }
+
+    #[test]
+    fn maps_dscope_factory_fine_gains_to_all_adc_branches() {
+        assert_eq!(
+            dscope_adc_fine_gain_commands([[1, 2, 3, 4], [5, 6, 7, 8]]),
+            [
+                [0, 1, 2, 0x34],
+                [0, 3, 4, 0x35],
+                [0, 5, 6, 0x36],
+                [0, 7, 8, 0x37],
+            ]
+        );
     }
 
     #[test]
