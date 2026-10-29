@@ -4,6 +4,7 @@ use dsview_core::{
     CaptureBatch, CaptureContext, CaptureError, CaptureSource, DeviceDescriptor, DeviceId,
     InstrumentKind, ScopeBatch,
 };
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 const CHANNEL_COUNT: usize = 2;
@@ -670,6 +671,20 @@ pub struct DsCopeCaptureSource {
     device: DiscoveredDevice,
     config: DsCopeCaptureConfig,
     descriptor: DeviceDescriptor,
+    runtime_trigger_receiver: Option<Receiver<DsCopeTriggerConfig>>,
+}
+
+#[derive(Clone)]
+pub struct DsCopeRuntimeTriggerControl {
+    sender: Sender<DsCopeTriggerConfig>,
+}
+
+impl DsCopeRuntimeTriggerControl {
+    pub fn update(&self, trigger: DsCopeTriggerConfig) -> Result<(), CaptureError> {
+        self.sender
+            .send(trigger)
+            .map_err(|_| CaptureError::new("DSCope capture is no longer running"))
+    }
 }
 
 pub fn apply_dscope_configuration(
@@ -940,7 +955,18 @@ impl DsCopeCaptureSource {
             device,
             config,
             descriptor,
+            runtime_trigger_receiver: None,
         })
+    }
+
+    pub fn with_runtime_trigger_control(
+        device: DiscoveredDevice,
+        config: DsCopeCaptureConfig,
+    ) -> Result<(Self, DsCopeRuntimeTriggerControl), CaptureError> {
+        let mut source = Self::new(device, config)?;
+        let (sender, receiver) = mpsc::channel();
+        source.runtime_trigger_receiver = Some(receiver);
+        Ok((source, DsCopeRuntimeTriggerControl { sender }))
     }
 }
 
@@ -951,7 +977,12 @@ impl CaptureSource for DsCopeCaptureSource {
 
     fn run(self: Box<Self>, context: CaptureContext) -> Result<(), CaptureError> {
         let session = UsbDeviceSession::open(&self.device).map_err(capture_error)?;
-        let capture_result = run_capture(&session, self.config, &context);
+        let capture_result = run_capture(
+            &session,
+            self.config,
+            &context,
+            self.runtime_trigger_receiver.as_ref(),
+        );
         let close_result = session.close().map_err(capture_error);
         combine_results(capture_result, close_result, "release the USB interface")
     }
@@ -959,8 +990,9 @@ impl CaptureSource for DsCopeCaptureSource {
 
 fn run_capture(
     session: &UsbDeviceSession,
-    config: DsCopeCaptureConfig,
+    mut config: DsCopeCaptureConfig,
     context: &CaptureContext,
+    runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
 ) -> Result<(), CaptureError> {
     validate_device_ready(session)?;
     session.stop_capture().map_err(capture_error)?;
@@ -970,7 +1002,14 @@ fn run_capture(
             .arm_capture(&config.encode_settings())
             .map_err(capture_error)?;
         configure_scope_post_arm(session, config, calibration)?;
-        let Some(capture) = read_prequeued_capture(session, config, context)? else {
+        let Some(capture) = read_prequeued_capture(
+            session,
+            &mut config,
+            calibration,
+            context,
+            runtime_trigger_receiver,
+        )?
+        else {
             return Ok(());
         };
         decode_capture(capture, config, context)
@@ -1318,8 +1357,10 @@ struct RawScopeCapture {
 
 fn read_prequeued_capture(
     session: &UsbDeviceSession,
-    config: DsCopeCaptureConfig,
+    config: &mut DsCopeCaptureConfig,
+    calibration: DsCopeCalibration,
     context: &CaptureContext,
+    runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
 ) -> Result<Option<RawScopeCapture>, CaptureError> {
     let payload_bytes = usize::try_from(config.armed_sample_count())
         .ok()
@@ -1356,10 +1397,13 @@ fn read_prequeued_capture(
 
     let capture_time =
         Duration::from_secs_f64(config.sample_count as f64 / config.sample_rate_hz as f64);
-    let deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
+    let mut deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
     let mut cancelled = false;
     let mut timeout_error = None;
     while !header_read.is_complete() || !payload_read.is_complete() {
+        if apply_pending_runtime_trigger(session, config, calibration, runtime_trigger_receiver)? {
+            deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
+        }
         if !cancelled && timeout_error.is_none() && context.is_cancelled() {
             cancelled = true;
             let _ = session.force_capture_ready();
@@ -1399,8 +1443,11 @@ fn read_prequeued_capture(
     // driver discards those pending frames and resubmits the data transfer.
     // Keep the trigger header from the initial transfer and do the same here.
     loop {
+        if apply_pending_runtime_trigger(session, config, calibration, runtime_trigger_receiver)? {
+            deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
+        }
         let footer = &payload[payload_bytes - MEASUREMENT_FOOTER_BYTES..];
-        if ScopeMeasurement::is_ready(footer, config) {
+        if ScopeMeasurement::is_ready(footer, *config) {
             return Ok(Some(RawScopeCapture {
                 trigger_header,
                 payload,
@@ -1422,6 +1469,14 @@ fn read_prequeued_capture(
             .queue_bulk_read(payload_bytes)
             .map_err(capture_error)?;
         while !next_payload_read.is_complete() {
+            if apply_pending_runtime_trigger(
+                session,
+                config,
+                calibration,
+                runtime_trigger_receiver,
+            )? {
+                deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
+            }
             if context.is_cancelled() {
                 let _ = session.force_capture_ready();
                 next_payload_read.cancel().map_err(capture_error)?;
@@ -1454,6 +1509,45 @@ fn read_prequeued_capture(
             payload_bytes,
         )?;
     }
+}
+
+fn latest_runtime_trigger(receiver: &Receiver<DsCopeTriggerConfig>) -> Option<DsCopeTriggerConfig> {
+    let mut latest = None;
+    loop {
+        match receiver.try_recv() {
+            Ok(trigger) => latest = Some(trigger),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return latest,
+        }
+    }
+}
+
+fn apply_runtime_trigger(
+    session: &UsbDeviceSession,
+    config: DsCopeCaptureConfig,
+    calibration: DsCopeCalibration,
+    trigger: DsCopeTriggerConfig,
+) -> Result<DsCopeCaptureConfig, CaptureError> {
+    let updated = config.with_trigger_config(trigger)?;
+    let commands = dso_commands(updated, calibration);
+    for index in [8, 9, 10, 11, 12, 13] {
+        session
+            .write_dso_command(commands[index])
+            .map_err(capture_error)?;
+    }
+    Ok(updated)
+}
+
+fn apply_pending_runtime_trigger(
+    session: &UsbDeviceSession,
+    config: &mut DsCopeCaptureConfig,
+    calibration: DsCopeCalibration,
+    receiver: Option<&Receiver<DsCopeTriggerConfig>>,
+) -> Result<bool, CaptureError> {
+    let Some(trigger) = receiver.and_then(latest_runtime_trigger) else {
+        return Ok(false);
+    };
+    *config = apply_runtime_trigger(session, *config, calibration, trigger)?;
+    Ok(true)
 }
 
 fn require_scope_payload(
@@ -1698,6 +1792,26 @@ mod tests {
     use super::*;
 
     const MAX_DUAL_CHANNEL_SAMPLE_COUNT: u64 = MAX_TOTAL_SAMPLE_COUNT / 2;
+
+    #[test]
+    fn runtime_trigger_queue_coalesces_to_the_latest_settings() {
+        let (sender, receiver) = mpsc::channel();
+        let first = DsCopeTriggerConfig::default()
+            .with_position_percent(25)
+            .unwrap();
+        let latest =
+            DsCopeTriggerConfig::new(DsCopeTriggerSource::ChannelOne, DsCopeTriggerSlope::Falling)
+                .with_position_percent(75)
+                .unwrap()
+                .with_channel_level(1, 180)
+                .unwrap();
+
+        sender.send(first).unwrap();
+        sender.send(latest).unwrap();
+
+        assert_eq!(latest_runtime_trigger(&receiver), Some(latest));
+        assert_eq!(latest_runtime_trigger(&receiver), None);
+    }
 
     #[test]
     fn validates_sample_rate_against_enabled_channel_count() {

@@ -9,13 +9,13 @@ use dsview_usb::{
     apply_dscope_configuration, auto_calibrate_dscope, discover_supported_devices, prepare_device,
     read_dscope_calibration, write_dscope_calibration, DeviceModel, DiscoveredDevice,
     DsCopeBandwidthLimit, DsCopeCalibrationValues, DsCopeCaptureConfig, DsCopeCaptureSource,
-    DsCopeChannelConfig, DsCopeCoupling, DsCopeOperationMode, DsCopeTriggerConfig,
-    DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig, DsLogicCaptureSource,
-    LinkStatus, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ, DSCOPE_TRIGGER_HOLDOFF_MAX_NS,
-    DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
-    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
-    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
-    DSCOPE_VOLTS_PER_DIV_MV,
+    DsCopeChannelConfig, DsCopeCoupling, DsCopeOperationMode, DsCopeRuntimeTriggerControl,
+    DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig,
+    DsLogicCaptureSource, LinkStatus, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
+    DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
+    DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
+    DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
+    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -594,6 +594,7 @@ fn extend_bounded<T>(destination: &mut VecDeque<T>, values: impl IntoIterator<It
 struct ActiveCapture {
     session: CaptureSession,
     scope_config: DsCopeCaptureConfig,
+    scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     stats: HashMap<DeviceId, DeviceStats>,
     stopped: HashSet<DeviceId>,
     waveforms: WaveformStore,
@@ -614,6 +615,7 @@ enum WorkerSuccess {
     Capture {
         session: CaptureSession,
         scope_config: DsCopeCaptureConfig,
+        scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     },
     ScopeConfigured(usize),
     ScopeAutoCalibrated,
@@ -729,10 +731,11 @@ impl DsViewApp {
         self.status = format!("Preparing {} instrument(s)…", devices.len());
         self.last_error = None;
         thread::spawn(move || {
-            let result = start_capture(devices, &resource_directory, scope_config).map(|session| {
+            let result = start_capture(devices, &resource_directory, scope_config).map(|started| {
                 WorkerSuccess::Capture {
-                    session,
+                    session: started.session,
                     scope_config,
+                    scope_trigger_controls: started.scope_trigger_controls,
                 }
             });
             let _ = sender.send(result);
@@ -959,6 +962,7 @@ impl DsViewApp {
             Ok(WorkerSuccess::Capture {
                 session,
                 scope_config,
+                scope_trigger_controls,
             }) => {
                 let count = session.descriptors().len();
                 let recording_path = self
@@ -987,6 +991,7 @@ impl DsViewApp {
                 self.capture = Some(ActiveCapture {
                     session,
                     scope_config,
+                    scope_trigger_controls,
                     stats: HashMap::new(),
                     stopped: HashSet::new(),
                     waveforms: WaveformStore::default(),
@@ -1549,6 +1554,7 @@ fn paint_capture_settings(
     scope_settings: &mut ScopeCaptureSettings,
     scope_channel_colors: &mut [Color32; 2],
     enabled: bool,
+    trigger_enabled: bool,
     calibration_action: &mut Option<ScopeCalibrationAction>,
 ) {
     let card_width = ui.available_width();
@@ -1714,7 +1720,7 @@ fn paint_capture_settings(
                         ui,
                         &mut scope_settings.trigger,
                         channel_enabled,
-                        enabled,
+                        trigger_enabled,
                     );
                     ui.add_space(8.0);
                     for (index, channel) in scope_settings.channels.iter_mut().enumerate() {
@@ -1785,6 +1791,11 @@ impl eframe::App for DsViewApp {
         let mut stop_clicked = false;
         let mut calibration_action = None;
         let capture_settings_enabled = !self.is_busy();
+        let trigger_controls_enabled = self.pending.is_none()
+            && self
+                .capture
+                .as_ref()
+                .map_or(true, |active| !active.scope_trigger_controls.is_empty());
         let scope_settings_before_ui = self.scope_settings;
 
         egui::TopBottomPanel::top("toolbar")
@@ -1865,6 +1876,7 @@ impl eframe::App for DsViewApp {
                                 &mut self.scope_settings,
                                 &mut self.scope_channel_colors,
                                 capture_settings_enabled,
+                                trigger_controls_enabled,
                                 &mut calibration_action,
                             );
                         }
@@ -2060,6 +2072,7 @@ impl eframe::App for DsViewApp {
                                         vertical_offsets: &mut scope_vertical_offsets,
                                         trigger_settings: &mut scope_trigger_settings,
                                         offset_controls_enabled: capture_settings_enabled,
+                                        trigger_controls_enabled,
                                     },
                                 )
                             },
@@ -2079,6 +2092,7 @@ impl eframe::App for DsViewApp {
                                 vertical_offsets: &mut scope_vertical_offsets,
                                 trigger_settings: &mut scope_trigger_settings,
                                 offset_controls_enabled: capture_settings_enabled,
+                                trigger_controls_enabled,
                             },
                         );
                     }
@@ -2324,7 +2338,38 @@ impl eframe::App for DsViewApp {
         if let Some(values) = save_manual_values {
             self.begin_save_manual_calibration(values);
         }
-        if self
+        let trigger_changed = self
+            .scope_settings
+            .trigger
+            .hardware_differs_from(scope_settings_before_ui.trigger);
+        if trigger_changed && self.capture.is_some() {
+            let update_result = self
+                .scope_settings
+                .trigger
+                .capture_config()
+                .and_then(|trigger| {
+                    let Some(active) = self.capture.as_mut() else {
+                        return Err("capture ended before the trigger update".to_owned());
+                    };
+                    let updated_config = active
+                        .scope_config
+                        .with_trigger_config(trigger)
+                        .map_err(|error| error.to_string())?;
+                    for control in &active.scope_trigger_controls {
+                        control.update(trigger).map_err(|error| error.to_string())?;
+                    }
+                    active.scope_config = updated_config;
+                    Ok(())
+                });
+            match update_result {
+                Ok(()) => {
+                    self.scope_configuration_due = None;
+                    self.status = "Updating trigger during capture…".to_owned();
+                    self.last_error = None;
+                }
+                Err(error) => self.set_error(error),
+            }
+        } else if self
             .scope_settings
             .frontend_differs_from(scope_settings_before_ui)
         {
@@ -2508,14 +2553,20 @@ fn append_error(error: &mut Option<String>, additional: String) {
     }
 }
 
+struct StartedCapture {
+    session: CaptureSession,
+    scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
+}
+
 fn start_capture(
     devices: Vec<DiscoveredDevice>,
     resource_directory: &Path,
     scope_config: DsCopeCaptureConfig,
-) -> Result<CaptureSession, String> {
+) -> Result<StartedCapture, String> {
     let logic_config = DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)
         .map_err(|error| error.to_string())?;
     let mut sources = Vec::<Box<dyn CaptureSource>>::with_capacity(devices.len());
+    let mut scope_trigger_controls = Vec::new();
     for device in devices {
         if device.link_status() == LinkStatus::Unsupported {
             return Err(format!(
@@ -2530,13 +2581,20 @@ fn start_capture(
                 DsLogicCaptureSource::new(device, logic_config)
                     .map_err(|error| error.to_string())?,
             )),
-            DeviceModel::DsCopeU3P100 => sources.push(Box::new(
-                DsCopeCaptureSource::new(device, scope_config)
-                    .map_err(|error| error.to_string())?,
-            )),
+            DeviceModel::DsCopeU3P100 => {
+                let (source, control) =
+                    DsCopeCaptureSource::with_runtime_trigger_control(device, scope_config)
+                        .map_err(|error| error.to_string())?;
+                sources.push(Box::new(source));
+                scope_trigger_controls.push(control);
+            }
         }
     }
-    CaptureCoordinator::start(sources).map_err(|error| error.to_string())
+    let session = CaptureCoordinator::start(sources).map_err(|error| error.to_string())?;
+    Ok(StartedCapture {
+        session,
+        scope_trigger_controls,
+    })
 }
 
 fn configure_style(context: &egui::Context) {
@@ -2564,6 +2622,7 @@ struct ScopeWaveformOptions<'a> {
     vertical_offsets: &'a mut [u16; 2],
     trigger_settings: &'a mut ScopeTriggerSettings,
     offset_controls_enabled: bool,
+    trigger_controls_enabled: bool,
 }
 
 fn waveform_card_fill(
@@ -3803,6 +3862,7 @@ fn paint_scope(
         vertical_offsets,
         trigger_settings,
         offset_controls_enabled,
+        trigger_controls_enabled,
     } = scope_options;
     for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
         channel.vertical_offset = vertical_offset;
@@ -3870,7 +3930,7 @@ fn paint_scope(
         trigger_settings,
         channel_colors,
         vertical_offsets,
-        offset_controls_enabled,
+        trigger_controls_enabled,
     );
     for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
         channel.vertical_offset = vertical_offset;
@@ -3910,7 +3970,7 @@ fn paint_scope(
             time_ruler,
             plot,
             trigger_settings,
-            offset_controls_enabled,
+            trigger_controls_enabled,
             viewport,
         );
         return;
@@ -3979,7 +4039,7 @@ fn paint_scope(
         time_ruler,
         plot,
         trigger_settings,
-        offset_controls_enabled,
+        trigger_controls_enabled,
         viewport,
     );
 }
