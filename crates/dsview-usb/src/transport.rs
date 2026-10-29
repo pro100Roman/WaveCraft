@@ -561,8 +561,31 @@ impl UsbDeviceSession {
         self.write_control(I2C_DSO_DESTINATION, 0, &command.to_le_bytes())
     }
 
+    pub(crate) fn set_dscope_bandwidth_limit(
+        &self,
+        limit: crate::dscope::DsCopeBandwidthLimit,
+    ) -> Result<(), UsbError> {
+        let pulse = match limit {
+            crate::dscope::DsCopeBandwidthLimit::Full => 1 << 6,
+            crate::dscope::DsCopeBandwidthLimit::Mhz20 => 1 << 5,
+        };
+        self.write_control(I2C_REGISTER_DESTINATION, CONTROL_REGISTER_ZERO, &[pulse])
+    }
+
     pub(crate) fn read_dscope_nvm(&self, address: u16, data: &mut [u8]) -> Result<(), UsbError> {
         self.read_control(NVM_DESTINATION, address, data)
+    }
+
+    pub(crate) fn write_dscope_nvm(&self, address: u16, data: &[u8]) -> Result<(), UsbError> {
+        self.write_control(NVM_DESTINATION, address, data)
+    }
+
+    pub(crate) fn set_dscope_nvm_write_enabled(&self, enabled: bool) -> Result<(), UsbError> {
+        self.write_control(
+            I2C_REGISTER_DESTINATION,
+            CONTROL_REGISTER_ZERO,
+            &[u8::from(enabled)],
+        )
     }
 
     pub(crate) fn configure_dscope_channels(

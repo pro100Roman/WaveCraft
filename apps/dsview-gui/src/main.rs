@@ -6,15 +6,16 @@ use dsview_core::{
 };
 use dsview_recording::{CompletionStatus, RecordingWriter};
 use dsview_usb::{
-    apply_dscope_configuration, discover_supported_devices, prepare_device, DeviceModel,
-    DiscoveredDevice, DsCopeCaptureConfig, DsCopeCaptureSource, DsCopeChannelConfig,
-    DsCopeCoupling, DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource,
-    DsLogicCaptureConfig, DsLogicCaptureSource, LinkStatus, DSCOPE_SAMPLE_COUNTS,
-    DSCOPE_SAMPLE_RATES_HZ, DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_CENTER,
-    DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
-    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
-    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
-    DSCOPE_VOLTS_PER_DIV_MV,
+    apply_dscope_configuration, auto_calibrate_dscope, discover_supported_devices, prepare_device,
+    read_dscope_calibration, write_dscope_calibration, DeviceModel, DiscoveredDevice,
+    DsCopeBandwidthLimit, DsCopeCalibrationValues, DsCopeCaptureConfig, DsCopeCaptureSource,
+    DsCopeChannelConfig, DsCopeCoupling, DsCopeOperationMode, DsCopeTriggerConfig,
+    DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig, DsLogicCaptureSource,
+    LinkStatus, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ, DSCOPE_TRIGGER_HOLDOFF_MAX_NS,
+    DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
+    DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
+    DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
+    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -195,6 +196,8 @@ struct ScopeCaptureSettings {
     sample_count: u64,
     channels: [ScopeChannelSettings; 2],
     trigger: ScopeTriggerSettings,
+    operation_mode: DsCopeOperationMode,
+    bandwidth_limit: DsCopeBandwidthLimit,
 }
 
 impl Default for ScopeCaptureSettings {
@@ -204,6 +207,8 @@ impl Default for ScopeCaptureSettings {
             sample_count: SAMPLE_COUNT,
             channels: [ScopeChannelSettings::default(); 2],
             trigger: ScopeTriggerSettings::default(),
+            operation_mode: DsCopeOperationMode::Normal,
+            bandwidth_limit: DsCopeBandwidthLimit::Full,
         }
     }
 }
@@ -226,6 +231,7 @@ impl ScopeCaptureSettings {
             .map_err(|error| error.to_string())?
             .with_trigger_config(self.trigger.capture_config()?)
             .map_err(|error| error.to_string())
+            .map(|config| config.with_options(self.operation_mode, self.bandwidth_limit))
     }
 
     fn enabled_channel_count(self) -> usize {
@@ -260,6 +266,8 @@ impl ScopeCaptureSettings {
 
     fn frontend_differs_from(self, other: Self) -> bool {
         self.sample_rate_hz != other.sample_rate_hz
+            || self.operation_mode != other.operation_mode
+            || self.bandwidth_limit != other.bandwidth_limit
             || self
                 .channels
                 .iter()
@@ -285,8 +293,21 @@ impl ScopeCaptureSettings {
                 vertical_offset: channel.vertical_offset(),
             }),
             trigger: ScopeTriggerSettings::from_capture_config(config.trigger()),
+            operation_mode: config.operation_mode(),
+            bandwidth_limit: config.bandwidth_limit(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeCalibrationAction {
+    Auto,
+    Manual,
+}
+
+struct ManualCalibrationEditor {
+    values: DsCopeCalibrationValues,
+    range: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -492,6 +513,9 @@ enum WorkerSuccess {
         scope_config: DsCopeCaptureConfig,
     },
     ScopeConfigured(usize),
+    ScopeAutoCalibrated,
+    ScopeCalibrationLoaded(DsCopeCalibrationValues),
+    ScopeCalibrationSaved,
 }
 
 type WorkerResult = Result<WorkerSuccess, String>;
@@ -499,6 +523,8 @@ type WorkerResult = Result<WorkerSuccess, String>;
 struct DsViewApp {
     resource_directory: String,
     settings_open: bool,
+    auto_calibration_confirmation_open: bool,
+    manual_calibration: Option<ManualCalibrationEditor>,
     record_capture: bool,
     recording_path: String,
     devices: Vec<DeviceEntry>,
@@ -524,6 +550,8 @@ impl DsViewApp {
         let mut app = Self {
             resource_directory: default_resource_directory(),
             settings_open: false,
+            auto_calibration_confirmation_open: false,
+            manual_calibration: None,
             record_capture: false,
             recording_path: "capture.dsv".to_owned(),
             devices: Vec::new(),
@@ -653,6 +681,113 @@ impl DsViewApp {
         });
     }
 
+    fn selected_scope_device(&mut self) -> Option<DiscoveredDevice> {
+        let devices = self
+            .devices
+            .iter()
+            .filter(|entry| {
+                entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100
+            })
+            .map(|entry| entry.device.clone())
+            .collect::<Vec<_>>();
+        if devices.len() != 1 {
+            self.last_error =
+                Some("Select exactly one connected DSCope U3P100 for calibration".to_owned());
+            return None;
+        }
+        devices.into_iter().next()
+    }
+
+    fn begin_auto_calibration(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(device) = self.selected_scope_device() else {
+            return;
+        };
+        let scope_config = match self.scope_settings.capture_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.last_error = Some(error);
+                return;
+            }
+        };
+        let resource_directory = PathBuf::from(self.resource_directory.trim());
+        let (sender, receiver) = mpsc::channel();
+        self.scope_configuration_due = None;
+        self.pending = Some(receiver);
+        self.status = "Auto-calibrating DSCope across all input ranges…".to_owned();
+        self.last_error = None;
+        thread::spawn(move || {
+            let result = (|| {
+                let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
+                prepare_device(&device, &bitstream_path).map_err(|error| error.to_string())?;
+                auto_calibrate_dscope(&device).map_err(|error| error.to_string())?;
+                apply_dscope_configuration(&device, scope_config)
+                    .map_err(|error| error.to_string())?;
+                Ok(WorkerSuccess::ScopeAutoCalibrated)
+            })();
+            let _ = sender.send(result);
+        });
+    }
+
+    fn begin_manual_calibration(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(device) = self.selected_scope_device() else {
+            return;
+        };
+        let resource_directory = PathBuf::from(self.resource_directory.trim());
+        let (sender, receiver) = mpsc::channel();
+        self.scope_configuration_due = None;
+        self.pending = Some(receiver);
+        self.status = "Loading DSCope calibration values…".to_owned();
+        self.last_error = None;
+        thread::spawn(move || {
+            let result = (|| {
+                let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
+                prepare_device(&device, &bitstream_path).map_err(|error| error.to_string())?;
+                let values = read_dscope_calibration(&device).map_err(|error| error.to_string())?;
+                Ok(WorkerSuccess::ScopeCalibrationLoaded(values))
+            })();
+            let _ = sender.send(result);
+        });
+    }
+
+    fn begin_save_manual_calibration(&mut self, values: DsCopeCalibrationValues) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(device) = self.selected_scope_device() else {
+            return;
+        };
+        let scope_config = match self.scope_settings.capture_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.last_error = Some(error);
+                return;
+            }
+        };
+        let resource_directory = PathBuf::from(self.resource_directory.trim());
+        let (sender, receiver) = mpsc::channel();
+        self.scope_configuration_due = None;
+        self.pending = Some(receiver);
+        self.status = "Saving DSCope calibration values to device NVM…".to_owned();
+        self.last_error = None;
+        thread::spawn(move || {
+            let result = (|| {
+                let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
+                prepare_device(&device, &bitstream_path).map_err(|error| error.to_string())?;
+                write_dscope_calibration(&device, values).map_err(|error| error.to_string())?;
+                apply_dscope_configuration(&device, scope_config)
+                    .map_err(|error| error.to_string())?;
+                Ok(WorkerSuccess::ScopeCalibrationSaved)
+            })();
+            let _ = sender.send(result);
+        });
+    }
+
     fn stop_capture(&mut self) {
         let Some(mut active) = self.capture.take() else {
             return;
@@ -766,6 +901,17 @@ impl DsViewApp {
             Ok(WorkerSuccess::ScopeConfigured(device_count)) => {
                 self.status =
                     format!("Applied DSCope configuration to {device_count} instrument(s)");
+            }
+            Ok(WorkerSuccess::ScopeAutoCalibrated) => {
+                self.status = "DSCope auto calibration completed and verified".to_owned();
+            }
+            Ok(WorkerSuccess::ScopeCalibrationLoaded(values)) => {
+                self.manual_calibration = Some(ManualCalibrationEditor { values, range: 0 });
+                self.status = "Loaded DSCope calibration values".to_owned();
+            }
+            Ok(WorkerSuccess::ScopeCalibrationSaved) => {
+                self.manual_calibration = None;
+                self.status = "DSCope manual calibration saved and verified".to_owned();
             }
             Err(error) => self.set_error(error),
         }
@@ -1291,6 +1437,7 @@ fn paint_capture_settings(
     scope_settings: &mut ScopeCaptureSettings,
     scope_channel_colors: &mut [Color32; 2],
     enabled: bool,
+    calibration_action: &mut Option<ScopeCalibrationAction>,
 ) {
     let card_width = ui.available_width();
     egui::Frame::none()
@@ -1386,6 +1533,69 @@ fn paint_capture_settings(
                             });
                     });
                     ui.add_space(8.0);
+                    egui::CollapsingHeader::new(RichText::new("Options").strong())
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.add_enabled_ui(enabled, |ui| {
+                                egui::Grid::new("dscope_options")
+                                    .num_columns(2)
+                                    .spacing([8.0, 6.0])
+                                    .show(ui, |ui| {
+                                        ui.label("Operating mode");
+                                        egui::ComboBox::from_id_salt("scope_operation_mode")
+                                            .selected_text(match scope_settings.operation_mode {
+                                                DsCopeOperationMode::Normal => "Normal",
+                                                DsCopeOperationMode::InternalTest => {
+                                                    "Internal test"
+                                                }
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut scope_settings.operation_mode,
+                                                    DsCopeOperationMode::Normal,
+                                                    "Normal",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut scope_settings.operation_mode,
+                                                    DsCopeOperationMode::InternalTest,
+                                                    "Internal test",
+                                                );
+                                            });
+                                        ui.end_row();
+
+                                        ui.label("Bandwidth");
+                                        egui::ComboBox::from_id_salt("scope_bandwidth_limit")
+                                            .selected_text(match scope_settings.bandwidth_limit {
+                                                DsCopeBandwidthLimit::Full => "Full",
+                                                DsCopeBandwidthLimit::Mhz20 => "20 MHz",
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut scope_settings.bandwidth_limit,
+                                                    DsCopeBandwidthLimit::Full,
+                                                    "Full",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut scope_settings.bandwidth_limit,
+                                                    DsCopeBandwidthLimit::Mhz20,
+                                                    "20 MHz",
+                                                );
+                                            });
+                                        ui.end_row();
+                                    });
+                                ui.add_space(6.0);
+                                ui.label(RichText::new("Calibration").color(TEXT_MUTED));
+                                ui.horizontal(|ui| {
+                                    if ui.button("Auto…").clicked() {
+                                        *calibration_action = Some(ScopeCalibrationAction::Auto);
+                                    }
+                                    if ui.button("Manual…").clicked() {
+                                        *calibration_action = Some(ScopeCalibrationAction::Manual);
+                                    }
+                                });
+                            });
+                        });
+                    ui.add_space(8.0);
                     let channel_count = scope_settings.channels.len();
                     let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
                     paint_scope_trigger_settings(
@@ -1460,6 +1670,7 @@ impl eframe::App for DsViewApp {
         let mut refresh_clicked = false;
         let mut start_clicked = false;
         let mut stop_clicked = false;
+        let mut calibration_action = None;
         let capture_settings_enabled = !self.is_busy();
         let scope_settings_before_ui = self.scope_settings;
 
@@ -1530,6 +1741,7 @@ impl eframe::App for DsViewApp {
                             &mut self.scope_settings,
                             &mut self.scope_channel_colors,
                             capture_settings_enabled,
+                            &mut calibration_action,
                         );
 
                         ui.add_space(14.0);
@@ -1850,6 +2062,126 @@ impl eframe::App for DsViewApp {
         }
         self.settings_open = settings_open;
 
+        let mut auto_confirmation_open = self.auto_calibration_confirmation_open;
+        let mut auto_confirmed = false;
+        let mut auto_cancelled = false;
+        egui::Window::new("DSCope Auto Calibration")
+            .open(&mut auto_confirmation_open)
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label(RichText::new("Disconnect all probes before continuing.").strong());
+                ui.add_space(6.0);
+                ui.label(
+                    "DSView will measure and adjust both channels across all input ranges, then write and verify the results in device NVM.",
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Do not disconnect the oscilloscope while calibration is running.")
+                        .color(Color32::LIGHT_RED),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        auto_cancelled = true;
+                    }
+                    if ui.button("Start calibration").clicked() {
+                        auto_confirmed = true;
+                    }
+                });
+            });
+        if auto_confirmed || auto_cancelled {
+            auto_confirmation_open = false;
+        }
+        self.auto_calibration_confirmation_open = auto_confirmation_open;
+
+        let mut save_manual_values = None;
+        let mut close_manual = false;
+        if let Some(editor) = self.manual_calibration.as_mut() {
+            let mut manual_open = true;
+            egui::Window::new("DSCope Manual Calibration")
+                .open(&mut manual_open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(430.0)
+                .show(context, |ui| {
+                    ui.label(
+                        "Adjust the stored offset and VGA gain for one input range. Changes reach device NVM only after Save.",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Input range");
+                        egui::ComboBox::from_id_salt("manual_calibration_range")
+                            .selected_text(format!(
+                                "{} mV/div",
+                                DSCOPE_VOLTS_PER_DIV_MV[editor.range]
+                            ))
+                            .show_ui(ui, |ui| {
+                                for (range, value) in
+                                    DSCOPE_VOLTS_PER_DIV_MV.into_iter().enumerate()
+                                {
+                                    ui.selectable_value(
+                                        &mut editor.range,
+                                        range,
+                                        format!("{value} mV/div"),
+                                    );
+                                }
+                            });
+                    });
+                    ui.add_space(8.0);
+                    for channel in 0..2 {
+                        ui.group(|ui| {
+                            ui.label(RichText::new(format!("CH{channel}")).strong());
+                            let mut offset = editor
+                                .values
+                                .preoffset(channel, editor.range)
+                                .expect("manual calibration selection is valid");
+                            ui.horizontal(|ui| {
+                                ui.label("Offset");
+                                ui.add(egui::Slider::new(&mut offset, 0..=1_023));
+                            });
+                            let _ = editor.values.set_preoffset(channel, editor.range, offset);
+
+                            let mut gain = editor
+                                .values
+                                .vga_gain(channel, editor.range)
+                                .expect("manual calibration selection is valid");
+                            ui.horizontal(|ui| {
+                                ui.label("VGA gain");
+                                ui.add(
+                                    egui::DragValue::new(&mut gain)
+                                        .range(1..=0x1fff)
+                                        .speed(1),
+                                );
+                            });
+                            let _ = editor.values.set_vga_gain(channel, editor.range, gain);
+                        });
+                        ui.add_space(6.0);
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Incorrect calibration values can distort measurements. Save only values established with a known reference.",
+                        )
+                        .color(Color32::LIGHT_RED),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            close_manual = true;
+                        }
+                        if ui.button("Save to device").clicked() {
+                            save_manual_values = Some(editor.values);
+                        }
+                    });
+                });
+            if !manual_open {
+                close_manual = true;
+            }
+        }
+        if close_manual {
+            self.manual_calibration = None;
+        }
+
         if refresh_clicked {
             self.begin_refresh();
         }
@@ -1858,6 +2190,19 @@ impl eframe::App for DsViewApp {
         }
         if stop_clicked {
             self.stop_capture();
+        }
+        match calibration_action {
+            Some(ScopeCalibrationAction::Auto) => {
+                self.auto_calibration_confirmation_open = true;
+            }
+            Some(ScopeCalibrationAction::Manual) => self.begin_manual_calibration(),
+            None => {}
+        }
+        if auto_confirmed {
+            self.begin_auto_calibration();
+        }
+        if let Some(values) = save_manual_values {
+            self.begin_save_manual_calibration(values);
         }
         if self
             .scope_settings
@@ -3469,6 +3814,8 @@ mod tests {
                 noise_sensitivity: 12,
                 level: 64,
             },
+            operation_mode: DsCopeOperationMode::InternalTest,
+            bandwidth_limit: DsCopeBandwidthLimit::Mhz20,
         };
 
         let config = settings.capture_config().unwrap();
@@ -3489,6 +3836,8 @@ mod tests {
         assert_eq!(config.trigger().holdoff_ns(), 250_000);
         assert_eq!(config.trigger().noise_sensitivity(), 12);
         assert_eq!(config.trigger().level(), 64);
+        assert_eq!(config.operation_mode(), DsCopeOperationMode::InternalTest);
+        assert_eq!(config.bandwidth_limit(), DsCopeBandwidthLimit::Mhz20);
         assert_eq!(ScopeCaptureSettings::from_capture_config(config), settings);
         assert_eq!(format_voltage(0.1), "100 mV");
         assert_eq!(format_sample_rate(1_000_000), "1.00 MSa/s");
@@ -3534,6 +3883,14 @@ mod tests {
 
         changed = original;
         changed.trigger.level = 64;
+        assert!(changed.frontend_differs_from(original));
+
+        changed = original;
+        changed.operation_mode = DsCopeOperationMode::InternalTest;
+        assert!(changed.frontend_differs_from(original));
+
+        changed = original;
+        changed.bandwidth_limit = DsCopeBandwidthLimit::Mhz20;
         assert!(changed.frontend_differs_from(original));
     }
 

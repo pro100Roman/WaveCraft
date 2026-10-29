@@ -23,6 +23,7 @@ const CALIBRATION_VGA_BYTES: usize = 17;
 const CALIBRATION_FLASH_PAGE_STRIDE: u16 = 8;
 const CALIBRATION_ID_BASE: u8 = 0x40;
 const OFFSET_PWM_SPAN: u64 = 780;
+const INTERNAL_TEST_MODE_BIT: u16 = 1 << 15;
 
 pub const DSCOPE_VERTICAL_OFFSET_MIN: u16 = 10;
 pub const DSCOPE_VERTICAL_OFFSET_CENTER: u16 = 128;
@@ -58,6 +59,97 @@ pub const DSCOPE_SAMPLE_COUNTS: [u64; 7] = [
     10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000,
 ];
 pub const DSCOPE_VOLTS_PER_DIV_MV: [u16; 8] = [10, 20, 50, 100, 200, 500, 1_000, 2_000];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DsCopeCalibrationValues {
+    preoffsets: [[u16; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+    vga_gains: [[u16; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+}
+
+impl DsCopeCalibrationValues {
+    fn settable_value(self, channel: usize, range: usize) -> Result<(), CaptureError> {
+        let preoffset = self.preoffset(channel, range).ok_or_else(|| {
+            CaptureError::new("DSCope calibration offset selection is out of range")
+        })?;
+        let vga_gain = self.vga_gain(channel, range).ok_or_else(|| {
+            CaptureError::new("DSCope calibration gain selection is out of range")
+        })?;
+        if preoffset > 1_023 || vga_gain == 0 || vga_gain > 0x1fff {
+            return Err(CaptureError::new(format!(
+                "invalid DSCope calibration at channel {channel}, range {range}: offset {preoffset}, VGA gain {vga_gain}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn preoffset(self, channel: usize, range: usize) -> Option<u16> {
+        self.preoffsets
+            .get(channel)
+            .and_then(|values| values.get(range))
+            .copied()
+    }
+
+    pub fn vga_gain(self, channel: usize, range: usize) -> Option<u16> {
+        self.vga_gains
+            .get(channel)
+            .and_then(|values| values.get(range))
+            .copied()
+    }
+
+    pub fn set_preoffset(
+        &mut self,
+        channel: usize,
+        range: usize,
+        value: u16,
+    ) -> Result<(), CaptureError> {
+        if value > 1_023 {
+            return Err(CaptureError::new(format!(
+                "DSCope calibration offset must be at most 1023; got {value}"
+            )));
+        }
+        let destination = self
+            .preoffsets
+            .get_mut(channel)
+            .and_then(|values| values.get_mut(range))
+            .ok_or_else(|| CaptureError::new("DSCope calibration selection is out of range"))?;
+        *destination = value;
+        Ok(())
+    }
+
+    pub fn set_vga_gain(
+        &mut self,
+        channel: usize,
+        range: usize,
+        value: u16,
+    ) -> Result<(), CaptureError> {
+        if value == 0 || value > 0x1fff {
+            return Err(CaptureError::new(format!(
+                "DSCope calibration VGA gain must be between 1 and 8191; got {value}"
+            )));
+        }
+        let destination = self
+            .vga_gains
+            .get_mut(channel)
+            .and_then(|values| values.get_mut(range))
+            .ok_or_else(|| CaptureError::new("DSCope calibration selection is out of range"))?;
+        *destination = value;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DsCopeOperationMode {
+    #[default]
+    Normal,
+    InternalTest,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DsCopeBandwidthLimit {
+    #[default]
+    Full,
+    Mhz20,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DsCopeCoupling {
@@ -320,6 +412,8 @@ pub struct DsCopeCaptureConfig {
     sample_count: u64,
     channels: [DsCopeChannelConfig; CHANNEL_COUNT],
     trigger: DsCopeTriggerConfig,
+    operation_mode: DsCopeOperationMode,
+    bandwidth_limit: DsCopeBandwidthLimit,
 }
 
 impl DsCopeCaptureConfig {
@@ -368,6 +462,8 @@ impl DsCopeCaptureConfig {
             sample_count,
             channels,
             trigger,
+            operation_mode: DsCopeOperationMode::Normal,
+            bandwidth_limit: DsCopeBandwidthLimit::Full,
         })
     }
 
@@ -378,6 +474,16 @@ impl DsCopeCaptureConfig {
         validate_trigger_channels(trigger, self.channels)?;
         self.trigger = trigger;
         Ok(self)
+    }
+
+    pub fn with_options(
+        mut self,
+        operation_mode: DsCopeOperationMode,
+        bandwidth_limit: DsCopeBandwidthLimit,
+    ) -> Self {
+        self.operation_mode = operation_mode;
+        self.bandwidth_limit = bandwidth_limit;
+        self
     }
 
     pub fn sample_rate_hz(self) -> u64 {
@@ -394,6 +500,14 @@ impl DsCopeCaptureConfig {
 
     pub fn trigger(self) -> DsCopeTriggerConfig {
         self.trigger
+    }
+
+    pub fn operation_mode(self) -> DsCopeOperationMode {
+        self.operation_mode
+    }
+
+    pub fn bandwidth_limit(self) -> DsCopeBandwidthLimit {
+        self.bandwidth_limit
     }
 
     pub fn enabled_channel_count(self) -> usize {
@@ -435,7 +549,11 @@ impl DsCopeCaptureConfig {
         let mut bytes = Vec::with_capacity(SETTINGS_BYTES);
         push_u32(&mut bytes, 0xf5a5_f5a5);
         push_u16(&mut bytes, 0x0001);
-        push_u16(&mut bytes, 1 << 4);
+        let operation_mode = match self.operation_mode {
+            DsCopeOperationMode::Normal => 0,
+            DsCopeOperationMode::InternalTest => INTERNAL_TEST_MODE_BIT,
+        };
+        push_u16(&mut bytes, (1 << 4) | operation_mode);
         push_u16(&mut bytes, 0x0102);
         push_u16(&mut bytes, divider as u16);
         push_u16(&mut bytes, (divider >> 16) as u16);
@@ -540,6 +658,226 @@ pub fn apply_dscope_configuration(
     )
 }
 
+pub fn read_dscope_calibration(
+    device: &DiscoveredDevice,
+) -> Result<DsCopeCalibrationValues, CaptureError> {
+    validate_dscope_device(device)?;
+    let session = UsbDeviceSession::open(device).map_err(capture_error)?;
+    let read_result = (|| {
+        validate_device_ready(&session)?;
+        read_calibration_values(&session)
+    })();
+    let close_result = session.close().map_err(capture_error);
+    match (read_result, close_result) {
+        (Ok(values), Ok(())) => Ok(values),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => Err(CaptureError::new(format!(
+            "{primary}; additionally failed to release the USB interface: {cleanup}"
+        ))),
+    }
+}
+
+pub fn write_dscope_calibration(
+    device: &DiscoveredDevice,
+    values: DsCopeCalibrationValues,
+) -> Result<(), CaptureError> {
+    validate_dscope_device(device)?;
+    let session = UsbDeviceSession::open(device).map_err(capture_error)?;
+    let write_result = (|| {
+        validate_device_ready(&session)?;
+        session.stop_capture().map_err(capture_error)?;
+        write_calibration_values(&session, values)
+    })();
+    let close_result = session.close().map_err(capture_error);
+    combine_results(write_result, close_result, "release the USB interface")
+}
+
+pub fn auto_calibrate_dscope(device: &DiscoveredDevice) -> Result<(), CaptureError> {
+    const CALIBRATION_SAMPLE_COUNT: u64 = 50_000;
+    const CALIBRATION_SAMPLE_RATE_HZ: u64 = 500_000_000;
+    const MAX_ADJUSTMENTS_PER_RANGE: usize = 16;
+    const PASS_MARGIN: f64 = 0.5;
+
+    validate_dscope_device(device)?;
+    let session = UsbDeviceSession::open(device).map_err(capture_error)?;
+    let calibration_result = (|| {
+        validate_device_ready(&session)?;
+        session.stop_capture().map_err(capture_error)?;
+        let mut values = read_calibration_values(&session)?;
+        for (range, volts_per_div_mv) in DSCOPE_VOLTS_PER_DIV_MV.iter().copied().enumerate() {
+            let channels = [DsCopeChannelConfig::new(volts_per_div_mv, DsCopeCoupling::Dc, 1)?
+                .with_vertical_offset(DSCOPE_VERTICAL_OFFSET_CENTER)?;
+                CHANNEL_COUNT];
+            let config = DsCopeCaptureConfig::with_channel_configs(
+                CALIBRATION_SAMPLE_RATE_HZ,
+                CALIBRATION_SAMPLE_COUNT,
+                channels,
+            )?;
+            let enabled_channels = [true; CHANNEL_COUNT];
+            session
+                .initialize_dscope_frontend(enabled_channels)
+                .map_err(capture_error)?;
+            session
+                .set_dscope_bandwidth_limit(DsCopeBandwidthLimit::Full)
+                .map_err(capture_error)?;
+            session
+                .configure_dscope_channels(enabled_channels)
+                .map_err(capture_error)?;
+
+            let mut converged = false;
+            for _ in 0..MAX_ADJUSTMENTS_PER_RANGE {
+                let calibration = DsCopeCalibration::from_values(values, range);
+                configure_scope(&session, config, calibration)?;
+                session
+                    .arm_capture(&config.encode_settings())
+                    .map_err(capture_error)?;
+                configure_scope_post_arm(&session, config, calibration)?;
+                let means = read_calibration_means(&session, config)?;
+                session.stop_capture().map_err(capture_error)?;
+
+                let margins = [128.0 - means[0], 128.0 - means[1]];
+                if margins.iter().all(|margin| margin.abs() <= PASS_MARGIN) {
+                    converged = true;
+                    break;
+                }
+                for (channel, margin) in margins.iter().copied().enumerate() {
+                    if margin.abs() <= PASS_MARGIN {
+                        continue;
+                    }
+                    let adjustment = if margin.is_sign_positive() {
+                        margin.ceil() as i32
+                    } else {
+                        margin.floor() as i32
+                    };
+                    let current = i32::from(
+                        values
+                            .preoffset(channel, range)
+                            .expect("calibration range is valid"),
+                    );
+                    let adjusted = (current + adjustment).clamp(0, 1_023) as u16;
+                    if adjusted == current as u16 {
+                        return Err(CaptureError::new(format!(
+                            "DSCope auto calibration reached the offset limit on CH{channel} at {volts_per_div_mv} mV/div"
+                        )));
+                    }
+                    values.set_preoffset(channel, range, adjusted)?;
+                }
+            }
+            if !converged {
+                return Err(CaptureError::new(format!(
+                    "DSCope auto calibration did not converge at {volts_per_div_mv} mV/div"
+                )));
+            }
+        }
+        write_calibration_values(&session, values)
+    })();
+    if calibration_result.is_err() {
+        let _ = session.force_capture_ready();
+        let _ = session.stop_capture();
+    }
+    let close_result = session.close().map_err(capture_error);
+    combine_results(
+        calibration_result,
+        close_result,
+        "release the USB interface",
+    )
+}
+
+fn validate_dscope_device(device: &DiscoveredDevice) -> Result<(), CaptureError> {
+    if device.profile.model == DeviceModel::DsCopeU3P100 {
+        Ok(())
+    } else {
+        Err(CaptureError::new(format!(
+            "{} is not a DSCope U3P100 oscilloscope",
+            device.location.stable_id()
+        )))
+    }
+}
+
+fn read_calibration_values(
+    session: &UsbDeviceSession,
+) -> Result<DsCopeCalibrationValues, CaptureError> {
+    let mut values = DsCopeCalibrationValues {
+        preoffsets: [[0; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+        vga_gains: [[0; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+    };
+    for channel in 0..CHANNEL_COUNT {
+        let (zero_record, vga_record) = read_calibration_records(session, channel)?;
+        for range in 0..DSCOPE_VOLTS_PER_DIV_MV.len() {
+            let calibration = parse_channel_calibration(channel, range, &zero_record, &vga_record)?;
+            values.preoffsets[channel][range] = calibration.preoffset;
+            values.vga_gains[channel][range] = (calibration.vga_gain >> 8) as u16;
+        }
+    }
+    Ok(values)
+}
+
+fn read_calibration_records(
+    session: &UsbDeviceSession,
+    channel: usize,
+) -> Result<([u8; CALIBRATION_ZERO_BYTES], [u8; CALIBRATION_VGA_BYTES]), CaptureError> {
+    let page =
+        u16::try_from(channel).expect("channel index fits u16") * CALIBRATION_FLASH_PAGE_STRIDE;
+    let mut zero_record = [0_u8; CALIBRATION_ZERO_BYTES];
+    let mut vga_record = [0_u8; CALIBRATION_VGA_BYTES];
+    session
+        .read_dscope_nvm(page, &mut zero_record)
+        .map_err(capture_error)?;
+    session
+        .read_dscope_nvm(page + 1, &mut vga_record)
+        .map_err(capture_error)?;
+    Ok((zero_record, vga_record))
+}
+
+fn write_calibration_values(
+    session: &UsbDeviceSession,
+    values: DsCopeCalibrationValues,
+) -> Result<(), CaptureError> {
+    let mut records = Vec::with_capacity(CHANNEL_COUNT);
+    for channel in 0..CHANNEL_COUNT {
+        let (mut zero_record, mut vga_record) = read_calibration_records(session, channel)?;
+        for range in 0..DSCOPE_VOLTS_PER_DIV_MV.len() {
+            values.settable_value(channel, range)?;
+            let offset = 1 + range * 2;
+            zero_record[offset..offset + 2]
+                .copy_from_slice(&values.preoffsets[channel][range].to_le_bytes());
+            vga_record[offset..offset + 2]
+                .copy_from_slice(&values.vga_gains[channel][range].to_le_bytes());
+        }
+        records.push((zero_record, vga_record));
+    }
+
+    session
+        .set_dscope_nvm_write_enabled(true)
+        .map_err(capture_error)?;
+    let write_result = (|| {
+        for (channel, (zero_record, vga_record)) in records.iter().enumerate() {
+            let page = u16::try_from(channel).expect("channel index fits u16")
+                * CALIBRATION_FLASH_PAGE_STRIDE;
+            session
+                .write_dscope_nvm(page, zero_record)
+                .map_err(capture_error)?;
+            session
+                .write_dscope_nvm(page + 1, vga_record)
+                .map_err(capture_error)?;
+        }
+        Ok(())
+    })();
+    let protect_result = session
+        .set_dscope_nvm_write_enabled(false)
+        .map_err(capture_error);
+    combine_results(write_result, protect_result, "restore NVM write protection")?;
+
+    let verified = read_calibration_values(session)?;
+    if verified != values {
+        return Err(CaptureError::new(
+            "DSCope calibration verification did not match the values written",
+        ));
+    }
+    Ok(())
+}
+
 impl DsCopeCaptureSource {
     pub fn new(
         device: DiscoveredDevice,
@@ -610,6 +948,9 @@ fn configure_frontend(
     let enabled_channels = config.channels.map(|channel| channel.enabled);
     session
         .initialize_dscope_frontend(enabled_channels)
+        .map_err(capture_error)?;
+    session
+        .set_dscope_bandwidth_limit(config.bandwidth_limit)
         .map_err(capture_error)?;
     let calibration = DsCopeCalibration::load(session, config)?;
     session
@@ -753,6 +1094,15 @@ impl DsCopeCalibration {
         Ok(Self { channels })
     }
 
+    fn from_values(values: DsCopeCalibrationValues, range: usize) -> Self {
+        Self {
+            channels: std::array::from_fn(|channel| DsCopeChannelCalibration {
+                preoffset: values.preoffsets[channel][range],
+                vga_gain: u32::from(values.vga_gains[channel][range]) << 8,
+            }),
+        }
+    }
+
     #[cfg(test)]
     fn nominal() -> Self {
         Self {
@@ -762,6 +1112,90 @@ impl DsCopeCalibration {
             }; CHANNEL_COUNT],
         }
     }
+}
+
+fn read_calibration_means(
+    session: &UsbDeviceSession,
+    config: DsCopeCaptureConfig,
+) -> Result<[f64; CHANNEL_COUNT], CaptureError> {
+    let payload_bytes = usize::try_from(config.armed_sample_count())
+        .expect("calibration sample count fits usize")
+        * CHANNEL_COUNT
+        + MEASUREMENT_FOOTER_BYTES;
+    let mut header_read = session
+        .queue_bulk_read(TRIGGER_HEADER_BYTES)
+        .map_err(capture_error)?;
+    let mut payload_read = match session.queue_bulk_read(payload_bytes) {
+        Ok(read) => read,
+        Err(error) => {
+            let _ = header_read.cancel();
+            while !header_read.is_complete() {
+                session
+                    .handle_usb_events(Duration::from_millis(5))
+                    .map_err(capture_error)?;
+            }
+            let _ = header_read.finish();
+            return Err(capture_error(error));
+        }
+    };
+    if let Err(error) = session.start_capture() {
+        let _ = header_read.cancel();
+        let _ = payload_read.cancel();
+        drain_reads(session, &header_read, &payload_read)?;
+        let _ = header_read.finish();
+        let _ = payload_read.finish();
+        return Err(capture_error(error));
+    }
+    let deadline = Instant::now() + CAPTURE_COMPLETION_GRACE;
+    while !header_read.is_complete() || !payload_read.is_complete() {
+        if Instant::now() >= deadline {
+            let _ = session.force_capture_ready();
+            let _ = header_read.cancel();
+            let _ = payload_read.cancel();
+            while !header_read.is_complete() || !payload_read.is_complete() {
+                session
+                    .handle_usb_events(Duration::from_millis(5))
+                    .map_err(capture_error)?;
+            }
+            let _ = header_read.finish();
+            let _ = payload_read.finish();
+            return Err(CaptureError::new(
+                "timed out waiting for a DSCope auto-calibration capture",
+            ));
+        }
+        session
+            .handle_usb_events(Duration::from_millis(5))
+            .map_err(capture_error)?;
+    }
+    let header = require_queued_data(
+        header_read.finish().map_err(capture_error)?,
+        "trigger header",
+    )?;
+    let payload = require_queued_data(
+        payload_read.finish().map_err(capture_error)?,
+        "capture payload",
+    )?;
+    validate_trigger_header(&header)?;
+    let measurement_offset = usize::try_from(config.armed_sample_count())
+        .expect("calibration sample count fits usize")
+        * CHANNEL_COUNT;
+    let measurement = ScopeMeasurement::decode(&payload[measurement_offset..], config)?;
+    let sample_count =
+        usize::try_from(measurement.sample_count).expect("measurement sample count fits usize");
+    let data_start = usize::from(measurement.trigger_offset) * CHANNEL_COUNT;
+    let data_end = data_start + sample_count * CHANNEL_COUNT;
+    if data_end > measurement_offset {
+        return Err(CaptureError::new(
+            "DSCope auto-calibration sample window is invalid",
+        ));
+    }
+    let mut sums = [0_u64; CHANNEL_COUNT];
+    for sample in payload[data_start..data_end].chunks_exact(CHANNEL_COUNT) {
+        for channel in 0..CHANNEL_COUNT {
+            sums[channel] += u64::from(sample[channel]);
+        }
+    }
+    Ok(sums.map(|sum| sum as f64 / sample_count as f64))
 }
 
 fn parse_channel_calibration(
@@ -1147,6 +1581,30 @@ mod tests {
         );
         assert_eq!(read_u16(&settings, 38), 0b11);
         assert_eq!(read_u32(&settings, 368), 0xfa5a_fa5a);
+
+        let internal_test = config
+            .with_options(
+                DsCopeOperationMode::InternalTest,
+                DsCopeBandwidthLimit::Mhz20,
+            )
+            .encode_settings();
+        assert_eq!(read_u16(&internal_test, 6), (1 << 4) | (1 << 15));
+    }
+
+    #[test]
+    fn validates_editable_calibration_values() {
+        let mut values = DsCopeCalibrationValues {
+            preoffsets: [[60; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+            vga_gains: [[0x100; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+        };
+
+        values.set_preoffset(1, 7, 1_023).unwrap();
+        values.set_vga_gain(1, 7, 0x1fff).unwrap();
+        assert_eq!(values.preoffset(1, 7), Some(1_023));
+        assert_eq!(values.vga_gain(1, 7), Some(0x1fff));
+        assert!(values.set_preoffset(0, 0, 1_024).is_err());
+        assert!(values.set_vga_gain(0, 0, 0).is_err());
+        assert!(values.set_preoffset(2, 0, 1).is_err());
     }
 
     #[test]

@@ -14,13 +14,15 @@ mod probe;
 mod transport;
 
 pub use dscope::{
-    apply_dscope_configuration, DsCopeCaptureConfig, DsCopeCaptureSource, DsCopeChannelConfig,
-    DsCopeCoupling, DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource,
-    DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ, DSCOPE_TRIGGER_HOLDOFF_MAX_NS,
-    DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
-    DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
-    DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
-    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
+    apply_dscope_configuration, auto_calibrate_dscope, read_dscope_calibration,
+    write_dscope_calibration, DsCopeBandwidthLimit, DsCopeCalibrationValues, DsCopeCaptureConfig,
+    DsCopeCaptureSource, DsCopeChannelConfig, DsCopeCoupling, DsCopeOperationMode,
+    DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource, DSCOPE_SAMPLE_COUNTS,
+    DSCOPE_SAMPLE_RATES_HZ, DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_CENTER,
+    DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
+    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
+    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
+    DSCOPE_VOLTS_PER_DIV_MV,
 };
 pub use dslogic::{DsLogicCaptureConfig, DsLogicCaptureSource};
 pub use prepare::{load_device_fpga, prepare_device, FpgaLoad, PreparedDevice};
