@@ -18,7 +18,7 @@ use dsview_usb::{
     DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
 use std::ops::Range;
@@ -42,6 +42,7 @@ const SCOPE_VERTICAL_DIVISIONS: usize = 8;
 const SCOPE_ADC_VERTICAL_DIVISIONS: f32 = 10.0;
 const SCOPE_CONFIGURATION_DEBOUNCE: Duration = Duration::from_millis(350);
 const TOOLTIP_DELAY_SECONDS: f32 = 0.1;
+const DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS: f64 = 1.0e-3;
 const TIMEBASE_STEPS_SECONDS: [f64; 30] = [
     2.0e-9, 5.0e-9, 10.0e-9, 20.0e-9, 50.0e-9, 100.0e-9, 200.0e-9, 500.0e-9, 1.0e-6, 2.0e-6,
     5.0e-6, 10.0e-6, 20.0e-6, 50.0e-6, 100.0e-6, 200.0e-6, 500.0e-6, 1.0e-3, 2.0e-3, 5.0e-3,
@@ -413,14 +414,6 @@ fn default_logic_channel_colors() -> [Color32; LOGIC_CHANNEL_COUNT] {
     ]
 }
 
-#[derive(Default)]
-struct DeviceStats {
-    frames: u64,
-    samples: u64,
-    first_timestamp: Option<Duration>,
-    last_timestamp: Option<Duration>,
-}
-
 struct WaveformStore {
     logic_samples: VecDeque<u32>,
     logic_channels: u8,
@@ -727,17 +720,13 @@ struct ActiveCapture {
     preserve_display_until_complete: bool,
     scope_config: DsCopeCaptureConfig,
     scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
-    stats: HashMap<DeviceId, DeviceStats>,
     stopped: HashSet<DeviceId>,
     waveforms: WaveformStore,
     recorder: Option<FileRecorder>,
-    recording_path: Option<String>,
 }
 
 struct CompletedCapture {
-    stats: HashMap<DeviceId, DeviceStats>,
     waveforms: WaveformStore,
-    recording_path: Option<String>,
 }
 
 type FileRecorder = RecordingWriter<BufWriter<File>>;
@@ -805,7 +794,7 @@ impl DsViewApp {
             scope_channel_colors: SCOPE_COLORS,
             logic_viewport: WaveformViewport::default(),
             scope_viewport: WaveformViewport::default(),
-            scope_time_per_division_seconds: None,
+            scope_time_per_division_seconds: Some(DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS),
             scope_capture_restart_requested: false,
             scope_configuration_due: None,
             pending: None,
@@ -1066,9 +1055,7 @@ impl DsViewApp {
         let recording_result = finish_gui_recording(&mut active.recorder, completion);
         if !active.preserve_display_until_complete {
             self.completed_capture = Some(CompletedCapture {
-                stats: active.stats,
                 waveforms: active.waveforms,
-                recording_path: active.recording_path,
             });
         }
         match (stop_result, recording_result) {
@@ -1223,11 +1210,9 @@ impl DsViewApp {
                     preserve_display_until_complete,
                     scope_config,
                     scope_trigger_controls,
-                    stats: HashMap::new(),
                     stopped: HashSet::new(),
                     waveforms,
                     recorder,
-                    recording_path: recording_path.clone(),
                 });
                 self.status = match (mode, recording_path) {
                     (AcquisitionMode::Single, Some(path)) => {
@@ -1290,11 +1275,6 @@ impl DsViewApp {
                         }
                         match event {
                             CaptureEvent::Frame(frame) => {
-                                let entry = active.stats.entry(frame.device_id).or_default();
-                                entry.frames += 1;
-                                entry.samples += frame.payload.sample_count() as u64;
-                                entry.first_timestamp.get_or_insert(frame.captured_at);
-                                entry.last_timestamp = Some(frame.captured_at);
                                 active.waveforms.ingest(
                                     &frame.payload,
                                     active
@@ -1367,9 +1347,7 @@ impl DsViewApp {
                 };
                 if update_completed_capture {
                     self.completed_capture = Some(CompletedCapture {
-                        stats: active.stats,
                         waveforms: active.waveforms,
-                        recording_path: active.recording_path,
                     });
                 }
                 let repeat = error.is_none()
@@ -2238,54 +2216,6 @@ impl eframe::App for DsViewApp {
                                 )
                                 .color(TEXT_MUTED),
                             );
-                        }
-                        if let Some(active) = &self.capture {
-                            ui.add_space(18.0);
-                            ui.label(RichText::new("SESSION").strong().color(TEXT_MUTED));
-                            ui.add_space(6.0);
-                            for descriptor in active.session.descriptors() {
-                                let stats = active.stats.get(&descriptor.id);
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("●").color(ACCENT));
-                                    ui.label(&descriptor.name);
-                                });
-                                if let Some(stats) = stats {
-                                    ui.small(
-                                        RichText::new(format!(
-                                            "{} frames · {} samples",
-                                            stats.frames, stats.samples
-                                        ))
-                                        .color(TEXT_MUTED),
-                                    );
-                                }
-                            }
-                            if let Some(skew) = capture_start_skew(&active.stats) {
-                                ui.add_space(6.0);
-                                ui.label(format!("Start skew: {skew:?}"));
-                            }
-                        } else if let Some(completed) = &self.completed_capture {
-                            ui.add_space(18.0);
-                            ui.label(RichText::new("LAST CAPTURE").strong().color(TEXT_MUTED));
-                            if let Some(path) = &completed.recording_path {
-                                ui.small(
-                                    RichText::new(format!("Recording file: {path}")).color(ACCENT),
-                                );
-                            }
-                            for (device_id, stats) in &completed.stats {
-                                ui.add_space(4.0);
-                                ui.label(device_id.to_string());
-                                ui.small(
-                                    RichText::new(format!(
-                                        "{} frames · {} samples",
-                                        stats.frames, stats.samples
-                                    ))
-                                    .color(TEXT_MUTED),
-                                );
-                            }
-                            if let Some(skew) = capture_start_skew(&completed.stats) {
-                                ui.add_space(6.0);
-                                ui.label(format!("Start skew: {skew:?}"));
-                            }
                         }
                     });
             });
@@ -4534,18 +4464,6 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-fn capture_start_skew(stats: &HashMap<DeviceId, DeviceStats>) -> Option<Duration> {
-    let mut timestamps = stats
-        .values()
-        .filter_map(|stats| stats.first_timestamp)
-        .collect::<Vec<_>>();
-    if timestamps.len() < 2 {
-        return None;
-    }
-    timestamps.sort_unstable();
-    Some(timestamps[timestamps.len() - 1] - timestamps[0])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4813,10 +4731,27 @@ mod tests {
     fn timebase_steps_follow_the_vendor_one_two_five_sequence() {
         assert_eq!(TIMEBASE_STEPS_SECONDS.first(), Some(&2.0e-9));
         assert_eq!(TIMEBASE_STEPS_SECONDS.last(), Some(&10.0));
+        assert!(TIMEBASE_STEPS_SECONDS.contains(&DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS));
         assert_eq!(adjacent_timebase(10.0e-9, true), Some(5.0e-9));
         assert_eq!(adjacent_timebase(10.0e-9, false), Some(20.0e-9));
         assert_eq!(adjacent_timebase(2.0e-9, true), None);
         assert_eq!(adjacent_timebase(10.0, false), None);
+
+        let mut default_viewport = WaveformViewport::default();
+        apply_time_per_division(
+            &mut default_viewport,
+            SAMPLE_COUNT as usize,
+            SAMPLE_RATE_HZ,
+            DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS,
+        );
+        assert!(
+            (default_viewport
+                .time_per_division(SAMPLE_COUNT as usize, SAMPLE_RATE_HZ)
+                .unwrap()
+                - DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS)
+                .abs()
+                < 1.0e-9
+        );
 
         let mut viewport = WaveformViewport::default();
         for _ in 0..6 {
