@@ -151,13 +151,16 @@ totals, errors, and shared-timeline start skew. Capture Setup provides separate
 DSLogic and DSCope settings tabs while recording controls remain shared across
 the synchronized session in a fixed-width sidebar. DSCope settings provide a
 common sample rate and capture buffer plus independent volts/div, AC/DC
-coupling, probe attenuation, and hardware enablement for CH0 and CH1. Enabled
+coupling, probe attenuation, and hardware enablement for CH0 and CH1. Its
+Trigger menu follows the vendor controls for horizontal position, source,
+rising/falling edge, holdoff, and noise sensitivity; these settings are encoded
+as U3P100 hardware commands and recorded in capture metadata. Enabled
 channels support up to 500 MSa/s; disabling either channel raises the remaining
 channel's limit to 1 GSa/s. The
 shared 2M-sample memory provides up to 1M samples/channel in dual-channel mode
-or 2M in single-channel mode. Input-range and coupling changes are applied to
-the selected DSCope front end while idle; existing waveforms retain the settings
-with which they were captured. Each input range uses a rotary-style encoder that
+or 2M in single-channel mode. Front-end and trigger changes are applied to the
+selected DSCope while idle; existing waveforms retain the settings with which
+they were captured. Each input range uses a rotary-style encoder that
 supports vertical mouse dragging, the mouse wheel, and arrow keys. Logic Analyzer and
 Oscilloscope tabs are
 created only for connected devices; the Combined tab appears when both models
@@ -176,7 +179,9 @@ ruler that remains visible before capture, tracks the visible zoom window, and
 divides every major interval into five minor ticks. The oscilloscope uses a
 conventional 10×8 graticule, zero-centered per-channel volts/div scaling,
 channel ground markers, configured front-end readouts, and illuminated channel
-traces.
+traces. A draggable trigger-level arrow on the right edge drives the hardware
+threshold and its dotted horizontal reference; it uses the selected channel's
+color, or green for combined CH0/CH1 triggering.
 
 Enable **Record complete capture** and enter a `.dsv` path before starting to
 write the full session to disk. The GUI uses the same streaming recorder as the

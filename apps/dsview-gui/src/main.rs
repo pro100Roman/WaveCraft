@@ -8,9 +8,13 @@ use dsview_recording::{CompletionStatus, RecordingWriter};
 use dsview_usb::{
     apply_dscope_configuration, discover_supported_devices, prepare_device, DeviceModel,
     DiscoveredDevice, DsCopeCaptureConfig, DsCopeCaptureSource, DsCopeChannelConfig,
-    DsCopeCoupling, DsLogicCaptureConfig, DsLogicCaptureSource, LinkStatus, DSCOPE_SAMPLE_COUNTS,
-    DSCOPE_SAMPLE_RATES_HZ, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
-    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
+    DsCopeCoupling, DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource,
+    DsLogicCaptureConfig, DsLogicCaptureSource, LinkStatus, DSCOPE_SAMPLE_COUNTS,
+    DSCOPE_SAMPLE_RATES_HZ, DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_CENTER,
+    DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
+    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
+    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
+    DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -82,10 +86,115 @@ impl Default for ScopeChannelSettings {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TriggerHoldoffUnit {
+    Microseconds,
+    Milliseconds,
+    Seconds,
+}
+
+impl TriggerHoldoffUnit {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Microseconds => "µs",
+            Self::Milliseconds => "ms",
+            Self::Seconds => "s",
+        }
+    }
+
+    fn nanoseconds(self) -> f64 {
+        match self {
+            Self::Microseconds => 1_000.0,
+            Self::Milliseconds => 1_000_000.0,
+            Self::Seconds => 1_000_000_000.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScopeTriggerSettings {
+    position_percent: u8,
+    source: DsCopeTriggerSource,
+    auto_channel: u8,
+    slope: DsCopeTriggerSlope,
+    holdoff_ns: u64,
+    holdoff_unit: TriggerHoldoffUnit,
+    noise_sensitivity: u8,
+    level: u8,
+}
+
+impl Default for ScopeTriggerSettings {
+    fn default() -> Self {
+        Self::from_capture_config(DsCopeTriggerConfig::default())
+    }
+}
+
+impl ScopeTriggerSettings {
+    fn capture_config(self) -> Result<DsCopeTriggerConfig, String> {
+        DsCopeTriggerConfig::new(self.source, self.slope)
+            .with_position_percent(self.position_percent)
+            .and_then(|trigger| trigger.with_auto_channel(self.auto_channel))
+            .and_then(|trigger| trigger.with_holdoff_ns(self.holdoff_ns))
+            .and_then(|trigger| trigger.with_noise_sensitivity(self.noise_sensitivity))
+            .and_then(|trigger| trigger.with_level(self.level))
+            .map_err(|error| error.to_string())
+    }
+
+    fn from_capture_config(config: DsCopeTriggerConfig) -> Self {
+        let holdoff_unit = if config.holdoff_ns() >= 1_000_000_000 {
+            TriggerHoldoffUnit::Seconds
+        } else if config.holdoff_ns() >= 1_000_000 {
+            TriggerHoldoffUnit::Milliseconds
+        } else {
+            TriggerHoldoffUnit::Microseconds
+        };
+        Self {
+            position_percent: config.position_percent(),
+            source: config.source(),
+            auto_channel: config.auto_channel(),
+            slope: config.slope(),
+            holdoff_ns: config.holdoff_ns(),
+            holdoff_unit,
+            noise_sensitivity: config.noise_sensitivity(),
+            level: config.level(),
+        }
+    }
+
+    fn source_is_available(self, channels: [bool; 2]) -> bool {
+        match self.source {
+            DsCopeTriggerSource::Auto => channels[usize::from(self.auto_channel)],
+            DsCopeTriggerSource::ChannelZero => channels[0],
+            DsCopeTriggerSource::ChannelOne => channels[1],
+            DsCopeTriggerSource::ChannelZeroAndOne => channels[0] && channels[1],
+            DsCopeTriggerSource::ChannelZeroOrOne => channels[0] || channels[1],
+        }
+    }
+
+    fn clamp_to_channels(&mut self, channels: [bool; 2]) {
+        if !channels[usize::from(self.auto_channel)] {
+            self.auto_channel = if channels[0] { 0 } else { 1 };
+        }
+        if !self.source_is_available(channels) {
+            self.source = DsCopeTriggerSource::Auto;
+        }
+    }
+
+    fn hardware_differs_from(self, other: Self) -> bool {
+        self.position_percent != other.position_percent
+            || self.source != other.source
+            || self.auto_channel != other.auto_channel
+            || self.slope != other.slope
+            || self.holdoff_ns != other.holdoff_ns
+            || self.noise_sensitivity != other.noise_sensitivity
+            || self.level != other.level
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ScopeCaptureSettings {
     sample_rate_hz: u64,
     sample_count: u64,
     channels: [ScopeChannelSettings; 2],
+    trigger: ScopeTriggerSettings,
 }
 
 impl Default for ScopeCaptureSettings {
@@ -94,6 +203,7 @@ impl Default for ScopeCaptureSettings {
             sample_rate_hz: SAMPLE_RATE_HZ,
             sample_count: SAMPLE_COUNT,
             channels: [ScopeChannelSettings::default(); 2],
+            trigger: ScopeTriggerSettings::default(),
         }
     }
 }
@@ -113,6 +223,8 @@ impl ScopeCaptureSettings {
             .with_enabled(source.enabled);
         }
         DsCopeCaptureConfig::with_channel_configs(self.sample_rate_hz, self.sample_count, channels)
+            .map_err(|error| error.to_string())?
+            .with_trigger_config(self.trigger.capture_config()?)
             .map_err(|error| error.to_string())
     }
 
@@ -142,6 +254,8 @@ impl ScopeCaptureSettings {
     fn clamp_to_channel_limits(&mut self) {
         self.sample_rate_hz = self.sample_rate_hz.min(self.maximum_sample_rate_hz());
         self.sample_count = self.sample_count.min(self.maximum_sample_count());
+        self.trigger
+            .clamp_to_channels(self.channels.map(|channel| channel.enabled));
     }
 
     fn frontend_differs_from(self, other: Self) -> bool {
@@ -156,6 +270,7 @@ impl ScopeCaptureSettings {
                         || left.coupling != right.coupling
                         || left.vertical_offset != right.vertical_offset
                 })
+            || self.trigger.hardware_differs_from(other.trigger)
     }
 
     fn from_capture_config(config: DsCopeCaptureConfig) -> Self {
@@ -169,6 +284,7 @@ impl ScopeCaptureSettings {
                 probe_attenuation: channel.probe_attenuation(),
                 vertical_offset: channel.vertical_offset(),
             }),
+            trigger: ScopeTriggerSettings::from_capture_config(config.trigger()),
         }
     }
 }
@@ -518,7 +634,7 @@ impl DsViewApp {
         let device_count = devices.len();
         let (sender, receiver) = mpsc::channel();
         self.pending = Some(receiver);
-        self.status = format!("Applying DSCope input settings to {device_count} instrument(s)…");
+        self.status = format!("Applying DSCope configuration to {device_count} instrument(s)…");
         self.last_error = None;
         thread::spawn(move || {
             let result = (|| {
@@ -647,7 +763,7 @@ impl DsViewApp {
             }
             Ok(WorkerSuccess::ScopeConfigured(device_count)) => {
                 self.status =
-                    format!("Applied DSCope input settings to {device_count} instrument(s)");
+                    format!("Applied DSCope configuration to {device_count} instrument(s)");
             }
             Err(error) => self.set_error(error),
         }
@@ -920,6 +1036,156 @@ fn coupling_label(coupling: DsCopeCoupling) -> &'static str {
     }
 }
 
+fn trigger_source_label(source: DsCopeTriggerSource) -> &'static str {
+    match source {
+        DsCopeTriggerSource::Auto => "Auto",
+        DsCopeTriggerSource::ChannelZero => "CH0",
+        DsCopeTriggerSource::ChannelOne => "CH1",
+        DsCopeTriggerSource::ChannelZeroAndOne => "CH0 AND CH1",
+        DsCopeTriggerSource::ChannelZeroOrOne => "CH0 OR CH1",
+    }
+}
+
+fn trigger_slope_label(slope: DsCopeTriggerSlope) -> &'static str {
+    match slope {
+        DsCopeTriggerSlope::Rising => "Rising edge",
+        DsCopeTriggerSlope::Falling => "Falling edge",
+    }
+}
+
+fn paint_scope_trigger_settings(
+    ui: &mut egui::Ui,
+    settings: &mut ScopeTriggerSettings,
+    channels: [bool; 2],
+    enabled: bool,
+) {
+    egui::CollapsingHeader::new(RichText::new("Trigger").strong())
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.add_enabled_ui(enabled, |ui| {
+                egui::Grid::new("dscope_trigger_settings")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Source");
+                        egui::ComboBox::from_id_salt("scope_trigger_source")
+                            .selected_text(trigger_source_label(settings.source))
+                            .show_ui(ui, |ui| {
+                                for source in [
+                                    DsCopeTriggerSource::Auto,
+                                    DsCopeTriggerSource::ChannelZero,
+                                    DsCopeTriggerSource::ChannelOne,
+                                    DsCopeTriggerSource::ChannelZeroAndOne,
+                                    DsCopeTriggerSource::ChannelZeroOrOne,
+                                ] {
+                                    let mut candidate = *settings;
+                                    candidate.source = source;
+                                    ui.add_enabled_ui(
+                                        candidate.source_is_available(channels),
+                                        |ui| {
+                                            ui.selectable_value(
+                                                &mut settings.source,
+                                                source,
+                                                trigger_source_label(source),
+                                            );
+                                        },
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        if settings.source == DsCopeTriggerSource::Auto {
+                            ui.label("Auto channel");
+                            egui::ComboBox::from_id_salt("scope_trigger_auto_channel")
+                                .selected_text(format!("CH{}", settings.auto_channel))
+                                .show_ui(ui, |ui| {
+                                    for (channel, channel_enabled) in
+                                        channels.into_iter().enumerate()
+                                    {
+                                        ui.add_enabled_ui(channel_enabled, |ui| {
+                                            ui.selectable_value(
+                                                &mut settings.auto_channel,
+                                                channel as u8,
+                                                format!("CH{channel}"),
+                                            );
+                                        });
+                                    }
+                                });
+                            ui.end_row();
+                        }
+
+                        ui.label("Edge");
+                        egui::ComboBox::from_id_salt("scope_trigger_slope")
+                            .selected_text(trigger_slope_label(settings.slope))
+                            .show_ui(ui, |ui| {
+                                for slope in
+                                    [DsCopeTriggerSlope::Rising, DsCopeTriggerSlope::Falling]
+                                {
+                                    ui.selectable_value(
+                                        &mut settings.slope,
+                                        slope,
+                                        trigger_slope_label(slope),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Horizontal position");
+                        ui.add(
+                            egui::Slider::new(
+                                &mut settings.position_percent,
+                                DSCOPE_TRIGGER_POSITION_MIN_PERCENT
+                                    ..=DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
+                            )
+                            .suffix("%"),
+                        );
+                        ui.end_row();
+
+                        ui.label("Holdoff");
+                        ui.horizontal(|ui| {
+                            let multiplier = settings.holdoff_unit.nanoseconds();
+                            let mut value = settings.holdoff_ns as f64 / multiplier;
+                            let maximum = DSCOPE_TRIGGER_HOLDOFF_MAX_NS as f64 / multiplier;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut value)
+                                        .range(0.0..=maximum)
+                                        .speed(0.1)
+                                        .max_decimals(3),
+                                )
+                                .changed()
+                            {
+                                settings.holdoff_ns = (value * multiplier).round() as u64;
+                            }
+                            egui::ComboBox::from_id_salt("scope_trigger_holdoff_unit")
+                                .selected_text(settings.holdoff_unit.label())
+                                .show_ui(ui, |ui| {
+                                    for unit in [
+                                        TriggerHoldoffUnit::Microseconds,
+                                        TriggerHoldoffUnit::Milliseconds,
+                                        TriggerHoldoffUnit::Seconds,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut settings.holdoff_unit,
+                                            unit,
+                                            unit.label(),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.end_row();
+
+                        ui.label("Noise sensitivity");
+                        ui.add(egui::Slider::new(
+                            &mut settings.noise_sensitivity,
+                            0..=DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
+                        ));
+                        ui.end_row();
+                    });
+            });
+        });
+}
+
 fn paint_scope_channel_settings(
     ui: &mut egui::Ui,
     channel_index: usize,
@@ -1083,6 +1349,13 @@ fn paint_capture_settings(
                     ui.add_space(8.0);
                     let channel_count = scope_settings.channels.len();
                     let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
+                    paint_scope_trigger_settings(
+                        ui,
+                        &mut scope_settings.trigger,
+                        channel_enabled,
+                        enabled,
+                    );
+                    ui.add_space(8.0);
                     for (index, channel) in scope_settings.channels.iter_mut().enumerate() {
                         paint_scope_channel_settings(
                             ui,
@@ -1369,6 +1642,7 @@ impl eframe::App for DsViewApp {
                     .scope_settings
                     .channels
                     .map(|channel| channel.vertical_offset);
+                let mut scope_trigger_settings = self.scope_settings.trigger;
                 let scope_settings = self
                     .capture
                     .as_ref()
@@ -1410,6 +1684,7 @@ impl eframe::App for DsViewApp {
                                     ScopeWaveformOptions {
                                         settings: scope_settings,
                                         vertical_offsets: &mut scope_vertical_offsets,
+                                        trigger_settings: &mut scope_trigger_settings,
                                         offset_controls_enabled: capture_settings_enabled,
                                     },
                                 )
@@ -1427,6 +1702,7 @@ impl eframe::App for DsViewApp {
                             ScopeWaveformOptions {
                                 settings: scope_settings,
                                 vertical_offsets: &mut scope_vertical_offsets,
+                                trigger_settings: &mut scope_trigger_settings,
                                 offset_controls_enabled: capture_settings_enabled,
                             },
                         );
@@ -1445,6 +1721,7 @@ impl eframe::App for DsViewApp {
                 {
                     channel.vertical_offset = vertical_offset;
                 }
+                self.scope_settings.trigger = scope_trigger_settings;
             });
 
         let mut settings_open = self.settings_open;
@@ -1544,7 +1821,7 @@ impl eframe::App for DsViewApp {
             .frontend_differs_from(scope_settings_before_ui)
         {
             self.scope_configuration_due = Some(Instant::now() + SCOPE_CONFIGURATION_DEBOUNCE);
-            self.status = "Adjusting DSCope input settings…".to_owned();
+            self.status = "Adjusting DSCope configuration…".to_owned();
         }
         if !refresh_clicked
             && !start_clicked
@@ -1631,6 +1908,46 @@ fn start_gui_recording(
     metadata.insert(
         "scope.sample_count".to_owned(),
         scope_config.sample_count().to_string(),
+    );
+    let trigger = scope_config.trigger();
+    metadata.insert(
+        "scope.trigger.position_percent".to_owned(),
+        trigger.position_percent().to_string(),
+    );
+    metadata.insert(
+        "scope.trigger.source".to_owned(),
+        match trigger.source() {
+            DsCopeTriggerSource::Auto => "auto",
+            DsCopeTriggerSource::ChannelZero => "ch0",
+            DsCopeTriggerSource::ChannelOne => "ch1",
+            DsCopeTriggerSource::ChannelZeroAndOne => "ch0_and_ch1",
+            DsCopeTriggerSource::ChannelZeroOrOne => "ch0_or_ch1",
+        }
+        .to_owned(),
+    );
+    metadata.insert(
+        "scope.trigger.auto_channel".to_owned(),
+        trigger.auto_channel().to_string(),
+    );
+    metadata.insert(
+        "scope.trigger.slope".to_owned(),
+        match trigger.slope() {
+            DsCopeTriggerSlope::Rising => "rising",
+            DsCopeTriggerSlope::Falling => "falling",
+        }
+        .to_owned(),
+    );
+    metadata.insert(
+        "scope.trigger.holdoff_ns".to_owned(),
+        trigger.holdoff_ns().to_string(),
+    );
+    metadata.insert(
+        "scope.trigger.noise_sensitivity".to_owned(),
+        trigger.noise_sensitivity().to_string(),
+    );
+    metadata.insert(
+        "scope.trigger.level".to_owned(),
+        trigger.level().to_string(),
     );
     for (index, channel) in scope_config.channels().iter().enumerate() {
         metadata.insert(
@@ -1727,6 +2044,7 @@ const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;
 struct ScopeWaveformOptions<'a> {
     settings: ScopeCaptureSettings,
     vertical_offsets: &'a mut [u16; 2],
+    trigger_settings: &'a mut ScopeTriggerSettings,
     offset_controls_enabled: bool,
 }
 
@@ -2493,6 +2811,95 @@ fn paint_scope_offset_arrows(
     }
 }
 
+const COMBINED_TRIGGER_COLOR: Color32 = Color32::from_rgb(75, 220, 120);
+
+fn scope_trigger_color(settings: ScopeTriggerSettings) -> Color32 {
+    match settings.source {
+        DsCopeTriggerSource::Auto => SCOPE_COLORS[usize::from(settings.auto_channel)],
+        DsCopeTriggerSource::ChannelZero => SCOPE_COLORS[0],
+        DsCopeTriggerSource::ChannelOne => SCOPE_COLORS[1],
+        DsCopeTriggerSource::ChannelZeroAndOne | DsCopeTriggerSource::ChannelZeroOrOne => {
+            COMBINED_TRIGGER_COLOR
+        }
+    }
+}
+
+fn scope_trigger_level_y(plot: Rect, level: u8) -> f32 {
+    let reference_span = f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
+    let ratio = f32::from(u16::from(level) - DSCOPE_VERTICAL_OFFSET_MIN) / reference_span;
+    egui::lerp(plot.y_range(), ratio)
+}
+
+fn scope_trigger_level_from_y(plot: Rect, y: f32) -> u8 {
+    let ratio = ((y - plot.top()) / plot.height().max(1.0)).clamp(0.0, 1.0);
+    let reference_span = f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
+    let level = (f32::from(DSCOPE_VERTICAL_OFFSET_MIN) + ratio * reference_span).round() as u8;
+    level.clamp(DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_LEVEL_MAX)
+}
+
+fn paint_scope_trigger_level(
+    ui: &egui::Ui,
+    plot: Rect,
+    settings: &mut ScopeTriggerSettings,
+    controls_enabled: bool,
+) {
+    const ARROW_WIDTH: f32 = 12.0;
+    const ARROW_HALF_HEIGHT: f32 = 7.0;
+    const DOT_SPACING: f32 = 7.0;
+    let painter = ui.painter().with_clip_rect(plot);
+    let color = scope_trigger_color(*settings);
+    let arrow_x = plot.right() - 2.0;
+    let arrow_y = scope_trigger_level_y(plot, settings.level);
+    let hit_rect = Rect::from_center_size(
+        Pos2::new(arrow_x - ARROW_WIDTH * 0.5, arrow_y),
+        Vec2::new(ARROW_WIDTH + 4.0, ARROW_HALF_HEIGHT * 2.0 + 10.0),
+    );
+    let response = ui.interact(
+        hit_rect,
+        ui.make_persistent_id("scope_trigger_level"),
+        if controls_enabled {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
+    );
+    let response = if controls_enabled {
+        response.on_hover_cursor(egui::CursorIcon::ResizeVertical)
+    } else {
+        response
+    }
+    .on_hover_text(format!(
+        "Trigger level: {}\nDrag to move · double-click to center",
+        settings.level
+    ));
+
+    if controls_enabled {
+        if response.double_clicked() {
+            settings.level = DSCOPE_TRIGGER_LEVEL_CENTER;
+        } else if response.dragged() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                settings.level = scope_trigger_level_from_y(plot, pointer.y);
+            }
+        }
+    }
+
+    let arrow_y = scope_trigger_level_y(plot, settings.level);
+    let mut x = plot.left();
+    while x <= plot.right() {
+        painter.circle_filled(Pos2::new(x, arrow_y), 0.8, color.gamma_multiply(0.45));
+        x += DOT_SPACING;
+    }
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(arrow_x, arrow_y - ARROW_HALF_HEIGHT),
+            Pos2::new(arrow_x - ARROW_WIDTH, arrow_y),
+            Pos2::new(arrow_x, arrow_y + ARROW_HALF_HEIGHT),
+        ],
+        color,
+        Stroke::new(1.0_f32, BACKGROUND),
+    ));
+}
+
 fn paint_scope_readouts(
     painter: &egui::Painter,
     rect: Rect,
@@ -2548,6 +2955,7 @@ fn paint_scope(
     let ScopeWaveformOptions {
         mut settings,
         vertical_offsets,
+        trigger_settings,
         offset_controls_enabled,
     } = scope_options;
     for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
@@ -2566,9 +2974,11 @@ fn paint_scope(
         vertical_offsets,
         offset_controls_enabled,
     );
+    paint_scope_trigger_level(ui, plot, trigger_settings, offset_controls_enabled);
     for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
         channel.vertical_offset = vertical_offset;
     }
+    settings.trigger = *trigger_settings;
 
     let sample_count = waveforms
         .scope_channels
@@ -2891,6 +3301,16 @@ mod tests {
                     vertical_offset: 192,
                 },
             ],
+            trigger: ScopeTriggerSettings {
+                position_percent: 75,
+                source: DsCopeTriggerSource::ChannelZero,
+                auto_channel: 0,
+                slope: DsCopeTriggerSlope::Falling,
+                holdoff_ns: 250_000,
+                holdoff_unit: TriggerHoldoffUnit::Microseconds,
+                noise_sensitivity: 12,
+                level: 64,
+            },
         };
 
         let config = settings.capture_config().unwrap();
@@ -2905,6 +3325,12 @@ mod tests {
         assert_eq!(config.channels()[1].probe_attenuation(), 1);
         assert_eq!(config.channels()[1].vertical_offset(), 192);
         assert!(!config.channels()[1].enabled());
+        assert_eq!(config.trigger().position_percent(), 75);
+        assert_eq!(config.trigger().source(), DsCopeTriggerSource::ChannelZero);
+        assert_eq!(config.trigger().slope(), DsCopeTriggerSlope::Falling);
+        assert_eq!(config.trigger().holdoff_ns(), 250_000);
+        assert_eq!(config.trigger().noise_sensitivity(), 12);
+        assert_eq!(config.trigger().level(), 64);
         assert_eq!(ScopeCaptureSettings::from_capture_config(config), settings);
         assert_eq!(format_voltage(0.1), "100 mV");
         assert_eq!(format_sample_rate(1_000_000), "1.00 MSa/s");
@@ -2940,6 +3366,56 @@ mod tests {
         changed = original;
         changed.channels[0].vertical_offset = 64;
         assert!(changed.frontend_differs_from(original));
+
+        changed = original;
+        changed.trigger.holdoff_unit = TriggerHoldoffUnit::Seconds;
+        assert!(!changed.frontend_differs_from(original));
+
+        changed.trigger.slope = DsCopeTriggerSlope::Falling;
+        assert!(changed.frontend_differs_from(original));
+
+        changed = original;
+        changed.trigger.level = 64;
+        assert!(changed.frontend_differs_from(original));
+    }
+
+    #[test]
+    fn scope_trigger_source_tracks_enabled_channels() {
+        let mut trigger = ScopeTriggerSettings {
+            source: DsCopeTriggerSource::ChannelOne,
+            auto_channel: 1,
+            ..ScopeTriggerSettings::default()
+        };
+
+        trigger.clamp_to_channels([true, false]);
+
+        assert_eq!(trigger.source, DsCopeTriggerSource::Auto);
+        assert_eq!(trigger.auto_channel, 0);
+        assert!(trigger.capture_config().is_ok());
+    }
+
+    #[test]
+    fn scope_trigger_level_uses_vendor_limits_and_source_colors() {
+        let plot = Rect::from_min_max(Pos2::new(0.0, 20.0), Pos2::new(100.0, 220.0));
+        let mut trigger = ScopeTriggerSettings::default();
+
+        assert_eq!(
+            scope_trigger_level_from_y(plot, plot.top()),
+            DSCOPE_TRIGGER_LEVEL_MIN
+        );
+        assert_eq!(
+            scope_trigger_level_from_y(plot, plot.bottom()),
+            DSCOPE_TRIGGER_LEVEL_MAX
+        );
+        assert_eq!(scope_trigger_color(trigger), SCOPE_COLORS[0]);
+
+        trigger.source = DsCopeTriggerSource::ChannelOne;
+        assert_eq!(scope_trigger_color(trigger), SCOPE_COLORS[1]);
+
+        trigger.source = DsCopeTriggerSource::ChannelZeroAndOne;
+        assert_eq!(scope_trigger_color(trigger), COMBINED_TRIGGER_COLOR);
+        trigger.source = DsCopeTriggerSource::ChannelZeroOrOne;
+        assert_eq!(scope_trigger_color(trigger), COMBINED_TRIGGER_COLOR);
     }
 
     #[test]

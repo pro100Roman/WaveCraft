@@ -27,6 +27,13 @@ const OFFSET_PWM_SPAN: u64 = 780;
 pub const DSCOPE_VERTICAL_OFFSET_MIN: u16 = 10;
 pub const DSCOPE_VERTICAL_OFFSET_CENTER: u16 = 128;
 pub const DSCOPE_VERTICAL_OFFSET_MAX: u16 = 245;
+pub const DSCOPE_TRIGGER_POSITION_MIN_PERCENT: u8 = 1;
+pub const DSCOPE_TRIGGER_POSITION_MAX_PERCENT: u8 = 99;
+pub const DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX: u8 = 15;
+pub const DSCOPE_TRIGGER_HOLDOFF_MAX_NS: u64 = 1_000_000_000;
+pub const DSCOPE_TRIGGER_LEVEL_MIN: u8 = 24;
+pub const DSCOPE_TRIGGER_LEVEL_CENTER: u8 = 128;
+pub const DSCOPE_TRIGGER_LEVEL_MAX: u8 = 232;
 
 pub const DSCOPE_SAMPLE_RATES_HZ: [u64; 17] = [
     100_000,
@@ -64,6 +71,157 @@ impl DsCopeCoupling {
             Self::Dc => 0x100,
             Self::Ac => 0,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DsCopeTriggerSource {
+    Auto,
+    ChannelZero,
+    ChannelOne,
+    ChannelZeroAndOne,
+    ChannelZeroOrOne,
+}
+
+impl DsCopeTriggerSource {
+    fn command_value(self) -> u8 {
+        match self {
+            Self::Auto => 0,
+            Self::ChannelZero => 1,
+            Self::ChannelOne => 2,
+            Self::ChannelZeroAndOne => 3,
+            Self::ChannelZeroOrOne => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DsCopeTriggerSlope {
+    Rising,
+    Falling,
+}
+
+impl DsCopeTriggerSlope {
+    fn command_value(self) -> u8 {
+        match self {
+            Self::Rising => 0,
+            Self::Falling => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DsCopeTriggerConfig {
+    position_percent: u8,
+    source: DsCopeTriggerSource,
+    auto_channel: u8,
+    slope: DsCopeTriggerSlope,
+    holdoff_ns: u64,
+    noise_sensitivity: u8,
+    level: u8,
+}
+
+impl Default for DsCopeTriggerConfig {
+    fn default() -> Self {
+        Self {
+            position_percent: DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
+            source: DsCopeTriggerSource::Auto,
+            auto_channel: 0,
+            slope: DsCopeTriggerSlope::Rising,
+            holdoff_ns: 0,
+            noise_sensitivity: 8,
+            level: DSCOPE_TRIGGER_LEVEL_CENTER,
+        }
+    }
+}
+
+impl DsCopeTriggerConfig {
+    pub fn new(source: DsCopeTriggerSource, slope: DsCopeTriggerSlope) -> Self {
+        Self {
+            source,
+            slope,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_position_percent(mut self, position_percent: u8) -> Result<Self, CaptureError> {
+        if !(DSCOPE_TRIGGER_POSITION_MIN_PERCENT..=DSCOPE_TRIGGER_POSITION_MAX_PERCENT)
+            .contains(&position_percent)
+        {
+            return Err(CaptureError::new(format!(
+                "DSCope trigger position must be between {DSCOPE_TRIGGER_POSITION_MIN_PERCENT}% and {DSCOPE_TRIGGER_POSITION_MAX_PERCENT}%; got {position_percent}%"
+            )));
+        }
+        self.position_percent = position_percent;
+        Ok(self)
+    }
+
+    pub fn with_auto_channel(mut self, auto_channel: u8) -> Result<Self, CaptureError> {
+        if usize::from(auto_channel) >= CHANNEL_COUNT {
+            return Err(CaptureError::new(format!(
+                "DSCope auto-trigger channel must be 0 or 1; got {auto_channel}"
+            )));
+        }
+        self.auto_channel = auto_channel;
+        Ok(self)
+    }
+
+    pub fn with_holdoff_ns(mut self, holdoff_ns: u64) -> Result<Self, CaptureError> {
+        if holdoff_ns > DSCOPE_TRIGGER_HOLDOFF_MAX_NS {
+            return Err(CaptureError::new(format!(
+                "DSCope trigger holdoff must not exceed {DSCOPE_TRIGGER_HOLDOFF_MAX_NS} ns; got {holdoff_ns} ns"
+            )));
+        }
+        self.holdoff_ns = holdoff_ns;
+        Ok(self)
+    }
+
+    pub fn with_noise_sensitivity(mut self, noise_sensitivity: u8) -> Result<Self, CaptureError> {
+        if noise_sensitivity > DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX {
+            return Err(CaptureError::new(format!(
+                "DSCope trigger noise sensitivity must not exceed {DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX}; got {noise_sensitivity}"
+            )));
+        }
+        self.noise_sensitivity = noise_sensitivity;
+        Ok(self)
+    }
+
+    pub fn with_level(mut self, level: u8) -> Result<Self, CaptureError> {
+        if !(DSCOPE_TRIGGER_LEVEL_MIN..=DSCOPE_TRIGGER_LEVEL_MAX).contains(&level) {
+            return Err(CaptureError::new(format!(
+                "DSCope trigger level must be between {DSCOPE_TRIGGER_LEVEL_MIN} and {DSCOPE_TRIGGER_LEVEL_MAX}; got {level}"
+            )));
+        }
+        self.level = level;
+        Ok(self)
+    }
+
+    pub fn position_percent(self) -> u8 {
+        self.position_percent
+    }
+
+    pub fn source(self) -> DsCopeTriggerSource {
+        self.source
+    }
+
+    pub fn auto_channel(self) -> u8 {
+        self.auto_channel
+    }
+
+    pub fn slope(self) -> DsCopeTriggerSlope {
+        self.slope
+    }
+
+    pub fn holdoff_ns(self) -> u64 {
+        self.holdoff_ns
+    }
+
+    pub fn noise_sensitivity(self) -> u8 {
+        self.noise_sensitivity
+    }
+
+    pub fn level(self) -> u8 {
+        self.level
     }
 }
 
@@ -161,6 +319,7 @@ pub struct DsCopeCaptureConfig {
     sample_rate_hz: u64,
     sample_count: u64,
     channels: [DsCopeChannelConfig; CHANNEL_COUNT],
+    trigger: DsCopeTriggerConfig,
 }
 
 impl DsCopeCaptureConfig {
@@ -200,11 +359,25 @@ impl DsCopeCaptureConfig {
                 "DSCope U3P100 sample count must be between {SAMPLE_ALIGNMENT} and {maximum_sample_count} with {enabled_channel_count} enabled channel(s)"
             )));
         }
+        let mut trigger = DsCopeTriggerConfig::default();
+        if !channels[0].enabled {
+            trigger.auto_channel = 1;
+        }
         Ok(Self {
             sample_rate_hz,
             sample_count,
             channels,
+            trigger,
         })
+    }
+
+    pub fn with_trigger_config(
+        mut self,
+        trigger: DsCopeTriggerConfig,
+    ) -> Result<Self, CaptureError> {
+        validate_trigger_channels(trigger, self.channels)?;
+        self.trigger = trigger;
+        Ok(self)
     }
 
     pub fn sample_rate_hz(self) -> u64 {
@@ -217,6 +390,10 @@ impl DsCopeCaptureConfig {
 
     pub fn channels(self) -> [DsCopeChannelConfig; CHANNEL_COUNT] {
         self.channels
+    }
+
+    pub fn trigger(self) -> DsCopeTriggerConfig {
+        self.trigger
     }
 
     pub fn enabled_channel_count(self) -> usize {
@@ -240,6 +417,13 @@ impl DsCopeCaptureConfig {
     fn divider(self) -> u32 {
         HARDWARE_SAMPLE_RATE_HZ.div_ceil(self.sample_rate_hz * self.enabled_channel_count() as u64)
             as u32
+    }
+
+    fn trigger_position_samples(self) -> u64 {
+        u64::from(self.trigger.position_percent)
+            * self.enabled_channel_count() as u64
+            * self.sample_count
+            / 200
     }
 
     fn encode_settings(self) -> Vec<u8> {
@@ -301,6 +485,28 @@ impl DsCopeCaptureConfig {
         push_u32(&mut bytes, 0xfa5a_fa5a);
         debug_assert_eq!(bytes.len(), SETTINGS_BYTES);
         bytes
+    }
+}
+
+fn validate_trigger_channels(
+    trigger: DsCopeTriggerConfig,
+    channels: [DsCopeChannelConfig; CHANNEL_COUNT],
+) -> Result<(), CaptureError> {
+    let channel_zero_enabled = channels[0].enabled;
+    let channel_one_enabled = channels[1].enabled;
+    let valid = match trigger.source {
+        DsCopeTriggerSource::Auto => channels[usize::from(trigger.auto_channel)].enabled,
+        DsCopeTriggerSource::ChannelZero => channel_zero_enabled,
+        DsCopeTriggerSource::ChannelOne => channel_one_enabled,
+        DsCopeTriggerSource::ChannelZeroAndOne => channel_zero_enabled && channel_one_enabled,
+        DsCopeTriggerSource::ChannelZeroOrOne => channel_zero_enabled || channel_one_enabled,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(CaptureError::new(
+            "DSCope trigger source references a disabled channel",
+        ))
     }
 }
 
@@ -463,6 +669,8 @@ fn configure_scope_post_arm(
 fn dso_commands(config: DsCopeCaptureConfig, calibration: DsCopeCalibration) -> [u64; 14] {
     let channel_zero = calibration.channels[0];
     let channel_one = calibration.channels[1];
+    let trigger = config.trigger;
+    let trigger_source = (trigger.auto_channel << 4) | trigger.source.command_value();
     [
         0xa5a5_a500,
         coupling_command(config, 0, config.channels[0].coupling),
@@ -480,12 +688,12 @@ fn dso_commands(config: DsCopeCaptureConfig, calibration: DsCopeCalibration) -> 
             channel_one.preoffset,
         ),
         0x18 + (u64::from(config.divider()) << 8),
-        0x20,
-        0x58,
-        0x28,
-        0x30,
-        0x0080_8038,
-        0x0840,
+        0x20 + (config.trigger_position_samples() << 8),
+        0x58 + (trigger.holdoff_ns << 8),
+        0x28 + (u64::from(trigger.slope.command_value()) << 8),
+        0x30 + (u64::from(trigger_source) << 8),
+        0x38 + (u64::from(trigger.level) << 8) + (u64::from(trigger.level) << 16),
+        0x40 + (u64::from(trigger.noise_sensitivity) << 8),
     ]
 }
 
@@ -952,7 +1160,77 @@ mod tests {
         assert_eq!(commands[3], 0x0006_9d08);
         assert_eq!(commands[4], 0x0006_9d88);
         assert_eq!(commands[7], 0x0001_f418);
+        assert_eq!(commands[8], 0x0027_1020);
+        assert_eq!(commands[9], 0x58);
+        assert_eq!(commands[10], 0x28);
+        assert_eq!(commands[11], 0x30);
         assert_eq!(commands[12], 0x0080_8038);
+        assert_eq!(commands[13], 0x0840);
+    }
+
+    #[test]
+    fn encodes_vendor_trigger_controls_as_dso_commands() {
+        let trigger = DsCopeTriggerConfig::new(
+            DsCopeTriggerSource::ChannelZeroAndOne,
+            DsCopeTriggerSlope::Falling,
+        )
+        .with_position_percent(75)
+        .unwrap()
+        .with_auto_channel(1)
+        .unwrap()
+        .with_holdoff_ns(250_000)
+        .unwrap()
+        .with_noise_sensitivity(12)
+        .unwrap()
+        .with_level(64)
+        .unwrap();
+        let config = DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT)
+            .unwrap()
+            .with_trigger_config(trigger)
+            .unwrap();
+
+        let commands = dso_commands(config, DsCopeCalibration::nominal());
+
+        assert_eq!(commands[8], 0x20 + (750_000 << 8));
+        assert_eq!(commands[9], 0x58 + (250_000 << 8));
+        assert_eq!(commands[10], 0x0128);
+        assert_eq!(commands[11], 0x1330);
+        assert_eq!(commands[12], 0x0040_4038);
+        assert_eq!(commands[13], 0x0c40);
+    }
+
+    #[test]
+    fn validates_trigger_ranges_and_enabled_channels() {
+        assert!(DsCopeTriggerConfig::default()
+            .with_position_percent(0)
+            .is_err());
+        assert!(DsCopeTriggerConfig::default()
+            .with_position_percent(100)
+            .is_err());
+        assert!(DsCopeTriggerConfig::default().with_auto_channel(2).is_err());
+        assert!(DsCopeTriggerConfig::default()
+            .with_holdoff_ns(DSCOPE_TRIGGER_HOLDOFF_MAX_NS + 1)
+            .is_err());
+        assert!(DsCopeTriggerConfig::default()
+            .with_noise_sensitivity(DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX + 1)
+            .is_err());
+        assert!(DsCopeTriggerConfig::default()
+            .with_level(DSCOPE_TRIGGER_LEVEL_MIN - 1)
+            .is_err());
+        assert!(DsCopeTriggerConfig::default()
+            .with_level(DSCOPE_TRIGGER_LEVEL_MAX + 1)
+            .is_err());
+
+        let channels = [
+            DsCopeChannelConfig::default(),
+            DsCopeChannelConfig::default().with_enabled(false),
+        ];
+        let config =
+            DsCopeCaptureConfig::with_channel_configs(1_000_000, 100_000, channels).unwrap();
+        let trigger =
+            DsCopeTriggerConfig::new(DsCopeTriggerSource::ChannelOne, DsCopeTriggerSlope::Rising);
+
+        assert!(config.with_trigger_config(trigger).is_err());
     }
 
     #[test]
@@ -978,6 +1256,7 @@ mod tests {
         assert_eq!(commands[1], 0x1b00);
         assert_eq!(commands[2], 0x1b80);
         assert_eq!(commands[7], 0x0118);
+        assert_eq!(commands[11], 0x1030);
     }
 
     #[test]
