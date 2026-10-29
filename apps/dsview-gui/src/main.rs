@@ -67,6 +67,7 @@ const SCOPE_COLORS: [Color32; 2] = [
 ];
 const MATH_COLOR: Color32 = Color32::from_rgb(213, 126, 255);
 const FFT_LENGTHS: [usize; 5] = [1_024, 2_048, 4_096, 8_192, 16_384];
+const SCOPE_MARKER_LIMIT: usize = 5;
 static SCOPE_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
 
 fn toolbar_action_button(label: &str, color: Color32) -> egui::Button<'static> {
@@ -352,6 +353,50 @@ impl ScopeFunctionSettings {
         }
         if !channels[self.fft.channel] {
             self.fft.channel = fallback;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScopeChannelMarkerSettings {
+    horizontal_count: usize,
+    horizontal_positions: [f32; SCOPE_MARKER_LIMIT],
+    vertical_count: usize,
+    vertical_positions: [f32; SCOPE_MARKER_LIMIT],
+}
+
+impl ScopeChannelMarkerSettings {
+    fn new(
+        horizontal_positions: [f32; SCOPE_MARKER_LIMIT],
+        vertical_positions: [f32; SCOPE_MARKER_LIMIT],
+    ) -> Self {
+        Self {
+            horizontal_count: 0,
+            horizontal_positions,
+            vertical_count: 0,
+            vertical_positions,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScopeMarkerSettings {
+    channels: [ScopeChannelMarkerSettings; 2],
+}
+
+impl Default for ScopeMarkerSettings {
+    fn default() -> Self {
+        Self {
+            channels: [
+                ScopeChannelMarkerSettings::new(
+                    [0.10, 0.25, 0.40, 0.55, 0.70],
+                    [0.10, 0.25, 0.40, 0.55, 0.70],
+                ),
+                ScopeChannelMarkerSettings::new(
+                    [0.30, 0.45, 0.60, 0.75, 0.90],
+                    [0.30, 0.45, 0.60, 0.75, 0.90],
+                ),
+            ],
         }
     }
 }
@@ -1030,6 +1075,7 @@ struct DsViewApp {
     scope_settings: ScopeCaptureSettings,
     scope_auto_sample_rate: bool,
     scope_function_settings: ScopeFunctionSettings,
+    scope_marker_settings: ScopeMarkerSettings,
     active_waveform_tab: Option<WaveformTab>,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
@@ -1067,6 +1113,7 @@ impl DsViewApp {
             scope_settings: ScopeCaptureSettings::default(),
             scope_auto_sample_rate: true,
             scope_function_settings: ScopeFunctionSettings::default(),
+            scope_marker_settings: ScopeMarkerSettings::default(),
             active_waveform_tab: None,
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
@@ -2274,6 +2321,81 @@ fn paint_scope_measurement_settings(
         });
 }
 
+fn paint_scope_marker_settings(
+    ui: &mut egui::Ui,
+    settings: &mut ScopeMarkerSettings,
+    channels: [bool; 2],
+) {
+    egui::CollapsingHeader::new(RichText::new("Markers").strong())
+        .default_open(false)
+        .show(ui, |ui| {
+            for (channel, channel_enabled) in channels.into_iter().enumerate() {
+                let channel_settings = &mut settings.channels[channel];
+                ui.add_enabled_ui(channel_enabled, |ui| {
+                    ui.group(|ui| {
+                        ui.label(
+                            RichText::new(format!("CH{channel} markers"))
+                                .strong()
+                                .color(SCOPE_COLORS[channel]),
+                        );
+                        paint_scope_marker_count_control(
+                            ui,
+                            "Horizontal · Δt",
+                            &mut channel_settings.horizontal_count,
+                        );
+                        ui.add_enabled_ui(channel_settings.horizontal_count > 0, |ui| {
+                            ui.small(
+                                RichText::new("Drag time markers left/right in the plot")
+                                    .color(TEXT_MUTED),
+                            );
+                        });
+
+                        ui.add_space(4.0);
+                        paint_scope_marker_count_control(
+                            ui,
+                            "Vertical · ΔV",
+                            &mut channel_settings.vertical_count,
+                        );
+                        ui.add_enabled_ui(channel_settings.vertical_count > 0, |ui| {
+                            ui.small(
+                                RichText::new("Drag voltage markers up/down in the plot")
+                                    .color(TEXT_MUTED),
+                            );
+                        });
+                    });
+                });
+                if !channel_enabled {
+                    ui.small(RichText::new(format!("CH{channel} is disabled")).color(TEXT_MUTED));
+                }
+                if channel + 1 < channels.len() {
+                    ui.add_space(6.0);
+                }
+            }
+        });
+}
+
+fn paint_scope_marker_count_control(ui: &mut egui::Ui, label: &str, count: &mut usize) {
+    *count = (*count).min(SCOPE_MARKER_LIMIT);
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(*count < SCOPE_MARKER_LIMIT, egui::Button::new("+ Add"))
+                .clicked()
+            {
+                *count += 1;
+            }
+            if ui
+                .add_enabled(*count > 0, egui::Button::new("− Remove"))
+                .clicked()
+            {
+                *count -= 1;
+            }
+            ui.monospace(format!("{} / {SCOPE_MARKER_LIMIT}", *count));
+        });
+    });
+}
+
 fn paint_scope_channel_settings(
     ui: &mut egui::Ui,
     channel_index: usize,
@@ -2358,12 +2480,17 @@ struct ScopeCaptureSettingsEditor<'a> {
     auto_sample_rate: &'a mut bool,
 }
 
+struct ScopeVisualizationSettingsEditor<'a> {
+    functions: &'a mut ScopeFunctionSettings,
+    markers: &'a mut ScopeMarkerSettings,
+    channel_colors: &'a mut [Color32; 2],
+}
+
 fn paint_capture_settings(
     ui: &mut egui::Ui,
     tab: CaptureSettingsTab,
     scope_editor: ScopeCaptureSettingsEditor<'_>,
-    scope_function_settings: &mut ScopeFunctionSettings,
-    scope_channel_colors: &mut [Color32; 2],
+    visualization_editor: ScopeVisualizationSettingsEditor<'_>,
     availability: CaptureSettingsAvailability,
     calibration_action: &mut Option<ScopeCalibrationAction>,
 ) {
@@ -2371,6 +2498,11 @@ fn paint_capture_settings(
         settings: scope_settings,
         auto_sample_rate: scope_auto_sample_rate,
     } = scope_editor;
+    let ScopeVisualizationSettingsEditor {
+        functions: scope_function_settings,
+        markers: scope_marker_settings,
+        channel_colors: scope_channel_colors,
+    } = visualization_editor;
     let card_width = ui.available_width();
     egui::Frame::none()
         .fill(BACKGROUND)
@@ -2581,6 +2713,8 @@ fn paint_capture_settings(
                         &mut scope_function_settings.measurements,
                         channel_enabled,
                     );
+                    ui.add_space(8.0);
+                    paint_scope_marker_settings(ui, scope_marker_settings, channel_enabled);
                 }
             }
         });
@@ -2777,8 +2911,11 @@ impl eframe::App for DsViewApp {
                                     settings: &mut self.scope_settings,
                                     auto_sample_rate: &mut self.scope_auto_sample_rate,
                                 },
-                                &mut self.scope_function_settings,
-                                &mut self.scope_channel_colors,
+                                ScopeVisualizationSettingsEditor {
+                                    functions: &mut self.scope_function_settings,
+                                    markers: &mut self.scope_marker_settings,
+                                    channel_colors: &mut self.scope_channel_colors,
+                                },
                                 CaptureSettingsAvailability {
                                     capture: capture_settings_enabled,
                                     sample_rate: frontend_controls_enabled,
@@ -2895,6 +3032,7 @@ impl eframe::App for DsViewApp {
                 let mut scope_measurement_caches = self.scope_measurement_caches;
                 let mut scope_measurement_window_positions =
                     self.scope_measurement_window_positions;
+                let mut scope_marker_settings = self.scope_marker_settings;
                 let mut scope_time_per_division_seconds = self.scope_time_per_division_seconds;
                 let mut scope_timebase_changed = false;
                 let mut scope_vertical_offsets = self
@@ -2942,6 +3080,7 @@ impl eframe::App for DsViewApp {
                                         measurement_caches: &mut scope_measurement_caches,
                                         measurement_window_positions:
                                             &mut scope_measurement_window_positions,
+                                        marker_settings: &mut scope_marker_settings,
                                         channel_colors: self.scope_channel_colors,
                                         vertical_offsets: &mut scope_vertical_offsets,
                                         trigger_settings: &mut scope_trigger_settings,
@@ -2972,6 +3111,7 @@ impl eframe::App for DsViewApp {
                                 measurement_caches: &mut scope_measurement_caches,
                                 measurement_window_positions:
                                     &mut scope_measurement_window_positions,
+                                marker_settings: &mut scope_marker_settings,
                                 channel_colors: self.scope_channel_colors,
                                 vertical_offsets: &mut scope_vertical_offsets,
                                 trigger_settings: &mut scope_trigger_settings,
@@ -2991,6 +3131,7 @@ impl eframe::App for DsViewApp {
                 self.scope_fft_viewport = scope_fft_viewport;
                 self.scope_measurement_caches = scope_measurement_caches;
                 self.scope_measurement_window_positions = scope_measurement_window_positions;
+                self.scope_marker_settings = scope_marker_settings;
                 self.scope_time_per_division_seconds = scope_time_per_division_seconds;
                 let automatic_sample_rate_inputs_changed = scope_timebase_changed
                     || (!scope_auto_sample_rate_before_ui && self.scope_auto_sample_rate)
@@ -3605,6 +3746,7 @@ struct ScopeWaveformOptions<'a> {
     function_settings: ScopeFunctionSettings,
     measurement_caches: &'a mut [ScopeMeasurementCache; 2],
     measurement_window_positions: &'a mut [Vec2; 2],
+    marker_settings: &'a mut ScopeMarkerSettings,
     channel_colors: [Color32; 2],
     vertical_offsets: &'a mut [u16; 2],
     trigger_settings: &'a mut ScopeTriggerSettings,
@@ -5043,6 +5185,290 @@ fn scope_measurement_window_position(plot: Rect, panel: Rect) -> Vec2 {
     )
 }
 
+struct ScopeMarkerPaintOptions<'a> {
+    settings: &'a mut ScopeMarkerSettings,
+    scope_settings: ScopeCaptureSettings,
+    sample_count: usize,
+    sample_rate_hz: u64,
+    viewport: WaveformViewport,
+}
+
+fn paint_scope_markers(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    plot: Rect,
+    options: ScopeMarkerPaintOptions<'_>,
+) {
+    let ScopeMarkerPaintOptions {
+        settings: marker_settings,
+        scope_settings,
+        sample_count,
+        sample_rate_hz,
+        viewport,
+    } = options;
+    for channel in 0..2 {
+        if !scope_settings.channels[channel].enabled {
+            continue;
+        }
+        let channel_markers = &mut marker_settings.channels[channel];
+        let horizontal_count = channel_markers.horizontal_count.min(SCOPE_MARKER_LIMIT);
+        for (index, position) in channel_markers.horizontal_positions[..horizontal_count]
+            .iter_mut()
+            .enumerate()
+        {
+            let color = scope_marker_color(channel, index);
+            let x = egui::lerp(plot.x_range(), position.clamp(0.0, 1.0));
+            let hit_rect = Rect::from_min_max(
+                Pos2::new(x - 7.0, plot.top()),
+                Pos2::new(x + 7.0, plot.bottom()),
+            );
+            let response = ui
+                .interact(
+                    hit_rect,
+                    ui.make_persistent_id(("scope_time_marker", channel, index)),
+                    Sense::drag(),
+                )
+                .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+                .on_hover_text(format!("Drag CH{channel} T{} horizontally", index + 1));
+            if response.dragged() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    *position = ((pointer.x - plot.left()) / plot.width().max(1.0)).clamp(0.0, 1.0);
+                }
+            }
+            let x = egui::lerp(plot.x_range(), position.clamp(0.0, 1.0));
+            paint_dashed_line(
+                painter,
+                Pos2::new(x, plot.top()),
+                Pos2::new(x, plot.bottom()),
+                Stroke::new(1.4_f32, color),
+            );
+            paint_marker_handle(
+                painter,
+                Pos2::new(x, plot.top() + 10.0),
+                &format!("T{channel}{}", index + 1),
+                color,
+            );
+        }
+        for pair in 0..horizontal_count.saturating_sub(1) {
+            let first = channel_markers.horizontal_positions[pair];
+            let second = channel_markers.horizontal_positions[pair + 1];
+            let Some(delta_seconds) =
+                scope_time_marker_delta(first, second, sample_count, sample_rate_hz, viewport)
+            else {
+                continue;
+            };
+            let frequency = (delta_seconds > 0.0).then(|| 1.0 / delta_seconds);
+            let text = match frequency {
+                Some(frequency) => format!(
+                    "CH{channel} T{}–T{}  {}  ·  {}",
+                    pair + 1,
+                    pair + 2,
+                    format_duration(Duration::from_secs_f64(delta_seconds)),
+                    format_frequency(frequency)
+                ),
+                None => format!(
+                    "CH{channel} T{}–T{}  {}",
+                    pair + 1,
+                    pair + 2,
+                    format_duration(Duration::from_secs_f64(delta_seconds))
+                ),
+            };
+            let center_x = egui::lerp(plot.x_range(), (first + second) * 0.5);
+            paint_marker_readout(
+                painter,
+                plot,
+                Pos2::new(
+                    center_x,
+                    plot.top() + 33.0 + pair as f32 * 27.0 + channel as f32 * 13.0,
+                ),
+                &text,
+                scope_marker_color(channel, pair),
+            );
+        }
+
+        let vertical_count = channel_markers.vertical_count.min(SCOPE_MARKER_LIMIT);
+        for (index, position) in channel_markers.vertical_positions[..vertical_count]
+            .iter_mut()
+            .enumerate()
+        {
+            let color = scope_marker_color(channel, index);
+            let y = egui::lerp(plot.y_range(), position.clamp(0.0, 1.0));
+            let hit_rect = Rect::from_min_max(
+                Pos2::new(plot.left(), y - 7.0),
+                Pos2::new(plot.right(), y + 7.0),
+            );
+            let response = ui
+                .interact(
+                    hit_rect,
+                    ui.make_persistent_id(("scope_voltage_marker", channel, index)),
+                    Sense::drag(),
+                )
+                .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+                .on_hover_text(format!("Drag CH{channel} V{} vertically", index + 1));
+            if response.dragged() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    *position = ((pointer.y - plot.top()) / plot.height().max(1.0)).clamp(0.0, 1.0);
+                }
+            }
+            let y = egui::lerp(plot.y_range(), position.clamp(0.0, 1.0));
+            paint_dashed_line(
+                painter,
+                Pos2::new(plot.left(), y),
+                Pos2::new(plot.right(), y),
+                Stroke::new(1.4_f32, color),
+            );
+            paint_marker_handle(
+                painter,
+                Pos2::new(plot.left() + 17.0, y),
+                &format!("V{channel}{}", index + 1),
+                color,
+            );
+        }
+        for pair in 0..vertical_count.saturating_sub(1) {
+            let first = channel_markers.vertical_positions[pair];
+            let second = channel_markers.vertical_positions[pair + 1];
+            let delta_voltage =
+                scope_voltage_marker_delta(first, second, scope_settings.channels[channel]);
+            let center_y = egui::lerp(plot.y_range(), (first + second) * 0.5);
+            let center_x = if channel == 0 {
+                plot.left() + 125.0
+            } else {
+                plot.right() - 125.0
+            };
+            paint_marker_readout(
+                painter,
+                plot,
+                Pos2::new(center_x, center_y),
+                &format!(
+                    "CH{channel} V{}–V{}  {}",
+                    pair + 1,
+                    pair + 2,
+                    format_marker_voltage(delta_voltage)
+                ),
+                scope_marker_color(channel, pair),
+            );
+        }
+    }
+}
+
+fn scope_marker_color(channel: usize, marker: usize) -> Color32 {
+    const CH0_COLORS: [Color32; SCOPE_MARKER_LIMIT] = [
+        Color32::from_rgb(255, 204, 74),
+        Color32::from_rgb(255, 132, 172),
+        Color32::from_rgb(255, 145, 77),
+        Color32::from_rgb(213, 126, 255),
+        Color32::from_rgb(180, 230, 80),
+    ];
+    const CH1_COLORS: [Color32; SCOPE_MARKER_LIMIT] = [
+        Color32::from_rgb(99, 179, 255),
+        Color32::from_rgb(70, 210, 185),
+        Color32::from_rgb(174, 130, 255),
+        Color32::from_rgb(100, 205, 255),
+        Color32::from_rgb(245, 100, 100),
+    ];
+    if channel == 0 {
+        CH0_COLORS[marker % SCOPE_MARKER_LIMIT]
+    } else {
+        CH1_COLORS[marker % SCOPE_MARKER_LIMIT]
+    }
+}
+
+fn paint_dashed_line(painter: &egui::Painter, start: Pos2, end: Pos2, stroke: Stroke) {
+    const DASH_LENGTH: f32 = 6.0;
+    const GAP_LENGTH: f32 = 4.0;
+    let delta = end - start;
+    let length = delta.length();
+    if length <= f32::EPSILON {
+        return;
+    }
+    let direction = delta / length;
+    let mut offset = 0.0;
+    while offset < length {
+        let dash_end = (offset + DASH_LENGTH).min(length);
+        painter.line_segment(
+            [start + direction * offset, start + direction * dash_end],
+            stroke,
+        );
+        offset += DASH_LENGTH + GAP_LENGTH;
+    }
+}
+
+fn paint_marker_handle(painter: &egui::Painter, center: Pos2, label: &str, color: Color32) {
+    let width = (label.chars().count() as f32 * 7.0 + 10.0).max(25.0);
+    let rect = Rect::from_center_size(center, Vec2::new(width, 18.0));
+    painter.rect_filled(rect, egui::Rounding::same(3.0), color);
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::monospace(10.0),
+        marker_text_color(color),
+    );
+}
+
+fn paint_marker_readout(
+    painter: &egui::Painter,
+    plot: Rect,
+    center: Pos2,
+    text: &str,
+    color: Color32,
+) {
+    let size = Vec2::new(
+        (text.chars().count() as f32 * 7.2 + 16.0).min(plot.width()),
+        24.0_f32.min(plot.height()),
+    );
+    let half = size * 0.5;
+    let center = Pos2::new(
+        center.x.clamp(plot.left() + half.x, plot.right() - half.x),
+        center.y.clamp(plot.top() + half.y, plot.bottom() - half.y),
+    );
+    let rect = Rect::from_center_size(center, size);
+    painter.rect_filled(
+        rect,
+        egui::Rounding::same(4.0),
+        Color32::from_rgba_unmultiplied(8, 12, 18, 230),
+    );
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        text,
+        FontId::monospace(12.0),
+        color,
+    );
+}
+
+fn scope_time_marker_delta(
+    first_position: f32,
+    second_position: f32,
+    sample_count: usize,
+    sample_rate_hz: u64,
+    viewport: WaveformViewport,
+) -> Option<f64> {
+    let visible_seconds = viewport.time_per_division(sample_count, sample_rate_hz)?
+        * SCOPE_HORIZONTAL_DIVISIONS as f64;
+    Some(f64::from((second_position - first_position).abs()) * visible_seconds)
+}
+
+fn scope_voltage_marker_delta(
+    first_position: f32,
+    second_position: f32,
+    channel: ScopeChannelSettings,
+) -> f32 {
+    let volts_per_division =
+        f32::from(channel.volts_per_div_mv) / 1_000.0 * f32::from(channel.probe_attenuation);
+    (second_position - first_position).abs() * volts_per_division * SCOPE_VERTICAL_DIVISIONS as f32
+}
+
+fn format_marker_voltage(value: f32) -> String {
+    if value >= 1.0 {
+        format!("{value:.3} V")
+    } else if value >= 1.0e-3 {
+        format!("{:.2} mV", value * 1.0e3)
+    } else {
+        format!("{:.2} µV", value * 1.0e6)
+    }
+}
+
 fn scope_math_value(
     waveforms: &WaveformStore,
     settings: ScopeMathSettings,
@@ -5460,6 +5886,7 @@ fn paint_scope_time_domain(
         function_settings,
         measurement_caches,
         measurement_window_positions,
+        marker_settings,
         channel_colors,
         vertical_offsets,
         trigger_settings,
@@ -5561,6 +5988,18 @@ fn paint_scope_time_domain(
             vertical_offsets,
             trigger_controls_enabled,
         );
+        paint_scope_markers(
+            ui,
+            &scope_painter,
+            plot,
+            ScopeMarkerPaintOptions {
+                settings: marker_settings,
+                scope_settings: settings,
+                sample_count: display_sample_count,
+                sample_rate_hz: display_sample_rate_hz,
+                viewport: *viewport,
+            },
+        );
         paint_waveform_time_scale(
             painter,
             time_ruler,
@@ -5654,6 +6093,18 @@ fn paint_scope_time_domain(
         channel_colors,
         vertical_offsets,
         trigger_controls_enabled,
+    );
+    paint_scope_markers(
+        ui,
+        &scope_painter,
+        plot,
+        ScopeMarkerPaintOptions {
+            settings: marker_settings,
+            scope_settings: settings,
+            sample_count: display_sample_count,
+            sample_rate_hz: display_sample_rate_hz,
+            viewport: *viewport,
+        },
     );
     paint_scope_measurements(
         ui,
@@ -6124,6 +6575,62 @@ mod tests {
             scope_measurement_window_position(plot, center),
             Vec2::new(0.5, 0.5)
         );
+    }
+
+    #[test]
+    fn scope_markers_measure_horizontal_time_and_vertical_amplitude() {
+        let markers = ScopeMarkerSettings::default();
+        let viewport = WaveformViewport::default();
+
+        assert!(
+            (scope_time_marker_delta(
+                markers.channels[0].horizontal_positions[0],
+                markers.channels[0].horizontal_positions[1],
+                1_000,
+                1_000,
+                viewport,
+            )
+            .unwrap()
+                - 0.15)
+                .abs()
+                < 0.000_001
+        );
+        assert!(
+            (scope_voltage_marker_delta(
+                markers.channels[0].vertical_positions[0],
+                markers.channels[0].vertical_positions[1],
+                ScopeCaptureSettings::default().channels[0]
+            ) - 1.2)
+                .abs()
+                < 0.000_001
+        );
+
+        let mut scope_settings = ScopeCaptureSettings::default();
+        scope_settings.channels[1].volts_per_div_mv = 500;
+        scope_settings.channels[1].probe_attenuation = 10;
+        assert!(
+            (scope_voltage_marker_delta(
+                markers.channels[1].vertical_positions[0],
+                markers.channels[1].vertical_positions[1],
+                scope_settings.channels[1]
+            ) - 6.0)
+                .abs()
+                < 0.000_001
+        );
+
+        assert_ne!(
+            markers.channels[0].horizontal_positions,
+            markers.channels[1].horizontal_positions
+        );
+        assert_eq!(
+            markers.channels[0].horizontal_positions.len(),
+            SCOPE_MARKER_LIMIT
+        );
+        assert_eq!(
+            markers.channels[1].vertical_positions.len(),
+            SCOPE_MARKER_LIMIT
+        );
+        assert_eq!(format_marker_voltage(0.125), "125.00 mV");
     }
 
     #[test]
