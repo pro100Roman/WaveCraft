@@ -1,5 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod measurements;
+
 use dsview_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSession, CaptureSource,
     DeviceDescriptor, DeviceId,
@@ -19,11 +21,16 @@ use dsview_usb::{
     DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+use measurements::{
+    calculate_scope_measurements, ScopeMeasurementResults, ScopeMeasurementSettings,
+    SCOPE_MEASUREMENT_KINDS,
+};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -60,6 +67,7 @@ const SCOPE_COLORS: [Color32; 2] = [
 ];
 const MATH_COLOR: Color32 = Color32::from_rgb(213, 126, 255);
 const FFT_LENGTHS: [usize; 5] = [1_024, 2_048, 4_096, 8_192, 16_384];
+static SCOPE_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
 
 fn toolbar_action_button(label: &str, color: Color32) -> egui::Button<'static> {
     egui::Button::new(label.to_owned())
@@ -330,6 +338,7 @@ impl Default for ScopeFftSettings {
 struct ScopeFunctionSettings {
     math: ScopeMathSettings,
     fft: ScopeFftSettings,
+    measurements: ScopeMeasurementSettings,
 }
 
 impl ScopeFunctionSettings {
@@ -584,6 +593,7 @@ struct WaveformStore {
     scope_sample_offset: u64,
     scope_trigger_sample_index: Option<u64>,
     scope_capacity: usize,
+    scope_revision: u64,
 }
 
 impl Default for WaveformStore {
@@ -598,7 +608,50 @@ impl Default for WaveformStore {
             scope_sample_offset: 0,
             scope_trigger_sample_index: None,
             scope_capacity: MAX_WAVEFORM_SAMPLES,
+            scope_revision: 0,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScopeMeasurementCacheKey {
+    waveform_revision: u64,
+    channel: usize,
+    range_start: usize,
+    range_end: usize,
+    sample_rate_hz: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ScopeMeasurementCache {
+    key: Option<ScopeMeasurementCacheKey>,
+    results: ScopeMeasurementResults,
+}
+
+impl ScopeMeasurementCache {
+    fn results(
+        &mut self,
+        waveforms: &WaveformStore,
+        channel: usize,
+        visible_range: Range<usize>,
+        sample_rate_hz: u64,
+    ) -> ScopeMeasurementResults {
+        let key = ScopeMeasurementCacheKey {
+            waveform_revision: waveforms.scope_revision,
+            channel,
+            range_start: visible_range.start,
+            range_end: visible_range.end,
+            sample_rate_hz,
+        };
+        if self.key != Some(key) {
+            self.results = waveforms
+                .scope_channels
+                .get(channel)
+                .map(|samples| calculate_scope_measurements(samples, visible_range, sample_rate_hz))
+                .unwrap_or_default();
+            self.key = Some(key);
+        }
+        self.results
     }
 }
 
@@ -874,6 +927,7 @@ impl WaveformStore {
                     extend_bounded(&mut self.logic_samples, logic.samples.iter().copied()) as u64;
             }
             CaptureBatch::Scope(scope) => {
+                self.scope_revision = SCOPE_WAVEFORM_REVISION.fetch_add(1, Ordering::Relaxed);
                 self.scope_rate_hz = scope.sample_rate_hz;
                 if self.scope_channels.len() != scope_channels.len() {
                     self.scope_channels = vec![VecDeque::new(); scope_channels.len()];
@@ -983,6 +1037,8 @@ struct DsViewApp {
     logic_viewport: WaveformViewport,
     scope_viewport: WaveformViewport,
     scope_fft_viewport: ScopeFftViewport,
+    scope_measurement_caches: [ScopeMeasurementCache; 2],
+    scope_measurement_window_positions: [Vec2; 2],
     scope_time_per_division_seconds: Option<f64>,
     scope_capture_restart_requested: bool,
     scope_configuration_due: Option<Instant>,
@@ -1018,6 +1074,8 @@ impl DsViewApp {
             logic_viewport: WaveformViewport::default(),
             scope_viewport: WaveformViewport::default(),
             scope_fft_viewport: ScopeFftViewport::default(),
+            scope_measurement_caches: [ScopeMeasurementCache::default(); 2],
+            scope_measurement_window_positions: [Vec2::new(1.0, 0.0), Vec2::new(0.0, 0.0)],
             scope_time_per_division_seconds: Some(DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS),
             scope_capture_restart_requested: false,
             scope_configuration_due: None,
@@ -2051,7 +2109,6 @@ fn paint_scope_function_settings(
     settings: &mut ScopeFunctionSettings,
     channels: [bool; 2],
 ) {
-    settings.clamp_to_channels(channels);
     egui::CollapsingHeader::new(RichText::new("Function").strong())
         .default_open(false)
         .show(ui, |ui| {
@@ -2152,6 +2209,68 @@ fn paint_scope_function_settings(
                     });
                 ui.small(RichText::new("Magnitude in dBV").color(TEXT_MUTED));
             });
+        });
+}
+
+fn paint_scope_measurement_settings(
+    ui: &mut egui::Ui,
+    settings: &mut ScopeMeasurementSettings,
+    channels: [bool; 2],
+) {
+    egui::CollapsingHeader::new(RichText::new("Measurements").strong())
+        .default_open(false)
+        .show(ui, |ui| {
+            for (channel, channel_enabled) in channels.into_iter().enumerate() {
+                let channel_settings = &mut settings.channels[channel];
+                ui.add_enabled_ui(channel_enabled, |ui| {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(
+                                &mut channel_settings.enabled,
+                                RichText::new(format!("CH{channel} measurements"))
+                                    .strong()
+                                    .color(SCOPE_COLORS[channel]),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Clear").clicked() {
+                                        channel_settings.selected.fill(false);
+                                    }
+                                    if ui.small_button("All").clicked() {
+                                        channel_settings.selected.fill(true);
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_enabled_ui(channel_settings.enabled, |ui| {
+                            egui::Grid::new(("dscope_measurement_settings", channel))
+                                .num_columns(2)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    for (index, kind) in
+                                        SCOPE_MEASUREMENT_KINDS.into_iter().enumerate()
+                                    {
+                                        ui.checkbox(
+                                            &mut channel_settings.selected[kind.index()],
+                                            kind.label(),
+                                        );
+                                        if index % 2 == 1 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                        });
+                    });
+                });
+                if !channel_enabled {
+                    ui.small(RichText::new(format!("CH{channel} is disabled")).color(TEXT_MUTED));
+                }
+                if channel + 1 < channels.len() {
+                    ui.add_space(6.0);
+                }
+            }
+            ui.small(RichText::new("Calculated over the visible window").color(TEXT_MUTED));
         });
 }
 
@@ -2454,7 +2573,14 @@ fn paint_capture_settings(
                         availability.trigger,
                     );
                     ui.add_space(8.0);
+                    scope_function_settings.clamp_to_channels(channel_enabled);
                     paint_scope_function_settings(ui, scope_function_settings, channel_enabled);
+                    ui.add_space(8.0);
+                    paint_scope_measurement_settings(
+                        ui,
+                        &mut scope_function_settings.measurements,
+                        channel_enabled,
+                    );
                 }
             }
         });
@@ -2766,6 +2892,9 @@ impl eframe::App for DsViewApp {
                 let mut logic_viewport = self.logic_viewport;
                 let mut scope_viewport = self.scope_viewport;
                 let mut scope_fft_viewport = self.scope_fft_viewport;
+                let mut scope_measurement_caches = self.scope_measurement_caches;
+                let mut scope_measurement_window_positions =
+                    self.scope_measurement_window_positions;
                 let mut scope_time_per_division_seconds = self.scope_time_per_division_seconds;
                 let mut scope_timebase_changed = false;
                 let mut scope_vertical_offsets = self
@@ -2810,6 +2939,9 @@ impl eframe::App for DsViewApp {
                                     ScopeWaveformOptions {
                                         settings: scope_settings,
                                         function_settings: self.scope_function_settings,
+                                        measurement_caches: &mut scope_measurement_caches,
+                                        measurement_window_positions:
+                                            &mut scope_measurement_window_positions,
                                         channel_colors: self.scope_channel_colors,
                                         vertical_offsets: &mut scope_vertical_offsets,
                                         trigger_settings: &mut scope_trigger_settings,
@@ -2837,6 +2969,9 @@ impl eframe::App for DsViewApp {
                             ScopeWaveformOptions {
                                 settings: scope_settings,
                                 function_settings: self.scope_function_settings,
+                                measurement_caches: &mut scope_measurement_caches,
+                                measurement_window_positions:
+                                    &mut scope_measurement_window_positions,
                                 channel_colors: self.scope_channel_colors,
                                 vertical_offsets: &mut scope_vertical_offsets,
                                 trigger_settings: &mut scope_trigger_settings,
@@ -2854,6 +2989,8 @@ impl eframe::App for DsViewApp {
                 self.logic_viewport = logic_viewport;
                 self.scope_viewport = scope_viewport;
                 self.scope_fft_viewport = scope_fft_viewport;
+                self.scope_measurement_caches = scope_measurement_caches;
+                self.scope_measurement_window_positions = scope_measurement_window_positions;
                 self.scope_time_per_division_seconds = scope_time_per_division_seconds;
                 let automatic_sample_rate_inputs_changed = scope_timebase_changed
                     || (!scope_auto_sample_rate_before_ui && self.scope_auto_sample_rate)
@@ -3466,6 +3603,8 @@ const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;
 struct ScopeWaveformOptions<'a> {
     settings: ScopeCaptureSettings,
     function_settings: ScopeFunctionSettings,
+    measurement_caches: &'a mut [ScopeMeasurementCache; 2],
+    measurement_window_positions: &'a mut [Vec2; 2],
     channel_colors: [Color32; 2],
     vertical_offsets: &'a mut [u16; 2],
     trigger_settings: &'a mut ScopeTriggerSettings,
@@ -4073,16 +4212,6 @@ fn paint_logic(
         display_sample_rate_hz,
         *viewport,
     );
-}
-
-fn format_voltage(value: f32) -> String {
-    if value.abs() >= 1.0 {
-        format!("{value:.2} V")
-    } else if value.abs() >= 0.001 {
-        format!("{:.0} mV", value * 1_000.0)
-    } else {
-        format!("{:.0} µV", value * 1_000_000.0)
-    }
 }
 
 fn format_trigger_voltage(value: f32) -> String {
@@ -4745,50 +4874,173 @@ fn paint_scope_trigger_level(
     }
 }
 
-fn paint_scope_readouts(
-    painter: &egui::Painter,
-    rect: Rect,
-    visible_samples: usize,
+struct ScopeMeasurementPaintOptions<'a> {
+    visible_range: Range<usize>,
     sample_rate_hz: u64,
-    settings: ScopeCaptureSettings,
+    settings: ScopeFunctionSettings,
+    enabled_channels: [bool; 2],
     channel_colors: [Color32; 2],
+    caches: &'a mut [ScopeMeasurementCache; 2],
+    window_positions: &'a mut [Vec2; 2],
+}
+
+fn paint_scope_measurements(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    plot: Rect,
+    waveforms: &WaveformStore,
+    options: ScopeMeasurementPaintOptions<'_>,
 ) {
-    let mut visible_row = 0;
-    for (channel, color) in channel_colors.iter().enumerate() {
-        let channel_settings = settings.channels[channel];
-        if !channel_settings.enabled {
+    let ScopeMeasurementPaintOptions {
+        visible_range,
+        sample_rate_hz,
+        settings,
+        enabled_channels,
+        channel_colors,
+        caches,
+        window_positions,
+    } = options;
+    const ROW_HEIGHT: f32 = 20.0;
+    const COLUMN_WIDTH: f32 = 176.0;
+    const PADDING: f32 = 8.0;
+    const HEADER_HEIGHT: f32 = 25.0;
+
+    for channel in 0..2 {
+        let channel_settings = settings.measurements.channels[channel];
+        if !enabled_channels[channel]
+            || !channel_settings.enabled
+            || waveforms.scope_channels.get(channel).is_none()
+        {
             continue;
         }
-        let scale = f32::from(channel_settings.volts_per_div_mv) / 1_000.0
-            * f32::from(channel_settings.probe_attenuation);
-        painter.text(
-            rect.left_top() + Vec2::new(26.0, 7.0 + visible_row as f32 * 14.0),
-            egui::Align2::LEFT_TOP,
-            format!(
-                "CH{}  {}/div  {}  {}×",
-                channel,
-                format_voltage(scale),
-                coupling_label(channel_settings.coupling),
-                channel_settings.probe_attenuation,
-            ),
-            FontId::monospace(10.0),
-            *color,
+        let selected = SCOPE_MEASUREMENT_KINDS
+            .into_iter()
+            .filter(|kind| channel_settings.selected[kind.index()])
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            continue;
+        }
+        let results =
+            caches[channel].results(waveforms, channel, visible_range.clone(), sample_rate_hz);
+        let rows = selected.len();
+        let desired_size = Vec2::new(
+            COLUMN_WIDTH + PADDING * 2.0,
+            HEADER_HEIGHT + rows as f32 * ROW_HEIGHT + PADDING * 2.0,
         );
-        visible_row += 1;
-    }
+        let panel_size = Vec2::new(
+            desired_size.x.min(plot.width()),
+            desired_size.y.min(plot.height()),
+        );
+        let mut panel = scope_measurement_window_rect(plot, panel_size, window_positions[channel]);
+        let header = Rect::from_min_size(
+            panel.min,
+            Vec2::new(panel.width(), HEADER_HEIGHT.min(panel.height())),
+        );
+        let response = ui
+            .interact(
+                header,
+                ui.make_persistent_id(("scope_measurement_window", channel)),
+                Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::Grab)
+            .on_hover_text(format!("Drag the CH{channel} measurement window"));
+        if response.dragged() {
+            let delta = ui.input(|input| input.pointer.delta());
+            panel = panel.translate(delta);
+            panel = panel.translate(Vec2::new(
+                panel
+                    .left()
+                    .clamp(plot.left(), plot.right() - panel.width())
+                    - panel.left(),
+                panel
+                    .top()
+                    .clamp(plot.top(), plot.bottom() - panel.height())
+                    - panel.top(),
+            ));
+            window_positions[channel] = scope_measurement_window_position(plot, panel);
+            ui.ctx().request_repaint();
+        }
 
-    if sample_rate_hz > 0 {
-        painter.text(
-            rect.center_bottom() + Vec2::new(0.0, -6.0),
-            egui::Align2::CENTER_BOTTOM,
-            format!(
-                "RUN  ·  {}  ·  {visible_samples} pts",
-                format_sample_rate(sample_rate_hz)
-            ),
-            FontId::monospace(10.0),
-            TEXT_MUTED,
+        let color = channel_colors[channel];
+        painter.rect_filled(
+            panel,
+            egui::Rounding::same(5.0),
+            Color32::from_rgba_unmultiplied(8, 12, 18, 230),
         );
+        painter.rect_filled(
+            Rect::from_min_size(panel.min, Vec2::new(panel.width(), HEADER_HEIGHT)),
+            egui::Rounding::same(5.0),
+            color.gamma_multiply(0.22),
+        );
+        painter.text(
+            panel.left_top() + Vec2::new(PADDING, 5.0),
+            egui::Align2::LEFT_TOP,
+            format!("CH{channel} MEASUREMENTS"),
+            FontId::monospace(12.0),
+            color,
+        );
+        painter.text(
+            panel.right_top() + Vec2::new(-PADDING, 5.0),
+            egui::Align2::RIGHT_TOP,
+            "⠿",
+            FontId::proportional(13.0),
+            color,
+        );
+
+        for (ordinal, kind) in selected.into_iter().enumerate() {
+            let row = ordinal;
+            let origin = panel.left_top()
+                + Vec2::new(PADDING, PADDING + HEADER_HEIGHT + row as f32 * ROW_HEIGHT);
+            painter.text(
+                origin,
+                egui::Align2::LEFT_TOP,
+                kind.label(),
+                FontId::monospace(12.0),
+                TEXT_MUTED,
+            );
+            painter.text(
+                origin + Vec2::new(COLUMN_WIDTH - PADDING * 2.0, -1.0),
+                egui::Align2::RIGHT_TOP,
+                results.formatted(kind),
+                FontId::monospace(14.0),
+                color,
+            );
+        }
     }
+}
+
+fn scope_measurement_window_rect(plot: Rect, size: Vec2, position: Vec2) -> Rect {
+    let travel = Vec2::new(
+        (plot.width() - size.x).max(0.0),
+        (plot.height() - size.y).max(0.0),
+    );
+    Rect::from_min_size(
+        plot.min
+            + Vec2::new(
+                position.x.clamp(0.0, 1.0) * travel.x,
+                position.y.clamp(0.0, 1.0) * travel.y,
+            ),
+        size,
+    )
+}
+
+fn scope_measurement_window_position(plot: Rect, panel: Rect) -> Vec2 {
+    let travel = Vec2::new(
+        (plot.width() - panel.width()).max(0.0),
+        (plot.height() - panel.height()).max(0.0),
+    );
+    Vec2::new(
+        if travel.x > 0.0 {
+            (panel.left() - plot.left()) / travel.x
+        } else {
+            0.0
+        },
+        if travel.y > 0.0 {
+            (panel.top() - plot.top()) / travel.y
+        } else {
+            0.0
+        },
+    )
 }
 
 fn scope_math_value(
@@ -5206,6 +5458,8 @@ fn paint_scope_time_domain(
     let ScopeWaveformOptions {
         mut settings,
         function_settings,
+        measurement_caches,
+        measurement_window_positions,
         channel_colors,
         vertical_offsets,
         trigger_settings,
@@ -5288,15 +5542,6 @@ fn paint_scope_time_domain(
     let visible_range = viewport.sample_range(sample_count);
     let visible_count = visible_range.len();
     if visible_count == 0 {
-        let idle_range = viewport.sample_range(display_sample_count);
-        paint_scope_readouts(
-            &scope_painter,
-            plot,
-            idle_range.len(),
-            settings.sample_rate_hz,
-            settings,
-            channel_colors,
-        );
         paint_empty(&scope_painter, plot, "Waiting for oscilloscope samples");
         paint_scope_offset_arrows(
             ui,
@@ -5410,13 +5655,20 @@ fn paint_scope_time_domain(
         vertical_offsets,
         trigger_controls_enabled,
     );
-    paint_scope_readouts(
+    paint_scope_measurements(
+        ui,
         &scope_painter,
         plot,
-        visible_count,
-        waveforms.scope_rate_hz,
-        settings,
-        channel_colors,
+        waveforms,
+        ScopeMeasurementPaintOptions {
+            visible_range,
+            sample_rate_hz: display_sample_rate_hz,
+            settings: function_settings,
+            enabled_channels: settings.channels.map(|channel| channel.enabled),
+            channel_colors,
+            caches: measurement_caches,
+            window_positions: measurement_window_positions,
+        },
     );
     paint_waveform_time_scale(
         painter,
@@ -5626,6 +5878,50 @@ mod tests {
     }
 
     #[test]
+    fn scope_measurement_cache_tracks_new_samples_and_visible_ranges() {
+        let mut store = WaveformStore {
+            scope_capacity: 4,
+            ..WaveformStore::default()
+        };
+        store.ingest(
+            &CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000,
+                trigger_sample_index: None,
+                channels: vec![vec![-1.0, 1.0], vec![0.0, 0.0]],
+            }),
+            [true, true],
+        );
+        let mut cache = ScopeMeasurementCache::default();
+
+        let first = cache.results(&store, 0, 0..2, 1_000);
+        assert_eq!(
+            first.get(measurements::ScopeMeasurementKind::Mean),
+            Some(0.0)
+        );
+        assert_eq!(cache.key.unwrap().range_end, 2);
+
+        store.ingest(
+            &CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000,
+                trigger_sample_index: None,
+                channels: vec![vec![3.0, 3.0], vec![0.0, 0.0]],
+            }),
+            [true, true],
+        );
+        let updated = cache.results(&store, 0, 0..4, 1_000);
+        assert_eq!(
+            updated.get(measurements::ScopeMeasurementKind::Mean),
+            Some(1.5)
+        );
+
+        let zoomed = cache.results(&store, 0, 2..4, 1_000);
+        assert_eq!(
+            zoomed.get(measurements::ScopeMeasurementKind::Mean),
+            Some(3.0)
+        );
+    }
+
+    #[test]
     fn scope_math_operations_use_captured_channel_values() {
         assert_eq!(ScopeMathOperation::Add.apply(6.0, 2.0), Some(8.0));
         assert_eq!(ScopeMathOperation::Subtract.apply(6.0, 2.0), Some(4.0));
@@ -5649,6 +5945,7 @@ mod tests {
                 length: 4_096,
                 window: ScopeFftWindow::Blackman,
             },
+            measurements: ScopeMeasurementSettings::default(),
         };
 
         settings.clamp_to_channels([false, true]);
@@ -5657,6 +5954,11 @@ mod tests {
         assert_eq!(settings.math.right_channel, 1);
         assert_eq!(settings.fft.channel, 1);
         assert_eq!(settings.fft.window, ScopeFftWindow::Blackman);
+        assert!(settings
+            .measurements
+            .channels
+            .iter()
+            .all(|channel| channel.enabled));
     }
 
     #[test]
@@ -5801,6 +6103,27 @@ mod tests {
         let minimum_scale = 300.0 / (MIN_LOGIC_PANE_HEIGHT + MIN_SCOPE_PANE_HEIGHT);
         assert!((logic - MIN_LOGIC_PANE_HEIGHT * minimum_scale).abs() < 0.001);
         assert!((scope - MIN_SCOPE_PANE_HEIGHT * minimum_scale).abs() < 0.001);
+    }
+
+    #[test]
+    fn floating_measurement_windows_stay_relative_to_the_plot() {
+        let plot = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(800.0, 400.0));
+        let size = Vec2::new(200.0, 100.0);
+
+        let top_right = scope_measurement_window_rect(plot, size, Vec2::new(1.0, 0.0));
+        assert_eq!(top_right.right(), plot.right());
+        assert_eq!(top_right.top(), plot.top());
+        assert_eq!(
+            scope_measurement_window_position(plot, top_right),
+            Vec2::new(1.0, 0.0)
+        );
+
+        let center = scope_measurement_window_rect(plot, size, Vec2::new(0.5, 0.5));
+        assert_eq!(center.center(), plot.center());
+        assert_eq!(
+            scope_measurement_window_position(plot, center),
+            Vec2::new(0.5, 0.5)
+        );
     }
 
     #[test]
@@ -6006,7 +6329,6 @@ mod tests {
         assert_eq!(config.operation_mode(), DsCopeOperationMode::InternalTest);
         assert_eq!(config.bandwidth_limit(), DsCopeBandwidthLimit::Mhz20);
         assert_eq!(ScopeCaptureSettings::from_capture_config(config), settings);
-        assert_eq!(format_voltage(0.1), "100 mV");
         assert_eq!(format_sample_rate(1_000_000), "1.00 MSa/s");
         assert_eq!(format_sample_rate(1_000_000_000), "1.00 GSa/s");
     }
