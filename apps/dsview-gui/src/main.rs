@@ -329,8 +329,18 @@ impl CaptureSettingsTab {
     }
 }
 
-fn capture_settings_tabs() -> [CaptureSettingsTab; 2] {
-    [CaptureSettingsTab::DsLogic, CaptureSettingsTab::DsCope]
+fn capture_settings_tabs(
+    has_logic_analyzer: bool,
+    has_oscilloscope: bool,
+) -> Vec<CaptureSettingsTab> {
+    let mut tabs = Vec::with_capacity(2);
+    if has_logic_analyzer {
+        tabs.push(CaptureSettingsTab::DsLogic);
+    }
+    if has_oscilloscope {
+        tabs.push(CaptureSettingsTab::DsCope);
+    }
+    tabs
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1063,6 +1073,28 @@ impl DsViewApp {
         waveform_tabs(has_logic_analyzer, has_oscilloscope)
     }
 
+    fn available_capture_settings_tabs(&self) -> Vec<CaptureSettingsTab> {
+        let has_logic_analyzer = self
+            .devices
+            .iter()
+            .any(|entry| entry.device.profile.model == DeviceModel::DsLogicU3Pro16);
+        let has_oscilloscope = self
+            .devices
+            .iter()
+            .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100);
+        capture_settings_tabs(has_logic_analyzer, has_oscilloscope)
+    }
+
+    fn reconcile_capture_settings_tab(&mut self) {
+        let available = self.available_capture_settings_tabs();
+        if available.contains(&self.active_capture_settings_tab) {
+            return;
+        }
+        if let Some(tab) = available.first() {
+            self.active_capture_settings_tab = *tab;
+        }
+    }
+
     fn reconcile_waveform_tab(&mut self) {
         let available = self.available_waveform_tabs();
         if self
@@ -1694,6 +1726,7 @@ fn paint_instrument_settings(
 impl eframe::App for DsViewApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
+        self.reconcile_capture_settings_tab();
         self.reconcile_waveform_tab();
         self.poll_capture();
 
@@ -1748,6 +1781,7 @@ impl eframe::App for DsViewApp {
                     .inner_margin(egui::Margin::same(14.0)),
             )
             .show(context, |ui| {
+                let available_capture_settings_tabs = self.available_capture_settings_tabs();
                 let content_width = ui.available_width();
                 egui::ScrollArea::vertical()
                     .max_width(content_width)
@@ -1755,24 +1789,35 @@ impl eframe::App for DsViewApp {
                         ui.set_width(content_width);
                         ui.label(RichText::new("CAPTURE SETUP").strong().color(TEXT_MUTED));
                         ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            for tab in capture_settings_tabs() {
-                                ui.selectable_value(
-                                    &mut self.active_capture_settings_tab,
-                                    tab,
-                                    tab.label(),
-                                );
-                            }
-                        });
-                        ui.add_space(6.0);
-                        paint_capture_settings(
-                            ui,
-                            self.active_capture_settings_tab,
-                            &mut self.scope_settings,
-                            &mut self.scope_channel_colors,
-                            capture_settings_enabled,
-                            &mut calibration_action,
-                        );
+                        if available_capture_settings_tabs.len() > 1 {
+                            ui.horizontal(|ui| {
+                                for tab in &available_capture_settings_tabs {
+                                    ui.selectable_value(
+                                        &mut self.active_capture_settings_tab,
+                                        *tab,
+                                        tab.label(),
+                                    );
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                        if available_capture_settings_tabs.is_empty() {
+                            ui.label(
+                                RichText::new(
+                                    "Connect a supported instrument to configure capture.",
+                                )
+                                .color(TEXT_MUTED),
+                            );
+                        } else {
+                            paint_capture_settings(
+                                ui,
+                                self.active_capture_settings_tab,
+                                &mut self.scope_settings,
+                                &mut self.scope_channel_colors,
+                                capture_settings_enabled,
+                                &mut calibration_action,
+                            );
+                        }
 
                         ui.add_space(14.0);
                         ui.label(RichText::new("RECORDING").strong().color(TEXT_MUTED));
@@ -3919,14 +3964,28 @@ mod tests {
     }
 
     #[test]
-    fn capture_setup_has_separate_device_settings_tabs() {
-        let tabs = capture_settings_tabs();
-
+    fn capture_setup_tabs_require_their_connected_devices() {
+        assert!(capture_settings_tabs(false, false).is_empty());
+        assert_eq!(
+            capture_settings_tabs(true, false),
+            vec![CaptureSettingsTab::DsLogic]
+        );
+        assert_eq!(
+            capture_settings_tabs(false, true),
+            vec![CaptureSettingsTab::DsCope]
+        );
+        let tabs = capture_settings_tabs(true, true);
         assert_eq!(
             tabs,
-            [CaptureSettingsTab::DsLogic, CaptureSettingsTab::DsCope]
+            vec![CaptureSettingsTab::DsLogic, CaptureSettingsTab::DsCope]
         );
-        assert_eq!(tabs.map(CaptureSettingsTab::label), ["DSLogic", "DSCope"]);
+        assert_eq!(
+            tabs.iter()
+                .copied()
+                .map(CaptureSettingsTab::label)
+                .collect::<Vec<_>>(),
+            ["DSLogic", "DSCope"]
+        );
     }
 
     #[test]
