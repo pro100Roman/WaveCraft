@@ -30,7 +30,11 @@ use std::time::{Duration, Instant};
 const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
 const LOGIC_CHANNEL_COUNT: usize = 16;
-const MAX_WAVEFORM_SAMPLES: usize = 8_192;
+// Keep the complete largest hardware capture in memory. Rendering is already
+// decimated to the plot width, so retaining the samples does not increase the
+// number of painted points. This also keeps the hardware trigger region in the
+// waveform instead of displaying only the final tail of a capture.
+const MAX_WAVEFORM_SAMPLES: usize = 2_000_000;
 const WAVEFORM_STATUS_HEIGHT: f32 = 20.0;
 const TIME_RULER_HEIGHT: f32 = 24.0;
 const SCOPE_HORIZONTAL_DIVISIONS: usize = 10;
@@ -445,6 +449,12 @@ impl WaveformViewport {
 
     fn zoom_factor(self) -> f32 {
         1.0 / self.span
+    }
+
+    fn move_screen_anchor(&mut self, old_fraction: f32, new_fraction: f32) {
+        let sample_anchor = self.start + old_fraction.clamp(0.0, 1.0) * self.span;
+        self.start =
+            (sample_anchor - new_fraction.clamp(0.0, 1.0) * self.span).clamp(0.0, 1.0 - self.span);
     }
 }
 
@@ -2760,6 +2770,7 @@ fn update_waveform_viewport(
     rect: Rect,
     id_salt: &'static str,
     viewport: &mut WaveformViewport,
+    zoom_anchor: Option<f32>,
 ) {
     let response = ui
         .interact(rect, ui.make_persistent_id(id_salt), Sense::click())
@@ -2771,11 +2782,13 @@ fn update_waveform_viewport(
     if response.hovered() {
         let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
         if scroll_delta != 0.0 {
-            let pointer_fraction = response
-                .hover_pos()
-                .map(|pointer| (pointer.x - rect.left()) / rect.width().max(1.0))
-                .unwrap_or(0.5);
-            viewport.zoom(scroll_delta, pointer_fraction);
+            let anchor_fraction = zoom_anchor.unwrap_or_else(|| {
+                response
+                    .hover_pos()
+                    .map(|pointer| (pointer.x - rect.left()) / rect.width().max(1.0))
+                    .unwrap_or(0.5)
+            });
+            viewport.zoom(scroll_delta, anchor_fraction);
             ui.ctx().request_repaint();
         }
     }
@@ -2843,7 +2856,7 @@ fn paint_logic(
     );
     let (status_bar, time_ruler, plot) = split_waveform_chrome(waveform_area);
     paint_plot_grid(ui, plot);
-    update_waveform_viewport(ui, waveform_area, "logic_waveform_zoom", viewport);
+    update_waveform_viewport(ui, waveform_area, "logic_waveform_zoom", viewport, None);
     let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
     let sample_count = waveforms.logic_samples.len();
     let visible_range = viewport.sample_range(sample_count);
@@ -3334,13 +3347,13 @@ fn paint_scope_trigger_position(
     plot: Rect,
     settings: &mut ScopeTriggerSettings,
     controls_enabled: bool,
+    viewport: &mut WaveformViewport,
 ) {
     const COLOR: Color32 = Color32::from_rgb(235, 72, 72);
     const ARROW_HALF_WIDTH: f32 = 10.0;
     const ARROW_HEIGHT: f32 = 19.0;
     const ARROW_SHOULDER_HEIGHT: f32 = 9.0;
     const DOT_SPACING: f32 = 7.0;
-
     let x = scope_trigger_position_x(plot, settings.position_percent);
     let arrow_top = plot.top() - ARROW_HEIGHT;
     let marker_rect = Rect::from_min_max(
@@ -3367,12 +3380,20 @@ fn paint_scope_trigger_position(
     ));
 
     if controls_enabled {
+        let old_position = settings.position_percent;
         if response.double_clicked() {
             settings.position_percent = 50;
         } else if response.dragged() {
             if let Some(pointer) = response.interact_pointer_pos() {
                 settings.position_percent = scope_trigger_position_from_x(plot, pointer.x);
             }
+        }
+        if settings.position_percent != old_position {
+            viewport.move_screen_anchor(
+                f32::from(old_position) / 100.0,
+                f32::from(settings.position_percent) / 100.0,
+            );
+            ui.ctx().request_repaint();
         }
     }
 
@@ -3551,7 +3572,13 @@ fn paint_scope(
     let (status_bar, time_ruler, plot) = split_waveform_chrome(rect);
     let scope_painter = painter.with_clip_rect(plot);
     paint_scope_graticule(&scope_painter, plot);
-    update_waveform_viewport(ui, plot, "scope_waveform_zoom", viewport);
+    update_waveform_viewport(
+        ui,
+        plot,
+        "scope_waveform_zoom",
+        viewport,
+        Some(f32::from(trigger_settings.position_percent) / 100.0),
+    );
     paint_scope_offset_arrows(
         ui,
         plot,
@@ -3615,6 +3642,7 @@ fn paint_scope(
             plot,
             trigger_settings,
             offset_controls_enabled,
+            viewport,
         );
         return;
     }
@@ -3667,7 +3695,7 @@ fn paint_scope(
     paint_waveform_time_scale(
         painter,
         time_ruler,
-        visible_range,
+        visible_range.clone(),
         waveforms.scope_rate_hz,
         waveforms.scope_sample_offset,
         *viewport,
@@ -3685,6 +3713,7 @@ fn paint_scope(
         plot,
         trigger_settings,
         offset_controls_enabled,
+        viewport,
     );
 }
 
@@ -4060,6 +4089,14 @@ mod tests {
             scope_trigger_position_from_x(plot, plot.right()),
             DSCOPE_TRIGGER_POSITION_MAX_PERCENT
         );
+
+        let mut viewport = WaveformViewport {
+            start: 0.25,
+            span: 0.5,
+        };
+        viewport.move_screen_anchor(0.5, 0.25);
+        assert!((viewport.start - 0.375).abs() < f32::EPSILON);
+        assert!(((0.5 - viewport.start) / viewport.span - 0.25).abs() < f32::EPSILON);
     }
 
     #[test]

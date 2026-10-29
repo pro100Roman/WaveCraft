@@ -29,6 +29,7 @@ pub const DSCOPE_VERTICAL_OFFSET_MIN: u16 = 10;
 pub const DSCOPE_VERTICAL_OFFSET_CENTER: u16 = 128;
 pub const DSCOPE_VERTICAL_OFFSET_MAX: u16 = 245;
 pub const DSCOPE_TRIGGER_POSITION_MIN_PERCENT: u8 = 1;
+pub const DSCOPE_TRIGGER_POSITION_CENTER_PERCENT: u8 = 50;
 pub const DSCOPE_TRIGGER_POSITION_MAX_PERCENT: u8 = 99;
 pub const DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX: u8 = 15;
 pub const DSCOPE_TRIGGER_HOLDOFF_MAX_NS: u64 = 1_000_000_000;
@@ -216,7 +217,7 @@ pub struct DsCopeTriggerConfig {
 impl Default for DsCopeTriggerConfig {
     fn default() -> Self {
         Self {
-            position_percent: DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
+            position_percent: DSCOPE_TRIGGER_POSITION_CENTER_PERCENT,
             source: DsCopeTriggerSource::Auto,
             auto_channel: 0,
             slope: DsCopeTriggerSlope::Rising,
@@ -1320,18 +1321,83 @@ fn read_prequeued_capture(
             trigger_header.len()
         )));
     }
-    let payload = require_queued_data(payload_result?, "capture payload")?;
+    validate_trigger_header(&trigger_header)?;
+    let mut payload = require_scope_payload(payload_result?, payload_bytes)?;
+
+    // While waiting for a non-auto edge, DSCope returns complete payload-sized
+    // transfers whose measurement footer has a zero valid length. The vendor
+    // driver discards those pending frames and resubmits the data transfer.
+    // Keep the trigger header from the initial transfer and do the same here.
+    loop {
+        let footer = &payload[payload_bytes - MEASUREMENT_FOOTER_BYTES..];
+        if ScopeMeasurement::is_ready(footer, config) {
+            return Ok(Some(RawScopeCapture {
+                trigger_header,
+                payload,
+                capture_origin,
+            }));
+        }
+
+        if context.is_cancelled() {
+            let _ = session.force_capture_ready();
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            let error = capture_timeout_error(session);
+            let _ = session.force_capture_ready();
+            return Err(error);
+        }
+
+        let mut next_payload_read = session
+            .queue_bulk_read(payload_bytes)
+            .map_err(capture_error)?;
+        while !next_payload_read.is_complete() {
+            if context.is_cancelled() {
+                let _ = session.force_capture_ready();
+                next_payload_read.cancel().map_err(capture_error)?;
+                while !next_payload_read.is_complete() {
+                    session
+                        .handle_usb_events(Duration::from_millis(5))
+                        .map_err(capture_error)?;
+                }
+                let _ = next_payload_read.finish();
+                return Ok(None);
+            }
+            if Instant::now() >= deadline {
+                let error = capture_timeout_error(session);
+                let _ = session.force_capture_ready();
+                next_payload_read.cancel().map_err(capture_error)?;
+                while !next_payload_read.is_complete() {
+                    session
+                        .handle_usb_events(Duration::from_millis(5))
+                        .map_err(capture_error)?;
+                }
+                let _ = next_payload_read.finish();
+                return Err(error);
+            }
+            session
+                .handle_usb_events(Duration::from_millis(5))
+                .map_err(capture_error)?;
+        }
+        payload = require_scope_payload(
+            next_payload_read.finish().map_err(capture_error)?,
+            payload_bytes,
+        )?;
+    }
+}
+
+fn require_scope_payload(
+    outcome: QueuedBulkReadOutcome,
+    payload_bytes: usize,
+) -> Result<Vec<u8>, CaptureError> {
+    let payload = require_queued_data(outcome, "capture payload")?;
     if payload.len() != payload_bytes {
         return Err(CaptureError::new(format!(
             "short DSCope payload: received {} of {payload_bytes} bytes",
             payload.len()
         )));
     }
-    Ok(Some(RawScopeCapture {
-        trigger_header,
-        payload,
-        capture_origin,
-    }))
+    Ok(payload)
 }
 
 fn drain_reads(
@@ -1434,6 +1500,13 @@ struct ScopeMeasurement {
 }
 
 impl ScopeMeasurement {
+    fn is_ready(footer: &[u8], config: DsCopeCaptureConfig) -> bool {
+        footer.len() == MEASUREMENT_FOOTER_BYTES
+            && read_u16(footer, 0) == DSO_PACKET_ID
+            && (read_u32(footer, 8) & 0x00ff_ffff) == config.divider()
+            && (read_u32(footer, 4) & 0x0fff_ffff) != 0
+    }
+
     fn decode(footer: &[u8], config: DsCopeCaptureConfig) -> Result<Self, CaptureError> {
         if footer.len() != MEASUREMENT_FOOTER_BYTES {
             return Err(CaptureError::new(format!(
@@ -1618,7 +1691,8 @@ mod tests {
         assert_eq!(commands[3], 0x0006_9d08);
         assert_eq!(commands[4], 0x0006_9d88);
         assert_eq!(commands[7], 0x0001_f418);
-        assert_eq!(commands[8], 0x0027_1020);
+        assert_eq!(config.trigger().position_percent(), 50);
+        assert_eq!(commands[8], 0x07a1_2020);
         assert_eq!(commands[9], 0x58);
         assert_eq!(commands[10], 0x28);
         assert_eq!(commands[11], 0x30);
@@ -1836,6 +1910,22 @@ mod tests {
         let channel = DsCopeChannelConfig::default();
         assert_eq!(raw_to_volts(128, 128, channel), 0.0);
         assert!(raw_to_volts(100, 128, channel) > 1.19);
+    }
+
+    #[test]
+    fn waits_for_a_nonzero_triggered_measurement() {
+        let config = DsCopeCaptureConfig::new(1_000_000, MAX_DUAL_CHANNEL_SAMPLE_COUNT).unwrap();
+        let mut footer = [0_u8; MEASUREMENT_FOOTER_BYTES];
+        footer[0..2].copy_from_slice(&DSO_PACKET_ID.to_le_bytes());
+        footer[8..12].copy_from_slice(&config.divider().to_le_bytes());
+
+        assert!(!ScopeMeasurement::is_ready(&footer, config));
+
+        footer[4..8].copy_from_slice(&100_u32.to_le_bytes());
+        assert!(ScopeMeasurement::is_ready(&footer, config));
+
+        footer[8..12].copy_from_slice(&(config.divider() + 1).to_le_bytes());
+        assert!(!ScopeMeasurement::is_ready(&footer, config));
     }
 
     #[test]
