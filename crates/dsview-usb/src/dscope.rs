@@ -1395,22 +1395,11 @@ fn read_prequeued_capture(
         return Err(capture_error(error));
     }
 
-    let capture_time =
-        Duration::from_secs_f64(config.sample_count as f64 / config.sample_rate_hz as f64);
-    let mut deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
     let mut cancelled = false;
-    let mut timeout_error = None;
     while !header_read.is_complete() || !payload_read.is_complete() {
-        if apply_pending_runtime_trigger(session, config, calibration, runtime_trigger_receiver)? {
-            deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
-        }
-        if !cancelled && timeout_error.is_none() && context.is_cancelled() {
+        apply_pending_runtime_trigger(session, config, calibration, runtime_trigger_receiver)?;
+        if !cancelled && context.is_cancelled() {
             cancelled = true;
-            let _ = session.force_capture_ready();
-            header_read.cancel().map_err(capture_error)?;
-            payload_read.cancel().map_err(capture_error)?;
-        } else if !cancelled && timeout_error.is_none() && Instant::now() >= deadline {
-            timeout_error = Some(capture_timeout_error(session));
             let _ = session.force_capture_ready();
             header_read.cancel().map_err(capture_error)?;
             payload_read.cancel().map_err(capture_error)?;
@@ -1424,9 +1413,6 @@ fn read_prequeued_capture(
     let payload_result = payload_read.finish().map_err(capture_error);
     if cancelled {
         return Ok(None);
-    }
-    if let Some(error) = timeout_error {
-        return Err(error);
     }
     let trigger_header = require_queued_data(header_result?, "trigger header")?;
     if trigger_header.len() != TRIGGER_HEADER_BYTES {
@@ -1442,10 +1428,10 @@ fn read_prequeued_capture(
     // transfers whose measurement footer has a zero valid length. The vendor
     // driver discards those pending frames and resubmits the data transfer.
     // Keep the trigger header from the initial transfer and do the same here.
+    // There is intentionally no acquisition deadline: an armed oscilloscope
+    // waits for its trigger until the caller explicitly stops the capture.
     loop {
-        if apply_pending_runtime_trigger(session, config, calibration, runtime_trigger_receiver)? {
-            deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
-        }
+        apply_pending_runtime_trigger(session, config, calibration, runtime_trigger_receiver)?;
         let footer = &payload[payload_bytes - MEASUREMENT_FOOTER_BYTES..];
         if ScopeMeasurement::is_ready(footer, *config) {
             return Ok(Some(RawScopeCapture {
@@ -1459,24 +1445,11 @@ fn read_prequeued_capture(
             let _ = session.force_capture_ready();
             return Ok(None);
         }
-        if Instant::now() >= deadline {
-            let error = capture_timeout_error(session);
-            let _ = session.force_capture_ready();
-            return Err(error);
-        }
-
         let mut next_payload_read = session
             .queue_bulk_read(payload_bytes)
             .map_err(capture_error)?;
         while !next_payload_read.is_complete() {
-            if apply_pending_runtime_trigger(
-                session,
-                config,
-                calibration,
-                runtime_trigger_receiver,
-            )? {
-                deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
-            }
+            apply_pending_runtime_trigger(session, config, calibration, runtime_trigger_receiver)?;
             if context.is_cancelled() {
                 let _ = session.force_capture_ready();
                 next_payload_read.cancel().map_err(capture_error)?;
@@ -1487,18 +1460,6 @@ fn read_prequeued_capture(
                 }
                 let _ = next_payload_read.finish();
                 return Ok(None);
-            }
-            if Instant::now() >= deadline {
-                let error = capture_timeout_error(session);
-                let _ = session.force_capture_ready();
-                next_payload_read.cancel().map_err(capture_error)?;
-                while !next_payload_read.is_complete() {
-                    session
-                        .handle_usb_events(Duration::from_millis(5))
-                        .map_err(capture_error)?;
-                }
-                let _ = next_payload_read.finish();
-                return Err(error);
             }
             session
                 .handle_usb_events(Duration::from_millis(5))
@@ -1542,12 +1503,12 @@ fn apply_pending_runtime_trigger(
     config: &mut DsCopeCaptureConfig,
     calibration: DsCopeCalibration,
     receiver: Option<&Receiver<DsCopeTriggerConfig>>,
-) -> Result<bool, CaptureError> {
+) -> Result<(), CaptureError> {
     let Some(trigger) = receiver.and_then(latest_runtime_trigger) else {
-        return Ok(false);
+        return Ok(());
     };
     *config = apply_runtime_trigger(session, *config, calibration, trigger)?;
-    Ok(true)
+    Ok(())
 }
 
 fn require_scope_payload(
@@ -1724,24 +1685,6 @@ fn raw_to_volts(raw: u8, hardware_offset: u8, channel: DsCopeChannelConfig) -> f
     let input_span = f32::from(channel.volts_per_div_mv) / 1_000.0 * 10.0;
     (f32::from(hardware_offset) - f32::from(raw)) * input_span / ADC_REFERENCE_SPAN
         * f32::from(channel.probe_attenuation)
-}
-
-fn capture_timeout_error(session: &UsbDeviceSession) -> CaptureError {
-    let status = session.hardware_status();
-    let progress = session.capture_progress();
-    match (status, progress) {
-        (Ok(status), Ok(progress)) => CaptureError::new(format!(
-            "timed out waiting for DSCope capture data (hardware status 0x{:02x}, capture progress 0x{progress:08x})",
-            status.raw
-        )),
-        (Ok(status), Err(error)) => CaptureError::new(format!(
-            "timed out waiting for DSCope capture data (hardware status 0x{:02x}; progress read failed: {error})",
-            status.raw
-        )),
-        (Err(error), _) => CaptureError::new(format!(
-            "timed out waiting for DSCope capture data; status read failed: {error}"
-        )),
-    }
 }
 
 fn combine_results(
