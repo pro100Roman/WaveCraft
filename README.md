@@ -154,7 +154,11 @@ common sample rate and capture buffer plus independent volts/div, AC/DC
 coupling, probe attenuation, and hardware enablement for CH0 and CH1. Its
 Trigger menu follows the vendor controls for horizontal position, source,
 rising/falling edge, holdoff, and noise sensitivity; these settings are encoded
-as U3P100 hardware commands and recorded in capture metadata. Enabled
+as U3P100 hardware commands and recorded in capture metadata. The toolbar uses
+oscilloscope-style **Run/Stop** and **Single** controls. Run continuously re-arms
+the hardware: Auto trigger behaves as Auto/Roll, while channel edge sources
+replace the displayed waveform after each trigger. Single waits for one trigger
+and then stops. Enabled
 channels support up to 500 MSa/s; disabling either channel raises the remaining
 channel's limit to 1 GSa/s. The
 shared 2M-sample memory provides up to 1M samples/channel in dual-channel mode

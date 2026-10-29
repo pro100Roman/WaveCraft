@@ -421,6 +421,27 @@ struct WaveformStore {
     scope_trigger_sample_index: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcquisitionMode {
+    Single,
+    Run,
+}
+
+impl AcquisitionMode {
+    fn runs_continuously(self) -> bool {
+        self == Self::Run
+    }
+}
+
+fn should_rearm_acquisition(
+    mode: AcquisitionMode,
+    run_requested: bool,
+    completion: CompletionStatus,
+    failed: bool,
+) -> bool {
+    mode.runs_continuously() && run_requested && completion == CompletionStatus::Complete && !failed
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct WaveformViewport {
     start: f32,
@@ -609,6 +630,8 @@ fn extend_bounded<T>(destination: &mut VecDeque<T>, values: impl IntoIterator<It
 
 struct ActiveCapture {
     session: CaptureSession,
+    mode: AcquisitionMode,
+    preserve_display_until_complete: bool,
     scope_config: DsCopeCaptureConfig,
     scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     stats: HashMap<DeviceId, DeviceStats>,
@@ -630,6 +653,7 @@ enum WorkerSuccess {
     Devices(Vec<DiscoveredDevice>),
     Capture {
         session: CaptureSession,
+        mode: AcquisitionMode,
         scope_config: DsCopeCaptureConfig,
         scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     },
@@ -648,6 +672,7 @@ struct DsViewApp {
     manual_calibration: Option<ManualCalibrationEditor>,
     record_capture: bool,
     recording_path: String,
+    capture_run_requested: bool,
     devices: Vec<DeviceEntry>,
     active_capture_settings_tab: CaptureSettingsTab,
     scope_settings: ScopeCaptureSettings,
@@ -675,6 +700,7 @@ impl DsViewApp {
             manual_calibration: None,
             record_capture: false,
             recording_path: "capture.dsv".to_owned(),
+            capture_run_requested: false,
             devices: Vec::new(),
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
             scope_settings: ScopeCaptureSettings::default(),
@@ -700,6 +726,7 @@ impl DsViewApp {
             return;
         }
         let (sender, receiver) = mpsc::channel();
+        self.capture_run_requested = false;
         self.scope_configuration_due = None;
         self.pending = Some(receiver);
         self.completed_capture = None;
@@ -713,8 +740,14 @@ impl DsViewApp {
         });
     }
 
-    fn begin_capture(&mut self) {
+    fn begin_capture(&mut self, mode: AcquisitionMode) {
         if self.pending.is_some() || self.capture.is_some() {
+            return;
+        }
+        if self.record_capture && mode.runs_continuously() {
+            self.capture_run_requested = false;
+            self.last_error =
+                Some("Complete-capture recording is available in Single mode only".to_owned());
             return;
         }
         let devices = self
@@ -724,32 +757,42 @@ impl DsViewApp {
             .map(|entry| entry.device.clone())
             .collect::<Vec<_>>();
         if devices.is_empty() {
+            self.capture_run_requested = false;
             self.last_error = Some("Select at least one supported instrument".to_owned());
             return;
         }
         if self.record_capture && self.recording_path.trim().is_empty() {
+            self.capture_run_requested = false;
             self.last_error = Some("Enter a recording file path".to_owned());
             return;
         }
         let scope_config = match self.scope_settings.capture_config() {
             Ok(config) => config,
             Err(error) => {
+                self.capture_run_requested = false;
                 self.last_error = Some(error);
                 return;
             }
         };
 
+        self.capture_run_requested = true;
         let resource_directory = PathBuf::from(self.resource_directory.trim());
         let (sender, receiver) = mpsc::channel();
         self.scope_configuration_due = None;
         self.pending = Some(receiver);
-        self.completed_capture = None;
-        self.status = format!("Preparing {} instrument(s)…", devices.len());
+        if mode == AcquisitionMode::Single {
+            self.completed_capture = None;
+        }
+        self.status = match mode {
+            AcquisitionMode::Single => "Preparing single acquisition…".to_owned(),
+            AcquisitionMode::Run => "Preparing continuous acquisition…".to_owned(),
+        };
         self.last_error = None;
         thread::spawn(move || {
             let result = start_capture(devices, &resource_directory, scope_config).map(|started| {
                 WorkerSuccess::Capture {
                     session: started.session,
+                    mode,
                     scope_config,
                     scope_trigger_controls: started.scope_trigger_controls,
                 }
@@ -911,6 +954,7 @@ impl DsViewApp {
     }
 
     fn stop_capture(&mut self) {
+        self.capture_run_requested = false;
         let Some(mut active) = self.capture.take() else {
             return;
         };
@@ -922,11 +966,13 @@ impl DsViewApp {
             CompletionStatus::Failed
         };
         let recording_result = finish_gui_recording(&mut active.recorder, completion);
-        self.completed_capture = Some(CompletedCapture {
-            stats: active.stats,
-            waveforms: active.waveforms,
-            recording_path: active.recording_path,
-        });
+        if !active.preserve_display_until_complete {
+            self.completed_capture = Some(CompletedCapture {
+                stats: active.stats,
+                waveforms: active.waveforms,
+                recording_path: active.recording_path,
+            });
+        }
         match (stop_result, recording_result) {
             (Ok(()), Ok(())) => self.status = "Capture stopped".to_owned(),
             (Err(error), Ok(())) => self.set_error(error.to_string()),
@@ -977,9 +1023,17 @@ impl DsViewApp {
             }
             Ok(WorkerSuccess::Capture {
                 session,
+                mode,
                 scope_config,
                 scope_trigger_controls,
             }) => {
+                if !self.capture_run_requested {
+                    match session.stop() {
+                        Ok(()) => self.status = "Acquisition stopped".to_owned(),
+                        Err(error) => self.set_error(error.to_string()),
+                    }
+                    return;
+                }
                 let count = session.descriptors().len();
                 let recording_path = self
                     .record_capture
@@ -1004,8 +1058,13 @@ impl DsViewApp {
                     },
                     None => None,
                 };
+                let has_scope = !scope_trigger_controls.is_empty();
+                let preserve_display_until_complete =
+                    mode == AcquisitionMode::Run && self.completed_capture.is_some();
                 self.capture = Some(ActiveCapture {
                     session,
+                    mode,
+                    preserve_display_until_complete,
                     scope_config,
                     scope_trigger_controls,
                     stats: HashMap::new(),
@@ -1014,11 +1073,28 @@ impl DsViewApp {
                     recorder,
                     recording_path: recording_path.clone(),
                 });
-                self.status = match recording_path {
-                    Some(path) => {
-                        format!("Capturing {count} instrument(s) to {path}")
+                self.status = match (mode, recording_path) {
+                    (AcquisitionMode::Single, Some(path)) => {
+                        format!("Single acquisition from {count} instrument(s) to {path}")
                     }
-                    None => format!("Capturing from {count} instrument(s)"),
+                    (AcquisitionMode::Single, None) => {
+                        if has_scope && scope_config.trigger().source() != DsCopeTriggerSource::Auto
+                        {
+                            "Single · waiting for trigger".to_owned()
+                        } else {
+                            format!("Single acquisition from {count} instrument(s)")
+                        }
+                    }
+                    (AcquisitionMode::Run, _) => {
+                        if has_scope && scope_config.trigger().source() == DsCopeTriggerSource::Auto
+                        {
+                            "Run · Auto/Roll".to_owned()
+                        } else if has_scope {
+                            "Run · waiting for trigger".to_owned()
+                        } else {
+                            format!("Run acquisition from {count} instrument(s)")
+                        }
+                    }
                 };
             }
             Ok(WorkerSuccess::ScopeConfigured(device_count)) => {
@@ -1105,6 +1181,8 @@ impl DsViewApp {
 
         if let Some((result, completion)) = finish_status {
             if let Some(mut active) = self.capture.take() {
+                let mode = active.mode;
+                let preserve_display_until_complete = active.preserve_display_until_complete;
                 let stop_result = active.session.stop();
                 let recording_completion = if stop_result.is_ok() {
                     completion
@@ -1123,22 +1201,37 @@ impl DsViewApp {
                         format!("failed to finish recording: {recording_error}"),
                     );
                 }
-                self.completed_capture = Some(CompletedCapture {
-                    stats: active.stats,
-                    waveforms: active.waveforms,
-                    recording_path: active.recording_path,
-                });
+                if completion == CompletionStatus::Complete || !preserve_display_until_complete {
+                    self.completed_capture = Some(CompletedCapture {
+                        stats: active.stats,
+                        waveforms: active.waveforms,
+                        recording_path: active.recording_path,
+                    });
+                }
+                let repeat = should_rearm_acquisition(
+                    mode,
+                    self.capture_run_requested,
+                    completion,
+                    error.is_some(),
+                );
+                if !repeat {
+                    self.capture_run_requested = false;
+                }
                 match error {
                     Some(error) => self.set_error(error),
                     None => {
                         self.status = result.ok().unwrap_or_else(|| "Capture complete".to_owned());
                     }
                 }
+                if repeat {
+                    self.begin_capture(mode);
+                }
             }
         }
     }
 
     fn set_error(&mut self, error: String) {
+        self.capture_run_requested = false;
         self.status = "Operation failed".to_owned();
         self.last_error = Some(error);
     }
@@ -1803,7 +1896,7 @@ impl eframe::App for DsViewApp {
         self.poll_capture();
 
         let mut refresh_clicked = false;
-        let mut start_clicked = false;
+        let mut start_mode = None;
         let mut stop_clicked = false;
         let mut calibration_action = None;
         let capture_settings_enabled = !self.is_busy();
@@ -1833,15 +1926,44 @@ impl eframe::App for DsViewApp {
                     ui.separator();
                     ui.label(RichText::new("USB capture workbench").color(TEXT_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        stop_clicked = ui
-                            .add_enabled(self.capture.is_some(), egui::Button::new("■ Stop"))
-                            .clicked();
-                        start_clicked = ui
+                        let device_selected = self.devices.iter().any(|entry| entry.selected);
+                        let acquisition_active = self.capture_run_requested
+                            && (self.capture.is_some() || self.pending.is_some());
+                        let run_stop_clicked = ui
                             .add_enabled(
-                                !self.is_busy() && self.devices.iter().any(|entry| entry.selected),
-                                egui::Button::new("▶ Capture"),
+                                acquisition_active
+                                    || (!self.is_busy()
+                                        && device_selected
+                                        && !self.record_capture),
+                                egui::Button::new(if acquisition_active {
+                                    "■ Stop"
+                                } else {
+                                    "▶ Run"
+                                }),
                             )
+                            .on_hover_text(if acquisition_active {
+                                "Stop the active acquisition"
+                            } else {
+                                "Run continuously; Auto trigger rolls, edge triggers update the display"
+                            })
                             .clicked();
+                        if run_stop_clicked {
+                            if acquisition_active {
+                                stop_clicked = true;
+                            } else {
+                                start_mode = Some(AcquisitionMode::Run);
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.is_busy() && device_selected,
+                                egui::Button::new("▶ Single"),
+                            )
+                            .on_hover_text("Wait for one trigger, acquire once, then stop")
+                            .clicked()
+                        {
+                            start_mode = Some(AcquisitionMode::Single);
+                        }
                         refresh_clicked = ui
                             .add_enabled(!self.is_busy(), egui::Button::new("↻ Refresh"))
                             .clicked();
@@ -1916,7 +2038,7 @@ impl eframe::App for DsViewApp {
                             );
                             ui.small(
                                 RichText::new(
-                                    "Lossless .dsv file; existing files are not overwritten",
+                                    "Single mode · lossless .dsv file · existing files are not overwritten",
                                 )
                                 .color(TEXT_MUTED),
                             );
@@ -2033,6 +2155,7 @@ impl eframe::App for DsViewApp {
                 let waveforms = self
                     .capture
                     .as_ref()
+                    .filter(|active| !active.preserve_display_until_complete)
                     .map(|active| &active.waveforms)
                     .or_else(|| {
                         self.completed_capture
@@ -2335,11 +2458,16 @@ impl eframe::App for DsViewApp {
         if refresh_clicked {
             self.begin_refresh();
         }
-        if start_clicked {
-            self.begin_capture();
+        if let Some(mode) = start_mode {
+            self.begin_capture(mode);
         }
         if stop_clicked {
-            self.stop_capture();
+            self.capture_run_requested = false;
+            if self.capture.is_some() {
+                self.stop_capture();
+            } else if self.pending.is_some() {
+                self.status = "Stopping acquisition after device preparation…".to_owned();
+            }
         }
         match calibration_action {
             Some(ScopeCalibrationAction::Auto) => {
@@ -2393,7 +2521,7 @@ impl eframe::App for DsViewApp {
             self.status = "Adjusting DSCope configuration…".to_owned();
         }
         if !refresh_clicked
-            && !start_clicked
+            && start_mode.is_none()
             && !stop_clicked
             && !self.is_busy()
             && self
@@ -4115,6 +4243,34 @@ fn capture_start_skew(stats: &HashMap<DeviceId, DeviceStats>) -> Option<Duration
 mod tests {
     use super::*;
     use dsview_core::{LogicBatch, ScopeBatch};
+
+    #[test]
+    fn acquisition_modes_rearm_only_successful_continuous_runs() {
+        assert!(should_rearm_acquisition(
+            AcquisitionMode::Run,
+            true,
+            CompletionStatus::Complete,
+            false,
+        ));
+        assert!(!should_rearm_acquisition(
+            AcquisitionMode::Run,
+            false,
+            CompletionStatus::Complete,
+            false,
+        ));
+        assert!(!should_rearm_acquisition(
+            AcquisitionMode::Run,
+            true,
+            CompletionStatus::Failed,
+            true,
+        ));
+        assert!(!should_rearm_acquisition(
+            AcquisitionMode::Single,
+            true,
+            CompletionStatus::Complete,
+            false,
+        ));
+    }
 
     #[test]
     fn waveform_store_keeps_newest_samples_within_bound() {
