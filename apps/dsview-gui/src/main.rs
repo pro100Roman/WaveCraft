@@ -3417,16 +3417,22 @@ fn scope_trigger_threshold_voltage(channel: ScopeChannelSettings, trigger_level:
     (zero_ratio - trigger_ratio) * voltage_span
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScopeTriggerCrossing {
+    sample: f32,
+    channel_index: usize,
+}
+
 fn scope_trigger_crossing_sample(
     waveforms: &WaveformStore,
     settings: ScopeCaptureSettings,
     trigger: ScopeTriggerSettings,
-) -> Option<f32> {
+) -> Option<ScopeTriggerCrossing> {
     const TRIGGER_SEARCH_SAMPLES: usize = 2;
     let trigger_sample = waveforms.scope_trigger_sample_index?;
     let local_trigger =
         usize::try_from(trigger_sample.checked_sub(waveforms.scope_sample_offset)?).ok()?;
-    let mut closest_crossing = None::<f32>;
+    let mut closest_crossing = None::<ScopeTriggerCrossing>;
 
     for &channel_index in scope_trigger_channels(trigger) {
         let channel_settings = settings.channels[channel_index];
@@ -3453,12 +3459,65 @@ fn scope_trigger_crossing_sample(
                 ((threshold - left_value) / delta).clamp(0.0, 1.0)
             };
             let crossing = waveforms.scope_sample_offset as f32 + left as f32 + interpolation;
-            closest_crossing =
-                Some(closest_crossing.map_or(crossing, |current| current.max(crossing)));
+            let crossing = ScopeTriggerCrossing {
+                sample: crossing,
+                channel_index,
+            };
+            if closest_crossing.map_or(true, |current| crossing.sample > current.sample) {
+                closest_crossing = Some(crossing);
+            }
             break;
         }
     }
     closest_crossing
+}
+
+fn scope_sample_fraction(sample: f32, sample_offset: u64, sample_count: usize) -> f32 {
+    let local_sample = sample - sample_offset as f32;
+    local_sample / sample_count.saturating_sub(1).max(1) as f32
+}
+
+fn scope_sample_x(
+    plot: Rect,
+    viewport: WaveformViewport,
+    sample_index: f32,
+    sample_count: usize,
+) -> f32 {
+    let sample_fraction = sample_index / sample_count.saturating_sub(1).max(1) as f32;
+    let screen_fraction = (sample_fraction - viewport.start) / viewport.span.max(f32::EPSILON);
+    plot.left() + screen_fraction * plot.width()
+}
+
+fn scope_plot_sample_indices(
+    visible_range: Range<usize>,
+    step: usize,
+    channel_index: usize,
+    trigger_crossing: Option<ScopeTriggerCrossing>,
+    sample_offset: u64,
+) -> Vec<usize> {
+    let mut indices = visible_range
+        .clone()
+        .step_by(step.max(1))
+        .collect::<Vec<_>>();
+    if let Some(last) = visible_range.end.checked_sub(1) {
+        indices.push(last);
+    }
+    if let Some(crossing) = trigger_crossing.filter(|crossing| {
+        crossing.channel_index == channel_index && crossing.sample >= sample_offset as f32
+    }) {
+        let local_crossing = crossing.sample - sample_offset as f32;
+        for index in [
+            local_crossing.floor() as usize,
+            local_crossing.ceil() as usize,
+        ] {
+            if visible_range.contains(&index) {
+                indices.push(index);
+            }
+        }
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    indices
 }
 
 fn scope_trigger_position_x(plot: Rect, position_percent: u8) -> f32 {
@@ -3713,17 +3772,16 @@ fn paint_scope(
     let (status_bar, time_ruler, plot) = split_waveform_chrome(rect);
     let scope_painter = painter.with_clip_rect(plot);
     paint_scope_graticule(&scope_painter, plot);
-    let trigger_sample_fraction =
-        scope_trigger_crossing_sample(waveforms, settings, *trigger_settings)
-            .or_else(|| {
-                waveforms
-                    .scope_trigger_sample_index
-                    .map(|sample| sample as f32)
-            })
-            .map(|sample| {
-                (sample - waveforms.scope_sample_offset as f32) / sample_count.max(1) as f32
-            })
-            .unwrap_or_else(|| f32::from(settings.trigger.position_percent) / 100.0);
+    let trigger_crossing = scope_trigger_crossing_sample(waveforms, settings, *trigger_settings);
+    let trigger_sample_fraction = trigger_crossing
+        .map(|crossing| crossing.sample)
+        .or_else(|| {
+            waveforms
+                .scope_trigger_sample_index
+                .map(|sample| sample as f32)
+        })
+        .map(|sample| scope_sample_fraction(sample, waveforms.scope_sample_offset, sample_count))
+        .unwrap_or_else(|| f32::from(settings.trigger.position_percent) / 100.0);
     let trigger_screen_fraction = f32::from(trigger_settings.position_percent) / 100.0;
     if viewport.span < 1.0 {
         viewport.align_sample_to_screen(trigger_sample_fraction, trigger_screen_fraction);
@@ -3805,18 +3863,20 @@ fn paint_scope(
         if !channel_settings.enabled {
             continue;
         }
-        let points = visible_range
-            .clone()
-            .step_by(step)
-            .map(|index| {
-                let x = plot.left()
-                    + index.saturating_sub(visible_range.start) as f32
-                        / visible_count.saturating_sub(1).max(1) as f32
-                        * plot.width();
-                let y = scope_sample_y(plot, channel_settings, channel[index]);
-                Pos2::new(x, y)
-            })
-            .collect::<Vec<_>>();
+        let points = scope_plot_sample_indices(
+            visible_range.clone(),
+            step,
+            channel_index,
+            trigger_crossing,
+            waveforms.scope_sample_offset,
+        )
+        .into_iter()
+        .map(|index| {
+            let x = scope_sample_x(plot, *viewport, index as f32, sample_count);
+            let y = scope_sample_y(plot, channel_settings, channel[index]);
+            Pos2::new(x, y)
+        })
+        .collect::<Vec<_>>();
         if points.len() > 1 {
             let color = channel_colors[channel_index.min(channel_colors.len() - 1)];
             scope_painter.add(egui::Shape::line(
@@ -4254,15 +4314,51 @@ mod tests {
 
         assert_eq!(
             scope_trigger_crossing_sample(&waveforms, settings, trigger),
-            Some(1.5)
+            Some(ScopeTriggerCrossing {
+                sample: 1.5,
+                channel_index: 0,
+            })
         );
 
         waveforms.scope_channels[0] = VecDeque::from(vec![1.0, 1.0, -1.0, -1.0]);
         trigger.slope = DsCopeTriggerSlope::Falling;
         assert_eq!(
             scope_trigger_crossing_sample(&waveforms, settings, trigger),
-            Some(1.5)
+            Some(ScopeTriggerCrossing {
+                sample: 1.5,
+                channel_index: 0,
+            })
         );
+    }
+
+    #[test]
+    fn scope_trace_and_trigger_use_the_same_sample_coordinates() {
+        let plot = Rect::from_min_max(Pos2::new(100.0, 20.0), Pos2::new(900.0, 420.0));
+        let viewport = WaveformViewport {
+            start: 0.25,
+            span: 0.5,
+        };
+
+        assert!((scope_sample_fraction(1_050.0, 1_000, 101) - 0.5).abs() < f32::EPSILON);
+        assert!((scope_sample_x(plot, viewport, 50.0, 101) - 500.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn scope_downsampling_preserves_trigger_crossing_samples() {
+        let indices = scope_plot_sample_indices(
+            0..1_000,
+            100,
+            0,
+            Some(ScopeTriggerCrossing {
+                sample: 512.25,
+                channel_index: 0,
+            }),
+            0,
+        );
+
+        assert!(indices.contains(&512));
+        assert!(indices.contains(&513));
+        assert_eq!(indices.last(), Some(&999));
     }
 
     #[test]
