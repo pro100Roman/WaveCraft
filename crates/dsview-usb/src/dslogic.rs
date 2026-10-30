@@ -24,6 +24,13 @@ const MAX_SAMPLE_COUNT: u64 = 134_217_728;
 const CAPTURE_COMPLETION_GRACE: Duration = Duration::from_secs(5);
 const PAYLOAD_TRANSFER_GRACE: Duration = Duration::from_secs(5);
 
+const CLOCK_TYPE_BIT: u16 = 1;
+const CLOCK_EDGE_BIT: u16 = 2;
+const RLE_MODE_BIT: u16 = 3;
+const FILTER_BIT: u16 = 8;
+const STREAM_MODE_BIT: u16 = 12;
+const INTERNAL_TEST_BIT: u16 = 15;
+
 const SUPPORTED_SAMPLE_RATES: &[u64] = &[
     1_000_000,
     2_000_000,
@@ -40,9 +47,35 @@ const SUPPORTED_SAMPLE_RATES: &[u64] = &[
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DsLogicOperationMode {
+    Buffer,
+    Stream,
+    InternalTest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DsLogicStopOption {
+    StopImmediately,
+    UploadCapturedData,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DsLogicInputFilter {
+    None,
+    OneSampleClock,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DsLogicCaptureConfig {
     sample_rate_hz: u64,
     sample_count: u64,
+    operation_mode: DsLogicOperationMode,
+    stop_option: DsLogicStopOption,
+    threshold_mv: u16,
+    input_filter: DsLogicInputFilter,
+    rle_enabled: bool,
+    external_clock: bool,
+    falling_clock_edge: bool,
 }
 
 impl DsLogicCaptureConfig {
@@ -60,7 +93,54 @@ impl DsLogicCaptureConfig {
         Ok(Self {
             sample_rate_hz,
             sample_count,
+            operation_mode: DsLogicOperationMode::Buffer,
+            stop_option: DsLogicStopOption::UploadCapturedData,
+            threshold_mv: 1_000,
+            input_filter: DsLogicInputFilter::None,
+            rle_enabled: false,
+            external_clock: false,
+            falling_clock_edge: false,
         })
+    }
+
+    pub fn with_operation_mode(mut self, operation_mode: DsLogicOperationMode) -> Self {
+        self.operation_mode = operation_mode;
+        self
+    }
+
+    pub fn with_stop_option(mut self, stop_option: DsLogicStopOption) -> Self {
+        self.stop_option = stop_option;
+        self
+    }
+
+    pub fn with_threshold_voltage(mut self, volts: f32) -> Result<Self, CaptureError> {
+        if !volts.is_finite() || !(0.0..=5.0).contains(&volts) {
+            return Err(CaptureError::new(
+                "DSLogic threshold voltage must be between 0.0 V and 5.0 V",
+            ));
+        }
+        self.threshold_mv = (volts * 1_000.0).round() as u16;
+        Ok(self)
+    }
+
+    pub fn with_input_filter(mut self, input_filter: DsLogicInputFilter) -> Self {
+        self.input_filter = input_filter;
+        self
+    }
+
+    pub fn with_rle_enabled(mut self, enabled: bool) -> Self {
+        self.rle_enabled = enabled;
+        self
+    }
+
+    pub fn with_external_clock(mut self, enabled: bool) -> Self {
+        self.external_clock = enabled;
+        self
+    }
+
+    pub fn with_falling_clock_edge(mut self, enabled: bool) -> Self {
+        self.falling_clock_edge = enabled;
+        self
     }
 
     pub fn sample_rate_hz(self) -> u64 {
@@ -69,6 +149,34 @@ impl DsLogicCaptureConfig {
 
     pub fn sample_count(self) -> u64 {
         self.sample_count
+    }
+
+    pub fn operation_mode(self) -> DsLogicOperationMode {
+        self.operation_mode
+    }
+
+    pub fn stop_option(self) -> DsLogicStopOption {
+        self.stop_option
+    }
+
+    pub fn threshold_voltage(self) -> f32 {
+        f32::from(self.threshold_mv) / 1_000.0
+    }
+
+    pub fn input_filter(self) -> DsLogicInputFilter {
+        self.input_filter
+    }
+
+    pub fn rle_enabled(self) -> bool {
+        self.rle_enabled
+    }
+
+    pub fn external_clock(self) -> bool {
+        self.external_clock
+    }
+
+    pub fn falling_clock_edge(self) -> bool {
+        self.falling_clock_edge
     }
 
     fn armed_sample_count(self) -> u64 {
@@ -86,10 +194,21 @@ impl DsLogicCaptureConfig {
         let armed_samples = self.armed_sample_count();
         let capture_count = armed_samples >> 4;
 
+        let operation_mode = match self.operation_mode {
+            DsLogicOperationMode::Buffer => 0,
+            DsLogicOperationMode::Stream => 1 << STREAM_MODE_BIT,
+            DsLogicOperationMode::InternalTest => 1 << INTERNAL_TEST_BIT,
+        };
+        let mode = operation_mode
+            | (u16::from(self.external_clock) << CLOCK_TYPE_BIT)
+            | (u16::from(self.falling_clock_edge) << CLOCK_EDGE_BIT)
+            | (u16::from(self.rle_enabled) << RLE_MODE_BIT)
+            | (u16::from(self.input_filter == DsLogicInputFilter::OneSampleClock) << FILTER_BIT);
+
         let mut bytes = Vec::with_capacity(SETTINGS_BYTES);
         push_u32(&mut bytes, 0xf5a5_f5a5);
         push_u16(&mut bytes, 0x0001);
-        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, mode);
         push_u16(&mut bytes, 0x0102);
         push_u16(&mut bytes, divided as u16);
         push_u16(&mut bytes, divider_high as u16 + (divided >> 16) as u16);
@@ -184,7 +303,7 @@ fn run_capture(
     config: DsLogicCaptureConfig,
     context: &CaptureContext,
 ) -> Result<(), CaptureError> {
-    validate_device_ready(session)?;
+    validate_device_ready(session, config)?;
     session.stop_capture().map_err(capture_error)?;
     let capture_result = (|| {
         session
@@ -203,7 +322,10 @@ fn run_capture(
     combine_results(capture_result, stop_result, "stop the capture engine")
 }
 
-fn validate_device_ready(session: &UsbDeviceSession) -> Result<(), CaptureError> {
+fn validate_device_ready(
+    session: &UsbDeviceSession,
+    config: DsLogicCaptureConfig,
+) -> Result<(), CaptureError> {
     let firmware = session.firmware_version().map_err(capture_error)?;
     if !firmware.is_compatible() {
         return Err(CaptureError::new(format!(
@@ -223,7 +345,7 @@ fn validate_device_ready(session: &UsbDeviceSession) -> Result<(), CaptureError>
         )));
     }
     session
-        .initialize_dslogic_frontend()
+        .initialize_dslogic_frontend(config.threshold_mv)
         .map_err(capture_error)?;
     Ok(())
 }
@@ -270,6 +392,7 @@ fn read_capture(
             &mut wire_buffer[..bytes_to_read],
             context,
             payload_deadline,
+            !prequeued.upload_after_stop,
         )? {
             ReadOutcome::Complete => {}
             ReadOutcome::Cancelled => return Ok(()),
@@ -294,6 +417,7 @@ struct PrequeuedCapture {
     header: [u8; TRIGGER_HEADER_BYTES],
     payload: Vec<u8>,
     capture_origin: Duration,
+    upload_after_stop: bool,
 }
 
 fn read_prequeued_capture(
@@ -343,13 +467,22 @@ fn read_prequeued_capture(
     }
 
     let mut cancelled = false;
+    let mut upload_after_stop = false;
     let mut timeout_error = None;
     while !header_read.is_complete() || !payload_read.is_complete() {
-        if !cancelled && timeout_error.is_none() && context.is_cancelled() {
-            cancelled = true;
-            let _ = session.force_capture_ready();
-            header_read.cancel().map_err(capture_error)?;
-            payload_read.cancel().map_err(capture_error)?;
+        if !cancelled && !upload_after_stop && timeout_error.is_none() && context.is_cancelled() {
+            match config.stop_option {
+                DsLogicStopOption::StopImmediately => {
+                    cancelled = true;
+                    let _ = session.force_capture_ready();
+                    header_read.cancel().map_err(capture_error)?;
+                    payload_read.cancel().map_err(capture_error)?;
+                }
+                DsLogicStopOption::UploadCapturedData => {
+                    upload_after_stop = true;
+                    session.force_capture_stop().map_err(capture_error)?;
+                }
+            }
         } else if !cancelled && timeout_error.is_none() && Instant::now() >= deadline {
             timeout_error = Some(capture_timeout_error(session, "queued capture transfers"));
             let _ = session.force_capture_ready();
@@ -396,6 +529,7 @@ fn read_prequeued_capture(
         header,
         payload,
         capture_origin,
+        upload_after_stop,
     }))
 }
 
@@ -429,11 +563,12 @@ fn read_exact_cancellable(
     mut buffer: &mut [u8],
     context: &CaptureContext,
     deadline: Instant,
+    honor_cancellation: bool,
 ) -> Result<ReadOutcome, CaptureError> {
     while !buffer.is_empty() {
         match session
             .read_bulk_cancellable(buffer, || {
-                context.is_cancelled() || Instant::now() >= deadline
+                (honor_cancellation && context.is_cancelled()) || Instant::now() >= deadline
             })
             .map_err(capture_error)?
         {
@@ -446,7 +581,7 @@ fn read_exact_cancellable(
                 let (_, remaining) = buffer.split_at_mut(bytes_read);
                 buffer = remaining;
             }
-            BulkReadOutcome::Cancelled if context.is_cancelled() => {
+            BulkReadOutcome::Cancelled if honor_cancellation && context.is_cancelled() => {
                 return Ok(ReadOutcome::Cancelled);
             }
             BulkReadOutcome::Cancelled => return Ok(ReadOutcome::TimedOut),
@@ -596,6 +731,14 @@ mod tests {
         assert!(DsLogicCaptureConfig::new(3_000_000, 1_000_000).is_err());
         assert!(DsLogicCaptureConfig::new(1_000_000, 0).is_err());
         assert!(DsLogicCaptureConfig::new(1_000_000, MAX_SAMPLE_COUNT + 1).is_err());
+        assert!(DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .expect("base configuration should be valid")
+            .with_threshold_voltage(f32::NAN)
+            .is_err());
+        assert!(DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .expect("base configuration should be valid")
+            .with_threshold_voltage(5.1)
+            .is_err());
     }
 
     #[test]
@@ -619,6 +762,41 @@ mod tests {
         assert_eq!(read_u16(&settings, 48), u16::MAX);
         assert_eq!(read_u16(&settings, 304), 0);
         assert_eq!(read_u32(&settings, 368), 0xfa5a_fa5a);
+    }
+
+    #[test]
+    fn encodes_dslogic_device_options_in_mode_word() {
+        let settings = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_stop_option(DsLogicStopOption::StopImmediately)
+            .with_threshold_voltage(2.5)
+            .expect("threshold should be valid")
+            .with_input_filter(DsLogicInputFilter::OneSampleClock)
+            .with_rle_enabled(true)
+            .with_external_clock(true)
+            .with_falling_clock_edge(true);
+
+        assert_eq!(
+            read_u16(&settings.encode_settings(), 6),
+            (1 << STREAM_MODE_BIT)
+                | (1 << FILTER_BIT)
+                | (1 << RLE_MODE_BIT)
+                | (1 << CLOCK_TYPE_BIT)
+                | (1 << CLOCK_EDGE_BIT)
+        );
+        assert_eq!(settings.stop_option(), DsLogicStopOption::StopImmediately);
+        assert_eq!(settings.threshold_voltage(), 2.5);
+    }
+
+    #[test]
+    fn encodes_internal_test_operation_mode() {
+        let settings = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_operation_mode(DsLogicOperationMode::InternalTest)
+            .encode_settings();
+
+        assert_eq!(read_u16(&settings, 6), 1 << INTERNAL_TEST_BIT);
     }
 
     #[test]

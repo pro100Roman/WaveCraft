@@ -55,6 +55,11 @@ const LED_RED: u8 = 1 << 1;
 const INTERRUPT_READY_HIGH: u8 = 1 << 7;
 const WORD_WIDTH_WIDE: u8 = 1;
 const FORCE_READY: u8 = 1 << 1;
+const FORCE_STOP: u8 = 1 << 2;
+
+fn dslogic_threshold_code(threshold_mv: u16) -> u8 {
+    ((u32::from(threshold_mv) * 153) / 3_300).min(255) as u8
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FirmwareVersion {
@@ -440,16 +445,28 @@ impl UsbDeviceSession {
         )
     }
 
+    pub(crate) fn force_capture_stop(&self) -> Result<(), UsbError> {
+        self.write_control(
+            I2C_REGISTER_DESTINATION,
+            CONTROL_REGISTER_ZERO,
+            &[FORCE_STOP],
+        )
+    }
+
     pub(crate) fn capture_progress(&self) -> Result<u32, UsbError> {
         let mut progress = [0_u8; 4];
         self.read_control(I2C_STATUS_DESTINATION, 0, &mut progress)?;
         Ok(u32::from_le_bytes(progress))
     }
 
-    pub(crate) fn initialize_dslogic_frontend(&self) -> Result<(), UsbError> {
-        // Match DSLogic's device-open path for the U3Pro16: a 1.0 V input
-        // threshold followed by the ADF4360 500 MHz clock configuration.
-        self.write_control(I2C_REGISTER_DESTINATION, THRESHOLD_REGISTER, &[0x2e])?;
+    pub(crate) fn initialize_dslogic_frontend(&self, threshold_mv: u16) -> Result<(), UsbError> {
+        // Match DSLogic's U3Pro16 VTH conversion: VTH / 3.3 * (1.5 / 2.5) * 255.
+        let threshold_code = dslogic_threshold_code(threshold_mv);
+        self.write_control(
+            I2C_REGISTER_DESTINATION,
+            THRESHOLD_REGISTER,
+            &[threshold_code],
+        )?;
         self.write_control(
             I2C_REGISTER_DESTINATION,
             ANALOG_CONTROL_REGISTER + 2,
@@ -899,6 +916,13 @@ mod tests {
     #[test]
     fn encodes_control_read_header_in_protocol_order() {
         assert_eq!(control_read_header(0x12, 0x3456, 7), [0x12, 0x56, 0x34, 7]);
+    }
+
+    #[test]
+    fn converts_dslogic_threshold_voltage_to_register_code() {
+        assert_eq!(dslogic_threshold_code(0), 0);
+        assert_eq!(dslogic_threshold_code(1_000), 0x2e);
+        assert_eq!(dslogic_threshold_code(5_000), 231);
     }
 
     #[test]

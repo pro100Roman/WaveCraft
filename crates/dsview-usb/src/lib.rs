@@ -26,7 +26,10 @@ pub use dscope::{
     DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
     DSCOPE_VOLTS_PER_DIV_MV,
 };
-pub use dslogic::{DsLogicCaptureConfig, DsLogicCaptureSource};
+pub use dslogic::{
+    DsLogicCaptureConfig, DsLogicCaptureSource, DsLogicInputFilter, DsLogicOperationMode,
+    DsLogicStopOption,
+};
 pub use prepare::{load_device_fpga, prepare_device, FpgaLoad, PreparedDevice};
 pub use probe::{probe_device, DeviceProbe, UsbEndpointInfo};
 pub use transport::{
