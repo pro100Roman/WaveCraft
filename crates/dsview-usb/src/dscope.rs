@@ -923,73 +923,17 @@ pub fn auto_calibrate_dscope_with_progress(
             &mut on_frame,
         )?;
 
-        for (range, volts_per_div_mv) in DSCOPE_VOLTS_PER_DIV_MV.iter().copied().enumerate() {
-            let config = calibration_capture_config(
-                CALIBRATION_SAMPLE_RATE_HZ,
-                CALIBRATION_SAMPLE_COUNT,
-                range,
-                DSCOPE_VERTICAL_OFFSET_CENTER,
-                enabled_channels,
-            )?;
-
-            let mut converged = false;
-            for adjustment in 0..CALIBRATION_MAX_ADJUSTMENTS {
-                let progress = 0.20
-                    + range as f32 / DSCOPE_VOLTS_PER_DIV_MV.len() as f32 * 0.50
-                    + adjustment as f32 / CALIBRATION_MAX_ADJUSTMENTS as f32
-                        * (0.50 / DSCOPE_VOLTS_PER_DIV_MV.len() as f32);
-                let progress_end = progress
-                    + 0.50
-                        / DSCOPE_VOLTS_PER_DIV_MV.len() as f32
-                        / CALIBRATION_MAX_ADJUSTMENTS as f32;
-                let measurement = capture_calibration_measurement(
-                    &session,
-                    config,
-                    values,
-                    range,
-                    CalibrationCaptureStep {
-                        settling_frames,
-                        progress_start: progress,
-                        progress_end,
-                        phase: "Centering input ranges",
-                    },
-                    &mut on_frame,
-                )?;
-                let means = measurement.channel_means()?;
-
-                let margins = [128.0 - means[0], 128.0 - means[1]];
-                if margins
-                    .iter()
-                    .all(|margin| margin.abs() < CALIBRATION_MARGIN_PASS)
-                {
-                    converged = true;
-                    break;
-                }
-                for (channel, margin) in margins.iter().copied().enumerate() {
-                    if margin.abs() < CALIBRATION_MARGIN_PASS {
-                        continue;
-                    }
-                    let adjustment = calibration_integer_adjustment(margin);
-                    let current = i32::from(
-                        values
-                            .preoffset(channel, range)
-                            .expect("calibration range is valid"),
-                    );
-                    let adjusted = (current + adjustment).clamp(0, 1_023) as u16;
-                    if adjusted == current as u16 {
-                        return Err(CaptureError::new(format!(
-                            "DSCope auto calibration reached the offset limit on CH{channel} at {volts_per_div_mv} mV/div"
-                        )));
-                    }
-                    values.set_preoffset(channel, range, adjusted)?;
-                }
-            }
-            if !converged {
-                return Err(CaptureError::new(format!(
-                    "DSCope auto calibration did not converge at {volts_per_div_mv} mV/div"
-                )));
-            }
-        }
+        center_calibration_ranges(
+            &session,
+            &mut values,
+            CalibrationCaptureStep {
+                settling_frames,
+                progress_start: 0.20,
+                progress_end: 0.65,
+                phase: "Centering input ranges",
+            },
+            &mut on_frame,
+        )?;
 
         calibrate_adc_fine_gains(
             &session,
@@ -1005,6 +949,17 @@ pub fn auto_calibrate_dscope_with_progress(
             CALIBRATION_SAMPLE_COUNT,
             true,
             branch_settling_frames,
+            &mut on_frame,
+        )?;
+        center_calibration_ranges(
+            &session,
+            &mut values,
+            CalibrationCaptureStep {
+                settling_frames,
+                progress_start: 0.91,
+                progress_end: 1.0,
+                phase: "Verifying calibrated zero levels",
+            },
             &mut on_frame,
         )?;
         Ok(values)
@@ -1141,7 +1096,7 @@ fn calibrate_vertical_transform(
             },
             on_frame,
         )?
-        .channel_means()?;
+        .channel_means(sample_count)?;
         let top_config = calibration_capture_config(
             sample_rate_hz,
             sample_count,
@@ -1162,7 +1117,7 @@ fn calibrate_vertical_transform(
             },
             on_frame,
         )?
-        .channel_means()?;
+        .channel_means(sample_count)?;
         let expected_span = f64::from(CALIBRATION_OFFSET_BOTTOM - CALIBRATION_OFFSET_TOP);
         let margins = [
             calibration_span_margin(bottom[0], top[0], expected_span),
@@ -1253,6 +1208,88 @@ fn next_vertical_transform(current: i32, margin: f64, previous: Option<(i32, f64
     current - calibration_integer_adjustment(margin)
 }
 
+fn center_calibration_ranges(
+    session: &UsbDeviceSession,
+    values: &mut DsCopeCalibrationValues,
+    step: CalibrationCaptureStep,
+    on_frame: &mut dyn FnMut(DsCopeCalibrationFrame),
+) -> Result<(), CaptureError> {
+    let enabled_channels = [true; CHANNEL_COUNT];
+    session
+        .initialize_dscope_frontend(enabled_channels)
+        .map_err(capture_error)?;
+    session
+        .set_dscope_bandwidth_limit(DsCopeBandwidthLimit::Full)
+        .map_err(capture_error)?;
+    session
+        .configure_dscope_channels(enabled_channels)
+        .map_err(capture_error)?;
+
+    let progress_span = step.progress_end - step.progress_start;
+    let range_span = progress_span / DSCOPE_VOLTS_PER_DIV_MV.len() as f32;
+    for (range, volts_per_div_mv) in DSCOPE_VOLTS_PER_DIV_MV.iter().copied().enumerate() {
+        let config = calibration_capture_config(
+            CALIBRATION_SAMPLE_RATE_HZ,
+            CALIBRATION_SAMPLE_COUNT,
+            range,
+            DSCOPE_VERTICAL_OFFSET_CENTER,
+            enabled_channels,
+        )?;
+
+        let mut converged = false;
+        for adjustment in 0..CALIBRATION_MAX_ADJUSTMENTS {
+            let attempt_span = range_span / CALIBRATION_MAX_ADJUSTMENTS as f32;
+            let progress =
+                step.progress_start + range as f32 * range_span + adjustment as f32 * attempt_span;
+            let measurement = capture_calibration_measurement(
+                session,
+                config,
+                *values,
+                range,
+                CalibrationCaptureStep {
+                    settling_frames: step.settling_frames,
+                    progress_start: progress,
+                    progress_end: progress + attempt_span,
+                    phase: step.phase,
+                },
+                on_frame,
+            )?;
+            let margins = calibration_center_margins(measurement, CALIBRATION_SAMPLE_COUNT)?;
+            if margins
+                .iter()
+                .all(|margin| margin.abs() < CALIBRATION_MARGIN_PASS)
+            {
+                converged = true;
+                break;
+            }
+            for (channel, margin) in margins.into_iter().enumerate() {
+                if margin.abs() < CALIBRATION_MARGIN_PASS {
+                    continue;
+                }
+                let adjustment = calibration_integer_adjustment(margin);
+                let current = i32::from(
+                    values
+                        .preoffset(channel, range)
+                        .expect("calibration range is valid"),
+                );
+                let adjusted = (current + adjustment).clamp(0, 1_023) as u16;
+                if adjusted == current as u16 {
+                    return Err(CaptureError::new(format!(
+                        "DSCope auto calibration reached the offset limit on CH{channel} at {volts_per_div_mv} mV/div"
+                    )));
+                }
+                values.set_preoffset(channel, range, adjusted)?;
+            }
+        }
+        if !converged {
+            return Err(CaptureError::new(format!(
+                "DSCope auto calibration did not converge at {volts_per_div_mv} mV/div"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn calibrate_adc_fine_gains(
     session: &UsbDeviceSession,
     values: &mut DsCopeCalibrationValues,
@@ -1291,10 +1328,11 @@ fn calibrate_adc_fine_gains(
     }
 
     for adjustment in 0..CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS {
-        let phase_start = if combined { 0.85 } else { 0.70 };
-        let progress =
-            phase_start + adjustment as f32 / CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS as f32 * 0.15;
-        let progress_end = progress + 0.15 / CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS as f32;
+        let (phase_start, phase_end) = if combined { (0.78, 0.91) } else { (0.65, 0.78) };
+        let phase_span = phase_end - phase_start;
+        let progress = phase_start
+            + adjustment as f32 / CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS as f32 * phase_span;
+        let progress_end = progress + phase_span / CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS as f32;
         let measurement = capture_calibration_measurement(
             session,
             config,
@@ -1348,6 +1386,16 @@ fn calibration_integer_adjustment(margin: f64) -> i32 {
     } else {
         margin.floor() as i32
     }
+}
+
+fn calibration_center_margins(
+    measurement: ScopeMeasurement,
+    calibration_sample_count: u64,
+) -> Result<[f64; CHANNEL_COUNT], CaptureError> {
+    let means = measurement.channel_means(calibration_sample_count)?;
+    Ok(std::array::from_fn(|channel| {
+        f64::from(measurement.hardware_offsets[channel]) - means[channel]
+    }))
 }
 
 fn fine_gain_skews(branches: [f64; 8], combined: bool) -> Result<[f64; 8], CaptureError> {
@@ -2540,13 +2588,20 @@ impl ScopeMeasurement {
         self.branch_accumulators.map(f64::from)
     }
 
-    fn channel_means(self) -> Result<[f64; CHANNEL_COUNT], CaptureError> {
-        if self.sample_count == 0 {
+    fn channel_means(
+        self,
+        calibration_sample_count: u64,
+    ) -> Result<[f64; CHANNEL_COUNT], CaptureError> {
+        if calibration_sample_count == 0 {
             return Err(CaptureError::new(
                 "DSCope calibration measurement contained no samples",
             ));
         }
-        let divisor = f64::from(self.sample_count);
+        // The FPGA accumulators cover the configured calibration window. The
+        // footer's valid length only describes how much waveform data was
+        // returned and can be shorter around the trigger point. The vendor
+        // driver therefore divides these sums by limit_samples, not vlen.
+        let divisor = calibration_sample_count as f64;
         Ok([
             self.branch_accumulators[..4]
                 .iter()
@@ -2809,6 +2864,22 @@ mod tests {
         assert_eq!(calibration_span_margin(15.0, 240.0, 225.0), 0.0);
         assert_eq!(calibration_span_margin(245.0, 15.0, 225.0), 5.0);
         assert_eq!(calibration_span_margin(15.0, 245.0, 225.0), 5.0);
+    }
+
+    #[test]
+    fn centers_calibration_on_the_real_packet_hardware_offsets() {
+        let measurement = ScopeMeasurement {
+            sample_count: 100,
+            triggered: false,
+            trigger_offset: 0,
+            hardware_offsets: [128, 130],
+            branch_accumulators: [3_250, 3_250, 3_250, 3_250, 3_175, 3_175, 3_175, 3_175],
+        };
+
+        assert_eq!(
+            calibration_center_margins(measurement, 100).unwrap(),
+            [-2.0, 3.0]
+        );
     }
 
     #[test]
@@ -3251,10 +3322,12 @@ mod tests {
             measurement.branch_accumulators,
             [10, 20, 30, 40, 50, 60, 70, 80]
         );
-        assert_eq!(measurement.channel_means().unwrap(), [1.0, 2.6]);
+        assert_eq!(measurement.channel_means(100).unwrap(), [1.0, 2.6]);
+        assert_eq!(measurement.channel_means(125).unwrap(), [0.8, 2.08]);
         let channel = DsCopeChannelConfig::default();
         assert_eq!(raw_to_volts(128, 128, channel), 0.0);
         assert!(raw_to_volts(100, 128, channel) > 1.19);
+        assert!(raw_to_volts(130, 128, channel) < 0.0);
 
         footer[8..12].copy_from_slice(&(config.divider() | 0x4000_0000).to_le_bytes());
         assert!(ScopeMeasurement::decode(&footer, config).unwrap().triggered);
