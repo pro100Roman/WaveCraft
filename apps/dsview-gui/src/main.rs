@@ -3542,6 +3542,7 @@ impl eframe::App for DsViewApp {
                                     waveforms,
                                     &mut logic_channel_colors,
                                     &mut logic_viewport,
+                                    false,
                                 )
                             },
                         ));
@@ -4595,7 +4596,16 @@ fn combined_waveform_cards(
         &mut logic_ui,
         "DIGITAL",
         "DSLogic · channels 0–15",
-        |ui, rect| paint_logic(ui, rect, waveforms, logic_channel_colors, logic_viewport),
+        |ui, rect| {
+            paint_logic(
+                ui,
+                rect,
+                waveforms,
+                logic_channel_colors,
+                logic_viewport,
+                true,
+            )
+        },
     );
 
     let mut scope_ui = ui.new_child(
@@ -4985,12 +4995,21 @@ fn paint_logic_zero_reference(painter: &egui::Painter, plot: Rect, y: f32, chann
     }
 }
 
+fn logic_plot_rect(area: Rect, square_grid_cells: bool) -> Rect {
+    if square_grid_cells {
+        fit_rect_to_grid(area, 10, 4)
+    } else {
+        area
+    }
+}
+
 fn paint_logic(
     ui: &egui::Ui,
     rect: Rect,
     waveforms: &WaveformStore,
     channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
     viewport: &mut WaveformViewport,
+    square_grid_cells: bool,
 ) {
     paint_plot_background(ui, rect);
     let painter = ui.painter();
@@ -5000,7 +5019,7 @@ fn paint_logic(
         rect.right_bottom(),
     );
     let (status_area, ruler_area, plot_area) = split_waveform_chrome(waveform_area);
-    let plot = fit_rect_to_grid(plot_area, 10, 4);
+    let plot = logic_plot_rect(plot_area, square_grid_cells);
     let (status_bar, time_ruler) = align_waveform_chrome(status_area, ruler_area, plot);
     paint_plot_grid(ui, plot);
     let sample_count = waveforms.logic_samples.len();
@@ -7547,6 +7566,9 @@ mod tests {
         assert!((logic_grid.width() - 800.0).abs() < 0.001);
         assert!((logic_grid.height() - 320.0).abs() < 0.001);
         assert!((logic_grid.width() / 10.0 - logic_grid.height() / 4.0).abs() < 0.001);
+
+        assert_eq!(logic_plot_rect(square_area, false), square_area);
+        assert_eq!(logic_plot_rect(square_area, true), logic_grid);
     }
 
     #[test]
