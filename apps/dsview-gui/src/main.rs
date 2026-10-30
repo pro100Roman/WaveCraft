@@ -1741,7 +1741,7 @@ struct DsViewApp {
 }
 
 fn default_scope_measurement_window_positions() -> [Vec2; 2] {
-    [Vec2::new(1.0, 1.0), Vec2::new(0.0, 1.0)]
+    [Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0)]
 }
 
 impl DsViewApp {
@@ -7072,6 +7072,9 @@ fn paint_scope_measurements(
     const COLUMN_WIDTH: f32 = 176.0;
     const PADDING: f32 = 8.0;
     const HEADER_HEIGHT: f32 = 25.0;
+    const HEADER_FONT_SIZE: f32 = 10.0;
+    const LABEL_FONT_SIZE: f32 = 10.0;
+    const VALUE_FONT_SIZE: f32 = 12.0;
 
     for channel in 0..2 {
         let channel_settings = settings.measurements.channels[channel];
@@ -7150,7 +7153,7 @@ fn paint_scope_measurements(
                 "{} MEASUREMENTS",
                 scope_channel_label(channel, channel_names)
             ),
-            FontId::monospace(12.0),
+            FontId::monospace(HEADER_FONT_SIZE),
             color,
         );
         painter.text(
@@ -7169,14 +7172,14 @@ fn paint_scope_measurements(
                 origin,
                 egui::Align2::LEFT_TOP,
                 kind.label(),
-                FontId::monospace(12.0),
+                FontId::monospace(LABEL_FONT_SIZE),
                 TEXT_MUTED,
             );
             painter.text(
                 origin + Vec2::new(COLUMN_WIDTH - PADDING * 2.0, -1.0),
                 egui::Align2::RIGHT_TOP,
                 results.formatted(kind),
-                FontId::monospace(14.0),
+                FontId::monospace(VALUE_FONT_SIZE),
                 color,
             );
         }
@@ -9224,10 +9227,10 @@ mod tests {
         let size = Vec2::new(200.0, 100.0);
 
         let [channel_zero, channel_one] = default_scope_measurement_window_positions();
-        let bottom_right = scope_measurement_window_rect(plot, size, channel_zero);
-        assert_eq!(bottom_right.right_bottom(), plot.right_bottom());
-        let bottom_left = scope_measurement_window_rect(plot, size, channel_one);
+        let bottom_left = scope_measurement_window_rect(plot, size, channel_zero);
         assert_eq!(bottom_left.left_bottom(), plot.left_bottom());
+        let bottom_right = scope_measurement_window_rect(plot, size, channel_one);
+        assert_eq!(bottom_right.right_bottom(), plot.right_bottom());
 
         let top_right = scope_measurement_window_rect(plot, size, Vec2::new(1.0, 0.0));
         assert_eq!(top_right.right(), plot.right());
