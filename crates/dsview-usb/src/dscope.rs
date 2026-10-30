@@ -21,6 +21,11 @@ const DSO_PACKET_ID: u16 = 0xa500;
 const SCOPE_BATCH_SAMPLES: usize = 65_536;
 const CAPTURE_COMPLETION_GRACE: Duration = Duration::from_secs(5);
 const ADC_REFERENCE_SPAN: f32 = 235.0;
+// The measurement footer reports the ADC code used as each channel's zero
+// reference. It normally follows the programmed vertical position within a
+// few codes. A larger jump indicates a stale/corrupt footer and would shift an
+// otherwise valid waveform by multiple divisions on every enabled channel.
+const MAX_HARDWARE_OFFSET_DELTA: u16 = 32;
 const CALIBRATION_ZERO_BYTES: usize = 30;
 const CALIBRATION_VGA_BYTES: usize = 17;
 const CALIBRATION_FLASH_PAGE_STRIDE: u16 = 8;
@@ -2543,6 +2548,7 @@ impl ScopeMeasurement {
             && read_u16(footer, 0) == DSO_PACKET_ID
             && (read_u32(footer, 8) & 0x00ff_ffff) == config.divider()
             && (read_u32(footer, 4) & 0x0fff_ffff) != 0
+            && hardware_offsets_are_plausible(footer, config)
     }
 
     fn decode(footer: &[u8], config: DsCopeCaptureConfig) -> Result<Self, CaptureError> {
@@ -2557,9 +2563,13 @@ impl ScopeMeasurement {
         }
         let valid_length = read_u32(footer, 4) & 0x0fff_ffff;
         let divider = read_u32(footer, 8) & 0x00ff_ffff;
-        if divider != config.divider() || valid_length == 0 {
+        if divider != config.divider()
+            || valid_length == 0
+            || !hardware_offsets_are_plausible(footer, config)
+        {
             return Err(CaptureError::new(format!(
-                "invalid DSCope measurement metadata: divider {divider}, valid length {valid_length}"
+                "invalid DSCope measurement metadata: divider {divider}, valid length {valid_length}, hardware offsets [{}, {}]",
+                footer[102], footer[166]
             )));
         }
         let channel_ratio = CHANNEL_COUNT / config.enabled_channel_count();
@@ -2615,6 +2625,22 @@ impl ScopeMeasurement {
                 / divisor,
         ])
     }
+}
+
+fn hardware_offsets_are_plausible(footer: &[u8], config: DsCopeCaptureConfig) -> bool {
+    if footer.len() != MEASUREMENT_FOOTER_BYTES {
+        return false;
+    }
+    config
+        .channels
+        .iter()
+        .enumerate()
+        .filter(|(_, channel)| channel.enabled)
+        .all(|(channel, settings)| {
+            let footer_offset = if channel == 0 { 102 } else { 166 };
+            u16::from(footer[footer_offset]).abs_diff(settings.vertical_offset)
+                <= MAX_HARDWARE_OFFSET_DELTA
+        })
 }
 
 fn raw_to_volts(raw: u8, hardware_offset: u8, channel: DsCopeChannelConfig) -> f32 {
@@ -3343,10 +3369,18 @@ mod tests {
         assert!(!ScopeMeasurement::is_ready(&footer, config));
 
         footer[4..8].copy_from_slice(&100_u32.to_le_bytes());
+        footer[102] = DSCOPE_VERTICAL_OFFSET_CENTER as u8;
+        footer[166] = DSCOPE_VERTICAL_OFFSET_CENTER as u8;
         assert!(ScopeMeasurement::is_ready(&footer, config));
 
         footer[8..12].copy_from_slice(&(config.divider() + 1).to_le_bytes());
         assert!(!ScopeMeasurement::is_ready(&footer, config));
+
+        footer[8..12].copy_from_slice(&config.divider().to_le_bytes());
+        footer[102] = 0;
+        footer[166] = u8::MAX;
+        assert!(!ScopeMeasurement::is_ready(&footer, config));
+        assert!(ScopeMeasurement::decode(&footer, config).is_err());
     }
 
     #[test]
@@ -3389,6 +3423,7 @@ mod tests {
         footer[0..2].copy_from_slice(&DSO_PACKET_ID.to_le_bytes());
         footer[4..8].copy_from_slice(&100_u32.to_le_bytes());
         footer[8..12].copy_from_slice(&config.divider().to_le_bytes());
+        footer[166] = DSCOPE_VERTICAL_OFFSET_CENTER as u8;
 
         let measurement = ScopeMeasurement::decode(&footer, config).unwrap();
 

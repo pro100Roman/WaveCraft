@@ -44,6 +44,9 @@ const LOGIC_CHANNEL_COUNT: usize = 16;
 // number of painted points. This also keeps the hardware trigger region in the
 // waveform instead of displaying only the final tail of a capture.
 const MAX_WAVEFORM_SAMPLES: usize = 2_000_000;
+// Continuous Auto acquisition uses a software ring large enough for the
+// selected OSC span. Bound its total sample storage across enabled channels.
+const SCOPE_ROLLING_MEMORY_BUDGET_BYTES: usize = 128 * 1024 * 1024;
 const WAVEFORM_STATUS_HEIGHT: f32 = 20.0;
 const TIME_RULER_HEIGHT: f32 = 24.0;
 const SCOPE_HORIZONTAL_DIVISIONS: usize = 10;
@@ -1147,7 +1150,9 @@ struct WaveformStore {
     scope_rate_hz: u64,
     scope_sample_offset: u64,
     scope_trigger_sample_index: Option<u64>,
+    scope_capture_boundaries: VecDeque<u64>,
     scope_capacity: usize,
+    scope_rolling: bool,
     scope_revision: u64,
 }
 
@@ -1162,7 +1167,9 @@ impl Default for WaveformStore {
             scope_rate_hz: 0,
             scope_sample_offset: 0,
             scope_trigger_sample_index: None,
+            scope_capture_boundaries: VecDeque::new(),
             scope_capacity: MAX_WAVEFORM_SAMPLES,
+            scope_rolling: false,
             scope_revision: 0,
         }
     }
@@ -1229,6 +1236,34 @@ fn should_rearm_acquisition(
     failed: bool,
 ) -> bool {
     mode.runs_continuously() && run_requested && completion == CompletionStatus::Complete && !failed
+}
+
+fn uses_rolling_scope_buffer(
+    mode: AcquisitionMode,
+    has_scope: bool,
+    trigger_source: DsCopeTriggerSource,
+) -> bool {
+    mode.runs_continuously() && has_scope && trigger_source == DsCopeTriggerSource::Auto
+}
+
+fn scope_rolling_sample_capacity(
+    config: DsCopeCaptureConfig,
+    time_per_division_seconds: Option<f64>,
+) -> usize {
+    let fallback = config.sample_count() as usize;
+    let Some(time_per_division_seconds) =
+        time_per_division_seconds.filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+    else {
+        return fallback;
+    };
+    let maximum = SCOPE_ROLLING_MEMORY_BUDGET_BYTES
+        / config.enabled_channel_count().max(1)
+        / std::mem::size_of::<f32>();
+    let visible_samples = (time_per_division_seconds
+        * SCOPE_HORIZONTAL_DIVISIONS as f64
+        * config.sample_rate_hz() as f64)
+        .ceil();
+    visible_samples.clamp(1.0, maximum as f64) as usize
 }
 
 fn scope_trigger_controls_are_enabled(
@@ -1327,6 +1362,26 @@ impl WaveformViewport {
         let mut end = (visible_end * sample_count as f32).ceil() as usize;
         end = end.clamp(start + 1, sample_count);
         start..end
+    }
+
+    fn sample_range_in_domain(
+        self,
+        available_sample_count: usize,
+        domain_sample_count: usize,
+    ) -> Range<usize> {
+        if available_sample_count == 0 || domain_sample_count == 0 {
+            return 0..0;
+        }
+        let visible_start = self.start.max(0.0);
+        let visible_end = (self.start + self.span).min(1.0);
+        if visible_start >= visible_end {
+            return 0..0;
+        }
+        let start = ((visible_start * domain_sample_count as f32).floor() as usize)
+            .min(available_sample_count);
+        let end = ((visible_end * domain_sample_count as f32).ceil() as usize)
+            .min(available_sample_count);
+        start..end.max(start)
     }
 
     fn zoom_factor(self) -> f32 {
@@ -1473,6 +1528,31 @@ fn adjacent_timebase(current_seconds: f64, zoom_in: bool) -> Option<f64> {
 }
 
 impl WaveformStore {
+    fn can_continue_scope_roll(&self, config: DsCopeCaptureConfig, scope_capacity: usize) -> bool {
+        self.scope_rolling
+            && self.scope_rate_hz == config.sample_rate_hz()
+            && self.scope_capacity == scope_capacity
+            && self
+                .scope_channels
+                .iter()
+                .map(|samples| !samples.is_empty())
+                .eq(config.channels().iter().map(|channel| channel.enabled()))
+    }
+
+    fn mark_scope_capture_start(&mut self, scope_channels: [bool; 2]) {
+        let sample_count = self
+            .scope_channels
+            .iter()
+            .zip(scope_channels)
+            .filter_map(|(samples, enabled)| enabled.then_some(samples.len() as u64))
+            .min()
+            .unwrap_or(0);
+        if sample_count > 0 {
+            self.scope_capture_boundaries
+                .push_back(self.scope_sample_offset + sample_count);
+        }
+    }
+
     fn ingest(&mut self, batch: &CaptureBatch, scope_channels: [bool; 2]) {
         match batch {
             CaptureBatch::Logic(logic) => {
@@ -1487,6 +1567,7 @@ impl WaveformStore {
                 if self.scope_channels.len() != scope_channels.len() {
                     self.scope_channels = vec![VecDeque::new(); scope_channels.len()];
                     self.scope_sample_offset = 0;
+                    self.scope_capture_boundaries.clear();
                 }
                 let capture_start = self.scope_sample_offset
                     + self
@@ -1515,6 +1596,13 @@ impl WaveformStore {
                     ));
                 }
                 self.scope_sample_offset += removed_samples as u64;
+                while self
+                    .scope_capture_boundaries
+                    .front()
+                    .is_some_and(|boundary| *boundary <= self.scope_sample_offset)
+                {
+                    self.scope_capture_boundaries.pop_front();
+                }
             }
         }
     }
@@ -2313,12 +2401,35 @@ impl DsViewApp {
                     .iter()
                     .any(|device| device.kind == InstrumentKind::Oscilloscope);
                 let has_scope_trigger = !scope_trigger_controls.is_empty();
-                let preserve_display_until_complete =
-                    mode == AcquisitionMode::Run && self.completed_capture.is_some();
-                let waveforms = WaveformStore {
-                    scope_capacity: scope_config.sample_count() as usize,
-                    ..WaveformStore::default()
+                let rolling =
+                    uses_rolling_scope_buffer(mode, has_scope, scope_config.trigger().source());
+                let scope_capacity = if rolling {
+                    scope_rolling_sample_capacity(
+                        scope_config,
+                        self.scope_time_per_division_seconds,
+                    )
+                } else {
+                    scope_config.sample_count() as usize
                 };
+                let continue_roll = rolling
+                    && self.completed_capture.as_ref().is_some_and(|capture| {
+                        capture
+                            .waveforms
+                            .can_continue_scope_roll(scope_config, scope_capacity)
+                    });
+                let preserve_display_until_complete = mode == AcquisitionMode::Run
+                    && self.completed_capture.is_some()
+                    && !continue_roll;
+                let mut waveforms = if continue_roll {
+                    self.completed_capture
+                        .take()
+                        .map(|capture| capture.waveforms)
+                        .unwrap_or_default()
+                } else {
+                    WaveformStore::default()
+                };
+                waveforms.scope_capacity = scope_capacity;
+                waveforms.scope_rolling = rolling;
                 self.capture = Some(ActiveCapture {
                     session,
                     mode,
@@ -2358,7 +2469,7 @@ impl DsViewApp {
                         if has_scope_trigger
                             && scope_config.trigger().source() == DsCopeTriggerSource::Auto
                         {
-                            "Run · Auto trigger".to_owned()
+                            "Run · Auto/Roll".to_owned()
                         } else if has_scope_trigger {
                             "Run · waiting for trigger".to_owned()
                         } else {
@@ -2531,13 +2642,21 @@ impl DsViewApp {
                         }
                         match event {
                             CaptureEvent::Frame(frame) => {
-                                active.waveforms.ingest(
-                                    &frame.payload,
+                                let enabled_scope_channels = active
+                                    .scope_config
+                                    .channels()
+                                    .map(|channel| channel.enabled());
+                                if active.waveforms.scope_rolling
+                                    && frame.sequence == 0
+                                    && matches!(&frame.payload, CaptureBatch::Scope(_))
+                                {
                                     active
-                                        .scope_config
-                                        .channels()
-                                        .map(|channel| channel.enabled()),
-                                );
+                                        .waveforms
+                                        .mark_scope_capture_start(enabled_scope_channels);
+                                }
+                                active
+                                    .waveforms
+                                    .ingest(&frame.payload, enabled_scope_channels);
                             }
                             CaptureEvent::SourceFailed { device_id, error } => {
                                 active.session.request_stop();
@@ -6553,6 +6672,12 @@ fn scope_trigger_crossing_sample(
     if hardware_trigger.is_none() && trigger.source != DsCopeTriggerSource::Auto {
         return None;
     }
+    let capture_boundaries = waveforms
+        .scope_capture_boundaries
+        .iter()
+        .filter_map(|boundary| boundary.checked_sub(waveforms.scope_sample_offset))
+        .filter_map(|boundary| usize::try_from(boundary).ok())
+        .collect::<HashSet<_>>();
     let mut closest_crossing = None::<(ScopeTriggerCrossing, f32)>;
 
     for &channel_index in scope_trigger_channels(trigger) {
@@ -6590,6 +6715,9 @@ fn scope_trigger_crossing_sample(
         };
         for left in first_left..last_left {
             let right = left + 1;
+            if capture_boundaries.contains(&right) {
+                continue;
+            }
             let (left_value, right_value) = (samples[left], samples[right]);
             let crosses = match trigger.slope {
                 DsCopeTriggerSlope::Rising => {
@@ -6669,6 +6797,47 @@ fn scope_plot_sample_indices(
     indices.sort_unstable();
     indices.dedup();
     indices
+}
+
+fn scope_plot_sample_segments(
+    visible_range: Range<usize>,
+    step: usize,
+    channel_index: usize,
+    trigger_crossing: Option<ScopeTriggerCrossing>,
+    sample_offset: u64,
+    capture_boundaries: &VecDeque<u64>,
+) -> Vec<Vec<usize>> {
+    let mut indices = scope_plot_sample_indices(
+        visible_range.clone(),
+        step,
+        channel_index,
+        trigger_crossing,
+        sample_offset,
+    );
+    let local_boundaries = capture_boundaries
+        .iter()
+        .filter_map(|boundary| boundary.checked_sub(sample_offset))
+        .filter_map(|boundary| usize::try_from(boundary).ok())
+        .filter(|boundary| *boundary > visible_range.start && *boundary < visible_range.end)
+        .collect::<Vec<_>>();
+    for boundary in &local_boundaries {
+        indices.extend([boundary - 1, *boundary]);
+    }
+    indices.sort_unstable();
+    indices.dedup();
+
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    for index in indices {
+        if local_boundaries.binary_search(&index).is_ok() && !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+        current.push(index);
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
 }
 
 fn scope_trigger_position_x(plot: Rect, position_percent: u8) -> f32 {
@@ -7421,41 +7590,39 @@ fn paint_scope_math_trace(
     if !settings.enabled || visible_range.is_empty() {
         return;
     }
-    let mut indices = visible_range
-        .clone()
-        .step_by(step.max(1))
-        .collect::<Vec<_>>();
-    if let Some(last) = visible_range.end.checked_sub(1) {
-        indices.push(last);
-    }
-    indices.sort_unstable();
-    indices.dedup();
-
-    let samples = indices
-        .into_iter()
-        .filter_map(|index| {
-            scope_math_value(waveforms, settings, index).map(|value| (index, value))
-        })
-        .collect::<Vec<_>>();
-    let maximum = samples
+    let segments = scope_plot_sample_segments(
+        visible_range,
+        step,
+        usize::MAX,
+        None,
+        waveforms.scope_sample_offset,
+        &waveforms.scope_capture_boundaries,
+    );
+    let maximum = segments
         .iter()
-        .map(|(_, value)| value.abs())
+        .flatten()
+        .filter_map(|index| scope_math_value(waveforms, settings, *index))
+        .map(f32::abs)
         .fold(0.0_f32, f32::max)
         .max(f32::EPSILON);
-    let points = samples
-        .into_iter()
-        .map(|(index, value)| {
-            let x = waveform_sample_x(plot, viewport, index as f32, sample_count);
-            let y = plot.center().y - value / maximum * plot.height() * 0.44;
-            Pos2::new(x, y)
-        })
-        .collect::<Vec<_>>();
-    if points.len() > 1 {
-        painter.add(egui::Shape::line(
-            points.clone(),
-            Stroke::new(4.0_f32, MATH_COLOR.gamma_multiply(0.16)),
-        ));
-        painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, MATH_COLOR)));
+    for segment in segments {
+        let points = segment
+            .into_iter()
+            .filter_map(|index| {
+                scope_math_value(waveforms, settings, index).map(|value| {
+                    let x = waveform_sample_x(plot, viewport, index as f32, sample_count);
+                    let y = plot.center().y - value / maximum * plot.height() * 0.44;
+                    Pos2::new(x, y)
+                })
+            })
+            .collect::<Vec<_>>();
+        if points.len() > 1 {
+            painter.add(egui::Shape::line(
+                points.clone(),
+                Stroke::new(4.0_f32, MATH_COLOR.gamma_multiply(0.16)),
+            ));
+            painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, MATH_COLOR)));
+        }
     }
     painter.text(
         plot.right_top() + Vec2::new(-8.0, 7.0),
@@ -7649,7 +7816,11 @@ fn paint_scope_fft(
         paint_empty(&painter, rect, "Waiting for FFT source samples");
         return;
     };
-    let visible_range = viewport.sample_range(samples.len());
+    let visible_range = if waveforms.scope_rolling {
+        viewport.sample_range_in_domain(samples.len(), waveforms.scope_capacity)
+    } else {
+        viewport.sample_range(samples.len())
+    };
     let spectrum = scope_fft_spectrum(samples, visible_range, settings.length, settings.window);
     if spectrum.len() < 2 || waveforms.scope_rate_hz == 0 {
         paint_empty(&painter, rect, "Waiting for FFT source samples");
@@ -7882,37 +8053,45 @@ fn paint_scope_lissajous(
         return;
     };
     let sample_count = x_samples.len().min(y_samples.len());
-    let visible_range = viewport.sample_range(sample_count);
+    let visible_range = if waveforms.scope_rolling {
+        viewport.sample_range_in_domain(sample_count, waveforms.scope_capacity)
+    } else {
+        viewport.sample_range(sample_count)
+    };
     if visible_range.is_empty() {
         paint_empty(&plot_painter, plot, "Waiting for two-channel samples");
         return;
     }
     let target_points = (plot.width() * 2.0).max(256.0) as usize;
     let step = (visible_range.len() / target_points).max(1);
-    let mut indices = visible_range.clone().step_by(step).collect::<Vec<_>>();
-    if let Some(last) = visible_range.end.checked_sub(1) {
-        indices.push(last);
-    }
-    indices.sort_unstable();
-    indices.dedup();
-    let points = indices
-        .into_iter()
-        .filter_map(|index| {
-            Some(scope_lissajous_position(
-                plot,
-                x_channel,
-                y_channel,
-                *x_samples.get(index)?,
-                *y_samples.get(index)?,
-            ))
-        })
-        .collect::<Vec<_>>();
-    if points.len() > 1 {
-        plot_painter.add(egui::Shape::line(
-            points.clone(),
-            Stroke::new(5.0_f32, ACCENT.gamma_multiply(0.14)),
-        ));
-        plot_painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, ACCENT)));
+    let segments = scope_plot_sample_segments(
+        visible_range,
+        step,
+        usize::MAX,
+        None,
+        waveforms.scope_sample_offset,
+        &waveforms.scope_capture_boundaries,
+    );
+    for segment in segments {
+        let points = segment
+            .into_iter()
+            .filter_map(|index| {
+                Some(scope_lissajous_position(
+                    plot,
+                    x_channel,
+                    y_channel,
+                    *x_samples.get(index)?,
+                    *y_samples.get(index)?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        if points.len() > 1 {
+            plot_painter.add(egui::Shape::line(
+                points.clone(),
+                Stroke::new(5.0_f32, ACCENT.gamma_multiply(0.14)),
+            ));
+            plot_painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, ACCENT)));
+        }
     }
 
     painter.text(
@@ -8038,7 +8217,9 @@ fn paint_scope_time_domain(
         .map(VecDeque::len)
         .min()
         .unwrap_or(0);
-    let display_sample_count = if sample_count == 0 {
+    let display_sample_count = if waveforms.scope_rolling {
+        waveforms.scope_capacity
+    } else if sample_count == 0 {
         settings.sample_count as usize
     } else {
         sample_count
@@ -8071,10 +8252,12 @@ fn paint_scope_time_domain(
                 .scope_trigger_sample_index
                 .map(|sample| sample as f32)
         })
-        .map(|sample| scope_sample_fraction(sample, waveforms.scope_sample_offset, sample_count))
+        .map(|sample| {
+            scope_sample_fraction(sample, waveforms.scope_sample_offset, display_sample_count)
+        })
         .unwrap_or_else(|| f32::from(settings.trigger.position_percent) / 100.0);
     let trigger_screen_fraction = f32::from(trigger_settings.position_percent) / 100.0;
-    if viewport.anchor_locked {
+    if viewport.anchor_locked && !waveforms.scope_rolling {
         viewport.align_trigger_to_screen(trigger_sample_fraction, trigger_screen_fraction);
     }
     let (viewport_panned, viewport_timebase_changed) = update_waveform_viewport(
@@ -8084,10 +8267,10 @@ fn paint_scope_time_domain(
         viewport,
         display_sample_count,
         display_sample_rate_hz,
-        Some((trigger_sample_fraction, trigger_screen_fraction)),
+        (!waveforms.scope_rolling).then_some((trigger_sample_fraction, trigger_screen_fraction)),
     );
     *timebase_changed |= viewport_timebase_changed;
-    if viewport_panned {
+    if viewport_panned && !waveforms.scope_rolling {
         trigger_settings.position_percent =
             scope_trigger_position_in_view(trigger_sample_fraction, *viewport);
         viewport.anchor_locked = true;
@@ -8099,7 +8282,7 @@ fn paint_scope_time_domain(
     }
     settings.trigger = *trigger_settings;
 
-    let visible_range = viewport.sample_range(sample_count);
+    let visible_range = viewport.sample_range_in_domain(sample_count, display_sample_count);
     let visible_count = visible_range.len();
     if visible_count == 0 {
         paint_empty(&scope_painter, plot, "Waiting for oscilloscope samples");
@@ -8174,27 +8357,31 @@ fn paint_scope_time_domain(
         if !channel_settings.enabled {
             continue;
         }
-        let points = scope_plot_sample_indices(
+        let segments = scope_plot_sample_segments(
             visible_range.clone(),
             step,
             channel_index,
             trigger_crossing,
             waveforms.scope_sample_offset,
-        )
-        .into_iter()
-        .map(|index| {
-            let x = waveform_sample_x(plot, *viewport, index as f32, sample_count);
-            let y = scope_sample_y(plot, channel_settings, channel[index]);
-            Pos2::new(x, y)
-        })
-        .collect::<Vec<_>>();
-        if points.len() > 1 {
-            let color = channel_colors[channel_index.min(channel_colors.len() - 1)];
-            scope_painter.add(egui::Shape::line(
-                points.clone(),
-                Stroke::new(4.0_f32, color.gamma_multiply(0.16)),
-            ));
-            scope_painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, color)));
+            &waveforms.scope_capture_boundaries,
+        );
+        let color = channel_colors[channel_index.min(channel_colors.len() - 1)];
+        for segment in segments {
+            let points = segment
+                .into_iter()
+                .map(|index| {
+                    let x = waveform_sample_x(plot, *viewport, index as f32, display_sample_count);
+                    let y = scope_sample_y(plot, channel_settings, channel[index]);
+                    Pos2::new(x, y)
+                })
+                .collect::<Vec<_>>();
+            if points.len() > 1 {
+                scope_painter.add(egui::Shape::line(
+                    points.clone(),
+                    Stroke::new(4.0_f32, color.gamma_multiply(0.16)),
+                ));
+                scope_painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, color)));
+            }
         }
     }
 
@@ -8204,7 +8391,7 @@ fn paint_scope_time_domain(
         waveforms,
         ScopeMathPaintOptions {
             viewport: *viewport,
-            sample_count,
+            sample_count: display_sample_count,
             visible_range: visible_range.clone(),
             step,
             settings: function_settings.math,
@@ -8615,9 +8802,14 @@ mod tests {
             scope_capacity: 3,
             ..WaveformStore::default()
         };
-        for (trigger_sample_index, samples) in
+        for (capture_index, (trigger_sample_index, samples)) in
             [(Some(1), vec![0.0, 1.0]), (Some(0), vec![2.0, 3.0])]
+                .into_iter()
+                .enumerate()
         {
+            if capture_index > 0 {
+                store.mark_scope_capture_start([true, true]);
+            }
             store.ingest(
                 &CaptureBatch::Scope(ScopeBatch {
                     sample_rate_hz: 1_000_000,
@@ -8631,6 +8823,37 @@ mod tests {
         assert_eq!(store.scope_channels[0], VecDeque::from(vec![1.0, 2.0, 3.0]));
         assert_eq!(store.scope_trigger_sample_index, Some(2));
         assert_eq!(store.scope_sample_offset, 1);
+        assert_eq!(store.scope_capture_boundaries, VecDeque::from([2]));
+    }
+
+    #[test]
+    fn scope_plot_segments_do_not_join_independent_captures() {
+        let segments = scope_plot_sample_segments(0..10, 4, 0, None, 100, &VecDeque::from([105]));
+
+        assert_eq!(segments, vec![vec![0, 4], vec![5, 8, 9]]);
+    }
+
+    #[test]
+    fn rolling_scope_discards_boundaries_evicted_from_the_ring() {
+        let mut store = WaveformStore {
+            scope_capacity: 3,
+            scope_rolling: true,
+            ..WaveformStore::default()
+        };
+        for samples in [vec![0.0, 1.0], vec![2.0, 3.0], vec![4.0, 5.0]] {
+            store.mark_scope_capture_start([true, true]);
+            store.ingest(
+                &CaptureBatch::Scope(ScopeBatch {
+                    sample_rate_hz: 1_000,
+                    trigger_sample_index: None,
+                    channels: vec![samples.clone(), samples],
+                }),
+                [true, true],
+            );
+        }
+
+        assert_eq!(store.scope_sample_offset, 3);
+        assert_eq!(store.scope_capture_boundaries, VecDeque::from([4]));
     }
 
     #[test]
@@ -9216,6 +9439,42 @@ mod tests {
     }
 
     #[test]
+    fn rolling_scope_uses_the_full_span_as_its_sample_domain() {
+        let viewport = WaveformViewport::default();
+        let range = viewport.sample_range_in_domain(200_000, 1_000_000);
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_000.0, 400.0));
+
+        assert_eq!(range, 0..200_000);
+        assert!((waveform_sample_x(plot, viewport, 199_999.0, 1_000_000) - 200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn only_auto_trigger_run_uses_the_rolling_scope_buffer() {
+        assert!(uses_rolling_scope_buffer(
+            AcquisitionMode::Run,
+            true,
+            DsCopeTriggerSource::Auto,
+        ));
+        assert!(!uses_rolling_scope_buffer(
+            AcquisitionMode::Single,
+            true,
+            DsCopeTriggerSource::Auto,
+        ));
+        assert!(!uses_rolling_scope_buffer(
+            AcquisitionMode::Run,
+            true,
+            DsCopeTriggerSource::ChannelZero,
+        ));
+
+        let config = ScopeCaptureSettings::default().capture_config().unwrap();
+        assert_eq!(scope_rolling_sample_capacity(config, Some(0.1)), 1_000_000);
+        assert_eq!(
+            scope_rolling_sample_capacity(config, Some(2.0)),
+            SCOPE_ROLLING_MEMORY_BUDGET_BYTES / 2 / std::mem::size_of::<f32>()
+        );
+    }
+
+    #[test]
     fn time_scale_selects_readable_units_for_the_visible_window() {
         assert_eq!(time_scale_unit(2.0), ("s", 1.0));
         assert_eq!(time_scale_unit(0.002), ("ms", 1.0e3));
@@ -9556,6 +9815,27 @@ mod tests {
             .for_each(|sample| *sample = 0.0);
         assert_eq!(
             scope_trigger_crossing_sample(&waveforms, ScopeCaptureSettings::default(), trigger),
+            None
+        );
+    }
+
+    #[test]
+    fn scope_trigger_detection_ignores_capture_boundaries() {
+        let waveforms = WaveformStore {
+            scope_channels: vec![
+                VecDeque::from(vec![-1.0, -1.0, 1.0, 1.0]),
+                VecDeque::from(vec![0.0; 4]),
+            ],
+            scope_capture_boundaries: VecDeque::from([2]),
+            ..WaveformStore::default()
+        };
+
+        assert_eq!(
+            scope_trigger_crossing_sample(
+                &waveforms,
+                ScopeCaptureSettings::default(),
+                ScopeTriggerSettings::default(),
+            ),
             None
         );
     }
