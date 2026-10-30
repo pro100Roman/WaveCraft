@@ -68,7 +68,7 @@ const SCOPE_COLORS: [Color32; 2] = [
 ];
 const MATH_COLOR: Color32 = Color32::from_rgb(213, 126, 255);
 const FFT_LENGTHS: [usize; 5] = [1_024, 2_048, 4_096, 8_192, 16_384];
-const SCOPE_MARKER_LIMIT: usize = 5;
+const SCOPE_MARKER_LIMIT: usize = 10;
 static SCOPE_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
 
 fn toolbar_action_button(label: &str, color: Color32) -> egui::Button<'static> {
@@ -528,20 +528,265 @@ impl ScopeFunctionSettings {
 struct ScopeChannelMarkerSettings {
     horizontal_count: usize,
     horizontal_positions: [f32; SCOPE_MARKER_LIMIT],
+    horizontal_comparisons: [Option<usize>; SCOPE_MARKER_LIMIT],
+    horizontal_colors: [Color32; SCOPE_MARKER_LIMIT],
     vertical_count: usize,
     vertical_positions: [f32; SCOPE_MARKER_LIMIT],
+    vertical_comparisons: [Option<usize>; SCOPE_MARKER_LIMIT],
+    vertical_colors: [Color32; SCOPE_MARKER_LIMIT],
 }
 
 impl ScopeChannelMarkerSettings {
     fn new(
+        channel: usize,
         horizontal_positions: [f32; SCOPE_MARKER_LIMIT],
         vertical_positions: [f32; SCOPE_MARKER_LIMIT],
     ) -> Self {
+        let colors = std::array::from_fn(|index| scope_marker_color(channel, index));
         Self {
             horizontal_count: 0,
             horizontal_positions,
+            horizontal_comparisons: [None; SCOPE_MARKER_LIMIT],
+            horizontal_colors: colors,
             vertical_count: 0,
             vertical_positions,
+            vertical_comparisons: [None; SCOPE_MARKER_LIMIT],
+            vertical_colors: colors,
+        }
+    }
+
+    fn count(self, kind: ScopeMarkerKind) -> usize {
+        match kind {
+            ScopeMarkerKind::Time => self.horizontal_count,
+            ScopeMarkerKind::Voltage => self.vertical_count,
+        }
+        .min(SCOPE_MARKER_LIMIT)
+    }
+
+    fn total_count(self) -> usize {
+        self.count(ScopeMarkerKind::Time) + self.count(ScopeMarkerKind::Voltage)
+    }
+
+    fn marker(self, kind: ScopeMarkerKind, index: usize) -> Option<(f32, Option<usize>, Color32)> {
+        (index < self.count(kind)).then(|| match kind {
+            ScopeMarkerKind::Time => (
+                self.horizontal_positions[index],
+                self.horizontal_comparisons[index],
+                self.horizontal_colors[index],
+            ),
+            ScopeMarkerKind::Voltage => (
+                self.vertical_positions[index],
+                self.vertical_comparisons[index],
+                self.vertical_colors[index],
+            ),
+        })
+    }
+
+    fn set_marker(
+        &mut self,
+        kind: ScopeMarkerKind,
+        index: usize,
+        position: f32,
+        comparison: Option<usize>,
+        color: Color32,
+    ) -> bool {
+        if index >= SCOPE_MARKER_LIMIT {
+            return false;
+        }
+        match kind {
+            ScopeMarkerKind::Time => {
+                self.horizontal_positions[index] = position.clamp(0.0, 1.0);
+                self.horizontal_comparisons[index] = comparison;
+                self.horizontal_colors[index] = color;
+            }
+            ScopeMarkerKind::Voltage => {
+                self.vertical_positions[index] = position.clamp(0.0, 1.0);
+                self.vertical_comparisons[index] = comparison;
+                self.vertical_colors[index] = color;
+            }
+        }
+        true
+    }
+
+    fn add_marker(
+        &mut self,
+        kind: ScopeMarkerKind,
+        position: f32,
+        comparison: Option<usize>,
+        color: Color32,
+    ) -> bool {
+        let index = self.count(kind);
+        if self.total_count() >= SCOPE_MARKER_LIMIT
+            || index >= SCOPE_MARKER_LIMIT
+            || !self.set_marker(kind, index, position, comparison, color)
+        {
+            return false;
+        }
+        match kind {
+            ScopeMarkerKind::Time => self.horizontal_count += 1,
+            ScopeMarkerKind::Voltage => self.vertical_count += 1,
+        }
+        true
+    }
+
+    fn remove_marker(&mut self, kind: ScopeMarkerKind, index: usize) -> bool {
+        let count = self.count(kind);
+        if index >= count {
+            return false;
+        }
+        match kind {
+            ScopeMarkerKind::Time => {
+                self.horizontal_positions
+                    .copy_within(index + 1..count, index);
+                self.horizontal_comparisons
+                    .copy_within(index + 1..count, index);
+                self.horizontal_colors.copy_within(index + 1..count, index);
+                self.horizontal_count -= 1;
+                remap_marker_comparisons(
+                    &mut self.horizontal_comparisons[..self.horizontal_count],
+                    index,
+                );
+            }
+            ScopeMarkerKind::Voltage => {
+                self.vertical_positions.copy_within(index + 1..count, index);
+                self.vertical_comparisons
+                    .copy_within(index + 1..count, index);
+                self.vertical_colors.copy_within(index + 1..count, index);
+                self.vertical_count -= 1;
+                remap_marker_comparisons(
+                    &mut self.vertical_comparisons[..self.vertical_count],
+                    index,
+                );
+            }
+        }
+        true
+    }
+}
+
+fn remap_marker_comparisons(comparisons: &mut [Option<usize>], removed: usize) {
+    for comparison in comparisons {
+        *comparison = match *comparison {
+            Some(index) if index == removed => None,
+            Some(index) if index > removed => Some(index - 1),
+            comparison => comparison,
+        };
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeMarkerKind {
+    Time,
+    Voltage,
+}
+
+impl ScopeMarkerKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Time => "Time (Δt)",
+            Self::Voltage => "Amplitude (ΔV)",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::Time => "T",
+            Self::Voltage => "V",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScopeMarkerKey {
+    channel: usize,
+    kind: ScopeMarkerKind,
+    index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScopeMarkerEditor {
+    original: Option<ScopeMarkerKey>,
+    channel: usize,
+    kind: ScopeMarkerKind,
+    position: f32,
+    comparison: Option<usize>,
+    color: Color32,
+}
+
+impl ScopeMarkerEditor {
+    fn for_new(settings: ScopeMarkerSettings, channel: usize, kind: ScopeMarkerKind) -> Self {
+        let channel_settings = settings.channels[channel];
+        let index = channel_settings.count(kind);
+        let (position, color) = match kind {
+            ScopeMarkerKind::Time => (
+                channel_settings.horizontal_positions[index.min(SCOPE_MARKER_LIMIT - 1)],
+                channel_settings.horizontal_colors[index.min(SCOPE_MARKER_LIMIT - 1)],
+            ),
+            ScopeMarkerKind::Voltage => (
+                channel_settings.vertical_positions[index.min(SCOPE_MARKER_LIMIT - 1)],
+                channel_settings.vertical_colors[index.min(SCOPE_MARKER_LIMIT - 1)],
+            ),
+        };
+        Self {
+            original: None,
+            channel,
+            kind,
+            position,
+            comparison: None,
+            color,
+        }
+    }
+
+    fn for_existing(settings: ScopeMarkerSettings, key: ScopeMarkerKey) -> Option<Self> {
+        let (position, comparison, color) =
+            settings.channels[key.channel].marker(key.kind, key.index)?;
+        Some(Self {
+            original: Some(key),
+            channel: key.channel,
+            kind: key.kind,
+            position,
+            comparison,
+            color,
+        })
+    }
+
+    fn save(self, settings: &mut ScopeMarkerSettings) -> bool {
+        let comparison = self
+            .comparison
+            .filter(|index| *index < settings.channels[self.channel].count(self.kind));
+        match self.original {
+            Some(key) if key.channel == self.channel && key.kind == self.kind => {
+                settings.channels[self.channel].set_marker(
+                    self.kind,
+                    key.index,
+                    self.position,
+                    comparison.filter(|index| *index != key.index),
+                    self.color,
+                )
+            }
+            Some(key) => {
+                let target_has_room = key.channel == self.channel
+                    || settings.channels[self.channel].total_count() < SCOPE_MARKER_LIMIT;
+                if !target_has_room
+                    || settings.channels[self.channel].count(self.kind) >= SCOPE_MARKER_LIMIT
+                {
+                    return false;
+                }
+                if !settings.channels[key.channel].remove_marker(key.kind, key.index) {
+                    return false;
+                }
+                settings.channels[self.channel].add_marker(
+                    self.kind,
+                    self.position,
+                    comparison,
+                    self.color,
+                )
+            }
+            None => settings.channels[self.channel].add_marker(
+                self.kind,
+                self.position,
+                comparison,
+                self.color,
+            ),
         }
     }
 }
@@ -556,12 +801,14 @@ impl Default for ScopeMarkerSettings {
         Self {
             channels: [
                 ScopeChannelMarkerSettings::new(
-                    [0.10, 0.25, 0.40, 0.55, 0.70],
-                    [0.10, 0.25, 0.40, 0.55, 0.70],
+                    0,
+                    [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95],
+                    [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95],
                 ),
                 ScopeChannelMarkerSettings::new(
-                    [0.30, 0.45, 0.60, 0.75, 0.90],
-                    [0.30, 0.45, 0.60, 0.75, 0.90],
+                    1,
+                    [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
+                    [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
                 ),
             ],
         }
@@ -1274,6 +1521,7 @@ struct DsViewApp {
     scope_auto_sample_rate: bool,
     scope_function_settings: ScopeFunctionSettings,
     scope_marker_settings: ScopeMarkerSettings,
+    scope_marker_editor: Option<ScopeMarkerEditor>,
     active_waveform_tab: Option<WaveformTab>,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
@@ -1318,6 +1566,7 @@ impl DsViewApp {
             scope_auto_sample_rate: true,
             scope_function_settings: ScopeFunctionSettings::default(),
             scope_marker_settings: ScopeMarkerSettings::default(),
+            scope_marker_editor: None,
             active_waveform_tab: None,
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
@@ -2712,44 +2961,107 @@ fn paint_scope_measurement_settings(
 fn paint_scope_marker_settings(
     ui: &mut egui::Ui,
     settings: &mut ScopeMarkerSettings,
+    editor: &mut Option<ScopeMarkerEditor>,
     channels: [bool; 2],
 ) {
     egui::CollapsingHeader::new(RichText::new("Markers").strong())
         .default_open(false)
         .show(ui, |ui| {
             for (channel, channel_enabled) in channels.into_iter().enumerate() {
-                let channel_settings = &mut settings.channels[channel];
                 ui.add_enabled_ui(channel_enabled, |ui| {
                     ui.group(|ui| {
-                        ui.label(
-                            RichText::new(format!("CH{channel} markers"))
-                                .strong()
-                                .color(SCOPE_COLORS[channel]),
-                        );
-                        paint_scope_marker_count_control(
-                            ui,
-                            "Horizontal · Δt",
-                            &mut channel_settings.horizontal_count,
-                        );
-                        ui.add_enabled_ui(channel_settings.horizontal_count > 0, |ui| {
-                            ui.small(
-                                RichText::new("Drag time markers left/right in the plot")
-                                    .color(TEXT_MUTED),
+                        let total = settings.channels[channel].total_count();
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("CH{channel} markers"))
+                                    .strong()
+                                    .color(SCOPE_COLORS[channel]),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            total < SCOPE_MARKER_LIMIT,
+                                            egui::Button::new("+ Add marker"),
+                                        )
+                                        .clicked()
+                                    {
+                                        *editor = Some(ScopeMarkerEditor::for_new(
+                                            *settings,
+                                            channel,
+                                            ScopeMarkerKind::Time,
+                                        ));
+                                    }
+                                    ui.monospace(format!("{total} / {SCOPE_MARKER_LIMIT}"));
+                                },
                             );
                         });
 
-                        ui.add_space(4.0);
-                        paint_scope_marker_count_control(
-                            ui,
-                            "Vertical · ΔV",
-                            &mut channel_settings.vertical_count,
-                        );
-                        ui.add_enabled_ui(channel_settings.vertical_count > 0, |ui| {
+                        let mut remove = None;
+                        for kind in [ScopeMarkerKind::Time, ScopeMarkerKind::Voltage] {
+                            let count = settings.channels[channel].count(kind);
+                            for index in 0..count {
+                                let (_, comparison, color) = settings.channels[channel]
+                                    .marker(kind, index)
+                                    .expect("marker index is active");
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        color,
+                                        RichText::new(format!(
+                                            "{}{}{}",
+                                            kind.short_label(),
+                                            channel,
+                                            index + 1
+                                        ))
+                                        .strong(),
+                                    );
+                                    ui.small(kind.label());
+                                    ui.small(match comparison {
+                                        Some(other) => format!(
+                                            "vs {}{}{}",
+                                            kind.short_label(),
+                                            channel,
+                                            other + 1
+                                        ),
+                                        None => "Standalone".to_owned(),
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .small_button("×")
+                                                .on_hover_text("Remove marker")
+                                                .clicked()
+                                            {
+                                                remove = Some((kind, index));
+                                            }
+                                            if ui.small_button("Edit…").clicked() {
+                                                *editor = ScopeMarkerEditor::for_existing(
+                                                    *settings,
+                                                    ScopeMarkerKey {
+                                                        channel,
+                                                        kind,
+                                                        index,
+                                                    },
+                                                );
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        }
+                        if let Some((kind, index)) = remove {
+                            settings.channels[channel].remove_marker(kind, index);
+                        }
+                        if total > 0 {
                             ui.small(
-                                RichText::new("Drag voltage markers up/down in the plot")
-                                    .color(TEXT_MUTED),
+                                RichText::new(
+                                    "Drag time markers left/right and amplitude markers up/down in the OSC plot",
+                                )
+                                .color(TEXT_MUTED),
                             );
-                        });
+                        }
                     });
                 });
                 if !channel_enabled {
@@ -2762,26 +3074,182 @@ fn paint_scope_marker_settings(
         });
 }
 
-fn paint_scope_marker_count_control(ui: &mut egui::Ui, label: &str, count: &mut usize) {
-    *count = (*count).min(SCOPE_MARKER_LIMIT);
-    ui.horizontal(|ui| {
-        ui.label(label);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add_enabled(*count < SCOPE_MARKER_LIMIT, egui::Button::new("+ Add"))
-                .clicked()
-            {
-                *count += 1;
-            }
-            if ui
-                .add_enabled(*count > 0, egui::Button::new("− Remove"))
-                .clicked()
-            {
-                *count -= 1;
-            }
-            ui.monospace(format!("{} / {SCOPE_MARKER_LIMIT}", *count));
+fn paint_scope_marker_editor(
+    context: &egui::Context,
+    editor_state: &mut Option<ScopeMarkerEditor>,
+    settings: &mut ScopeMarkerSettings,
+    channels: [bool; 2],
+) {
+    let Some(mut editor) = *editor_state else {
+        return;
+    };
+    let mut open = true;
+    let mut cancel = false;
+    let mut save = false;
+    let screen_rect = context.input(|input| input.screen_rect());
+    egui::Area::new(egui::Id::new("scope_marker_modal_backdrop"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen_rect.min)
+        .show(context, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen_rect.size(), Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(rect, egui::Rounding::ZERO, Color32::from_black_alpha(96));
         });
-    });
+    let title = if editor.original.is_some() {
+        "Marker settings"
+    } else {
+        "Add marker"
+    };
+    egui::Window::new(title)
+        .open(&mut open)
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .default_width(360.0)
+        .show(context, |ui| {
+            ui.label(
+                RichText::new(format!("CH{} marker", editor.channel))
+                    .strong()
+                    .color(SCOPE_COLORS[editor.channel]),
+            );
+            let kind_before = editor.kind;
+            ui.horizontal(|ui| {
+                ui.label("Type");
+                egui::ComboBox::from_id_salt("scope_marker_kind")
+                    .selected_text(editor.kind.label())
+                    .show_ui(ui, |ui| {
+                        for kind in [ScopeMarkerKind::Time, ScopeMarkerKind::Voltage] {
+                            ui.selectable_value(&mut editor.kind, kind, kind.label());
+                        }
+                    });
+            });
+            if kind_before != editor.kind {
+                editor.comparison = None;
+            }
+
+            ui.add_space(8.0);
+            let position_label = match editor.kind {
+                ScopeMarkerKind::Time => "Horizontal position",
+                ScopeMarkerKind::Voltage => "Vertical position",
+            };
+            ui.label(position_label);
+            let mut position_percent = editor.position * 100.0;
+            if ui
+                .add(
+                    egui::Slider::new(&mut position_percent, 0.0..=100.0)
+                        .suffix(" %")
+                        .max_decimals(1),
+                )
+                .changed()
+            {
+                editor.position = position_percent / 100.0;
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Color");
+                ui.color_edit_button_srgba(&mut editor.color);
+            });
+
+            ui.add_space(8.0);
+            ui.label("Math");
+            let marker_count = settings.channels[editor.channel].count(editor.kind);
+            let original_index = editor
+                .original
+                .filter(|key| key.channel == editor.channel && key.kind == editor.kind)
+                .map(|key| key.index);
+            if editor
+                .comparison
+                .is_some_and(|index| index >= marker_count || Some(index) == original_index)
+            {
+                editor.comparison = None;
+            }
+            egui::ComboBox::from_id_salt("scope_marker_comparison")
+                .selected_text(match editor.comparison {
+                    Some(index) => format!(
+                        "Compare with {}{}{}",
+                        editor.kind.short_label(),
+                        editor.channel,
+                        index + 1
+                    ),
+                    None => "Standalone (no calculation)".to_owned(),
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut editor.comparison,
+                        None,
+                        "Standalone (no calculation)",
+                    );
+                    for index in 0..marker_count {
+                        if Some(index) == original_index {
+                            continue;
+                        }
+                        ui.selectable_value(
+                            &mut editor.comparison,
+                            Some(index),
+                            format!(
+                                "{}{}{}",
+                                editor.kind.short_label(),
+                                editor.channel,
+                                index + 1
+                            ),
+                        );
+                    }
+                });
+            ui.small(
+                RichText::new(match (editor.kind, editor.comparison) {
+                    (ScopeMarkerKind::Time, Some(_)) => {
+                        "The OSC plot displays Δt and the reciprocal frequency."
+                    }
+                    (ScopeMarkerKind::Voltage, Some(_)) => {
+                        "The OSC plot displays ΔV using this channel's scale."
+                    }
+                    (_, None) => "Standalone markers do not display a delta calculation.",
+                })
+                .color(TEXT_MUTED),
+            );
+
+            let stays_on_channel = editor
+                .original
+                .is_some_and(|key| key.channel == editor.channel);
+            let target_total = settings.channels[editor.channel].total_count();
+            let can_save =
+                channels[editor.channel] && (stays_on_channel || target_total < SCOPE_MARKER_LIMIT);
+            if !can_save {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "This channel already has the maximum of {SCOPE_MARKER_LIMIT} markers."
+                    ))
+                    .color(Color32::LIGHT_RED),
+                );
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                if ui
+                    .add_enabled(can_save, egui::Button::new("Save marker"))
+                    .clicked()
+                {
+                    save = true;
+                }
+            });
+        });
+
+    if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+        cancel = true;
+    }
+    if save {
+        editor.save(settings);
+        *editor_state = None;
+    } else if cancel || !open {
+        *editor_state = None;
+    } else {
+        *editor_state = Some(editor);
+    }
 }
 
 fn paint_scope_channel_settings(
@@ -3090,6 +3558,7 @@ fn paint_scope_tools(
     scope_settings: &mut ScopeCaptureSettings,
     function_settings: &mut ScopeFunctionSettings,
     marker_settings: &mut ScopeMarkerSettings,
+    marker_editor: &mut Option<ScopeMarkerEditor>,
     trigger_controls_enabled: bool,
 ) {
     let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
@@ -3107,7 +3576,7 @@ fn paint_scope_tools(
     ui.add_space(8.0);
     paint_scope_measurement_settings(ui, &mut function_settings.measurements, channel_enabled);
     ui.add_space(8.0);
-    paint_scope_marker_settings(ui, marker_settings, channel_enabled);
+    paint_scope_marker_settings(ui, marker_settings, marker_editor, channel_enabled);
 }
 
 fn paint_instrument_settings(
@@ -3448,6 +3917,7 @@ impl eframe::App for DsViewApp {
                                         &mut self.scope_settings,
                                         &mut self.scope_function_settings,
                                         &mut self.scope_marker_settings,
+                                        &mut self.scope_marker_editor,
                                         trigger_controls_enabled,
                                     );
                                 });
@@ -3908,6 +4378,13 @@ impl eframe::App for DsViewApp {
         if close_manual {
             self.manual_calibration = None;
         }
+
+        paint_scope_marker_editor(
+            context,
+            &mut self.scope_marker_editor,
+            &mut self.scope_marker_settings,
+            self.scope_settings.channels.map(|channel| channel.enabled),
+        );
 
         if record_now_clicked {
             if let Some(path) = choose_recording_save_path(&self.recording_path) {
@@ -6003,7 +6480,7 @@ fn paint_scope_markers(
             .iter_mut()
             .enumerate()
         {
-            let color = scope_marker_color(channel, index);
+            let color = channel_markers.horizontal_colors[index];
             let x = egui::lerp(plot.x_range(), position.clamp(0.0, 1.0));
             let hit_rect = Rect::from_min_max(
                 Pos2::new(x - 7.0, plot.top()),
@@ -6036,9 +6513,17 @@ fn paint_scope_markers(
                 color,
             );
         }
-        for pair in 0..horizontal_count.saturating_sub(1) {
-            let first = channel_markers.horizontal_positions[pair];
-            let second = channel_markers.horizontal_positions[pair + 1];
+        for index in 0..horizontal_count {
+            let Some(other) = channel_markers.horizontal_comparisons[index]
+                .filter(|other| *other < horizontal_count && *other != index)
+            else {
+                continue;
+            };
+            if other < index && channel_markers.horizontal_comparisons[other] == Some(index) {
+                continue;
+            }
+            let first = channel_markers.horizontal_positions[index];
+            let second = channel_markers.horizontal_positions[other];
             let Some(delta_seconds) =
                 scope_time_marker_delta(first, second, sample_count, sample_rate_hz, viewport)
             else {
@@ -6048,15 +6533,15 @@ fn paint_scope_markers(
             let text = match frequency {
                 Some(frequency) => format!(
                     "CH{channel} T{}–T{}  {}  ·  {}",
-                    pair + 1,
-                    pair + 2,
+                    index + 1,
+                    other + 1,
                     format_duration(Duration::from_secs_f64(delta_seconds)),
                     format_frequency(frequency)
                 ),
                 None => format!(
                     "CH{channel} T{}–T{}  {}",
-                    pair + 1,
-                    pair + 2,
+                    index + 1,
+                    other + 1,
                     format_duration(Duration::from_secs_f64(delta_seconds))
                 ),
             };
@@ -6066,10 +6551,10 @@ fn paint_scope_markers(
                 plot,
                 Pos2::new(
                     center_x,
-                    plot.top() + 33.0 + pair as f32 * 27.0 + channel as f32 * 13.0,
+                    plot.top() + 33.0 + index as f32 * 27.0 + channel as f32 * 13.0,
                 ),
                 &text,
-                scope_marker_color(channel, pair),
+                channel_markers.horizontal_colors[index],
             );
         }
 
@@ -6078,7 +6563,7 @@ fn paint_scope_markers(
             .iter_mut()
             .enumerate()
         {
-            let color = scope_marker_color(channel, index);
+            let color = channel_markers.vertical_colors[index];
             let y = egui::lerp(plot.y_range(), position.clamp(0.0, 1.0));
             let hit_rect = Rect::from_min_max(
                 Pos2::new(plot.left(), y - 7.0),
@@ -6111,9 +6596,17 @@ fn paint_scope_markers(
                 color,
             );
         }
-        for pair in 0..vertical_count.saturating_sub(1) {
-            let first = channel_markers.vertical_positions[pair];
-            let second = channel_markers.vertical_positions[pair + 1];
+        for index in 0..vertical_count {
+            let Some(other) = channel_markers.vertical_comparisons[index]
+                .filter(|other| *other < vertical_count && *other != index)
+            else {
+                continue;
+            };
+            if other < index && channel_markers.vertical_comparisons[other] == Some(index) {
+                continue;
+            }
+            let first = channel_markers.vertical_positions[index];
+            let second = channel_markers.vertical_positions[other];
             let delta_voltage =
                 scope_voltage_marker_delta(first, second, scope_settings.channels[channel]);
             let center_y = egui::lerp(plot.y_range(), (first + second) * 0.5);
@@ -6128,11 +6621,11 @@ fn paint_scope_markers(
                 Pos2::new(center_x, center_y),
                 &format!(
                     "CH{channel} V{}–V{}  {}",
-                    pair + 1,
-                    pair + 2,
+                    index + 1,
+                    other + 1,
                     format_marker_voltage(delta_voltage)
                 ),
-                scope_marker_color(channel, pair),
+                channel_markers.vertical_colors[index],
             );
         }
     }
@@ -6145,6 +6638,11 @@ fn scope_marker_color(channel: usize, marker: usize) -> Color32 {
         Color32::from_rgb(255, 145, 77),
         Color32::from_rgb(213, 126, 255),
         Color32::from_rgb(180, 230, 80),
+        Color32::from_rgb(255, 225, 120),
+        Color32::from_rgb(255, 105, 105),
+        Color32::from_rgb(232, 170, 255),
+        Color32::from_rgb(255, 180, 95),
+        Color32::from_rgb(205, 240, 120),
     ];
     const CH1_COLORS: [Color32; SCOPE_MARKER_LIMIT] = [
         Color32::from_rgb(99, 179, 255),
@@ -6152,6 +6650,11 @@ fn scope_marker_color(channel: usize, marker: usize) -> Color32 {
         Color32::from_rgb(174, 130, 255),
         Color32::from_rgb(100, 205, 255),
         Color32::from_rgb(245, 100, 100),
+        Color32::from_rgb(80, 235, 205),
+        Color32::from_rgb(135, 205, 255),
+        Color32::from_rgb(205, 165, 255),
+        Color32::from_rgb(85, 225, 240),
+        Color32::from_rgb(255, 135, 180),
     ];
     if channel == 0 {
         CH0_COLORS[marker % SCOPE_MARKER_LIMIT]
@@ -7800,7 +8303,7 @@ mod tests {
                 viewport,
             )
             .unwrap()
-                - 0.15)
+                - 0.1)
                 .abs()
                 < 0.000_001
         );
@@ -7809,7 +8312,7 @@ mod tests {
                 markers.channels[0].vertical_positions[0],
                 markers.channels[0].vertical_positions[1],
                 ScopeCaptureSettings::default().channels[0]
-            ) - 1.2)
+            ) - 0.8)
                 .abs()
                 < 0.000_001
         );
@@ -7822,7 +8325,7 @@ mod tests {
                 markers.channels[1].vertical_positions[0],
                 markers.channels[1].vertical_positions[1],
                 scope_settings.channels[1]
-            ) - 6.0)
+            ) - 4.0)
                 .abs()
                 < 0.000_001
         );
@@ -7840,6 +8343,77 @@ mod tests {
             SCOPE_MARKER_LIMIT
         );
         assert_eq!(format_marker_voltage(0.125), "125.00 mV");
+    }
+
+    #[test]
+    fn scope_markers_are_saved_and_compared_individually() {
+        let mut settings = ScopeMarkerSettings::default();
+        let mut first = ScopeMarkerEditor::for_new(settings, 0, ScopeMarkerKind::Time);
+        first.position = 0.2;
+        first.color = Color32::RED;
+        assert!(first.save(&mut settings));
+
+        let mut second = ScopeMarkerEditor::for_new(settings, 0, ScopeMarkerKind::Time);
+        second.position = 0.7;
+        second.comparison = Some(0);
+        assert!(second.save(&mut settings));
+
+        let channel = settings.channels[0];
+        assert_eq!(channel.horizontal_count, 2);
+        assert_eq!(channel.marker(ScopeMarkerKind::Time, 0).unwrap().0, 0.2);
+        assert_eq!(
+            channel.marker(ScopeMarkerKind::Time, 0).unwrap().2,
+            Color32::RED
+        );
+        assert_eq!(channel.horizontal_comparisons[1], Some(0));
+        assert!(
+            (scope_time_marker_delta(
+                channel.horizontal_positions[1],
+                channel.horizontal_positions[0],
+                1_000,
+                1_000,
+                WaveformViewport::default(),
+            )
+            .unwrap()
+                - 0.5)
+                .abs()
+                < 0.000_001
+        );
+
+        assert!(settings.channels[0].remove_marker(ScopeMarkerKind::Time, 0));
+        assert_eq!(settings.channels[0].horizontal_count, 1);
+        assert_eq!(settings.channels[0].horizontal_comparisons[0], None);
+        assert_eq!(settings.channels[0].horizontal_positions[0], 0.7);
+    }
+
+    #[test]
+    fn scope_marker_limit_is_shared_across_types_and_markers_can_change_type() {
+        let mut settings = ScopeMarkerSettings::default();
+        for index in 0..SCOPE_MARKER_LIMIT {
+            let kind = if index % 2 == 0 {
+                ScopeMarkerKind::Time
+            } else {
+                ScopeMarkerKind::Voltage
+            };
+            let editor = ScopeMarkerEditor::for_new(settings, 0, kind);
+            assert!(editor.save(&mut settings));
+        }
+        assert_eq!(settings.channels[0].total_count(), SCOPE_MARKER_LIMIT);
+        assert!(
+            !ScopeMarkerEditor::for_new(settings, 0, ScopeMarkerKind::Time).save(&mut settings)
+        );
+
+        let key = ScopeMarkerKey {
+            channel: 0,
+            kind: ScopeMarkerKind::Time,
+            index: 0,
+        };
+        let mut editor = ScopeMarkerEditor::for_existing(settings, key).unwrap();
+        editor.kind = ScopeMarkerKind::Voltage;
+        assert!(editor.save(&mut settings));
+        assert_eq!(settings.channels[0].total_count(), SCOPE_MARKER_LIMIT);
+        assert_eq!(settings.channels[0].count(ScopeMarkerKind::Time), 4);
+        assert_eq!(settings.channels[0].count(ScopeMarkerKind::Voltage), 6);
     }
 
     #[test]

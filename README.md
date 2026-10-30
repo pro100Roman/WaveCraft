@@ -2,6 +2,13 @@
 
 A Rust reimplementation of DSView designed to capture from a logic analyzer and an oscilloscope concurrently. The original C/C++ application in `../DSView` is retained as a protocol and behavior reference.
 
+## Terminology
+
+In project discussions and feature requests, these abbreviations are used:
+
+- **LA** — Logic Analyzer
+- **OSC** — Oscilloscope
+
 ## Current milestone
 
 The repository contains the first vertical slice of the new capture engine:
