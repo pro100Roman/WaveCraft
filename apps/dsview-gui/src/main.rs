@@ -870,11 +870,11 @@ struct ScopeCaptureSettings {
 struct LogicCaptureSettings {
     sample_rate_hz: u64,
     enabled_channels: [bool; LOGIC_CHANNEL_COUNT],
+    maximum_heights: [u8; LOGIC_CHANNEL_COUNT],
     operation_mode: DsLogicOperationMode,
     stop_option: DsLogicStopOption,
     threshold_voltage: f32,
     input_filter: DsLogicInputFilter,
-    maximum_height: u8,
     rle_enabled: bool,
     external_clock: bool,
     falling_clock_edge: bool,
@@ -885,11 +885,11 @@ impl Default for LogicCaptureSettings {
         Self {
             sample_rate_hz: SAMPLE_RATE_HZ,
             enabled_channels: [true; LOGIC_CHANNEL_COUNT],
+            maximum_heights: [1; LOGIC_CHANNEL_COUNT],
             operation_mode: DsLogicOperationMode::Buffer,
             stop_option: DsLogicStopOption::UploadCapturedData,
             threshold_voltage: 1.0,
             input_filter: DsLogicInputFilter::None,
-            maximum_height: 1,
             rle_enabled: false,
             external_clock: false,
             falling_clock_edge: false,
@@ -1227,6 +1227,26 @@ fn default_logic_channel_colors() -> [Color32; LOGIC_CHANNEL_COUNT] {
 
 fn default_logic_channel_marker_opacities() -> [u8; LOGIC_CHANNEL_COUNT] {
     [DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY; LOGIC_CHANNEL_COUNT]
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LogicChannelSettingsDraft {
+    enabled: bool,
+    maximum_height: u8,
+    name: String,
+    color: Color32,
+    marker_opacity: u8,
+}
+
+fn default_logic_channel_settings_drafts() -> [LogicChannelSettingsDraft; LOGIC_CHANNEL_COUNT] {
+    let colors = default_logic_channel_colors();
+    std::array::from_fn(|channel| LogicChannelSettingsDraft {
+        enabled: true,
+        maximum_height: 1,
+        name: String::new(),
+        color: colors[channel],
+        marker_opacity: DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY,
+    })
 }
 
 struct WaveformStore {
@@ -1812,6 +1832,7 @@ struct DsViewApp {
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
     logic_channel_marker_opacities: [u8; LOGIC_CHANNEL_COUNT],
+    logic_channel_settings_drafts: [LogicChannelSettingsDraft; LOGIC_CHANNEL_COUNT],
     scope_channel_colors: [Color32; 2],
     logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
     scope_channel_names: [String; 2],
@@ -1867,6 +1888,7 @@ impl DsViewApp {
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
             logic_channel_marker_opacities: default_logic_channel_marker_opacities(),
+            logic_channel_settings_drafts: default_logic_channel_settings_drafts(),
             scope_channel_colors: SCOPE_COLORS,
             logic_channel_names: empty_logic_channel_names(),
             scope_channel_names: empty_scope_channel_names(),
@@ -4163,24 +4185,6 @@ fn paint_capture_settings(
                                             });
                                         ui.end_row();
 
-                                        ui.label("Max height");
-                                        egui::ComboBox::from_id_salt("logic_maximum_height")
-                                            .width(CONTROL_WIDTH)
-                                            .selected_text(format!(
-                                                "{}×",
-                                                logic_settings.maximum_height
-                                            ))
-                                            .show_ui(ui, |ui| {
-                                                for height in 1..=5 {
-                                                    ui.selectable_value(
-                                                        &mut logic_settings.maximum_height,
-                                                        height,
-                                                        format!("{height}×"),
-                                                    );
-                                                }
-                                            });
-                                        ui.end_row();
-
                                         ui.label("Enable RLE compress");
                                         ui.add_enabled(
                                             logic_settings.operation_mode
@@ -5028,6 +5032,9 @@ impl eframe::App for DsViewApp {
                 let mut logic_channel_colors = self.logic_channel_colors;
                 let mut logic_channel_marker_opacities = self.logic_channel_marker_opacities;
                 let mut logic_channel_names = self.logic_channel_names.clone();
+                let mut logic_channel_settings_drafts = self.logic_channel_settings_drafts.clone();
+                let mut logic_enabled_channels = self.logic_settings.enabled_channels;
+                let mut logic_maximum_heights = self.logic_settings.maximum_heights;
                 let mut logic_viewport = self.logic_viewport;
                 let mut scope_viewport = self.scope_viewport;
                 let mut scope_fft_viewport = self.scope_fft_viewport;
@@ -5071,8 +5078,9 @@ impl eframe::App for DsViewApp {
                                         channel_marker_opacities:
                                             &mut logic_channel_marker_opacities,
                                         channel_names: &mut logic_channel_names,
-                                        maximum_height: self.logic_settings.maximum_height,
-                                        enabled_channels: self.logic_settings.enabled_channels,
+                                        channel_settings_drafts: &mut logic_channel_settings_drafts,
+                                        maximum_heights: &mut logic_maximum_heights,
+                                        enabled_channels: &mut logic_enabled_channels,
                                     },
                                     &mut logic_viewport,
                                 )
@@ -5158,8 +5166,9 @@ impl eframe::App for DsViewApp {
                                 channel_colors: &mut logic_channel_colors,
                                 channel_marker_opacities: &mut logic_channel_marker_opacities,
                                 channel_names: &mut logic_channel_names,
-                                maximum_height: self.logic_settings.maximum_height,
-                                enabled_channels: self.logic_settings.enabled_channels,
+                                channel_settings_drafts: &mut logic_channel_settings_drafts,
+                                maximum_heights: &mut logic_maximum_heights,
+                                enabled_channels: &mut logic_enabled_channels,
                             },
                             CombinedWaveformViewports {
                                 logic: &mut logic_viewport,
@@ -5190,6 +5199,9 @@ impl eframe::App for DsViewApp {
                 self.logic_channel_colors = logic_channel_colors;
                 self.logic_channel_marker_opacities = logic_channel_marker_opacities;
                 self.logic_channel_names = logic_channel_names;
+                self.logic_channel_settings_drafts = logic_channel_settings_drafts;
+                self.logic_settings.enabled_channels = logic_enabled_channels;
+                self.logic_settings.maximum_heights = logic_maximum_heights;
                 self.logic_viewport = logic_viewport;
                 self.scope_viewport = scope_viewport;
                 self.scope_fft_viewport = scope_fft_viewport;
@@ -5787,12 +5799,12 @@ fn start_gui_recording(
         "logic.falling_clock_edge".to_owned(),
         logic_config.falling_clock_edge().to_string(),
     );
-    metadata.insert(
-        "logic.maximum_height".to_owned(),
-        logic_settings.maximum_height.to_string(),
-    );
     for (channel, enabled) in logic_config.enabled_channels().into_iter().enumerate() {
         metadata.insert(format!("logic.ch{channel}.enabled"), enabled.to_string());
+        metadata.insert(
+            format!("logic.ch{channel}.maximum_height"),
+            logic_settings.maximum_heights[channel].to_string(),
+        );
     }
     insert_channel_name_metadata(&mut metadata, logic_channel_names, scope_channel_names);
     metadata.insert(
@@ -5954,7 +5966,16 @@ fn logic_settings_from_recording_metadata(
     }
     if let Some(maximum_height) = recording_metadata_value::<u8>(metadata, "logic.maximum_height") {
         if (1..=5).contains(&maximum_height) {
-            settings.maximum_height = maximum_height;
+            settings.maximum_heights = [maximum_height; LOGIC_CHANNEL_COUNT];
+        }
+    }
+    for (channel, maximum_height) in settings.maximum_heights.iter_mut().enumerate() {
+        if let Some(recorded) =
+            recording_metadata_value::<u8>(metadata, &format!("logic.ch{channel}.maximum_height"))
+        {
+            if (1..=5).contains(&recorded) {
+                *maximum_height = recorded;
+            }
         }
     }
     if let Some(rle_enabled) = recording_metadata_value(metadata, "logic.rle_enabled") {
@@ -6293,8 +6314,9 @@ struct LogicWaveformOptions<'a> {
     channel_colors: &'a mut [Color32; LOGIC_CHANNEL_COUNT],
     channel_marker_opacities: &'a mut [u8; LOGIC_CHANNEL_COUNT],
     channel_names: &'a mut [String; LOGIC_CHANNEL_COUNT],
-    maximum_height: u8,
-    enabled_channels: [bool; LOGIC_CHANNEL_COUNT],
+    channel_settings_drafts: &'a mut [LogicChannelSettingsDraft; LOGIC_CHANNEL_COUNT],
+    maximum_heights: &'a mut [u8; LOGIC_CHANNEL_COUNT],
+    enabled_channels: &'a mut [bool; LOGIC_CHANNEL_COUNT],
 }
 
 fn combined_waveform_cards(
@@ -6756,6 +6778,11 @@ const LOGIC_CHANNEL_MARKER_MIN_BODY_WIDTH: f32 = 16.0;
 const LOGIC_CHANNEL_MARKER_TIP_WIDTH: f32 = 6.0;
 const LOGIC_CHANNEL_MARKER_CHARACTER_WIDTH: f32 = 6.0;
 const LOGIC_CHANNEL_MARKER_HORIZONTAL_PADDING: f32 = 8.0;
+const LOGIC_SIGNAL_HEIGHT_AT_1X: f32 = 0.3;
+
+fn logic_signal_height(lane_height: f32, maximum_height: u8) -> f32 {
+    lane_height * LOGIC_SIGNAL_HEIGHT_AT_1X * f32::from(maximum_height.clamp(1, 5))
+}
 
 fn logic_channel_marker_text(channel: usize, channel_name: &str) -> String {
     let channel_name = channel_name.trim();
@@ -6838,7 +6865,8 @@ fn paint_logic(
         channel_colors,
         channel_marker_opacities,
         channel_names,
-        maximum_height,
+        channel_settings_drafts,
+        maximum_heights,
         enabled_channels,
     } = options;
     paint_plot_background(ui, rect);
@@ -6868,32 +6896,9 @@ fn paint_logic(
         display_sample_rate_hz,
         None,
     );
-    let enabled_channel_count = enabled_channels
-        .iter()
-        .filter(|enabled| **enabled)
-        .count()
-        .max(1);
-    let lane_height = plot.height() / enabled_channel_count as f32;
-    let visible_range = viewport.sample_range(sample_count);
-    let visible_count = visible_range.len();
-    let step = (visible_count as f32 / plot.width().max(1.0))
-        .floor()
-        .max(1.0) as usize;
-    for (lane, (channel, channel_color)) in channel_colors
-        .iter_mut()
-        .enumerate()
-        .filter(|(channel, _)| enabled_channels[*channel])
-        .enumerate()
-    {
-        let channel_marker_opacity = &mut channel_marker_opacities[channel];
-        let channel_name = &mut channel_names[channel];
-        let channel_label = channel_label("D", channel, channel_name);
-        let marker_text = logic_channel_marker_text(channel, channel_name);
-        let lane_top = plot.top() + lane as f32 * lane_height;
-        let low = lane_top + lane_height * 0.9;
-        let signal_height =
-            lane_height * (0.3 + 0.125 * f32::from(maximum_height.saturating_sub(1).min(4)));
-        let high = low - signal_height;
+    let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
+    for channel in 0..LOGIC_CHANNEL_COUNT {
+        let lane_top = plot.top() + channel as f32 * lane_height;
         painter.line_segment(
             [
                 Pos2::new(plot.left(), lane_top),
@@ -6901,6 +6906,25 @@ fn paint_logic(
             ],
             Stroke::new(0.6_f32, GRID.gamma_multiply(0.45)),
         );
+    }
+    let visible_range = viewport.sample_range(sample_count);
+    let visible_count = visible_range.len();
+    let step = (visible_count as f32 / plot.width().max(1.0))
+        .floor()
+        .max(1.0) as usize;
+    for channel in 0..LOGIC_CHANNEL_COUNT {
+        if !enabled_channels[channel] {
+            continue;
+        }
+        let channel_color = &mut channel_colors[channel];
+        let channel_marker_opacity = &mut channel_marker_opacities[channel];
+        let channel_name = &mut channel_names[channel];
+        let channel_label = channel_label("D", channel, channel_name);
+        let marker_text = logic_channel_marker_text(channel, channel_name);
+        let lane_top = plot.top() + channel as f32 * lane_height;
+        let low = lane_top + lane_height * 0.9;
+        let signal_height = logic_signal_height(lane_height, maximum_heights[channel]);
+        let high = low - signal_height;
         paint_logic_zero_reference(painter, plot, low, *channel_color);
         let marker_rect = logic_channel_marker_rect(plot, low, lane_height, &marker_text);
         let marker_response = ui
@@ -6910,10 +6934,17 @@ fn paint_logic(
                 Sense::click(),
             )
             .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(format!("Click to edit {channel_label} name and color"));
+            .on_hover_text(format!("Click to edit {channel_label} settings"));
 
-        let popup_id = ui.make_persistent_id(("logic_channel_color_popup", channel));
+        let popup_id = ui.make_persistent_id(("logic_channel_settings_popup", channel));
         if marker_response.clicked() {
+            channel_settings_drafts[channel] = LogicChannelSettingsDraft {
+                enabled: enabled_channels[channel],
+                maximum_height: maximum_heights[channel],
+                name: channel_name.clone(),
+                color: *channel_color,
+                marker_opacity: *channel_marker_opacity,
+            };
             ui.memory_mut(|memory| memory.toggle_popup(popup_id));
         }
         egui::popup::popup_below_widget(
@@ -6922,12 +6953,25 @@ fn paint_logic(
             &marker_response,
             egui::popup::PopupCloseBehavior::CloseOnClickOutside,
             |popup_ui| {
+                let draft = &mut channel_settings_drafts[channel];
+                let mut save_requested = false;
+                let mut cancel_requested = false;
                 popup_ui.set_min_width(280.0);
                 popup_ui.label(RichText::new(format!("D{channel} settings")).strong());
+                popup_ui.checkbox(&mut draft.enabled, "Enabled");
+                popup_ui.horizontal(|ui| {
+                    ui.label("Max height");
+                    ui.add(
+                        egui::Slider::new(&mut draft.maximum_height, 1..=5)
+                            .integer()
+                            .suffix("×"),
+                    );
+                });
+                popup_ui.separator();
                 popup_ui.horizontal(|ui| {
                     ui.label("Name");
                     let name_edit = ui.add(
-                        egui::TextEdit::singleline(channel_name)
+                        egui::TextEdit::singleline(&mut draft.name)
                             .char_limit(LOGIC_CHANNEL_NAME_MAX_CHARS)
                             .desired_width(190.0)
                             .hint_text("Optional name"),
@@ -6935,23 +6979,23 @@ fn paint_logic(
                     if name_edit.lost_focus()
                         && ui.input(|input| input.key_pressed(egui::Key::Enter))
                     {
-                        ui.memory_mut(egui::Memory::close_popup);
+                        save_requested = true;
                     }
                 });
                 popup_ui.separator();
                 popup_ui.label("Color");
                 egui::color_picker::color_picker_color32(
                     popup_ui,
-                    channel_color,
+                    &mut draft.color,
                     egui::color_picker::Alpha::Opaque,
                 );
                 if popup_ui.button("Reset color").clicked() {
-                    *channel_color = default_logic_channel_colors()[channel];
+                    draft.color = default_logic_channel_colors()[channel];
                 }
                 popup_ui.separator();
                 popup_ui.horizontal(|ui| {
                     ui.label("Opacity");
-                    let mut opacity_percent = f32::from(*channel_marker_opacity) / 255.0 * 100.0;
+                    let mut opacity_percent = f32::from(draft.marker_opacity) / 255.0 * 100.0;
                     if ui
                         .add(
                             egui::Slider::new(&mut opacity_percent, 10.0..=100.0)
@@ -6960,9 +7004,24 @@ fn paint_logic(
                         )
                         .changed()
                     {
-                        *channel_marker_opacity = (opacity_percent / 100.0 * 255.0).round() as u8;
+                        draft.marker_opacity = (opacity_percent / 100.0 * 255.0).round() as u8;
                     }
                 });
+                popup_ui.separator();
+                popup_ui.horizontal(|ui| {
+                    save_requested |= ui.button("Save").clicked();
+                    cancel_requested |= ui.button("Cancel").clicked();
+                });
+                if save_requested {
+                    enabled_channels[channel] = draft.enabled;
+                    maximum_heights[channel] = draft.maximum_height;
+                    *channel_name = draft.name.clone();
+                    *channel_color = draft.color;
+                    *channel_marker_opacity = draft.marker_opacity;
+                    popup_ui.memory_mut(egui::Memory::close_popup);
+                } else if cancel_requested {
+                    popup_ui.memory_mut(egui::Memory::close_popup);
+                }
             },
         );
 
@@ -9192,11 +9251,11 @@ mod tests {
         let settings = LogicCaptureSettings {
             sample_rate_hz: 250_000_000,
             enabled_channels,
+            maximum_heights: [4; LOGIC_CHANNEL_COUNT],
             operation_mode: DsLogicOperationMode::Buffer,
             stop_option: DsLogicStopOption::StopImmediately,
             threshold_voltage: 2.5,
             input_filter: DsLogicInputFilter::OneSampleClock,
-            maximum_height: 4,
             rle_enabled: true,
             external_clock: true,
             falling_clock_edge: true,
@@ -9263,6 +9322,10 @@ mod tests {
                 format!("logic.ch{channel}.enabled"),
                 matches!(channel, 2 | 9).to_string(),
             );
+            metadata.insert(
+                format!("logic.ch{channel}.maximum_height"),
+                (channel % 5 + 1).to_string(),
+            );
         }
         metadata.insert(
             "logic.stop_option".to_owned(),
@@ -9273,7 +9336,6 @@ mod tests {
             "logic.input_filter".to_owned(),
             "one_sample_clock".to_owned(),
         );
-        metadata.insert("logic.maximum_height".to_owned(), "4".to_owned());
         metadata.insert("logic.rle_enabled".to_owned(), "true".to_owned());
         metadata.insert("logic.external_clock".to_owned(), "true".to_owned());
         metadata.insert("logic.falling_clock_edge".to_owned(), "true".to_owned());
@@ -9354,7 +9416,10 @@ mod tests {
             logic_settings.input_filter,
             DsLogicInputFilter::OneSampleClock
         );
-        assert_eq!(logic_settings.maximum_height, 4);
+        assert_eq!(
+            logic_settings.maximum_heights,
+            [1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1]
+        );
         assert!(logic_settings.rle_enabled);
         assert!(logic_settings.external_clock);
         assert!(logic_settings.falling_clock_edge);
@@ -10207,6 +10272,16 @@ mod tests {
         assert!(marker.height() <= 13.0);
         assert!(marker.top() >= plot.top());
         assert!(marker.bottom() <= plot.top() + lane_height);
+    }
+
+    #[test]
+    fn logic_maximum_height_uses_the_selected_multiple() {
+        let height_at_1x = logic_signal_height(20.0, 1);
+
+        for multiple in 1..=5 {
+            let scaled_height = logic_signal_height(20.0, multiple);
+            assert!((scaled_height - height_at_1x * f32::from(multiple)).abs() < f32::EPSILON);
+        }
     }
 
     #[test]
