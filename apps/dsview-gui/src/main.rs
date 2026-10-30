@@ -991,6 +991,43 @@ fn capture_settings_tabs(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureTarget {
+    LogicAnalyzer,
+    Oscilloscope,
+    Combined,
+}
+
+impl CaptureTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LogicAnalyzer => "Logic Analyzer",
+            Self::Oscilloscope => "Oscilloscope",
+            Self::Combined => "Combined",
+        }
+    }
+
+    fn includes_model(self, model: DeviceModel) -> bool {
+        match self {
+            Self::LogicAnalyzer => model == DeviceModel::DsLogicU3Pro16,
+            Self::Oscilloscope => model == DeviceModel::DsCopeU3P100,
+            Self::Combined => true,
+        }
+    }
+
+    fn is_available(self, has_logic_analyzer: bool, has_oscilloscope: bool) -> bool {
+        match self {
+            Self::LogicAnalyzer => has_logic_analyzer,
+            Self::Oscilloscope => has_oscilloscope,
+            Self::Combined => has_logic_analyzer && has_oscilloscope,
+        }
+    }
+
+    fn includes_oscilloscope(self) -> bool {
+        matches!(self, Self::Oscilloscope | Self::Combined)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WaveformTab {
     LogicAnalyzer,
     Oscilloscope,
@@ -1005,6 +1042,14 @@ impl WaveformTab {
             Self::Oscilloscope => "Oscilloscope",
             Self::Lissajous => "Lissajous",
             Self::Combined => "Combined",
+        }
+    }
+
+    fn capture_target(self) -> CaptureTarget {
+        match self {
+            Self::LogicAnalyzer => CaptureTarget::LogicAnalyzer,
+            Self::Oscilloscope | Self::Lissajous => CaptureTarget::Oscilloscope,
+            Self::Combined => CaptureTarget::Combined,
         }
     }
 }
@@ -1458,6 +1503,7 @@ fn extend_bounded_to<T>(
 struct ActiveCapture {
     session: CaptureSession,
     mode: AcquisitionMode,
+    target: CaptureTarget,
     preserve_display_until_complete: bool,
     scope_config: DsCopeCaptureConfig,
     scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
@@ -1489,6 +1535,7 @@ enum WorkerSuccess {
     Capture {
         session: CaptureSession,
         mode: AcquisitionMode,
+        target: CaptureTarget,
         scope_config: DsCopeCaptureConfig,
         scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
         scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
@@ -1515,6 +1562,7 @@ struct DsViewApp {
     record_capture: bool,
     recording_path: String,
     capture_run_requested: bool,
+    requested_capture_target: Option<CaptureTarget>,
     devices: Vec<DeviceEntry>,
     active_capture_settings_tab: CaptureSettingsTab,
     scope_settings: ScopeCaptureSettings,
@@ -1560,6 +1608,7 @@ impl DsViewApp {
             record_capture: false,
             recording_path: "capture.dsv".to_owned(),
             capture_run_requested: false,
+            requested_capture_target: None,
             devices: Vec::new(),
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
             scope_settings: ScopeCaptureSettings::default(),
@@ -1647,6 +1696,7 @@ impl DsViewApp {
         let (sender, receiver) = mpsc::channel();
         self.pending = Some(receiver);
         self.capture_run_requested = false;
+        self.requested_capture_target = None;
         self.scope_configuration_due = None;
         self.status = format!("Opening capture {}…", path.display());
         self.last_error = None;
@@ -1663,6 +1713,7 @@ impl DsViewApp {
         }
         let (sender, receiver) = mpsc::channel();
         self.capture_run_requested = false;
+        self.requested_capture_target = None;
         self.scope_capture_restart_requested = false;
         self.scope_configuration_due = None;
         self.pending = Some(receiver);
@@ -1677,29 +1728,49 @@ impl DsViewApp {
         });
     }
 
-    fn begin_capture(&mut self, mode: AcquisitionMode) {
+    fn begin_capture(&mut self, mode: AcquisitionMode, target: CaptureTarget) {
         if self.pending.is_some() || self.capture.is_some() {
             return;
         }
         if self.record_capture && mode.runs_continuously() {
             self.capture_run_requested = false;
+            self.requested_capture_target = None;
             self.last_error =
                 Some("Complete-capture recording is available in Single mode only".to_owned());
+            return;
+        }
+        let has_logic_analyzer = self.devices.iter().any(|entry| {
+            entry.selected && entry.device.profile.model == DeviceModel::DsLogicU3Pro16
+        });
+        let has_oscilloscope = self
+            .devices
+            .iter()
+            .any(|entry| entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100);
+        if !target.is_available(has_logic_analyzer, has_oscilloscope) {
+            self.capture_run_requested = false;
+            self.requested_capture_target = None;
+            self.last_error = Some(match target {
+                CaptureTarget::LogicAnalyzer => {
+                    "Select at least one Logic Analyzer instrument".to_owned()
+                }
+                CaptureTarget::Oscilloscope => {
+                    "Select at least one Oscilloscope instrument".to_owned()
+                }
+                CaptureTarget::Combined => {
+                    "Select at least one Logic Analyzer and one Oscilloscope instrument".to_owned()
+                }
+            });
             return;
         }
         let devices = self
             .devices
             .iter()
-            .filter(|entry| entry.selected)
+            .filter(|entry| entry.selected && target.includes_model(entry.device.profile.model))
             .map(|entry| entry.device.clone())
             .collect::<Vec<_>>();
-        if devices.is_empty() {
-            self.capture_run_requested = false;
-            self.last_error = Some("Select at least one supported instrument".to_owned());
-            return;
-        }
         if self.record_capture && self.recording_path.trim().is_empty() {
             self.capture_run_requested = false;
+            self.requested_capture_target = None;
             self.last_error = Some("Enter a recording file path".to_owned());
             return;
         }
@@ -1707,6 +1778,7 @@ impl DsViewApp {
             Ok(config) => config,
             Err(error) => {
                 self.capture_run_requested = false;
+                self.requested_capture_target = None;
                 self.last_error = Some(error);
                 return;
             }
@@ -1714,6 +1786,7 @@ impl DsViewApp {
         let calibration_values = self.manual_calibration.as_ref().map(|editor| editor.values);
 
         self.capture_run_requested = true;
+        self.requested_capture_target = Some(target);
         let resource_directory = PathBuf::from(self.resource_directory.trim());
         let (sender, receiver) = mpsc::channel();
         self.scope_configuration_due = None;
@@ -1722,8 +1795,12 @@ impl DsViewApp {
             self.completed_capture = None;
         }
         self.status = match mode {
-            AcquisitionMode::Single => "Preparing single acquisition…".to_owned(),
-            AcquisitionMode::Run => "Preparing continuous acquisition…".to_owned(),
+            AcquisitionMode::Single => {
+                format!("Preparing {} single acquisition…", target.label())
+            }
+            AcquisitionMode::Run => {
+                format!("Preparing {} continuous acquisition…", target.label())
+            }
         };
         self.last_error = None;
         thread::spawn(move || {
@@ -1736,6 +1813,7 @@ impl DsViewApp {
             .map(|started| WorkerSuccess::Capture {
                 session: started.session,
                 mode,
+                target,
                 scope_config,
                 scope_trigger_controls: started.scope_trigger_controls,
                 scope_calibration_controls: started.scope_calibration_controls,
@@ -1931,6 +2009,7 @@ impl DsViewApp {
 
     fn stop_capture(&mut self) {
         self.capture_run_requested = false;
+        self.requested_capture_target = None;
         let Some(mut active) = self.capture.take() else {
             return;
         };
@@ -2011,11 +2090,13 @@ impl DsViewApp {
             Ok(WorkerSuccess::Capture {
                 session,
                 mode,
+                target,
                 mut scope_config,
                 scope_trigger_controls,
                 scope_calibration_controls,
             }) => {
                 if !self.capture_run_requested {
+                    self.requested_capture_target = None;
                     match session.stop() {
                         Ok(()) => self.status = "Acquisition stopped".to_owned(),
                         Err(error) => self.set_error(error.to_string()),
@@ -2027,7 +2108,7 @@ impl DsViewApp {
                     match session.stop() {
                         Ok(()) => {
                             self.status = "Reconfiguring oscilloscope frontend…".to_owned();
-                            self.begin_capture(mode);
+                            self.begin_capture(mode, target);
                         }
                         Err(error) => self.set_error(error.to_string()),
                     }
@@ -2116,6 +2197,7 @@ impl DsViewApp {
                 self.capture = Some(ActiveCapture {
                     session,
                     mode,
+                    target,
                     preserve_display_until_complete,
                     scope_config,
                     scope_trigger_controls,
@@ -2130,7 +2212,8 @@ impl DsViewApp {
                 self.status = match (mode, recording_path) {
                     (AcquisitionMode::Single, Some(path)) => {
                         format!(
-                            "Single acquisition from {count} instrument(s) to {}",
+                            "{} Single acquisition from {count} instrument(s) to {}",
+                            target.label(),
                             path.display()
                         )
                     }
@@ -2140,7 +2223,10 @@ impl DsViewApp {
                         {
                             "Single · waiting for trigger".to_owned()
                         } else {
-                            format!("Single acquisition from {count} instrument(s)")
+                            format!(
+                                "{} Single acquisition from {count} instrument(s)",
+                                target.label()
+                            )
                         }
                     }
                     (AcquisitionMode::Run, _) => {
@@ -2151,7 +2237,10 @@ impl DsViewApp {
                         } else if has_scope_trigger {
                             "Run · waiting for trigger".to_owned()
                         } else {
-                            format!("Run acquisition from {count} instrument(s)")
+                            format!(
+                                "{} Run acquisition from {count} instrument(s)",
+                                target.label()
+                            )
                         }
                     }
                 };
@@ -2198,14 +2287,18 @@ impl DsViewApp {
                 self.manual_calibration = Some(ManualCalibrationEditor { values, range });
                 self.status = "Loaded DSCope calibration values".to_owned();
                 if self.capture_run_requested {
-                    self.begin_capture(AcquisitionMode::Run);
+                    if let Some(target) = self.requested_capture_target {
+                        self.begin_capture(AcquisitionMode::Run, target);
+                    }
                 }
             }
             Ok(WorkerSuccess::ScopeCalibrationSaved) => {
                 self.manual_calibration = None;
                 self.status = "DSCope manual calibration saved and verified".to_owned();
                 if self.capture_run_requested {
-                    self.begin_capture(AcquisitionMode::Run);
+                    if let Some(target) = self.requested_capture_target {
+                        self.begin_capture(AcquisitionMode::Run, target);
+                    }
                 }
             }
             Err(error) => self.set_error(error),
@@ -2273,6 +2366,7 @@ impl DsViewApp {
         if let Some((result, completion)) = finish_status {
             if let Some(mut active) = self.capture.take() {
                 let mode = active.mode;
+                let target = active.target;
                 let preserve_display_until_complete = active.preserve_display_until_complete;
                 let recording_path = active.recording_path.take();
                 let has_logic = active.has_logic;
@@ -2331,6 +2425,7 @@ impl DsViewApp {
                         ));
                 if !repeat {
                     self.capture_run_requested = false;
+                    self.requested_capture_target = None;
                 }
                 if recording_path.is_some() {
                     self.record_capture = false;
@@ -2349,7 +2444,7 @@ impl DsViewApp {
                     }
                 }
                 if repeat {
-                    self.begin_capture(mode);
+                    self.begin_capture(mode, target);
                 }
             }
         }
@@ -2357,6 +2452,7 @@ impl DsViewApp {
 
     fn set_error(&mut self, error: String) {
         self.capture_run_requested = false;
+        self.requested_capture_target = None;
         self.scope_capture_restart_requested = false;
         self.manual_calibration_load_requested = false;
         self.manual_calibration_save_requested = None;
@@ -2365,7 +2461,7 @@ impl DsViewApp {
     }
 
     fn available_waveform_tabs(&self) -> Vec<WaveformTab> {
-        let displayed_capture = self
+        let (displayed_logic, displayed_scope) = self
             .capture
             .as_ref()
             .map(|capture| (capture.has_logic, capture.has_scope))
@@ -2373,17 +2469,18 @@ impl DsViewApp {
                 self.completed_capture
                     .as_ref()
                     .map(|capture| (capture.has_logic, capture.has_scope))
-            });
-        let (has_logic_analyzer, has_oscilloscope) = displayed_capture.unwrap_or_else(|| {
-            (
-                self.devices
-                    .iter()
-                    .any(|entry| entry.device.profile.model == DeviceModel::DsLogicU3Pro16),
-                self.devices
-                    .iter()
-                    .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100),
-            )
-        });
+            })
+            .unwrap_or((false, false));
+        let has_logic_analyzer = displayed_logic
+            || self
+                .devices
+                .iter()
+                .any(|entry| entry.device.profile.model == DeviceModel::DsLogicU3Pro16);
+        let has_oscilloscope = displayed_scope
+            || self
+                .devices
+                .iter()
+                .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100);
         waveform_tabs(
             has_logic_analyzer,
             has_oscilloscope,
@@ -3630,23 +3727,37 @@ impl eframe::App for DsViewApp {
         let mut choose_recording_path_clicked = false;
         let mut recording_path_required = false;
         let mut open_recording_clicked = false;
-        let mut start_mode = None;
+        let mut start_request = None;
         let mut stop_clicked = false;
         let mut calibration_action = None;
         let capture_settings_enabled = !self.is_busy();
+        let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
+        let selected_logic_device = self.devices.iter().any(|entry| {
+            entry.selected && entry.device.profile.model == DeviceModel::DsLogicU3Pro16
+        });
         let selected_scope_device = self
             .devices
             .iter()
             .any(|entry| entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100);
+        let control_target_available = control_target.is_some_and(|target| {
+            target.is_available(selected_logic_device, selected_scope_device)
+        });
+        let scope_capture_requested = self.capture_run_requested
+            && self
+                .requested_capture_target
+                .is_some_and(CaptureTarget::includes_oscilloscope);
         let manual_calibration_enabled = manual_calibration_control_is_enabled(
             self.pending.is_some(),
             selected_scope_device,
             self.manual_calibration.is_some(),
-            self.capture.as_ref().map(|active| active.mode),
+            self.capture
+                .as_ref()
+                .filter(|active| active.target.includes_oscilloscope())
+                .map(|active| active.mode),
         );
         let trigger_controls_enabled = scope_trigger_controls_are_enabled(
             self.pending.is_some(),
-            self.capture_run_requested,
+            scope_capture_requested,
             selected_scope_device,
             self.capture
                 .as_ref()
@@ -3654,7 +3765,7 @@ impl eframe::App for DsViewApp {
         );
         let frontend_controls_enabled = scope_frontend_controls_are_enabled(
             self.pending.is_some(),
-            self.capture_run_requested,
+            scope_capture_requested,
             selected_scope_device,
         ) && !(self.record_capture && self.is_busy());
         let scope_settings_before_ui = self.scope_settings;
@@ -3690,14 +3801,14 @@ impl eframe::App for DsViewApp {
                     ui.separator();
                     ui.label(RichText::new("USB capture workbench").color(TEXT_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let device_selected = self.devices.iter().any(|entry| entry.selected);
                         let acquisition_active = self.capture_run_requested
+                            && self.requested_capture_target == control_target
                             && (self.capture.is_some() || self.pending.is_some());
                         let run_stop_clicked = ui
                             .add_enabled(
                                 acquisition_active
                                     || (!self.is_busy()
-                                        && device_selected
+                                        && control_target_available
                                         && !self.record_capture),
                                 if acquisition_active {
                                     toolbar_action_button("■ Stop", Color32::LIGHT_RED)
@@ -3714,23 +3825,25 @@ impl eframe::App for DsViewApp {
                         if run_stop_clicked {
                             if acquisition_active {
                                 stop_clicked = true;
-                            } else {
-                                start_mode = Some(AcquisitionMode::Run);
+                            } else if let Some(target) = control_target {
+                                start_request = Some((AcquisitionMode::Run, target));
                             }
                         }
                         if ui
                             .add_enabled(
-                                !self.is_busy() && device_selected,
+                                !self.is_busy() && control_target_available,
                                 toolbar_action_button("▶ Single", SCOPE_COLORS[0]),
                             )
                             .on_hover_text("Wait for one trigger, acquire once, then stop")
                             .clicked()
                         {
-                            start_mode = Some(AcquisitionMode::Single);
+                            if let Some(target) = control_target {
+                                start_request = Some((AcquisitionMode::Single, target));
+                            }
                         }
                         if ui
                             .add_enabled(
-                                !self.is_busy() && device_selected,
+                                !self.is_busy() && control_target_available,
                                 toolbar_action_button("● Record", Color32::LIGHT_RED),
                             )
                             .on_hover_text("Record a complete Single capture to a .dsv file")
@@ -3738,12 +3851,7 @@ impl eframe::App for DsViewApp {
                         {
                             record_now_clicked = true;
                         }
-                        refresh_clicked = ui
-                            .add_enabled(
-                                !self.is_busy(),
-                                toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
-                            )
-                            .clicked();
+                        ui.add_space(12.0);
                         if ui
                             .add_enabled(
                                 self.snapshot_plot_rect.is_some()
@@ -3755,6 +3863,12 @@ impl eframe::App for DsViewApp {
                         {
                             snapshot_clicked = true;
                         }
+                        refresh_clicked = ui
+                            .add_enabled(
+                                !self.is_busy(),
+                                toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
+                            )
+                            .clicked();
                     });
                 });
             });
@@ -4390,7 +4504,9 @@ impl eframe::App for DsViewApp {
             if let Some(path) = choose_recording_save_path(&self.recording_path) {
                 self.recording_path = path.to_string_lossy().into_owned();
                 self.record_capture = true;
-                start_mode = Some(AcquisitionMode::Single);
+                if let Some(target) = control_target {
+                    start_request = Some((AcquisitionMode::Single, target));
+                }
             }
         } else if choose_recording_path_clicked {
             match choose_recording_save_path(&self.recording_path) {
@@ -4416,12 +4532,13 @@ impl eframe::App for DsViewApp {
             self.begin_refresh();
         }
         if !open_recording_clicked {
-            if let Some(mode) = start_mode {
-                self.begin_capture(mode);
+            if let Some((mode, target)) = start_request {
+                self.begin_capture(mode, target);
             }
         }
         if stop_clicked {
             self.capture_run_requested = false;
+            self.requested_capture_target = None;
             self.scope_capture_restart_requested = false;
             self.scope_configuration_due = None;
             if self.capture.is_some() {
@@ -4464,7 +4581,7 @@ impl eframe::App for DsViewApp {
             .trigger
             .hardware_differs_from(scope_settings_before_ui.trigger);
         let mut runtime_calibration_applied = false;
-        if manual_calibration_changed && !runtime_frontend_changed && self.capture_run_requested {
+        if manual_calibration_changed && !runtime_frontend_changed && scope_capture_requested {
             if let (Some(values), Some(active)) = (
                 self.manual_calibration.as_ref().map(|editor| editor.values),
                 self.capture.as_ref(),
@@ -4478,7 +4595,7 @@ impl eframe::App for DsViewApp {
         let manual_calibration_requires_restart =
             manual_calibration_changed && !runtime_calibration_applied;
         if (runtime_frontend_changed || manual_calibration_requires_restart)
-            && self.capture_run_requested
+            && scope_capture_requested
             && selected_scope_device
         {
             self.scope_configuration_due = Some(Instant::now() + SCOPE_CONFIGURATION_DEBOUNCE);
@@ -4525,8 +4642,12 @@ impl eframe::App for DsViewApp {
         let scope_configuration_is_due = self
             .scope_configuration_due
             .is_some_and(|due| Instant::now() >= due);
-        if !refresh_clicked && start_mode.is_none() && !stop_clicked && scope_configuration_is_due {
-            if self.capture_run_requested && selected_scope_device {
+        if !refresh_clicked
+            && start_request.is_none()
+            && !stop_clicked
+            && scope_configuration_is_due
+        {
+            if scope_capture_requested && selected_scope_device {
                 self.scope_configuration_due = None;
                 self.scope_capture_restart_requested = true;
                 if let Some(active) = self.capture.as_ref() {
@@ -8206,6 +8327,42 @@ mod tests {
                 WaveformTab::Combined,
             ]
         );
+    }
+
+    #[test]
+    fn waveform_tabs_target_their_matching_instruments() {
+        assert_eq!(
+            WaveformTab::LogicAnalyzer.capture_target(),
+            CaptureTarget::LogicAnalyzer
+        );
+        assert_eq!(
+            WaveformTab::Oscilloscope.capture_target(),
+            CaptureTarget::Oscilloscope
+        );
+        assert_eq!(
+            WaveformTab::Lissajous.capture_target(),
+            CaptureTarget::Oscilloscope
+        );
+        assert_eq!(
+            WaveformTab::Combined.capture_target(),
+            CaptureTarget::Combined
+        );
+
+        assert!(CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsLogicU3Pro16));
+        assert!(!CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsCopeU3P100));
+        assert!(CaptureTarget::Oscilloscope.includes_model(DeviceModel::DsCopeU3P100));
+        assert!(!CaptureTarget::Oscilloscope.includes_model(DeviceModel::DsLogicU3Pro16));
+        assert!(CaptureTarget::Combined.includes_model(DeviceModel::DsLogicU3Pro16));
+        assert!(CaptureTarget::Combined.includes_model(DeviceModel::DsCopeU3P100));
+    }
+
+    #[test]
+    fn combined_capture_requires_both_instrument_types() {
+        assert!(CaptureTarget::LogicAnalyzer.is_available(true, false));
+        assert!(CaptureTarget::Oscilloscope.is_available(false, true));
+        assert!(!CaptureTarget::Combined.is_available(true, false));
+        assert!(!CaptureTarget::Combined.is_available(false, true));
+        assert!(CaptureTarget::Combined.is_available(true, true));
     }
 
     #[test]
