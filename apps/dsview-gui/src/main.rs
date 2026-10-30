@@ -74,6 +74,8 @@ const MATH_COLOR: Color32 = Color32::from_rgb(213, 126, 255);
 const FFT_LENGTHS: [usize; 5] = [1_024, 2_048, 4_096, 8_192, 16_384];
 const SCOPE_MARKER_LIMIT: usize = 10;
 const CHANNEL_NAME_MAX_CHARS: usize = 32;
+const LOGIC_CHANNEL_NAME_MAX_CHARS: usize = 8;
+const DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY: u8 = 128;
 static SCOPE_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
 
 fn toolbar_action_button(label: &str, color: Color32) -> egui::Button<'static> {
@@ -1139,6 +1141,10 @@ fn default_logic_channel_colors() -> [Color32; LOGIC_CHANNEL_COUNT] {
     ]
 }
 
+fn default_logic_channel_marker_opacities() -> [u8; LOGIC_CHANNEL_COUNT] {
+    [DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY; LOGIC_CHANNEL_COUNT]
+}
+
 struct WaveformStore {
     logic_samples: VecDeque<u32>,
     logic_channels: u8,
@@ -1714,6 +1720,7 @@ struct DsViewApp {
     active_waveform_tab: Option<WaveformTab>,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
+    logic_channel_marker_opacities: [u8; LOGIC_CHANNEL_COUNT],
     scope_channel_colors: [Color32; 2],
     logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
     scope_channel_names: [String; 2],
@@ -1766,6 +1773,7 @@ impl DsViewApp {
             active_waveform_tab: None,
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
+            logic_channel_marker_opacities: default_logic_channel_marker_opacities(),
             scope_channel_colors: SCOPE_COLORS,
             logic_channel_names: empty_logic_channel_names(),
             scope_channel_names: empty_scope_channel_names(),
@@ -4570,6 +4578,7 @@ impl eframe::App for DsViewApp {
                     .unwrap_or(&empty_waveforms);
                 let mut combined_logic_ratio = self.combined_logic_ratio;
                 let mut logic_channel_colors = self.logic_channel_colors;
+                let mut logic_channel_marker_opacities = self.logic_channel_marker_opacities;
                 let mut logic_channel_names = self.logic_channel_names.clone();
                 let mut logic_viewport = self.logic_viewport;
                 let mut scope_viewport = self.scope_viewport;
@@ -4609,8 +4618,12 @@ impl eframe::App for DsViewApp {
                                     ui,
                                     rect,
                                     waveforms,
-                                    &mut logic_channel_colors,
-                                    &mut logic_channel_names,
+                                    LogicWaveformOptions {
+                                        channel_colors: &mut logic_channel_colors,
+                                        channel_marker_opacities:
+                                            &mut logic_channel_marker_opacities,
+                                        channel_names: &mut logic_channel_names,
+                                    },
                                     &mut logic_viewport,
                                 )
                             },
@@ -4691,8 +4704,11 @@ impl eframe::App for DsViewApp {
                             ui,
                             waveforms,
                             &mut combined_logic_ratio,
-                            &mut logic_channel_colors,
-                            &mut logic_channel_names,
+                            LogicWaveformOptions {
+                                channel_colors: &mut logic_channel_colors,
+                                channel_marker_opacities: &mut logic_channel_marker_opacities,
+                                channel_names: &mut logic_channel_names,
+                            },
                             CombinedWaveformViewports {
                                 logic: &mut logic_viewport,
                                 scope: &mut scope_viewport,
@@ -4720,6 +4736,7 @@ impl eframe::App for DsViewApp {
                 }
                 self.combined_logic_ratio = combined_logic_ratio;
                 self.logic_channel_colors = logic_channel_colors;
+                self.logic_channel_marker_opacities = logic_channel_marker_opacities;
                 self.logic_channel_names = logic_channel_names;
                 self.logic_viewport = logic_viewport;
                 self.scope_viewport = scope_viewport;
@@ -5685,12 +5702,17 @@ struct CombinedWaveformViewports<'a> {
     fft: &'a mut ScopeFftViewport,
 }
 
+struct LogicWaveformOptions<'a> {
+    channel_colors: &'a mut [Color32; LOGIC_CHANNEL_COUNT],
+    channel_marker_opacities: &'a mut [u8; LOGIC_CHANNEL_COUNT],
+    channel_names: &'a mut [String; LOGIC_CHANNEL_COUNT],
+}
+
 fn combined_waveform_cards(
     ui: &mut egui::Ui,
     waveforms: &WaveformStore,
     logic_ratio: &mut f32,
-    logic_channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
-    logic_channel_names: &mut [String; LOGIC_CHANNEL_COUNT],
+    logic_options: LogicWaveformOptions<'_>,
     viewports: CombinedWaveformViewports<'_>,
     scope_options: ScopeWaveformOptions<'_>,
 ) -> Rect {
@@ -5749,16 +5771,7 @@ fn combined_waveform_cards(
         &mut logic_ui,
         "DIGITAL",
         "DSLogic · channels 0–15",
-        |ui, rect| {
-            paint_logic(
-                ui,
-                rect,
-                waveforms,
-                logic_channel_colors,
-                logic_channel_names,
-                logic_viewport,
-            )
-        },
+        |ui, rect| paint_logic(ui, rect, waveforms, logic_options, logic_viewport),
     );
 
     let mut scope_ui = ui.new_child(
@@ -6150,25 +6163,96 @@ fn paint_logic_zero_reference(painter: &egui::Painter, plot: Rect, y: f32, chann
     }
 }
 
+const LOGIC_CHANNEL_MARKER_MIN_BODY_WIDTH: f32 = 16.0;
+const LOGIC_CHANNEL_MARKER_TIP_WIDTH: f32 = 6.0;
+const LOGIC_CHANNEL_MARKER_CHARACTER_WIDTH: f32 = 6.0;
+const LOGIC_CHANNEL_MARKER_HORIZONTAL_PADDING: f32 = 8.0;
+
+fn logic_channel_marker_text(channel: usize, channel_name: &str) -> String {
+    let channel_name = channel_name.trim();
+    if channel_name.is_empty() {
+        channel.to_string()
+    } else {
+        channel_name
+            .chars()
+            .take(LOGIC_CHANNEL_NAME_MAX_CHARS)
+            .collect()
+    }
+}
+
+fn logic_channel_marker_body_width(marker_text: &str) -> f32 {
+    (marker_text.chars().count() as f32 * LOGIC_CHANNEL_MARKER_CHARACTER_WIDTH
+        + LOGIC_CHANNEL_MARKER_HORIZONTAL_PADDING)
+        .max(LOGIC_CHANNEL_MARKER_MIN_BODY_WIDTH)
+}
+
+fn logic_channel_marker_rect(plot: Rect, y: f32, lane_height: f32, marker_text: &str) -> Rect {
+    let half_height = (lane_height * 0.22).clamp(3.5, 6.5);
+    let body_width = logic_channel_marker_body_width(marker_text);
+    Rect::from_min_max(
+        Pos2::new(plot.left() + 1.0, y - half_height),
+        Pos2::new(
+            plot.left() + 1.0 + body_width + LOGIC_CHANNEL_MARKER_TIP_WIDTH,
+            y + half_height,
+        ),
+    )
+}
+
+fn paint_logic_channel_marker(
+    painter: &egui::Painter,
+    plot: Rect,
+    y: f32,
+    lane_height: f32,
+    marker_text: &str,
+    color: Color32,
+    opacity: u8,
+) {
+    let marker = logic_channel_marker_rect(plot, y, lane_height, marker_text);
+    let body_width = logic_channel_marker_body_width(marker_text);
+    let body_right = marker.left() + body_width;
+    let marker_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), opacity);
+    let text_color = marker_text_color(color);
+    let text_color =
+        Color32::from_rgba_unmultiplied(text_color.r(), text_color.g(), text_color.b(), opacity);
+    let outline_color =
+        Color32::from_rgba_unmultiplied(BACKGROUND.r(), BACKGROUND.g(), BACKGROUND.b(), opacity);
+    painter
+        .with_clip_rect(plot)
+        .add(egui::Shape::convex_polygon(
+            vec![
+                marker.left_top(),
+                Pos2::new(body_right, marker.top()),
+                marker.right_center(),
+                Pos2::new(body_right, marker.bottom()),
+                marker.left_bottom(),
+            ],
+            marker_color,
+            Stroke::new(1.0_f32, outline_color),
+        ));
+    painter.with_clip_rect(plot).text(
+        Pos2::new(marker.left() + body_width * 0.5, marker.center().y),
+        egui::Align2::CENTER_CENTER,
+        marker_text,
+        FontId::monospace((marker.height() * 0.65).clamp(7.0, 9.0)),
+        text_color,
+    );
+}
+
 fn paint_logic(
     ui: &egui::Ui,
     rect: Rect,
     waveforms: &WaveformStore,
-    channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
-    channel_names: &mut [String; LOGIC_CHANNEL_COUNT],
+    options: LogicWaveformOptions<'_>,
     viewport: &mut WaveformViewport,
 ) {
+    let LogicWaveformOptions {
+        channel_colors,
+        channel_marker_opacities,
+        channel_names,
+    } = options;
     paint_plot_background(ui, rect);
     let painter = ui.painter();
-    let label_width = if channel_names.iter().any(|name| !name.trim().is_empty()) {
-        130.0
-    } else {
-        42.0
-    };
-    let waveform_area = Rect::from_min_max(
-        Pos2::new(rect.left() + label_width, rect.top()),
-        rect.right_bottom(),
-    );
+    let waveform_area = rect;
     let (status_area, ruler_area, plot_area) = split_waveform_chrome(waveform_area);
     let plot = plot_area;
     let (status_bar, time_ruler) = align_waveform_chrome(status_area, ruler_area, plot);
@@ -6200,8 +6284,10 @@ fn paint_logic(
         .floor()
         .max(1.0) as usize;
     for (channel, channel_color) in channel_colors.iter_mut().enumerate() {
+        let channel_marker_opacity = &mut channel_marker_opacities[channel];
         let channel_name = &mut channel_names[channel];
         let channel_label = channel_label("D", channel, channel_name);
+        let marker_text = logic_channel_marker_text(channel, channel_name);
         let lane_top = plot.top() + channel as f32 * lane_height;
         let high = lane_top + lane_height * 0.25;
         let low = lane_top + lane_height * 0.75;
@@ -6213,53 +6299,41 @@ fn paint_logic(
             Stroke::new(0.6_f32, GRID.gamma_multiply(0.45)),
         );
         paint_logic_zero_reference(painter, plot, low, *channel_color);
-        let label_rect = Rect::from_min_max(
-            Pos2::new(rect.left(), lane_top),
-            Pos2::new(plot.left(), lane_top + lane_height),
-        );
-        let label_response = ui
+        let marker_rect = logic_channel_marker_rect(plot, low, lane_height, &marker_text);
+        let marker_response = ui
             .interact(
-                label_rect,
-                ui.make_persistent_id(("logic_channel_label", channel)),
+                marker_rect.expand(3.0),
+                ui.make_persistent_id(("logic_channel_marker", channel)),
                 Sense::click(),
             )
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text(format!("Click to edit {channel_label} name and color"));
-        if label_response.hovered() {
-            painter.rect_filled(
-                label_rect.shrink(1.0),
-                3.0,
-                channel_color.gamma_multiply(0.18),
-            );
-        }
-        painter.with_clip_rect(label_rect).text(
-            Pos2::new(rect.left() + 4.0, lane_top + lane_height * 0.5),
-            egui::Align2::LEFT_CENTER,
-            &channel_label,
-            FontId::monospace(10.0),
-            *channel_color,
-        );
 
         let popup_id = ui.make_persistent_id(("logic_channel_color_popup", channel));
-        if label_response.clicked() {
+        if marker_response.clicked() {
             ui.memory_mut(|memory| memory.toggle_popup(popup_id));
         }
         egui::popup::popup_below_widget(
             ui,
             popup_id,
-            &label_response,
+            &marker_response,
             egui::popup::PopupCloseBehavior::CloseOnClickOutside,
             |popup_ui| {
                 popup_ui.set_min_width(280.0);
                 popup_ui.label(RichText::new(format!("D{channel} settings")).strong());
                 popup_ui.horizontal(|ui| {
                     ui.label("Name");
-                    ui.add(
+                    let name_edit = ui.add(
                         egui::TextEdit::singleline(channel_name)
-                            .char_limit(CHANNEL_NAME_MAX_CHARS)
+                            .char_limit(LOGIC_CHANNEL_NAME_MAX_CHARS)
                             .desired_width(190.0)
                             .hint_text("Optional name"),
                     );
+                    if name_edit.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        ui.memory_mut(egui::Memory::close_popup);
+                    }
                 });
                 popup_ui.separator();
                 popup_ui.label("Color");
@@ -6271,34 +6345,57 @@ fn paint_logic(
                 if popup_ui.button("Reset color").clicked() {
                     *channel_color = default_logic_channel_colors()[channel];
                 }
+                popup_ui.separator();
+                popup_ui.horizontal(|ui| {
+                    ui.label("Opacity");
+                    let mut opacity_percent = f32::from(*channel_marker_opacity) / 255.0 * 100.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut opacity_percent, 10.0..=100.0)
+                                .fixed_decimals(0)
+                                .suffix("%"),
+                        )
+                        .changed()
+                    {
+                        *channel_marker_opacity = (opacity_percent / 100.0 * 255.0).round() as u8;
+                    }
+                });
             },
         );
 
-        if visible_count == 0 {
-            continue;
-        }
-        let mut points = Vec::new();
-        let mut previous_y = None;
-        for index in visible_range.clone().step_by(step) {
-            let sample = waveforms.logic_samples[index];
-            let y = if sample & (1_u32 << channel) != 0 {
-                high
-            } else {
-                low
-            };
-            let x = waveform_sample_x(plot, *viewport, index as f32, sample_count);
-            if let Some(previous_y) = previous_y {
-                points.push(Pos2::new(x, previous_y));
+        if visible_count != 0 {
+            let mut points = Vec::new();
+            let mut previous_y = None;
+            for index in visible_range.clone().step_by(step) {
+                let sample = waveforms.logic_samples[index];
+                let y = if sample & (1_u32 << channel) != 0 {
+                    high
+                } else {
+                    low
+                };
+                let x = waveform_sample_x(plot, *viewport, index as f32, sample_count);
+                if let Some(previous_y) = previous_y {
+                    points.push(Pos2::new(x, previous_y));
+                }
+                points.push(Pos2::new(x, y));
+                previous_y = Some(y);
             }
-            points.push(Pos2::new(x, y));
-            previous_y = Some(y);
+            if points.len() > 1 {
+                painter.add(egui::Shape::line(
+                    points,
+                    Stroke::new(1.2_f32, *channel_color),
+                ));
+            }
         }
-        if points.len() > 1 {
-            painter.add(egui::Shape::line(
-                points,
-                Stroke::new(1.2_f32, *channel_color),
-            ));
-        }
+        paint_logic_channel_marker(
+            painter,
+            plot,
+            low,
+            lane_height,
+            &marker_text,
+            *channel_color,
+            *channel_marker_opacity,
+        );
     }
     if visible_count == 0 {
         paint_empty(painter, plot, "Waiting for logic samples");
@@ -9375,6 +9472,28 @@ mod tests {
         for (index, color) in colors.iter().enumerate() {
             assert!(!colors[..index].contains(color));
         }
+    }
+
+    #[test]
+    fn logic_channel_markers_stay_compact_and_inside_their_lanes() {
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 320.0));
+        let lane_height = 20.0;
+        let marker = logic_channel_marker_rect(plot, lane_height * 0.75, lane_height, "15");
+        let named_marker =
+            logic_channel_marker_rect(plot, lane_height * 0.75, lane_height, "CLOCKCLK");
+
+        assert_eq!(marker.width(), 26.0);
+        assert_eq!(named_marker.width(), 62.0);
+        assert!(marker.height() <= 13.0);
+        assert!(marker.top() >= plot.top());
+        assert!(marker.bottom() <= plot.top() + lane_height);
+    }
+
+    #[test]
+    fn logic_channel_marker_uses_name_limited_to_eight_characters() {
+        assert_eq!(logic_channel_marker_text(3, ""), "3");
+        assert_eq!(logic_channel_marker_text(3, "  CLOCK  "), "CLOCK");
+        assert_eq!(logic_channel_marker_text(3, "DATA-LONG-NAME"), "DATA-LON");
     }
 
     #[test]
