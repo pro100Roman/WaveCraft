@@ -69,12 +69,47 @@ const SCOPE_COLORS: [Color32; 2] = [
 const MATH_COLOR: Color32 = Color32::from_rgb(213, 126, 255);
 const FFT_LENGTHS: [usize; 5] = [1_024, 2_048, 4_096, 8_192, 16_384];
 const SCOPE_MARKER_LIMIT: usize = 10;
+const CHANNEL_NAME_MAX_CHARS: usize = 32;
 static SCOPE_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
 
 fn toolbar_action_button(label: &str, color: Color32) -> egui::Button<'static> {
     egui::Button::new(label.to_owned())
         .fill(color.gamma_multiply(0.24))
         .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.85)))
+}
+
+fn empty_logic_channel_names() -> [String; LOGIC_CHANNEL_COUNT] {
+    std::array::from_fn(|_| String::new())
+}
+
+fn empty_scope_channel_names() -> [String; 2] {
+    std::array::from_fn(|_| String::new())
+}
+
+fn normalized_channel_name(name: &str) -> String {
+    name.trim().chars().take(CHANNEL_NAME_MAX_CHARS).collect()
+}
+
+fn channel_label(prefix: &str, index: usize, name: &str) -> String {
+    let identifier = format!("{prefix}{index}");
+    let name = name.trim();
+    if name.is_empty() {
+        identifier
+    } else {
+        format!("{identifier} · {name}")
+    }
+}
+
+fn scope_channel_label(index: usize, names: &[String; 2]) -> String {
+    channel_label("CH", index, &names[index])
+}
+
+fn scope_channels_subtitle(names: &[String; 2]) -> String {
+    format!(
+        "DSCope · {} / {}",
+        scope_channel_label(0, names),
+        scope_channel_label(1, names)
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1525,6 +1560,8 @@ struct CompletedCapture {
 struct LoadedRecording {
     capture: CompletedCapture,
     scope_settings: Option<ScopeCaptureSettings>,
+    logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
+    scope_channel_names: [String; 2],
     completion: CompletionStatus,
 }
 
@@ -1546,7 +1583,7 @@ enum WorkerSuccess {
     ScopeCalibrationSaved,
     RecordingLoaded {
         path: PathBuf,
-        recording: LoadedRecording,
+        recording: Box<LoadedRecording>,
     },
 }
 
@@ -1574,6 +1611,8 @@ struct DsViewApp {
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
     scope_channel_colors: [Color32; 2],
+    logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
+    scope_channel_names: [String; 2],
     logic_viewport: WaveformViewport,
     scope_viewport: WaveformViewport,
     scope_fft_viewport: ScopeFftViewport,
@@ -1620,6 +1659,8 @@ impl DsViewApp {
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
             scope_channel_colors: SCOPE_COLORS,
+            logic_channel_names: empty_logic_channel_names(),
+            scope_channel_names: empty_scope_channel_names(),
             logic_viewport: WaveformViewport::default(),
             scope_viewport: WaveformViewport::default(),
             scope_fft_viewport: ScopeFftViewport::default(),
@@ -1701,8 +1742,11 @@ impl DsViewApp {
         self.status = format!("Opening capture {}…", path.display());
         self.last_error = None;
         thread::spawn(move || {
-            let result = load_gui_recording(&path)
-                .map(|recording| WorkerSuccess::RecordingLoaded { path, recording });
+            let result =
+                load_gui_recording(&path).map(|recording| WorkerSuccess::RecordingLoaded {
+                    path,
+                    recording: Box::new(recording),
+                });
             let _ = sender.send(result);
         });
     }
@@ -2163,7 +2207,13 @@ impl DsViewApp {
                     .then(|| PathBuf::from(self.recording_path.trim()));
                 let recorder = match recording_path.as_deref() {
                     Some(path) => {
-                        match start_gui_recording(path, session.descriptors(), scope_config) {
+                        match start_gui_recording(
+                            path,
+                            session.descriptors(),
+                            scope_config,
+                            &self.logic_channel_names,
+                            &self.scope_channel_names,
+                        ) {
                             Ok(recorder) => Some(recorder),
                             Err(error) => {
                                 let cleanup = session.stop().err();
@@ -2249,13 +2299,17 @@ impl DsViewApp {
                 let LoadedRecording {
                     capture,
                     scope_settings,
+                    logic_channel_names,
+                    scope_channel_names,
                     completion,
-                } = recording;
+                } = *recording;
                 if let Some(scope_settings) = scope_settings {
                     self.scope_settings = scope_settings;
                     self.scope_auto_sample_rate = false;
                 }
                 self.completed_capture = Some(capture);
+                self.logic_channel_names = logic_channel_names;
+                self.scope_channel_names = scope_channel_names;
                 self.record_capture = false;
                 self.logic_viewport.reset();
                 self.scope_viewport.reset();
@@ -2691,13 +2745,21 @@ fn coupling_label(coupling: DsCopeCoupling) -> &'static str {
     }
 }
 
-fn trigger_source_label(source: DsCopeTriggerSource) -> &'static str {
+fn trigger_source_label(source: DsCopeTriggerSource, channel_names: &[String; 2]) -> String {
     match source {
-        DsCopeTriggerSource::Auto => "Auto",
-        DsCopeTriggerSource::ChannelZero => "CH0",
-        DsCopeTriggerSource::ChannelOne => "CH1",
-        DsCopeTriggerSource::ChannelZeroAndOne => "CH0 AND CH1",
-        DsCopeTriggerSource::ChannelZeroOrOne => "CH0 OR CH1",
+        DsCopeTriggerSource::Auto => "Auto".to_owned(),
+        DsCopeTriggerSource::ChannelZero => scope_channel_label(0, channel_names),
+        DsCopeTriggerSource::ChannelOne => scope_channel_label(1, channel_names),
+        DsCopeTriggerSource::ChannelZeroAndOne => format!(
+            "{} AND {}",
+            scope_channel_label(0, channel_names),
+            scope_channel_label(1, channel_names)
+        ),
+        DsCopeTriggerSource::ChannelZeroOrOne => format!(
+            "{} OR {}",
+            scope_channel_label(0, channel_names),
+            scope_channel_label(1, channel_names)
+        ),
     }
 }
 
@@ -2712,6 +2774,7 @@ fn paint_scope_trigger_settings(
     ui: &mut egui::Ui,
     settings: &mut ScopeTriggerSettings,
     channels: [bool; 2],
+    channel_names: &[String; 2],
     enabled: bool,
 ) {
     egui::CollapsingHeader::new(RichText::new("Trigger").strong())
@@ -2724,7 +2787,7 @@ fn paint_scope_trigger_settings(
                     .show(ui, |ui| {
                         ui.label("Source");
                         egui::ComboBox::from_id_salt("scope_trigger_source")
-                            .selected_text(trigger_source_label(settings.source))
+                            .selected_text(trigger_source_label(settings.source, channel_names))
                             .show_ui(ui, |ui| {
                                 for source in [
                                     DsCopeTriggerSource::Auto,
@@ -2741,7 +2804,7 @@ fn paint_scope_trigger_settings(
                                             ui.selectable_value(
                                                 &mut settings.source,
                                                 source,
-                                                trigger_source_label(source),
+                                                trigger_source_label(source, channel_names),
                                             );
                                         },
                                     );
@@ -2752,7 +2815,10 @@ fn paint_scope_trigger_settings(
                         if settings.source == DsCopeTriggerSource::Auto {
                             ui.label("Auto channel");
                             egui::ComboBox::from_id_salt("scope_trigger_auto_channel")
-                                .selected_text(format!("CH{}", settings.auto_channel))
+                                .selected_text(scope_channel_label(
+                                    usize::from(settings.auto_channel),
+                                    channel_names,
+                                ))
                                 .show_ui(ui, |ui| {
                                     for (channel, channel_enabled) in
                                         channels.into_iter().enumerate()
@@ -2761,7 +2827,7 @@ fn paint_scope_trigger_settings(
                                             ui.selectable_value(
                                                 &mut settings.auto_channel,
                                                 channel as u8,
-                                                format!("CH{channel}"),
+                                                scope_channel_label(channel, channel_names),
                                             );
                                         });
                                     }
@@ -2835,13 +2901,14 @@ fn paint_scope_channel_picker(
     id: &'static str,
     channel: &mut usize,
     channels: [bool; 2],
+    channel_names: &[String; 2],
 ) {
     egui::ComboBox::from_id_salt(id)
-        .selected_text(format!("CH{channel}"))
+        .selected_text(scope_channel_label(*channel, channel_names))
         .show_ui(ui, |ui| {
             for (index, enabled) in channels.into_iter().enumerate() {
                 ui.add_enabled_ui(enabled, |ui| {
-                    ui.selectable_value(channel, index, format!("CH{index}"));
+                    ui.selectable_value(channel, index, scope_channel_label(index, channel_names));
                 });
             }
         });
@@ -2851,6 +2918,7 @@ fn paint_scope_function_settings(
     ui: &mut egui::Ui,
     settings: &mut ScopeFunctionSettings,
     channels: [bool; 2],
+    channel_names: &[String; 2],
 ) {
     egui::CollapsingHeader::new(RichText::new("Functions").strong())
         .default_open(false)
@@ -2886,6 +2954,7 @@ fn paint_scope_function_settings(
                             "scope_math_left_channel",
                             &mut settings.math.left_channel,
                             channels,
+                            channel_names,
                         );
                         ui.end_row();
 
@@ -2895,6 +2964,7 @@ fn paint_scope_function_settings(
                             "scope_math_right_channel",
                             &mut settings.math.right_channel,
                             channels,
+                            channel_names,
                         );
                         ui.end_row();
                     });
@@ -2913,6 +2983,7 @@ fn paint_scope_function_settings(
                             "scope_fft_channel",
                             &mut settings.fft.channel,
                             channels,
+                            channel_names,
                         );
                         ui.end_row();
 
@@ -2970,6 +3041,7 @@ fn paint_scope_function_settings(
                             "scope_lissajous_x_channel",
                             &mut settings.lissajous.x_channel,
                             channels,
+                            channel_names,
                         );
                         ui.end_row();
 
@@ -2979,6 +3051,7 @@ fn paint_scope_function_settings(
                             "scope_lissajous_y_channel",
                             &mut settings.lissajous.y_channel,
                             channels,
+                            channel_names,
                         );
                         ui.end_row();
                     });
@@ -2997,6 +3070,7 @@ fn paint_scope_measurement_settings(
     ui: &mut egui::Ui,
     settings: &mut ScopeMeasurementSettings,
     channels: [bool; 2],
+    channel_names: &[String; 2],
 ) {
     egui::CollapsingHeader::new(RichText::new("Measurements").strong())
         .default_open(false)
@@ -3008,9 +3082,12 @@ fn paint_scope_measurement_settings(
                         ui.horizontal(|ui| {
                             ui.checkbox(
                                 &mut channel_settings.enabled,
-                                RichText::new(format!("CH{channel} measurements"))
-                                    .strong()
-                                    .color(SCOPE_COLORS[channel]),
+                                RichText::new(format!(
+                                    "{} measurements",
+                                    scope_channel_label(channel, channel_names)
+                                ))
+                                .strong()
+                                .color(SCOPE_COLORS[channel]),
                             );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -3045,7 +3122,13 @@ fn paint_scope_measurement_settings(
                     });
                 });
                 if !channel_enabled {
-                    ui.small(RichText::new(format!("CH{channel} is disabled")).color(TEXT_MUTED));
+                    ui.small(
+                        RichText::new(format!(
+                            "{} is disabled",
+                            scope_channel_label(channel, channel_names)
+                        ))
+                        .color(TEXT_MUTED),
+                    );
                 }
                 if channel + 1 < channels.len() {
                     ui.add_space(6.0);
@@ -3060,6 +3143,7 @@ fn paint_scope_marker_settings(
     settings: &mut ScopeMarkerSettings,
     editor: &mut Option<ScopeMarkerEditor>,
     channels: [bool; 2],
+    channel_names: &[String; 2],
 ) {
     egui::CollapsingHeader::new(RichText::new("Markers").strong())
         .default_open(false)
@@ -3070,7 +3154,10 @@ fn paint_scope_marker_settings(
                         let total = settings.channels[channel].total_count();
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(format!("CH{channel} markers"))
+                                RichText::new(format!(
+                                    "{} markers",
+                                    scope_channel_label(channel, channel_names)
+                                ))
                                     .strong()
                                     .color(SCOPE_COLORS[channel]),
                             );
@@ -3162,7 +3249,13 @@ fn paint_scope_marker_settings(
                     });
                 });
                 if !channel_enabled {
-                    ui.small(RichText::new(format!("CH{channel} is disabled")).color(TEXT_MUTED));
+                    ui.small(
+                        RichText::new(format!(
+                            "{} is disabled",
+                            scope_channel_label(channel, channel_names)
+                        ))
+                        .color(TEXT_MUTED),
+                    );
                 }
                 if channel + 1 < channels.len() {
                     ui.add_space(6.0);
@@ -3176,6 +3269,7 @@ fn paint_scope_marker_editor(
     editor_state: &mut Option<ScopeMarkerEditor>,
     settings: &mut ScopeMarkerSettings,
     channels: [bool; 2],
+    channel_names: &[String; 2],
 ) {
     let Some(mut editor) = *editor_state else {
         return;
@@ -3206,9 +3300,12 @@ fn paint_scope_marker_editor(
         .default_width(360.0)
         .show(context, |ui| {
             ui.label(
-                RichText::new(format!("CH{} marker", editor.channel))
-                    .strong()
-                    .color(SCOPE_COLORS[editor.channel]),
+                RichText::new(format!(
+                    "{} marker",
+                    scope_channel_label(editor.channel, channel_names)
+                ))
+                .strong()
+                .color(SCOPE_COLORS[editor.channel]),
             );
             let kind_before = editor.kind;
             ui.horizontal(|ui| {
@@ -3354,6 +3451,7 @@ fn paint_scope_channel_settings(
     channel_index: usize,
     settings: &mut ScopeChannelSettings,
     channel_color: &mut Color32,
+    channel_name: &mut String,
     other_channel_enabled: bool,
     availability: CaptureSettingsAvailability,
 ) {
@@ -3364,13 +3462,25 @@ fn paint_scope_channel_settings(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let can_toggle_enable = !settings.enabled || other_channel_enabled;
-            let enable_control =
-                egui::Checkbox::new(&mut settings.enabled, format!("CH{channel_index} enabled"));
+            let enable_label = format!(
+                "{} enabled",
+                channel_label("CH", channel_index, channel_name)
+            );
+            let enable_control = egui::Checkbox::new(&mut settings.enabled, enable_label);
             ui.add_enabled(
                 availability.channel_enable && can_toggle_enable,
                 enable_control,
             )
             .on_hover_text("At least one oscilloscope channel must remain enabled");
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.add_enabled(
+                    availability.capture,
+                    egui::TextEdit::singleline(channel_name)
+                        .char_limit(CHANNEL_NAME_MAX_CHARS)
+                        .hint_text(format!("CH{channel_index}")),
+                );
+            });
             ui.add_enabled_ui(availability.input_range && settings.enabled, |ui| {
                 ui.label("Input range");
                 paint_scope_input_range_encoder(
@@ -3434,6 +3544,7 @@ struct ScopeCaptureSettingsEditor<'a> {
 
 struct ScopeVisualizationSettingsEditor<'a> {
     channel_colors: &'a mut [Color32; 2],
+    scope_channel_names: &'a mut [String; 2],
 }
 
 fn paint_capture_settings(
@@ -3450,6 +3561,7 @@ fn paint_capture_settings(
     } = scope_editor;
     let ScopeVisualizationSettingsEditor {
         channel_colors: scope_channel_colors,
+        scope_channel_names,
     } = visualization_editor;
     let card_width = ui.available_width();
     egui::Frame::none()
@@ -3485,7 +3597,7 @@ fn paint_capture_settings(
                             ui.monospace("D0–D15");
                             ui.end_row();
                             ui.label("Display");
-                            ui.monospace("Per-channel colors");
+                            ui.monospace("Per-channel names and colors");
                             ui.end_row();
                         });
                 }
@@ -3637,6 +3749,7 @@ fn paint_capture_settings(
                             index,
                             channel,
                             &mut scope_channel_colors[index],
+                            &mut scope_channel_names[index],
                             channel_enabled[1 - index],
                             availability,
                         );
@@ -3656,6 +3769,7 @@ fn paint_scope_tools(
     function_settings: &mut ScopeFunctionSettings,
     marker_settings: &mut ScopeMarkerSettings,
     marker_editor: &mut Option<ScopeMarkerEditor>,
+    channel_names: &[String; 2],
     trigger_controls_enabled: bool,
 ) {
     let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
@@ -3666,14 +3780,26 @@ fn paint_scope_tools(
         ui,
         &mut scope_settings.trigger,
         channel_enabled,
+        channel_names,
         trigger_controls_enabled,
     );
     ui.add_space(8.0);
-    paint_scope_function_settings(ui, function_settings, channel_enabled);
+    paint_scope_function_settings(ui, function_settings, channel_enabled, channel_names);
     ui.add_space(8.0);
-    paint_scope_measurement_settings(ui, &mut function_settings.measurements, channel_enabled);
+    paint_scope_measurement_settings(
+        ui,
+        &mut function_settings.measurements,
+        channel_enabled,
+        channel_names,
+    );
     ui.add_space(8.0);
-    paint_scope_marker_settings(ui, marker_settings, marker_editor, channel_enabled);
+    paint_scope_marker_settings(
+        ui,
+        marker_settings,
+        marker_editor,
+        channel_enabled,
+        channel_names,
+    );
 }
 
 fn paint_instrument_settings(
@@ -3946,6 +4072,7 @@ impl eframe::App for DsViewApp {
                                 },
                                 ScopeVisualizationSettingsEditor {
                                     channel_colors: &mut self.scope_channel_colors,
+                                    scope_channel_names: &mut self.scope_channel_names,
                                 },
                                 CaptureSettingsAvailability {
                                     capture: capture_settings_enabled,
@@ -4032,6 +4159,7 @@ impl eframe::App for DsViewApp {
                                         &mut self.scope_function_settings,
                                         &mut self.scope_marker_settings,
                                         &mut self.scope_marker_editor,
+                                        &self.scope_channel_names,
                                         trigger_controls_enabled,
                                     );
                                 });
@@ -4098,6 +4226,7 @@ impl eframe::App for DsViewApp {
                     .unwrap_or(&empty_waveforms);
                 let mut combined_logic_ratio = self.combined_logic_ratio;
                 let mut logic_channel_colors = self.logic_channel_colors;
+                let mut logic_channel_names = self.logic_channel_names.clone();
                 let mut logic_viewport = self.logic_viewport;
                 let mut scope_viewport = self.scope_viewport;
                 let mut scope_fft_viewport = self.scope_fft_viewport;
@@ -4129,16 +4258,18 @@ impl eframe::App for DsViewApp {
                                     rect,
                                     waveforms,
                                     &mut logic_channel_colors,
+                                    &mut logic_channel_names,
                                     &mut logic_viewport,
                                 )
                             },
                         ));
                     }
                     Some(WaveformTab::Oscilloscope) => {
+                        let subtitle = scope_channels_subtitle(&self.scope_channel_names);
                         snapshot_plot_rect = Some(waveform_card_fill(
                             ui,
                             "OSCILLOSCOPE",
-                            "DSCope · CH0 / CH1",
+                            &subtitle,
                             |ui, rect| {
                                 paint_scope(
                                     ui,
@@ -4150,6 +4281,7 @@ impl eframe::App for DsViewApp {
                                     ScopeWaveformOptions {
                                         settings: scope_settings,
                                         function_settings: self.scope_function_settings,
+                                        channel_names: &self.scope_channel_names,
                                         measurement_caches: &mut scope_measurement_caches,
                                         measurement_window_positions:
                                             &mut scope_measurement_window_positions,
@@ -4170,8 +4302,9 @@ impl eframe::App for DsViewApp {
                     Some(WaveformTab::Lissajous) => {
                         let lissajous = self.scope_function_settings.lissajous;
                         let subtitle = format!(
-                            "DSCope · CH{} → X / CH{} → Y",
-                            lissajous.x_channel, lissajous.y_channel
+                            "DSCope · {} → X / {} → Y",
+                            scope_channel_label(lissajous.x_channel, &self.scope_channel_names),
+                            scope_channel_label(lissajous.y_channel, &self.scope_channel_names)
                         );
                         let mut lissajous_scope_settings = scope_settings;
                         for (channel, vertical_offset) in lissajous_scope_settings
@@ -4190,10 +4323,13 @@ impl eframe::App for DsViewApp {
                                     ui,
                                     rect,
                                     waveforms,
-                                    scope_viewport,
-                                    lissajous_scope_settings,
-                                    lissajous,
-                                    self.scope_channel_colors,
+                                    ScopeLissajousPaintOptions {
+                                        viewport: scope_viewport,
+                                        settings: lissajous_scope_settings,
+                                        lissajous,
+                                        channel_colors: self.scope_channel_colors,
+                                        channel_names: &self.scope_channel_names,
+                                    },
                                 )
                             },
                         ));
@@ -4204,6 +4340,7 @@ impl eframe::App for DsViewApp {
                             waveforms,
                             &mut combined_logic_ratio,
                             &mut logic_channel_colors,
+                            &mut logic_channel_names,
                             CombinedWaveformViewports {
                                 logic: &mut logic_viewport,
                                 scope: &mut scope_viewport,
@@ -4212,6 +4349,7 @@ impl eframe::App for DsViewApp {
                             ScopeWaveformOptions {
                                 settings: scope_settings,
                                 function_settings: self.scope_function_settings,
+                                channel_names: &self.scope_channel_names,
                                 measurement_caches: &mut scope_measurement_caches,
                                 measurement_window_positions:
                                     &mut scope_measurement_window_positions,
@@ -4230,6 +4368,7 @@ impl eframe::App for DsViewApp {
                 }
                 self.combined_logic_ratio = combined_logic_ratio;
                 self.logic_channel_colors = logic_channel_colors;
+                self.logic_channel_names = logic_channel_names;
                 self.logic_viewport = logic_viewport;
                 self.scope_viewport = scope_viewport;
                 self.scope_fft_viewport = scope_fft_viewport;
@@ -4498,6 +4637,7 @@ impl eframe::App for DsViewApp {
             &mut self.scope_marker_editor,
             &mut self.scope_marker_settings,
             self.scope_settings.channels.map(|channel| channel.enabled),
+            &self.scope_channel_names,
         );
 
         if record_now_clicked {
@@ -4704,10 +4844,31 @@ fn has_required_fpga_resources(directory: &Path) -> bool {
     directory.join("DSLogicU3Pro16.bin").is_file() && directory.join("DSCopeU3P100.bin").is_file()
 }
 
+fn insert_channel_name_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    logic_channel_names: &[String; LOGIC_CHANNEL_COUNT],
+    scope_channel_names: &[String; 2],
+) {
+    for (index, name) in logic_channel_names.iter().enumerate() {
+        metadata.insert(
+            format!("logic.ch{index}.name"),
+            normalized_channel_name(name),
+        );
+    }
+    for (index, name) in scope_channel_names.iter().enumerate() {
+        metadata.insert(
+            format!("scope.ch{index}.name"),
+            normalized_channel_name(name),
+        );
+    }
+}
+
 fn start_gui_recording(
     path: &Path,
     devices: &[DeviceDescriptor],
     scope_config: DsCopeCaptureConfig,
+    logic_channel_names: &[String; LOGIC_CHANNEL_COUNT],
+    scope_channel_names: &[String; 2],
 ) -> Result<FileRecorder, String> {
     let file = OpenOptions::new()
         .write(true)
@@ -4726,6 +4887,7 @@ fn start_gui_recording(
         SAMPLE_RATE_HZ.to_string(),
     );
     metadata.insert("logic.sample_count".to_owned(), SAMPLE_COUNT.to_string());
+    insert_channel_name_metadata(&mut metadata, logic_channel_names, scope_channel_names);
     metadata.insert(
         "scope.sample_rate_hz".to_owned(),
         scope_config.sample_rate_hz().to_string(),
@@ -4820,6 +4982,24 @@ fn recording_metadata_value<T: std::str::FromStr>(
     key: &str,
 ) -> Option<T> {
     metadata.get(key)?.parse().ok()
+}
+
+fn channel_names_from_recording_metadata(
+    metadata: &BTreeMap<String, String>,
+) -> ([String; LOGIC_CHANNEL_COUNT], [String; 2]) {
+    let logic_names = std::array::from_fn(|index| {
+        metadata
+            .get(&format!("logic.ch{index}.name"))
+            .map(|name| normalized_channel_name(name))
+            .unwrap_or_default()
+    });
+    let scope_names = std::array::from_fn(|index| {
+        metadata
+            .get(&format!("scope.ch{index}.name"))
+            .map(|name| normalized_channel_name(name))
+            .unwrap_or_default()
+    });
+    (logic_names, scope_names)
 }
 
 fn scope_settings_from_recording_metadata(
@@ -4938,6 +5118,8 @@ fn read_gui_recording(input: impl Read) -> Result<LoadedRecording, String> {
             .contains_key(&format!("scope.ch{index}.enabled"))
     });
     let mut scope_settings = scope_settings_from_recording_metadata(&header.metadata);
+    let (logic_channel_names, scope_channel_names) =
+        channel_names_from_recording_metadata(&header.metadata);
     let mut enabled_scope_channels = scope_settings.channels.map(|channel| channel.enabled);
     if !enabled_scope_channels.into_iter().any(|enabled| enabled) {
         enabled_scope_channels = [true, true];
@@ -4988,6 +5170,8 @@ fn read_gui_recording(input: impl Read) -> Result<LoadedRecording, String> {
             has_scope,
         },
         scope_settings: has_scope.then_some(scope_settings),
+        logic_channel_names,
+        scope_channel_names,
         completion,
     })
 }
@@ -5093,6 +5277,7 @@ const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;
 struct ScopeWaveformOptions<'a> {
     settings: ScopeCaptureSettings,
     function_settings: ScopeFunctionSettings,
+    channel_names: &'a [String; 2],
     measurement_caches: &'a mut [ScopeMeasurementCache; 2],
     measurement_window_positions: &'a mut [Vec2; 2],
     marker_settings: &'a mut ScopeMarkerSettings,
@@ -5140,6 +5325,7 @@ fn combined_waveform_cards(
     waveforms: &WaveformStore,
     logic_ratio: &mut f32,
     logic_channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
+    logic_channel_names: &mut [String; LOGIC_CHANNEL_COUNT],
     viewports: CombinedWaveformViewports<'_>,
     scope_options: ScopeWaveformOptions<'_>,
 ) -> Rect {
@@ -5198,7 +5384,16 @@ fn combined_waveform_cards(
         &mut logic_ui,
         "DIGITAL",
         "DSLogic · channels 0–15",
-        |ui, rect| paint_logic(ui, rect, waveforms, logic_channel_colors, logic_viewport),
+        |ui, rect| {
+            paint_logic(
+                ui,
+                rect,
+                waveforms,
+                logic_channel_colors,
+                logic_channel_names,
+                logic_viewport,
+            )
+        },
     );
 
     let mut scope_ui = ui.new_child(
@@ -5207,10 +5402,11 @@ fn combined_waveform_cards(
             .max_rect(scope_rect)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
+    let scope_subtitle = scope_channels_subtitle(scope_options.channel_names);
     let scope_plot_rect = waveform_card_fill(
         &mut scope_ui,
         "OSCILLOSCOPE",
-        "DSCope · CH0 / CH1",
+        &scope_subtitle,
         |ui, rect| {
             paint_scope(
                 ui,
@@ -5594,11 +5790,16 @@ fn paint_logic(
     rect: Rect,
     waveforms: &WaveformStore,
     channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
+    channel_names: &mut [String; LOGIC_CHANNEL_COUNT],
     viewport: &mut WaveformViewport,
 ) {
     paint_plot_background(ui, rect);
     let painter = ui.painter();
-    let label_width = 42.0;
+    let label_width = if channel_names.iter().any(|name| !name.trim().is_empty()) {
+        130.0
+    } else {
+        42.0
+    };
     let waveform_area = Rect::from_min_max(
         Pos2::new(rect.left() + label_width, rect.top()),
         rect.right_bottom(),
@@ -5634,6 +5835,8 @@ fn paint_logic(
         .floor()
         .max(1.0) as usize;
     for (channel, channel_color) in channel_colors.iter_mut().enumerate() {
+        let channel_name = &mut channel_names[channel];
+        let channel_label = channel_label("D", channel, channel_name);
         let lane_top = plot.top() + channel as f32 * lane_height;
         let high = lane_top + lane_height * 0.25;
         let low = lane_top + lane_height * 0.75;
@@ -5656,7 +5859,7 @@ fn paint_logic(
                 Sense::click(),
             )
             .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(format!("Click to change D{channel} color"));
+            .on_hover_text(format!("Click to edit {channel_label} name and color"));
         if label_response.hovered() {
             painter.rect_filled(
                 label_rect.shrink(1.0),
@@ -5664,10 +5867,10 @@ fn paint_logic(
                 channel_color.gamma_multiply(0.18),
             );
         }
-        painter.text(
+        painter.with_clip_rect(label_rect).text(
             Pos2::new(rect.left() + 4.0, lane_top + lane_height * 0.5),
             egui::Align2::LEFT_CENTER,
-            format!("D{channel}"),
+            &channel_label,
             FontId::monospace(10.0),
             *channel_color,
         );
@@ -5683,7 +5886,18 @@ fn paint_logic(
             egui::popup::PopupCloseBehavior::CloseOnClickOutside,
             |popup_ui| {
                 popup_ui.set_min_width(280.0);
-                popup_ui.label(RichText::new(format!("D{channel} color")).strong());
+                popup_ui.label(RichText::new(format!("D{channel} settings")).strong());
+                popup_ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.add(
+                        egui::TextEdit::singleline(channel_name)
+                            .char_limit(CHANNEL_NAME_MAX_CHARS)
+                            .desired_width(190.0)
+                            .hint_text("Optional name"),
+                    );
+                });
+                popup_ui.separator();
+                popup_ui.label("Color");
                 egui::color_picker::color_picker_color32(
                     popup_ui,
                     channel_color,
@@ -5875,15 +6089,24 @@ fn scope_offset_arrow_at_pointer(
         .map(|(channel, _)| channel)
 }
 
-fn paint_scope_offset_arrows(
-    ui: &egui::Ui,
-    plot: Rect,
+struct ScopeOffsetArrowOptions<'a> {
     settings: ScopeCaptureSettings,
     channel_colors: [Color32; 2],
-    vertical_offsets: &mut [u16; 2],
-    trigger_settings: &mut ScopeTriggerSettings,
+    channel_names: &'a [String; 2],
+    vertical_offsets: &'a mut [u16; 2],
+    trigger_settings: &'a mut ScopeTriggerSettings,
     controls_enabled: bool,
-) {
+}
+
+fn paint_scope_offset_arrows(ui: &egui::Ui, plot: Rect, options: ScopeOffsetArrowOptions<'_>) {
+    let ScopeOffsetArrowOptions {
+        settings,
+        channel_colors,
+        channel_names,
+        vertical_offsets,
+        trigger_settings,
+        controls_enabled,
+    } = options;
     const ARROW_BODY_WIDTH: f32 = 15.0;
     const ARROW_TIP_WIDTH: f32 = 8.0;
     const ARROW_HALF_HEIGHT: f32 = 9.0;
@@ -5915,7 +6138,8 @@ fn paint_scope_offset_arrows(
         response
             .on_hover_cursor(egui::CursorIcon::ResizeVertical)
             .on_hover_text(format!(
-                "CH{channel} vertical offset: {:+.2} div\nDrag to move · double-click to center",
+                "{} vertical offset: {:+.2} div\nDrag to move · double-click to center",
+                scope_channel_label(channel, channel_names),
                 scope_vertical_offset_divisions(plot, vertical_offsets[channel])
             ))
     } else {
@@ -6407,6 +6631,7 @@ struct ScopeMeasurementPaintOptions<'a> {
     settings: ScopeFunctionSettings,
     enabled_channels: [bool; 2],
     channel_colors: [Color32; 2],
+    channel_names: &'a [String; 2],
     caches: &'a mut [ScopeMeasurementCache; 2],
     window_positions: &'a mut [Vec2; 2],
 }
@@ -6424,6 +6649,7 @@ fn paint_scope_measurements(
         settings,
         enabled_channels,
         channel_colors,
+        channel_names,
         caches,
         window_positions,
     } = options;
@@ -6470,7 +6696,10 @@ fn paint_scope_measurements(
                 Sense::drag(),
             )
             .on_hover_cursor(egui::CursorIcon::Grab)
-            .on_hover_text(format!("Drag the CH{channel} measurement window"));
+            .on_hover_text(format!(
+                "Drag the {} measurement window",
+                scope_channel_label(channel, channel_names)
+            ));
         if response.dragged() {
             let delta = ui.input(|input| input.pointer.delta());
             panel = panel.translate(delta);
@@ -6502,7 +6731,10 @@ fn paint_scope_measurements(
         painter.text(
             panel.left_top() + Vec2::new(PADDING, 5.0),
             egui::Align2::LEFT_TOP,
-            format!("CH{channel} MEASUREMENTS"),
+            format!(
+                "{} MEASUREMENTS",
+                scope_channel_label(channel, channel_names)
+            ),
             FontId::monospace(12.0),
             color,
         );
@@ -6573,6 +6805,7 @@ fn scope_measurement_window_position(plot: Rect, panel: Rect) -> Vec2 {
 struct ScopeMarkerPaintOptions<'a> {
     settings: &'a mut ScopeMarkerSettings,
     scope_settings: ScopeCaptureSettings,
+    channel_names: &'a [String; 2],
     sample_count: usize,
     sample_rate_hz: u64,
     viewport: WaveformViewport,
@@ -6587,6 +6820,7 @@ fn paint_scope_markers(
     let ScopeMarkerPaintOptions {
         settings: marker_settings,
         scope_settings,
+        channel_names,
         sample_count,
         sample_rate_hz,
         viewport,
@@ -6614,7 +6848,11 @@ fn paint_scope_markers(
                     Sense::drag(),
                 )
                 .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
-                .on_hover_text(format!("Drag CH{channel} T{} horizontally", index + 1));
+                .on_hover_text(format!(
+                    "Drag {} T{} horizontally",
+                    scope_channel_label(channel, channel_names),
+                    index + 1
+                ));
             if response.dragged() {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     *position = ((pointer.x - plot.left()) / plot.width().max(1.0)).clamp(0.0, 1.0);
@@ -6653,14 +6891,16 @@ fn paint_scope_markers(
             let frequency = (delta_seconds > 0.0).then(|| 1.0 / delta_seconds);
             let text = match frequency {
                 Some(frequency) => format!(
-                    "CH{channel} T{}–T{}  {}  ·  {}",
+                    "{} T{}–T{}  {}  ·  {}",
+                    scope_channel_label(channel, channel_names),
                     index + 1,
                     other + 1,
                     format_duration(Duration::from_secs_f64(delta_seconds)),
                     format_frequency(frequency)
                 ),
                 None => format!(
-                    "CH{channel} T{}–T{}  {}",
+                    "{} T{}–T{}  {}",
+                    scope_channel_label(channel, channel_names),
                     index + 1,
                     other + 1,
                     format_duration(Duration::from_secs_f64(delta_seconds))
@@ -6697,7 +6937,11 @@ fn paint_scope_markers(
                     Sense::drag(),
                 )
                 .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-                .on_hover_text(format!("Drag CH{channel} V{} vertically", index + 1));
+                .on_hover_text(format!(
+                    "Drag {} V{} vertically",
+                    scope_channel_label(channel, channel_names),
+                    index + 1
+                ));
             if response.dragged() {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     *position = ((pointer.y - plot.top()) / plot.height().max(1.0)).clamp(0.0, 1.0);
@@ -6741,7 +6985,8 @@ fn paint_scope_markers(
                 plot,
                 Pos2::new(center_x, center_y),
                 &format!(
-                    "CH{channel} V{}–V{}  {}",
+                    "{} V{}–V{}  {}",
+                    scope_channel_label(channel, channel_names),
                     index + 1,
                     other + 1,
                     format_marker_voltage(delta_voltage)
@@ -6904,19 +7149,20 @@ fn scope_math_unit(operation: ScopeMathOperation) -> &'static str {
     }
 }
 
-struct ScopeMathPaintOptions {
+struct ScopeMathPaintOptions<'a> {
     viewport: WaveformViewport,
     sample_count: usize,
     visible_range: Range<usize>,
     step: usize,
     settings: ScopeMathSettings,
+    channel_names: &'a [String; 2],
 }
 
 fn paint_scope_math_trace(
     painter: &egui::Painter,
     plot: Rect,
     waveforms: &WaveformStore,
-    options: ScopeMathPaintOptions,
+    options: ScopeMathPaintOptions<'_>,
 ) {
     let ScopeMathPaintOptions {
         viewport,
@@ -6924,6 +7170,7 @@ fn paint_scope_math_trace(
         visible_range,
         step,
         settings,
+        channel_names,
     } = options;
     if !settings.enabled || visible_range.is_empty() {
         return;
@@ -6968,10 +7215,10 @@ fn paint_scope_math_trace(
         plot.right_top() + Vec2::new(-8.0, 7.0),
         egui::Align2::RIGHT_TOP,
         format!(
-            "M  CH{} {} CH{}  auto ±{:.3} {}",
-            settings.left_channel,
+            "M  {} {} {}  auto ±{:.3} {}",
+            scope_channel_label(settings.left_channel, channel_names),
             settings.operation.symbol(),
-            settings.right_channel,
+            scope_channel_label(settings.right_channel, channel_names),
             maximum,
             scope_math_unit(settings.operation),
         ),
@@ -7121,15 +7368,27 @@ fn update_scope_fft_viewport(
     response
 }
 
+struct ScopeFftPaintOptions<'a> {
+    viewport: WaveformViewport,
+    fft_viewport: &'a mut ScopeFftViewport,
+    settings: ScopeFftSettings,
+    channel_names: &'a [String; 2],
+    square_grid_cells: bool,
+}
+
 fn paint_scope_fft(
     ui: &egui::Ui,
     rect: Rect,
     waveforms: &WaveformStore,
-    viewport: WaveformViewport,
-    fft_viewport: &mut ScopeFftViewport,
-    settings: ScopeFftSettings,
-    square_grid_cells: bool,
+    options: ScopeFftPaintOptions<'_>,
 ) {
+    let ScopeFftPaintOptions {
+        viewport,
+        fft_viewport,
+        settings,
+        channel_names,
+        square_grid_cells,
+    } = options;
     const MIN_DBV: f32 = -120.0;
     const MAX_DBV: f32 = 20.0;
     let rect = if square_grid_cells {
@@ -7196,8 +7455,8 @@ fn paint_scope_fft(
         rect.left_top() + Vec2::new(8.0, 7.0),
         egui::Align2::LEFT_TOP,
         format!(
-            "FFT · CH{} · {} · {fft_length} pts",
-            settings.channel,
+            "FFT · {} · {} · {fft_length} pts",
+            scope_channel_label(settings.channel, channel_names),
             settings.window.label(),
         ),
         FontId::monospace(10.0),
@@ -7303,15 +7562,27 @@ fn paint_scope_xy_graticule(painter: &egui::Painter, plot: Rect) {
     }
 }
 
-fn paint_scope_lissajous(
-    ui: &egui::Ui,
-    rect: Rect,
-    waveforms: &WaveformStore,
+struct ScopeLissajousPaintOptions<'a> {
     viewport: WaveformViewport,
     settings: ScopeCaptureSettings,
     lissajous: ScopeLissajousSettings,
     channel_colors: [Color32; 2],
+    channel_names: &'a [String; 2],
+}
+
+fn paint_scope_lissajous(
+    ui: &egui::Ui,
+    rect: Rect,
+    waveforms: &WaveformStore,
+    options: ScopeLissajousPaintOptions<'_>,
 ) {
+    let ScopeLissajousPaintOptions {
+        viewport,
+        settings,
+        lissajous,
+        channel_colors,
+        channel_names,
+    } = options;
     let panel_side = rect.width().min(rect.height()).max(1.0);
     let panel = Rect::from_center_size(rect.center(), Vec2::splat(panel_side));
     paint_plot_background(ui, panel);
@@ -7338,7 +7609,11 @@ fn paint_scope_lissajous(
     painter.text(
         header.right_center() + Vec2::new(-6.0, 0.0),
         egui::Align2::RIGHT_CENTER,
-        format!("X CH{x_index} · Y CH{y_index}"),
+        format!(
+            "X {} · Y {}",
+            scope_channel_label(x_index, channel_names),
+            scope_channel_label(y_index, channel_names)
+        ),
         FontId::monospace(10.0),
         TEXT_MUTED,
     );
@@ -7398,7 +7673,8 @@ fn paint_scope_lissajous(
         plot.left_bottom() + Vec2::new(4.0, -4.0),
         egui::Align2::LEFT_BOTTOM,
         format!(
-            "X · CH{x_index} · {} · {}× probe",
+            "X · {} · {} · {}× probe",
+            scope_channel_label(x_index, channel_names),
             format_input_scale(x_channel.volts_per_div_mv),
             x_channel.probe_attenuation
         ),
@@ -7409,7 +7685,8 @@ fn paint_scope_lissajous(
         plot.left_top() + Vec2::new(4.0, 4.0),
         egui::Align2::LEFT_TOP,
         format!(
-            "Y · CH{y_index} · {} · {}× probe",
+            "Y · {} · {} · {}× probe",
+            scope_channel_label(y_index, channel_names),
             format_input_scale(y_channel.volts_per_div_mv),
             y_channel.probe_attenuation
         ),
@@ -7428,6 +7705,7 @@ fn paint_scope(
     scope_options: ScopeWaveformOptions<'_>,
 ) {
     let fft_settings = scope_options.function_settings.fft;
+    let channel_names = scope_options.channel_names;
     if !fft_settings.enabled {
         paint_scope_time_domain(
             ui,
@@ -7461,10 +7739,13 @@ fn paint_scope(
         ui,
         fft_rect,
         waveforms,
-        *viewport,
-        fft_viewport,
-        fft_settings,
-        square_grid_cells,
+        ScopeFftPaintOptions {
+            viewport: *viewport,
+            fft_viewport,
+            settings: fft_settings,
+            channel_names,
+            square_grid_cells,
+        },
     );
 }
 
@@ -7487,6 +7768,7 @@ fn paint_scope_time_domain(
     let ScopeWaveformOptions {
         mut settings,
         function_settings,
+        channel_names,
         measurement_caches,
         measurement_window_positions,
         marker_settings,
@@ -7578,11 +7860,14 @@ fn paint_scope_time_domain(
         paint_scope_offset_arrows(
             ui,
             plot,
-            settings,
-            channel_colors,
-            vertical_offsets,
-            trigger_settings,
-            offset_controls_enabled,
+            ScopeOffsetArrowOptions {
+                settings,
+                channel_colors,
+                channel_names,
+                vertical_offsets,
+                trigger_settings,
+                controls_enabled: offset_controls_enabled,
+            },
         );
         paint_scope_trigger_level(
             ui,
@@ -7600,6 +7885,7 @@ fn paint_scope_time_domain(
             ScopeMarkerPaintOptions {
                 settings: marker_settings,
                 scope_settings: settings,
+                channel_names,
                 sample_count: display_sample_count,
                 sample_rate_hz: display_sample_rate_hz,
                 viewport: *viewport,
@@ -7676,6 +7962,7 @@ fn paint_scope_time_domain(
             visible_range: visible_range.clone(),
             step,
             settings: function_settings.math,
+            channel_names,
         },
     );
 
@@ -7684,11 +7971,14 @@ fn paint_scope_time_domain(
     paint_scope_offset_arrows(
         ui,
         plot,
-        settings,
-        channel_colors,
-        vertical_offsets,
-        trigger_settings,
-        offset_controls_enabled,
+        ScopeOffsetArrowOptions {
+            settings,
+            channel_colors,
+            channel_names,
+            vertical_offsets,
+            trigger_settings,
+            controls_enabled: offset_controls_enabled,
+        },
     );
     paint_scope_trigger_level(
         ui,
@@ -7706,6 +7996,7 @@ fn paint_scope_time_domain(
         ScopeMarkerPaintOptions {
             settings: marker_settings,
             scope_settings: settings,
+            channel_names,
             sample_count: display_sample_count,
             sample_rate_hz: display_sample_rate_hz,
             viewport: *viewport,
@@ -7722,6 +8013,7 @@ fn paint_scope_time_domain(
             settings: function_settings,
             enabled_channels: settings.channels.map(|channel| channel.enabled),
             channel_colors,
+            channel_names,
             caches: measurement_caches,
             window_positions: measurement_window_positions,
         },
@@ -7801,6 +8093,10 @@ mod tests {
         metadata.insert("scope.ch1.volts_per_div_mv".to_owned(), "500".to_owned());
         metadata.insert("scope.ch1.coupling".to_owned(), "ac".to_owned());
         metadata.insert("scope.ch1.probe_attenuation".to_owned(), "10".to_owned());
+        metadata.insert("logic.ch0.name".to_owned(), "Clock".to_owned());
+        metadata.insert("logic.ch1.name".to_owned(), "  Data  ".to_owned());
+        metadata.insert("scope.ch0.name".to_owned(), "Input".to_owned());
+        metadata.insert("scope.ch1.name".to_owned(), "Reference".to_owned());
         let mut bytes = Vec::new();
         {
             let mut writer = RecordingWriter::new(&mut bytes, &descriptors, metadata)
@@ -7855,6 +8151,40 @@ mod tests {
         assert_eq!(scope_settings.channels[1].volts_per_div_mv, 500);
         assert_eq!(scope_settings.channels[1].coupling, DsCopeCoupling::Ac);
         assert_eq!(scope_settings.channels[1].probe_attenuation, 10);
+        assert_eq!(loaded.logic_channel_names[0], "Clock");
+        assert_eq!(loaded.logic_channel_names[1], "Data");
+        assert_eq!(loaded.scope_channel_names, ["Input", "Reference"]);
+    }
+
+    #[test]
+    fn recordings_without_channel_names_use_hardware_identifiers() {
+        let (logic_names, scope_names) = channel_names_from_recording_metadata(&BTreeMap::new());
+
+        assert!(logic_names.iter().all(String::is_empty));
+        assert!(scope_names.iter().all(String::is_empty));
+        assert_eq!(channel_label("D", 0, &logic_names[0]), "D0");
+        assert_eq!(scope_channel_label(1, &scope_names), "CH1");
+    }
+
+    #[test]
+    fn recording_metadata_saves_normalized_channel_names() {
+        let mut logic_names = empty_logic_channel_names();
+        logic_names[0] = "  Clock  ".to_owned();
+        let mut scope_names = empty_scope_channel_names();
+        scope_names[1] = "Reference".to_owned();
+        let mut metadata = BTreeMap::new();
+
+        insert_channel_name_metadata(&mut metadata, &logic_names, &scope_names);
+
+        assert_eq!(
+            metadata.get("logic.ch0.name").map(String::as_str),
+            Some("Clock")
+        );
+        assert_eq!(metadata.get("logic.ch1.name").map(String::as_str), Some(""));
+        assert_eq!(
+            metadata.get("scope.ch1.name").map(String::as_str),
+            Some("Reference")
+        );
     }
 
     #[test]
