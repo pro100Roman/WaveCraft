@@ -1187,7 +1187,11 @@ fn calibrate_vertical_transform(
 }
 
 fn calibration_span_margin(bottom: f64, top: f64, expected_span: f64) -> f64 {
-    (bottom - top).abs() - expected_span
+    // Keep the direction of the transfer just like the vendor calibration.
+    // Dropping the sign can accept an inverted response and then program a
+    // transform that makes the captured zero drift away from its marker as
+    // the vertical position is moved.
+    bottom - top - expected_span
 }
 
 fn vertical_transform_is_saturated(transform: i32, margin: f64) -> bool {
@@ -1398,6 +1402,10 @@ fn calibration_center_margins(
     calibration_sample_count: u64,
 ) -> Result<[f64; CHANNEL_COUNT], CaptureError> {
     let means = measurement.channel_means(calibration_sample_count)?;
+    // Runtime voltage conversion uses the per-channel hardware reference from
+    // the measurement footer. Center calibration on that same reference so a
+    // grounded input decodes to zero even when the device's actual midpoint
+    // differs from the nominal command value of 128.
     Ok(std::array::from_fn(|channel| {
         f64::from(measurement.hardware_offsets[channel]) - means[channel]
     }))
@@ -2885,15 +2893,15 @@ mod tests {
     }
 
     #[test]
-    fn calibrates_vertical_span_independently_of_adc_polarity() {
+    fn calibrates_vertical_span_with_the_vendor_transfer_direction() {
         assert_eq!(calibration_span_margin(240.0, 15.0, 225.0), 0.0);
-        assert_eq!(calibration_span_margin(15.0, 240.0, 225.0), 0.0);
+        assert_eq!(calibration_span_margin(15.0, 240.0, 225.0), -450.0);
         assert_eq!(calibration_span_margin(245.0, 15.0, 225.0), 5.0);
-        assert_eq!(calibration_span_margin(15.0, 245.0, 225.0), 5.0);
+        assert_eq!(calibration_span_margin(235.0, 15.0, 225.0), -5.0);
     }
 
     #[test]
-    fn centers_calibration_on_the_real_packet_hardware_offsets() {
+    fn centers_calibration_on_the_runtime_hardware_reference() {
         let measurement = ScopeMeasurement {
             sample_count: 100,
             triggered: false,

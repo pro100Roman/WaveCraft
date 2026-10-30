@@ -15,10 +15,11 @@ use dsview_usb::{
     DsCopeOperationMode, DsCopeRuntimeCalibrationControl, DsCopeRuntimeTriggerControl,
     DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig,
     DsLogicCaptureSource, LinkStatus, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
-    DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
-    DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
-    DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
-    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
+    DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX,
+    DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
+    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
+    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
+    DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use image::ImageFormat;
@@ -880,13 +881,13 @@ impl ScopeCaptureSettings {
     fn capture_config(self) -> Result<DsCopeCaptureConfig, String> {
         let mut channels = [DsCopeChannelConfig::default(); 2];
         for (destination, source) in channels.iter_mut().zip(self.channels) {
+            // Keep the analog frontend centered. `ScopeChannelSettings` keeps
+            // the independently movable display offset used by the plot.
             *destination = DsCopeChannelConfig::new(
                 source.volts_per_div_mv,
                 source.coupling,
                 source.probe_attenuation,
             )
-            .map_err(|error| error.to_string())?
-            .with_vertical_offset(source.vertical_offset)
             .map_err(|error| error.to_string())?
             .with_enabled(source.enabled);
         }
@@ -954,7 +955,6 @@ impl ScopeCaptureSettings {
                     left.enabled != right.enabled
                         || left.volts_per_div_mv != right.volts_per_div_mv
                         || left.coupling != right.coupling
-                        || left.vertical_offset != right.vertical_offset
                 })
             || self.trigger.hardware_differs_from(other.trigger)
     }
@@ -964,9 +964,7 @@ impl ScopeCaptureSettings {
             .iter()
             .zip(other.channels)
             .any(|(left, right)| {
-                left.enabled != right.enabled
-                    || left.volts_per_div_mv != right.volts_per_div_mv
-                    || left.vertical_offset != right.vertical_offset
+                left.enabled != right.enabled || left.volts_per_div_mv != right.volts_per_div_mv
             })
     }
 
@@ -2374,6 +2372,7 @@ impl DsViewApp {
                             path,
                             session.descriptors(),
                             scope_config,
+                            self.scope_settings,
                             &self.logic_channel_names,
                             &self.scope_channel_names,
                         ) {
@@ -5232,6 +5231,7 @@ fn start_gui_recording(
     path: &Path,
     devices: &[DeviceDescriptor],
     scope_config: DsCopeCaptureConfig,
+    scope_settings: ScopeCaptureSettings,
     logic_channel_names: &[String; LOGIC_CHANNEL_COUNT],
     scope_channel_names: &[String; 2],
 ) -> Result<FileRecorder, String> {
@@ -5307,26 +5307,26 @@ fn start_gui_recording(
             level.to_string(),
         );
     }
-    for (index, channel) in scope_config.channels().iter().enumerate() {
+    for (index, channel) in scope_settings.channels.iter().enumerate() {
         metadata.insert(
             format!("scope.ch{index}.enabled"),
-            channel.enabled().to_string(),
+            channel.enabled.to_string(),
         );
         metadata.insert(
             format!("scope.ch{index}.volts_per_div_mv"),
-            channel.volts_per_div_mv().to_string(),
+            channel.volts_per_div_mv.to_string(),
         );
         metadata.insert(
             format!("scope.ch{index}.coupling"),
-            coupling_label(channel.coupling()).to_ascii_lowercase(),
+            coupling_label(channel.coupling).to_ascii_lowercase(),
         );
         metadata.insert(
             format!("scope.ch{index}.probe_attenuation"),
-            channel.probe_attenuation().to_string(),
+            channel.probe_attenuation.to_string(),
         );
         metadata.insert(
             format!("scope.ch{index}.vertical_offset"),
-            channel.vertical_offset().to_string(),
+            channel.vertical_offset.to_string(),
         );
     }
     RecordingWriter::new(BufWriter::new(file), devices, metadata).map_err(|error| error.to_string())
@@ -6459,7 +6459,6 @@ struct ScopeOffsetArrowOptions<'a> {
     channel_colors: [Color32; 2],
     channel_names: &'a [String; 2],
     vertical_offsets: &'a mut [u16; 2],
-    trigger_settings: &'a mut ScopeTriggerSettings,
     controls_enabled: bool,
 }
 
@@ -6469,7 +6468,6 @@ fn paint_scope_offset_arrows(ui: &egui::Ui, plot: Rect, options: ScopeOffsetArro
         channel_colors,
         channel_names,
         vertical_offsets,
-        trigger_settings,
         controls_enabled,
     } = options;
     const ARROW_BODY_WIDTH: f32 = 15.0;
@@ -6512,7 +6510,6 @@ fn paint_scope_offset_arrows(ui: &egui::Ui, plot: Rect, options: ScopeOffsetArro
     };
 
     if controls_enabled {
-        let previous_offsets = *vertical_offsets;
         if response.drag_started() {
             let channel = response.interact_pointer_pos().and_then(|pointer| {
                 scope_offset_arrow_at_pointer(plot, pointer.y, settings, vertical_offsets)
@@ -6538,15 +6535,6 @@ fn paint_scope_offset_arrows(ui: &egui::Ui, plot: Rect, options: ScopeOffsetArro
         }
         if response.drag_stopped() {
             ui.data_mut(|data| data.remove_temp::<usize>(interaction_id));
-        }
-        for channel in 0..vertical_offsets.len() {
-            if vertical_offsets[channel] != previous_offsets[channel] {
-                trigger_settings.levels[channel] = shift_scope_trigger_level(
-                    trigger_settings.levels[channel],
-                    previous_offsets[channel],
-                    vertical_offsets[channel],
-                );
-            }
         }
     }
 
@@ -6610,18 +6598,11 @@ fn scope_trigger_level_y(plot: Rect, channel: ScopeChannelSettings, trigger_leve
     )
 }
 
-fn shift_scope_trigger_level(level: u8, old_offset: u16, new_offset: u16) -> u8 {
-    (i32::from(level) + i32::from(new_offset) - i32::from(old_offset)).clamp(
-        i32::from(DSCOPE_TRIGGER_LEVEL_MIN),
-        i32::from(DSCOPE_TRIGGER_LEVEL_MAX),
-    ) as u8
-}
-
 fn scope_trigger_level_from_y(plot: Rect, y: f32, channel: ScopeChannelSettings) -> u8 {
     let zero_y = scope_vertical_offset_y(plot, channel.vertical_offset);
     let screen_divisions = (y - zero_y) / plot.height().max(1.0) * SCOPE_VERTICAL_DIVISIONS as f32;
     let reference_span = f32::from(DSCOPE_VERTICAL_OFFSET_MAX - DSCOPE_VERTICAL_OFFSET_MIN);
-    let level = (f32::from(channel.vertical_offset)
+    let level = (f32::from(DSCOPE_VERTICAL_OFFSET_CENTER)
         + screen_divisions / SCOPE_ADC_VERTICAL_DIVISIONS * reference_span)
         .round()
         .clamp(
@@ -6646,7 +6627,8 @@ fn scope_trigger_threshold_voltage(channel: ScopeChannelSettings, trigger_level:
     let input_span = f32::from(channel.volts_per_div_mv) / 1_000.0
         * SCOPE_ADC_VERTICAL_DIVISIONS
         * f32::from(channel.probe_attenuation);
-    (f32::from(channel.vertical_offset) - f32::from(trigger_level)) / reference_span * input_span
+    (f32::from(DSCOPE_VERTICAL_OFFSET_CENTER) - f32::from(trigger_level)) / reference_span
+        * input_span
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -7000,10 +6982,7 @@ fn paint_scope_trigger_level(
 
         if controls_enabled {
             if response.double_clicked() {
-                settings.levels[channel] = vertical_offsets[channel].clamp(
-                    u16::from(DSCOPE_TRIGGER_LEVEL_MIN),
-                    u16::from(DSCOPE_TRIGGER_LEVEL_MAX),
-                ) as u8;
+                settings.levels[channel] = DSCOPE_TRIGGER_LEVEL_CENTER;
             } else if response.dragged() {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     settings.levels[channel] =
@@ -8297,7 +8276,6 @@ fn paint_scope_time_domain(
                 channel_colors,
                 channel_names,
                 vertical_offsets,
-                trigger_settings,
                 controls_enabled: offset_controls_enabled,
             },
         );
@@ -8412,7 +8390,6 @@ fn paint_scope_time_domain(
             channel_colors,
             channel_names,
             vertical_offsets,
-            trigger_settings,
             controls_enabled: offset_controls_enabled,
         },
     );
@@ -9599,11 +9576,17 @@ mod tests {
         assert_eq!(config.channels()[0].volts_per_div_mv(), 100);
         assert_eq!(config.channels()[0].coupling(), DsCopeCoupling::Ac);
         assert_eq!(config.channels()[0].probe_attenuation(), 100);
-        assert_eq!(config.channels()[0].vertical_offset(), 64);
+        assert_eq!(
+            config.channels()[0].vertical_offset(),
+            DSCOPE_VERTICAL_OFFSET_CENTER
+        );
         assert_eq!(config.channels()[1].volts_per_div_mv(), 2_000);
         assert_eq!(config.channels()[1].coupling(), DsCopeCoupling::Dc);
         assert_eq!(config.channels()[1].probe_attenuation(), 1);
-        assert_eq!(config.channels()[1].vertical_offset(), 192);
+        assert_eq!(
+            config.channels()[1].vertical_offset(),
+            DSCOPE_VERTICAL_OFFSET_CENTER
+        );
         assert!(!config.channels()[1].enabled());
         assert_eq!(config.trigger().position_percent(), 75);
         assert_eq!(config.trigger().source(), DsCopeTriggerSource::ChannelZero);
@@ -9613,7 +9596,14 @@ mod tests {
         assert_eq!(config.trigger().levels(), [64, 192]);
         assert_eq!(config.operation_mode(), DsCopeOperationMode::InternalTest);
         assert_eq!(config.bandwidth_limit(), DsCopeBandwidthLimit::Mhz20);
-        assert_eq!(ScopeCaptureSettings::from_capture_config(config), settings);
+        let mut hardware_settings = settings;
+        for channel in &mut hardware_settings.channels {
+            channel.vertical_offset = DSCOPE_VERTICAL_OFFSET_CENTER;
+        }
+        assert_eq!(
+            ScopeCaptureSettings::from_capture_config(config),
+            hardware_settings
+        );
         assert_eq!(format_sample_rate(1_000_000), "1.00 MSa/s");
         assert_eq!(format_sample_rate(1_000_000_000), "1.00 GSa/s");
     }
@@ -9653,8 +9643,8 @@ mod tests {
 
         changed = original;
         changed.channels[0].vertical_offset = 64;
-        assert!(changed.frontend_differs_from(original));
-        assert!(changed.runtime_frontend_differs_from(original));
+        assert!(!changed.frontend_differs_from(original));
+        assert!(!changed.runtime_frontend_differs_from(original));
 
         changed = original;
         changed.channels[0].coupling = DsCopeCoupling::Ac;
@@ -9697,7 +9687,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_trigger_levels_use_vendor_limits_and_follow_channel_offsets() {
+    fn scope_trigger_levels_use_centered_hardware_and_follow_display_offsets() {
         let plot = Rect::from_min_max(Pos2::new(0.0, 20.0), Pos2::new(100.0, 220.0));
         let channel = ScopeChannelSettings::default();
 
@@ -9712,9 +9702,24 @@ mod tests {
         );
         assert!((scope_trigger_threshold_voltage(channel, 128)).abs() < f32::EPSILON);
         assert!((scope_trigger_threshold_voltage(channel, 104) - 1.021_276_6).abs() < 0.000_001);
-        assert_eq!(shift_scope_trigger_level(128, 128, 160), 160);
-        assert_eq!(shift_scope_trigger_level(220, 128, 160), 232);
-        assert_eq!(shift_scope_trigger_level(32, 128, 96), 24);
+
+        let shifted_channel = ScopeChannelSettings {
+            vertical_offset: 160,
+            ..channel
+        };
+        let shifted_zero_y = scope_vertical_offset_y(plot, 160);
+        assert_eq!(
+            scope_trigger_level_y(plot, shifted_channel, DSCOPE_TRIGGER_LEVEL_CENTER),
+            shifted_zero_y
+        );
+        assert_eq!(
+            scope_trigger_level_from_y(plot, shifted_zero_y, shifted_channel),
+            DSCOPE_TRIGGER_LEVEL_CENTER
+        );
+        assert_eq!(
+            scope_trigger_threshold_voltage(shifted_channel, 104),
+            scope_trigger_threshold_voltage(channel, 104)
+        );
         assert_eq!(format_trigger_voltage(0.0), "0.00 mV");
         assert_eq!(format_trigger_voltage(0.125), "125 mV");
         assert_eq!(format_trigger_voltage(-1.25), "-1.25 V");
