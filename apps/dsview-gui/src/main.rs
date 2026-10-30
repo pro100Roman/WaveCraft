@@ -1295,6 +1295,10 @@ struct DsViewApp {
     last_error: Option<String>,
 }
 
+fn default_scope_measurement_window_positions() -> [Vec2; 2] {
+    [Vec2::new(1.0, 1.0), Vec2::new(0.0, 1.0)]
+}
+
 impl DsViewApp {
     fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         configure_style(&creation_context.egui_ctx);
@@ -1322,7 +1326,7 @@ impl DsViewApp {
             scope_viewport: WaveformViewport::default(),
             scope_fft_viewport: ScopeFftViewport::default(),
             scope_measurement_caches: [ScopeMeasurementCache::default(); 2],
-            scope_measurement_window_positions: [Vec2::new(1.0, 0.0), Vec2::new(0.0, 0.0)],
+            scope_measurement_window_positions: default_scope_measurement_window_positions(),
             snapshot_plot_rect: None,
             pending_snapshot: None,
             scope_time_per_division_seconds: Some(DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS),
@@ -3542,7 +3546,6 @@ impl eframe::App for DsViewApp {
                                     waveforms,
                                     &mut logic_channel_colors,
                                     &mut logic_viewport,
-                                    false,
                                 )
                             },
                         ));
@@ -3559,6 +3562,7 @@ impl eframe::App for DsViewApp {
                                     waveforms,
                                     &mut scope_viewport,
                                     &mut scope_fft_viewport,
+                                    true,
                                     ScopeWaveformOptions {
                                         settings: scope_settings,
                                         function_settings: self.scope_function_settings,
@@ -4596,16 +4600,7 @@ fn combined_waveform_cards(
         &mut logic_ui,
         "DIGITAL",
         "DSLogic · channels 0–15",
-        |ui, rect| {
-            paint_logic(
-                ui,
-                rect,
-                waveforms,
-                logic_channel_colors,
-                logic_viewport,
-                true,
-            )
-        },
+        |ui, rect| paint_logic(ui, rect, waveforms, logic_channel_colors, logic_viewport),
     );
 
     let mut scope_ui = ui.new_child(
@@ -4625,6 +4620,7 @@ fn combined_waveform_cards(
                 waveforms,
                 scope_viewport,
                 scope_fft_viewport,
+                false,
                 scope_options,
             )
         },
@@ -4995,21 +4991,12 @@ fn paint_logic_zero_reference(painter: &egui::Painter, plot: Rect, y: f32, chann
     }
 }
 
-fn logic_plot_rect(area: Rect, square_grid_cells: bool) -> Rect {
-    if square_grid_cells {
-        fit_rect_to_grid(area, 10, 4)
-    } else {
-        area
-    }
-}
-
 fn paint_logic(
     ui: &egui::Ui,
     rect: Rect,
     waveforms: &WaveformStore,
     channel_colors: &mut [Color32; LOGIC_CHANNEL_COUNT],
     viewport: &mut WaveformViewport,
-    square_grid_cells: bool,
 ) {
     paint_plot_background(ui, rect);
     let painter = ui.painter();
@@ -5019,7 +5006,7 @@ fn paint_logic(
         rect.right_bottom(),
     );
     let (status_area, ruler_area, plot_area) = split_waveform_chrome(waveform_area);
-    let plot = logic_plot_rect(plot_area, square_grid_cells);
+    let plot = plot_area;
     let (status_bar, time_ruler) = align_waveform_chrome(status_area, ruler_area, plot);
     paint_plot_grid(ui, plot);
     let sample_count = waveforms.logic_samples.len();
@@ -6517,10 +6504,15 @@ fn paint_scope_fft(
     viewport: WaveformViewport,
     fft_viewport: &mut ScopeFftViewport,
     settings: ScopeFftSettings,
+    square_grid_cells: bool,
 ) {
     const MIN_DBV: f32 = -120.0;
     const MAX_DBV: f32 = 20.0;
-    let rect = fit_rect_to_grid(rect, 10, 4);
+    let rect = if square_grid_cells {
+        fit_rect_to_grid(rect, 10, 4)
+    } else {
+        rect
+    };
     paint_plot_background(ui, rect);
     let painter = ui.painter().with_clip_rect(rect);
     paint_plot_grid(ui, rect);
@@ -6808,11 +6800,19 @@ fn paint_scope(
     waveforms: &WaveformStore,
     viewport: &mut WaveformViewport,
     fft_viewport: &mut ScopeFftViewport,
+    square_grid_cells: bool,
     scope_options: ScopeWaveformOptions<'_>,
 ) {
     let fft_settings = scope_options.function_settings.fft;
     if !fft_settings.enabled {
-        paint_scope_time_domain(ui, rect, waveforms, viewport, scope_options);
+        paint_scope_time_domain(
+            ui,
+            rect,
+            waveforms,
+            viewport,
+            square_grid_cells,
+            scope_options,
+        );
         return;
     }
 
@@ -6825,7 +6825,14 @@ fn paint_scope(
         Pos2::new(rect.left(), time_rect.bottom() + FFT_GAP),
         Vec2::new(rect.width(), fft_height),
     );
-    paint_scope_time_domain(ui, time_rect, waveforms, viewport, scope_options);
+    paint_scope_time_domain(
+        ui,
+        time_rect,
+        waveforms,
+        viewport,
+        square_grid_cells,
+        scope_options,
+    );
     paint_scope_fft(
         ui,
         fft_rect,
@@ -6833,7 +6840,16 @@ fn paint_scope(
         *viewport,
         fft_viewport,
         fft_settings,
+        square_grid_cells,
     );
+}
+
+fn scope_plot_rect(area: Rect, square_grid_cells: bool) -> Rect {
+    if square_grid_cells {
+        fit_rect_to_grid(area, SCOPE_HORIZONTAL_DIVISIONS, SCOPE_VERTICAL_DIVISIONS)
+    } else {
+        area
+    }
 }
 
 fn paint_scope_time_domain(
@@ -6841,6 +6857,7 @@ fn paint_scope_time_domain(
     rect: Rect,
     waveforms: &WaveformStore,
     viewport: &mut WaveformViewport,
+    square_grid_cells: bool,
     scope_options: ScopeWaveformOptions<'_>,
 ) {
     let ScopeWaveformOptions {
@@ -6890,11 +6907,7 @@ fn paint_scope_time_domain(
     paint_plot_background(ui, rect);
     let painter = ui.painter();
     let (status_area, ruler_area, plot_area) = split_waveform_chrome(rect);
-    let plot = fit_rect_to_grid(
-        plot_area,
-        SCOPE_HORIZONTAL_DIVISIONS,
-        SCOPE_VERTICAL_DIVISIONS,
-    );
+    let plot = scope_plot_rect(plot_area, square_grid_cells);
     let (status_bar, time_ruler) = align_waveform_chrome(status_area, ruler_area, plot);
     let scope_painter = painter.with_clip_rect(plot);
     paint_scope_graticule(&scope_painter, plot);
@@ -7560,15 +7573,14 @@ mod tests {
         assert!((scope_grid.height() - 800.0).abs() < 0.001);
         assert!((scope_grid.center().x - wide_area.center().x).abs() < 0.001);
         assert!((scope_grid.width() / 10.0 - scope_grid.height() / 8.0).abs() < 0.001);
+        assert_eq!(scope_plot_rect(wide_area, false), wide_area);
+        assert_eq!(scope_plot_rect(wide_area, true), scope_grid);
 
         let square_area = Rect::from_min_size(Pos2::ZERO, Vec2::splat(800.0));
-        let logic_grid = fit_rect_to_grid(square_area, 10, 4);
-        assert!((logic_grid.width() - 800.0).abs() < 0.001);
-        assert!((logic_grid.height() - 320.0).abs() < 0.001);
-        assert!((logic_grid.width() / 10.0 - logic_grid.height() / 4.0).abs() < 0.001);
-
-        assert_eq!(logic_plot_rect(square_area, false), square_area);
-        assert_eq!(logic_plot_rect(square_area, true), logic_grid);
+        let fft_grid = fit_rect_to_grid(square_area, 10, 4);
+        assert!((fft_grid.width() - 800.0).abs() < 0.001);
+        assert!((fft_grid.height() - 320.0).abs() < 0.001);
+        assert!((fft_grid.width() / 10.0 - fft_grid.height() / 4.0).abs() < 0.001);
     }
 
     #[test]
@@ -7751,6 +7763,12 @@ mod tests {
     fn floating_measurement_windows_stay_relative_to_the_plot() {
         let plot = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(800.0, 400.0));
         let size = Vec2::new(200.0, 100.0);
+
+        let [channel_zero, channel_one] = default_scope_measurement_window_positions();
+        let bottom_right = scope_measurement_window_rect(plot, size, channel_zero);
+        assert_eq!(bottom_right.right_bottom(), plot.right_bottom());
+        let bottom_left = scope_measurement_window_rect(plot, size, channel_one);
+        assert_eq!(bottom_left.left_bottom(), plot.left_bottom());
 
         let top_right = scope_measurement_window_rect(plot, size, Vec2::new(1.0, 0.0));
         assert_eq!(top_right.right(), plot.right());
