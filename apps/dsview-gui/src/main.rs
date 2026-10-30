@@ -475,10 +475,28 @@ impl Default for ScopeFftSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScopeLissajousSettings {
+    enabled: bool,
+    x_channel: usize,
+    y_channel: usize,
+}
+
+impl Default for ScopeLissajousSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            x_channel: 0,
+            y_channel: 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ScopeFunctionSettings {
     math: ScopeMathSettings,
     fft: ScopeFftSettings,
+    lissajous: ScopeLissajousSettings,
     measurements: ScopeMeasurementSettings,
 }
 
@@ -493,6 +511,15 @@ impl ScopeFunctionSettings {
         }
         if !channels[self.fft.channel] {
             self.fft.channel = fallback;
+        }
+        if !channels[self.lissajous.x_channel] {
+            self.lissajous.x_channel = fallback;
+        }
+        if !channels[self.lissajous.y_channel] {
+            self.lissajous.y_channel = fallback;
+        }
+        if channels.into_iter().filter(|enabled| *enabled).count() < 2 {
+            self.lissajous.enabled = false;
         }
     }
 }
@@ -720,6 +747,7 @@ fn capture_settings_tabs(
 enum WaveformTab {
     LogicAnalyzer,
     Oscilloscope,
+    Lissajous,
     Combined,
 }
 
@@ -728,23 +756,38 @@ impl WaveformTab {
         match self {
             Self::LogicAnalyzer => "Logic Analyzer",
             Self::Oscilloscope => "Oscilloscope",
+            Self::Lissajous => "Lissajous",
             Self::Combined => "Combined",
         }
     }
 }
 
-fn waveform_tabs(has_logic_analyzer: bool, has_oscilloscope: bool) -> Vec<WaveformTab> {
-    let mut tabs = Vec::with_capacity(3);
+fn waveform_tabs(
+    has_logic_analyzer: bool,
+    has_oscilloscope: bool,
+    show_lissajous: bool,
+) -> Vec<WaveformTab> {
+    let mut tabs = Vec::with_capacity(4);
     if has_logic_analyzer {
         tabs.push(WaveformTab::LogicAnalyzer);
     }
     if has_oscilloscope {
         tabs.push(WaveformTab::Oscilloscope);
     }
+    if has_oscilloscope && show_lissajous {
+        tabs.push(WaveformTab::Lissajous);
+    }
     if has_logic_analyzer && has_oscilloscope {
         tabs.push(WaveformTab::Combined);
     }
     tabs
+}
+
+fn scope_tools_panel_is_visible(active_tab: Option<WaveformTab>) -> bool {
+    matches!(
+        active_tab,
+        Some(WaveformTab::Oscilloscope) | Some(WaveformTab::Lissajous)
+    )
 }
 
 fn default_logic_channel_colors() -> [Color32; LOGIC_CHANNEL_COUNT] {
@@ -2088,7 +2131,11 @@ impl DsViewApp {
                     .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100),
             )
         });
-        waveform_tabs(has_logic_analyzer, has_oscilloscope)
+        waveform_tabs(
+            has_logic_analyzer,
+            has_oscilloscope,
+            self.scope_function_settings.lissajous.enabled,
+        )
     }
 
     fn available_capture_settings_tabs(&self) -> Vec<CaptureSettingsTab> {
@@ -2455,7 +2502,7 @@ fn paint_scope_function_settings(
     settings: &mut ScopeFunctionSettings,
     channels: [bool; 2],
 ) {
-    egui::CollapsingHeader::new(RichText::new("Function").strong())
+    egui::CollapsingHeader::new(RichText::new("Functions").strong())
         .default_open(false)
         .show(ui, |ui| {
             ui.checkbox(&mut settings.math.enabled, "Math");
@@ -2555,6 +2602,44 @@ fn paint_scope_function_settings(
                     });
                 ui.small(RichText::new("Magnitude in dBV").color(TEXT_MUTED));
             });
+
+            ui.add_space(6.0);
+            let lissajous_available = channels.into_iter().filter(|enabled| *enabled).count() >= 2;
+            ui.add_enabled(
+                lissajous_available,
+                egui::Checkbox::new(&mut settings.lissajous.enabled, "Lissajous tab (XY)"),
+            );
+            ui.add_enabled_ui(settings.lissajous.enabled && lissajous_available, |ui| {
+                egui::Grid::new("dscope_lissajous_settings")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("X source");
+                        paint_scope_channel_picker(
+                            ui,
+                            "scope_lissajous_x_channel",
+                            &mut settings.lissajous.x_channel,
+                            channels,
+                        );
+                        ui.end_row();
+
+                        ui.label("Y source");
+                        paint_scope_channel_picker(
+                            ui,
+                            "scope_lissajous_y_channel",
+                            &mut settings.lissajous.y_channel,
+                            channels,
+                        );
+                        ui.end_row();
+                    });
+                ui.small(
+                    RichText::new("Plots Y-channel voltage against X-channel voltage")
+                        .color(TEXT_MUTED),
+                );
+            });
+            if !lissajous_available {
+                ui.small(RichText::new("Requires two enabled channels").color(TEXT_MUTED));
+            }
         });
 }
 
@@ -2768,7 +2853,6 @@ fn paint_scope_channel_settings(
 struct CaptureSettingsAvailability {
     capture: bool,
     sample_rate: bool,
-    trigger: bool,
     channel_enable: bool,
     input_range: bool,
     manual_calibration: bool,
@@ -2780,8 +2864,6 @@ struct ScopeCaptureSettingsEditor<'a> {
 }
 
 struct ScopeVisualizationSettingsEditor<'a> {
-    functions: &'a mut ScopeFunctionSettings,
-    markers: &'a mut ScopeMarkerSettings,
     channel_colors: &'a mut [Color32; 2],
 }
 
@@ -2798,8 +2880,6 @@ fn paint_capture_settings(
         auto_sample_rate: scope_auto_sample_rate,
     } = scope_editor;
     let ScopeVisualizationSettingsEditor {
-        functions: scope_function_settings,
-        markers: scope_marker_settings,
         channel_colors: scope_channel_colors,
     } = visualization_editor;
     let card_width = ui.available_width();
@@ -2995,29 +3075,35 @@ fn paint_capture_settings(
                             ui.add_space(6.0);
                         }
                     }
-                    ui.add_space(8.0);
-                    let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
-                    paint_scope_trigger_settings(
-                        ui,
-                        &mut scope_settings.trigger,
-                        channel_enabled,
-                        availability.trigger,
-                    );
-                    ui.add_space(8.0);
-                    scope_function_settings.clamp_to_channels(channel_enabled);
-                    paint_scope_function_settings(ui, scope_function_settings, channel_enabled);
-                    ui.add_space(8.0);
-                    paint_scope_measurement_settings(
-                        ui,
-                        &mut scope_function_settings.measurements,
-                        channel_enabled,
-                    );
-                    ui.add_space(8.0);
-                    paint_scope_marker_settings(ui, scope_marker_settings, channel_enabled);
                 }
             }
         });
     scope_settings.clamp_to_channel_limits();
+}
+
+fn paint_scope_tools(
+    ui: &mut egui::Ui,
+    scope_settings: &mut ScopeCaptureSettings,
+    function_settings: &mut ScopeFunctionSettings,
+    marker_settings: &mut ScopeMarkerSettings,
+    trigger_controls_enabled: bool,
+) {
+    let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
+    scope_settings.trigger.clamp_to_channels(channel_enabled);
+    function_settings.clamp_to_channels(channel_enabled);
+
+    paint_scope_trigger_settings(
+        ui,
+        &mut scope_settings.trigger,
+        channel_enabled,
+        trigger_controls_enabled,
+    );
+    ui.add_space(8.0);
+    paint_scope_function_settings(ui, function_settings, channel_enabled);
+    ui.add_space(8.0);
+    paint_scope_measurement_settings(ui, &mut function_settings.measurements, channel_enabled);
+    ui.add_space(8.0);
+    paint_scope_marker_settings(ui, marker_settings, channel_enabled);
 }
 
 fn paint_instrument_settings(
@@ -3200,6 +3286,33 @@ impl eframe::App for DsViewApp {
                 });
             });
 
+        let available_waveform_tabs = self.available_waveform_tabs();
+        if !available_waveform_tabs.is_empty() {
+            egui::TopBottomPanel::top("waveform_tabs")
+                .frame(
+                    egui::Frame::none()
+                        .fill(PANEL)
+                        .inner_margin(egui::Margin::symmetric(14.0, 7.0)),
+                )
+                .show(context, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("VIEW").strong().color(TEXT_MUTED));
+                        ui.separator();
+                        for tab in &available_waveform_tabs {
+                            if ui
+                                .selectable_label(
+                                    self.active_waveform_tab == Some(*tab),
+                                    tab.label(),
+                                )
+                                .clicked()
+                            {
+                                self.active_waveform_tab = Some(*tab);
+                            }
+                        }
+                    });
+                });
+        }
+
         egui::SidePanel::left("capture_setup_fixed")
             .resizable(false)
             .exact_width(300.0)
@@ -3245,14 +3358,11 @@ impl eframe::App for DsViewApp {
                                     auto_sample_rate: &mut self.scope_auto_sample_rate,
                                 },
                                 ScopeVisualizationSettingsEditor {
-                                    functions: &mut self.scope_function_settings,
-                                    markers: &mut self.scope_marker_settings,
                                     channel_colors: &mut self.scope_channel_colors,
                                 },
                                 CaptureSettingsAvailability {
                                     capture: capture_settings_enabled,
                                     sample_rate: frontend_controls_enabled,
-                                    trigger: trigger_controls_enabled,
                                     channel_enable: frontend_controls_enabled,
                                     input_range: frontend_controls_enabled,
                                     manual_calibration: manual_calibration_enabled,
@@ -3306,6 +3416,41 @@ impl eframe::App for DsViewApp {
                     });
             });
 
+        if scope_tools_panel_is_visible(self.active_waveform_tab) {
+            egui::SidePanel::right("scope_tools_fixed")
+                .resizable(false)
+                .exact_width(300.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(PANEL)
+                        .inner_margin(egui::Margin::same(14.0)),
+                )
+                .show(context, |ui| {
+                    let content_width = ui.available_width();
+                    egui::ScrollArea::vertical()
+                        .max_width(content_width)
+                        .show(ui, |ui| {
+                            ui.set_width(content_width);
+                            ui.label(RichText::new("SCOPE TOOLS").strong().color(TEXT_MUTED));
+                            ui.add_space(8.0);
+                            egui::Frame::none()
+                                .fill(BACKGROUND)
+                                .rounding(egui::Rounding::same(6.0))
+                                .inner_margin(egui::Margin::same(10.0))
+                                .show(ui, |ui| {
+                                    ui.set_width((content_width - 20.0).max(0.0));
+                                    paint_scope_tools(
+                                        ui,
+                                        &mut self.scope_settings,
+                                        &mut self.scope_function_settings,
+                                        &mut self.scope_marker_settings,
+                                        trigger_controls_enabled,
+                                    );
+                                });
+                        });
+                });
+        }
+
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::none()
@@ -3350,19 +3495,6 @@ impl eframe::App for DsViewApp {
                     });
                     return;
                 }
-
-                ui.horizontal(|ui| {
-                    for tab in &available_tabs {
-                        if ui
-                            .selectable_label(self.active_waveform_tab == Some(*tab), tab.label())
-                            .clicked()
-                        {
-                            self.active_waveform_tab = Some(*tab);
-                        }
-                    }
-                });
-                ui.separator();
-                ui.add_space(8.0);
 
                 let empty_waveforms = WaveformStore::default();
                 let waveforms = self
@@ -3442,6 +3574,37 @@ impl eframe::App for DsViewApp {
                                         offset_controls_enabled: frontend_controls_enabled,
                                         trigger_controls_enabled,
                                     },
+                                )
+                            },
+                        ));
+                    }
+                    Some(WaveformTab::Lissajous) => {
+                        let lissajous = self.scope_function_settings.lissajous;
+                        let subtitle = format!(
+                            "DSCope · CH{} → X / CH{} → Y",
+                            lissajous.x_channel, lissajous.y_channel
+                        );
+                        let mut lissajous_scope_settings = scope_settings;
+                        for (channel, vertical_offset) in lissajous_scope_settings
+                            .channels
+                            .iter_mut()
+                            .zip(scope_vertical_offsets)
+                        {
+                            channel.vertical_offset = vertical_offset;
+                        }
+                        snapshot_plot_rect = Some(waveform_card_fill(
+                            ui,
+                            "LISSAJOUS",
+                            &subtitle,
+                            |ui, rect| {
+                                paint_scope_lissajous(
+                                    ui,
+                                    rect,
+                                    waveforms,
+                                    scope_viewport,
+                                    lissajous_scope_settings,
+                                    lissajous,
+                                    self.scope_channel_colors,
                                 )
                             },
                         ));
@@ -4504,6 +4667,36 @@ fn paint_plot_background(ui: &egui::Ui, rect: Rect) {
     painter.rect_filled(rect, 4.0, BACKGROUND);
 }
 
+fn fit_rect_to_grid(area: Rect, horizontal_divisions: usize, vertical_divisions: usize) -> Rect {
+    if area.width() <= 0.0
+        || area.height() <= 0.0
+        || horizontal_divisions == 0
+        || vertical_divisions == 0
+    {
+        return area;
+    }
+    let target_aspect = horizontal_divisions as f32 / vertical_divisions as f32;
+    let area_aspect = area.width() / area.height();
+    let size = if area_aspect > target_aspect {
+        Vec2::new(area.height() * target_aspect, area.height())
+    } else {
+        Vec2::new(area.width(), area.width() / target_aspect)
+    };
+    Rect::from_center_size(area.center(), size)
+}
+
+fn align_waveform_chrome(status: Rect, ruler: Rect, plot: Rect) -> (Rect, Rect) {
+    let ruler = Rect::from_min_max(
+        Pos2::new(plot.left(), plot.top() - ruler.height()),
+        Pos2::new(plot.right(), plot.top()),
+    );
+    let status = Rect::from_min_max(
+        Pos2::new(plot.left(), ruler.top() - status.height()),
+        Pos2::new(plot.right(), ruler.top()),
+    );
+    (status, ruler)
+}
+
 fn paint_plot_grid(ui: &egui::Ui, rect: Rect) {
     let painter = ui.painter();
     for index in 0..=10 {
@@ -4806,7 +4999,9 @@ fn paint_logic(
         Pos2::new(rect.left() + label_width, rect.top()),
         rect.right_bottom(),
     );
-    let (status_bar, time_ruler, plot) = split_waveform_chrome(waveform_area);
+    let (status_area, ruler_area, plot_area) = split_waveform_chrome(waveform_area);
+    let plot = fit_rect_to_grid(plot_area, 10, 4);
+    let (status_bar, time_ruler) = align_waveform_chrome(status_area, ruler_area, plot);
     paint_plot_grid(ui, plot);
     let sample_count = waveforms.logic_samples.len();
     let display_sample_count = if sample_count == 0 {
@@ -6306,6 +6501,7 @@ fn paint_scope_fft(
 ) {
     const MIN_DBV: f32 = -120.0;
     const MAX_DBV: f32 = 20.0;
+    let rect = fit_rect_to_grid(rect, 10, 4);
     paint_plot_background(ui, rect);
     let painter = ui.painter().with_clip_rect(rect);
     paint_plot_grid(ui, rect);
@@ -6426,6 +6622,167 @@ fn paint_scope_fft(
     }
 }
 
+fn scope_lissajous_position(
+    plot: Rect,
+    x_channel: ScopeChannelSettings,
+    y_channel: ScopeChannelSettings,
+    x_voltage: f32,
+    y_voltage: f32,
+) -> Pos2 {
+    let x_volts_per_division =
+        f32::from(x_channel.volts_per_div_mv) / 1_000.0 * f32::from(x_channel.probe_attenuation);
+    let y_volts_per_division =
+        f32::from(y_channel.volts_per_div_mv) / 1_000.0 * f32::from(y_channel.probe_attenuation);
+    let x_span = x_volts_per_division * SCOPE_VERTICAL_DIVISIONS as f32;
+    let y_span = y_volts_per_division * SCOPE_VERTICAL_DIVISIONS as f32;
+    let x_fraction = scope_vertical_offset_ratio(x_channel.vertical_offset) + x_voltage / x_span;
+    let y_fraction = scope_vertical_offset_ratio(y_channel.vertical_offset) - y_voltage / y_span;
+    Pos2::new(
+        plot.left() + x_fraction * plot.width(),
+        plot.top() + y_fraction * plot.height(),
+    )
+}
+
+fn paint_scope_xy_graticule(painter: &egui::Painter, plot: Rect) {
+    for index in 0..=SCOPE_VERTICAL_DIVISIONS {
+        let fraction = index as f32 / SCOPE_VERTICAL_DIVISIONS as f32;
+        let x = egui::lerp(plot.x_range(), fraction);
+        let y = egui::lerp(plot.y_range(), fraction);
+        let center = index == SCOPE_VERTICAL_DIVISIONS / 2;
+        let stroke = Stroke::new(
+            if center { 1.2_f32 } else { 0.8_f32 },
+            if center {
+                TEXT_MUTED.gamma_multiply(0.45)
+            } else {
+                GRID.gamma_multiply(0.8)
+            },
+        );
+        painter.line_segment(
+            [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+            stroke,
+        );
+        painter.line_segment(
+            [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+            stroke,
+        );
+    }
+}
+
+fn paint_scope_lissajous(
+    ui: &egui::Ui,
+    rect: Rect,
+    waveforms: &WaveformStore,
+    viewport: WaveformViewport,
+    settings: ScopeCaptureSettings,
+    lissajous: ScopeLissajousSettings,
+    channel_colors: [Color32; 2],
+) {
+    let panel_side = rect.width().min(rect.height()).max(1.0);
+    let panel = Rect::from_center_size(rect.center(), Vec2::splat(panel_side));
+    paint_plot_background(ui, panel);
+    let painter = ui.painter();
+    let header_bottom = (panel.top() + WAVEFORM_STATUS_HEIGHT).min(panel.bottom());
+    let header = Rect::from_min_max(panel.left_top(), Pos2::new(panel.right(), header_bottom));
+    painter.rect_filled(header, 4.0, PANEL.gamma_multiply(0.9));
+    painter.line_segment(
+        [header.left_bottom(), header.right_bottom()],
+        Stroke::new(1.0_f32, GRID),
+    );
+
+    let x_index = lissajous.x_channel.min(settings.channels.len() - 1);
+    let y_index = lissajous.y_channel.min(settings.channels.len() - 1);
+    let x_channel = settings.channels[x_index];
+    let y_channel = settings.channels[y_index];
+    painter.text(
+        header.left_center() + Vec2::new(6.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        "LISSAJOUS · XY",
+        FontId::monospace(10.0),
+        ACCENT,
+    );
+    painter.text(
+        header.right_center() + Vec2::new(-6.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        format!("X CH{x_index} · Y CH{y_index}"),
+        FontId::monospace(10.0),
+        TEXT_MUTED,
+    );
+
+    let available_plot = Rect::from_min_max(
+        Pos2::new(panel.left() + 8.0, header.bottom() + 8.0),
+        Pos2::new(panel.right() - 8.0, panel.bottom() - 8.0),
+    );
+    let side = available_plot.width().min(available_plot.height()).max(1.0);
+    let plot = Rect::from_center_size(available_plot.center(), Vec2::splat(side));
+    let plot_painter = painter.with_clip_rect(plot);
+    paint_scope_xy_graticule(&plot_painter, plot);
+
+    let Some(x_samples) = waveforms.scope_channels.get(x_index) else {
+        paint_empty(&plot_painter, plot, "Waiting for X source samples");
+        return;
+    };
+    let Some(y_samples) = waveforms.scope_channels.get(y_index) else {
+        paint_empty(&plot_painter, plot, "Waiting for Y source samples");
+        return;
+    };
+    let sample_count = x_samples.len().min(y_samples.len());
+    let visible_range = viewport.sample_range(sample_count);
+    if visible_range.is_empty() {
+        paint_empty(&plot_painter, plot, "Waiting for two-channel samples");
+        return;
+    }
+    let target_points = (plot.width() * 2.0).max(256.0) as usize;
+    let step = (visible_range.len() / target_points).max(1);
+    let mut indices = visible_range.clone().step_by(step).collect::<Vec<_>>();
+    if let Some(last) = visible_range.end.checked_sub(1) {
+        indices.push(last);
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    let points = indices
+        .into_iter()
+        .filter_map(|index| {
+            Some(scope_lissajous_position(
+                plot,
+                x_channel,
+                y_channel,
+                *x_samples.get(index)?,
+                *y_samples.get(index)?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    if points.len() > 1 {
+        plot_painter.add(egui::Shape::line(
+            points.clone(),
+            Stroke::new(5.0_f32, ACCENT.gamma_multiply(0.14)),
+        ));
+        plot_painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, ACCENT)));
+    }
+
+    painter.text(
+        plot.left_bottom() + Vec2::new(4.0, -4.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!(
+            "X · CH{x_index} · {} · {}× probe",
+            format_input_scale(x_channel.volts_per_div_mv),
+            x_channel.probe_attenuation
+        ),
+        FontId::monospace(9.0),
+        channel_colors[x_index],
+    );
+    painter.text(
+        plot.left_top() + Vec2::new(4.0, 4.0),
+        egui::Align2::LEFT_TOP,
+        format!(
+            "Y · CH{y_index} · {} · {}× probe",
+            format_input_scale(y_channel.volts_per_div_mv),
+            y_channel.probe_attenuation
+        ),
+        FontId::monospace(9.0),
+        channel_colors[y_index],
+    );
+}
+
 fn paint_scope(
     ui: &egui::Ui,
     rect: Rect,
@@ -6513,7 +6870,13 @@ fn paint_scope_time_domain(
     }
     paint_plot_background(ui, rect);
     let painter = ui.painter();
-    let (status_bar, time_ruler, plot) = split_waveform_chrome(rect);
+    let (status_area, ruler_area, plot_area) = split_waveform_chrome(rect);
+    let plot = fit_rect_to_grid(
+        plot_area,
+        SCOPE_HORIZONTAL_DIVISIONS,
+        SCOPE_VERTICAL_DIVISIONS,
+    );
+    let (status_bar, time_ruler) = align_waveform_chrome(status_area, ruler_area, plot);
     let scope_painter = painter.with_clip_rect(plot);
     paint_scope_graticule(&scope_painter, plot);
     let trigger_crossing = scope_trigger_crossing_sample(waveforms, settings, *trigger_settings);
@@ -7122,6 +7485,11 @@ mod tests {
                 length: 4_096,
                 window: ScopeFftWindow::Blackman,
             },
+            lissajous: ScopeLissajousSettings {
+                enabled: true,
+                x_channel: 0,
+                y_channel: 0,
+            },
             measurements: ScopeMeasurementSettings::default(),
         };
 
@@ -7131,11 +7499,54 @@ mod tests {
         assert_eq!(settings.math.right_channel, 1);
         assert_eq!(settings.fft.channel, 1);
         assert_eq!(settings.fft.window, ScopeFftWindow::Blackman);
+        assert_eq!(settings.lissajous.x_channel, 1);
+        assert_eq!(settings.lissajous.y_channel, 1);
+        assert!(!settings.lissajous.enabled);
         assert!(settings
             .measurements
             .channels
             .iter()
             .all(|channel| channel.enabled));
+    }
+
+    #[test]
+    fn lissajous_coordinates_use_each_channels_voltage_scale() {
+        let plot = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 800.0));
+        let x_channel = ScopeChannelSettings {
+            volts_per_div_mv: 1_000,
+            ..ScopeChannelSettings::default()
+        };
+        let y_channel = ScopeChannelSettings {
+            volts_per_div_mv: 500,
+            ..ScopeChannelSettings::default()
+        };
+
+        let zero = scope_lissajous_position(plot, x_channel, y_channel, 0.0, 0.0);
+        let expected_zero = plot.left_top()
+            + Vec2::splat(
+                scope_vertical_offset_ratio(DSCOPE_VERTICAL_OFFSET_CENTER) * plot.width(),
+            );
+        assert!((zero.x - expected_zero.x).abs() < 0.001);
+        assert!((zero.y - expected_zero.y).abs() < 0.001);
+        let point = scope_lissajous_position(plot, x_channel, y_channel, 1.0, 0.5);
+        assert!((point.x - zero.x - 100.0).abs() < 0.001);
+        assert!((zero.y - point.y - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn waveform_grids_fit_square_division_cells() {
+        let wide_area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_600.0, 800.0));
+        let scope_grid = fit_rect_to_grid(wide_area, 10, 8);
+        assert!((scope_grid.width() - 1_000.0).abs() < 0.001);
+        assert!((scope_grid.height() - 800.0).abs() < 0.001);
+        assert!((scope_grid.center().x - wide_area.center().x).abs() < 0.001);
+        assert!((scope_grid.width() / 10.0 - scope_grid.height() / 8.0).abs() < 0.001);
+
+        let square_area = Rect::from_min_size(Pos2::ZERO, Vec2::splat(800.0));
+        let logic_grid = fit_rect_to_grid(square_area, 10, 4);
+        assert!((logic_grid.width() - 800.0).abs() < 0.001);
+        assert!((logic_grid.height() - 320.0).abs() < 0.001);
+        assert!((logic_grid.width() / 10.0 - logic_grid.height() / 4.0).abs() < 0.001);
     }
 
     #[test]
@@ -7228,17 +7639,49 @@ mod tests {
 
     #[test]
     fn waveform_tabs_require_their_connected_devices() {
-        assert!(waveform_tabs(false, false).is_empty());
-        assert_eq!(waveform_tabs(true, false), vec![WaveformTab::LogicAnalyzer]);
-        assert_eq!(waveform_tabs(false, true), vec![WaveformTab::Oscilloscope]);
+        assert!(waveform_tabs(false, false, true).is_empty());
         assert_eq!(
-            waveform_tabs(true, true),
+            waveform_tabs(true, false, true),
+            vec![WaveformTab::LogicAnalyzer]
+        );
+        assert_eq!(
+            waveform_tabs(false, true, false),
+            vec![WaveformTab::Oscilloscope]
+        );
+        assert_eq!(
+            waveform_tabs(false, true, true),
+            vec![WaveformTab::Oscilloscope, WaveformTab::Lissajous]
+        );
+        assert_eq!(
+            waveform_tabs(true, true, false),
             vec![
                 WaveformTab::LogicAnalyzer,
                 WaveformTab::Oscilloscope,
                 WaveformTab::Combined,
             ]
         );
+        assert_eq!(
+            waveform_tabs(true, true, true),
+            vec![
+                WaveformTab::LogicAnalyzer,
+                WaveformTab::Oscilloscope,
+                WaveformTab::Lissajous,
+                WaveformTab::Combined,
+            ]
+        );
+    }
+
+    #[test]
+    fn scope_tools_panel_is_limited_to_scope_views() {
+        assert!(scope_tools_panel_is_visible(Some(
+            WaveformTab::Oscilloscope
+        )));
+        assert!(scope_tools_panel_is_visible(Some(WaveformTab::Lissajous)));
+        assert!(!scope_tools_panel_is_visible(Some(
+            WaveformTab::LogicAnalyzer
+        )));
+        assert!(!scope_tools_panel_is_visible(Some(WaveformTab::Combined)));
+        assert!(!scope_tools_panel_is_visible(None));
     }
 
     #[test]
