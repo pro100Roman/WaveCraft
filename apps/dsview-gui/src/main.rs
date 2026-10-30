@@ -4,21 +4,21 @@ mod measurements;
 
 use dsview_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSession, CaptureSource,
-    DeviceDescriptor, DeviceId, InstrumentKind,
+    DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
 };
 use dsview_recording::{CompletionStatus, RecordingReader, RecordingWriter};
 use dsview_usb::{
-    apply_dscope_configuration, auto_calibrate_dscope, discover_supported_devices, prepare_device,
-    read_dscope_calibration, write_dscope_calibration, DeviceModel, DiscoveredDevice,
-    DsCopeBandwidthLimit, DsCopeCalibrationValues, DsCopeCaptureConfig, DsCopeCaptureSource,
-    DsCopeChannelConfig, DsCopeCoupling, DsCopeOperationMode, DsCopeRuntimeCalibrationControl,
-    DsCopeRuntimeTriggerControl, DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource,
-    DsLogicCaptureConfig, DsLogicCaptureSource, LinkStatus, DSCOPE_SAMPLE_COUNTS,
-    DSCOPE_SAMPLE_RATES_HZ, DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_MAX,
-    DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
-    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
-    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
-    DSCOPE_VOLTS_PER_DIV_MV,
+    apply_dscope_configuration, auto_calibrate_dscope_with_progress, discover_supported_devices,
+    prepare_device, read_dscope_calibration, write_dscope_calibration, DeviceModel,
+    DiscoveredDevice, DsCopeBandwidthLimit, DsCopeCalibrationFrame, DsCopeCalibrationValues,
+    DsCopeCaptureConfig, DsCopeCaptureSource, DsCopeChannelConfig, DsCopeCoupling,
+    DsCopeOperationMode, DsCopeRuntimeCalibrationControl, DsCopeRuntimeTriggerControl,
+    DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig,
+    DsLogicCaptureSource, LinkStatus, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
+    DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
+    DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
+    DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
+    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use image::ImageFormat;
@@ -1557,6 +1557,17 @@ struct CompletedCapture {
     has_scope: bool,
 }
 
+struct CalibrationDisplay {
+    waveforms: WaveformStore,
+    scope_config: DsCopeCaptureConfig,
+}
+
+struct CalibrationProgressModal {
+    progress: f32,
+    phase: String,
+    completed: bool,
+}
+
 struct LoadedRecording {
     capture: CompletedCapture,
     scope_settings: Option<ScopeCaptureSettings>,
@@ -1624,6 +1635,10 @@ struct DsViewApp {
     scope_capture_restart_requested: bool,
     scope_configuration_due: Option<Instant>,
     pending: Option<Receiver<WorkerResult>>,
+    calibration_progress: Option<Receiver<DsCopeCalibrationFrame>>,
+    calibration_display: Option<CalibrationDisplay>,
+    calibration_active: bool,
+    calibration_modal: Option<CalibrationProgressModal>,
     capture: Option<ActiveCapture>,
     completed_capture: Option<CompletedCapture>,
     status: String,
@@ -1672,6 +1687,10 @@ impl DsViewApp {
             scope_capture_restart_requested: false,
             scope_configuration_due: None,
             pending: None,
+            calibration_progress: None,
+            calibration_display: None,
+            calibration_active: false,
+            calibration_modal: None,
             capture: None,
             completed_capture: None,
             status: "Ready".to_owned(),
@@ -1944,15 +1963,28 @@ impl DsViewApp {
         };
         let resource_directory = PathBuf::from(self.resource_directory.trim());
         let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
         self.scope_configuration_due = None;
         self.pending = Some(receiver);
-        self.status = "Auto-calibrating DSCope across all input ranges…".to_owned();
+        self.calibration_progress = Some(progress_receiver);
+        self.calibration_display = None;
+        self.calibration_active = true;
+        self.calibration_modal = Some(CalibrationProgressModal {
+            progress: 0.0,
+            phase: "Preparing oscilloscope…".to_owned(),
+            completed: false,
+        });
+        self.active_waveform_tab = Some(WaveformTab::Oscilloscope);
+        self.status = "Auto-calibrating DSCope offsets and ADC branches…".to_owned();
         self.last_error = None;
         thread::spawn(move || {
             let result = (|| {
                 let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
                 prepare_device(&device, &bitstream_path).map_err(|error| error.to_string())?;
-                auto_calibrate_dscope(&device).map_err(|error| error.to_string())?;
+                auto_calibrate_dscope_with_progress(&device, |frame| {
+                    let _ = progress_sender.send(frame);
+                })
+                .map_err(|error| error.to_string())?;
                 apply_dscope_configuration(&device, scope_config)
                     .map_err(|error| error.to_string())?;
                 Ok(WorkerSuccess::ScopeAutoCalibrated)
@@ -2328,6 +2360,14 @@ impl DsViewApp {
                     format!("Applied DSCope configuration to {device_count} instrument(s)");
             }
             Ok(WorkerSuccess::ScopeAutoCalibrated) => {
+                self.calibration_active = false;
+                self.calibration_progress = None;
+                self.calibration_display = None;
+                if let Some(modal) = self.calibration_modal.as_mut() {
+                    modal.progress = 1.0;
+                    modal.phase = "Calibration is done.".to_owned();
+                    modal.completed = true;
+                }
                 self.status = "DSCope auto calibration completed and verified".to_owned();
             }
             Ok(WorkerSuccess::ScopeCalibrationLoaded(values)) => {
@@ -2357,6 +2397,67 @@ impl DsViewApp {
             }
             Err(error) => self.set_error(error),
         }
+    }
+
+    fn poll_calibration_progress(&mut self) {
+        let mut latest = None;
+        let mut disconnected = false;
+        if let Some(receiver) = self.calibration_progress.as_ref() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(frame) => latest = Some(frame),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.calibration_progress = None;
+        }
+        let Some(frame) = latest else {
+            return;
+        };
+
+        let config = frame.config();
+        if let Some(modal) = self.calibration_modal.as_mut() {
+            modal.progress = modal.progress.max(frame.progress());
+            modal.phase = frame.phase().to_owned();
+        }
+        let enabled_channels = config.channels().map(|channel| channel.enabled());
+        let mut waveforms = WaveformStore {
+            scope_capacity: config.sample_count() as usize,
+            ..WaveformStore::default()
+        };
+        waveforms.ingest(
+            &CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: config.sample_rate_hz(),
+                trigger_sample_index: None,
+                channels: frame.channels().to_vec(),
+            }),
+            enabled_channels,
+        );
+        self.calibration_display = Some(CalibrationDisplay {
+            waveforms,
+            scope_config: config,
+        });
+        self.scope_viewport.reset();
+        self.scope_time_per_division_seconds = Some(
+            config.sample_count() as f64
+                / config.sample_rate_hz() as f64
+                / SCOPE_HORIZONTAL_DIVISIONS as f64,
+        );
+        let volts_per_div_mv = config.channels()[0].volts_per_div_mv();
+        self.status = format!(
+            "Auto-calibrating DSCope · {volts_per_div_mv} mV/div · {}",
+            if config.enabled_channel_count() == 1 {
+                "interleaved ADC"
+            } else {
+                "dual-channel ADC"
+            }
+        );
     }
 
     fn poll_capture(&mut self) {
@@ -2510,6 +2611,10 @@ impl DsViewApp {
         self.scope_capture_restart_requested = false;
         self.manual_calibration_load_requested = false;
         self.manual_calibration_save_requested = None;
+        self.calibration_active = false;
+        self.calibration_progress = None;
+        self.calibration_display = None;
+        self.calibration_modal = None;
         self.status = "Operation failed".to_owned();
         self.last_error = Some(error);
     }
@@ -3802,6 +3907,58 @@ fn paint_scope_tools(
     );
 }
 
+fn paint_calibration_progress_modal(
+    context: &egui::Context,
+    state: &CalibrationProgressModal,
+) -> bool {
+    let screen_rect = context.input(|input| input.screen_rect());
+    egui::Area::new(egui::Id::new("calibration_progress_modal_backdrop"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen_rect.min)
+        .show(context, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen_rect.size(), Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(rect, egui::Rounding::ZERO, Color32::from_black_alpha(112));
+        });
+
+    let mut close = false;
+    egui::Window::new("DSCope Auto Calibration")
+        .id(egui::Id::new("calibration_progress_modal"))
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .default_width(430.0)
+        .show(context, |ui| {
+            if state.completed {
+                ui.label(RichText::new("Calibration is done.").strong().color(ACCENT));
+                ui.add_space(8.0);
+                ui.add(egui::ProgressBar::new(1.0).show_percentage().fill(ACCENT));
+                ui.add_space(12.0);
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            } else {
+                ui.label(RichText::new(&state.phase).strong());
+                ui.add_space(8.0);
+                ui.add(
+                    egui::ProgressBar::new(state.progress)
+                        .show_percentage()
+                        .animate(true)
+                        .fill(ACCENT),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Keep all probes disconnected. Do not disconnect the oscilloscope.",
+                    )
+                    .color(Color32::LIGHT_RED),
+                );
+            }
+        });
+    close
+}
+
 fn paint_instrument_settings(
     ui: &mut egui::Ui,
     devices: &mut [DeviceEntry],
@@ -3841,6 +3998,7 @@ fn paint_instrument_settings(
 
 impl eframe::App for DsViewApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_calibration_progress();
         self.poll_worker();
         self.reconcile_capture_settings_tab();
         self.reconcile_waveform_tab();
@@ -4219,6 +4377,12 @@ impl eframe::App for DsViewApp {
                     .filter(|active| !active.preserve_display_until_complete)
                     .map(|active| &active.waveforms)
                     .or_else(|| {
+                        self.calibration_active
+                            .then_some(self.calibration_display.as_ref())
+                            .flatten()
+                            .map(|display| &display.waveforms)
+                    })
+                    .or_else(|| {
                         self.completed_capture
                             .as_ref()
                             .map(|capture| &capture.waveforms)
@@ -4245,6 +4409,14 @@ impl eframe::App for DsViewApp {
                     .capture
                     .as_ref()
                     .map(|active| ScopeCaptureSettings::from_capture_config(active.scope_config))
+                    .or_else(|| {
+                        self.calibration_active
+                            .then_some(self.calibration_display.as_ref())
+                            .flatten()
+                            .map(|display| {
+                                ScopeCaptureSettings::from_capture_config(display.scope_config)
+                            })
+                    })
                     .unwrap_or(self.scope_settings);
                 match self.active_waveform_tab {
                     Some(WaveformTab::LogicAnalyzer) => {
@@ -4497,6 +4669,7 @@ impl eframe::App for DsViewApp {
         let mut auto_confirmed = false;
         let mut auto_cancelled = false;
         egui::Window::new("DSCope Auto Calibration")
+            .id(egui::Id::new("auto_calibration_confirmation"))
             .open(&mut auto_confirmation_open)
             .collapsible(false)
             .resizable(false)
@@ -4504,12 +4677,14 @@ impl eframe::App for DsViewApp {
                 ui.label(RichText::new("Disconnect all probes before continuing.").strong());
                 ui.add_space(6.0);
                 ui.label(
-                    "DSView will measure and adjust both channels across all input ranges, then write and verify the results in device NVM.",
+                    "DSView will run the vendor calibration sequence for both channels: offset transfer, all input ranges, and ADC branch balance. It can take a while.",
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new("Do not disconnect the oscilloscope while calibration is running.")
-                        .color(Color32::LIGHT_RED),
+                    RichText::new(
+                        "Keep all probes disconnected during calibration. Do not disconnect the oscilloscope while calibration is running.",
+                    )
+                    .color(Color32::LIGHT_RED),
                 );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
@@ -4639,6 +4814,13 @@ impl eframe::App for DsViewApp {
             self.scope_settings.channels.map(|channel| channel.enabled),
             &self.scope_channel_names,
         );
+        if self
+            .calibration_modal
+            .as_ref()
+            .is_some_and(|state| paint_calibration_progress_modal(context, state))
+        {
+            self.calibration_modal = None;
+        }
 
         if record_now_clicked {
             if let Some(path) = choose_recording_save_path(&self.recording_path) {

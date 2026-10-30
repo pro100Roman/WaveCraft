@@ -23,8 +23,16 @@ const CALIBRATION_ZERO_BYTES: usize = 30;
 const CALIBRATION_VGA_BYTES: usize = 17;
 const CALIBRATION_FLASH_PAGE_STRIDE: u16 = 8;
 const CALIBRATION_ID_BASE: u8 = 0x40;
-#[cfg(test)]
 const OFFSET_PWM_SPAN: u64 = 780;
+const CALIBRATION_DEFAULT_PREOFFSET: u16 = 60;
+const CALIBRATION_OFFSET_TOP: u16 = 15;
+const CALIBRATION_OFFSET_BOTTOM: u16 = 240;
+const CALIBRATION_MARGIN_PASS: f64 = 0.3;
+const CALIBRATION_MAX_ADJUSTMENTS: usize = 32;
+const CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS: usize = 24;
+const CALIBRATION_FINE_GAIN_VARIANCE: f64 = 0.0005;
+const CALIBRATION_FINE_GAIN_MIN: f64 = 0.9923;
+const CALIBRATION_FINE_GAIN_MAX: f64 = 1.0077;
 const CALIBRATION_VPOS_TRANS_OFFSET: usize = 19;
 const CALIBRATION_COMB_COMP_OFFSET: usize = 21;
 const CALIBRATION_FINE_GAIN_OFFSET: usize = 22;
@@ -88,6 +96,32 @@ pub struct DsCopeCalibrationValues {
     comb_comp: [i8; CHANNEL_COUNT],
     fine_gain_codes: [[u8; 4]; CHANNEL_COUNT],
     comb_fine_gain_codes: [[u8; 4]; CHANNEL_COUNT],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DsCopeCalibrationFrame {
+    config: DsCopeCaptureConfig,
+    channels: Vec<Vec<f32>>,
+    progress: f32,
+    phase: &'static str,
+}
+
+impl DsCopeCalibrationFrame {
+    pub fn config(&self) -> DsCopeCaptureConfig {
+        self.config
+    }
+
+    pub fn channels(&self) -> &[Vec<f32>] {
+        &self.channels
+    }
+
+    pub fn progress(&self) -> f32 {
+        self.progress
+    }
+
+    pub fn phase(&self) -> &'static str {
+        self.phase
+    }
 }
 
 impl DsCopeCalibrationValues {
@@ -797,10 +831,15 @@ pub fn write_dscope_calibration(
 }
 
 pub fn auto_calibrate_dscope(device: &DiscoveredDevice) -> Result<(), CaptureError> {
+    auto_calibrate_dscope_with_progress(device, |_| {})
+}
+
+pub fn auto_calibrate_dscope_with_progress(
+    device: &DiscoveredDevice,
+    mut on_frame: impl FnMut(DsCopeCalibrationFrame),
+) -> Result<(), CaptureError> {
     const CALIBRATION_SAMPLE_COUNT: u64 = 50_000;
     const CALIBRATION_SAMPLE_RATE_HZ: u64 = 500_000_000;
-    const MAX_ADJUSTMENTS_PER_RANGE: usize = 16;
-    const PASS_MARGIN: f64 = 0.5;
 
     validate_dscope_device(device)?;
     let session = UsbDeviceSession::open(device).map_err(capture_error)?;
@@ -808,52 +847,85 @@ pub fn auto_calibrate_dscope(device: &DiscoveredDevice) -> Result<(), CaptureErr
         validate_device_ready(&session)?;
         session.stop_capture().map_err(capture_error)?;
         let mut values = read_calibration_values(&session)?;
-        for (range, volts_per_div_mv) in DSCOPE_VOLTS_PER_DIV_MV.iter().copied().enumerate() {
-            let channels = [DsCopeChannelConfig::new(volts_per_div_mv, DsCopeCoupling::Dc, 1)?
-                .with_vertical_offset(DSCOPE_VERTICAL_OFFSET_CENTER)?;
-                CHANNEL_COUNT];
-            let config = DsCopeCaptureConfig::with_channel_configs(
+
+        // The vendor calibration starts from the U3P100 model defaults while
+        // preserving the factory VGA table. Later stages replace the ADC
+        // fine-gain values with newly measured values.
+        values.preoffsets =
+            [[CALIBRATION_DEFAULT_PREOFFSET; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT];
+        values.vpos_trans = [OFFSET_PWM_SPAN as u16; CHANNEL_COUNT];
+
+        let enabled_channels = [true; CHANNEL_COUNT];
+        session
+            .initialize_dscope_frontend(enabled_channels)
+            .map_err(capture_error)?;
+        session
+            .set_dscope_bandwidth_limit(DsCopeBandwidthLimit::Full)
+            .map_err(capture_error)?;
+        session
+            .configure_dscope_channels(enabled_channels)
+            .map_err(capture_error)?;
+
+        // Exercise every input range before measuring, matching the warm-up
+        // sweep performed by the vendor driver.
+        for range in 0..DSCOPE_VOLTS_PER_DIV_MV.len() {
+            let config = calibration_capture_config(
                 CALIBRATION_SAMPLE_RATE_HZ,
                 CALIBRATION_SAMPLE_COUNT,
-                channels,
+                range,
+                DSCOPE_VERTICAL_OFFSET_CENTER,
+                enabled_channels,
             )?;
-            let enabled_channels = [true; CHANNEL_COUNT];
-            session
-                .initialize_dscope_frontend(enabled_channels)
-                .map_err(capture_error)?;
-            session
-                .set_dscope_bandwidth_limit(DsCopeBandwidthLimit::Full)
-                .map_err(capture_error)?;
-            session
-                .configure_dscope_channels(enabled_channels)
-                .map_err(capture_error)?;
+            configure_calibration_capture(&session, config, values, range)?;
+        }
+
+        calibrate_vertical_transform(
+            &session,
+            &mut values,
+            CALIBRATION_SAMPLE_RATE_HZ,
+            CALIBRATION_SAMPLE_COUNT,
+            &mut on_frame,
+        )?;
+
+        for (range, volts_per_div_mv) in DSCOPE_VOLTS_PER_DIV_MV.iter().copied().enumerate() {
+            let config = calibration_capture_config(
+                CALIBRATION_SAMPLE_RATE_HZ,
+                CALIBRATION_SAMPLE_COUNT,
+                range,
+                DSCOPE_VERTICAL_OFFSET_CENTER,
+                enabled_channels,
+            )?;
 
             let mut converged = false;
-            for _ in 0..MAX_ADJUSTMENTS_PER_RANGE {
-                let calibration = DsCopeCalibration::from_values(values, [range; CHANNEL_COUNT]);
-                configure_adc_fine_gains(&session, config, calibration)?;
-                configure_scope(&session, config, calibration)?;
-                session
-                    .arm_capture(&config.encode_settings())
-                    .map_err(capture_error)?;
-                configure_scope_post_arm(&session, config, calibration)?;
-                let means = read_calibration_means(&session, config)?;
-                session.stop_capture().map_err(capture_error)?;
+            for adjustment in 0..CALIBRATION_MAX_ADJUSTMENTS {
+                let progress = 0.15
+                    + range as f32 / DSCOPE_VOLTS_PER_DIV_MV.len() as f32 * 0.55
+                    + adjustment as f32 / CALIBRATION_MAX_ADJUSTMENTS as f32
+                        * (0.55 / DSCOPE_VOLTS_PER_DIV_MV.len() as f32);
+                let measurement = capture_calibration_measurement(
+                    &session,
+                    config,
+                    values,
+                    range,
+                    progress,
+                    "Centering input ranges",
+                    &mut on_frame,
+                )?;
+                let means = measurement.channel_means()?;
 
                 let margins = [128.0 - means[0], 128.0 - means[1]];
-                if margins.iter().all(|margin| margin.abs() <= PASS_MARGIN) {
+                if margins
+                    .iter()
+                    .all(|margin| margin.abs() < CALIBRATION_MARGIN_PASS)
+                {
                     converged = true;
                     break;
                 }
                 for (channel, margin) in margins.iter().copied().enumerate() {
-                    if margin.abs() <= PASS_MARGIN {
+                    if margin.abs() < CALIBRATION_MARGIN_PASS {
                         continue;
                     }
-                    let adjustment = if margin.is_sign_positive() {
-                        margin.ceil() as i32
-                    } else {
-                        margin.floor() as i32
-                    };
+                    let adjustment = calibration_integer_adjustment(margin);
                     let current = i32::from(
                         values
                             .preoffset(channel, range)
@@ -874,6 +946,21 @@ pub fn auto_calibrate_dscope(device: &DiscoveredDevice) -> Result<(), CaptureErr
                 )));
             }
         }
+
+        calibrate_adc_fine_gains(
+            &session,
+            &mut values,
+            CALIBRATION_SAMPLE_COUNT,
+            false,
+            &mut on_frame,
+        )?;
+        calibrate_adc_fine_gains(
+            &session,
+            &mut values,
+            CALIBRATION_SAMPLE_COUNT,
+            true,
+            &mut on_frame,
+        )?;
         write_calibration_values(&session, values)
     })();
     if calibration_result.is_err() {
@@ -886,6 +973,313 @@ pub fn auto_calibrate_dscope(device: &DiscoveredDevice) -> Result<(), CaptureErr
         close_result,
         "release the USB interface",
     )
+}
+
+fn calibration_capture_config(
+    sample_rate_hz: u64,
+    sample_count: u64,
+    range: usize,
+    vertical_offset: u16,
+    enabled_channels: [bool; CHANNEL_COUNT],
+) -> Result<DsCopeCaptureConfig, CaptureError> {
+    let volts_per_div_mv = DSCOPE_VOLTS_PER_DIV_MV[range];
+    let channel = DsCopeChannelConfig::new(volts_per_div_mv, DsCopeCoupling::Dc, 1)?
+        .with_vertical_offset(vertical_offset)?;
+    DsCopeCaptureConfig::with_channel_configs(
+        sample_rate_hz,
+        sample_count,
+        [
+            channel.with_enabled(enabled_channels[0]),
+            channel.with_enabled(enabled_channels[1]),
+        ],
+    )
+}
+
+fn configure_calibration_capture(
+    session: &UsbDeviceSession,
+    config: DsCopeCaptureConfig,
+    values: DsCopeCalibrationValues,
+    range: usize,
+) -> Result<(), CaptureError> {
+    let calibration = DsCopeCalibration::from_values(values, [range; CHANNEL_COUNT]);
+    configure_adc_fine_gains(session, config, calibration)?;
+    configure_scope(session, config, calibration)
+}
+
+fn capture_calibration_measurement(
+    session: &UsbDeviceSession,
+    config: DsCopeCaptureConfig,
+    values: DsCopeCalibrationValues,
+    range: usize,
+    progress: f32,
+    phase: &'static str,
+    on_frame: &mut dyn FnMut(DsCopeCalibrationFrame),
+) -> Result<ScopeMeasurement, CaptureError> {
+    let calibration = DsCopeCalibration::from_values(values, [range; CHANNEL_COUNT]);
+    configure_adc_fine_gains(session, config, calibration)?;
+    configure_scope(session, config, calibration)?;
+    session
+        .arm_capture(&config.encode_settings())
+        .map_err(capture_error)?;
+    configure_scope_post_arm(session, config, calibration)?;
+    let measurement = read_calibration_measurement(session, config);
+    let stop_result = session.stop_capture().map_err(capture_error);
+    match (measurement, stop_result) {
+        (Ok((measurement, mut frame)), Ok(())) => {
+            frame.progress = progress;
+            frame.phase = phase;
+            on_frame(frame);
+            Ok(measurement)
+        }
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => Err(CaptureError::new(format!(
+            "{primary}; additionally failed to stop calibration capture: {cleanup}"
+        ))),
+    }
+}
+
+fn calibrate_vertical_transform(
+    session: &UsbDeviceSession,
+    values: &mut DsCopeCalibrationValues,
+    sample_rate_hz: u64,
+    sample_count: u64,
+    on_frame: &mut dyn FnMut(DsCopeCalibrationFrame),
+) -> Result<(), CaptureError> {
+    let range = DSCOPE_VOLTS_PER_DIV_MV.len() - 1;
+    for adjustment in 0..CALIBRATION_MAX_ADJUSTMENTS {
+        let attempt_progress = adjustment as f32 / CALIBRATION_MAX_ADJUSTMENTS as f32 * 0.15;
+        let bottom_config = calibration_capture_config(
+            sample_rate_hz,
+            sample_count,
+            range,
+            CALIBRATION_OFFSET_BOTTOM,
+            [true; CHANNEL_COUNT],
+        )?;
+        let bottom = capture_calibration_measurement(
+            session,
+            bottom_config,
+            *values,
+            range,
+            attempt_progress,
+            "Calibrating vertical offset span",
+            on_frame,
+        )?
+        .channel_means()?;
+        let top_config = calibration_capture_config(
+            sample_rate_hz,
+            sample_count,
+            range,
+            CALIBRATION_OFFSET_TOP,
+            [true; CHANNEL_COUNT],
+        )?;
+        let top = capture_calibration_measurement(
+            session,
+            top_config,
+            *values,
+            range,
+            attempt_progress + 0.002,
+            "Calibrating vertical offset span",
+            on_frame,
+        )?
+        .channel_means()?;
+        let expected_span = f64::from(CALIBRATION_OFFSET_BOTTOM - CALIBRATION_OFFSET_TOP);
+        let margins = [
+            bottom[0] - top[0] - expected_span,
+            bottom[1] - top[1] - expected_span,
+        ];
+        if margins
+            .iter()
+            .all(|margin| margin.abs() < CALIBRATION_MARGIN_PASS)
+        {
+            return Ok(());
+        }
+        for (channel, margin) in margins.into_iter().enumerate() {
+            if margin.abs() < CALIBRATION_MARGIN_PASS {
+                continue;
+            }
+            let current = i32::from(values.vpos_trans[channel]);
+            let adjusted = (current - calibration_integer_adjustment(margin)).clamp(1, 1_023);
+            if adjusted == current {
+                return Err(CaptureError::new(format!(
+                    "DSCope auto calibration reached the vertical transform limit on CH{channel}"
+                )));
+            }
+            values.vpos_trans[channel] = adjusted as u16;
+        }
+    }
+    Err(CaptureError::new(
+        "DSCope auto calibration did not converge while calibrating the vertical transform",
+    ))
+}
+
+fn calibrate_adc_fine_gains(
+    session: &UsbDeviceSession,
+    values: &mut DsCopeCalibrationValues,
+    sample_count: u64,
+    combined: bool,
+    on_frame: &mut dyn FnMut(DsCopeCalibrationFrame),
+) -> Result<(), CaptureError> {
+    let enabled_channels = if combined {
+        [true, false]
+    } else {
+        [true, true]
+    };
+    let sample_rate_hz = if combined { 1_000_000_000 } else { 500_000_000 };
+    let range = DSCOPE_VOLTS_PER_DIV_MV.len() - 1;
+    let config = calibration_capture_config(
+        sample_rate_hz,
+        sample_count,
+        range,
+        CALIBRATION_OFFSET_BOTTOM,
+        enabled_channels,
+    )?;
+    session
+        .initialize_dscope_frontend(enabled_channels)
+        .map_err(capture_error)?;
+    session
+        .set_dscope_bandwidth_limit(DsCopeBandwidthLimit::Full)
+        .map_err(capture_error)?;
+    session
+        .configure_dscope_channels(enabled_channels)
+        .map_err(capture_error)?;
+    if combined {
+        values.comb_fine_gain_codes = [[0; 4]; CHANNEL_COUNT];
+    } else {
+        values.fine_gain_codes = [[0; 4]; CHANNEL_COUNT];
+    }
+
+    for adjustment in 0..CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS {
+        let phase_start = if combined { 0.85 } else { 0.70 };
+        let progress =
+            phase_start + adjustment as f32 / CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS as f32 * 0.15;
+        let measurement = capture_calibration_measurement(
+            session,
+            config,
+            *values,
+            range,
+            progress,
+            if combined {
+                "Balancing interleaved ADC branches"
+            } else {
+                "Balancing dual-channel ADC branches"
+            },
+            on_frame,
+        )?;
+        let branches = measurement.branch_means();
+        let skews = fine_gain_skews(branches, combined)?;
+        if skews
+            .iter()
+            .all(|skew| skew.abs() <= CALIBRATION_FINE_GAIN_VARIANCE)
+        {
+            return Ok(());
+        }
+        let codes = if combined {
+            &mut values.comb_fine_gain_codes
+        } else {
+            &mut values.fine_gain_codes
+        };
+        if !adjust_fine_gain_codes(codes, skews, combined) {
+            // The vendor falls back to a volatile FPGA correction when an ADC
+            // gain reaches its limit. Keep the saturated ADC result, which is
+            // the persistent portion of that calibration.
+            return Ok(());
+        }
+    }
+    Err(CaptureError::new(format!(
+        "DSCope auto calibration did not converge while balancing {} ADC branches",
+        if combined {
+            "interleaved"
+        } else {
+            "dual-channel"
+        }
+    )))
+}
+
+fn calibration_integer_adjustment(margin: f64) -> i32 {
+    if margin.is_sign_positive() {
+        margin.ceil() as i32
+    } else {
+        margin.floor() as i32
+    }
+}
+
+fn fine_gain_skews(branches: [f64; 8], combined: bool) -> Result<[f64; 8], CaptureError> {
+    let mut skews = [0.0; 8];
+    if combined {
+        let mean = branches.iter().sum::<f64>() / 8.0;
+        if mean == 0.0 {
+            return Err(CaptureError::new(
+                "DSCope ADC branch measurements were empty",
+            ));
+        }
+        for (skew, branch) in skews.iter_mut().zip(branches) {
+            *skew = branch / mean - 1.0;
+        }
+    } else {
+        for channel in 0..CHANNEL_COUNT {
+            let start = channel * 4;
+            let mean = branches[start..start + 4].iter().sum::<f64>() / 4.0;
+            if mean == 0.0 {
+                return Err(CaptureError::new(
+                    "DSCope ADC branch measurements were empty",
+                ));
+            }
+            for branch in 0..4 {
+                skews[start + branch] = branches[start + branch] / mean - 1.0;
+            }
+        }
+    }
+    Ok(skews)
+}
+
+fn adjust_fine_gain_codes(
+    codes: &mut [[u8; 4]; CHANNEL_COUNT],
+    skews: [f64; 8],
+    combined: bool,
+) -> bool {
+    let branch_for_code = if combined {
+        [[0, 1, 6, 7], [5, 4, 3, 2]]
+    } else {
+        [[0, 2, 1, 3], [4, 6, 5, 7]]
+    };
+    let mut changed = false;
+    for channel in 0..CHANNEL_COUNT {
+        for gain in 0..4 {
+            let skew = skews[branch_for_code[channel][gain]];
+            if skew.abs() <= CALIBRATION_FINE_GAIN_VARIANCE / 2.0 {
+                continue;
+            }
+            let current = adc_fine_gain_from_code(codes[channel][gain]);
+            let adjusted = (current / (1.0 + skew / 2.0))
+                .clamp(CALIBRATION_FINE_GAIN_MIN, CALIBRATION_FINE_GAIN_MAX);
+            let code = adc_fine_gain_code(adjusted);
+            changed |= code != codes[channel][gain];
+            codes[channel][gain] = code;
+        }
+    }
+    changed
+}
+
+fn adc_fine_gain_from_code(code: u8) -> f64 {
+    let signed = if code & 0x40 != 0 {
+        -i16::from((!code) & 0x3f)
+    } else {
+        i16::from(code & 0x3f)
+    };
+    1.0 + f64::from(signed) / 8_192.0
+}
+
+fn adc_fine_gain_code(gain: f64) -> u8 {
+    let ratio = ((gain - 1.0) * 8_192.0) as i16;
+    if ratio > 63 {
+        63
+    } else if ratio > 0 {
+        ratio as u8
+    } else if ratio < -63 {
+        64
+    } else {
+        !(-ratio as u8) & 0x7f
+    }
 }
 
 fn validate_dscope_device(device: &DiscoveredDevice) -> Result<(), CaptureError> {
@@ -953,15 +1347,7 @@ fn write_calibration_values(
     let mut records = Vec::with_capacity(CHANNEL_COUNT);
     for channel in 0..CHANNEL_COUNT {
         let (mut zero_record, mut vga_record) = read_calibration_records(session, channel)?;
-        for range in 0..DSCOPE_VOLTS_PER_DIV_MV.len() {
-            values.settable_value(channel, range)?;
-            let offset = 1 + range * 2;
-            zero_record[offset..offset + 2]
-                .copy_from_slice(&values.preoffsets[channel][range].to_le_bytes());
-            vga_record[offset..offset + 2]
-                .copy_from_slice(&values.vga_gains[channel][range].to_le_bytes());
-        }
-        zero_record[CALIBRATION_COMB_COMP_OFFSET] = values.comb_comp[channel] as u8;
+        encode_calibration_records(values, channel, &mut zero_record, &mut vga_record)?;
         records.push((zero_record, vga_record));
     }
 
@@ -992,6 +1378,36 @@ fn write_calibration_values(
             "DSCope calibration verification did not match the values written",
         ));
     }
+    Ok(())
+}
+
+fn encode_calibration_records(
+    values: DsCopeCalibrationValues,
+    channel: usize,
+    zero_record: &mut [u8; CALIBRATION_ZERO_BYTES],
+    vga_record: &mut [u8; CALIBRATION_VGA_BYTES],
+) -> Result<(), CaptureError> {
+    for range in 0..DSCOPE_VOLTS_PER_DIV_MV.len() {
+        values.settable_value(channel, range)?;
+        let offset = 1 + range * 2;
+        zero_record[offset..offset + 2]
+            .copy_from_slice(&values.preoffsets[channel][range].to_le_bytes());
+        vga_record[offset..offset + 2]
+            .copy_from_slice(&values.vga_gains[channel][range].to_le_bytes());
+    }
+    let vpos_trans = values.vpos_trans[channel];
+    if vpos_trans == 0 || vpos_trans > 1_023 {
+        return Err(CaptureError::new(format!(
+            "invalid DSCope vertical transform on channel {channel}: {vpos_trans}"
+        )));
+    }
+    zero_record[CALIBRATION_VPOS_TRANS_OFFSET..CALIBRATION_VPOS_TRANS_OFFSET + 2]
+        .copy_from_slice(&vpos_trans.to_le_bytes());
+    zero_record[CALIBRATION_COMB_COMP_OFFSET] = values.comb_comp[channel] as u8;
+    zero_record[CALIBRATION_FINE_GAIN_OFFSET..CALIBRATION_COMB_FINE_GAIN_OFFSET]
+        .copy_from_slice(&values.fine_gain_codes[channel]);
+    zero_record[CALIBRATION_COMB_FINE_GAIN_OFFSET..CALIBRATION_ZERO_BYTES]
+        .copy_from_slice(&values.comb_fine_gain_codes[channel]);
     Ok(())
 }
 
@@ -1341,14 +1757,11 @@ impl DsCopeCalibration {
     }
 }
 
-fn read_calibration_means(
+fn read_calibration_measurement(
     session: &UsbDeviceSession,
     config: DsCopeCaptureConfig,
-) -> Result<[f64; CHANNEL_COUNT], CaptureError> {
-    let payload_bytes = usize::try_from(config.armed_sample_count())
-        .expect("calibration sample count fits usize")
-        * CHANNEL_COUNT
-        + MEASUREMENT_FOOTER_BYTES;
+) -> Result<(ScopeMeasurement, DsCopeCalibrationFrame), CaptureError> {
+    let payload_bytes = calibration_payload_bytes(config);
     let mut header_read = session
         .queue_bulk_read(TRIGGER_HEADER_BYTES)
         .map_err(capture_error)?;
@@ -1398,31 +1811,101 @@ fn read_calibration_means(
         header_read.finish().map_err(capture_error)?,
         "trigger header",
     )?;
-    let payload = require_queued_data(
-        payload_read.finish().map_err(capture_error)?,
-        "capture payload",
-    )?;
+    let mut payload =
+        require_scope_payload(payload_read.finish().map_err(capture_error)?, payload_bytes)?;
     validate_trigger_header(&header)?;
-    let measurement_offset = usize::try_from(config.armed_sample_count())
-        .expect("calibration sample count fits usize")
-        * CHANNEL_COUNT;
-    let measurement = ScopeMeasurement::decode(&payload[measurement_offset..], config)?;
-    let sample_count =
-        usize::try_from(measurement.sample_count).expect("measurement sample count fits usize");
-    let data_start = usize::from(measurement.trigger_offset) * CHANNEL_COUNT;
-    let data_end = data_start + sample_count * CHANNEL_COUNT;
-    if data_end > measurement_offset {
-        return Err(CaptureError::new(
-            "DSCope auto-calibration sample window is invalid",
-        ));
+
+    // The device can complete a payload-sized USB transfer before the FPGA
+    // has published valid measurement metadata. Normal acquisition discards
+    // these pending frames; calibration must do the same instead of trying to
+    // decode their empty footer as a measurement packet.
+    loop {
+        let footer = &payload[payload_bytes - MEASUREMENT_FOOTER_BYTES..];
+        if ScopeMeasurement::is_ready(footer, config) {
+            let measurement = ScopeMeasurement::decode(footer, config)?;
+            let frame = decode_calibration_frame(&payload, config, measurement)?;
+            return Ok((measurement, frame));
+        }
+        if Instant::now() >= deadline {
+            let _ = session.force_capture_ready();
+            return Err(CaptureError::new(
+                "timed out waiting for valid DSCope auto-calibration measurement metadata",
+            ));
+        }
+
+        let mut next_payload_read = session
+            .queue_bulk_read(payload_bytes)
+            .map_err(capture_error)?;
+        while !next_payload_read.is_complete() {
+            if Instant::now() >= deadline {
+                let _ = session.force_capture_ready();
+                next_payload_read.cancel().map_err(capture_error)?;
+                while !next_payload_read.is_complete() {
+                    session
+                        .handle_usb_events(Duration::from_millis(5))
+                        .map_err(capture_error)?;
+                }
+                let _ = next_payload_read.finish();
+                return Err(CaptureError::new(
+                    "timed out waiting for a valid DSCope auto-calibration frame",
+                ));
+            }
+            session
+                .handle_usb_events(Duration::from_millis(5))
+                .map_err(capture_error)?;
+        }
+        payload = require_scope_payload(
+            next_payload_read.finish().map_err(capture_error)?,
+            payload_bytes,
+        )?;
     }
-    let mut sums = [0_u64; CHANNEL_COUNT];
-    for sample in payload[data_start..data_end].chunks_exact(CHANNEL_COUNT) {
-        for channel in 0..CHANNEL_COUNT {
-            sums[channel] += u64::from(sample[channel]);
+}
+
+fn calibration_payload_bytes(config: DsCopeCaptureConfig) -> usize {
+    usize::try_from(config.armed_sample_count()).expect("calibration sample count fits usize")
+        * config.enabled_channel_count()
+        + MEASUREMENT_FOOTER_BYTES
+}
+
+fn decode_calibration_frame(
+    payload: &[u8],
+    config: DsCopeCaptureConfig,
+    measurement: ScopeMeasurement,
+) -> Result<DsCopeCalibrationFrame, CaptureError> {
+    let enabled_channel_count = config.enabled_channel_count();
+    let enabled_channel_indices = config.enabled_channel_indices().collect::<Vec<_>>();
+    let measurement_offset = usize::try_from(config.armed_sample_count())
+        .expect("validated sample count fits usize")
+        * enabled_channel_count;
+    let sample_count = usize::try_from(measurement.sample_count)
+        .expect("32-bit measurement sample count fits usize");
+    let data_start = usize::from(measurement.trigger_offset) * CHANNEL_COUNT;
+    let data_end = sample_count
+        .checked_mul(enabled_channel_count)
+        .and_then(|bytes| data_start.checked_add(bytes))
+        .ok_or_else(|| CaptureError::new("DSCope calibration sample window is too large"))?;
+    if data_end > measurement_offset {
+        return Err(CaptureError::new(format!(
+            "DSCope calibration sample window ends at byte {data_end}, beyond measurement footer at {measurement_offset}"
+        )));
+    }
+
+    let mut channels = vec![Vec::with_capacity(sample_count); enabled_channel_count];
+    for wire_samples in payload[data_start..data_end].chunks_exact(enabled_channel_count) {
+        for (wire_index, physical_channel) in enabled_channel_indices.iter().copied().enumerate() {
+            channels[wire_index].push(raw_to_volts(
+                wire_samples[wire_index],
+                measurement.hardware_offsets[physical_channel],
+                config.channels[physical_channel],
+            ));
         }
     }
-    Ok(sums.map(|sum| sum as f64 / sample_count as f64))
+    Ok(DsCopeCalibrationFrame {
+        config,
+        channels,
+        progress: 0.0,
+        phase: "Preparing calibration",
+    })
 }
 
 fn parse_channel_calibration(
@@ -1839,6 +2322,7 @@ struct ScopeMeasurement {
     triggered: bool,
     trigger_offset: u8,
     hardware_offsets: [u8; CHANNEL_COUNT],
+    branch_accumulators: [u32; 8],
 }
 
 impl ScopeMeasurement {
@@ -1875,7 +2359,42 @@ impl ScopeMeasurement {
             triggered: read_u32(footer, 8) & 0x4000_0000 != 0,
             trigger_offset: footer[11] & 0x07,
             hardware_offsets: [footer[102], footer[166]],
+            branch_accumulators: [
+                read_u32(footer, 104),
+                read_u32(footer, 108),
+                read_u32(footer, 112),
+                read_u32(footer, 116),
+                read_u32(footer, 168),
+                read_u32(footer, 172),
+                read_u32(footer, 176),
+                read_u32(footer, 180),
+            ],
         })
+    }
+
+    fn branch_means(self) -> [f64; 8] {
+        self.branch_accumulators.map(f64::from)
+    }
+
+    fn channel_means(self) -> Result<[f64; CHANNEL_COUNT], CaptureError> {
+        if self.sample_count == 0 {
+            return Err(CaptureError::new(
+                "DSCope calibration measurement contained no samples",
+            ));
+        }
+        let divisor = f64::from(self.sample_count);
+        Ok([
+            self.branch_accumulators[..4]
+                .iter()
+                .map(|value| f64::from(*value))
+                .sum::<f64>()
+                / divisor,
+            self.branch_accumulators[4..]
+                .iter()
+                .map(|value| f64::from(*value))
+                .sum::<f64>()
+                / divisor,
+        ])
     }
 }
 
@@ -2056,6 +2575,63 @@ mod tests {
         assert!(values.set_comb_comp(0, 128).is_err());
         assert!(values.set_preoffset(2, 0, 1).is_err());
         assert!(values.set_comb_comp(2, 0).is_err());
+    }
+
+    #[test]
+    fn serializes_every_persistent_calibration_field() {
+        let values = DsCopeCalibrationValues {
+            preoffsets: [[60; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+            vga_gains: [[0x069d; DSCOPE_VOLTS_PER_DIV_MV.len()]; CHANNEL_COUNT],
+            vpos_trans: [781, 812],
+            comb_comp: [-3, 7],
+            fine_gain_codes: [[1, 2, 3, 4], [5, 6, 7, 8]],
+            comb_fine_gain_codes: [[9, 10, 11, 12], [13, 14, 15, 16]],
+        };
+        let mut zero_record = [0_u8; CALIBRATION_ZERO_BYTES];
+        let mut vga_record = [0_u8; CALIBRATION_VGA_BYTES];
+
+        encode_calibration_records(values, 1, &mut zero_record, &mut vga_record).unwrap();
+
+        assert_eq!(read_u16(&zero_record, 1), 60);
+        assert_eq!(read_u16(&vga_record, 1), 0x069d);
+        assert_eq!(read_u16(&zero_record, CALIBRATION_VPOS_TRANS_OFFSET), 812);
+        assert_eq!(zero_record[CALIBRATION_COMB_COMP_OFFSET] as i8, 7);
+        assert_eq!(
+            &zero_record[CALIBRATION_FINE_GAIN_OFFSET..CALIBRATION_COMB_FINE_GAIN_OFFSET],
+            &[5, 6, 7, 8]
+        );
+        assert_eq!(
+            &zero_record[CALIBRATION_COMB_FINE_GAIN_OFFSET..CALIBRATION_ZERO_BYTES],
+            &[13, 14, 15, 16]
+        );
+    }
+
+    #[test]
+    fn uses_vendor_adc_fine_gain_encoding() {
+        assert_eq!(adc_fine_gain_from_code(0), 1.0);
+        assert_eq!(adc_fine_gain_from_code(0x7f), 1.0);
+        assert_eq!(adc_fine_gain_code(1.0), 0x7f);
+        assert!(adc_fine_gain_from_code(adc_fine_gain_code(1.005)) > 1.0);
+        assert!(adc_fine_gain_from_code(adc_fine_gain_code(0.995)) < 1.0);
+        assert_eq!(adc_fine_gain_code(2.0), 63);
+        assert_eq!(adc_fine_gain_code(0.5), 64);
+    }
+
+    #[test]
+    fn maps_dual_and_interleaved_adc_branches_like_vendor_calibration() {
+        let skews = [0.004, -0.004, 0.006, -0.006, 0.003, -0.003, 0.005, -0.005];
+        let mut dual_codes = [[0; 4]; CHANNEL_COUNT];
+        assert!(adjust_fine_gain_codes(&mut dual_codes, skews, false));
+        assert!(adc_fine_gain_from_code(dual_codes[0][0]) < 1.0);
+        assert!(adc_fine_gain_from_code(dual_codes[0][1]) < 1.0);
+        assert!(adc_fine_gain_from_code(dual_codes[0][2]) > 1.0);
+        assert!(adc_fine_gain_from_code(dual_codes[1][1]) < 1.0);
+
+        let mut combined_codes = [[0; 4]; CHANNEL_COUNT];
+        assert!(adjust_fine_gain_codes(&mut combined_codes, skews, true));
+        assert!(adc_fine_gain_from_code(combined_codes[0][2]) < 1.0);
+        assert!(adc_fine_gain_from_code(combined_codes[1][0]) > 1.0);
+        assert!(adc_fine_gain_from_code(combined_codes[1][3]) < 1.0);
     }
 
     #[test]
@@ -2445,6 +3021,14 @@ mod tests {
         footer[11] = 3;
         footer[102] = 128;
         footer[166] = 130;
+        for (index, value) in [10_u32, 20, 30, 40, 50, 60, 70, 80].into_iter().enumerate() {
+            let offset = if index < 4 {
+                104 + index * 4
+            } else {
+                168 + (index - 4) * 4
+            };
+            footer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
 
         let measurement = ScopeMeasurement::decode(&footer, config).unwrap();
 
@@ -2452,6 +3036,11 @@ mod tests {
         assert!(!measurement.triggered);
         assert_eq!(measurement.trigger_offset, 3);
         assert_eq!(measurement.hardware_offsets, [128, 130]);
+        assert_eq!(
+            measurement.branch_accumulators,
+            [10, 20, 30, 40, 50, 60, 70, 80]
+        );
+        assert_eq!(measurement.channel_means().unwrap(), [1.0, 2.6]);
         let channel = DsCopeChannelConfig::default();
         assert_eq!(raw_to_volts(128, 128, channel), 0.0);
         assert!(raw_to_volts(100, 128, channel) > 1.19);
@@ -2520,6 +3109,29 @@ mod tests {
         let measurement = ScopeMeasurement::decode(&footer, config).unwrap();
 
         assert_eq!(measurement.sample_count, 200);
+    }
+
+    #[test]
+    fn sizes_calibration_payload_for_enabled_channel_count() {
+        let dual = DsCopeCaptureConfig::new(500_000_000, 50_000).unwrap();
+        let single = DsCopeCaptureConfig::with_channel_configs(
+            1_000_000_000,
+            50_000,
+            [
+                DsCopeChannelConfig::default(),
+                DsCopeChannelConfig::default().with_enabled(false),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            calibration_payload_bytes(dual),
+            dual.armed_sample_count() as usize * 2 + MEASUREMENT_FOOTER_BYTES
+        );
+        assert_eq!(
+            calibration_payload_bytes(single),
+            single.armed_sample_count() as usize + MEASUREMENT_FOOTER_BYTES
+        );
     }
 
     #[test]
