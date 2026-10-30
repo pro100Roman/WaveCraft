@@ -1,5 +1,7 @@
 use crate::transport::QueuedBulkReadOutcome;
-use crate::{DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbError, DSCOPE_U3P100};
+use crate::{
+    DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbError, UsbSpeedClass, DSCOPE_U3P100,
+};
 use dsview_core::{
     CaptureBatch, CaptureContext, CaptureError, CaptureSource, DeviceDescriptor, DeviceId,
     InstrumentKind, ScopeBatch,
@@ -28,8 +30,11 @@ const CALIBRATION_DEFAULT_PREOFFSET: u16 = 60;
 const CALIBRATION_OFFSET_TOP: u16 = 15;
 const CALIBRATION_OFFSET_BOTTOM: u16 = 240;
 const CALIBRATION_MARGIN_PASS: f64 = 0.3;
-const CALIBRATION_MAX_ADJUSTMENTS: usize = 32;
+const CALIBRATION_MAX_ADJUSTMENTS: usize = 64;
+const CALIBRATION_MAX_TRANSFORM_RESIDUAL: f64 = 8.0;
 const CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS: usize = 24;
+const CALIBRATION_SAMPLE_COUNT: u64 = 2_000;
+const CALIBRATION_SAMPLE_RATE_HZ: u64 = 500_000_000;
 const CALIBRATION_FINE_GAIN_VARIANCE: f64 = 0.0005;
 const CALIBRATION_FINE_GAIN_MIN: f64 = 0.9923;
 const CALIBRATION_FINE_GAIN_MAX: f64 = 1.0077;
@@ -122,6 +127,14 @@ impl DsCopeCalibrationFrame {
     pub fn phase(&self) -> &'static str {
         self.phase
     }
+}
+
+#[derive(Clone, Copy)]
+struct CalibrationCaptureStep {
+    settling_frames: usize,
+    progress_start: f32,
+    progress_end: f32,
+    phase: &'static str,
 }
 
 impl DsCopeCalibrationValues {
@@ -830,18 +843,19 @@ pub fn write_dscope_calibration(
     combine_results(write_result, close_result, "release the USB interface")
 }
 
-pub fn auto_calibrate_dscope(device: &DiscoveredDevice) -> Result<(), CaptureError> {
+pub fn auto_calibrate_dscope(
+    device: &DiscoveredDevice,
+) -> Result<DsCopeCalibrationValues, CaptureError> {
     auto_calibrate_dscope_with_progress(device, |_| {})
 }
 
 pub fn auto_calibrate_dscope_with_progress(
     device: &DiscoveredDevice,
     mut on_frame: impl FnMut(DsCopeCalibrationFrame),
-) -> Result<(), CaptureError> {
-    const CALIBRATION_SAMPLE_COUNT: u64 = 50_000;
-    const CALIBRATION_SAMPLE_RATE_HZ: u64 = 500_000_000;
-
+) -> Result<DsCopeCalibrationValues, CaptureError> {
     validate_dscope_device(device)?;
+    let settling_frames = calibration_settling_frames(device.speed);
+    let branch_settling_frames = calibration_branch_settling_frames(device.speed);
     let session = UsbDeviceSession::open(device).map_err(capture_error)?;
     let calibration_result = (|| {
         validate_device_ready(&session)?;
@@ -878,12 +892,34 @@ pub fn auto_calibrate_dscope_with_progress(
             )?;
             configure_calibration_capture(&session, config, values, range)?;
         }
+        let warm_range = DSCOPE_VOLTS_PER_DIV_MV.len() - 1;
+        let warm_config = calibration_capture_config(
+            CALIBRATION_SAMPLE_RATE_HZ,
+            CALIBRATION_SAMPLE_COUNT,
+            warm_range,
+            DSCOPE_VERTICAL_OFFSET_CENTER,
+            enabled_channels,
+        )?;
+        capture_calibration_measurement(
+            &session,
+            warm_config,
+            values,
+            warm_range,
+            CalibrationCaptureStep {
+                settling_frames,
+                progress_start: 0.0,
+                progress_end: 0.05,
+                phase: "Warming up input ranges",
+            },
+            &mut on_frame,
+        )?;
 
         calibrate_vertical_transform(
             &session,
             &mut values,
             CALIBRATION_SAMPLE_RATE_HZ,
             CALIBRATION_SAMPLE_COUNT,
+            settling_frames,
             &mut on_frame,
         )?;
 
@@ -898,17 +934,25 @@ pub fn auto_calibrate_dscope_with_progress(
 
             let mut converged = false;
             for adjustment in 0..CALIBRATION_MAX_ADJUSTMENTS {
-                let progress = 0.15
-                    + range as f32 / DSCOPE_VOLTS_PER_DIV_MV.len() as f32 * 0.55
+                let progress = 0.20
+                    + range as f32 / DSCOPE_VOLTS_PER_DIV_MV.len() as f32 * 0.50
                     + adjustment as f32 / CALIBRATION_MAX_ADJUSTMENTS as f32
-                        * (0.55 / DSCOPE_VOLTS_PER_DIV_MV.len() as f32);
+                        * (0.50 / DSCOPE_VOLTS_PER_DIV_MV.len() as f32);
+                let progress_end = progress
+                    + 0.50
+                        / DSCOPE_VOLTS_PER_DIV_MV.len() as f32
+                        / CALIBRATION_MAX_ADJUSTMENTS as f32;
                 let measurement = capture_calibration_measurement(
                     &session,
                     config,
                     values,
                     range,
-                    progress,
-                    "Centering input ranges",
+                    CalibrationCaptureStep {
+                        settling_frames,
+                        progress_start: progress,
+                        progress_end,
+                        phase: "Centering input ranges",
+                    },
                     &mut on_frame,
                 )?;
                 let means = measurement.channel_means()?;
@@ -952,6 +996,7 @@ pub fn auto_calibrate_dscope_with_progress(
             &mut values,
             CALIBRATION_SAMPLE_COUNT,
             false,
+            branch_settling_frames,
             &mut on_frame,
         )?;
         calibrate_adc_fine_gains(
@@ -959,20 +1004,44 @@ pub fn auto_calibrate_dscope_with_progress(
             &mut values,
             CALIBRATION_SAMPLE_COUNT,
             true,
+            branch_settling_frames,
             &mut on_frame,
         )?;
-        write_calibration_values(&session, values)
+        Ok(values)
     })();
     if calibration_result.is_err() {
         let _ = session.force_capture_ready();
         let _ = session.stop_capture();
     }
     let close_result = session.close().map_err(capture_error);
-    combine_results(
-        calibration_result,
-        close_result,
-        "release the USB interface",
-    )
+    match (calibration_result, close_result) {
+        (Ok(values), Ok(())) => Ok(values),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => Err(CaptureError::new(format!(
+            "{primary}; additionally failed to release the USB interface: {cleanup}"
+        ))),
+    }
+}
+
+fn calibration_settling_frames(speed: UsbSpeedClass) -> usize {
+    if cfg!(target_os = "windows") {
+        if speed >= UsbSpeedClass::SuperSpeed {
+            10
+        } else {
+            4
+        }
+    } else {
+        50
+    }
+}
+
+fn calibration_branch_settling_frames(speed: UsbSpeedClass) -> usize {
+    let branch_done_count = if speed >= UsbSpeedClass::SuperSpeed {
+        10
+    } else {
+        2
+    };
+    branch_done_count * calibration_settling_frames(speed)
 }
 
 fn calibration_capture_config(
@@ -1011,8 +1080,7 @@ fn capture_calibration_measurement(
     config: DsCopeCaptureConfig,
     values: DsCopeCalibrationValues,
     range: usize,
-    progress: f32,
-    phase: &'static str,
+    step: CalibrationCaptureStep,
     on_frame: &mut dyn FnMut(DsCopeCalibrationFrame),
 ) -> Result<ScopeMeasurement, CaptureError> {
     let calibration = DsCopeCalibration::from_values(values, [range; CHANNEL_COUNT]);
@@ -1022,15 +1090,10 @@ fn capture_calibration_measurement(
         .arm_capture(&config.encode_settings())
         .map_err(capture_error)?;
     configure_scope_post_arm(session, config, calibration)?;
-    let measurement = read_calibration_measurement(session, config);
+    let measurement = read_calibration_measurement(session, config, step, on_frame);
     let stop_result = session.stop_capture().map_err(capture_error);
     match (measurement, stop_result) {
-        (Ok((measurement, mut frame)), Ok(())) => {
-            frame.progress = progress;
-            frame.phase = phase;
-            on_frame(frame);
-            Ok(measurement)
-        }
+        (Ok(measurement), Ok(())) => Ok(measurement),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(primary), Err(cleanup)) => Err(CaptureError::new(format!(
             "{primary}; additionally failed to stop calibration capture: {cleanup}"
@@ -1043,11 +1106,21 @@ fn calibrate_vertical_transform(
     values: &mut DsCopeCalibrationValues,
     sample_rate_hz: u64,
     sample_count: u64,
+    settling_frames: usize,
     on_frame: &mut dyn FnMut(DsCopeCalibrationFrame),
 ) -> Result<(), CaptureError> {
     let range = DSCOPE_VOLTS_PER_DIV_MV.len() - 1;
+    let mut previous = [None; CHANNEL_COUNT];
+    let mut saturated = [false; CHANNEL_COUNT];
+    let mut best = [
+        (f64::INFINITY, values.vpos_trans[0]),
+        (f64::INFINITY, values.vpos_trans[1]),
+    ];
+    let mut last_bottom = [0.0; CHANNEL_COUNT];
+    let mut last_top = [0.0; CHANNEL_COUNT];
     for adjustment in 0..CALIBRATION_MAX_ADJUSTMENTS {
-        let attempt_progress = adjustment as f32 / CALIBRATION_MAX_ADJUSTMENTS as f32 * 0.15;
+        let attempt_progress = 0.05 + adjustment as f32 / CALIBRATION_MAX_ADJUSTMENTS as f32 * 0.15;
+        let attempt_span = 0.15 / CALIBRATION_MAX_ADJUSTMENTS as f32;
         let bottom_config = calibration_capture_config(
             sample_rate_hz,
             sample_count,
@@ -1060,8 +1133,12 @@ fn calibrate_vertical_transform(
             bottom_config,
             *values,
             range,
-            attempt_progress,
-            "Calibrating vertical offset span",
+            CalibrationCaptureStep {
+                settling_frames,
+                progress_start: attempt_progress,
+                progress_end: attempt_progress + attempt_span * 0.5,
+                phase: "Calibrating vertical offset span",
+            },
             on_frame,
         )?
         .channel_means()?;
@@ -1077,39 +1154,103 @@ fn calibrate_vertical_transform(
             top_config,
             *values,
             range,
-            attempt_progress + 0.002,
-            "Calibrating vertical offset span",
+            CalibrationCaptureStep {
+                settling_frames,
+                progress_start: attempt_progress + attempt_span * 0.5,
+                progress_end: attempt_progress + attempt_span,
+                phase: "Calibrating vertical offset span",
+            },
             on_frame,
         )?
         .channel_means()?;
         let expected_span = f64::from(CALIBRATION_OFFSET_BOTTOM - CALIBRATION_OFFSET_TOP);
         let margins = [
-            bottom[0] - top[0] - expected_span,
-            bottom[1] - top[1] - expected_span,
+            calibration_span_margin(bottom[0], top[0], expected_span),
+            calibration_span_margin(bottom[1], top[1], expected_span),
         ];
+        last_bottom = bottom;
+        last_top = top;
+        for channel in 0..CHANNEL_COUNT {
+            if margins[channel].abs() < best[channel].0 {
+                best[channel] = (margins[channel].abs(), values.vpos_trans[channel]);
+            }
+        }
         if margins
             .iter()
-            .all(|margin| margin.abs() < CALIBRATION_MARGIN_PASS)
+            .enumerate()
+            .all(|(channel, margin)| saturated[channel] || margin.abs() < CALIBRATION_MARGIN_PASS)
         {
             return Ok(());
         }
         for (channel, margin) in margins.into_iter().enumerate() {
-            if margin.abs() < CALIBRATION_MARGIN_PASS {
+            if saturated[channel] || margin.abs() < CALIBRATION_MARGIN_PASS {
                 continue;
             }
             let current = i32::from(values.vpos_trans[channel]);
-            let adjusted = (current - calibration_integer_adjustment(margin)).clamp(1, 1_023);
+            let adjusted =
+                next_vertical_transform(current, margin, previous[channel]).clamp(1, 1_023);
+            previous[channel] = Some((current, margin));
             if adjusted == current {
-                return Err(CaptureError::new(format!(
-                    "DSCope auto calibration reached the vertical transform limit on CH{channel}"
-                )));
+                if vertical_transform_is_saturated(current, margin) {
+                    // The vendor driver clamps the 10-bit transform at this
+                    // boundary. Some units cannot produce the full nominal
+                    // 225-code offset span, so retain their closest attainable
+                    // value and continue calibrating the remaining stages.
+                    saturated[channel] = true;
+                    continue;
+                }
+                break;
             }
             values.vpos_trans[channel] = adjusted as u16;
         }
+        if margins
+            .iter()
+            .enumerate()
+            .all(|(channel, margin)| saturated[channel] || margin.abs() < CALIBRATION_MARGIN_PASS)
+        {
+            return Ok(());
+        }
     }
-    Err(CaptureError::new(
-        "DSCope auto calibration did not converge while calibrating the vertical transform",
-    ))
+    for (destination, (_, transform)) in values.vpos_trans.iter_mut().zip(best) {
+        *destination = transform;
+    }
+    if best
+        .iter()
+        .all(|(margin, _)| *margin <= CALIBRATION_MAX_TRANSFORM_RESIDUAL)
+    {
+        return Ok(());
+    }
+    Err(CaptureError::new(format!(
+        "DSCope auto calibration did not converge while calibrating the vertical transform: CH0 bottom {:.3}, top {:.3}, best error {:.3}; CH1 bottom {:.3}, top {:.3}, best error {:.3}",
+        last_bottom[0], last_top[0], best[0].0, last_bottom[1], last_top[1], best[1].0
+    )))
+}
+
+fn calibration_span_margin(bottom: f64, top: f64, expected_span: f64) -> f64 {
+    (bottom - top).abs() - expected_span
+}
+
+fn vertical_transform_is_saturated(transform: i32, margin: f64) -> bool {
+    (transform == 1_023 && margin < 0.0) || (transform == 1 && margin > 0.0)
+}
+
+fn next_vertical_transform(current: i32, margin: f64, previous: Option<(i32, f64)>) -> i32 {
+    if let Some((previous_transform, previous_margin)) = previous {
+        let transform_delta = f64::from(current - previous_transform);
+        if transform_delta != 0.0 {
+            let slope = (margin - previous_margin) / transform_delta;
+            // A larger PWM transform must increase the measured offset span.
+            // Reject negative slopes caused by frame-to-frame measurement
+            // noise and fall back to the vendor's integer correction.
+            if slope.is_finite() && slope > 0.05 {
+                let correction = (margin / slope).round() as i32;
+                if correction != 0 {
+                    return current - correction;
+                }
+            }
+        }
+    }
+    current - calibration_integer_adjustment(margin)
 }
 
 fn calibrate_adc_fine_gains(
@@ -1117,6 +1258,7 @@ fn calibrate_adc_fine_gains(
     values: &mut DsCopeCalibrationValues,
     sample_count: u64,
     combined: bool,
+    settling_frames: usize,
     on_frame: &mut dyn FnMut(DsCopeCalibrationFrame),
 ) -> Result<(), CaptureError> {
     let enabled_channels = if combined {
@@ -1143,25 +1285,30 @@ fn calibrate_adc_fine_gains(
         .configure_dscope_channels(enabled_channels)
         .map_err(capture_error)?;
     if combined {
-        values.comb_fine_gain_codes = [[0; 4]; CHANNEL_COUNT];
+        values.comb_fine_gain_codes = [[adc_fine_gain_code(1.0); 4]; CHANNEL_COUNT];
     } else {
-        values.fine_gain_codes = [[0; 4]; CHANNEL_COUNT];
+        values.fine_gain_codes = [[adc_fine_gain_code(1.0); 4]; CHANNEL_COUNT];
     }
 
     for adjustment in 0..CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS {
         let phase_start = if combined { 0.85 } else { 0.70 };
         let progress =
             phase_start + adjustment as f32 / CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS as f32 * 0.15;
+        let progress_end = progress + 0.15 / CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS as f32;
         let measurement = capture_calibration_measurement(
             session,
             config,
             *values,
             range,
-            progress,
-            if combined {
-                "Balancing interleaved ADC branches"
-            } else {
-                "Balancing dual-channel ADC branches"
+            CalibrationCaptureStep {
+                settling_frames,
+                progress_start: progress,
+                progress_end,
+                phase: if combined {
+                    "Balancing interleaved ADC branches"
+                } else {
+                    "Balancing dual-channel ADC branches"
+                },
             },
             on_frame,
         )?;
@@ -1760,7 +1907,9 @@ impl DsCopeCalibration {
 fn read_calibration_measurement(
     session: &UsbDeviceSession,
     config: DsCopeCaptureConfig,
-) -> Result<(ScopeMeasurement, DsCopeCalibrationFrame), CaptureError> {
+    step: CalibrationCaptureStep,
+    on_frame: &mut dyn FnMut(DsCopeCalibrationFrame),
+) -> Result<ScopeMeasurement, CaptureError> {
     let payload_bytes = calibration_payload_bytes(config);
     let mut header_read = session
         .queue_bulk_read(TRIGGER_HEADER_BYTES)
@@ -1786,7 +1935,7 @@ fn read_calibration_measurement(
         let _ = payload_read.finish();
         return Err(capture_error(error));
     }
-    let deadline = Instant::now() + CAPTURE_COMPLETION_GRACE;
+    let mut deadline = Instant::now() + CAPTURE_COMPLETION_GRACE;
     while !header_read.is_complete() || !payload_read.is_complete() {
         if Instant::now() >= deadline {
             let _ = session.force_capture_ready();
@@ -1819,12 +1968,26 @@ fn read_calibration_measurement(
     // has published valid measurement metadata. Normal acquisition discards
     // these pending frames; calibration must do the same instead of trying to
     // decode their empty footer as a measurement packet.
+    let target_frames = step.settling_frames.max(1);
+    let report_interval = (target_frames / 50).max(1);
+    let mut valid_frames = 0_usize;
     loop {
         let footer = &payload[payload_bytes - MEASUREMENT_FOOTER_BYTES..];
         if ScopeMeasurement::is_ready(footer, config) {
             let measurement = ScopeMeasurement::decode(footer, config)?;
-            let frame = decode_calibration_frame(&payload, config, measurement)?;
-            return Ok((measurement, frame));
+            valid_frames += 1;
+            if valid_frames.checked_rem(report_interval) == Some(0) || valid_frames == target_frames
+            {
+                let mut frame = decode_calibration_frame(&payload, config, measurement)?;
+                let fraction = valid_frames as f32 / target_frames as f32;
+                frame.progress =
+                    step.progress_start + (step.progress_end - step.progress_start) * fraction;
+                frame.phase = step.phase;
+                on_frame(frame);
+            }
+            if valid_frames >= target_frames {
+                return Ok(measurement);
+            }
         }
         if Instant::now() >= deadline {
             let _ = session.force_capture_ready();
@@ -1858,6 +2021,7 @@ fn read_calibration_measurement(
             next_payload_read.finish().map_err(capture_error)?,
             payload_bytes,
         )?;
+        deadline = Instant::now() + CAPTURE_COMPLETION_GRACE;
     }
 }
 
@@ -2615,6 +2779,53 @@ mod tests {
         assert!(adc_fine_gain_from_code(adc_fine_gain_code(0.995)) < 1.0);
         assert_eq!(adc_fine_gain_code(2.0), 63);
         assert_eq!(adc_fine_gain_code(0.5), 64);
+    }
+
+    #[test]
+    fn uses_vendor_calibration_frame_intervals() {
+        let super_speed = calibration_settling_frames(UsbSpeedClass::SuperSpeed);
+        let high_speed = calibration_settling_frames(UsbSpeedClass::HighSpeed);
+        if cfg!(target_os = "windows") {
+            assert_eq!(super_speed, 10);
+            assert_eq!(high_speed, 4);
+        } else {
+            assert_eq!(super_speed, 50);
+            assert_eq!(high_speed, 50);
+        }
+        assert_eq!(
+            calibration_branch_settling_frames(UsbSpeedClass::SuperSpeed),
+            super_speed * 10
+        );
+        assert_eq!(
+            calibration_branch_settling_frames(UsbSpeedClass::HighSpeed),
+            high_speed * 2
+        );
+        assert_eq!(CALIBRATION_SAMPLE_COUNT, 2_000);
+    }
+
+    #[test]
+    fn calibrates_vertical_span_independently_of_adc_polarity() {
+        assert_eq!(calibration_span_margin(240.0, 15.0, 225.0), 0.0);
+        assert_eq!(calibration_span_margin(15.0, 240.0, 225.0), 0.0);
+        assert_eq!(calibration_span_margin(245.0, 15.0, 225.0), 5.0);
+        assert_eq!(calibration_span_margin(15.0, 245.0, 225.0), 5.0);
+    }
+
+    #[test]
+    fn refines_vertical_transform_from_measured_response() {
+        assert_eq!(next_vertical_transform(780, 10.0, None), 770);
+        assert_eq!(next_vertical_transform(770, 2.0, Some((780, 10.0))), 767);
+        assert_eq!(next_vertical_transform(790, -2.0, Some((780, -10.0))), 793);
+        assert_eq!(next_vertical_transform(790, -2.0, Some((780, 10.0))), 792);
+    }
+
+    #[test]
+    fn accepts_the_closest_attainable_vertical_transform_at_hardware_limits() {
+        assert!(vertical_transform_is_saturated(1_023, -6.8));
+        assert!(vertical_transform_is_saturated(1, 6.8));
+        assert!(!vertical_transform_is_saturated(1_023, 6.8));
+        assert!(!vertical_transform_is_saturated(1, -6.8));
+        assert!(!vertical_transform_is_saturated(780, -6.8));
     }
 
     #[test]

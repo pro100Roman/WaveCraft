@@ -1566,6 +1566,12 @@ struct CalibrationProgressModal {
     progress: f32,
     phase: String,
     completed: bool,
+    values: Option<DsCopeCalibrationValues>,
+}
+
+enum CalibrationModalAction {
+    Close,
+    Save(DsCopeCalibrationValues),
 }
 
 struct LoadedRecording {
@@ -1589,7 +1595,8 @@ enum WorkerSuccess {
         scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
     },
     ScopeConfigured(usize),
-    ScopeAutoCalibrated,
+    ScopeAutoCalibrated(DsCopeCalibrationValues),
+    ScopeAutoCalibrationSaved,
     ScopeCalibrationLoaded(DsCopeCalibrationValues),
     ScopeCalibrationSaved,
     RecordingLoaded {
@@ -1973,6 +1980,7 @@ impl DsViewApp {
             progress: 0.0,
             phase: "Preparing oscilloscope…".to_owned(),
             completed: false,
+            values: None,
         });
         self.active_waveform_tab = Some(WaveformTab::Oscilloscope);
         self.status = "Auto-calibrating DSCope offsets and ADC branches…".to_owned();
@@ -1981,13 +1989,48 @@ impl DsViewApp {
             let result = (|| {
                 let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
                 prepare_device(&device, &bitstream_path).map_err(|error| error.to_string())?;
-                auto_calibrate_dscope_with_progress(&device, |frame| {
+                let values = auto_calibrate_dscope_with_progress(&device, |frame| {
                     let _ = progress_sender.send(frame);
                 })
                 .map_err(|error| error.to_string())?;
                 apply_dscope_configuration(&device, scope_config)
                     .map_err(|error| error.to_string())?;
-                Ok(WorkerSuccess::ScopeAutoCalibrated)
+                Ok(WorkerSuccess::ScopeAutoCalibrated(values))
+            })();
+            let _ = sender.send(result);
+        });
+    }
+
+    fn begin_save_auto_calibration(&mut self, values: DsCopeCalibrationValues) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(device) = self.selected_scope_device() else {
+            return;
+        };
+        let scope_config = match self.scope_settings.capture_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.pending = Some(receiver);
+        if let Some(modal) = self.calibration_modal.as_mut() {
+            modal.progress = 0.0;
+            modal.phase = "Saving calibration to device NVM…".to_owned();
+            modal.completed = false;
+            modal.values = None;
+        }
+        self.status = "Saving DSCope calibration to device NVM…".to_owned();
+        self.last_error = None;
+        thread::spawn(move || {
+            let result = (|| {
+                write_dscope_calibration(&device, values).map_err(|error| error.to_string())?;
+                apply_dscope_configuration(&device, scope_config)
+                    .map_err(|error| error.to_string())?;
+                Ok(WorkerSuccess::ScopeAutoCalibrationSaved)
             })();
             let _ = sender.send(result);
         });
@@ -2359,16 +2402,26 @@ impl DsViewApp {
                 self.status =
                     format!("Applied DSCope configuration to {device_count} instrument(s)");
             }
-            Ok(WorkerSuccess::ScopeAutoCalibrated) => {
+            Ok(WorkerSuccess::ScopeAutoCalibrated(values)) => {
                 self.calibration_active = false;
                 self.calibration_progress = None;
                 self.calibration_display = None;
                 if let Some(modal) = self.calibration_modal.as_mut() {
                     modal.progress = 1.0;
-                    modal.phase = "Calibration is done.".to_owned();
+                    modal.phase = "Calibration is done. Save the result to device NVM?".to_owned();
                     modal.completed = true;
+                    modal.values = Some(values);
                 }
-                self.status = "DSCope auto calibration completed and verified".to_owned();
+                self.status = "DSCope auto calibration finished · result not saved".to_owned();
+            }
+            Ok(WorkerSuccess::ScopeAutoCalibrationSaved) => {
+                if let Some(modal) = self.calibration_modal.as_mut() {
+                    modal.progress = 1.0;
+                    modal.phase = "Calibration was saved to device NVM.".to_owned();
+                    modal.completed = true;
+                    modal.values = None;
+                }
+                self.status = "DSCope auto calibration saved and verified".to_owned();
             }
             Ok(WorkerSuccess::ScopeCalibrationLoaded(values)) => {
                 let range = DSCOPE_VOLTS_PER_DIV_MV
@@ -3910,7 +3963,7 @@ fn paint_scope_tools(
 fn paint_calibration_progress_modal(
     context: &egui::Context,
     state: &CalibrationProgressModal,
-) -> bool {
+) -> Option<CalibrationModalAction> {
     let screen_rect = context.input(|input| input.screen_rect());
     egui::Area::new(egui::Id::new("calibration_progress_modal_backdrop"))
         .order(egui::Order::Middle)
@@ -3921,7 +3974,7 @@ fn paint_calibration_progress_modal(
                 .rect_filled(rect, egui::Rounding::ZERO, Color32::from_black_alpha(112));
         });
 
-    let mut close = false;
+    let mut action = None;
     egui::Window::new("DSCope Auto Calibration")
         .id(egui::Id::new("calibration_progress_modal"))
         .order(egui::Order::Foreground)
@@ -3931,12 +3984,21 @@ fn paint_calibration_progress_modal(
         .default_width(430.0)
         .show(context, |ui| {
             if state.completed {
-                ui.label(RichText::new("Calibration is done.").strong().color(ACCENT));
+                ui.label(RichText::new(&state.phase).strong().color(ACCENT));
                 ui.add_space(8.0);
                 ui.add(egui::ProgressBar::new(1.0).show_percentage().fill(ACCENT));
                 ui.add_space(12.0);
-                if ui.button("Close").clicked() {
-                    close = true;
+                if let Some(values) = state.values {
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            action = Some(CalibrationModalAction::Close);
+                        }
+                        if ui.button("Save").clicked() {
+                            action = Some(CalibrationModalAction::Save(values));
+                        }
+                    });
+                } else if ui.button("Close").clicked() {
+                    action = Some(CalibrationModalAction::Close);
                 }
             } else {
                 ui.label(RichText::new(&state.phase).strong());
@@ -3956,7 +4018,7 @@ fn paint_calibration_progress_modal(
                 );
             }
         });
-    close
+    action
 }
 
 fn paint_instrument_settings(
@@ -4677,7 +4739,7 @@ impl eframe::App for DsViewApp {
                 ui.label(RichText::new("Disconnect all probes before continuing.").strong());
                 ui.add_space(6.0);
                 ui.label(
-                    "DSView will run the vendor calibration sequence for both channels: offset transfer, all input ranges, and ADC branch balance. It can take a while.",
+                    "DSView will run the vendor calibration sequence for both channels: offset transfer, all input ranges, and ADC branch balance. It can take a while. Device NVM is changed only if you choose Save when calibration finishes.",
                 );
                 ui.add_space(6.0);
                 ui.label(
@@ -4814,12 +4876,14 @@ impl eframe::App for DsViewApp {
             self.scope_settings.channels.map(|channel| channel.enabled),
             &self.scope_channel_names,
         );
-        if self
+        let calibration_modal_action = self
             .calibration_modal
             .as_ref()
-            .is_some_and(|state| paint_calibration_progress_modal(context, state))
-        {
-            self.calibration_modal = None;
+            .and_then(|state| paint_calibration_progress_modal(context, state));
+        match calibration_modal_action {
+            Some(CalibrationModalAction::Close) => self.calibration_modal = None,
+            Some(CalibrationModalAction::Save(values)) => self.begin_save_auto_calibration(values),
+            None => {}
         }
 
         if record_now_clicked {
