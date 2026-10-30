@@ -28,7 +28,7 @@ pub use dscope::{
 };
 pub use dslogic::{
     DsLogicCaptureConfig, DsLogicCaptureSource, DsLogicInputFilter, DsLogicOperationMode,
-    DsLogicStopOption,
+    DsLogicStopOption, DSLOGIC_SAMPLE_RATES_HZ,
 };
 pub use prepare::{load_device_fpga, prepare_device, FpgaLoad, PreparedDevice};
 pub use probe::{probe_device, DeviceProbe, UsbEndpointInfo};

@@ -1,6 +1,7 @@
 use crate::transport::QueuedBulkReadOutcome;
 use crate::{
-    BulkReadOutcome, DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbError, DSLOGIC_U3PRO16,
+    BulkReadOutcome, DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbError, UsbSpeedClass,
+    DSLOGIC_U3PRO16,
 };
 use dsview_core::{
     CaptureBatch, CaptureContext, CaptureError, CaptureSource, DeviceDescriptor, DeviceId,
@@ -14,7 +15,6 @@ const PRE_DIVIDER: u32 = 5;
 const SAMPLE_ALIGNMENT: u64 = 1_024;
 const ATOMIC_SAMPLES: usize = 64;
 const BYTES_PER_CHANNEL_BLOCK: usize = 8;
-const CROSS_BLOCK_BYTES: usize = CHANNEL_COUNT as usize * BYTES_PER_CHANNEL_BLOCK;
 const TRIGGER_HEADER_BYTES: usize = 1_024;
 const TRIGGER_CHECK_ID: u32 = 0x5555_5555;
 const SETTINGS_BYTES: usize = 372;
@@ -27,11 +27,13 @@ const PAYLOAD_TRANSFER_GRACE: Duration = Duration::from_secs(5);
 const CLOCK_TYPE_BIT: u16 = 1;
 const CLOCK_EDGE_BIT: u16 = 2;
 const RLE_MODE_BIT: u16 = 3;
+const HALF_MODE_BIT: u16 = 5;
+const QUARTER_MODE_BIT: u16 = 6;
 const FILTER_BIT: u16 = 8;
 const STREAM_MODE_BIT: u16 = 12;
 const INTERNAL_TEST_BIT: u16 = 15;
 
-const SUPPORTED_SAMPLE_RATES: &[u64] = &[
+pub const DSLOGIC_SAMPLE_RATES_HZ: &[u64] = &[
     1_000_000,
     2_000_000,
     4_000_000,
@@ -44,6 +46,7 @@ const SUPPORTED_SAMPLE_RATES: &[u64] = &[
     125_000_000,
     250_000_000,
     500_000_000,
+    1_000_000_000,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,11 +79,12 @@ pub struct DsLogicCaptureConfig {
     rle_enabled: bool,
     external_clock: bool,
     falling_clock_edge: bool,
+    enabled_channels: [bool; CHANNEL_COUNT as usize],
 }
 
 impl DsLogicCaptureConfig {
     pub fn new(sample_rate_hz: u64, sample_count: u64) -> Result<Self, CaptureError> {
-        if !SUPPORTED_SAMPLE_RATES.contains(&sample_rate_hz) {
+        if !DSLOGIC_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
             return Err(CaptureError::new(format!(
                 "unsupported DSLogic U3Pro16 sample rate {sample_rate_hz} Hz"
             )));
@@ -100,6 +104,7 @@ impl DsLogicCaptureConfig {
             rle_enabled: false,
             external_clock: false,
             falling_clock_edge: false,
+            enabled_channels: [true; CHANNEL_COUNT as usize],
         })
     }
 
@@ -143,6 +148,19 @@ impl DsLogicCaptureConfig {
         self
     }
 
+    pub fn with_enabled_channels(
+        mut self,
+        enabled_channels: [bool; CHANNEL_COUNT as usize],
+    ) -> Result<Self, CaptureError> {
+        if !enabled_channels.iter().any(|enabled| *enabled) {
+            return Err(CaptureError::new(
+                "DSLogic capture requires at least one enabled channel",
+            ));
+        }
+        self.enabled_channels = enabled_channels;
+        Ok(self)
+    }
+
     pub fn sample_rate_hz(self) -> u64 {
         self.sample_rate_hz
     }
@@ -179,6 +197,68 @@ impl DsLogicCaptureConfig {
         self.falling_clock_edge
     }
 
+    pub fn enabled_channels(self) -> [bool; CHANNEL_COUNT as usize] {
+        self.enabled_channels
+    }
+
+    pub fn enabled_channel_count(self) -> u8 {
+        self.enabled_channels
+            .iter()
+            .filter(|enabled| **enabled)
+            .count() as u8
+    }
+
+    pub fn maximum_sample_rate_hz(self, speed: UsbSpeedClass) -> u64 {
+        let enabled_count = self.enabled_channel_count();
+        let lower_eight_only = self.enabled_channels[8..].iter().all(|enabled| !enabled);
+        match self.operation_mode {
+            DsLogicOperationMode::Buffer => {
+                if enabled_count <= 8 && lower_eight_only {
+                    1_000_000_000
+                } else {
+                    500_000_000
+                }
+            }
+            DsLogicOperationMode::Stream if speed >= UsbSpeedClass::SuperSpeed => {
+                if enabled_count <= 3 && lower_eight_only {
+                    1_000_000_000
+                } else if enabled_count <= 6 {
+                    500_000_000
+                } else if enabled_count <= 12 {
+                    250_000_000
+                } else {
+                    125_000_000
+                }
+            }
+            DsLogicOperationMode::Stream => {
+                if enabled_count <= 3 {
+                    100_000_000
+                } else if enabled_count <= 6 {
+                    50_000_000
+                } else if enabled_count <= 12 {
+                    25_000_000
+                } else {
+                    20_000_000
+                }
+            }
+            DsLogicOperationMode::InternalTest => 100_000_000,
+        }
+    }
+
+    fn validate_for_speed(self, speed: UsbSpeedClass) -> Result<(), CaptureError> {
+        let maximum = self.maximum_sample_rate_hz(speed);
+        if self.sample_rate_hz > maximum {
+            return Err(CaptureError::new(format!(
+                "DSLogic sample rate {} Hz exceeds the {} Hz maximum for {} enabled channel(s) in {:?} mode",
+                self.sample_rate_hz,
+                maximum,
+                self.enabled_channel_count(),
+                self.operation_mode
+            )));
+        }
+        Ok(())
+    }
+
     fn armed_sample_count(self) -> u64 {
         self.sample_count.div_ceil(SAMPLE_ALIGNMENT) * SAMPLE_ALIGNMENT
     }
@@ -203,7 +283,16 @@ impl DsLogicCaptureConfig {
             | (u16::from(self.external_clock) << CLOCK_TYPE_BIT)
             | (u16::from(self.falling_clock_edge) << CLOCK_EDGE_BIT)
             | (u16::from(self.rle_enabled) << RLE_MODE_BIT)
+            | (u16::from(self.sample_rate_hz == 500_000_000) << HALF_MODE_BIT)
+            | (u16::from(self.sample_rate_hz == 1_000_000_000) << QUARTER_MODE_BIT)
             | (u16::from(self.input_filter == DsLogicInputFilter::OneSampleClock) << FILTER_BIT);
+        let enabled_channel_mask = self
+            .enabled_channels
+            .iter()
+            .enumerate()
+            .fold(0_u16, |mask, (channel, enabled)| {
+                mask | (u16::from(*enabled) << channel)
+            });
 
         let mut bytes = Vec::with_capacity(SETTINGS_BYTES);
         push_u32(&mut bytes, 0xf5a5_f5a5);
@@ -219,12 +308,12 @@ impl DsLogicCaptureConfig {
         push_u16(&mut bytes, ATOMIC_SAMPLES as u16);
         push_u16(&mut bytes, 0);
         push_u16(&mut bytes, 0x0701);
-        push_u16(&mut bytes, u16::from(CHANNEL_COUNT) << 8);
+        push_u16(&mut bytes, u16::from(self.enabled_channel_count()) << 8);
         push_u16(&mut bytes, 0x0802);
         push_u16(&mut bytes, armed_samples as u16);
         push_u16(&mut bytes, (armed_samples >> 16) as u16);
         push_u16(&mut bytes, 0x0a02);
-        push_u16(&mut bytes, u16::MAX);
+        push_u16(&mut bytes, enabled_channel_mask);
         push_u16(&mut bytes, 0);
         push_u16(&mut bytes, 0x0c01);
         push_u16(&mut bytes, 0);
@@ -272,6 +361,7 @@ impl DsLogicCaptureSource {
                 device.location.stable_id()
             )));
         }
+        config.validate_for_speed(device.speed)?;
         let descriptor = DeviceDescriptor {
             id: DeviceId::new(device.location.stable_id()),
             name: DSLOGIC_U3PRO16.display_name.to_owned(),
@@ -360,7 +450,8 @@ fn read_capture(
     let available_samples = trigger.available_samples(config.sample_count)?;
     let total_bytes = usize::try_from(available_samples)
         .ok()
-        .and_then(|samples| samples.checked_mul(CHANNEL_COUNT as usize / 8))
+        .and_then(|samples| samples.checked_mul(config.enabled_channel_count() as usize))
+        .map(|bits| bits / 8)
         .ok_or_else(|| CaptureError::new("captured DSLogic payload is too large"))?;
 
     if prequeued.payload.len() > total_bytes {
@@ -369,7 +460,9 @@ fn read_capture(
             prequeued.payload.len()
         )));
     }
-    let mut wire_buffer = vec![0_u8; CAPTURE_READ_BYTES];
+    let cross_block_bytes = config.enabled_channel_count() as usize * BYTES_PER_CHANNEL_BLOCK;
+    let read_buffer_bytes = CAPTURE_READ_BYTES / cross_block_bytes * cross_block_bytes;
+    let mut wire_buffer = vec![0_u8; read_buffer_bytes];
     let mut bytes_remaining = total_bytes - prequeued.payload.len();
     let mut sample_offset = 0_u64;
     let mut sequence = 0_u64;
@@ -427,10 +520,13 @@ fn read_prequeued_capture(
 ) -> Result<Option<PrequeuedCapture>, CaptureError> {
     let expected_payload_bytes = usize::try_from(config.sample_count & !(SAMPLE_ALIGNMENT - 1))
         .ok()
-        .and_then(|samples| samples.checked_mul(CHANNEL_COUNT as usize / 8))
+        .and_then(|samples| samples.checked_mul(config.enabled_channel_count() as usize))
+        .map(|bits| bits / 8)
         .ok_or_else(|| CaptureError::new("requested DSLogic payload is too large"))?;
+    let cross_block_bytes = config.enabled_channel_count() as usize * BYTES_PER_CHANNEL_BLOCK;
+    let prequeued_data_bytes = PREQUEUED_DATA_BYTES / cross_block_bytes * cross_block_bytes;
     let mut header = [0_u8; TRIGGER_HEADER_BYTES];
-    let mut payload = vec![0_u8; expected_payload_bytes.min(PREQUEUED_DATA_BYTES)];
+    let mut payload = vec![0_u8; expected_payload_bytes.min(prequeued_data_bytes)];
     let capture_time =
         Duration::from_secs_f64(config.sample_count as f64 / config.sample_rate_hz as f64);
     let deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
@@ -541,7 +637,7 @@ fn emit_wire_batch(
     sequence: &mut u64,
     sample_offset: &mut u64,
 ) -> Result<(), CaptureError> {
-    let samples = decode_cross_samples(bytes)?;
+    let samples = decode_cross_samples(bytes, config.enabled_channels)?;
     let captured_at = capture_origin
         + Duration::from_secs_f64(*sample_offset as f64 / config.sample_rate_hz as f64);
     *sample_offset += samples.len() as u64;
@@ -618,19 +714,34 @@ fn capture_timeout_error(session: &UsbDeviceSession, phase: &str) -> CaptureErro
     }
 }
 
-fn decode_cross_samples(bytes: &[u8]) -> Result<Vec<u32>, CaptureError> {
-    if bytes.len() % CROSS_BLOCK_BYTES != 0 {
+fn decode_cross_samples(
+    bytes: &[u8],
+    enabled_channels: [bool; CHANNEL_COUNT as usize],
+) -> Result<Vec<u32>, CaptureError> {
+    let enabled_channel_count = enabled_channels.iter().filter(|enabled| **enabled).count();
+    if enabled_channel_count == 0 {
+        return Err(CaptureError::new(
+            "cannot decode DSLogic data without an enabled channel",
+        ));
+    }
+    let cross_block_bytes = enabled_channel_count * BYTES_PER_CHANNEL_BLOCK;
+    if bytes.len() % cross_block_bytes != 0 {
         return Err(CaptureError::new(format!(
-            "DSLogic payload length {} is not aligned to {CROSS_BLOCK_BYTES} bytes",
+            "DSLogic payload length {} is not aligned to {cross_block_bytes} bytes",
             bytes.len()
         )));
     }
 
-    let mut samples = Vec::with_capacity(bytes.len() * 8 / CHANNEL_COUNT as usize);
-    for block in bytes.chunks_exact(CROSS_BLOCK_BYTES) {
+    let mut samples = Vec::with_capacity(bytes.len() * 8 / enabled_channel_count);
+    for block in bytes.chunks_exact(cross_block_bytes) {
         let mut channels = [0_u64; CHANNEL_COUNT as usize];
-        for (channel, word) in channels.iter_mut().zip(block.chunks_exact(8)) {
-            *channel = u64::from_le_bytes(word.try_into().expect("chunk size is fixed"));
+        for (channel, word) in enabled_channels
+            .iter()
+            .enumerate()
+            .filter_map(|(channel, enabled)| enabled.then_some(channel))
+            .zip(block.chunks_exact(BYTES_PER_CHANNEL_BLOCK))
+        {
+            channels[channel] = u64::from_le_bytes(word.try_into().expect("chunk size is fixed"));
         }
         for bit in 0..ATOMIC_SAMPLES {
             let mut sample = 0_u32;
@@ -800,19 +911,120 @@ mod tests {
     }
 
     #[test]
+    fn encodes_enabled_channel_count_mask_and_high_rate_modes() {
+        let mut enabled_channels = [false; CHANNEL_COUNT as usize];
+        enabled_channels[2] = true;
+        enabled_channels[9] = true;
+        let settings = DsLogicCaptureConfig::new(500_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_enabled_channels(enabled_channels)
+            .expect("channel selection should be valid")
+            .encode_settings();
+
+        assert_eq!(read_u16(&settings, 6), 1 << HALF_MODE_BIT);
+        assert_eq!(read_u16(&settings, 28), 2 << 8);
+        assert_eq!(read_u16(&settings, 38), (1 << 2) | (1 << 9));
+
+        let gigahertz = DsLogicCaptureConfig::new(1_000_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_enabled_channels([
+                true, true, true, true, true, true, true, true, false, false, false, false, false,
+                false, false, false,
+            ])
+            .expect("channel selection should be valid")
+            .encode_settings();
+        assert_eq!(read_u16(&gigahertz, 6), 1 << QUARTER_MODE_BIT);
+    }
+
+    #[test]
+    fn channel_selection_matches_original_u3pro16_rate_limits() {
+        let all_channels = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_operation_mode(DsLogicOperationMode::Stream);
+        assert_eq!(
+            all_channels.maximum_sample_rate_hz(UsbSpeedClass::SuperSpeed),
+            125_000_000
+        );
+        assert_eq!(
+            all_channels.maximum_sample_rate_hz(UsbSpeedClass::HighSpeed),
+            20_000_000
+        );
+
+        let mut six_channels = [false; CHANNEL_COUNT as usize];
+        six_channels[..6].fill(true);
+        let six_channels = all_channels
+            .with_enabled_channels(six_channels)
+            .expect("channel selection should be valid");
+        assert_eq!(
+            six_channels.maximum_sample_rate_hz(UsbSpeedClass::SuperSpeed),
+            500_000_000
+        );
+
+        let mut three_channels = [false; CHANNEL_COUNT as usize];
+        three_channels[..3].fill(true);
+        let three_channels = all_channels
+            .with_enabled_channels(three_channels)
+            .expect("channel selection should be valid");
+        assert_eq!(
+            three_channels.maximum_sample_rate_hz(UsbSpeedClass::SuperSpeed),
+            1_000_000_000
+        );
+
+        let lower_eight = [
+            true, true, true, true, true, true, true, true, false, false, false, false, false,
+            false, false, false,
+        ];
+        let buffer = all_channels
+            .with_operation_mode(DsLogicOperationMode::Buffer)
+            .with_enabled_channels(lower_eight)
+            .expect("channel selection should be valid");
+        assert_eq!(
+            buffer.maximum_sample_rate_hz(UsbSpeedClass::HighSpeed),
+            1_000_000_000
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_channel_selection() {
+        assert!(DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_enabled_channels([false; CHANNEL_COUNT as usize])
+            .is_err());
+    }
+
+    #[test]
     fn transposes_cross_channel_bitmaps_into_sample_words() {
-        let mut bytes = [0_u8; CROSS_BLOCK_BYTES];
+        let mut bytes = [0_u8; CHANNEL_COUNT as usize * BYTES_PER_CHANNEL_BLOCK];
         bytes[0..8].copy_from_slice(&(1_u64 | (1_u64 << 63)).to_le_bytes());
         bytes[7 * 8..8 * 8].copy_from_slice(&u64::MAX.to_le_bytes());
         bytes[15 * 8..16 * 8].copy_from_slice(&(1_u64 << 1).to_le_bytes());
 
-        let samples = decode_cross_samples(&bytes).expect("payload should decode");
+        let samples = decode_cross_samples(&bytes, [true; CHANNEL_COUNT as usize])
+            .expect("payload should decode");
 
         assert_eq!(samples.len(), 64);
         assert_eq!(samples[0], (1 << 0) | (1 << 7));
         assert_eq!(samples[1], (1 << 7) | (1 << 15));
         assert_eq!(samples[2], 1 << 7);
         assert_eq!(samples[63], (1 << 0) | (1 << 7));
+    }
+
+    #[test]
+    fn maps_sparse_wire_channels_back_to_physical_channel_bits() {
+        let mut enabled_channels = [false; CHANNEL_COUNT as usize];
+        enabled_channels[2] = true;
+        enabled_channels[9] = true;
+        let mut bytes = [0_u8; 2 * BYTES_PER_CHANNEL_BLOCK];
+        bytes[0..8].copy_from_slice(&1_u64.to_le_bytes());
+        bytes[8..16].copy_from_slice(&(1_u64 << 1).to_le_bytes());
+
+        let samples =
+            decode_cross_samples(&bytes, enabled_channels).expect("payload should decode");
+
+        assert_eq!(samples.len(), ATOMIC_SAMPLES);
+        assert_eq!(samples[0], 1 << 2);
+        assert_eq!(samples[1], 1 << 9);
+        assert!(samples[2..].iter().all(|sample| *sample == 0));
     }
 
     #[test]

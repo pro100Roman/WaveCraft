@@ -19,7 +19,7 @@ use dsview_usb::{
     DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
     DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
     DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
-    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV,
+    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_RATES_HZ,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use image::ImageFormat;
@@ -868,6 +868,8 @@ struct ScopeCaptureSettings {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LogicCaptureSettings {
+    sample_rate_hz: u64,
+    enabled_channels: [bool; LOGIC_CHANNEL_COUNT],
     operation_mode: DsLogicOperationMode,
     stop_option: DsLogicStopOption,
     threshold_voltage: f32,
@@ -881,6 +883,8 @@ struct LogicCaptureSettings {
 impl Default for LogicCaptureSettings {
     fn default() -> Self {
         Self {
+            sample_rate_hz: SAMPLE_RATE_HZ,
+            enabled_channels: [true; LOGIC_CHANNEL_COUNT],
             operation_mode: DsLogicOperationMode::Buffer,
             stop_option: DsLogicStopOption::UploadCapturedData,
             threshold_voltage: 1.0,
@@ -896,23 +900,53 @@ impl Default for LogicCaptureSettings {
 impl LogicCaptureSettings {
     fn capture_config(self) -> Result<DsLogicCaptureConfig, String> {
         let stream_mode = self.operation_mode == DsLogicOperationMode::Stream;
+        let internal_test = self.operation_mode == DsLogicOperationMode::InternalTest;
+        DsLogicCaptureConfig::new(
+            if internal_test {
+                100_000_000
+            } else {
+                self.sample_rate_hz
+            },
+            SAMPLE_COUNT,
+        )
+        .map_err(|error| error.to_string())?
+        .with_threshold_voltage(self.threshold_voltage)
+        .map_err(|error| error.to_string())
+        .map(|config| {
+            config
+                .with_operation_mode(self.operation_mode)
+                .with_stop_option(if stream_mode {
+                    DsLogicStopOption::StopImmediately
+                } else {
+                    self.stop_option
+                })
+                .with_input_filter(self.input_filter)
+                .with_rle_enabled(self.rle_enabled && !stream_mode && !internal_test)
+                .with_external_clock(self.external_clock)
+                .with_falling_clock_edge(self.falling_clock_edge)
+        })
+        .and_then(|config| {
+            config
+                .with_enabled_channels(if internal_test {
+                    [true; LOGIC_CHANNEL_COUNT]
+                } else {
+                    self.enabled_channels
+                })
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn maximum_sample_rate_hz(self, speed: UsbSpeedClass) -> u64 {
+        let mut enabled_channels = self.enabled_channels;
+        if !enabled_channels.iter().any(|enabled| *enabled) {
+            enabled_channels[0] = true;
+        }
         DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)
-            .map_err(|error| error.to_string())?
-            .with_threshold_voltage(self.threshold_voltage)
-            .map_err(|error| error.to_string())
-            .map(|config| {
-                config
-                    .with_operation_mode(self.operation_mode)
-                    .with_stop_option(if stream_mode {
-                        DsLogicStopOption::StopImmediately
-                    } else {
-                        self.stop_option
-                    })
-                    .with_input_filter(self.input_filter)
-                    .with_rle_enabled(self.rle_enabled && !stream_mode)
-                    .with_external_clock(self.external_clock)
-                    .with_falling_clock_edge(self.falling_clock_edge)
-            })
+            .expect("default logic capture configuration is valid")
+            .with_operation_mode(self.operation_mode)
+            .with_enabled_channels(enabled_channels)
+            .expect("at least one logic channel is enabled")
+            .maximum_sample_rate_hz(speed)
     }
 }
 
@@ -3909,6 +3943,7 @@ struct ScopeCaptureSettingsEditor<'a> {
 
 struct LogicCaptureSettingsEditor<'a> {
     settings: &'a mut LogicCaptureSettings,
+    speed: UsbSpeedClass,
 }
 
 struct ScopeVisualizationSettingsEditor<'a> {
@@ -3925,7 +3960,10 @@ fn paint_capture_settings(
     availability: CaptureSettingsAvailability,
     calibration_action: &mut Option<ScopeCalibrationAction>,
 ) {
-    let logic_settings = logic_editor.settings;
+    let LogicCaptureSettingsEditor {
+        settings: logic_settings,
+        speed: logic_speed,
+    } = logic_editor;
     let ScopeCaptureSettingsEditor {
         settings: scope_settings,
         auto_sample_rate: scope_auto_sample_rate,
@@ -3953,6 +3991,25 @@ fn paint_capture_settings(
             ui.add_space(6.0);
             match tab {
                 CaptureSettingsTab::DsLogic => {
+                    if logic_settings.operation_mode == DsLogicOperationMode::InternalTest {
+                        logic_settings.enabled_channels = [true; LOGIC_CHANNEL_COUNT];
+                        logic_settings.sample_rate_hz = 100_000_000;
+                    }
+                    let maximum_sample_rate_hz =
+                        logic_settings.maximum_sample_rate_hz(logic_speed);
+                    if logic_settings.sample_rate_hz > maximum_sample_rate_hz {
+                        logic_settings.sample_rate_hz = DSLOGIC_SAMPLE_RATES_HZ
+                            .iter()
+                            .rev()
+                            .copied()
+                            .find(|rate| *rate <= maximum_sample_rate_hz)
+                            .unwrap_or(SAMPLE_RATE_HZ);
+                    }
+                    let enabled_channel_count = logic_settings
+                        .enabled_channels
+                        .iter()
+                        .filter(|enabled| **enabled)
+                        .count();
                     egui::Grid::new("dslogic_capture_settings")
                         .num_columns(2)
                         .min_col_width(90.0)
@@ -3960,13 +4017,40 @@ fn paint_capture_settings(
                         .spacing([12.0, 6.0])
                         .show(ui, |ui| {
                             ui.label("Sample rate");
-                            ui.monospace("1 MHz");
+                            ui.add_enabled_ui(
+                                availability.capture
+                                    && logic_settings.operation_mode
+                                        != DsLogicOperationMode::InternalTest,
+                                |ui| {
+                                    egui::ComboBox::from_id_salt("logic_sample_rate")
+                                        .width(100.0)
+                                        .selected_text(format_sample_rate(
+                                            logic_settings.sample_rate_hz,
+                                        ))
+                                        .show_ui(ui, |ui| {
+                                            for rate in DSLOGIC_SAMPLE_RATES_HZ
+                                                .iter()
+                                                .copied()
+                                                .filter(|rate| *rate <= maximum_sample_rate_hz)
+                                            {
+                                                ui.selectable_value(
+                                                    &mut logic_settings.sample_rate_hz,
+                                                    rate,
+                                                    format_sample_rate(rate),
+                                                );
+                                            }
+                                        });
+                                },
+                            );
                             ui.end_row();
                             ui.label("Buffer");
                             ui.monospace("1M samples");
                             ui.end_row();
                             ui.label("Channels");
-                            ui.monospace("D0–D15");
+                            ui.monospace(format!("{enabled_channel_count}/16 enabled"));
+                            ui.end_row();
+                            ui.label("Maximum");
+                            ui.monospace(format_sample_rate(maximum_sample_rate_hz));
                             ui.end_row();
                             ui.label("Display");
                             ui.monospace("Per-channel names and colors");
@@ -4116,6 +4200,56 @@ fn paint_capture_settings(
                                         ui.end_row();
                                     });
                             });
+                        });
+                    ui.add_space(8.0);
+                    egui::CollapsingHeader::new(RichText::new("Channels").strong())
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            let channel_controls_enabled = availability.capture
+                                && logic_settings.operation_mode
+                                    != DsLogicOperationMode::InternalTest;
+                            ui.add_enabled_ui(channel_controls_enabled, |ui| {
+                                egui::Grid::new("dslogic_channels")
+                                    .num_columns(8)
+                                    .min_col_width(20.0)
+                                    .max_col_width(24.0)
+                                    .spacing([5.0, 4.0])
+                                    .show(ui, |ui| {
+                                        for (channel, enabled) in logic_settings
+                                            .enabled_channels
+                                            .iter_mut()
+                                            .enumerate()
+                                        {
+                                            ui.vertical_centered(|ui| {
+                                                ui.small(channel.to_string());
+                                                ui.add(egui::Checkbox::without_text(enabled));
+                                            });
+                                            if channel % 8 == 7 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Enable all").clicked() {
+                                        logic_settings.enabled_channels =
+                                            [true; LOGIC_CHANNEL_COUNT];
+                                    }
+                                    if ui.small_button("Disable all").clicked() {
+                                        logic_settings.enabled_channels =
+                                            [false; LOGIC_CHANNEL_COUNT];
+                                    }
+                                });
+                            });
+                            if !logic_settings
+                                .enabled_channels
+                                .iter()
+                                .any(|enabled| *enabled)
+                            {
+                                ui.small(
+                                    RichText::new("Enable at least one channel")
+                                        .color(Color32::LIGHT_RED),
+                                );
+                            }
                         });
                 }
                 CaptureSettingsTab::DsCope => {
@@ -4499,6 +4633,22 @@ impl eframe::App for DsViewApp {
         let selected_logic_device = self.devices.iter().any(|entry| {
             entry.selected && entry.device.profile.model == DeviceModel::DsLogicU3Pro16
         });
+        let logic_settings_speed = self
+            .devices
+            .iter()
+            .filter(|entry| {
+                entry.selected && entry.device.profile.model == DeviceModel::DsLogicU3Pro16
+            })
+            .map(|entry| entry.device.speed)
+            .min()
+            .or_else(|| {
+                self.devices
+                    .iter()
+                    .filter(|entry| entry.device.profile.model == DeviceModel::DsLogicU3Pro16)
+                    .map(|entry| entry.device.speed)
+                    .min()
+            })
+            .unwrap_or(UsbSpeedClass::HighSpeed);
         let selected_scope_device = self
             .devices
             .iter()
@@ -4708,6 +4858,7 @@ impl eframe::App for DsViewApp {
                                 self.active_capture_settings_tab,
                                 LogicCaptureSettingsEditor {
                                     settings: &mut self.logic_settings,
+                                    speed: logic_settings_speed,
                                 },
                                 ScopeCaptureSettingsEditor {
                                     settings: &mut self.scope_settings,
@@ -4921,6 +5072,7 @@ impl eframe::App for DsViewApp {
                                             &mut logic_channel_marker_opacities,
                                         channel_names: &mut logic_channel_names,
                                         maximum_height: self.logic_settings.maximum_height,
+                                        enabled_channels: self.logic_settings.enabled_channels,
                                     },
                                     &mut logic_viewport,
                                 )
@@ -5007,6 +5159,7 @@ impl eframe::App for DsViewApp {
                                 channel_marker_opacities: &mut logic_channel_marker_opacities,
                                 channel_names: &mut logic_channel_names,
                                 maximum_height: self.logic_settings.maximum_height,
+                                enabled_channels: self.logic_settings.enabled_channels,
                             },
                             CombinedWaveformViewports {
                                 logic: &mut logic_viewport,
@@ -5638,6 +5791,9 @@ fn start_gui_recording(
         "logic.maximum_height".to_owned(),
         logic_settings.maximum_height.to_string(),
     );
+    for (channel, enabled) in logic_config.enabled_channels().into_iter().enumerate() {
+        metadata.insert(format!("logic.ch{channel}.enabled"), enabled.to_string());
+    }
     insert_channel_name_metadata(&mut metadata, logic_channel_names, scope_channel_names);
     metadata.insert(
         "scope.sample_rate_hz".to_owned(),
@@ -5757,6 +5913,19 @@ fn logic_settings_from_recording_metadata(
     metadata: &BTreeMap<String, String>,
 ) -> LogicCaptureSettings {
     let mut settings = LogicCaptureSettings::default();
+    if let Some(sample_rate_hz) = recording_metadata_value::<u64>(metadata, "logic.sample_rate_hz")
+    {
+        if DSLOGIC_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
+            settings.sample_rate_hz = sample_rate_hz;
+        }
+    }
+    for (channel, enabled) in settings.enabled_channels.iter_mut().enumerate() {
+        if let Some(recorded) =
+            recording_metadata_value::<bool>(metadata, &format!("logic.ch{channel}.enabled"))
+        {
+            *enabled = recorded;
+        }
+    }
     if let Some(operation_mode) = metadata.get("logic.operation_mode") {
         settings.operation_mode = match operation_mode.as_str() {
             "stream" => DsLogicOperationMode::Stream,
@@ -6125,6 +6294,7 @@ struct LogicWaveformOptions<'a> {
     channel_marker_opacities: &'a mut [u8; LOGIC_CHANNEL_COUNT],
     channel_names: &'a mut [String; LOGIC_CHANNEL_COUNT],
     maximum_height: u8,
+    enabled_channels: [bool; LOGIC_CHANNEL_COUNT],
 }
 
 fn combined_waveform_cards(
@@ -6669,6 +6839,7 @@ fn paint_logic(
         channel_marker_opacities,
         channel_names,
         maximum_height,
+        enabled_channels,
     } = options;
     paint_plot_background(ui, rect);
     let painter = ui.painter();
@@ -6697,18 +6868,28 @@ fn paint_logic(
         display_sample_rate_hz,
         None,
     );
-    let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
+    let enabled_channel_count = enabled_channels
+        .iter()
+        .filter(|enabled| **enabled)
+        .count()
+        .max(1);
+    let lane_height = plot.height() / enabled_channel_count as f32;
     let visible_range = viewport.sample_range(sample_count);
     let visible_count = visible_range.len();
     let step = (visible_count as f32 / plot.width().max(1.0))
         .floor()
         .max(1.0) as usize;
-    for (channel, channel_color) in channel_colors.iter_mut().enumerate() {
+    for (lane, (channel, channel_color)) in channel_colors
+        .iter_mut()
+        .enumerate()
+        .filter(|(channel, _)| enabled_channels[*channel])
+        .enumerate()
+    {
         let channel_marker_opacity = &mut channel_marker_opacities[channel];
         let channel_name = &mut channel_names[channel];
         let channel_label = channel_label("D", channel, channel_name);
         let marker_text = logic_channel_marker_text(channel, channel_name);
-        let lane_top = plot.top() + channel as f32 * lane_height;
+        let lane_top = plot.top() + lane as f32 * lane_height;
         let low = lane_top + lane_height * 0.9;
         let signal_height =
             lane_height * (0.3 + 0.125 * f32::from(maximum_height.saturating_sub(1).min(4)));
@@ -9005,8 +9186,13 @@ mod tests {
 
     #[test]
     fn logic_settings_map_every_device_option() {
+        let mut enabled_channels = [false; LOGIC_CHANNEL_COUNT];
+        enabled_channels[0] = true;
+        enabled_channels[3] = true;
         let settings = LogicCaptureSettings {
-            operation_mode: DsLogicOperationMode::InternalTest,
+            sample_rate_hz: 250_000_000,
+            enabled_channels,
+            operation_mode: DsLogicOperationMode::Buffer,
             stop_option: DsLogicStopOption::StopImmediately,
             threshold_voltage: 2.5,
             input_filter: DsLogicInputFilter::OneSampleClock,
@@ -9021,6 +9207,8 @@ mod tests {
             .expect("logic settings should be valid");
 
         assert_eq!(config.operation_mode(), settings.operation_mode);
+        assert_eq!(config.sample_rate_hz(), settings.sample_rate_hz);
+        assert_eq!(config.enabled_channels(), settings.enabled_channels);
         assert_eq!(config.stop_option(), settings.stop_option);
         assert_eq!(config.threshold_voltage(), settings.threshold_voltage);
         assert_eq!(config.input_filter(), settings.input_filter);
@@ -9069,6 +9257,13 @@ mod tests {
         metadata.insert("scope.ch1.coupling".to_owned(), "ac".to_owned());
         metadata.insert("scope.ch1.probe_attenuation".to_owned(), "10".to_owned());
         metadata.insert("logic.operation_mode".to_owned(), "stream".to_owned());
+        metadata.insert("logic.sample_rate_hz".to_owned(), "250000000".to_owned());
+        for channel in 0..LOGIC_CHANNEL_COUNT {
+            metadata.insert(
+                format!("logic.ch{channel}.enabled"),
+                matches!(channel, 2 | 9).to_string(),
+            );
+        }
         metadata.insert(
             "logic.stop_option".to_owned(),
             "stop_immediately".to_owned(),
@@ -9142,6 +9337,14 @@ mod tests {
         assert_eq!(scope_settings.channels[1].probe_attenuation, 10);
         let logic_settings = loaded.logic_settings.expect("logic metadata should load");
         assert_eq!(logic_settings.operation_mode, DsLogicOperationMode::Stream);
+        assert_eq!(logic_settings.sample_rate_hz, 250_000_000);
+        assert_eq!(
+            logic_settings.enabled_channels,
+            [
+                false, false, true, false, false, false, false, false, false, true, false, false,
+                false, false, false, false,
+            ]
+        );
         assert_eq!(
             logic_settings.stop_option,
             DsLogicStopOption::StopImmediately
