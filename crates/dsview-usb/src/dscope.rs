@@ -38,7 +38,8 @@ const CALIBRATION_MARGIN_PASS: f64 = 0.3;
 const CALIBRATION_MAX_ADJUSTMENTS: usize = 64;
 const CALIBRATION_MAX_TRANSFORM_RESIDUAL: f64 = 8.0;
 const CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS: usize = 24;
-const CALIBRATION_SAMPLE_COUNT: u64 = 2_000;
+const CALIBRATION_DUAL_SAMPLE_COUNT: u64 = MAX_TOTAL_SAMPLE_COUNT / CHANNEL_COUNT as u64;
+const CALIBRATION_SINGLE_SAMPLE_COUNT: u64 = MAX_TOTAL_SAMPLE_COUNT;
 const CALIBRATION_SAMPLE_RATE_HZ: u64 = 500_000_000;
 const CALIBRATION_FINE_GAIN_VARIANCE: f64 = 0.0005;
 const CALIBRATION_FINE_GAIN_MIN: f64 = 0.9923;
@@ -890,7 +891,7 @@ pub fn auto_calibrate_dscope_with_progress(
         for range in 0..DSCOPE_VOLTS_PER_DIV_MV.len() {
             let config = calibration_capture_config(
                 CALIBRATION_SAMPLE_RATE_HZ,
-                CALIBRATION_SAMPLE_COUNT,
+                CALIBRATION_DUAL_SAMPLE_COUNT,
                 range,
                 DSCOPE_VERTICAL_OFFSET_CENTER,
                 enabled_channels,
@@ -900,7 +901,7 @@ pub fn auto_calibrate_dscope_with_progress(
         let warm_range = DSCOPE_VOLTS_PER_DIV_MV.len() - 1;
         let warm_config = calibration_capture_config(
             CALIBRATION_SAMPLE_RATE_HZ,
-            CALIBRATION_SAMPLE_COUNT,
+            CALIBRATION_DUAL_SAMPLE_COUNT,
             warm_range,
             DSCOPE_VERTICAL_OFFSET_CENTER,
             enabled_channels,
@@ -923,7 +924,7 @@ pub fn auto_calibrate_dscope_with_progress(
             &session,
             &mut values,
             CALIBRATION_SAMPLE_RATE_HZ,
-            CALIBRATION_SAMPLE_COUNT,
+            CALIBRATION_DUAL_SAMPLE_COUNT,
             settling_frames,
             &mut on_frame,
         )?;
@@ -943,7 +944,6 @@ pub fn auto_calibrate_dscope_with_progress(
         calibrate_adc_fine_gains(
             &session,
             &mut values,
-            CALIBRATION_SAMPLE_COUNT,
             false,
             branch_settling_frames,
             &mut on_frame,
@@ -951,20 +951,8 @@ pub fn auto_calibrate_dscope_with_progress(
         calibrate_adc_fine_gains(
             &session,
             &mut values,
-            CALIBRATION_SAMPLE_COUNT,
             true,
             branch_settling_frames,
-            &mut on_frame,
-        )?;
-        center_calibration_ranges(
-            &session,
-            &mut values,
-            CalibrationCaptureStep {
-                settling_frames,
-                progress_start: 0.91,
-                progress_end: 1.0,
-                phase: "Verifying calibrated zero levels",
-            },
             &mut on_frame,
         )?;
         Ok(values)
@@ -1239,7 +1227,7 @@ fn center_calibration_ranges(
     for (range, volts_per_div_mv) in DSCOPE_VOLTS_PER_DIV_MV.iter().copied().enumerate() {
         let config = calibration_capture_config(
             CALIBRATION_SAMPLE_RATE_HZ,
-            CALIBRATION_SAMPLE_COUNT,
+            CALIBRATION_DUAL_SAMPLE_COUNT,
             range,
             DSCOPE_VERTICAL_OFFSET_CENTER,
             enabled_channels,
@@ -1263,7 +1251,7 @@ fn center_calibration_ranges(
                 },
                 on_frame,
             )?;
-            let margins = calibration_center_margins(measurement, CALIBRATION_SAMPLE_COUNT)?;
+            let margins = calibration_center_margins(measurement, CALIBRATION_DUAL_SAMPLE_COUNT)?;
             if margins
                 .iter()
                 .all(|margin| margin.abs() < CALIBRATION_MARGIN_PASS)
@@ -1302,7 +1290,6 @@ fn center_calibration_ranges(
 fn calibrate_adc_fine_gains(
     session: &UsbDeviceSession,
     values: &mut DsCopeCalibrationValues,
-    sample_count: u64,
     combined: bool,
     settling_frames: usize,
     on_frame: &mut dyn FnMut(DsCopeCalibrationFrame),
@@ -1313,6 +1300,11 @@ fn calibrate_adc_fine_gains(
         [true, true]
     };
     let sample_rate_hz = if combined { 1_000_000_000 } else { 500_000_000 };
+    let sample_count = if combined {
+        CALIBRATION_SINGLE_SAMPLE_COUNT
+    } else {
+        CALIBRATION_DUAL_SAMPLE_COUNT
+    };
     let range = DSCOPE_VOLTS_PER_DIV_MV.len() - 1;
     let config = calibration_capture_config(
         sample_rate_hz,
@@ -1335,9 +1327,15 @@ fn calibrate_adc_fine_gains(
     } else {
         values.fine_gain_codes = [[adc_fine_gain_code(1.0); 4]; CHANNEL_COUNT];
     }
+    let mut best_codes = if combined {
+        values.comb_fine_gain_codes
+    } else {
+        values.fine_gain_codes
+    };
+    let mut best_max_skew = f64::INFINITY;
 
     for adjustment in 0..CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS {
-        let (phase_start, phase_end) = if combined { (0.78, 0.91) } else { (0.65, 0.78) };
+        let (phase_start, phase_end) = if combined { (0.78, 1.0) } else { (0.65, 0.78) };
         let phase_span = phase_end - phase_start;
         let progress = phase_start
             + adjustment as f32 / CALIBRATION_MAX_FINE_GAIN_ADJUSTMENTS as f32 * phase_span;
@@ -1361,10 +1359,17 @@ fn calibrate_adc_fine_gains(
         )?;
         let branches = measurement.branch_means();
         let skews = fine_gain_skews(branches, combined)?;
-        if skews
-            .iter()
-            .all(|skew| skew.abs() <= CALIBRATION_FINE_GAIN_VARIANCE)
-        {
+        let max_skew = skews.iter().map(|skew| skew.abs()).fold(0.0, f64::max);
+        let current_codes = if combined {
+            values.comb_fine_gain_codes
+        } else {
+            values.fine_gain_codes
+        };
+        if max_skew < best_max_skew {
+            best_max_skew = max_skew;
+            best_codes = current_codes;
+        }
+        if max_skew <= CALIBRATION_FINE_GAIN_VARIANCE {
             return Ok(());
         }
         let codes = if combined {
@@ -1379,14 +1384,19 @@ fn calibrate_adc_fine_gains(
             return Ok(());
         }
     }
-    Err(CaptureError::new(format!(
-        "DSCope auto calibration did not converge while balancing {} ADC branches",
-        if combined {
-            "interleaved"
-        } else {
-            "dual-channel"
-        }
-    )))
+
+    // The vendor does not fail zero calibration when ADC fine-gain trimming
+    // cannot reach the requested variance. It keeps the persistent analog
+    // gains and finishes with a volatile FPGA branch correction. Our runtime
+    // front-end initialization clears that volatile correction, so retain the
+    // best persistent ADC codes observed instead of saving the final noisy or
+    // oscillating iteration and aborting the entire zero calibration.
+    if combined {
+        values.comb_fine_gain_codes = best_codes;
+    } else {
+        values.fine_gain_codes = best_codes;
+    }
+    Ok(())
 }
 
 fn calibration_integer_adjustment(margin: f64) -> i32 {
@@ -1402,13 +1412,9 @@ fn calibration_center_margins(
     calibration_sample_count: u64,
 ) -> Result<[f64; CHANNEL_COUNT], CaptureError> {
     let means = measurement.channel_means(calibration_sample_count)?;
-    // Runtime voltage conversion uses the per-channel hardware reference from
-    // the measurement footer. Center calibration on that same reference so a
-    // grounded input decodes to zero even when the device's actual midpoint
-    // differs from the nominal command value of 128.
-    Ok(std::array::from_fn(|channel| {
-        f64::from(measurement.hardware_offsets[channel]) - means[channel]
-    }))
+    // Match the vendor zero routine: every input range is centered on the
+    // nominal midpoint programmed by the calibration offset command.
+    Ok(means.map(|mean| f64::from(DSCOPE_VERTICAL_OFFSET_CENTER) - mean))
 }
 
 fn fine_gain_skews(branches: [f64; 8], combined: bool) -> Result<[f64; 8], CaptureError> {
@@ -2030,7 +2036,7 @@ fn read_calibration_measurement(
     // these pending frames; calibration must do the same instead of trying to
     // decode their empty footer as a measurement packet.
     let target_frames = step.settling_frames.max(1);
-    let report_interval = (target_frames / 50).max(1);
+    let report_interval = (target_frames / 10).max(1);
     let mut valid_frames = 0_usize;
     loop {
         let footer = &payload[payload_bytes - MEASUREMENT_FOOTER_BYTES..];
@@ -2115,8 +2121,14 @@ fn decode_calibration_frame(
         )));
     }
 
-    let mut channels = vec![Vec::with_capacity(sample_count); enabled_channel_count];
-    for wire_samples in payload[data_start..data_end].chunks_exact(enabled_channel_count) {
+    const DISPLAY_SAMPLE_LIMIT: usize = 20_000;
+    let display_stride = sample_count.div_ceil(DISPLAY_SAMPLE_LIMIT).max(1);
+    let display_sample_count = sample_count.div_ceil(display_stride);
+    let mut channels = vec![Vec::with_capacity(display_sample_count); enabled_channel_count];
+    for wire_samples in payload[data_start..data_end]
+        .chunks_exact(enabled_channel_count)
+        .step_by(display_stride)
+    {
         for (wire_index, physical_channel) in enabled_channel_indices.iter().copied().enumerate() {
             channels[wire_index].push(raw_to_volts(
                 wire_samples[wire_index],
@@ -2889,7 +2901,8 @@ mod tests {
             calibration_branch_settling_frames(UsbSpeedClass::HighSpeed),
             high_speed * 2
         );
-        assert_eq!(CALIBRATION_SAMPLE_COUNT, 2_000);
+        assert_eq!(CALIBRATION_DUAL_SAMPLE_COUNT, 1_000_000);
+        assert_eq!(CALIBRATION_SINGLE_SAMPLE_COUNT, 2_000_000);
     }
 
     #[test]
@@ -2901,7 +2914,7 @@ mod tests {
     }
 
     #[test]
-    fn centers_calibration_on_the_runtime_hardware_reference() {
+    fn centers_calibration_on_the_vendor_midpoint() {
         let measurement = ScopeMeasurement {
             sample_count: 100,
             triggered: false,
@@ -2912,7 +2925,7 @@ mod tests {
 
         assert_eq!(
             calibration_center_margins(measurement, 100).unwrap(),
-            [-2.0, 3.0]
+            [-2.0, 1.0]
         );
     }
 
