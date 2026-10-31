@@ -22,12 +22,24 @@ jobs:
       - run: cargo check --workspace --locked
 
   workspace:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        include:
+          - name: macOS
+            os: macos-latest
+            artifact: dsview-macos
+            archive: dsview-macos.zip
+          - name: Linux
+            os: ubuntu-latest
+            artifact: dsview-linux-x86_64
+            archive: dsview-linux-x86_64.tar.gz
+          - name: Windows
+            os: windows-latest
+            artifact: dsview-windows-x86_64
+            archive: dsview-windows-x86_64.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -46,8 +58,71 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - run: cargo build --workspace --release
+      - run: cargo build --workspace --release --locked
 
       - name: Build macOS application bundle
         if: runner.os == 'macOS'
         run: bash scripts/package-macos.sh
+
+      - name: Package macOS release
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist/dsview-macos
+          cp -R target/release/bundle/osx/DSView.app dist/dsview-macos/
+          cp target/release/dsview-cli README.md dist/dsview-macos/
+          ditto -c -k --sequesterRsrc --keepParent \
+            dist/dsview-macos dist/dsview-macos.zip
+
+      - name: Package Linux release
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p dist/dsview-linux-x86_64/resources
+          install -m 755 target/release/dsview-gui \
+            target/release/dsview-cli dist/dsview-linux-x86_64/
+          cp -R resources/fpga dist/dsview-linux-x86_64/resources/
+          cp README.md dist/dsview-linux-x86_64/
+          tar -C dist -czf dist/dsview-linux-x86_64.tar.gz \
+            dsview-linux-x86_64
+
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $packageDirectory = "dist/dsview-windows-x86_64"
+          New-Item -ItemType Directory -Force "$packageDirectory/resources" | Out-Null
+          Copy-Item -Path target/release/dsview-gui.exe -Destination $packageDirectory
+          Copy-Item -Path target/release/dsview-cli.exe -Destination $packageDirectory
+          Copy-Item -Path README.md -Destination $packageDirectory
+          Copy-Item -Path resources/fpga -Destination "$packageDirectory/resources/" -Recurse
+          Compress-Archive -Path $packageDirectory -DestinationPath dist/dsview-windows-x86_64.zip
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [msrv, workspace]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dsview-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

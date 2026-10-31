@@ -7,7 +7,7 @@ bundle="$project_root/target/release/bundle/osx/DSView.app"
 contents="$bundle/Contents"
 
 cd "$project_root"
-cargo build --release -p dsview-gui
+cargo build --release --locked -p dsview-gui
 
 rm -rf "$bundle"
 mkdir -p "$contents/MacOS" "$contents/Resources"
