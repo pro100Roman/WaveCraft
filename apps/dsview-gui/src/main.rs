@@ -856,6 +856,40 @@ impl Default for ScopeMarkerSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum ScopeQuickTimeMeasurement {
+    #[default]
+    Idle,
+    AwaitingSecond {
+        first_position: f32,
+    },
+    Complete {
+        first_position: f32,
+        second_position: f32,
+    },
+}
+
+impl ScopeQuickTimeMeasurement {
+    fn start(&mut self, position: f32) {
+        *self = Self::AwaitingSecond {
+            first_position: position.clamp(0.0, 1.0),
+        };
+    }
+
+    fn finish(&mut self, position: f32) {
+        if let Self::AwaitingSecond { first_position } = *self {
+            *self = Self::Complete {
+                first_position,
+                second_position: position.clamp(0.0, 1.0),
+            };
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::Idle;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ScopeCaptureSettings {
     sample_rate_hz: u64,
@@ -1827,6 +1861,7 @@ struct DsViewApp {
     scope_auto_sample_rate: bool,
     scope_function_settings: ScopeFunctionSettings,
     scope_marker_settings: ScopeMarkerSettings,
+    scope_quick_time_measurement: ScopeQuickTimeMeasurement,
     scope_marker_editor: Option<ScopeMarkerEditor>,
     active_waveform_tab: Option<WaveformTab>,
     combined_logic_ratio: f32,
@@ -1883,6 +1918,7 @@ impl DsViewApp {
             scope_auto_sample_rate: true,
             scope_function_settings: ScopeFunctionSettings::default(),
             scope_marker_settings: ScopeMarkerSettings::default(),
+            scope_quick_time_measurement: ScopeQuickTimeMeasurement::default(),
             scope_marker_editor: None,
             active_waveform_tab: None,
             combined_logic_ratio: 0.55,
@@ -5042,6 +5078,7 @@ impl eframe::App for DsViewApp {
                 let mut scope_measurement_window_positions =
                     self.scope_measurement_window_positions;
                 let mut scope_marker_settings = self.scope_marker_settings;
+                let mut scope_quick_time_measurement = self.scope_quick_time_measurement;
                 let mut scope_time_per_division_seconds = self.scope_time_per_division_seconds;
                 let mut scope_timebase_changed = false;
                 let mut scope_vertical_offsets = self
@@ -5109,6 +5146,7 @@ impl eframe::App for DsViewApp {
                                         measurement_window_positions:
                                             &mut scope_measurement_window_positions,
                                         marker_settings: &mut scope_marker_settings,
+                                        quick_time_measurement: &mut scope_quick_time_measurement,
                                         channel_colors: self.scope_channel_colors,
                                         vertical_offsets: &mut scope_vertical_offsets,
                                         trigger_settings: &mut scope_trigger_settings,
@@ -5183,6 +5221,7 @@ impl eframe::App for DsViewApp {
                                 measurement_window_positions:
                                     &mut scope_measurement_window_positions,
                                 marker_settings: &mut scope_marker_settings,
+                                quick_time_measurement: &mut scope_quick_time_measurement,
                                 channel_colors: self.scope_channel_colors,
                                 vertical_offsets: &mut scope_vertical_offsets,
                                 trigger_settings: &mut scope_trigger_settings,
@@ -5208,6 +5247,7 @@ impl eframe::App for DsViewApp {
                 self.scope_measurement_caches = scope_measurement_caches;
                 self.scope_measurement_window_positions = scope_measurement_window_positions;
                 self.scope_marker_settings = scope_marker_settings;
+                self.scope_quick_time_measurement = scope_quick_time_measurement;
                 self.scope_time_per_division_seconds = scope_time_per_division_seconds;
                 let automatic_sample_rate_inputs_changed = scope_timebase_changed
                     || (!scope_auto_sample_rate_before_ui && self.scope_auto_sample_rate)
@@ -6271,6 +6311,7 @@ struct ScopeWaveformOptions<'a> {
     measurement_caches: &'a mut [ScopeMeasurementCache; 2],
     measurement_window_positions: &'a mut [Vec2; 2],
     marker_settings: &'a mut ScopeMarkerSettings,
+    quick_time_measurement: &'a mut ScopeQuickTimeMeasurement,
     channel_colors: [Color32; 2],
     vertical_offsets: &'a mut [u16; 2],
     trigger_settings: &'a mut ScopeTriggerSettings,
@@ -6657,6 +6698,16 @@ fn paint_waveform_time_scale(
     paint_time_scale(painter, rect, first_sample, last_sample, sample_rate_hz);
 }
 
+struct WaveformViewportInteractionOptions {
+    zoom_anchor: Option<(f32, f32)>,
+    reset_on_double_click: bool,
+}
+
+enum WaveformPlotClick {
+    Primary { double_clicked: bool, position: f32 },
+    Secondary,
+}
+
 fn update_waveform_viewport(
     ui: &egui::Ui,
     rect: Rect,
@@ -6664,8 +6715,12 @@ fn update_waveform_viewport(
     viewport: &mut WaveformViewport,
     sample_count: usize,
     sample_rate_hz: u64,
-    zoom_anchor: Option<(f32, f32)>,
-) -> (bool, bool) {
+    options: WaveformViewportInteractionOptions,
+) -> (bool, bool, Option<WaveformPlotClick>) {
+    let WaveformViewportInteractionOptions {
+        zoom_anchor,
+        reset_on_double_click,
+    } = options;
     let mut panned = false;
     let mut timebase_changed = false;
     let response = ui.interact(
@@ -6679,7 +6734,26 @@ fn update_waveform_viewport(
         egui::CursorIcon::Grab
     };
     let response = response.on_hover_cursor(cursor);
-    if response.double_clicked() {
+    let click = if response.double_clicked() {
+        response
+            .interact_pointer_pos()
+            .map(|pointer| WaveformPlotClick::Primary {
+                double_clicked: true,
+                position: ((pointer.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0),
+            })
+    } else if response.clicked() {
+        response
+            .interact_pointer_pos()
+            .map(|pointer| WaveformPlotClick::Primary {
+                double_clicked: false,
+                position: ((pointer.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0),
+            })
+    } else if response.secondary_clicked() {
+        Some(WaveformPlotClick::Secondary)
+    } else {
+        None
+    };
+    if response.double_clicked() && reset_on_double_click {
         let previous = *viewport;
         viewport.reset();
         timebase_changed = *viewport != previous;
@@ -6719,7 +6793,7 @@ fn update_waveform_viewport(
             ui.ctx().request_repaint();
         }
     }
-    (panned, timebase_changed)
+    (panned, timebase_changed, click)
 }
 
 fn paint_waveform_status(
@@ -6958,14 +7032,17 @@ fn paint_logic(
     } else {
         waveforms.logic_rate_hz
     };
-    update_waveform_viewport(
+    let _ = update_waveform_viewport(
         ui,
         waveform_area,
         "logic_waveform_zoom",
         viewport,
         display_sample_count,
         display_sample_rate_hz,
-        None,
+        WaveformViewportInteractionOptions {
+            zoom_anchor: None,
+            reset_on_double_click: true,
+        },
     );
     let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
     for channel in 0..LOGIC_CHANNEL_COUNT {
@@ -8037,6 +8114,8 @@ struct ScopeMarkerPaintOptions<'a> {
     viewport: WaveformViewport,
 }
 
+const SCOPE_MARKER_LINE_WIDTH: f32 = 0.5;
+
 fn paint_scope_markers(
     ui: &egui::Ui,
     painter: &egui::Painter,
@@ -8089,7 +8168,7 @@ fn paint_scope_markers(
                 painter,
                 Pos2::new(x, plot.top()),
                 Pos2::new(x, plot.bottom()),
-                Stroke::new(1.4_f32, color),
+                Stroke::new(SCOPE_MARKER_LINE_WIDTH, color),
             );
             paint_marker_handle(
                 painter,
@@ -8178,7 +8257,7 @@ fn paint_scope_markers(
                 painter,
                 Pos2::new(plot.left(), y),
                 Pos2::new(plot.right(), y),
-                Stroke::new(1.4_f32, color),
+                Stroke::new(SCOPE_MARKER_LINE_WIDTH, color),
             );
             paint_marker_handle(
                 painter,
@@ -8221,6 +8300,83 @@ fn paint_scope_markers(
             );
         }
     }
+}
+
+fn paint_scope_quick_time_measurement(
+    painter: &egui::Painter,
+    plot: Rect,
+    measurement: ScopeQuickTimeMeasurement,
+    sample_count: usize,
+    sample_rate_hz: u64,
+    viewport: WaveformViewport,
+) {
+    const COLOR: Color32 = Color32::from_rgb(255, 214, 76);
+
+    let (first_position, second_position) = match measurement {
+        ScopeQuickTimeMeasurement::Idle => return,
+        ScopeQuickTimeMeasurement::AwaitingSecond { first_position } => (first_position, None),
+        ScopeQuickTimeMeasurement::Complete {
+            first_position,
+            second_position,
+        } => (first_position, Some(second_position)),
+    };
+    let first_x = egui::lerp(plot.x_range(), first_position);
+    paint_dashed_line(
+        painter,
+        Pos2::new(first_x, plot.top()),
+        Pos2::new(first_x, plot.bottom()),
+        Stroke::new(SCOPE_MARKER_LINE_WIDTH, COLOR),
+    );
+    paint_marker_handle(
+        painter,
+        Pos2::new(first_x, plot.bottom() - 11.0),
+        "Δt1",
+        COLOR,
+    );
+
+    let Some(second_position) = second_position else {
+        paint_marker_readout(
+            painter,
+            plot,
+            Pos2::new(first_x, plot.bottom() - 39.0),
+            "Click to place Δt2",
+            COLOR,
+        );
+        return;
+    };
+
+    let second_x = egui::lerp(plot.x_range(), second_position);
+    paint_dashed_line(
+        painter,
+        Pos2::new(second_x, plot.top()),
+        Pos2::new(second_x, plot.bottom()),
+        Stroke::new(SCOPE_MARKER_LINE_WIDTH, COLOR),
+    );
+    paint_marker_handle(
+        painter,
+        Pos2::new(second_x, plot.bottom() - 11.0),
+        "Δt2",
+        COLOR,
+    );
+    let Some(delta_seconds) = scope_time_marker_delta(
+        first_position,
+        second_position,
+        sample_count,
+        sample_rate_hz,
+        viewport,
+    ) else {
+        return;
+    };
+    paint_marker_readout(
+        painter,
+        plot,
+        Pos2::new((first_x + second_x) * 0.5, plot.bottom() - 39.0),
+        &format!(
+            "Δt  {}",
+            format_duration(Duration::from_secs_f64(delta_seconds))
+        ),
+        COLOR,
+    );
 }
 
 fn scope_marker_color(channel: usize, marker: usize) -> Color32 {
@@ -9008,6 +9164,7 @@ fn paint_scope_time_domain(
         measurement_caches,
         measurement_window_positions,
         marker_settings,
+        quick_time_measurement,
         channel_colors,
         vertical_offsets,
         trigger_settings,
@@ -9071,15 +9228,32 @@ fn paint_scope_time_domain(
     if viewport.anchor_locked && !waveforms.scope_rolling {
         viewport.align_trigger_to_screen(trigger_sample_fraction, trigger_screen_fraction);
     }
-    let (viewport_panned, viewport_timebase_changed) = update_waveform_viewport(
+    let (viewport_panned, viewport_timebase_changed, waveform_click) = update_waveform_viewport(
         ui,
         plot,
         "scope_waveform_zoom",
         viewport,
         display_sample_count,
         display_sample_rate_hz,
-        (!waveforms.scope_rolling).then_some((trigger_sample_fraction, trigger_screen_fraction)),
+        WaveformViewportInteractionOptions {
+            zoom_anchor: (!waveforms.scope_rolling)
+                .then_some((trigger_sample_fraction, trigger_screen_fraction)),
+            reset_on_double_click: false,
+        },
     );
+    if let Some(click) = waveform_click {
+        match click {
+            WaveformPlotClick::Primary {
+                double_clicked: true,
+                position,
+            } => quick_time_measurement.start(position),
+            WaveformPlotClick::Primary {
+                double_clicked: false,
+                position,
+            } => quick_time_measurement.finish(position),
+            WaveformPlotClick::Secondary => quick_time_measurement.clear(),
+        }
+    }
     *timebase_changed |= viewport_timebase_changed;
     if viewport_panned && !waveforms.scope_rolling {
         trigger_settings.position_percent =
@@ -9129,6 +9303,14 @@ fn paint_scope_time_domain(
                 sample_rate_hz: display_sample_rate_hz,
                 viewport: *viewport,
             },
+        );
+        paint_scope_quick_time_measurement(
+            &scope_painter,
+            plot,
+            *quick_time_measurement,
+            display_sample_count,
+            display_sample_rate_hz,
+            *viewport,
         );
         paint_waveform_time_scale(
             painter,
@@ -9243,6 +9425,14 @@ fn paint_scope_time_domain(
             sample_rate_hz: display_sample_rate_hz,
             viewport: *viewport,
         },
+    );
+    paint_scope_quick_time_measurement(
+        &scope_painter,
+        plot,
+        *quick_time_measurement,
+        display_sample_count,
+        display_sample_rate_hz,
+        *viewport,
     );
     paint_scope_measurements(
         ui,
@@ -10231,6 +10421,51 @@ mod tests {
             SCOPE_MARKER_LIMIT
         );
         assert_eq!(format_marker_voltage(0.125), "125.00 mV");
+    }
+
+    #[test]
+    fn quick_time_measurement_starts_then_finishes_with_clamped_positions() {
+        let mut measurement = ScopeQuickTimeMeasurement::default();
+
+        measurement.finish(0.8);
+        assert_eq!(measurement, ScopeQuickTimeMeasurement::Idle);
+
+        measurement.start(-0.2);
+        assert_eq!(
+            measurement,
+            ScopeQuickTimeMeasurement::AwaitingSecond {
+                first_position: 0.0,
+            }
+        );
+
+        measurement.finish(1.2);
+        assert_eq!(
+            measurement,
+            ScopeQuickTimeMeasurement::Complete {
+                first_position: 0.0,
+                second_position: 1.0,
+            }
+        );
+
+        measurement.finish(0.4);
+        assert_eq!(
+            measurement,
+            ScopeQuickTimeMeasurement::Complete {
+                first_position: 0.0,
+                second_position: 1.0,
+            }
+        );
+
+        measurement.start(0.25);
+        assert_eq!(
+            measurement,
+            ScopeQuickTimeMeasurement::AwaitingSecond {
+                first_position: 0.25,
+            }
+        );
+
+        measurement.clear();
+        assert_eq!(measurement, ScopeQuickTimeMeasurement::Idle);
     }
 
     #[test]
