@@ -75,6 +75,7 @@ const SCOPE_COLORS: [Color32; 2] = [
 const MATH_COLOR: Color32 = Color32::from_rgb(213, 126, 255);
 const FFT_LENGTHS: [usize; 5] = [1_024, 2_048, 4_096, 8_192, 16_384];
 const SCOPE_MARKER_LIMIT: usize = 10;
+const LOGIC_MARKER_LIMIT: usize = 20;
 const CHANNEL_NAME_MAX_CHARS: usize = 32;
 const LOGIC_CHANNEL_NAME_MAX_CHARS: usize = 8;
 const DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY: u8 = 128;
@@ -1299,6 +1300,10 @@ impl CaptureTarget {
     fn includes_oscilloscope(self) -> bool {
         matches!(self, Self::Oscilloscope | Self::Combined)
     }
+
+    fn includes_logic_analyzer(self) -> bool {
+        matches!(self, Self::LogicAnalyzer | Self::Combined)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1407,6 +1412,100 @@ fn default_logic_channel_settings_drafts() -> [LogicChannelSettingsDraft; LOGIC_
         color: colors[channel],
         marker_opacity: DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogicMarker {
+    start_sample: u64,
+    end_sample: u64,
+    sample_rate_hz: u64,
+}
+
+impl LogicMarker {
+    fn new(first_sample: u64, second_sample: u64, sample_rate_hz: u64) -> Option<Self> {
+        let (start_sample, end_sample) = if first_sample <= second_sample {
+            (first_sample, second_sample)
+        } else {
+            (second_sample, first_sample)
+        };
+        (start_sample != end_sample && sample_rate_hz != 0).then_some(Self {
+            start_sample,
+            end_sample,
+            sample_rate_hz,
+        })
+    }
+
+    fn duration(self) -> Duration {
+        Duration::from_secs_f64(
+            self.end_sample.saturating_sub(self.start_sample) as f64 / self.sample_rate_hz as f64,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogicMarkerDraft {
+    start_sample: u64,
+    end_sample: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LogicMarkerSettings {
+    markers: Vec<LogicMarker>,
+    adding: bool,
+    draft: Option<LogicMarkerDraft>,
+}
+
+impl LogicMarkerSettings {
+    fn arm(&mut self) -> bool {
+        if self.markers.len() >= LOGIC_MARKER_LIMIT {
+            return false;
+        }
+        self.adding = true;
+        self.draft = None;
+        true
+    }
+
+    fn cancel(&mut self) {
+        self.adding = false;
+        self.draft = None;
+    }
+
+    fn start(&mut self, sample: u64) {
+        if self.adding && self.markers.len() < LOGIC_MARKER_LIMIT {
+            self.draft = Some(LogicMarkerDraft {
+                start_sample: sample,
+                end_sample: sample,
+            });
+        }
+    }
+
+    fn update(&mut self, sample: u64) {
+        if let Some(draft) = &mut self.draft {
+            draft.end_sample = sample;
+        }
+    }
+
+    fn finish(&mut self, sample_rate_hz: u64) -> bool {
+        let Some(draft) = self.draft.take() else {
+            return false;
+        };
+        let Some(marker) = LogicMarker::new(draft.start_sample, draft.end_sample, sample_rate_hz)
+        else {
+            return false;
+        };
+        if self.markers.len() >= LOGIC_MARKER_LIMIT {
+            self.cancel();
+            return false;
+        }
+        self.markers.push(marker);
+        self.adding = false;
+        true
+    }
+
+    fn clear(&mut self) {
+        self.markers.clear();
+        self.cancel();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2130,6 +2229,7 @@ struct DsViewApp {
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
     logic_channel_marker_opacities: [u8; LOGIC_CHANNEL_COUNT],
     logic_channel_settings_drafts: [LogicChannelSettingsDraft; LOGIC_CHANNEL_COUNT],
+    logic_marker_settings: LogicMarkerSettings,
     scope_channel_colors: [Color32; 2],
     logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
     scope_channel_names: [String; 2],
@@ -2190,6 +2290,7 @@ impl DsViewApp {
             logic_channel_colors: default_logic_channel_colors(),
             logic_channel_marker_opacities: default_logic_channel_marker_opacities(),
             logic_channel_settings_drafts: default_logic_channel_settings_drafts(),
+            logic_marker_settings: LogicMarkerSettings::default(),
             scope_channel_colors: SCOPE_COLORS,
             logic_channel_names: empty_logic_channel_names(),
             scope_channel_names: empty_scope_channel_names(),
@@ -2301,6 +2402,7 @@ impl DsViewApp {
         self.scope_configuration_due = None;
         self.pending = Some(receiver);
         self.completed_capture = None;
+        self.logic_marker_settings.clear();
         self.status = "Discovering USB instruments…".to_owned();
         self.last_error = None;
         thread::spawn(move || {
@@ -2314,6 +2416,9 @@ impl DsViewApp {
     fn begin_capture(&mut self, mode: AcquisitionMode, target: CaptureTarget) {
         if self.pending.is_some() || self.capture.is_some() {
             return;
+        }
+        if !self.capture_run_requested && target.includes_logic_analyzer() {
+            self.logic_marker_settings.clear();
         }
         self.scheduled_repetitive_capture = None;
         if self.record_capture && mode.runs_continuously() {
@@ -2998,6 +3103,7 @@ impl DsViewApp {
                     self.scope_auto_sample_rate = false;
                 }
                 self.completed_capture = Some(capture);
+                self.logic_marker_settings.clear();
                 self.logic_channel_names = logic_channel_names;
                 self.scope_channel_names = scope_channel_names;
                 self.record_capture = false;
@@ -4379,6 +4485,9 @@ struct LogicCaptureSettingsEditor<'a> {
     speed: UsbSpeedClass,
     acquisition_mode: &'a mut AcquisitionMode,
     repetitive_interval_seconds: &'a mut f32,
+    marker_settings: &'a mut LogicMarkerSettings,
+    displayed_sample_count: usize,
+    displayed_sample_rate_hz: u64,
 }
 
 struct ScopeVisualizationSettingsEditor<'a> {
@@ -4400,6 +4509,9 @@ fn paint_capture_settings(
         speed: logic_speed,
         acquisition_mode: logic_acquisition_mode,
         repetitive_interval_seconds,
+        marker_settings: logic_marker_settings,
+        displayed_sample_count: displayed_logic_sample_count,
+        displayed_sample_rate_hz: displayed_logic_sample_rate_hz,
     } = logic_editor;
     let ScopeCaptureSettingsEditor {
         settings: scope_settings,
@@ -4800,6 +4912,13 @@ fn paint_capture_settings(
                                 );
                             }
                         });
+                    ui.add_space(8.0);
+                    paint_logic_marker_settings(
+                        ui,
+                        logic_marker_settings,
+                        displayed_logic_sample_count,
+                        displayed_logic_sample_rate_hz,
+                    );
                 }
                 CaptureSettingsTab::DsCope => {
                     let maximum_sample_rate_hz = scope_settings.maximum_sample_rate_hz();
@@ -4961,6 +5080,93 @@ fn paint_capture_settings(
             }
         });
     scope_settings.clamp_to_channel_limits();
+}
+
+fn paint_logic_marker_settings(
+    ui: &mut egui::Ui,
+    settings: &mut LogicMarkerSettings,
+    logic_sample_count: usize,
+    logic_sample_rate_hz: u64,
+) {
+    let has_waveform = logic_sample_count > 1 && logic_sample_rate_hz != 0;
+    egui::CollapsingHeader::new(RichText::new("Markers").strong())
+        .id_salt("logic_markers_section")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if settings.adding {
+                    if ui.button("Cancel").clicked() {
+                        settings.cancel();
+                    }
+                } else if ui
+                    .add_enabled(
+                        has_waveform && settings.markers.len() < LOGIC_MARKER_LIMIT,
+                        egui::Button::new("+ Add"),
+                    )
+                    .on_disabled_hover_text(if has_waveform {
+                        "The maximum of 20 markers has been reached"
+                    } else {
+                        "Capture or open logic samples before adding a marker"
+                    })
+                    .clicked()
+                {
+                    settings.arm();
+                }
+                ui.label(
+                    RichText::new(format!("{}/{}", settings.markers.len(), LOGIC_MARKER_LIMIT))
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+                if !settings.markers.is_empty()
+                    && ui
+                        .small_button("Clear")
+                        .on_hover_text("Remove all markers")
+                        .clicked()
+                {
+                    settings.clear();
+                }
+            });
+
+            if settings.adding {
+                ui.add_space(4.0);
+                ui.small(
+                    RichText::new(
+                        "Hold the left mouse button on the waveform, drag, then release.",
+                    )
+                    .color(ACCENT),
+                );
+            } else if settings.markers.is_empty() {
+                ui.add_space(4.0);
+                ui.small(RichText::new("No markers").color(TEXT_MUTED));
+            }
+
+            let mut remove = None;
+            for (index, marker) in settings.markers.iter().copied().enumerate() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.colored_label(logic_marker_color(index), format!("M{}", index + 1));
+                    ui.monospace(format_duration(marker.duration()))
+                        .on_hover_text(format!(
+                            "Samples {}–{} at {}",
+                            marker.start_sample,
+                            marker.end_sample,
+                            format_sample_rate(marker.sample_rate_hz)
+                        ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Remove marker")
+                            .clicked()
+                        {
+                            remove = Some(index);
+                        }
+                    });
+                });
+            }
+            if let Some(index) = remove {
+                settings.markers.remove(index);
+            }
+        });
 }
 
 struct ScopeToolsOptions {
@@ -5400,6 +5606,19 @@ impl eframe::App for DsViewApp {
                 });
         }
 
+        let (displayed_logic_sample_count, displayed_logic_sample_rate_hz) = self
+            .capture
+            .as_ref()
+            .filter(|active| !active.preserve_display_until_complete)
+            .map(|active| &active.waveforms)
+            .or_else(|| {
+                self.completed_capture
+                    .as_ref()
+                    .map(|capture| &capture.waveforms)
+            })
+            .map(|waveforms| (waveforms.logic_sample_count, waveforms.logic_rate_hz))
+            .unwrap_or((0, 0));
+
         egui::SidePanel::left("capture_setup_fixed")
             .resizable(false)
             .exact_width(300.0)
@@ -5448,6 +5667,9 @@ impl eframe::App for DsViewApp {
                                     acquisition_mode: &mut self.logic_acquisition_mode,
                                     repetitive_interval_seconds: &mut self
                                         .repetitive_interval_seconds,
+                                    marker_settings: &mut self.logic_marker_settings,
+                                    displayed_sample_count: displayed_logic_sample_count,
+                                    displayed_sample_rate_hz: displayed_logic_sample_rate_hz,
                                 },
                                 ScopeCaptureSettingsEditor {
                                     settings: &mut self.scope_settings,
@@ -5584,6 +5806,7 @@ impl eframe::App for DsViewApp {
                 let mut logic_channel_marker_opacities = self.logic_channel_marker_opacities;
                 let mut logic_channel_names = self.logic_channel_names.clone();
                 let mut logic_channel_settings_drafts = self.logic_channel_settings_drafts.clone();
+                let mut logic_marker_settings = self.logic_marker_settings.clone();
                 let mut logic_enabled_channels = self.logic_settings.enabled_channels;
                 let mut logic_maximum_heights = self.logic_settings.maximum_heights;
                 let mut logic_viewport = self.logic_viewport;
@@ -5631,6 +5854,7 @@ impl eframe::App for DsViewApp {
                                             &mut logic_channel_marker_opacities,
                                         channel_names: &mut logic_channel_names,
                                         channel_settings_drafts: &mut logic_channel_settings_drafts,
+                                        marker_settings: &mut logic_marker_settings,
                                         maximum_heights: &mut logic_maximum_heights,
                                         enabled_channels: &mut logic_enabled_channels,
                                     },
@@ -5720,6 +5944,7 @@ impl eframe::App for DsViewApp {
                                 channel_marker_opacities: &mut logic_channel_marker_opacities,
                                 channel_names: &mut logic_channel_names,
                                 channel_settings_drafts: &mut logic_channel_settings_drafts,
+                                marker_settings: &mut logic_marker_settings,
                                 maximum_heights: &mut logic_maximum_heights,
                                 enabled_channels: &mut logic_enabled_channels,
                             },
@@ -5754,6 +5979,7 @@ impl eframe::App for DsViewApp {
                 self.logic_channel_marker_opacities = logic_channel_marker_opacities;
                 self.logic_channel_names = logic_channel_names;
                 self.logic_channel_settings_drafts = logic_channel_settings_drafts;
+                self.logic_marker_settings = logic_marker_settings;
                 self.logic_settings.enabled_channels = logic_enabled_channels;
                 self.logic_settings.maximum_heights = logic_maximum_heights;
                 self.logic_viewport = logic_viewport;
@@ -6872,6 +7098,7 @@ struct LogicWaveformOptions<'a> {
     channel_marker_opacities: &'a mut [u8; LOGIC_CHANNEL_COUNT],
     channel_names: &'a mut [String; LOGIC_CHANNEL_COUNT],
     channel_settings_drafts: &'a mut [LogicChannelSettingsDraft; LOGIC_CHANNEL_COUNT],
+    marker_settings: &'a mut LogicMarkerSettings,
     maximum_heights: &'a mut [u8; LOGIC_CHANNEL_COUNT],
     enabled_channels: &'a mut [bool; LOGIC_CHANNEL_COUNT],
 }
@@ -7240,6 +7467,7 @@ enum WaveformZoomAnchor {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct WaveformViewportOptions {
     reset_on_double_click: bool,
+    primary_pan_enabled: bool,
     zoom_anchor: WaveformZoomAnchor,
 }
 
@@ -7259,7 +7487,9 @@ fn update_waveform_viewport(
         ui.make_persistent_id(id_salt),
         Sense::click_and_drag(),
     );
-    let cursor = if response.dragged_by(egui::PointerButton::Primary) {
+    let cursor = if !options.primary_pan_enabled {
+        egui::CursorIcon::Crosshair
+    } else if response.dragged_by(egui::PointerButton::Primary) {
         egui::CursorIcon::Grabbing
     } else {
         egui::CursorIcon::Grab
@@ -7284,12 +7514,12 @@ fn update_waveform_viewport(
     } else {
         None
     };
-    if response.double_clicked() && options.reset_on_double_click {
+    if response.double_clicked() && options.reset_on_double_click && options.primary_pan_enabled {
         let previous = *viewport;
         viewport.reset();
         timebase_changed = *viewport != previous;
     }
-    if response.dragged_by(egui::PointerButton::Primary) {
+    if options.primary_pan_enabled && response.dragged_by(egui::PointerButton::Primary) {
         let delta_x = ui.input(|input| input.pointer.delta().x);
         if viewport.pan_by_screen_delta(delta_x, rect.width()) {
             panned = true;
@@ -7726,6 +7956,259 @@ fn logic_waveform_points(
     points
 }
 
+fn logic_marker_color(index: usize) -> Color32 {
+    scope_marker_color(index % 2, index / 2)
+}
+
+fn logic_sample_at_x(
+    plot: Rect,
+    viewport: WaveformViewport,
+    sample_offset: u64,
+    sample_count: usize,
+    x: f32,
+) -> Option<u64> {
+    if sample_count == 0 {
+        return None;
+    }
+    let screen_fraction = ((x - plot.left()) / plot.width().max(1.0)).clamp(0.0, 1.0);
+    let domain_fraction = viewport
+        .domain_fraction_at_screen(screen_fraction)
+        .clamp(0.0, 1.0);
+    let local_sample = (domain_fraction * sample_count.saturating_sub(1) as f32).round() as u64;
+    Some(sample_offset.saturating_add(local_sample))
+}
+
+fn logic_marker_x(
+    plot: Rect,
+    viewport: WaveformViewport,
+    sample_offset: u64,
+    sample_count: usize,
+    sample: u64,
+) -> Option<f32> {
+    let last_sample = sample_offset.saturating_add(sample_count.saturating_sub(1) as u64);
+    if sample_count == 0 || sample < sample_offset || sample > last_sample {
+        return None;
+    }
+    Some(waveform_sample_x(
+        plot,
+        viewport,
+        sample.saturating_sub(sample_offset) as f32,
+        sample_count,
+    ))
+}
+
+fn pan_logic_marker_viewport_at_edge(
+    viewport: &mut WaveformViewport,
+    plot: Rect,
+    pointer_x: f32,
+) -> bool {
+    const EDGE_WIDTH: f32 = 32.0;
+    const PAN_STEP: f32 = 0.02;
+
+    let edge_width = EDGE_WIDTH.min(plot.width() * 0.25).max(1.0);
+    let direction = if pointer_x < plot.left() + edge_width {
+        -((plot.left() + edge_width - pointer_x) / edge_width).clamp(0.0, 1.0)
+    } else if pointer_x > plot.right() - edge_width {
+        ((pointer_x - (plot.right() - edge_width)) / edge_width).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if direction == 0.0 {
+        return false;
+    }
+
+    let previous_start = viewport.start;
+    viewport.start = viewport.clamp_start(viewport.start + direction * viewport.span * PAN_STEP);
+    if (viewport.start - previous_start).abs() <= f32::EPSILON {
+        return false;
+    }
+    viewport.anchor_locked = false;
+    true
+}
+
+fn update_logic_marker_gesture(
+    ui: &egui::Ui,
+    plot: Rect,
+    waveforms: &WaveformStore,
+    viewport: &mut WaveformViewport,
+    settings: &mut LogicMarkerSettings,
+) {
+    if !settings.adding
+        || settings.markers.len() >= LOGIC_MARKER_LIMIT
+        || waveforms.logic_sample_count < 2
+        || waveforms.logic_rate_hz == 0
+    {
+        settings.draft = None;
+        return;
+    }
+
+    let (pressed, down, released, pointer_position) = ui.input(|input| {
+        (
+            input.pointer.button_pressed(egui::PointerButton::Primary),
+            input.pointer.button_down(egui::PointerButton::Primary),
+            input.pointer.button_released(egui::PointerButton::Primary),
+            input.pointer.interact_pos(),
+        )
+    });
+    if pointer_position.is_some_and(|pointer| plot.contains(pointer)) || settings.draft.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+    if pressed {
+        if let Some(pointer) = pointer_position.filter(|pointer| plot.contains(*pointer)) {
+            if let Some(sample) = logic_sample_at_x(
+                plot,
+                *viewport,
+                waveforms.logic_sample_offset,
+                waveforms.logic_sample_count,
+                pointer.x,
+            ) {
+                settings.start(sample);
+            }
+        }
+    }
+    if settings.draft.is_some() && (down || released) {
+        if let Some(pointer) = pointer_position {
+            if down && pan_logic_marker_viewport_at_edge(viewport, plot, pointer.x) {
+                ui.ctx().request_repaint();
+            }
+            if let Some(sample) = logic_sample_at_x(
+                plot,
+                *viewport,
+                waveforms.logic_sample_offset,
+                waveforms.logic_sample_count,
+                pointer.x.clamp(plot.left(), plot.right()),
+            ) {
+                settings.update(sample);
+            }
+        }
+    }
+    if released && settings.draft.is_some() {
+        settings.finish(waveforms.logic_rate_hz);
+    }
+}
+
+fn paint_logic_marker_span(
+    painter: &egui::Painter,
+    plot: Rect,
+    first_x: f32,
+    second_x: f32,
+    label: &str,
+    color: Color32,
+) {
+    let left = first_x.min(second_x).clamp(plot.left(), plot.right());
+    let right = first_x.max(second_x).clamp(plot.left(), plot.right());
+    let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 24);
+    painter.rect_filled(
+        Rect::from_min_max(Pos2::new(left, plot.top()), Pos2::new(right, plot.bottom())),
+        0.0,
+        fill,
+    );
+    for x in [left, right] {
+        painter.line_segment(
+            [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+            Stroke::new(1.5_f32, color),
+        );
+    }
+    painter.line_segment(
+        [
+            Pos2::new(left, plot.top() + 3.0),
+            Pos2::new(right, plot.top() + 3.0),
+        ],
+        Stroke::new(1.5_f32, color),
+    );
+    painter.text(
+        Pos2::new((left + right) * 0.5, plot.top() + 6.0),
+        egui::Align2::CENTER_TOP,
+        label,
+        FontId::monospace(10.0),
+        color,
+    );
+}
+
+fn paint_logic_markers(
+    ui: &egui::Ui,
+    plot: Rect,
+    waveforms: &WaveformStore,
+    viewport: WaveformViewport,
+    settings: &mut LogicMarkerSettings,
+) {
+    let last_sample = waveforms
+        .logic_sample_offset
+        .saturating_add(waveforms.logic_sample_count.saturating_sub(1) as u64);
+    for (index, marker) in settings.markers.iter().copied().enumerate() {
+        if marker.end_sample < waveforms.logic_sample_offset || marker.start_sample > last_sample {
+            continue;
+        }
+        let start = marker
+            .start_sample
+            .clamp(waveforms.logic_sample_offset, last_sample);
+        let end = marker
+            .end_sample
+            .clamp(waveforms.logic_sample_offset, last_sample);
+        let (Some(start_x), Some(end_x)) = (
+            logic_marker_x(
+                plot,
+                viewport,
+                waveforms.logic_sample_offset,
+                waveforms.logic_sample_count,
+                start,
+            ),
+            logic_marker_x(
+                plot,
+                viewport,
+                waveforms.logic_sample_offset,
+                waveforms.logic_sample_count,
+                end,
+            ),
+        ) else {
+            continue;
+        };
+        paint_logic_marker_span(
+            ui.painter(),
+            plot,
+            start_x,
+            end_x,
+            &format!("M{}  {}", index + 1, format_duration(marker.duration())),
+            logic_marker_color(index),
+        );
+    }
+
+    if let Some(draft) = settings.draft {
+        if let (Some(start_x), Some(end_x)) = (
+            logic_marker_x(
+                plot,
+                viewport,
+                waveforms.logic_sample_offset,
+                waveforms.logic_sample_count,
+                draft.start_sample,
+            ),
+            logic_marker_x(
+                plot,
+                viewport,
+                waveforms.logic_sample_offset,
+                waveforms.logic_sample_count,
+                draft.end_sample,
+            ),
+        ) {
+            let duration = LogicMarker::new(
+                draft.start_sample,
+                draft.end_sample,
+                waveforms.logic_rate_hz,
+            )
+            .map(|marker| format_duration(marker.duration()))
+            .unwrap_or_else(|| "0.0 ns".to_owned());
+            paint_logic_marker_span(
+                ui.painter(),
+                plot,
+                start_x,
+                end_x,
+                &format!("New  {duration}"),
+                ACCENT,
+            );
+        }
+    }
+}
+
 fn paint_logic(
     ui: &egui::Ui,
     rect: Rect,
@@ -7738,6 +8221,7 @@ fn paint_logic(
         channel_marker_opacities,
         channel_names,
         channel_settings_drafts,
+        marker_settings,
         maximum_heights,
         enabled_channels,
     } = options;
@@ -7768,9 +8252,11 @@ fn paint_logic(
         display_sample_rate_hz,
         WaveformViewportOptions {
             reset_on_double_click: true,
+            primary_pan_enabled: !marker_settings.adding,
             zoom_anchor: WaveformZoomAnchor::Pointer,
         },
     );
+    update_logic_marker_gesture(ui, plot, waveforms, viewport, marker_settings);
     let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
     for channel in 0..LOGIC_CHANNEL_COUNT {
         let lane_top = plot.top() + channel as f32 * lane_height;
@@ -7927,6 +8413,7 @@ fn paint_logic(
             *channel_marker_opacity,
         );
     }
+    paint_logic_markers(ui, plot, waveforms, *viewport, marker_settings);
     if visible_count == 0 {
         paint_empty(painter, plot, "Waiting for logic samples");
     }
@@ -10082,6 +10569,7 @@ fn paint_scope_time_domain(
         display_sample_rate_hz,
         WaveformViewportOptions {
             reset_on_double_click: false,
+            primary_pan_enabled: true,
             zoom_anchor: WaveformZoomAnchor::Sample {
                 domain_fraction: trigger_sample_fraction,
                 screen_fraction: trigger_screen_fraction,
@@ -11303,6 +11791,84 @@ mod tests {
         )));
         assert!(!scope_tools_panel_is_visible(Some(WaveformTab::Combined)));
         assert!(!scope_tools_panel_is_visible(None));
+    }
+
+    #[test]
+    fn logic_markers_normalize_reverse_drags_and_stop_at_twenty() {
+        let mut settings = LogicMarkerSettings::default();
+        for index in 0..LOGIC_MARKER_LIMIT {
+            assert!(settings.arm());
+            settings.start((index * 10 + 9) as u64);
+            settings.update((index * 10) as u64);
+            assert!(settings.finish(1_000));
+        }
+
+        assert_eq!(settings.markers.len(), LOGIC_MARKER_LIMIT);
+        assert_eq!(settings.markers[0].start_sample, 0);
+        assert_eq!(settings.markers[0].end_sample, 9);
+        assert_eq!(settings.markers[0].duration(), Duration::from_millis(9));
+        assert!(!settings.arm());
+    }
+
+    #[test]
+    fn zero_length_logic_marker_drag_remains_armed() {
+        let mut settings = LogicMarkerSettings::default();
+        assert!(settings.arm());
+        settings.start(42);
+        settings.update(42);
+
+        assert!(!settings.finish(1_000_000));
+        assert!(settings.adding);
+        assert!(settings.markers.is_empty());
+        assert!(settings.draft.is_none());
+    }
+
+    #[test]
+    fn logic_marker_positions_snap_to_captured_samples() {
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_000.0, 400.0));
+        let viewport = WaveformViewport::default();
+
+        assert_eq!(
+            logic_sample_at_x(plot, viewport, 2_000, 101, 254.0),
+            Some(2_025)
+        );
+        assert_eq!(
+            logic_marker_x(plot, viewport, 2_000, 101, 2_025),
+            Some(250.0)
+        );
+        assert_eq!(logic_marker_x(plot, viewport, 2_000, 101, 1_999), None);
+    }
+
+    #[test]
+    fn logic_marker_drag_pans_the_zoomed_viewport_at_plot_edges() {
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_000.0, 400.0));
+        let mut viewport = WaveformViewport {
+            start: 0.4,
+            span: 0.2,
+            anchor_locked: true,
+        };
+
+        assert!(pan_logic_marker_viewport_at_edge(
+            &mut viewport,
+            plot,
+            plot.right()
+        ));
+        assert!(viewport.start > 0.4);
+        let right_start = viewport.start;
+        assert!(pan_logic_marker_viewport_at_edge(
+            &mut viewport,
+            plot,
+            plot.left()
+        ));
+        assert!(viewport.start < right_start);
+        assert!(!viewport.anchor_locked);
+
+        viewport.start = 0.0;
+        assert!(!pan_logic_marker_viewport_at_edge(
+            &mut viewport,
+            plot,
+            plot.left()
+        ));
     }
 
     #[test]
