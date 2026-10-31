@@ -1,4 +1,4 @@
-use crate::transport::QueuedBulkReadOutcome;
+use crate::transport::{QueuedBulkRead, QueuedBulkReadOutcome};
 use crate::{
     DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbError, UsbSpeedClass, DSCOPE_U3P100,
 };
@@ -6,6 +6,7 @@ use dsview_core::{
     CaptureBatch, CaptureContext, CaptureError, CaptureSource, DeviceDescriptor, DeviceId,
     InstrumentKind, ScopeBatch,
 };
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ const MEASUREMENT_FOOTER_BYTES: usize = 1_024;
 const TRIGGER_CHECK_ID: u32 = 0x5555_5555;
 const DSO_PACKET_ID: u16 = 0xa500;
 const SCOPE_BATCH_SAMPLES: usize = 65_536;
+const CONTINUOUS_QUEUED_FRAMES: usize = 10;
 const CAPTURE_COMPLETION_GRACE: Duration = Duration::from_secs(5);
 const ADC_REFERENCE_SPAN: f32 = 235.0;
 // The measurement footer reports the ADC code used as each channel's zero
@@ -58,6 +60,7 @@ pub const DSCOPE_TRIGGER_POSITION_CENTER_PERCENT: u8 = 50;
 pub const DSCOPE_TRIGGER_POSITION_MAX_PERCENT: u8 = 99;
 pub const DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX: u8 = 15;
 pub const DSCOPE_TRIGGER_HOLDOFF_MAX_NS: u64 = 1_000_000_000;
+pub const DSCOPE_FRAME_SEQUENCE_STRIDE: u64 = 1_u64 << 32;
 pub const DSCOPE_TRIGGER_LEVEL_MIN: u8 = 24;
 pub const DSCOPE_TRIGGER_LEVEL_CENTER: u8 = 128;
 pub const DSCOPE_TRIGGER_LEVEL_MAX: u8 = 232;
@@ -762,6 +765,7 @@ pub struct DsCopeCaptureSource {
     descriptor: DeviceDescriptor,
     runtime_trigger_receiver: Option<Receiver<DsCopeTriggerConfig>>,
     runtime_calibration_receiver: Option<Receiver<DsCopeCalibrationValues>>,
+    continuous: bool,
 }
 
 #[derive(Clone)]
@@ -1648,6 +1652,7 @@ impl DsCopeCaptureSource {
             descriptor,
             runtime_trigger_receiver: None,
             runtime_calibration_receiver: None,
+            continuous: false,
         })
     }
 
@@ -1671,6 +1676,11 @@ impl DsCopeCaptureSource {
         self.runtime_calibration_receiver = Some(receiver);
         (self, DsCopeRuntimeCalibrationControl { sender })
     }
+
+    pub fn with_continuous_capture(mut self) -> Self {
+        self.continuous = true;
+        self
+    }
 }
 
 impl CaptureSource for DsCopeCaptureSource {
@@ -1687,6 +1697,7 @@ impl CaptureSource for DsCopeCaptureSource {
             &context,
             self.runtime_trigger_receiver.as_ref(),
             self.runtime_calibration_receiver.as_ref(),
+            self.continuous,
         );
         let close_result = session.close().map_err(capture_error);
         combine_results(capture_result, close_result, "release the USB interface")
@@ -1700,6 +1711,7 @@ fn run_capture(
     context: &CaptureContext,
     runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
     runtime_calibration_receiver: Option<&Receiver<DsCopeCalibrationValues>>,
+    continuous: bool,
 ) -> Result<(), CaptureError> {
     validate_device_ready(session)?;
     session.stop_capture().map_err(capture_error)?;
@@ -1709,6 +1721,16 @@ fn run_capture(
             .arm_capture(&config.encode_settings())
             .map_err(capture_error)?;
         configure_scope_post_arm(session, config, calibration)?;
+        if continuous {
+            return read_continuous_capture(
+                session,
+                &mut config,
+                &mut calibration,
+                context,
+                runtime_trigger_receiver,
+                runtime_calibration_receiver,
+            );
+        }
         let Some(capture) = read_prequeued_capture(
             session,
             &mut config,
@@ -1720,7 +1742,7 @@ fn run_capture(
         else {
             return Ok(());
         };
-        decode_capture(capture, config, context)
+        decode_capture(capture, config, context, 0)
     })();
 
     if context.is_cancelled() || capture_result.is_err() {
@@ -2211,6 +2233,179 @@ struct RawScopeCapture {
     capture_origin: Duration,
 }
 
+fn read_continuous_capture(
+    session: &UsbDeviceSession,
+    config: &mut DsCopeCaptureConfig,
+    calibration: &mut DsCopeCalibration,
+    context: &CaptureContext,
+    runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
+    runtime_calibration_receiver: Option<&Receiver<DsCopeCalibrationValues>>,
+) -> Result<(), CaptureError> {
+    let mut header_read = None;
+    let mut payload_reads = VecDeque::new();
+    let capture_result = read_continuous_capture_inner(
+        session,
+        config,
+        calibration,
+        context,
+        runtime_trigger_receiver,
+        runtime_calibration_receiver,
+        &mut header_read,
+        &mut payload_reads,
+    );
+    let cleanup_result = cancel_pending_scope_reads(session, &mut header_read, &mut payload_reads);
+    combine_results(
+        capture_result,
+        cleanup_result,
+        "cancel queued continuous scope reads",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_continuous_capture_inner(
+    session: &UsbDeviceSession,
+    config: &mut DsCopeCaptureConfig,
+    calibration: &mut DsCopeCalibration,
+    context: &CaptureContext,
+    runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
+    runtime_calibration_receiver: Option<&Receiver<DsCopeCalibrationValues>>,
+    header_read: &mut Option<QueuedBulkRead>,
+    payload_reads: &mut VecDeque<QueuedBulkRead>,
+) -> Result<(), CaptureError> {
+    let payload_bytes = scope_payload_bytes(*config)?;
+    *header_read = Some(
+        session
+            .queue_bulk_read(TRIGGER_HEADER_BYTES)
+            .map_err(capture_error)?,
+    );
+    for _ in 0..CONTINUOUS_QUEUED_FRAMES {
+        payload_reads.push_back(
+            session
+                .queue_bulk_read(payload_bytes)
+                .map_err(capture_error)?,
+        );
+    }
+
+    context.synchronize_start()?;
+    session.start_capture().map_err(capture_error)?;
+
+    let mut trigger_header = None;
+    let mut frame_index = 0_u64;
+    loop {
+        apply_pending_runtime_controls(
+            session,
+            config,
+            calibration,
+            runtime_trigger_receiver,
+            runtime_calibration_receiver,
+        )?;
+        if context.is_cancelled() {
+            return Ok(());
+        }
+
+        if header_read
+            .as_ref()
+            .is_some_and(QueuedBulkRead::is_complete)
+        {
+            let completed = header_read
+                .take()
+                .expect("the completed continuous scope header read is present");
+            let header = require_queued_data(
+                completed.finish().map_err(capture_error)?,
+                "continuous trigger header",
+            )?;
+            validate_trigger_header(&header)?;
+            trigger_header = Some(header);
+        }
+
+        while payload_reads
+            .front()
+            .is_some_and(QueuedBulkRead::is_complete)
+        {
+            let Some(current_trigger_header) = trigger_header.as_ref() else {
+                break;
+            };
+            let completed = payload_reads
+                .pop_front()
+                .expect("the completed continuous scope payload read is present");
+            let payload =
+                require_scope_payload(completed.finish().map_err(capture_error)?, payload_bytes)?;
+
+            // Replenish the USB queue before decoding and publishing the frame.
+            payload_reads.push_back(
+                session
+                    .queue_bulk_read(payload_bytes)
+                    .map_err(capture_error)?,
+            );
+
+            let footer = &payload[payload_bytes - MEASUREMENT_FOOTER_BYTES..];
+            if !ScopeMeasurement::is_ready(footer, *config) {
+                continue;
+            }
+            let sequence_base = frame_index
+                .checked_mul(DSCOPE_FRAME_SEQUENCE_STRIDE)
+                .ok_or_else(|| CaptureError::new("continuous scope sequence overflowed"))?;
+            let frame_duration =
+                Duration::from_secs_f64(config.sample_count as f64 / config.sample_rate_hz as f64);
+            let capture_origin = context.elapsed().saturating_sub(frame_duration);
+            decode_capture(
+                RawScopeCapture {
+                    trigger_header: current_trigger_header.clone(),
+                    payload,
+                    capture_origin,
+                },
+                *config,
+                context,
+                sequence_base,
+            )?;
+            frame_index += 1;
+        }
+
+        session
+            .handle_usb_events(Duration::from_millis(5))
+            .map_err(capture_error)?;
+    }
+}
+
+fn cancel_pending_scope_reads(
+    session: &UsbDeviceSession,
+    header_read: &mut Option<QueuedBulkRead>,
+    payload_reads: &mut VecDeque<QueuedBulkRead>,
+) -> Result<(), CaptureError> {
+    if header_read.is_none() && payload_reads.is_empty() {
+        return Ok(());
+    }
+    let _ = session.force_capture_ready();
+    if let Some(header_read) = header_read.as_mut() {
+        header_read.cancel().map_err(capture_error)?;
+    }
+    for payload_read in payload_reads.iter_mut() {
+        payload_read.cancel().map_err(capture_error)?;
+    }
+    while header_read.as_ref().is_some_and(|read| !read.is_complete())
+        || payload_reads.iter().any(|read| !read.is_complete())
+    {
+        session
+            .handle_usb_events(Duration::from_millis(5))
+            .map_err(capture_error)?;
+    }
+    if let Some(header_read) = header_read.take() {
+        let _ = header_read.finish();
+    }
+    while let Some(payload_read) = payload_reads.pop_front() {
+        let _ = payload_read.finish();
+    }
+    Ok(())
+}
+
+fn scope_payload_bytes(config: DsCopeCaptureConfig) -> Result<usize, CaptureError> {
+    usize::try_from(config.armed_sample_count())
+        .ok()
+        .and_then(|samples| samples.checked_mul(config.enabled_channel_count()))
+        .and_then(|bytes| bytes.checked_add(MEASUREMENT_FOOTER_BYTES))
+        .ok_or_else(|| CaptureError::new("requested DSCope payload is too large"))
+}
+
 fn read_prequeued_capture(
     session: &UsbDeviceSession,
     config: &mut DsCopeCaptureConfig,
@@ -2219,11 +2414,7 @@ fn read_prequeued_capture(
     runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
     runtime_calibration_receiver: Option<&Receiver<DsCopeCalibrationValues>>,
 ) -> Result<Option<RawScopeCapture>, CaptureError> {
-    let payload_bytes = usize::try_from(config.armed_sample_count())
-        .ok()
-        .and_then(|samples| samples.checked_mul(config.enabled_channel_count()))
-        .and_then(|bytes| bytes.checked_add(MEASUREMENT_FOOTER_BYTES))
-        .ok_or_else(|| CaptureError::new("requested DSCope payload is too large"))?;
+    let payload_bytes = scope_payload_bytes(*config)?;
     let mut header_read = session
         .queue_bulk_read(TRIGGER_HEADER_BYTES)
         .map_err(capture_error)?;
@@ -2463,6 +2654,7 @@ fn decode_capture(
     capture: RawScopeCapture,
     config: DsCopeCaptureConfig,
     context: &CaptureContext,
+    sequence_base: u64,
 ) -> Result<(), CaptureError> {
     let enabled_channel_count = config.enabled_channel_count();
     let enabled_channel_indices = config.enabled_channel_indices().collect::<Vec<_>>();
@@ -2511,7 +2703,7 @@ fn decode_capture(
         let captured_at = capture.capture_origin
             + Duration::from_secs_f64(frame_sample_offset as f64 / config.sample_rate_hz as f64);
         context.emit(
-            sequence as u64,
+            sequence_base + sequence as u64,
             captured_at,
             CaptureBatch::Scope(ScopeBatch {
                 sample_rate_hz: config.sample_rate_hz,
@@ -3472,6 +3664,27 @@ mod tests {
             calibration_payload_bytes(single),
             single.armed_sample_count() as usize + MEASUREMENT_FOOTER_BYTES
         );
+    }
+
+    #[test]
+    fn scope_payloads_are_usb_packet_aligned_for_every_sample_depth() {
+        for sample_count in DSCOPE_SAMPLE_COUNTS {
+            let dual =
+                DsCopeCaptureConfig::new(500_000_000, sample_count.min(MAX_TOTAL_SAMPLE_COUNT / 2))
+                    .expect("dual-channel configuration should be valid");
+            assert_eq!(scope_payload_bytes(dual).unwrap() % 1_024, 0);
+
+            let single = DsCopeCaptureConfig::with_channel_configs(
+                1_000_000_000,
+                sample_count,
+                [
+                    DsCopeChannelConfig::default(),
+                    DsCopeChannelConfig::default().with_enabled(false),
+                ],
+            )
+            .expect("single-channel configuration should be valid");
+            assert_eq!(scope_payload_bytes(single).unwrap() % 1_024, 0);
+        }
     }
 
     #[test]

@@ -195,10 +195,26 @@ impl QueuedBulkRead {
             }
             rusb::constants::LIBUSB_TRANSFER_CANCELLED => Ok(QueuedBulkReadOutcome::Cancelled),
             status => Err(UsbError::new(format!(
-                "queued capture read for {} failed with libusb transfer status {status}",
-                self.device_id
+                "queued capture read for {} failed with libusb transfer status {status} ({}; received {} of {} bytes)",
+                self.device_id,
+                libusb_transfer_status_name(status),
+                self.state.actual_length,
+                self.state.buffer.len(),
             ))),
         }
+    }
+}
+
+fn libusb_transfer_status_name(status: i32) -> &'static str {
+    match status {
+        rusb::constants::LIBUSB_TRANSFER_COMPLETED => "completed",
+        rusb::constants::LIBUSB_TRANSFER_ERROR => "error",
+        rusb::constants::LIBUSB_TRANSFER_TIMED_OUT => "timed out",
+        rusb::constants::LIBUSB_TRANSFER_CANCELLED => "cancelled",
+        rusb::constants::LIBUSB_TRANSFER_STALL => "stalled",
+        rusb::constants::LIBUSB_TRANSFER_NO_DEVICE => "device disconnected",
+        rusb::constants::LIBUSB_TRANSFER_OVERFLOW => "overflow",
+        _ => "unknown",
     }
 }
 

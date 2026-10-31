@@ -15,12 +15,12 @@ use dsview_usb::{
     DsCopeOperationMode, DsCopeRuntimeCalibrationControl, DsCopeRuntimeTriggerControl,
     DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig,
     DsLogicCaptureSource, DsLogicInputFilter, DsLogicOperationMode, DsLogicStopOption, LinkStatus,
-    UsbSpeedClass, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ, DSCOPE_TRIGGER_HOLDOFF_MAX_NS,
-    DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
-    DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
-    DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
-    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_MAX_SAMPLE_COUNT,
-    DSLOGIC_SAMPLE_ALIGNMENT, DSLOGIC_SAMPLE_RATES_HZ,
+    UsbSpeedClass, DSCOPE_FRAME_SEQUENCE_STRIDE, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
+    DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX,
+    DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
+    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
+    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
+    DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_ALIGNMENT, DSLOGIC_SAMPLE_RATES_HZ,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use image::ImageFormat;
@@ -996,9 +996,20 @@ impl LogicCaptureSettings {
             .expect("at least one logic channel is enabled")
             .maximum_sample_rate_hz(speed)
     }
+
+    fn maximum_sample_count(self) -> u64 {
+        DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)
+            .expect("default logic capture configuration is valid")
+            .with_operation_mode(self.operation_mode)
+            .maximum_sample_count()
+    }
 }
 
-fn aligned_logic_sample_count(duration_seconds: f64, sample_rate_hz: u64) -> Option<u64> {
+fn aligned_logic_sample_count(
+    duration_seconds: f64,
+    sample_rate_hz: u64,
+    maximum_sample_count: u64,
+) -> Option<u64> {
     if !duration_seconds.is_finite() || duration_seconds <= 0.0 || sample_rate_hz == 0 {
         return None;
     }
@@ -1007,15 +1018,18 @@ fn aligned_logic_sample_count(duration_seconds: f64, sample_rate_hz: u64) -> Opt
         return None;
     }
     let aligned = (requested as u64).div_ceil(DSLOGIC_SAMPLE_ALIGNMENT) * DSLOGIC_SAMPLE_ALIGNMENT;
-    (aligned <= DSLOGIC_MAX_SAMPLE_COUNT && aligned <= MAX_WAVEFORM_SAMPLES as u64)
-        .then_some(aligned)
+    (aligned <= maximum_sample_count).then_some(aligned)
 }
 
-fn logic_capture_duration_options(sample_rate_hz: u64) -> Vec<(f64, u64)> {
+fn logic_capture_duration_options(settings: LogicCaptureSettings) -> Vec<(f64, u64)> {
     let mut options = Vec::new();
+    let maximum_sample_count = settings.maximum_sample_count();
     for duration_seconds in TIMEBASE_STEPS_SECONDS {
-        let Some(sample_count) = aligned_logic_sample_count(duration_seconds, sample_rate_hz)
-        else {
+        let Some(sample_count) = aligned_logic_sample_count(
+            duration_seconds,
+            settings.sample_rate_hz,
+            maximum_sample_count,
+        ) else {
             continue;
         };
         if options
@@ -1030,7 +1044,7 @@ fn logic_capture_duration_options(sample_rate_hz: u64) -> Vec<(f64, u64)> {
 }
 
 fn logic_capture_duration_seconds(settings: LogicCaptureSettings) -> f64 {
-    logic_capture_duration_options(settings.sample_rate_hz)
+    logic_capture_duration_options(settings)
         .into_iter()
         .find_map(|(duration, sample_count)| {
             (sample_count == settings.sample_count).then_some(duration)
@@ -1053,15 +1067,38 @@ fn set_logic_sample_rate_preserving_duration(
     }
     let duration_seconds = logic_capture_duration_seconds(*settings);
     settings.sample_rate_hz = sample_rate_hz;
-    settings.sample_count = aligned_logic_sample_count(duration_seconds, sample_rate_hz)
-        .unwrap_or_else(|| {
-            if duration_seconds * (sample_rate_hz as f64) < DSLOGIC_SAMPLE_ALIGNMENT as f64 {
-                DSLOGIC_SAMPLE_ALIGNMENT
-            } else {
-                let maximum = DSLOGIC_MAX_SAMPLE_COUNT.min(MAX_WAVEFORM_SAMPLES as u64);
-                maximum / DSLOGIC_SAMPLE_ALIGNMENT * DSLOGIC_SAMPLE_ALIGNMENT
-            }
-        });
+    set_logic_capture_duration(settings, duration_seconds);
+}
+
+fn set_logic_operation_mode_preserving_duration(
+    settings: &mut LogicCaptureSettings,
+    operation_mode: DsLogicOperationMode,
+) {
+    if settings.operation_mode == operation_mode {
+        return;
+    }
+    let duration_seconds = logic_capture_duration_seconds(*settings);
+    settings.operation_mode = operation_mode;
+    if operation_mode == DsLogicOperationMode::InternalTest {
+        settings.sample_rate_hz = 100_000_000;
+    }
+    set_logic_capture_duration(settings, duration_seconds);
+}
+
+fn set_logic_capture_duration(settings: &mut LogicCaptureSettings, duration_seconds: f64) {
+    let maximum_sample_count = settings.maximum_sample_count();
+    settings.sample_count = aligned_logic_sample_count(
+        duration_seconds,
+        settings.sample_rate_hz,
+        maximum_sample_count,
+    )
+    .unwrap_or_else(|| {
+        if duration_seconds * (settings.sample_rate_hz as f64) < DSLOGIC_SAMPLE_ALIGNMENT as f64 {
+            DSLOGIC_SAMPLE_ALIGNMENT
+        } else {
+            maximum_sample_count / DSLOGIC_SAMPLE_ALIGNMENT * DSLOGIC_SAMPLE_ALIGNMENT
+        }
+    });
 }
 
 impl Default for ScopeCaptureSettings {
@@ -1371,11 +1408,49 @@ fn default_logic_channel_settings_drafts() -> [LogicChannelSettingsDraft; LOGIC_
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogicSampleBucket {
+    first: u32,
+    last: u32,
+    activity: u32,
+    sample_count: u32,
+}
+
+impl LogicSampleBucket {
+    fn new(sample: u32) -> Self {
+        Self {
+            first: sample,
+            last: sample,
+            activity: 0,
+            sample_count: 1,
+        }
+    }
+
+    fn from_samples(samples: &[u32]) -> Option<Self> {
+        let first = *samples.first()?;
+        let mut bucket = Self::new(first);
+        bucket.push_samples(&samples[1..]);
+        Some(bucket)
+    }
+
+    fn push_samples(&mut self, samples: &[u32]) {
+        self.activity |= samples
+            .iter()
+            .fold(0_u32, |activity, sample| activity | (self.first ^ sample));
+        if let Some(last) = samples.last() {
+            self.last = *last;
+            self.sample_count += samples.len() as u32;
+        }
+    }
+}
+
 struct WaveformStore {
-    logic_samples: VecDeque<u32>,
+    logic_samples: VecDeque<LogicSampleBucket>,
     logic_channels: u8,
     logic_rate_hz: u64,
     logic_sample_offset: u64,
+    logic_sample_count: usize,
+    logic_sample_stride: usize,
     logic_capacity: usize,
     scope_channels: Vec<VecDeque<f32>>,
     scope_rate_hz: u64,
@@ -1394,6 +1469,8 @@ impl Default for WaveformStore {
             logic_channels: 0,
             logic_rate_hz: 0,
             logic_sample_offset: 0,
+            logic_sample_count: 0,
+            logic_sample_stride: 1,
             logic_capacity: MAX_WAVEFORM_SAMPLES,
             scope_channels: Vec::new(),
             scope_rate_hz: 0,
@@ -1502,6 +1579,14 @@ fn uses_rolling_scope_buffer(
     trigger_source: DsCopeTriggerSource,
 ) -> bool {
     mode.runs_continuously() && has_scope && trigger_source == DsCopeTriggerSource::Auto
+}
+
+fn uses_continuous_scope_source(mode: AcquisitionMode, target: CaptureTarget) -> bool {
+    mode == AcquisitionMode::Run && target == CaptureTarget::Oscilloscope
+}
+
+fn is_scope_frame_start(sequence: u64) -> bool {
+    sequence % DSCOPE_FRAME_SEQUENCE_STRIDE == 0
 }
 
 fn scope_rolling_sample_capacity(
@@ -1798,6 +1883,49 @@ fn adjacent_timebase(current_seconds: f64, zoom_in: bool) -> Option<f64> {
 }
 
 impl WaveformStore {
+    fn configure_logic_capture(&mut self, expected_sample_count: u64, rolling: bool) {
+        let expected_sample_count = usize::try_from(expected_sample_count).unwrap_or(usize::MAX);
+        self.logic_capacity = expected_sample_count.clamp(1, MAX_WAVEFORM_SAMPLES);
+        self.logic_sample_stride = if rolling {
+            1
+        } else {
+            expected_sample_count / self.logic_capacity
+                + usize::from(expected_sample_count % self.logic_capacity != 0)
+        }
+        .clamp(1, u32::MAX as usize);
+        self.logic_samples.clear();
+        self.logic_sample_offset = 0;
+        self.logic_sample_count = 0;
+    }
+
+    fn ingest_logic_samples(&mut self, samples: &[u32]) {
+        let mut remaining = samples;
+        if let Some(bucket) = self.logic_samples.back_mut() {
+            let available = self
+                .logic_sample_stride
+                .saturating_sub(bucket.sample_count as usize);
+            let append_count = available.min(remaining.len());
+            bucket.push_samples(&remaining[..append_count]);
+            remaining = &remaining[append_count..];
+        }
+        for chunk in remaining.chunks(self.logic_sample_stride) {
+            if let Some(bucket) = LogicSampleBucket::from_samples(chunk) {
+                self.logic_samples.push_back(bucket);
+            }
+        }
+        self.logic_sample_count = self.logic_sample_count.saturating_add(samples.len());
+
+        while self.logic_samples.len() > self.logic_capacity {
+            if let Some(removed) = self.logic_samples.pop_front() {
+                let removed_count = removed.sample_count as usize;
+                self.logic_sample_count = self.logic_sample_count.saturating_sub(removed_count);
+                self.logic_sample_offset = self
+                    .logic_sample_offset
+                    .saturating_add(removed_count as u64);
+            }
+        }
+    }
+
     fn can_continue_scope_roll(&self, config: DsCopeCaptureConfig, scope_capacity: usize) -> bool {
         self.scope_rolling
             && self.scope_rate_hz == config.sample_rate_hz()
@@ -1828,11 +1956,7 @@ impl WaveformStore {
             CaptureBatch::Logic(logic) => {
                 self.logic_channels = logic.channel_count;
                 self.logic_rate_hz = logic.sample_rate_hz;
-                self.logic_sample_offset += extend_bounded_to(
-                    &mut self.logic_samples,
-                    logic.samples.iter().copied(),
-                    self.logic_capacity,
-                ) as u64;
+                self.ingest_logic_samples(&logic.samples);
             }
             CaptureBatch::Scope(scope) => {
                 self.scope_revision = SCOPE_WAVEFORM_REVISION.fetch_add(1, Ordering::Relaxed);
@@ -2311,6 +2435,7 @@ impl DsViewApp {
                 logic_config,
                 scope_config,
                 calibration_values,
+                uses_continuous_scope_source(mode, target),
             )
             .map(|started| WorkerSuccess::Capture {
                 session: started.session,
@@ -2788,8 +2913,12 @@ impl DsViewApp {
                 } else {
                     WaveformStore::default()
                 };
-                waveforms.logic_capacity =
-                    (logic_config.sample_count() as usize).clamp(1, MAX_WAVEFORM_SAMPLES);
+                if !continue_logic_loop {
+                    waveforms.configure_logic_capture(
+                        logic_config.sample_count(),
+                        mode == AcquisitionMode::Loop,
+                    );
+                }
                 waveforms.scope_capacity = scope_capacity;
                 waveforms.scope_rolling = rolling;
                 self.capture = Some(ActiveCapture {
@@ -3021,7 +3150,7 @@ impl DsViewApp {
                                     .channels()
                                     .map(|channel| channel.enabled());
                                 if active.waveforms.scope_rolling
-                                    && frame.sequence == 0
+                                    && is_scope_frame_start(frame.sequence)
                                     && matches!(&frame.payload, CaptureBatch::Scope(_))
                                 {
                                     active
@@ -4394,9 +4523,7 @@ fn paint_capture_settings(
                                             ))
                                             .show_ui(ui, |ui| {
                                                 for (duration_seconds, sample_count) in
-                                                    logic_capture_duration_options(
-                                                        logic_settings.sample_rate_hz,
-                                                    )
+                                                    logic_capture_duration_options(*logic_settings)
                                                 {
                                                     ui.selectable_value(
                                                         &mut logic_settings.sample_count,
@@ -4488,6 +4615,8 @@ fn paint_capture_settings(
                                     .spacing([8.0, 6.0])
                                     .show(ui, |ui| {
                                         ui.label("Operation mode");
+                                        let previous_operation_mode =
+                                            logic_settings.operation_mode;
                                         egui::ComboBox::from_id_salt("logic_operation_mode")
                                             .width(CONTROL_WIDTH)
                                             .selected_text(match logic_settings.operation_mode {
@@ -4514,6 +4643,18 @@ fn paint_capture_settings(
                                                     "Internal test",
                                                 );
                                             });
+                                        if logic_settings.operation_mode
+                                            != previous_operation_mode
+                                        {
+                                            let selected_operation_mode =
+                                                logic_settings.operation_mode;
+                                            logic_settings.operation_mode =
+                                                previous_operation_mode;
+                                            set_logic_operation_mode_preserving_duration(
+                                                logic_settings,
+                                                selected_operation_mode,
+                                            );
+                                        }
                                         ui.end_row();
 
                                         ui.label("Stop options");
@@ -6337,8 +6478,15 @@ fn logic_settings_from_recording_metadata(
             settings.sample_rate_hz = sample_rate_hz;
         }
     }
+    if let Some(operation_mode) = metadata.get("logic.operation_mode") {
+        settings.operation_mode = match operation_mode.as_str() {
+            "stream" => DsLogicOperationMode::Stream,
+            "internal_test" => DsLogicOperationMode::InternalTest,
+            _ => DsLogicOperationMode::Buffer,
+        };
+    }
     if let Some(sample_count) = recording_metadata_value::<u64>(metadata, "logic.sample_count") {
-        if (DSLOGIC_SAMPLE_ALIGNMENT..=DSLOGIC_MAX_SAMPLE_COUNT).contains(&sample_count) {
+        if (DSLOGIC_SAMPLE_ALIGNMENT..=settings.maximum_sample_count()).contains(&sample_count) {
             settings.sample_count = sample_count;
         }
     }
@@ -6348,13 +6496,6 @@ fn logic_settings_from_recording_metadata(
         {
             *enabled = recorded;
         }
-    }
-    if let Some(operation_mode) = metadata.get("logic.operation_mode") {
-        settings.operation_mode = match operation_mode.as_str() {
-            "stream" => DsLogicOperationMode::Stream,
-            "internal_test" => DsLogicOperationMode::InternalTest,
-            _ => DsLogicOperationMode::Buffer,
-        };
     }
     if let Some(stop_option) = metadata.get("logic.stop_option") {
         settings.stop_option = match stop_option.as_str() {
@@ -6531,6 +6672,9 @@ fn read_gui_recording(input: impl Read) -> Result<LoadedRecording, String> {
         scope_capacity: (scope_settings.sample_count as usize).min(MAX_WAVEFORM_SAMPLES),
         ..WaveformStore::default()
     };
+    if header.metadata.contains_key("logic.sample_count") {
+        waveforms.configure_logic_capture(logic_settings.sample_count, false);
+    }
     while let Some(event) = reader.read_event().map_err(|error| error.to_string())? {
         if let CaptureEvent::Frame(frame) = event {
             waveforms.ingest(&frame.payload, enabled_scope_channels);
@@ -6615,6 +6759,7 @@ fn start_capture(
     logic_config: DsLogicCaptureConfig,
     scope_config: DsCopeCaptureConfig,
     calibration_values: Option<DsCopeCalibrationValues>,
+    continuous_scope: bool,
 ) -> Result<StartedCapture, String> {
     let mut sources = Vec::<Box<dyn CaptureSource>>::with_capacity(devices.len());
     let mut scope_trigger_controls = Vec::new();
@@ -6640,6 +6785,11 @@ fn start_capture(
                 let source = match calibration_values {
                     Some(values) => source.with_calibration_values(values),
                     None => source,
+                };
+                let source = if continuous_scope {
+                    source.with_continuous_capture()
+                } else {
+                    source
                 };
                 let (source, calibration_control) = source.with_runtime_calibration_control();
                 sources.push(Box::new(source));
@@ -7430,20 +7580,36 @@ impl LogicTransitionBucket {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LogicSampleView<'a> {
+    samples: &'a VecDeque<LogicSampleBucket>,
+    sample_count: usize,
+    sample_stride: usize,
+}
+
 fn logic_waveform_points(
-    samples: &VecDeque<u32>,
+    sample_view: LogicSampleView<'_>,
     visible_range: Range<usize>,
     plot: Rect,
     viewport: WaveformViewport,
     levels: &[(f32, f32); LOGIC_CHANNEL_COUNT],
     enabled_channels: &[bool; LOGIC_CHANNEL_COUNT],
 ) -> [Vec<Pos2>; LOGIC_CHANNEL_COUNT] {
+    let LogicSampleView {
+        samples,
+        sample_count,
+        sample_stride,
+    } = sample_view;
     let mut points: [Vec<Pos2>; LOGIC_CHANNEL_COUNT] = std::array::from_fn(|_| Vec::new());
     let Some(first_index) = visible_range.clone().next() else {
         return points;
     };
-    let sample_count = samples.len();
-    let mut previous = samples[first_index];
+    let first_bucket_index = first_index / sample_stride;
+    let end_bucket_index = ((visible_range.end - 1) / sample_stride + 1).min(samples.len());
+    let Some(first_bucket) = samples.get(first_bucket_index) else {
+        return points;
+    };
+    let mut previous = first_bucket.first;
     let first_x = waveform_sample_x(plot, viewport, first_index as f32, sample_count);
     for channel in 0..LOGIC_CHANNEL_COUNT {
         if enabled_channels[channel] {
@@ -7464,26 +7630,60 @@ fn logic_waveform_points(
             mask | (u32::from(*enabled) << channel)
         });
     let mut buckets = [LogicTransitionBucket::default(); LOGIC_CHANNEL_COUNT];
-    for index in visible_range.clone().skip(1) {
-        let sample = samples[index];
-        let mut changed = (previous ^ sample) & enabled_mask;
-        if changed != 0 {
-            let x = waveform_sample_x(plot, viewport, index as f32, sample_count)
+    for (bucket_index, bucket) in samples
+        .iter()
+        .copied()
+        .enumerate()
+        .take(end_bucket_index)
+        .skip(first_bucket_index)
+    {
+        let bucket_start = bucket_index.saturating_mul(sample_stride);
+
+        let mut boundary_changes = (previous ^ bucket.first) & enabled_mask;
+        if boundary_changes != 0 {
+            let x = waveform_sample_x(plot, viewport, bucket_start as f32, sample_count)
                 .clamp(plot.left(), plot.right());
             let pixel = (x - plot.left()).floor() as i32;
-            while changed != 0 {
-                let channel = changed.trailing_zeros() as usize;
-                changed &= changed - 1;
-                let bucket = &mut buckets[channel];
-                if bucket.pixel != pixel {
+            while boundary_changes != 0 {
+                let channel = boundary_changes.trailing_zeros() as usize;
+                boundary_changes &= boundary_changes - 1;
+                let transition_bucket = &mut buckets[channel];
+                if transition_bucket.pixel != pixel {
                     let (high, low) = levels[channel];
-                    bucket.flush(&mut points[channel], plot, high, low);
-                    bucket.begin(pixel, previous & (1_u32 << channel) != 0);
+                    transition_bucket.flush(&mut points[channel], plot, high, low);
+                    transition_bucket.begin(pixel, previous & (1_u32 << channel) != 0);
                 }
-                bucket.record(x, sample & (1_u32 << channel) != 0);
+                transition_bucket.record(x, bucket.first & (1_u32 << channel) != 0);
             }
         }
-        previous = sample;
+
+        let mut activity = bucket.activity & enabled_mask;
+        if activity != 0 {
+            let activity_index = bucket_start
+                .saturating_add(bucket.sample_count as usize / 2)
+                .min(sample_count.saturating_sub(1));
+            let x = waveform_sample_x(plot, viewport, activity_index as f32, sample_count)
+                .clamp(plot.left(), plot.right());
+            let pixel = (x - plot.left()).floor() as i32;
+            while activity != 0 {
+                let channel = activity.trailing_zeros() as usize;
+                activity &= activity - 1;
+                let mask = 1_u32 << channel;
+                let starts_high = bucket.first & mask != 0;
+                let ends_high = bucket.last & mask != 0;
+                let transition_bucket = &mut buckets[channel];
+                if transition_bucket.pixel != pixel {
+                    let (high, low) = levels[channel];
+                    transition_bucket.flush(&mut points[channel], plot, high, low);
+                    transition_bucket.begin(pixel, starts_high);
+                }
+                if starts_high == ends_high {
+                    transition_bucket.record(x, !starts_high);
+                }
+                transition_bucket.record(x, ends_high);
+            }
+        }
+        previous = bucket.last;
     }
 
     let last_index = visible_range.end - 1;
@@ -7526,7 +7726,7 @@ fn paint_logic(
     let plot = plot_area;
     let (status_bar, time_ruler) = align_waveform_chrome(status_area, ruler_area, plot);
     paint_plot_grid(ui, plot);
-    let sample_count = waveforms.logic_samples.len();
+    let sample_count = waveforms.logic_sample_count;
     let display_sample_count = if sample_count == 0 {
         SAMPLE_COUNT as usize
     } else {
@@ -7561,7 +7761,11 @@ fn paint_logic(
     let visible_count = visible_range.len();
     let signal_layout = logic_signal_layout(plot.top(), plot.height(), &*maximum_heights);
     let mut waveform_points = logic_waveform_points(
-        &waveforms.logic_samples,
+        LogicSampleView {
+            samples: &waveforms.logic_samples,
+            sample_count,
+            sample_stride: waveforms.logic_sample_stride,
+        },
         visible_range.clone(),
         plot,
         *viewport,
@@ -10034,10 +10238,13 @@ mod tests {
 
     #[test]
     fn logic_capture_menu_offers_five_milliseconds_at_125_megahertz() {
-        let option = logic_capture_duration_options(125_000_000)
-            .into_iter()
-            .find(|(duration, _)| (*duration - 0.005).abs() < f64::EPSILON)
-            .expect("5 ms should be available");
+        let option = logic_capture_duration_options(LogicCaptureSettings {
+            sample_rate_hz: 125_000_000,
+            ..LogicCaptureSettings::default()
+        })
+        .into_iter()
+        .find(|(duration, _)| (*duration - 0.005).abs() < f64::EPSILON)
+        .expect("5 ms should be available");
 
         assert_eq!(option.1, 625_664);
         let settings = LogicCaptureSettings {
@@ -10061,6 +10268,38 @@ mod tests {
         assert_eq!(settings.sample_rate_hz, 250_000_000);
         assert_eq!(settings.sample_count, 1_250_304);
         assert_eq!(logic_capture_duration_label(settings), "5.00 ms");
+    }
+
+    #[test]
+    fn stream_duration_choices_do_not_shrink_at_high_sample_rates() {
+        let settings = LogicCaptureSettings {
+            sample_rate_hz: 1_000_000_000,
+            enabled_channels: [
+                true, true, true, false, false, false, false, false, false, false, false, false,
+                false, false, false, false,
+            ],
+            ..LogicCaptureSettings::default()
+        };
+
+        let ten_seconds = logic_capture_duration_options(settings)
+            .into_iter()
+            .find(|(duration, _)| (*duration - 10.0).abs() < f64::EPSILON)
+            .expect("10 s should remain available in stream mode");
+
+        assert_eq!(ten_seconds.1, 10_000_000_000);
+    }
+
+    #[test]
+    fn switching_to_buffer_mode_clamps_capture_to_hardware_depth() {
+        let mut settings = LogicCaptureSettings {
+            sample_rate_hz: 125_000_000,
+            sample_count: 1_250_000_128,
+            ..LogicCaptureSettings::default()
+        };
+
+        set_logic_operation_mode_preserving_duration(&mut settings, DsLogicOperationMode::Buffer);
+
+        assert_eq!(settings.sample_count, 134_217_728);
     }
 
     #[test]
@@ -10207,8 +10446,13 @@ mod tests {
         assert_eq!(loaded.capture.waveforms.logic_rate_hz, 2_000_000);
         assert_eq!(
             loaded.capture.waveforms.logic_samples,
-            VecDeque::from(vec![1, 2, 3])
+            VecDeque::from(vec![
+                LogicSampleBucket::new(1),
+                LogicSampleBucket::new(2),
+                LogicSampleBucket::new(3),
+            ])
         );
+        assert_eq!(loaded.capture.waveforms.logic_sample_count, 3);
         assert!(loaded.capture.waveforms.scope_channels[0].is_empty());
         assert_eq!(
             loaded.capture.waveforms.scope_channels[1],
@@ -10381,6 +10625,30 @@ mod tests {
     }
 
     #[test]
+    fn only_oscilloscope_run_uses_the_persistent_scope_source() {
+        assert!(uses_continuous_scope_source(
+            AcquisitionMode::Run,
+            CaptureTarget::Oscilloscope,
+        ));
+        assert!(!uses_continuous_scope_source(
+            AcquisitionMode::Single,
+            CaptureTarget::Oscilloscope,
+        ));
+        assert!(!uses_continuous_scope_source(
+            AcquisitionMode::Run,
+            CaptureTarget::Combined,
+        ));
+    }
+
+    #[test]
+    fn continuous_scope_sequences_identify_each_hardware_frame() {
+        assert!(is_scope_frame_start(0));
+        assert!(!is_scope_frame_start(1));
+        assert!(is_scope_frame_start(DSCOPE_FRAME_SEQUENCE_STRIDE));
+        assert!(!is_scope_frame_start(DSCOPE_FRAME_SEQUENCE_STRIDE + 1));
+    }
+
+    #[test]
     fn repetitive_interval_matches_original_stream_and_buffer_behavior() {
         assert_eq!(
             repetitive_interval(DsLogicOperationMode::Stream, 7.5),
@@ -10465,8 +10733,38 @@ mod tests {
         );
 
         assert_eq!(store.logic_samples.len(), MAX_WAVEFORM_SAMPLES);
-        assert_eq!(store.logic_samples.front(), Some(&10));
+        assert_eq!(
+            store.logic_samples.front(),
+            Some(&LogicSampleBucket::new(10))
+        );
+        assert_eq!(store.logic_sample_count, MAX_WAVEFORM_SAMPLES);
         assert_eq!(store.logic_sample_offset, 10);
+    }
+
+    #[test]
+    fn waveform_store_preserves_a_one_second_logic_domain_with_bounded_buckets() {
+        let mut store = WaveformStore::default();
+        store.configure_logic_capture(1_000_000_000, false);
+
+        assert_eq!(store.logic_capacity, MAX_WAVEFORM_SAMPLES);
+        assert_eq!(store.logic_sample_stride, 500);
+
+        let mut samples = vec![0_u32; 1_000];
+        samples[123] = 1;
+        store.ingest(
+            &CaptureBatch::Logic(LogicBatch {
+                sample_rate_hz: 1_000_000_000,
+                channel_count: 3,
+                samples,
+            }),
+            [true, true],
+        );
+
+        assert_eq!(store.logic_sample_count, 1_000);
+        assert_eq!(store.logic_samples.len(), 2);
+        assert_eq!(store.logic_samples[0].sample_count, 500);
+        assert_eq!(store.logic_samples[0].activity & 1, 1);
+        assert_eq!(store.logic_sample_offset, 0);
     }
 
     #[test]
@@ -11276,9 +11574,20 @@ mod tests {
         enabled_channels[0] = true;
         let levels = logic_signal_layout(plot.top(), plot.height(), &[1; LOGIC_CHANNEL_COUNT]);
 
+        let sample_count = samples.len();
+        let sample_stride = 500;
+        let buckets = samples
+            .make_contiguous()
+            .chunks(sample_stride)
+            .filter_map(LogicSampleBucket::from_samples)
+            .collect::<VecDeque<_>>();
         let points = logic_waveform_points(
-            &samples,
-            0..samples.len(),
+            LogicSampleView {
+                samples: &buckets,
+                sample_count,
+                sample_stride,
+            },
+            0..sample_count,
             plot,
             WaveformViewport::default(),
             &levels.levels,
