@@ -15,7 +15,7 @@ Keep hardware drivers independent of the UI. New device backends should implemen
 - `cargo clippy --workspace --all-targets -- -D warnings` — reject lint warnings.
 - `cargo build --workspace --release` — produce optimized binaries.
 
-Rust 1.75 or newer is required. Run commands from the workspace root.
+Rust 1.79 or newer is required. Run commands from the workspace root.
 
 ## Coding Style & Naming Conventions
 

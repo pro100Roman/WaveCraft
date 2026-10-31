@@ -65,7 +65,7 @@ simulators.
 
 ## Run the simulator
 
-Install Rust 1.76 or newer, then run:
+Install Rust 1.79 or newer, then run:
 
 ```sh
 cargo run -p dsview-cli -- 2
@@ -155,7 +155,7 @@ stability.
 
 ## Run the desktop application
 
-Install Rust 1.76 or newer and run these commands from the workspace root.
+Install Rust 1.79 or newer and run these commands from the workspace root.
 Build an unoptimized development executable with:
 
 ```sh
@@ -257,7 +257,7 @@ CLI and refuses to replace an existing file.
 The GUI uses native window backends on macOS and Windows and enables both
 Wayland and X11 on Linux. Vendored libusb keeps the USB transport consistent
 across the three platforms. CI builds and tests the workspace on macOS, Ubuntu,
-and Windows, with a separate Rust 1.76 compatibility check.
+and Windows, with a separate Rust 1.79 compatibility check.
 
 The USB transport also provides cancellable bulk-IN reads. It polls with a
 50 ms timeout, preserves partial transfers reported by libusb, retries timeout
