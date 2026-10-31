@@ -7020,6 +7020,152 @@ fn paint_logic_channel_marker(
     );
 }
 
+const MAX_LOGIC_TRANSITIONS_PER_PIXEL: usize = 4;
+
+#[derive(Clone, Copy, Debug)]
+struct LogicTransitionBucket {
+    pixel: i32,
+    start_high: bool,
+    end_high: bool,
+    transition_count: usize,
+    transition_x: [f32; MAX_LOGIC_TRANSITIONS_PER_PIXEL],
+}
+
+impl Default for LogicTransitionBucket {
+    fn default() -> Self {
+        Self {
+            pixel: -1,
+            start_high: false,
+            end_high: false,
+            transition_count: 0,
+            transition_x: [0.0; MAX_LOGIC_TRANSITIONS_PER_PIXEL],
+        }
+    }
+}
+
+impl LogicTransitionBucket {
+    fn begin(&mut self, pixel: i32, start_high: bool) {
+        self.pixel = pixel;
+        self.start_high = start_high;
+        self.end_high = start_high;
+        self.transition_count = 0;
+    }
+
+    fn record(&mut self, x: f32, end_high: bool) {
+        if self.transition_count < MAX_LOGIC_TRANSITIONS_PER_PIXEL {
+            self.transition_x[self.transition_count] = x;
+        }
+        self.transition_count += 1;
+        self.end_high = end_high;
+    }
+
+    fn flush(&mut self, points: &mut Vec<Pos2>, plot: Rect, high: f32, low: f32) {
+        if self.transition_count == 0 {
+            return;
+        }
+        let y = |is_high| if is_high { high } else { low };
+        if self.transition_count <= MAX_LOGIC_TRANSITIONS_PER_PIXEL {
+            let mut is_high = self.start_high;
+            for x in self
+                .transition_x
+                .iter()
+                .copied()
+                .take(self.transition_count)
+            {
+                points.push(Pos2::new(x, y(is_high)));
+                is_high = !is_high;
+                points.push(Pos2::new(x, y(is_high)));
+            }
+        } else {
+            // Once several edges occupy the same screen pixel, their exact
+            // spacing is no longer visible. Draw an activity stroke instead
+            // of dropping the entire bucket and aliasing the signal.
+            let x = (plot.left() + self.pixel as f32 + 0.5).clamp(plot.left(), plot.right());
+            points.push(Pos2::new(x, y(self.start_high)));
+            points.push(Pos2::new(x, y(!self.start_high)));
+            if self.end_high == self.start_high {
+                points.push(Pos2::new(x, y(self.end_high)));
+            }
+        }
+        self.transition_count = 0;
+        self.pixel = -1;
+    }
+}
+
+fn logic_waveform_points(
+    samples: &VecDeque<u32>,
+    visible_range: Range<usize>,
+    plot: Rect,
+    viewport: WaveformViewport,
+    levels: &[(f32, f32); LOGIC_CHANNEL_COUNT],
+    enabled_channels: &[bool; LOGIC_CHANNEL_COUNT],
+) -> [Vec<Pos2>; LOGIC_CHANNEL_COUNT] {
+    let mut points: [Vec<Pos2>; LOGIC_CHANNEL_COUNT] = std::array::from_fn(|_| Vec::new());
+    let Some(first_index) = visible_range.clone().next() else {
+        return points;
+    };
+    let sample_count = samples.len();
+    let mut previous = samples[first_index];
+    let first_x = waveform_sample_x(plot, viewport, first_index as f32, sample_count);
+    for channel in 0..LOGIC_CHANNEL_COUNT {
+        if enabled_channels[channel] {
+            let (high, low) = levels[channel];
+            let y = if previous & (1_u32 << channel) != 0 {
+                high
+            } else {
+                low
+            };
+            points[channel].push(Pos2::new(first_x, y));
+        }
+    }
+
+    let enabled_mask = enabled_channels
+        .iter()
+        .enumerate()
+        .fold(0_u32, |mask, (channel, enabled)| {
+            mask | (u32::from(*enabled) << channel)
+        });
+    let mut buckets = [LogicTransitionBucket::default(); LOGIC_CHANNEL_COUNT];
+    for index in visible_range.clone().skip(1) {
+        let sample = samples[index];
+        let mut changed = (previous ^ sample) & enabled_mask;
+        if changed != 0 {
+            let x = waveform_sample_x(plot, viewport, index as f32, sample_count)
+                .clamp(plot.left(), plot.right());
+            let pixel = (x - plot.left()).floor() as i32;
+            while changed != 0 {
+                let channel = changed.trailing_zeros() as usize;
+                changed &= changed - 1;
+                let bucket = &mut buckets[channel];
+                if bucket.pixel != pixel {
+                    let (high, low) = levels[channel];
+                    bucket.flush(&mut points[channel], plot, high, low);
+                    bucket.begin(pixel, previous & (1_u32 << channel) != 0);
+                }
+                bucket.record(x, sample & (1_u32 << channel) != 0);
+            }
+        }
+        previous = sample;
+    }
+
+    let last_index = visible_range.end - 1;
+    let last_x = waveform_sample_x(plot, viewport, last_index as f32, sample_count);
+    for channel in 0..LOGIC_CHANNEL_COUNT {
+        if !enabled_channels[channel] {
+            continue;
+        }
+        let (high, low) = levels[channel];
+        buckets[channel].flush(&mut points[channel], plot, high, low);
+        let y = if previous & (1_u32 << channel) != 0 {
+            high
+        } else {
+            low
+        };
+        points[channel].push(Pos2::new(last_x, y));
+    }
+    points
+}
+
 fn paint_logic(
     ui: &egui::Ui,
     rect: Rect,
@@ -7075,10 +7221,15 @@ fn paint_logic(
     }
     let visible_range = viewport.sample_range(sample_count);
     let visible_count = visible_range.len();
-    let step = (visible_count as f32 / plot.width().max(1.0))
-        .floor()
-        .max(1.0) as usize;
     let signal_layout = logic_signal_layout(plot.top(), plot.height(), &*maximum_heights);
+    let mut waveform_points = logic_waveform_points(
+        &waveforms.logic_samples,
+        visible_range.clone(),
+        plot,
+        *viewport,
+        &signal_layout.levels,
+        enabled_channels,
+    );
     let marker_lane_height = signal_layout.base_height * LOGIC_SIGNAL_DEFAULT_STEPS_PER_LANE as f32;
     for channel in 0..LOGIC_CHANNEL_COUNT {
         if !enabled_channels[channel] {
@@ -7089,7 +7240,7 @@ fn paint_logic(
         let channel_name = &mut channel_names[channel];
         let channel_label = channel_label("D", channel, channel_name);
         let marker_text = logic_channel_marker_text(channel, channel_name);
-        let (high, low) = signal_layout.levels[channel];
+        let (_, low) = signal_layout.levels[channel];
         paint_logic_zero_reference(painter, plot, low, *channel_color);
         let marker_rect = logic_channel_marker_rect(plot, low, marker_lane_height, &marker_text);
         let marker_response = ui
@@ -7191,22 +7342,7 @@ fn paint_logic(
         );
 
         if visible_count != 0 {
-            let mut points = Vec::new();
-            let mut previous_y = None;
-            for index in visible_range.clone().step_by(step) {
-                let sample = waveforms.logic_samples[index];
-                let y = if sample & (1_u32 << channel) != 0 {
-                    high
-                } else {
-                    low
-                };
-                let x = waveform_sample_x(plot, *viewport, index as f32, sample_count);
-                if let Some(previous_y) = previous_y {
-                    points.push(Pos2::new(x, previous_y));
-                }
-                points.push(Pos2::new(x, y));
-                previous_y = Some(y);
-            }
+            let points = std::mem::take(&mut waveform_points[channel]);
             if points.len() > 1 {
                 painter.add(egui::Shape::line(
                     points,
@@ -10701,6 +10837,42 @@ mod tests {
         assert_eq!(logic_channel_marker_text(3, ""), "3");
         assert_eq!(logic_channel_marker_text(3, "  CLOCK  "), "CLOCK");
         assert_eq!(logic_channel_marker_text(3, "DATA-LONG-NAME"), "DATA-LON");
+    }
+
+    #[test]
+    fn logic_decimation_preserves_one_kilohertz_pulses_across_a_one_second_span() {
+        let mut samples = VecDeque::from(vec![0_u32; 1_000_000]);
+        for pulse in 0..1_000 {
+            let start = pulse * 1_000 + 100;
+            for sample in samples.range_mut(start..start + 20) {
+                *sample = 1;
+            }
+        }
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_000.0, 320.0));
+        let mut enabled_channels = [false; LOGIC_CHANNEL_COUNT];
+        enabled_channels[0] = true;
+        let levels = logic_signal_layout(plot.top(), plot.height(), &[1; LOGIC_CHANNEL_COUNT]);
+
+        let points = logic_waveform_points(
+            &samples,
+            0..samples.len(),
+            plot,
+            WaveformViewport::default(),
+            &levels.levels,
+            &enabled_channels,
+        );
+        let (high, low) = levels.levels[0];
+        let pulses_in_first_200_ms = points[0]
+            .windows(2)
+            .filter(|edge| {
+                edge[0].x < 200.0
+                    && (edge[0].x - edge[1].x).abs() < f32::EPSILON
+                    && edge[0].y == low
+                    && edge[1].y == high
+            })
+            .count();
+
+        assert_eq!(pulses_in_first_200_ms, 200);
     }
 
     #[test]
