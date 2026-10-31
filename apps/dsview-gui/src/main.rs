@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod measurements;
+mod protocol_analyzer;
 
 use dsview_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSession, CaptureSource,
@@ -27,6 +28,10 @@ use image::ImageFormat;
 use measurements::{
     calculate_scope_measurements, ScopeMeasurementResults, ScopeMeasurementSettings,
     SCOPE_MEASUREMENT_KINDS,
+};
+use protocol_analyzer::{
+    matching_protocols, protocol_by_id, protocol_channels, protocol_stack,
+    ProtocolAnalyzerSettings, ProtocolDataFormat, PROTOCOLS,
 };
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -1860,7 +1865,7 @@ impl WaveformViewport {
 
     fn move_screen_anchor(&mut self, old_fraction: f32, new_fraction: f32) {
         let sample_anchor = self.start + old_fraction.clamp(0.0, 1.0) * self.span;
-        self.start = sample_anchor - new_fraction.clamp(0.0, 1.0) * self.span;
+        self.start = self.clamp_start(sample_anchor - new_fraction.clamp(0.0, 1.0) * self.span);
         self.anchor_locked = true;
     }
 
@@ -1870,7 +1875,8 @@ impl WaveformViewport {
     }
 
     fn align_trigger_to_screen(&mut self, sample_fraction: f32, screen_fraction: f32) {
-        self.start = sample_fraction - screen_fraction.clamp(0.0, 1.0) * self.span;
+        self.start =
+            self.clamp_start(sample_fraction - screen_fraction.clamp(0.0, 1.0) * self.span);
     }
 
     fn clamp_start(self, start: f32) -> f32 {
@@ -1911,11 +1917,12 @@ impl WaveformViewport {
         };
         let full_duration = sample_count as f64 / sample_rate_hz as f64;
         let minimum_span = (1.0 / sample_count as f64).min(1.0);
-        let maximum_span = TIMEBASE_STEPS_SECONDS[TIMEBASE_STEPS_SECONDS.len() - 1]
-            * SCOPE_HORIZONTAL_DIVISIONS as f64
-            / full_duration;
-        self.span = (timebase * SCOPE_HORIZONTAL_DIVISIONS as f64 / full_duration)
-            .clamp(minimum_span, maximum_span.max(minimum_span)) as f32;
+        let new_span = (timebase * SCOPE_HORIZONTAL_DIVISIONS as f64 / full_duration)
+            .clamp(minimum_span, 1.0) as f32;
+        if (new_span - self.span).abs() <= f32::EPSILON {
+            return false;
+        }
+        self.span = new_span;
         self.align_sample_to_screen(sample_fraction, screen_fraction);
         self.anchor_locked = true;
         true
@@ -1973,7 +1980,7 @@ fn apply_time_per_division(
     let new_span =
         (time_per_division_seconds * SCOPE_HORIZONTAL_DIVISIONS as f64 * sample_rate_hz as f64
             / sample_count as f64)
-            .max(1.0 / sample_count as f64) as f32;
+            .clamp(1.0 / sample_count as f64, 1.0) as f32;
     if (new_span - viewport.span).abs() <= f32::EPSILON {
         return;
     }
@@ -2245,6 +2252,7 @@ struct DsViewApp {
     logic_channel_marker_opacities: [u8; LOGIC_CHANNEL_COUNT],
     logic_channel_settings_drafts: [LogicChannelSettingsDraft; LOGIC_CHANNEL_COUNT],
     logic_marker_settings: LogicMarkerSettings,
+    protocol_analyzer: ProtocolAnalyzerSettings,
     scope_channel_colors: [Color32; 2],
     logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
     scope_channel_names: [String; 2],
@@ -2306,6 +2314,7 @@ impl DsViewApp {
             logic_channel_marker_opacities: default_logic_channel_marker_opacities(),
             logic_channel_settings_drafts: default_logic_channel_settings_drafts(),
             logic_marker_settings: LogicMarkerSettings::default(),
+            protocol_analyzer: ProtocolAnalyzerSettings::default(),
             scope_channel_colors: SCOPE_COLORS,
             logic_channel_names: empty_logic_channel_names(),
             scope_channel_names: empty_scope_channel_names(),
@@ -4501,6 +4510,7 @@ struct LogicCaptureSettingsEditor<'a> {
     acquisition_mode: &'a mut AcquisitionMode,
     repetitive_interval_seconds: &'a mut f32,
     marker_settings: &'a mut LogicMarkerSettings,
+    protocol_analyzer: &'a mut ProtocolAnalyzerSettings,
     displayed_sample_count: usize,
     displayed_sample_rate_hz: u64,
 }
@@ -4525,6 +4535,7 @@ fn paint_capture_settings(
         acquisition_mode: logic_acquisition_mode,
         repetitive_interval_seconds,
         marker_settings: logic_marker_settings,
+        protocol_analyzer,
         displayed_sample_count: displayed_logic_sample_count,
         displayed_sample_rate_hz: displayed_logic_sample_rate_hz,
     } = logic_editor;
@@ -4934,6 +4945,12 @@ fn paint_capture_settings(
                         displayed_logic_sample_count,
                         displayed_logic_sample_rate_hz,
                     );
+                    ui.add_space(8.0);
+                    paint_protocol_analyzer_settings(
+                        ui,
+                        protocol_analyzer,
+                        &logic_settings.enabled_channels,
+                    );
                 }
                 CaptureSettingsTab::DsCope => {
                     let maximum_sample_rate_hz = scope_settings.maximum_sample_rate_hz();
@@ -5195,6 +5212,351 @@ fn paint_logic_marker_settings(
                 settings.markers.remove(index);
             }
         });
+}
+
+fn paint_protocol_analyzer_settings(
+    ui: &mut egui::Ui,
+    settings: &mut ProtocolAnalyzerSettings,
+    enabled_channels: &[bool; LOGIC_CHANNEL_COUNT],
+) {
+    let heading = format!("Protocol analyzer ({})", settings.analyzers.len());
+    egui::CollapsingHeader::new(RichText::new(heading).strong())
+        .id_salt("logic_protocol_analyzer_section")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let add_label = if settings.picker_open {
+                    "Close list"
+                } else {
+                    "+ Add protocol"
+                };
+                if ui.button(add_label).clicked() {
+                    settings.picker_open = !settings.picker_open;
+                }
+                if !settings.analyzers.is_empty()
+                    && ui
+                        .small_button("Clear")
+                        .on_hover_text("Remove all protocol analyzers")
+                        .clicked()
+                {
+                    settings.clear();
+                }
+            });
+
+            if settings.picker_open {
+                ui.add_space(5.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut settings.search)
+                        .desired_width(ui.available_width())
+                        .hint_text(format!("Search {} protocols…", PROTOCOLS.len())),
+                );
+                let protocols = matching_protocols(&settings.search);
+                ui.small(RichText::new(format!("{} matches", protocols.len())).color(TEXT_MUTED));
+                let mut selected_protocol = None;
+                egui::Frame::none()
+                    .fill(PANEL)
+                    .rounding(egui::Rounding::same(4.0))
+                    .inner_margin(egui::Margin::same(4.0))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("protocol_catalog_scroll")
+                            .max_height(210.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                for protocol in protocols {
+                                    let response = ui
+                                        .selectable_label(false, protocol.name)
+                                        .on_hover_text(format!(
+                                            "{}\nDecoder ID: {}",
+                                            protocol.long_name, protocol.id
+                                        ));
+                                    if response.clicked() {
+                                        selected_protocol = Some(protocol.id);
+                                    }
+                                }
+                            });
+                    });
+                if let Some(protocol_id) = selected_protocol {
+                    settings.begin_add(protocol_id);
+                }
+            }
+
+            if settings.analyzers.is_empty() {
+                ui.add_space(4.0);
+                ui.small(RichText::new("No protocols configured").color(TEXT_MUTED));
+                return;
+            }
+
+            let mut remove = None;
+            let mut edit = None;
+            for (analyzer_index, analyzer) in settings.analyzers.iter().enumerate() {
+                let definition = protocol_by_id(analyzer.protocol_id)
+                    .expect("configured protocol should remain in the catalog");
+                let stack =
+                    protocol_stack(analyzer.protocol_id).unwrap_or_else(|| vec![definition]);
+                let base = stack[0];
+                let channels = protocol_channels(base.id);
+                let assigned_channels = analyzer
+                    .channel_mappings
+                    .iter()
+                    .filter(|mapping| mapping.is_some())
+                    .count();
+                let missing_required = channels.iter().enumerate().any(|(index, channel)| {
+                    channel.required
+                        && analyzer
+                            .channel_mappings
+                            .get(index)
+                            .copied()
+                            .flatten()
+                            .is_none()
+                });
+                let disabled_mapping = analyzer.channel_mappings.iter().any(|mapping| {
+                    mapping
+                        .map(|channel| !enabled_channels[channel])
+                        .unwrap_or(false)
+                });
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(PANEL)
+                    .rounding(egui::Rounding::same(4.0))
+                    .inner_margin(egui::Margin::same(6.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.small(RichText::new(definition.long_name).color(TEXT_MUTED));
+                                ui.label(RichText::new(definition.name).strong());
+                                ui.small(
+                                    RichText::new(format!(
+                                        "{} · {assigned_channels}/{} inputs",
+                                        analyzer.data_format.label(),
+                                        channels.len()
+                                    ))
+                                    .color(TEXT_MUTED),
+                                );
+                                if missing_required {
+                                    ui.small(
+                                        RichText::new("Assign every required input")
+                                            .color(Color32::LIGHT_RED),
+                                    );
+                                } else if disabled_mapping {
+                                    ui.small(
+                                        RichText::new(
+                                            "One or more mapped capture channels are disabled",
+                                        )
+                                        .color(Color32::YELLOW),
+                                    );
+                                }
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("×").on_hover_text("Remove").clicked() {
+                                        remove = Some(analyzer_index);
+                                    }
+                                    if ui.small_button("Edit…").clicked() {
+                                        edit = Some(analyzer_index);
+                                    }
+                                },
+                            );
+                        })
+                        .response
+                        .on_hover_text(format!(
+                            "Decoder chain: {}",
+                            stack
+                                .iter()
+                                .map(|decoder| decoder.name)
+                                .collect::<Vec<_>>()
+                                .join(" → ")
+                        ));
+                    });
+            }
+            if let Some(index) = remove {
+                settings.analyzers.remove(index);
+            } else if let Some(index) = edit {
+                settings.begin_edit(index);
+            }
+        });
+}
+
+fn paint_protocol_analyzer_modal(
+    context: &egui::Context,
+    settings: &mut ProtocolAnalyzerSettings,
+    logic_channel_names: &[String; LOGIC_CHANNEL_COUNT],
+    enabled_channels: &[bool; LOGIC_CHANNEL_COUNT],
+) {
+    let Some(mut editor) = settings.editor.clone() else {
+        return;
+    };
+    let definition = protocol_by_id(editor.analyzer.protocol_id)
+        .expect("configured protocol should remain in the catalog");
+    let stack = protocol_stack(editor.analyzer.protocol_id).unwrap_or_else(|| vec![definition]);
+    let channels = protocol_channels(stack[0].id);
+    editor
+        .analyzer
+        .channel_mappings
+        .resize(channels.len(), None);
+
+    let screen_rect = context.input(|input| input.screen_rect());
+    egui::Area::new(egui::Id::new("protocol_settings_modal_backdrop"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen_rect.min)
+        .show(context, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen_rect.size(), Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(rect, egui::Rounding::ZERO, Color32::from_black_alpha(112));
+        });
+
+    let mut open = true;
+    let mut cancel = false;
+    let mut save = false;
+    let title = if editor.target_index.is_some() {
+        "Protocol settings"
+    } else {
+        "Add protocol"
+    };
+    egui::Window::new(title)
+        .id(egui::Id::new("protocol_settings_modal"))
+        .open(&mut open)
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(true)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .default_width(440.0)
+        .min_width(380.0)
+        .show(context, |ui| {
+            ui.label(RichText::new(definition.name).strong().color(ACCENT));
+            ui.label(RichText::new(definition.long_name).color(TEXT_MUTED));
+            if stack.len() > 1 {
+                ui.small(
+                    RichText::new(format!(
+                        "Decoder chain: {}",
+                        stack
+                            .iter()
+                            .map(|decoder| decoder.name)
+                            .collect::<Vec<_>>()
+                            .join(" → ")
+                    ))
+                    .color(TEXT_MUTED),
+                );
+            }
+            ui.add_space(10.0);
+
+            let maximum_height = (screen_rect.height() * 0.62).max(220.0);
+            egui::ScrollArea::vertical()
+                .id_salt("protocol_settings_modal_scroll")
+                .max_height(maximum_height)
+                .show(ui, |ui| {
+                    egui::Grid::new("protocol_settings_modal_grid")
+                        .num_columns(2)
+                        .min_col_width(120.0)
+                        .spacing([16.0, 7.0])
+                        .show(ui, |ui| {
+                            ui.label("Output format");
+                            egui::ComboBox::from_id_salt("protocol_modal_format")
+                                .width(210.0)
+                                .selected_text(editor.analyzer.data_format.label())
+                                .show_ui(ui, |ui| {
+                                    for format in ProtocolDataFormat::ALL {
+                                        ui.selectable_value(
+                                            &mut editor.analyzer.data_format,
+                                            format,
+                                            format.label(),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+
+                            for (channel_index, channel) in channels.iter().enumerate() {
+                                let label = if channel.required {
+                                    format!("{} *", channel.name)
+                                } else {
+                                    channel.name.to_owned()
+                                };
+                                ui.label(label).on_hover_text(if channel.required {
+                                    "Required decoder input"
+                                } else {
+                                    "Optional decoder input"
+                                });
+                                let selected_text = editor.analyzer.channel_mappings[channel_index]
+                                    .map(|logic_channel| {
+                                        channel_label(
+                                            "D",
+                                            logic_channel,
+                                            &logic_channel_names[logic_channel],
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "Not assigned".to_owned());
+                                egui::ComboBox::from_id_salt((
+                                    "protocol_modal_channel",
+                                    channel_index,
+                                ))
+                                .width(210.0)
+                                .selected_text(selected_text)
+                                .show_ui(ui, |ui| {
+                                    if !channel.required {
+                                        ui.selectable_value(
+                                            &mut editor.analyzer.channel_mappings[channel_index],
+                                            None,
+                                            "Not assigned",
+                                        );
+                                    }
+                                    for (logic_channel, channel_name) in
+                                        logic_channel_names.iter().enumerate()
+                                    {
+                                        ui.selectable_value(
+                                            &mut editor.analyzer.channel_mappings[channel_index],
+                                            Some(logic_channel),
+                                            channel_label("D", logic_channel, channel_name),
+                                        );
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                });
+
+            let missing_required = channels.iter().enumerate().any(|(index, channel)| {
+                channel.required && editor.analyzer.channel_mappings[index].is_none()
+            });
+            let disabled_mapping = editor.analyzer.channel_mappings.iter().any(|mapping| {
+                mapping
+                    .map(|channel| !enabled_channels[channel])
+                    .unwrap_or(false)
+            });
+            ui.add_space(8.0);
+            if missing_required {
+                ui.label(
+                    RichText::new("Assign every required input before saving")
+                        .color(Color32::LIGHT_RED),
+                );
+            } else if disabled_mapping {
+                ui.label(
+                    RichText::new("One or more mapped capture channels are disabled")
+                        .color(Color32::YELLOW),
+                );
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                if ui
+                    .add_enabled(!missing_required, egui::Button::new("Save"))
+                    .clicked()
+                {
+                    save = true;
+                }
+            });
+        });
+
+    if save {
+        settings.save_editor(editor);
+    } else if cancel || !open {
+        settings.cancel_editor();
+    } else {
+        settings.editor = Some(editor);
+    }
 }
 
 fn paint_logic_marker_color_picker(ui: &mut egui::Ui, index: usize, color: &mut Color32) {
@@ -5767,6 +6129,7 @@ impl eframe::App for DsViewApp {
                                     repetitive_interval_seconds: &mut self
                                         .repetitive_interval_seconds,
                                     marker_settings: &mut self.logic_marker_settings,
+                                    protocol_analyzer: &mut self.protocol_analyzer,
                                     displayed_sample_count: displayed_logic_sample_count,
                                     displayed_sample_rate_hz: displayed_logic_sample_rate_hz,
                                 },
@@ -5790,6 +6153,13 @@ impl eframe::App for DsViewApp {
                         }
                     });
             });
+
+        paint_protocol_analyzer_modal(
+            context,
+            &mut self.protocol_analyzer,
+            &self.logic_channel_names,
+            &self.logic_settings.enabled_channels,
+        );
 
         if self.logic_acquisition_mode == AcquisitionMode::Loop
             && self.logic_settings.operation_mode != DsLogicOperationMode::Stream
@@ -11108,6 +11478,44 @@ mod tests {
     }
 
     #[test]
+    fn protocol_analyzer_panel_renders_catalog_and_channel_mapping() {
+        let context = egui::Context::default();
+        let mut settings = ProtocolAnalyzerSettings::default();
+        settings.picker_open = true;
+        settings.search = "SPI flash".to_owned();
+        assert!(settings.begin_add("spiflash"));
+        let editor = settings.editor.clone().unwrap();
+        settings.save_editor(editor);
+        let enabled = [true; LOGIC_CHANNEL_COUNT];
+
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_protocol_analyzer_settings(ui, &mut settings, &enabled);
+            });
+        });
+
+        assert!(!output.shapes.is_empty());
+        assert_eq!(settings.analyzers[0].channel_mappings.len(), 4);
+    }
+
+    #[test]
+    fn protocol_settings_modal_renders_without_committing_the_draft() {
+        let context = egui::Context::default();
+        let mut settings = ProtocolAnalyzerSettings::default();
+        assert!(settings.begin_add("i2cdemux"));
+        let names = empty_logic_channel_names();
+        let enabled = [true; LOGIC_CHANNEL_COUNT];
+
+        let output = context.run(egui::RawInput::default(), |context| {
+            paint_protocol_analyzer_modal(context, &mut settings, &names, &enabled);
+        });
+
+        assert!(!output.shapes.is_empty());
+        assert!(settings.editor.is_some());
+        assert!(settings.analyzers.is_empty());
+    }
+
+    #[test]
     fn logic_capture_menu_offers_five_milliseconds_at_125_megahertz() {
         let option = logic_capture_duration_options(LogicCaptureSettings {
             sample_rate_hz: 125_000_000,
@@ -12669,6 +13077,7 @@ mod tests {
         viewport.step_timebase(1.0, 1_000_000, 1_000_000, 0.75);
 
         viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.75);
+        assert!(!viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.25));
 
         assert_eq!(viewport.start, 0.0);
         assert_eq!(viewport.span, 1.0);
@@ -12677,7 +13086,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_timebase_does_not_change_with_capture_length() {
+    fn scope_timebase_fits_when_selected_window_is_wider_than_the_capture() {
         let mut viewport = WaveformViewport {
             start: 0.25,
             span: 0.5,
@@ -12687,10 +13096,11 @@ mod tests {
 
         apply_time_per_division(&mut viewport, 250_000, 1_000_000, selected_timebase);
 
-        assert!((viewport.span - 2.0).abs() < f32::EPSILON);
+        assert_eq!(viewport.start, 0.0);
+        assert_eq!(viewport.span, 1.0);
         assert!(
-            (viewport.time_per_division(250_000, 1_000_000).unwrap() - selected_timebase).abs()
-                < f64::EPSILON
+            (viewport.time_per_division(250_000, 1_000_000).unwrap() - 0.025).abs() < f64::EPSILON,
+            "fit-to-capture should replace a wider persisted timebase"
         );
     }
 
@@ -12772,11 +13182,16 @@ mod tests {
         );
 
         let mut viewport = WaveformViewport::default();
-        for _ in 0..6 {
-            viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.5);
-        }
-        assert!((viewport.time_per_division(1_000_000, 1_000_000).unwrap() - 10.0).abs() < 0.001);
-        assert!((viewport.span - 100.0).abs() < 0.001);
+        assert!(!viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.5));
+        assert!(viewport.step_timebase(1.0, 1_000_000, 1_000_000, 0.5));
+        assert_eq!(viewport.time_per_division(1_000_000, 1_000_000), Some(0.05));
+        assert!(viewport.step_timebase(1.0, 1_000_000, 1_000_000, 0.5));
+        assert!(
+            (viewport.time_per_division(1_000_000, 1_000_000).unwrap() - 0.02).abs() < 0.000_001
+        );
+        assert!(viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.5));
+        assert!(viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.5));
+        assert_eq!(viewport.span, 1.0);
         assert_eq!(viewport.sample_range(1_000_000), 0..1_000_000);
         assert!(!viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.5));
     }
@@ -13272,8 +13687,9 @@ mod tests {
 
         let mut full_span = WaveformViewport::default();
         full_span.align_trigger_to_screen(0.75, 0.5);
-        assert!((full_span.start - 0.25).abs() < f32::EPSILON);
-        assert!(((0.75 - full_span.start) / full_span.span - 0.5).abs() < f32::EPSILON);
+        assert_eq!(full_span.start, 0.0);
+        assert_eq!(full_span.span, 1.0);
+        assert!(((0.75 - full_span.start) / full_span.span - 0.75).abs() < f32::EPSILON);
 
         let mut hardware_anchored = WaveformViewport {
             start: 0.25,
