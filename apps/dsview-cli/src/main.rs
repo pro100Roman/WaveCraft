@@ -133,15 +133,18 @@ fn capture_usb(resource_directory: &Path, output: Option<&Path>) -> Result<(), B
     const SAMPLE_COUNT: u64 = 1_000_000;
     const CAPTURE_TIMEOUT: Duration = Duration::from_secs(11);
 
-    let logic_config = DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)?;
+    let logic_config = DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)?
+        .with_operation_mode(dsview_usb::DsLogicOperationMode::Stream);
     let scope_config = DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)?;
     let report = discover_supported_devices()?;
     let logic_device = report
         .devices
         .iter()
-        .find(|device| device.profile.model == DeviceModel::DsLogicU3Pro16)
+        .find(|device| {
+            device.profile.model.is_logic_analyzer() && device.profile.model.supports_capture()
+        })
         .cloned()
-        .ok_or("no DSLogic U3Pro16 detected")?;
+        .ok_or("no supported DSLogic analyzer detected")?;
     let scope_device = report
         .devices
         .iter()
@@ -504,13 +507,16 @@ fn capture_logic(
     let sample_count = SAMPLE_RATE_HZ
         .checked_mul(seconds)
         .ok_or("capture duration is too large")?;
-    let config = DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, sample_count)?;
+    let config = DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, sample_count)?
+        .with_operation_mode(dsview_usb::DsLogicOperationMode::Stream);
     let report = discover_supported_devices()?;
     let device = report
         .devices
         .into_iter()
-        .find(|device| device.profile.model == DeviceModel::DsLogicU3Pro16)
-        .ok_or("no DSLogic U3Pro16 detected")?;
+        .find(|device| {
+            device.profile.model.is_logic_analyzer() && device.profile.model.supports_capture()
+        })
+        .ok_or("no supported DSLogic analyzer detected")?;
 
     let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
     let prepared = prepare_device(&device, &bitstream_path)?;
@@ -756,11 +762,16 @@ fn list_devices() -> Result<(), Box<dyn Error>> {
     }
     for device in report.devices {
         println!(
-            "{}: {} at {} ({})",
+            "{}: {} at {} ({}, {})",
             device.location.stable_id(),
             device.profile.display_name,
             device.location.platform_path,
-            device.speed.description()
+            device.speed.description(),
+            if device.profile.model.supports_capture() {
+                "acquisition available"
+            } else {
+                "discovery/probe/preparation available"
+            }
         );
         match device.link_status() {
             LinkStatus::Optimal => {}

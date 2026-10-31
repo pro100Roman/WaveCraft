@@ -38,6 +38,15 @@ const REQUIRED_HDL_VERSION: u8 = 0x0e;
 const CONTROL_REGISTER_ZERO: u16 = 0x70;
 const ANALOG_CONTROL_REGISTER: u16 = 0x48;
 const THRESHOLD_REGISTER: u16 = 0x78;
+const SECURITY_CONTROL_REGISTER: u16 = 0x73;
+const SECURITY_DATA_REGISTER: u16 = 0x75;
+const SECURITY_EEPROM_ADDRESS: u16 = 0x3c00;
+const SECURITY_STEPS: usize = 8;
+const SECURITY_READY_MASK: u8 = 1 << 3;
+const SECURITY_PASS_MASK: u8 = 1 << 4;
+const SECURITY_START: u16 = 0x0513;
+const SECURITY_CHECK: u16 = 0x0219;
+const SECURITY_READY_ATTEMPTS: usize = 8;
 const HDL_VERSION_OFFSET: usize = 4;
 const MAX_CONTROL_WRITE_DATA: usize = 60;
 const MAX_BITSTREAM_SIZE: usize = 0x00ff_ffff;
@@ -57,8 +66,9 @@ const WORD_WIDTH_WIDE: u8 = 1;
 const FORCE_READY: u8 = 1 << 1;
 const FORCE_STOP: u8 = 1 << 2;
 
-fn dslogic_threshold_code(threshold_mv: u16) -> u8 {
-    ((u32::from(threshold_mv) * 153) / 3_300).min(255) as u8
+fn dslogic_threshold_code(threshold_mv: u16, max_2v5: bool) -> u8 {
+    let numerator = if max_2v5 { 128 } else { 153 };
+    ((u32::from(threshold_mv) * numerator) / 3_300).min(255) as u8
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -421,6 +431,14 @@ impl UsbDeviceSession {
     }
 
     pub(crate) fn arm_capture(&self, settings: &[u8]) -> Result<(), UsbError> {
+        self.arm_capture_extended(settings, None)
+    }
+
+    pub(crate) fn arm_capture_extended(
+        &self,
+        settings: &[u8],
+        extended_settings: Option<&[u8]>,
+    ) -> Result<(), UsbError> {
         if settings.is_empty() || settings.len() % 2 != 0 {
             return Err(UsbError::new(
                 "capture settings must contain a non-empty number of 16-bit words",
@@ -444,6 +462,14 @@ impl UsbDeviceSession {
         )?;
         self.wait_for_status("capture engine reset", |status| status.system_cleared)?;
         self.write_bulk_exact(settings, "write capture settings")?;
+        if let Some(extended_settings) = extended_settings {
+            if extended_settings.is_empty() || extended_settings.len() % 2 != 0 {
+                return Err(UsbError::new(
+                    "extended capture settings must contain a non-empty number of 16-bit words",
+                ));
+            }
+            self.write_bulk_exact(extended_settings, "write extended capture settings")?;
+        }
         self.write_control(INTERRUPT_READY_DESTINATION, 0, &[INTERRUPT_READY_HIGH])?;
         self.wait_for_status("capture settings transfer", |status| status.gpif_done)?;
         Ok(())
@@ -475,14 +501,20 @@ impl UsbDeviceSession {
         Ok(u32::from_le_bytes(progress))
     }
 
-    pub(crate) fn initialize_dslogic_frontend(&self, threshold_mv: u16) -> Result<(), UsbError> {
-        // Match DSLogic's U3Pro16 VTH conversion: VTH / 3.3 * (1.5 / 2.5) * 255.
-        let threshold_code = dslogic_threshold_code(threshold_mv);
+    pub(crate) fn initialize_dslogic_frontend(
+        &self,
+        model: crate::DeviceModel,
+        threshold_mv: u16,
+    ) -> Result<(), UsbError> {
+        let threshold_code = dslogic_threshold_code(threshold_mv, model.logic_uses_2v5_threshold());
         self.write_control(
             I2C_REGISTER_DESTINATION,
             THRESHOLD_REGISTER,
             &[threshold_code],
         )?;
+        if !model.logic_uses_adf4360() {
+            return Ok(());
+        }
         self.write_control(
             I2C_REGISTER_DESTINATION,
             ANALOG_CONTROL_REGISTER + 2,
@@ -499,6 +531,88 @@ impl UsbDeviceSession {
             self.write_control(I2C_REGISTER_DESTINATION, ANALOG_CONTROL_REGISTER, &[value])?;
         }
         Ok(())
+    }
+
+    /// Complete the challenge sequence used by security-enabled DSLogic
+    /// models. The challenge words are unique to the instrument and stored in
+    /// its EEPROM; no key material is embedded in the application.
+    pub(crate) fn initialize_dslogic_security(&self) -> Result<(), UsbError> {
+        let mut challenge_bytes = [0_u8; SECURITY_STEPS * 2];
+        self.read_control(
+            NVM_DESTINATION,
+            SECURITY_EEPROM_ADDRESS,
+            &mut challenge_bytes,
+        )?;
+        let challenges = challenge_bytes
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+
+        self.write_register(SECURITY_CONTROL_REGISTER, 0)?;
+        self.write_register(SECURITY_CONTROL_REGISTER + 1, 0)?;
+        thread::sleep(Duration::from_millis(10));
+        self.write_register(SECURITY_CONTROL_REGISTER, 1)?;
+        self.write_register(SECURITY_CONTROL_REGISTER + 1, 0)?;
+
+        if self.read_register(SECURITY_CONTROL_REGISTER)? & SECURITY_PASS_MASK != 0 {
+            return Err(UsbError::new(format!(
+                "{} reported an invalid pre-authorized security state",
+                self.device.location.stable_id()
+            )));
+        }
+        self.write_security_command(SECURITY_START, 0)?;
+        for challenge in challenges.into_iter().rev() {
+            let mut ready = false;
+            for _ in 0..SECURITY_READY_ATTEMPTS {
+                let status = self.read_register(SECURITY_CONTROL_REGISTER)?;
+                if status & SECURITY_PASS_MASK != 0 {
+                    return Err(UsbError::new(format!(
+                        "{} passed security before the challenge completed",
+                        self.device.location.stable_id()
+                    )));
+                }
+                if status & SECURITY_READY_MASK != 0 {
+                    ready = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            if !ready {
+                return Err(UsbError::new(format!(
+                    "timed out waiting for the DSLogic security engine on {}",
+                    self.device.location.stable_id()
+                )));
+            }
+            let response_high = self.read_register(SECURITY_DATA_REGISTER + 1)?;
+            let response_low = self.read_register(SECURITY_DATA_REGISTER)?;
+            if u16::from_be_bytes([response_high, response_low]) != 0 {
+                return Err(UsbError::new(format!(
+                    "the DSLogic security engine rejected a challenge on {}",
+                    self.device.location.stable_id()
+                )));
+            }
+            self.write_security_command(SECURITY_CHECK, challenge)?;
+        }
+        Ok(())
+    }
+
+    fn write_security_command(&self, command: u16, data: u16) -> Result<(), UsbError> {
+        let [data_low, data_high] = data.to_le_bytes();
+        let [command_low, command_high] = command.to_le_bytes();
+        self.write_register(SECURITY_DATA_REGISTER, data_low)?;
+        self.write_register(SECURITY_DATA_REGISTER + 1, data_high)?;
+        self.write_register(SECURITY_CONTROL_REGISTER, command_low)?;
+        self.write_register(SECURITY_CONTROL_REGISTER + 1, command_high)
+    }
+
+    fn write_register(&self, register: u16, value: u8) -> Result<(), UsbError> {
+        self.write_control(I2C_REGISTER_DESTINATION, register, &[value])
+    }
+
+    fn read_register(&self, register: u16) -> Result<u8, UsbError> {
+        let mut value = [0_u8; 1];
+        self.read_control(I2C_STATUS_DESTINATION, register, &mut value)?;
+        Ok(value[0])
     }
 
     pub(crate) fn initialize_dscope_frontend(
@@ -872,14 +986,23 @@ fn validate_bitstream(bitstream: &[u8]) -> Result<(), UsbError> {
         )));
     }
     let sync_end = BITSTREAM_SYNC_OFFSET + BITSTREAM_SYNC_WORD.len();
-    if bitstream.len() < sync_end
-        || bitstream[..BITSTREAM_SYNC_OFFSET]
+    let erased_prefix = bitstream
+        .get(..BITSTREAM_SYNC_OFFSET)
+        .is_some_and(|prefix| prefix.iter().all(|byte| *byte == 0xff));
+    let xilinx = erased_prefix
+        && bitstream
+            .get(BITSTREAM_SYNC_OFFSET..sync_end)
+            .is_some_and(|sync| sync == BITSTREAM_SYNC_WORD);
+    // Newer PGL12 resources are opaque/encrypted vendor images. They retain
+    // the erased flash prefix but intentionally contain no Xilinx sync word.
+    let opaque_vendor_image = bitstream.len() >= 1_024
+        && erased_prefix
+        && bitstream[BITSTREAM_SYNC_OFFSET..]
             .iter()
-            .any(|byte| *byte != 0xff)
-        || bitstream[BITSTREAM_SYNC_OFFSET..sync_end] != BITSTREAM_SYNC_WORD
-    {
+            .any(|byte| *byte != 0xff);
+    if !xilinx && !opaque_vendor_image {
         return Err(UsbError::new(
-            "FPGA bitstream does not contain the expected Xilinx sync header",
+            "FPGA bitstream is neither a raw Xilinx image nor an opaque vendor image",
         ));
     }
     Ok(())
@@ -926,6 +1049,21 @@ fn usb_error(discovered: &DiscoveredDevice, action: &str, error: rusb::Error) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn accepts_every_bundled_upstream_bitstream() {
+        let resource_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/fpga");
+        for file in crate::REQUIRED_RESOURCE_FILES
+            .iter()
+            .filter(|file| file.ends_with(".bin"))
+        {
+            let bitstream = std::fs::read(resource_directory.join(file))
+                .unwrap_or_else(|error| panic!("failed to read {file}: {error}"));
+            validate_bitstream(&bitstream)
+                .unwrap_or_else(|error| panic!("invalid bundled bitstream {file}: {error}"));
+        }
+    }
     use std::cell::Cell;
     use std::collections::VecDeque;
 
@@ -936,9 +1074,10 @@ mod tests {
 
     #[test]
     fn converts_dslogic_threshold_voltage_to_register_code() {
-        assert_eq!(dslogic_threshold_code(0), 0);
-        assert_eq!(dslogic_threshold_code(1_000), 0x2e);
-        assert_eq!(dslogic_threshold_code(5_000), 231);
+        assert_eq!(dslogic_threshold_code(0, false), 0);
+        assert_eq!(dslogic_threshold_code(1_000, false), 0x2e);
+        assert_eq!(dslogic_threshold_code(5_000, false), 231);
+        assert_eq!(dslogic_threshold_code(1_000, true), 38);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::transport::{QueuedBulkRead, QueuedBulkReadOutcome};
 use crate::{
-    BulkReadOutcome, DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbError, UsbSpeedClass,
-    DSLOGIC_U3PRO16,
+    BulkReadOutcome, DeviceModel, DeviceProfile, DiscoveredDevice, UsbDeviceSession, UsbError,
+    UsbSpeedClass,
 };
 use dsview_core::{
     CaptureBatch, CaptureContext, CaptureError, CaptureSource, DeviceDescriptor, DeviceId,
@@ -10,15 +10,16 @@ use dsview_core::{
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-const CHANNEL_COUNT: u8 = 16;
-const HARDWARE_SAMPLE_RATE_HZ: u64 = 500_000_000;
-const PRE_DIVIDER: u32 = 5;
+const CHANNEL_COUNT: u8 = 32;
+const LEGACY_CHANNEL_COUNT: usize = 16;
 pub const DSLOGIC_SAMPLE_ALIGNMENT: u64 = 1_024;
 const ATOMIC_SAMPLES: usize = 64;
 const BYTES_PER_CHANNEL_BLOCK: usize = 8;
+#[cfg(test)]
 const TRIGGER_HEADER_BYTES: usize = 1_024;
 const TRIGGER_CHECK_ID: u32 = 0x5555_5555;
 const SETTINGS_BYTES: usize = 372;
+const EXTENDED_SETTINGS_BYTES: usize = 204;
 const CAPTURE_READ_BYTES: usize = 128 * 1_024;
 const PREQUEUED_DATA_BYTES: usize = 1_024 * 1_024;
 // U3Pro16 uses 1,024-byte SuperSpeed packets and 512-byte HighSpeed packets.
@@ -61,7 +62,9 @@ pub const DSLOGIC_SAMPLE_RATES_HZ: &[u64] = &[
     50_000_000,
     100_000_000,
     125_000_000,
+    200_000_000,
     250_000_000,
+    400_000_000,
     500_000_000,
     1_000_000_000,
 ];
@@ -98,20 +101,24 @@ pub struct DsLogicCaptureConfig {
     external_clock: bool,
     falling_clock_edge: bool,
     enabled_channels: [bool; CHANNEL_COUNT as usize],
+    device_model: DeviceModel,
+    device_channel_count: u8,
 }
 
 impl DsLogicCaptureConfig {
     pub fn new(sample_rate_hz: u64, sample_count: u64) -> Result<Self, CaptureError> {
         if !DSLOGIC_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
             return Err(CaptureError::new(format!(
-                "unsupported DSLogic U3Pro16 sample rate {sample_rate_hz} Hz"
+                "unsupported DSLogic sample rate {sample_rate_hz} Hz"
             )));
         }
         if !(SAMPLE_ALIGNMENT..=MAX_SAMPLE_COUNT).contains(&sample_count) {
             return Err(CaptureError::new(format!(
-                "DSLogic U3Pro16 sample count must be between {SAMPLE_ALIGNMENT} and {MAX_SAMPLE_COUNT}"
+                "DSLogic sample count must be between {SAMPLE_ALIGNMENT} and {MAX_SAMPLE_COUNT}"
             )));
         }
+        let mut enabled_channels = [false; CHANNEL_COUNT as usize];
+        enabled_channels[..LEGACY_CHANNEL_COUNT].fill(true);
         Ok(Self {
             sample_rate_hz,
             sample_count,
@@ -123,7 +130,9 @@ impl DsLogicCaptureConfig {
             rle_enabled: false,
             external_clock: false,
             falling_clock_edge: false,
-            enabled_channels: [true; CHANNEL_COUNT as usize],
+            enabled_channels,
+            device_model: DeviceModel::DsLogicU3Pro16,
+            device_channel_count: LEGACY_CHANNEL_COUNT as u8,
         })
     }
 
@@ -172,17 +181,30 @@ impl DsLogicCaptureConfig {
         self
     }
 
-    pub fn with_enabled_channels(
+    pub fn with_enabled_channels<const N: usize>(
         mut self,
-        enabled_channels: [bool; CHANNEL_COUNT as usize],
+        enabled_channels: [bool; N],
     ) -> Result<Self, CaptureError> {
+        if N != LEGACY_CHANNEL_COUNT && N != CHANNEL_COUNT as usize {
+            return Err(CaptureError::new(format!(
+                "DSLogic channel selection must contain 16 or 32 entries; got {N}"
+            )));
+        }
         if !enabled_channels.iter().any(|enabled| *enabled) {
             return Err(CaptureError::new(
                 "DSLogic capture requires at least one enabled channel",
             ));
         }
-        self.enabled_channels = enabled_channels;
+        self.enabled_channels = [false; CHANNEL_COUNT as usize];
+        self.enabled_channels[..N].copy_from_slice(&enabled_channels);
         Ok(self)
+    }
+
+    pub fn with_enabled_channels_32(
+        self,
+        enabled_channels: [bool; CHANNEL_COUNT as usize],
+    ) -> Result<Self, CaptureError> {
+        self.with_enabled_channels(enabled_channels)
     }
 
     pub fn sample_rate_hz(self) -> u64 {
@@ -225,7 +247,13 @@ impl DsLogicCaptureConfig {
         self.falling_clock_edge
     }
 
-    pub fn enabled_channels(self) -> [bool; CHANNEL_COUNT as usize] {
+    pub fn enabled_channels(self) -> [bool; LEGACY_CHANNEL_COUNT] {
+        self.enabled_channels[..LEGACY_CHANNEL_COUNT]
+            .try_into()
+            .expect("the DSLogic legacy channel range is fixed")
+    }
+
+    pub fn enabled_channels_32(self) -> [bool; CHANNEL_COUNT as usize] {
         self.enabled_channels
     }
 
@@ -237,25 +265,56 @@ impl DsLogicCaptureConfig {
     }
 
     pub fn maximum_sample_rate_hz(self, speed: UsbSpeedClass) -> u64 {
+        self.maximum_sample_rate_hz_for_model(DeviceModel::DsLogicU3Pro16, speed)
+    }
+
+    pub fn maximum_sample_rate_hz_for_model(self, model: DeviceModel, speed: UsbSpeedClass) -> u64 {
         let enabled_count = self.enabled_channel_count();
         let lower_eight_only = self.enabled_channels[8..].iter().all(|enabled| !enabled);
+        let lower_four_only = self.enabled_channels[4..].iter().all(|enabled| !enabled);
+        let lower_sixteen_only = self.enabled_channels[16..].iter().all(|enabled| !enabled);
+        let modern = model.logic_hardware_sample_rate_hz() == 500_000_000;
         match self.operation_mode {
-            DsLogicOperationMode::Buffer => {
+            DsLogicOperationMode::Buffer if modern => {
                 if enabled_count <= 8 && lower_eight_only {
                     1_000_000_000
-                } else {
+                } else if enabled_count <= 16 && lower_sixteen_only {
                     500_000_000
+                } else {
+                    250_000_000
                 }
             }
-            DsLogicOperationMode::Stream if speed >= UsbSpeedClass::SuperSpeed => {
+            DsLogicOperationMode::Buffer => {
+                if matches!(
+                    model,
+                    DeviceModel::DsLogicU2Basic
+                        | DeviceModel::DsLogicU2BasicPgl12
+                        | DeviceModel::DsLogicU2BasicPgl12Rev2
+                ) {
+                    100_000_000
+                } else if enabled_count <= 4 && lower_four_only {
+                    400_000_000
+                } else if enabled_count <= 8 && lower_eight_only {
+                    200_000_000
+                } else {
+                    100_000_000
+                }
+            }
+            DsLogicOperationMode::Stream
+                if model.logic_uses_usb3_protocol() && speed >= UsbSpeedClass::SuperSpeed =>
+            {
                 if enabled_count <= 3 && lower_eight_only {
                     1_000_000_000
                 } else if enabled_count <= 6 {
                     500_000_000
                 } else if enabled_count <= 12 {
                     250_000_000
-                } else {
+                } else if enabled_count <= 16 && lower_sixteen_only {
                     125_000_000
+                } else if enabled_count <= 30 {
+                    100_000_000
+                } else {
+                    50_000_000
                 }
             }
             DsLogicOperationMode::Stream => {
@@ -265,8 +324,10 @@ impl DsLogicCaptureConfig {
                     50_000_000
                 } else if enabled_count <= 12 {
                     25_000_000
-                } else {
+                } else if enabled_count <= 16 {
                     20_000_000
+                } else {
+                    10_000_000
                 }
             }
             DsLogicOperationMode::InternalTest => 100_000_000,
@@ -274,21 +335,48 @@ impl DsLogicCaptureConfig {
     }
 
     pub fn maximum_sample_count(self) -> u64 {
+        self.maximum_sample_count_for_model(DeviceModel::DsLogicU3Pro16)
+    }
+
+    pub fn maximum_sample_count_for_model(self, model: DeviceModel) -> u64 {
         match self.operation_mode {
             DsLogicOperationMode::Stream => DSLOGIC_MAX_STREAM_SAMPLE_COUNT,
-            DsLogicOperationMode::Buffer | DsLogicOperationMode::InternalTest => {
-                DSLOGIC_MAX_BUFFER_SAMPLE_COUNT
-            }
+            DsLogicOperationMode::Buffer | DsLogicOperationMode::InternalTest => model
+                .logic_buffer_bits()
+                .checked_div(u64::from(self.enabled_channel_count().max(1)))
+                .unwrap_or(0)
+                .min(DSLOGIC_MAX_BUFFER_SAMPLE_COUNT),
         }
     }
 
-    fn validate_for_speed(self, speed: UsbSpeedClass) -> Result<(), CaptureError> {
+    fn validate_for_device(
+        self,
+        profile: &DeviceProfile,
+        speed: UsbSpeedClass,
+    ) -> Result<(), CaptureError> {
+        let model = profile.model;
+        let channel_count = profile.channel_count;
+        if self.enabled_channels[usize::from(channel_count)..]
+            .iter()
+            .any(|enabled| *enabled)
+        {
+            return Err(CaptureError::new(format!(
+                "{} exposes {channel_count} logic channels",
+                profile.display_name
+            )));
+        }
+        if self.operation_mode == DsLogicOperationMode::Buffer && !model.logic_has_buffer() {
+            return Err(CaptureError::new(format!(
+                "{} supports stream capture only",
+                profile.display_name
+            )));
+        }
         if self.loop_mode && self.operation_mode != DsLogicOperationMode::Stream {
             return Err(CaptureError::new(
                 "DSLogic loop mode requires stream operation mode",
             ));
         }
-        let maximum = self.maximum_sample_rate_hz(speed);
+        let maximum = self.maximum_sample_rate_hz_for_model(model, speed);
         if self.sample_rate_hz > maximum {
             return Err(CaptureError::new(format!(
                 "DSLogic sample rate {} Hz exceeds the {} Hz maximum for {} enabled channel(s) in {:?} mode",
@@ -298,7 +386,7 @@ impl DsLogicCaptureConfig {
                 self.operation_mode
             )));
         }
-        let maximum_sample_count = self.maximum_sample_count();
+        let maximum_sample_count = self.maximum_sample_count_for_model(model);
         if self.sample_count > maximum_sample_count {
             return Err(CaptureError::new(format!(
                 "DSLogic sample count {} exceeds the {}-sample maximum in {:?} mode",
@@ -308,18 +396,26 @@ impl DsLogicCaptureConfig {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn validate_for_speed(self, speed: UsbSpeedClass) -> Result<(), CaptureError> {
+        self.validate_for_device(&crate::DSLOGIC_U3PRO16, speed)
+    }
+
     fn armed_sample_count(self) -> u64 {
         self.sample_count.div_ceil(SAMPLE_ALIGNMENT) * SAMPLE_ALIGNMENT
     }
 
     fn encode_settings(self) -> Vec<u8> {
-        let divider = HARDWARE_SAMPLE_RATE_HZ.div_ceil(self.sample_rate_hz) as u32;
-        let divider_high = if divider >= PRE_DIVIDER {
-            PRE_DIVIDER - 1
+        let model = self.device_model;
+        let hardware_sample_rate_hz = model.logic_hardware_sample_rate_hz();
+        let predivider = model.logic_predivider();
+        let divider = hardware_sample_rate_hz.div_ceil(self.sample_rate_hz) as u32;
+        let divider_high = if divider >= predivider {
+            predivider - 1
         } else {
             divider - 1
         } << 8;
-        let divided = divider.div_ceil(PRE_DIVIDER);
+        let divided = divider.div_ceil(predivider);
         let armed_samples = self.armed_sample_count();
         let capture_count = armed_samples >> 4;
 
@@ -333,11 +429,30 @@ impl DsLogicCaptureConfig {
             | (u16::from(self.falling_clock_edge) << CLOCK_EDGE_BIT)
             | (u16::from(self.rle_enabled) << RLE_MODE_BIT)
             | (u16::from(self.loop_mode) << LOOP_MODE_BIT)
-            | (u16::from(self.sample_rate_hz == 500_000_000) << HALF_MODE_BIT)
-            | (u16::from(self.sample_rate_hz == 1_000_000_000) << QUARTER_MODE_BIT)
+            | (u16::from(
+                self.sample_rate_hz
+                    == if hardware_sample_rate_hz == 500_000_000 {
+                        500_000_000
+                    } else {
+                        200_000_000
+                    },
+            ) << HALF_MODE_BIT)
+            | (u16::from(
+                self.sample_rate_hz
+                    == if hardware_sample_rate_hz == 500_000_000 {
+                        1_000_000_000
+                    } else {
+                        400_000_000
+                    },
+            ) << QUARTER_MODE_BIT)
             | (u16::from(self.input_filter == DsLogicInputFilter::OneSampleClock) << FILTER_BIT);
-        let enabled_channel_mask = self
-            .enabled_channels
+        let enabled_channel_mask_low = self.enabled_channels[..16]
+            .iter()
+            .enumerate()
+            .fold(0_u16, |mask, (channel, enabled)| {
+                mask | (u16::from(*enabled) << channel)
+            });
+        let enabled_channel_mask_high = self.enabled_channels[16..]
             .iter()
             .enumerate()
             .fold(0_u16, |mask, (channel, enabled)| {
@@ -363,8 +478,8 @@ impl DsLogicCaptureConfig {
         push_u16(&mut bytes, armed_samples as u16);
         push_u16(&mut bytes, (armed_samples >> 16) as u16);
         push_u16(&mut bytes, 0x0a02);
-        push_u16(&mut bytes, enabled_channel_mask);
-        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, enabled_channel_mask_low);
+        push_u16(&mut bytes, enabled_channel_mask_high);
         push_u16(&mut bytes, 0x0c01);
         push_u16(&mut bytes, 0);
         push_u16(&mut bytes, 0x40a0);
@@ -392,6 +507,30 @@ impl DsLogicCaptureConfig {
         debug_assert_eq!(bytes.len(), SETTINGS_BYTES);
         bytes
     }
+
+    fn encode_extended_settings(self) -> Option<Vec<u8>> {
+        let model = self.device_model;
+        if model != DeviceModel::DsLogicU3Pro32 {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(EXTENDED_SETTINGS_BYTES);
+        push_u32(&mut bytes, 0xf5a5_f5a5);
+        push_u16(&mut bytes, 0x6060);
+        for _ in 0..2 {
+            for _ in 0..16 {
+                push_u16(&mut bytes, u16::MAX);
+            }
+        }
+        for _ in 0..4 {
+            for _ in 0..16 {
+                push_u16(&mut bytes, 0);
+            }
+        }
+        push_u16(&mut bytes, u16::MAX);
+        push_u32(&mut bytes, 0xfa5a_fa5a);
+        debug_assert_eq!(bytes.len(), EXTENDED_SETTINGS_BYTES);
+        Some(bytes)
+    }
 }
 
 pub struct DsLogicCaptureSource {
@@ -403,18 +542,20 @@ pub struct DsLogicCaptureSource {
 impl DsLogicCaptureSource {
     pub fn new(
         device: DiscoveredDevice,
-        config: DsLogicCaptureConfig,
+        mut config: DsLogicCaptureConfig,
     ) -> Result<Self, CaptureError> {
-        if device.profile.model != DeviceModel::DsLogicU3Pro16 {
+        if !device.profile.model.is_logic_analyzer() || !device.profile.model.supports_capture() {
             return Err(CaptureError::new(format!(
-                "{} is not a DSLogic U3Pro16 logic analyzer",
+                "{} is not a supported DSLogic logic analyzer",
                 device.location.stable_id()
             )));
         }
-        config.validate_for_speed(device.speed)?;
+        config.validate_for_device(device.profile, device.speed)?;
+        config.device_model = device.profile.model;
+        config.device_channel_count = device.profile.channel_count;
         let descriptor = DeviceDescriptor {
             id: DeviceId::new(device.location.stable_id()),
-            name: DSLOGIC_U3PRO16.display_name.to_owned(),
+            name: device.profile.display_name.to_owned(),
             kind: InstrumentKind::LogicAnalyzer,
         };
         Ok(Self {
@@ -432,7 +573,13 @@ impl CaptureSource for DsLogicCaptureSource {
 
     fn run(self: Box<Self>, context: CaptureContext) -> Result<(), CaptureError> {
         let session = UsbDeviceSession::open(&self.device).map_err(capture_error)?;
-        let capture_result = run_capture(&session, self.config, self.device.speed, &context);
+        let capture_result = run_capture(
+            &session,
+            self.device.profile.model,
+            self.config,
+            self.device.speed,
+            &context,
+        );
         let close_result = session.close().map_err(capture_error);
         combine_results(capture_result, close_result, "release the USB interface")
     }
@@ -440,20 +587,31 @@ impl CaptureSource for DsLogicCaptureSource {
 
 fn run_capture(
     session: &UsbDeviceSession,
+    model: DeviceModel,
     config: DsLogicCaptureConfig,
     speed: UsbSpeedClass,
     context: &CaptureContext,
 ) -> Result<(), CaptureError> {
-    validate_device_ready(session, config)?;
+    validate_device_ready(session, model, config)?;
     session.stop_capture().map_err(capture_error)?;
     let capture_result = (|| {
+        let settings = config.encode_settings();
+        let extended_settings = config.encode_extended_settings();
         session
-            .arm_capture(&config.encode_settings())
+            .arm_capture_extended(&settings, extended_settings.as_deref())
             .map_err(capture_error)?;
         if config.operation_mode == DsLogicOperationMode::Stream && !config.loop_mode {
-            return read_stream_capture(session, config, speed, context);
+            return read_stream_capture(
+                session,
+                config,
+                speed,
+                model.logic_trigger_header_bytes(),
+                context,
+            );
         }
-        let Some(prequeued) = read_prequeued_capture(session, config, context)? else {
+        let Some(prequeued) =
+            read_prequeued_capture(session, config, model.logic_trigger_header_bytes(), context)?
+        else {
             return Ok(());
         };
         read_capture(session, config, prequeued, context)
@@ -489,6 +647,7 @@ fn read_stream_capture(
     session: &UsbDeviceSession,
     config: DsLogicCaptureConfig,
     speed: UsbSpeedClass,
+    trigger_header_bytes: usize,
     context: &CaptureContext,
 ) -> Result<(), CaptureError> {
     let mut header_read = None;
@@ -497,6 +656,7 @@ fn read_stream_capture(
         session,
         config,
         speed,
+        trigger_header_bytes,
         context,
         &mut header_read,
         &mut payload_reads,
@@ -509,6 +669,7 @@ fn read_stream_capture_inner(
     session: &UsbDeviceSession,
     config: DsLogicCaptureConfig,
     speed: UsbSpeedClass,
+    trigger_header_bytes: usize,
     context: &CaptureContext,
     header_read: &mut Option<QueuedBulkRead>,
     payload_reads: &mut VecDeque<PendingStreamRead>,
@@ -521,7 +682,7 @@ fn read_stream_capture_inner(
     let (transfer_bytes, queued_transfer_count) = stream_transfer_plan(speed, config);
     *header_read = Some(
         session
-            .queue_bulk_read(TRIGGER_HEADER_BYTES)
+            .queue_bulk_read(trigger_header_bytes)
             .map_err(capture_error)?,
     );
 
@@ -621,7 +782,7 @@ fn read_stream_capture_inner(
     }
 
     let header = header.expect("the stream header completed before the loop exited");
-    TriggerPosition::decode(&header)?;
+    TriggerPosition::decode(&header, trigger_header_bytes)?;
     Ok(())
 }
 
@@ -685,6 +846,7 @@ fn cancel_pending_stream_reads(
 
 fn validate_device_ready(
     session: &UsbDeviceSession,
+    model: DeviceModel,
     config: DsLogicCaptureConfig,
 ) -> Result<(), CaptureError> {
     let firmware = session.firmware_version().map_err(capture_error)?;
@@ -706,8 +868,13 @@ fn validate_device_ready(
         )));
     }
     session
-        .initialize_dslogic_frontend(config.threshold_mv)
+        .initialize_dslogic_frontend(model, config.threshold_mv)
         .map_err(capture_error)?;
+    if model.requires_security_handshake() {
+        session
+            .initialize_dslogic_security()
+            .map_err(capture_error)?;
+    }
     Ok(())
 }
 
@@ -717,7 +884,7 @@ fn read_capture(
     prequeued: PrequeuedCapture,
     context: &CaptureContext,
 ) -> Result<(), CaptureError> {
-    let trigger = TriggerPosition::decode(&prequeued.header)?;
+    let trigger = TriggerPosition::decode(&prequeued.header, prequeued.header.len())?;
     let available_samples = captured_sample_count(config, trigger)?;
     let total_bytes = usize::try_from(available_samples)
         .ok()
@@ -857,7 +1024,7 @@ fn captured_sample_count(
 }
 
 struct PrequeuedCapture {
-    header: [u8; TRIGGER_HEADER_BYTES],
+    header: Vec<u8>,
     payload: Vec<u8>,
     capture_origin: Duration,
     upload_after_stop: bool,
@@ -866,6 +1033,7 @@ struct PrequeuedCapture {
 fn read_prequeued_capture(
     session: &UsbDeviceSession,
     config: DsLogicCaptureConfig,
+    trigger_header_bytes: usize,
     context: &CaptureContext,
 ) -> Result<Option<PrequeuedCapture>, CaptureError> {
     let expected_payload_bytes = usize::try_from(config.sample_count & !(SAMPLE_ALIGNMENT - 1))
@@ -874,7 +1042,7 @@ fn read_prequeued_capture(
         .map(|bits| bits / 8)
         .ok_or_else(|| CaptureError::new("requested DSLogic payload is too large"))?;
     let prequeued_data_bytes = aligned_transfer_bytes(PREQUEUED_DATA_BYTES, config);
-    let mut header = [0_u8; TRIGGER_HEADER_BYTES];
+    let mut header = vec![0_u8; trigger_header_bytes];
     let mut payload = vec![0_u8; expected_payload_bytes.min(prequeued_data_bytes)];
     let capture_time =
         Duration::from_secs_f64(config.sample_count as f64 / config.sample_rate_hz as f64);
@@ -955,10 +1123,10 @@ fn read_prequeued_capture(
             ));
         }
     };
-    if header_data.len() != TRIGGER_HEADER_BYTES {
+    if header_data.len() != trigger_header_bytes {
         return Err(CaptureError::new(format!(
-            "short DSLogic trigger header: received {} of {TRIGGER_HEADER_BYTES} bytes",
-            header_data.len()
+            "short DSLogic trigger header: received {} of {trigger_header_bytes} bytes",
+            header_data.len(),
         )));
     }
     header.copy_from_slice(&header_data);
@@ -995,7 +1163,7 @@ fn emit_wire_batch(
         captured_at,
         CaptureBatch::Logic(LogicBatch {
             sample_rate_hz: config.sample_rate_hz,
-            channel_count: CHANNEL_COUNT,
+            channel_count: config.device_channel_count,
             samples,
         }),
     )?;
@@ -1139,11 +1307,11 @@ struct TriggerPosition {
 }
 
 impl TriggerPosition {
-    fn decode(header: &[u8]) -> Result<Self, CaptureError> {
-        if header.len() != TRIGGER_HEADER_BYTES {
+    fn decode(header: &[u8], expected_bytes: usize) -> Result<Self, CaptureError> {
+        if header.len() != expected_bytes {
             return Err(CaptureError::new(format!(
-                "DSLogic trigger header has {} bytes; expected {TRIGGER_HEADER_BYTES}",
-                header.len()
+                "DSLogic trigger header has {} bytes; expected {expected_bytes}",
+                header.len(),
             )));
         }
         if read_u32(header, 0) != TRIGGER_CHECK_ID {
@@ -1214,6 +1382,105 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_u2pro16_as_a_capture_source() {
+        let device = DiscoveredDevice {
+            profile: &crate::DSLOGIC_U2PRO16,
+            location: crate::DeviceLocation {
+                platform_path: "test-u2pro16".to_owned(),
+            },
+            speed: UsbSpeedClass::HighSpeed,
+        };
+        let config =
+            DsLogicCaptureConfig::new(1_000_000, 1_000_000).expect("configuration should be valid");
+
+        let source = DsLogicCaptureSource::new(device, config)
+            .expect("U2Pro16 should use the DSLogic capture driver");
+
+        assert_eq!(source.descriptor().name, "DSLogic U2Pro16");
+        assert_eq!(source.descriptor().kind, InstrumentKind::LogicAnalyzer);
+    }
+
+    #[test]
+    fn every_dslogic_profile_accepts_a_safe_stream_configuration() {
+        for profile in crate::SUPPORTED_PROFILES
+            .iter()
+            .filter(|profile| profile.model.is_logic_analyzer())
+        {
+            let device = DiscoveredDevice {
+                profile,
+                location: crate::DeviceLocation {
+                    platform_path: format!("test-{:04x}", profile.product_id),
+                },
+                speed: profile.minimum_speed,
+            };
+            let config = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+                .expect("configuration should be valid")
+                .with_operation_mode(DsLogicOperationMode::Stream);
+            let source = DsLogicCaptureSource::new(device, config)
+                .unwrap_or_else(|error| panic!("{}: {error}", profile.display_name));
+            assert_eq!(source.descriptor().name, profile.display_name);
+        }
+    }
+
+    #[test]
+    fn u3pro32_encodes_upper_channels_and_extended_trigger_settings() {
+        let mut channels = [false; CHANNEL_COUNT as usize];
+        channels[31] = true;
+        let mut config = DsLogicCaptureConfig::new(100_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_enabled_channels_32(channels)
+            .expect("channel selection should be valid");
+        config.device_model = DeviceModel::DsLogicU3Pro32;
+        config.device_channel_count = 32;
+
+        let settings = config.encode_settings();
+        assert_eq!(read_u16(&settings, 38), 0);
+        assert_eq!(read_u16(&settings, 40), 1 << 15);
+        assert_eq!(
+            config
+                .encode_extended_settings()
+                .expect("U3Pro32 needs extended settings")
+                .len(),
+            EXTENDED_SETTINGS_BYTES
+        );
+
+        let samples = decode_cross_samples(&1_u64.to_le_bytes(), channels)
+            .expect("upper-channel data should decode");
+        assert_eq!(samples[0], 1_u32 << 31);
+    }
+
+    #[test]
+    fn legacy_logic_limits_and_headers_follow_the_upstream_profiles() {
+        let all_channels = DsLogicCaptureConfig::new(100_000_000, 1_000_000)
+            .expect("configuration should be valid");
+        assert_eq!(
+            all_channels.maximum_sample_rate_hz_for_model(
+                DeviceModel::DsLogicPro,
+                UsbSpeedClass::HighSpeed
+            ),
+            100_000_000
+        );
+        assert_eq!(DeviceModel::DsLogicPro.logic_trigger_header_bytes(), 512);
+        assert_eq!(
+            DeviceModel::DsLogicU3Pro16.logic_trigger_header_bytes(),
+            1_024
+        );
+
+        let basic_device = DiscoveredDevice {
+            profile: &crate::DSLOGIC_BASIC,
+            location: crate::DeviceLocation {
+                platform_path: "test-basic".to_owned(),
+            },
+            speed: UsbSpeedClass::HighSpeed,
+        };
+        assert!(DsLogicCaptureSource::new(basic_device.clone(), all_channels).is_err());
+        let safe_stream = DsLogicCaptureConfig::new(20_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_operation_mode(DsLogicOperationMode::Stream);
+        assert!(DsLogicCaptureSource::new(basic_device, safe_stream).is_ok());
+    }
 
     #[test]
     fn validates_finite_capture_configuration() {
@@ -1534,7 +1801,8 @@ mod tests {
         header[0..4].copy_from_slice(&TRIGGER_CHECK_ID.to_le_bytes());
         header[12..16].copy_from_slice(&64_u32.to_le_bytes());
 
-        let trigger = TriggerPosition::decode(&header).expect("header should decode");
+        let trigger =
+            TriggerPosition::decode(&header, TRIGGER_HEADER_BYTES).expect("header should decode");
 
         assert_eq!(trigger.remaining_samples, 64);
         assert_eq!(trigger.available_samples(1_000_000).unwrap(), 999_424);
@@ -1568,7 +1836,7 @@ mod tests {
     #[test]
     fn rejects_malformed_or_empty_trigger_results() {
         let header = [0_u8; TRIGGER_HEADER_BYTES];
-        assert!(TriggerPosition::decode(&header).is_err());
+        assert!(TriggerPosition::decode(&header, TRIGGER_HEADER_BYTES).is_err());
 
         let trigger = TriggerPosition {
             remaining_samples: 1_000_000,

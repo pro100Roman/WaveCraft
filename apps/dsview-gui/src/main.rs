@@ -25,6 +25,7 @@ use dsview_usb::{
     DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
     DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
     DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_ALIGNMENT, DSLOGIC_SAMPLE_RATES_HZ,
+    REQUIRED_RESOURCE_FILES,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use image::ImageFormat;
@@ -1334,8 +1335,8 @@ impl CaptureTarget {
 
     fn includes_model(self, model: DeviceModel) -> bool {
         match self {
-            Self::LogicAnalyzer => model == DeviceModel::DsLogicU3Pro16,
-            Self::Oscilloscope => model == DeviceModel::DsCopeU3P100,
+            Self::LogicAnalyzer => model.is_logic_analyzer(),
+            Self::Oscilloscope => model.is_oscilloscope(),
             Self::Combined => true,
         }
     }
@@ -2536,9 +2537,10 @@ impl DsViewApp {
                 Some("Complete-capture recording is available in Single mode only".to_owned());
             return;
         }
-        let has_logic_analyzer = self.devices.iter().any(|entry| {
-            entry.selected && entry.device.profile.model == DeviceModel::DsLogicU3Pro16
-        });
+        let has_logic_analyzer = self
+            .devices
+            .iter()
+            .any(|entry| entry.selected && entry.device.profile.model.is_logic_analyzer());
         let has_oscilloscope = self
             .devices
             .iter()
@@ -3558,7 +3560,7 @@ impl DsViewApp {
             || self
                 .devices
                 .iter()
-                .any(|entry| entry.device.profile.model == DeviceModel::DsLogicU3Pro16);
+                .any(|entry| entry.device.profile.model.is_logic_analyzer());
         let has_oscilloscope = displayed_scope
             || self
                 .devices
@@ -3582,7 +3584,7 @@ impl DsViewApp {
         let has_logic_analyzer = self
             .devices
             .iter()
-            .any(|entry| entry.device.profile.model == DeviceModel::DsLogicU3Pro16);
+            .any(|entry| entry.device.profile.model.is_logic_analyzer());
         let has_oscilloscope = self
             .devices
             .iter()
@@ -4645,7 +4647,7 @@ fn paint_capture_settings(
             ui.set_max_width(content_width);
             ui.label(
                 RichText::new(match tab {
-                    CaptureSettingsTab::DsLogic => "DSLogic U3Pro16",
+                    CaptureSettingsTab::DsLogic => "DSLogic 16-channel analyzer",
                     CaptureSettingsTab::DsCope => "DSCope U3P100",
                 })
                 .strong(),
@@ -5853,13 +5855,27 @@ fn paint_instrument_settings(
                 );
                 ui.small(RichText::new(entry.device.location.stable_id()).color(TEXT_MUTED));
                 let (link_text, link_color) = match entry.device.link_status() {
-                    LinkStatus::Optimal => ("USB 3 · optimal", ACCENT),
-                    LinkStatus::ReducedPerformance => {
-                        ("USB 2 · reduced performance", SCOPE_COLORS[0])
+                    LinkStatus::Optimal => (
+                        format!("{} · optimal", entry.device.speed.description()),
+                        ACCENT,
+                    ),
+                    LinkStatus::ReducedPerformance => (
+                        format!("{} · reduced performance", entry.device.speed.description()),
+                        SCOPE_COLORS[0],
+                    ),
+                    LinkStatus::Unsupported => {
+                        ("Unsupported link speed".to_owned(), Color32::LIGHT_RED)
                     }
-                    LinkStatus::Unsupported => ("Unsupported link speed", Color32::LIGHT_RED),
                 };
                 ui.small(RichText::new(link_text).color(link_color));
+                ui.small(
+                    RichText::new(if entry.device.profile.model.supports_capture() {
+                        "Acquisition driver available"
+                    } else {
+                        "Discovery, probe, and FPGA preparation available"
+                    })
+                    .color(TEXT_MUTED),
+                );
             });
     }
 }
@@ -5867,7 +5883,7 @@ fn paint_instrument_settings(
 fn usb_speed_warning(devices: &[DiscoveredDevice]) -> Option<UsbSpeedWarning> {
     let devices = devices
         .iter()
-        .filter(|device| device.speed < UsbSpeedClass::SuperSpeed)
+        .filter(|device| device.link_status() == LinkStatus::ReducedPerformance)
         .cloned()
         .collect::<Vec<_>>();
     (!devices.is_empty()).then_some(UsbSpeedWarning { devices })
@@ -5943,21 +5959,20 @@ impl eframe::App for DsViewApp {
         let mut calibration_action = None;
         let capture_settings_enabled = !self.is_busy();
         let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
-        let selected_logic_device = self.devices.iter().any(|entry| {
-            entry.selected && entry.device.profile.model == DeviceModel::DsLogicU3Pro16
-        });
+        let selected_logic_device = self
+            .devices
+            .iter()
+            .any(|entry| entry.selected && entry.device.profile.model.is_logic_analyzer());
         let logic_settings_speed = self
             .devices
             .iter()
-            .filter(|entry| {
-                entry.selected && entry.device.profile.model == DeviceModel::DsLogicU3Pro16
-            })
+            .filter(|entry| entry.selected && entry.device.profile.model.is_logic_analyzer())
             .map(|entry| entry.device.speed)
             .min()
             .or_else(|| {
                 self.devices
                     .iter()
-                    .filter(|entry| entry.device.profile.model == DeviceModel::DsLogicU3Pro16)
+                    .filter(|entry| entry.device.profile.model.is_logic_analyzer())
                     .map(|entry| entry.device.speed)
                     .min()
             })
@@ -6612,7 +6627,7 @@ impl eframe::App for DsViewApp {
                             .desired_width(f32::INFINITY),
                     );
                     ui.small(
-                        RichText::new("Contains DSLogicU3Pro16.bin and DSCopeU3P100.bin")
+                        RichText::new("Contains the complete original DSView FPGA/firmware set")
                             .color(TEXT_MUTED),
                     );
                     ui.add_space(10.0);
@@ -7041,7 +7056,9 @@ fn default_resource_directory() -> String {
 }
 
 fn has_required_fpga_resources(directory: &Path) -> bool {
-    directory.join("DSLogicU3Pro16.bin").is_file() && directory.join("DSCopeU3P100.bin").is_file()
+    REQUIRED_RESOURCE_FILES
+        .iter()
+        .all(|name| directory.join(name).is_file())
 }
 
 fn insert_channel_name_metadata(
@@ -7768,10 +7785,12 @@ fn start_capture(
         let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
         prepare_device(&device, &bitstream_path).map_err(|error| error.to_string())?;
         match device.profile.model {
-            DeviceModel::DsLogicU3Pro16 => sources.push(Box::new(
-                DsLogicCaptureSource::new(device, logic_config)
-                    .map_err(|error| error.to_string())?,
-            )),
+            model if model.is_logic_analyzer() && model.supports_capture() => {
+                sources.push(Box::new(
+                    DsLogicCaptureSource::new(device, logic_config)
+                        .map_err(|error| error.to_string())?,
+                ))
+            }
             DeviceModel::DsCopeU3P100 => {
                 let (source, control) =
                     DsCopeCaptureSource::with_runtime_trigger_control(device, scope_config)
@@ -7784,6 +7803,12 @@ fn start_capture(
                 sources.push(Box::new(source));
                 scope_trigger_controls.push(control);
                 scope_calibration_controls.push(calibration_control);
+            }
+            _ => {
+                return Err(format!(
+                    "{} supports discovery, probing, and FPGA preparation, but its acquisition driver is not implemented",
+                    device.profile.display_name
+                ));
             }
         }
     }
@@ -12772,6 +12797,7 @@ mod tests {
         assert_eq!(WaveformTab::Combined.capture_settings_tab(), None);
 
         assert!(CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsLogicU3Pro16));
+        assert!(CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsLogicU2Pro16));
         assert!(!CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsCopeU3P100));
         assert!(CaptureTarget::Oscilloscope.includes_model(DeviceModel::DsCopeU3P100));
         assert!(!CaptureTarget::Oscilloscope.includes_model(DeviceModel::DsLogicU3Pro16));
@@ -12961,7 +12987,7 @@ mod tests {
     }
 
     #[test]
-    fn usb_speed_warning_only_lists_devices_below_usb_three() {
+    fn usb_speed_warning_only_lists_reduced_performance_links() {
         let device = |platform_path: &str, speed| DiscoveredDevice {
             profile: &dsview_usb::DSLOGIC_U3PRO16,
             location: dsview_usb::DeviceLocation {
@@ -12977,9 +13003,8 @@ mod tests {
 
         let warning = usb_speed_warning(&devices).unwrap();
 
-        assert_eq!(warning.devices.len(), 2);
+        assert_eq!(warning.devices.len(), 1);
         assert_eq!(warning.devices[0].speed, UsbSpeedClass::HighSpeed);
-        assert_eq!(warning.devices[1].speed, UsbSpeedClass::Unknown);
         assert!(usb_speed_warning(&devices[1..2]).is_none());
     }
 
@@ -13226,7 +13251,7 @@ mod tests {
     }
 
     #[test]
-    fn default_resource_directory_contains_both_bitstreams() {
+    fn default_resource_directory_contains_complete_upstream_resource_set() {
         let directory = PathBuf::from(default_resource_directory());
         assert!(has_required_fpga_resources(&directory));
     }

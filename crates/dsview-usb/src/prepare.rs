@@ -42,6 +42,9 @@ pub fn prepare_device(
                 "HDL {hdl} is incompatible; version 0x0e is required"
             )));
         }
+        if device.profile.model.requires_security_handshake() {
+            session.initialize_dslogic_security()?;
+        }
         Ok(PreparedDevice {
             firmware,
             hdl,

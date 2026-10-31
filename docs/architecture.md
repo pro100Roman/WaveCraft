@@ -103,19 +103,25 @@ The synchronization layer will therefore preserve raw device timing metadata ins
 ## Hardware integration plan
 
 The `dsview-usb` crate owns model profiles, read-only discovery, claimed device
-sessions, and the vendor control transport. It initially targets DSLogic U3Pro16
-(VID/PID `2a0e:002a`) and DSCope U3P100 (`2a0e:002b`) on interface 0, with bulk
+sessions, and the vendor control transport. Its profile table contains all 22
+unique DSLogic and DSCope IDs in the upstream driver: the legacy DSLogic,
+DSLogic Pro/Plus/Basic, U2/U3 and PGL12 logic analyzers, plus the DSCope,
+DSCope20, B20/C20, U2, and U3 oscilloscope families. They use interface 0, with bulk
 OUT endpoint `0x02` and bulk IN endpoint `0x86` reserved for the acquisition
 layer. The current transport reads firmware and hardware status and loads the
 model-specific FPGA bitstream with bounded waits and exact transfer checks.
-The idempotent preparation path then validates FPGA HDL version `0x0e` before
-declaring an instrument ready for acquisition.
+The idempotent preparation path then validates FPGA HDL version `0x0e` and, on
+security-enabled U2Pro16/PGL12 models, completes the EEPROM-backed FPGA
+challenge before declaring an instrument ready for acquisition.
 
 Bulk-IN acquisition uses queued asynchronous libusb transfers so reads are
-already pending when an instrument starts. The DSLogic U3Pro16 driver implements
-finite 16-channel buffered capture, including packed FPGA settings,
+already pending when an instrument starts. The shared DSLogic driver implements
+the legacy and U2/U3 profile matrix, including packed FPGA settings,
 arm/start/stop commands, trigger-header validation, and conversion of
-channel-major 64-sample bitmaps into `LogicBatch` sample words. Cancellation
+channel-major 64-sample bitmaps into `LogicBatch` sample words. It selects the
+profile's clock generator, threshold conversion, USB header size, memory/rate
+limits, and security behavior. U3Pro32 additionally sends the extended trigger
+settings block and can decode all 32 channels into `u32` samples. Cancellation
 forces the FPGA read path ready before stopping it.
 
 The DSCope U3P100 driver implements finite one- or two-channel capture with

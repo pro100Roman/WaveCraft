@@ -18,7 +18,8 @@ The repository contains the first vertical slice of the new capture engine:
 - typed logic and oscilloscope sample batches;
 - coordinated cancellation and worker cleanup;
 - simulated instruments and a CLI demonstrating simultaneous capture;
-- finite buffered capture from DSLogic U3Pro16 at supported 16-channel rates;
+- capture support for the complete upstream DSLogic profile matrix, including
+  legacy 16-channel models and DSLogic U3Pro32;
 - finite one- or two-channel capture from DSCope U3P100 with configurable sampling and
   per-channel front-end settings;
 - concurrent physical capture from one DSLogic and one DSCope on a shared timeline;
@@ -43,9 +44,18 @@ bounded waveform display cache. A local service API and thin Python client can
 reuse the same application command layer for long-lived and streaming
 workflows; automation must never depend on parsing human-readable status text.
 
-Initial USB discovery supports DSLogic U3Pro16 (`2a0e:002a`) and DSCope U3P100 (`2a0e:002b`) at HighSpeed or SuperSpeed. Discovery is read-only; explicit preparation and capture commands perform the state-changing operations.
+USB discovery, probing, and FPGA preparation cover all 22 unique DSLogic and
+DSCope USB profiles from the upstream driver (`2a0e:0001` through the current
+PGL12 revisions at `2a0e:0035`). DSLogic acquisition supports the complete
+logic-analyzer matrix, including U3Pro32's extended settings and 32-channel
+library API. DSCope acquisition currently uses the calibrated U3P100 driver;
+the other DSCope models are discoverable, probeable, and preparable with their
+model-specific resources. Discovery is read-only; preparation and capture
+commands perform the state-changing operations.
 
-The device listing reports the negotiated USB link speed. USB 3 SuperSpeed is recommended; USB 2 HighSpeed produces a reduced-performance warning, and slower links are reported as unsupported.
+The device listing reports the negotiated USB link speed. USB 3 SuperSpeed is
+recommended for U3 models, so they show a reduced-performance warning on USB 2
+HighSpeed. HighSpeed is optimal for U2Pro16; slower links are unsupported.
 
 The hardware probe validates descriptors, claims interface 0, and reads firmware
 and FPGA status. A bounded, idempotent FPGA loader can configure each model from
@@ -71,10 +81,11 @@ cargo run -p dsview-cli -- inspect capture.dsv
 cargo run -p dsview-cli -- simulate 1 --output simulated.dsv
 ```
 
-Here `<resource-directory>` contains `DSLogicU3Pro16.bin` and
-`DSCopeU3P100.bin`. Unmodified copies from the original DSView project are
+Here `<resource-directory>` contains the complete set of 25 `.bin` and `.fw`
+files shipped by the original DSView application. Unmodified copies are
 included under `resources/fpga`; only preparation and hardware-capture commands
-need them.
+need them. The file inventory and SHA-256 hashes are documented in
+`resources/fpga/README.md`.
 
 `list` performs read-only discovery. `probe` opens each supported instrument,
 validates its interface and bulk endpoints, reads the firmware version, and
@@ -92,10 +103,12 @@ path and requires compatible firmware `2.x`, a configured FPGA, and HDL version
 `0x0e`. A successful result means the instrument is ready for acquisition.
 
 `capture-logic <resource-directory> [seconds]` prepares the first connected
-DSLogic U3Pro16 and performs a finite, trigger-free, 16-channel capture at
-1 MHz. The default duration is one second. The driver sends the packed FPGA
-settings, validates the 1 KiB trigger header, transposes the channel-major
-64-sample wire blocks, and emits typed `LogicBatch` frames.
+DSLogic analyzer and performs a finite, trigger-free stream capture at 1 MHz.
+The driver selects legacy or ADF4360 clocking, 512-byte or 1 KiB headers,
+model-specific buffer/rate limits, threshold encoding, and security challenges.
+U3Pro32 uses its extended trigger block and supports a 32-channel mask through
+`DsLogicCaptureConfig::with_enabled_channels_32`. Wire data is transposed from
+channel-major 64-sample blocks into typed `LogicBatch` frames.
 
 `capture-scope <resource-directory>` prepares the first connected DSCope
 U3P100 and performs a finite two-channel capture at 1 MHz with 1 V/div scaling.
