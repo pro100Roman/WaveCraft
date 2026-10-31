@@ -5312,6 +5312,18 @@ impl eframe::App for DsViewApp {
                     {
                         open_recording_clicked = true;
                     }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.snapshot_plot_rect.is_some()
+                                && self.pending_snapshot.is_none(),
+                            toolbar_action_button("📷", TEXT_MUTED),
+                        )
+                        .on_hover_text("Save the visible waveform plot as a PNG snapshot")
+                        .clicked()
+                    {
+                        snapshot_clicked = true;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let logic_only = control_target == Some(CaptureTarget::LogicAnalyzer);
                         let acquisition_active = self.capture_run_requested
@@ -5373,18 +5385,6 @@ impl eframe::App for DsViewApp {
                             if let Some(target) = control_target {
                                 start_request = Some((AcquisitionMode::Single, target));
                             }
-                        }
-                        ui.separator();
-                        if ui
-                            .add_enabled(
-                                self.snapshot_plot_rect.is_some()
-                                    && self.pending_snapshot.is_none(),
-                                toolbar_action_button("📷", TEXT_MUTED),
-                            )
-                            .on_hover_text("Save the visible waveform plot as a PNG snapshot")
-                            .clicked()
-                        {
-                            snapshot_clicked = true;
                         }
                     });
                 });
