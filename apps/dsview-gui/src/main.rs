@@ -79,6 +79,7 @@ const LOGIC_MARKER_LIMIT: usize = 20;
 const CHANNEL_NAME_MAX_CHARS: usize = 32;
 const LOGIC_CHANNEL_NAME_MAX_CHARS: usize = 8;
 const DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY: u8 = 128;
+const LOGIC_MARKER_EDGE_SNAP_DISTANCE: f32 = 8.0;
 const CAPTURE_FILE_BUTTON_WIDTH: f32 = 82.0;
 static SCOPE_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
 
@@ -5131,7 +5132,7 @@ fn paint_logic_marker_settings(
                 ui.add_space(4.0);
                 ui.small(
                     RichText::new(
-                        "Hold the left mouse button on the waveform, drag, then release.",
+                        "Drag with the left mouse button. Endpoints snap to nearby edges on the channel under the pointer.",
                     )
                     .color(ACCENT),
                 );
@@ -7997,6 +7998,122 @@ fn logic_marker_x(
     ))
 }
 
+fn logic_channel_at_y(
+    levels: &[(f32, f32); LOGIC_CHANNEL_COUNT],
+    enabled_channels: &[bool; LOGIC_CHANNEL_COUNT],
+    pointer_y: f32,
+) -> Option<usize> {
+    levels
+        .iter()
+        .enumerate()
+        .filter(|(channel, _)| enabled_channels[*channel])
+        .min_by(|(_, left), (_, right)| {
+            let left_distance = (pointer_y - (left.0 + left.1) * 0.5).abs();
+            let right_distance = (pointer_y - (right.0 + right.1) * 0.5).abs();
+            left_distance.total_cmp(&right_distance)
+        })
+        .map(|(channel, _)| channel)
+}
+
+fn nearest_logic_transition_sample(
+    waveforms: &WaveformStore,
+    channel: usize,
+    target_sample: u64,
+    search_radius: u64,
+) -> Option<u64> {
+    if channel >= LOGIC_CHANNEL_COUNT
+        || waveforms.logic_samples.is_empty()
+        || waveforms.logic_sample_stride == 0
+    {
+        return None;
+    }
+    let local_target = target_sample.saturating_sub(waveforms.logic_sample_offset);
+    let stride = waveforms.logic_sample_stride as u64;
+    let target_bucket = local_target / stride;
+    let bucket_radius = search_radius.div_ceil(stride).saturating_add(2);
+    let first_bucket = target_bucket
+        .saturating_sub(bucket_radius)
+        .min(waveforms.logic_samples.len() as u64) as usize;
+    let end_bucket = target_bucket
+        .saturating_add(bucket_radius)
+        .saturating_add(1)
+        .min(waveforms.logic_samples.len() as u64) as usize;
+    let channel_mask = 1_u32 << channel;
+    let mut closest = None;
+
+    for bucket_index in first_bucket..end_bucket {
+        let bucket = waveforms.logic_samples[bucket_index];
+        let bucket_start = (bucket_index as u64).saturating_mul(stride);
+        if bucket_index > 0 {
+            let previous = waveforms.logic_samples[bucket_index - 1];
+            if (previous.last ^ bucket.first) & channel_mask != 0 {
+                let candidate = waveforms.logic_sample_offset.saturating_add(bucket_start);
+                let distance = candidate.abs_diff(target_sample);
+                if distance <= search_radius
+                    && closest.map_or(true, |(_, closest_distance)| distance < closest_distance)
+                {
+                    closest = Some((candidate, distance));
+                }
+            }
+        }
+        if bucket.activity & channel_mask != 0 {
+            let activity_sample = bucket_start
+                .saturating_add(u64::from(bucket.sample_count) / 2)
+                .min(waveforms.logic_sample_count.saturating_sub(1) as u64);
+            let candidate = waveforms
+                .logic_sample_offset
+                .saturating_add(activity_sample);
+            let distance = candidate.abs_diff(target_sample);
+            if distance <= search_radius
+                && closest.map_or(true, |(_, closest_distance)| distance < closest_distance)
+            {
+                closest = Some((candidate, distance));
+            }
+        }
+    }
+    closest.map(|(sample, _)| sample)
+}
+
+fn logic_marker_sample_at_pointer(
+    plot: Rect,
+    viewport: WaveformViewport,
+    waveforms: &WaveformStore,
+    levels: &[(f32, f32); LOGIC_CHANNEL_COUNT],
+    enabled_channels: &[bool; LOGIC_CHANNEL_COUNT],
+    pointer: Pos2,
+) -> Option<u64> {
+    let sample = logic_sample_at_x(
+        plot,
+        viewport,
+        waveforms.logic_sample_offset,
+        waveforms.logic_sample_count,
+        pointer.x.clamp(plot.left(), plot.right()),
+    )?;
+    let visible_samples_per_pixel = viewport.span
+        * waveforms.logic_sample_count.saturating_sub(1) as f32
+        / plot.width().max(1.0);
+    let search_radius = (visible_samples_per_pixel * LOGIC_MARKER_EDGE_SNAP_DISTANCE).ceil() as u64;
+    let Some(channel) = logic_channel_at_y(levels, enabled_channels, pointer.y) else {
+        return Some(sample);
+    };
+    let Some(snapped) = nearest_logic_transition_sample(waveforms, channel, sample, search_radius)
+    else {
+        return Some(sample);
+    };
+    let snapped_x = logic_marker_x(
+        plot,
+        viewport,
+        waveforms.logic_sample_offset,
+        waveforms.logic_sample_count,
+        snapped,
+    )?;
+    if (snapped_x - pointer.x).abs() <= LOGIC_MARKER_EDGE_SNAP_DISTANCE {
+        Some(snapped)
+    } else {
+        Some(sample)
+    }
+}
+
 fn pan_logic_marker_viewport_at_edge(
     viewport: &mut WaveformViewport,
     plot: Rect,
@@ -8031,6 +8148,8 @@ fn update_logic_marker_gesture(
     plot: Rect,
     waveforms: &WaveformStore,
     viewport: &mut WaveformViewport,
+    levels: &[(f32, f32); LOGIC_CHANNEL_COUNT],
+    enabled_channels: &[bool; LOGIC_CHANNEL_COUNT],
     settings: &mut LogicMarkerSettings,
 ) {
     if !settings.adding
@@ -8055,12 +8174,13 @@ fn update_logic_marker_gesture(
     }
     if pressed {
         if let Some(pointer) = pointer_position.filter(|pointer| plot.contains(*pointer)) {
-            if let Some(sample) = logic_sample_at_x(
+            if let Some(sample) = logic_marker_sample_at_pointer(
                 plot,
                 *viewport,
-                waveforms.logic_sample_offset,
-                waveforms.logic_sample_count,
-                pointer.x,
+                waveforms,
+                levels,
+                enabled_channels,
+                pointer,
             ) {
                 settings.start(sample);
             }
@@ -8071,12 +8191,13 @@ fn update_logic_marker_gesture(
             if down && pan_logic_marker_viewport_at_edge(viewport, plot, pointer.x) {
                 ui.ctx().request_repaint();
             }
-            if let Some(sample) = logic_sample_at_x(
+            if let Some(sample) = logic_marker_sample_at_pointer(
                 plot,
                 *viewport,
-                waveforms.logic_sample_offset,
-                waveforms.logic_sample_count,
-                pointer.x.clamp(plot.left(), plot.right()),
+                waveforms,
+                levels,
+                enabled_channels,
+                pointer,
             ) {
                 settings.update(sample);
             }
@@ -8243,6 +8364,7 @@ fn paint_logic(
     } else {
         waveforms.logic_rate_hz
     };
+    let signal_layout = logic_signal_layout(plot.top(), plot.height(), &*maximum_heights);
     let _ = update_waveform_viewport(
         ui,
         plot,
@@ -8256,7 +8378,15 @@ fn paint_logic(
             zoom_anchor: WaveformZoomAnchor::Pointer,
         },
     );
-    update_logic_marker_gesture(ui, plot, waveforms, viewport, marker_settings);
+    update_logic_marker_gesture(
+        ui,
+        plot,
+        waveforms,
+        viewport,
+        &signal_layout.levels,
+        enabled_channels,
+        marker_settings,
+    );
     let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
     for channel in 0..LOGIC_CHANNEL_COUNT {
         let lane_top = plot.top() + channel as f32 * lane_height;
@@ -8270,7 +8400,6 @@ fn paint_logic(
     }
     let visible_range = viewport.sample_range(sample_count);
     let visible_count = visible_range.len();
-    let signal_layout = logic_signal_layout(plot.top(), plot.height(), &*maximum_heights);
     let mut waveform_points = logic_waveform_points(
         LogicSampleView {
             samples: &waveforms.logic_samples,
@@ -11837,6 +11966,56 @@ mod tests {
             Some(250.0)
         );
         assert_eq!(logic_marker_x(plot, viewport, 2_000, 101, 1_999), None);
+    }
+
+    #[test]
+    fn logic_marker_edges_snap_on_the_channel_under_the_pointer() {
+        let mut waveforms = WaveformStore {
+            logic_channels: 2,
+            logic_rate_hz: 1_000_000,
+            ..WaveformStore::default()
+        };
+        waveforms.configure_logic_capture(101, false);
+        let samples = (0..101)
+            .map(|index| match index {
+                0..20 => 0,
+                20..80 => 0b01,
+                _ => 0b11,
+            })
+            .collect::<Vec<_>>();
+        waveforms.ingest_logic_samples(&samples);
+
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 400.0));
+        let viewport = WaveformViewport::default();
+        let layout = logic_signal_layout(plot.top(), plot.height(), &[1; LOGIC_CHANNEL_COUNT]);
+        let channel_y = |channel: usize| {
+            let (high, low) = layout.levels[channel];
+            (high + low) * 0.5
+        };
+        let enabled_channels = [true; LOGIC_CHANNEL_COUNT];
+
+        assert_eq!(
+            logic_marker_sample_at_pointer(
+                plot,
+                viewport,
+                &waveforms,
+                &layout.levels,
+                &enabled_channels,
+                Pos2::new(77.0, channel_y(1)),
+            ),
+            Some(80)
+        );
+        assert_eq!(
+            logic_marker_sample_at_pointer(
+                plot,
+                viewport,
+                &waveforms,
+                &layout.levels,
+                &enabled_channels,
+                Pos2::new(77.0, channel_y(0)),
+            ),
+            Some(77)
+        );
     }
 
     #[test]
