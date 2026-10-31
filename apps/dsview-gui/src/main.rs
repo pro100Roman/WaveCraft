@@ -76,6 +76,7 @@ const MATH_COLOR: Color32 = Color32::from_rgb(213, 126, 255);
 const FFT_LENGTHS: [usize; 5] = [1_024, 2_048, 4_096, 8_192, 16_384];
 const SCOPE_MARKER_LIMIT: usize = 10;
 const LOGIC_MARKER_LIMIT: usize = 20;
+const LOGIC_MARKER_NAME_MAX_CHARS: usize = 32;
 const CHANNEL_NAME_MAX_CHARS: usize = 32;
 const LOGIC_CHANNEL_NAME_MAX_CHARS: usize = 8;
 const DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY: u8 = 128;
@@ -1415,28 +1416,37 @@ fn default_logic_channel_settings_drafts() -> [LogicChannelSettingsDraft; LOGIC_
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LogicMarker {
+    name: String,
+    color: Color32,
     start_sample: u64,
     end_sample: u64,
     sample_rate_hz: u64,
 }
 
 impl LogicMarker {
-    fn new(first_sample: u64, second_sample: u64, sample_rate_hz: u64) -> Option<Self> {
+    fn new(
+        first_sample: u64,
+        second_sample: u64,
+        sample_rate_hz: u64,
+        color: Color32,
+    ) -> Option<Self> {
         let (start_sample, end_sample) = if first_sample <= second_sample {
             (first_sample, second_sample)
         } else {
             (second_sample, first_sample)
         };
         (start_sample != end_sample && sample_rate_hz != 0).then_some(Self {
+            name: String::new(),
+            color,
             start_sample,
             end_sample,
             sample_rate_hz,
         })
     }
 
-    fn duration(self) -> Duration {
+    fn duration(&self) -> Duration {
         Duration::from_secs_f64(
             self.end_sample.saturating_sub(self.start_sample) as f64 / self.sample_rate_hz as f64,
         )
@@ -1490,8 +1500,12 @@ impl LogicMarkerSettings {
         let Some(draft) = self.draft.take() else {
             return false;
         };
-        let Some(marker) = LogicMarker::new(draft.start_sample, draft.end_sample, sample_rate_hz)
-        else {
+        let Some(marker) = LogicMarker::new(
+            draft.start_sample,
+            draft.end_sample,
+            sample_rate_hz,
+            logic_marker_color(self.markers.len()),
+        ) else {
             return false;
         };
         if self.markers.len() >= LOGIC_MARKER_LIMIT {
@@ -1801,13 +1815,13 @@ impl WaveformViewport {
         if sample_count == 0 {
             return 0..0;
         }
-        let visible_start = self.start.max(0.0);
-        let visible_end = (self.start + self.span).min(1.0);
+        let visible_start = f64::from(self.start).max(0.0);
+        let visible_end = (f64::from(self.start) + f64::from(self.span)).min(1.0);
         if visible_start >= visible_end {
             return 0..0;
         }
-        let start = ((visible_start * sample_count as f32).floor() as usize).min(sample_count - 1);
-        let mut end = (visible_end * sample_count as f32).ceil() as usize;
+        let start = ((visible_start * sample_count as f64).floor() as usize).min(sample_count - 1);
+        let mut end = (visible_end * sample_count as f64).ceil() as usize;
         end = end.clamp(start + 1, sample_count);
         start..end
     }
@@ -1820,14 +1834,14 @@ impl WaveformViewport {
         if available_sample_count == 0 || domain_sample_count == 0 {
             return 0..0;
         }
-        let visible_start = self.start.max(0.0);
-        let visible_end = (self.start + self.span).min(1.0);
+        let visible_start = f64::from(self.start).max(0.0);
+        let visible_end = (f64::from(self.start) + f64::from(self.span)).min(1.0);
         if visible_start >= visible_end {
             return 0..0;
         }
-        let start = ((visible_start * domain_sample_count as f32).floor() as usize)
+        let start = ((visible_start * domain_sample_count as f64).floor() as usize)
             .min(available_sample_count);
-        let end = ((visible_end * domain_sample_count as f32).ceil() as usize)
+        let end = ((visible_end * domain_sample_count as f64).ceil() as usize)
             .min(available_sample_count);
         start..end.max(start)
     }
@@ -5142,10 +5156,23 @@ fn paint_logic_marker_settings(
             }
 
             let mut remove = None;
-            for (index, marker) in settings.markers.iter().copied().enumerate() {
+            for (index, marker) in settings.markers.iter_mut().enumerate() {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.colored_label(logic_marker_color(index), format!("M{}", index + 1));
+                    paint_logic_marker_color_picker(ui, index, &mut marker.color);
+                    if marker.name.trim().is_empty() {
+                        ui.colored_label(marker.color, format!("M{}", index + 1));
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut marker.name)
+                            .char_limit(LOGIC_MARKER_NAME_MAX_CHARS)
+                            .desired_width(105.0)
+                            .hint_text("Name"),
+                    )
+                    .on_hover_text("Optional marker name");
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(26.0);
                     ui.monospace(format_duration(marker.duration()))
                         .on_hover_text(format!(
                             "Samples {}–{} at {}",
@@ -5168,6 +5195,77 @@ fn paint_logic_marker_settings(
                 settings.markers.remove(index);
             }
         });
+}
+
+fn paint_logic_marker_color_picker(ui: &mut egui::Ui, index: usize, color: &mut Color32) {
+    let popup_id = ui.make_persistent_id(("logic_marker_color_popup", index));
+    let button = ui
+        .add(
+            egui::Button::new(RichText::new("◆").color(marker_text_color(*color)))
+                .fill(*color)
+                .min_size(Vec2::splat(18.0)),
+        )
+        .on_hover_text("Change marker color");
+    if button.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+    }
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &button,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |popup_ui| {
+            popup_ui.set_min_width(150.0);
+            popup_ui.set_max_width(150.0);
+            popup_ui.label(RichText::new("Marker color").strong());
+            egui::Grid::new(("logic_marker_color_palette", index))
+                .num_columns(5)
+                .spacing([4.0, 4.0])
+                .show(popup_ui, |ui| {
+                    for palette_index in 0..LOGIC_MARKER_LIMIT {
+                        let palette_color = logic_marker_color(palette_index);
+                        let selected = *color == palette_color;
+                        let response = ui
+                            .add(
+                                egui::Button::new("")
+                                    .fill(palette_color)
+                                    .stroke(Stroke::new(
+                                        if selected { 2.0_f32 } else { 1.0_f32 },
+                                        if selected { Color32::WHITE } else { GRID },
+                                    ))
+                                    .min_size(Vec2::splat(20.0)),
+                            )
+                            .on_hover_text(format!("Color {}", palette_index + 1));
+                        if response.clicked() {
+                            *color = palette_color;
+                            ui.memory_mut(egui::Memory::close_popup);
+                        }
+                        if palette_index % 5 == 4 {
+                            ui.end_row();
+                        }
+                    }
+                });
+            popup_ui.separator();
+            let [mut red, mut green, mut blue, _] = color.to_array();
+            let mut changed = false;
+            egui::Grid::new(("logic_marker_color_rgb", index))
+                .num_columns(2)
+                .spacing([6.0, 3.0])
+                .show(popup_ui, |ui| {
+                    for (label, component) in [("R", &mut red), ("G", &mut green), ("B", &mut blue)]
+                    {
+                        ui.label(label);
+                        changed |= ui
+                            .add(egui::DragValue::new(component).range(0..=255).speed(1))
+                            .changed();
+                        ui.end_row();
+                    }
+                });
+            if changed {
+                *color = Color32::from_rgb(red, green, blue);
+            }
+        },
+    );
 }
 
 struct ScopeToolsOptions {
@@ -7345,8 +7443,8 @@ fn time_scale_sample_window(
     }
     let sample_extent = sample_count.saturating_sub(1).max(1) as f64;
     let first_sample = sample_offset as f64 + viewport.start as f64 * sample_extent;
-    let last_sample =
-        sample_offset as f64 + (viewport.start + viewport.span) as f64 * sample_extent;
+    let last_sample = sample_offset as f64
+        + (f64::from(viewport.start) + f64::from(viewport.span)) * sample_extent;
     Some((first_sample, last_sample))
 }
 
@@ -7863,7 +7961,11 @@ fn logic_waveform_points(
         return points;
     };
     let mut previous = first_bucket.first;
-    let first_x = waveform_sample_x(plot, viewport, first_index as f32, sample_count);
+    let first_x = if viewport.start >= 0.0 {
+        plot.left()
+    } else {
+        waveform_sample_x(plot, viewport, first_index as f64, sample_count)
+    };
     for channel in 0..LOGIC_CHANNEL_COUNT {
         if enabled_channels[channel] {
             let (high, low) = levels[channel];
@@ -7894,7 +7996,7 @@ fn logic_waveform_points(
 
         let mut boundary_changes = (previous ^ bucket.first) & enabled_mask;
         if boundary_changes != 0 {
-            let x = waveform_sample_x(plot, viewport, bucket_start as f32, sample_count)
+            let x = waveform_sample_x(plot, viewport, bucket_start as f64, sample_count)
                 .clamp(plot.left(), plot.right());
             let pixel = (x - plot.left()).floor() as i32;
             while boundary_changes != 0 {
@@ -7915,7 +8017,7 @@ fn logic_waveform_points(
             let activity_index = bucket_start
                 .saturating_add(bucket.sample_count as usize / 2)
                 .min(sample_count.saturating_sub(1));
-            let x = waveform_sample_x(plot, viewport, activity_index as f32, sample_count)
+            let x = waveform_sample_x(plot, viewport, activity_index as f64, sample_count)
                 .clamp(plot.left(), plot.right());
             let pixel = (x - plot.left()).floor() as i32;
             while activity != 0 {
@@ -7940,7 +8042,11 @@ fn logic_waveform_points(
     }
 
     let last_index = visible_range.end - 1;
-    let last_x = waveform_sample_x(plot, viewport, last_index as f32, sample_count);
+    let last_x = if viewport.start + viewport.span <= 1.0 {
+        plot.right()
+    } else {
+        waveform_sample_x(plot, viewport, last_index as f64, sample_count)
+    };
     for channel in 0..LOGIC_CHANNEL_COUNT {
         if !enabled_channels[channel] {
             continue;
@@ -7972,10 +8078,10 @@ fn logic_sample_at_x(
         return None;
     }
     let screen_fraction = ((x - plot.left()) / plot.width().max(1.0)).clamp(0.0, 1.0);
-    let domain_fraction = viewport
-        .domain_fraction_at_screen(screen_fraction)
-        .clamp(0.0, 1.0);
-    let local_sample = (domain_fraction * sample_count.saturating_sub(1) as f32).round() as u64;
+    let domain_fraction = (f64::from(viewport.start)
+        + f64::from(screen_fraction) * f64::from(viewport.span))
+    .clamp(0.0, 1.0);
+    let local_sample = (domain_fraction * sample_count.saturating_sub(1) as f64).round() as u64;
     Some(sample_offset.saturating_add(local_sample))
 }
 
@@ -7993,7 +8099,7 @@ fn logic_marker_x(
     Some(waveform_sample_x(
         plot,
         viewport,
-        sample.saturating_sub(sample_offset) as f32,
+        sample.saturating_sub(sample_offset) as f64,
         sample_count,
     ))
 }
@@ -8256,7 +8362,7 @@ fn paint_logic_markers(
     let last_sample = waveforms
         .logic_sample_offset
         .saturating_add(waveforms.logic_sample_count.saturating_sub(1) as u64);
-    for (index, marker) in settings.markers.iter().copied().enumerate() {
+    for (index, marker) in settings.markers.iter().enumerate() {
         if marker.end_sample < waveforms.logic_sample_offset || marker.start_sample > last_sample {
             continue;
         }
@@ -8284,13 +8390,18 @@ fn paint_logic_markers(
         ) else {
             continue;
         };
+        let marker_label = if marker.name.trim().is_empty() {
+            format!("M{}", index + 1)
+        } else {
+            marker.name.trim().to_owned()
+        };
         paint_logic_marker_span(
             ui.painter(),
             plot,
             start_x,
             end_x,
-            &format!("M{}  {}", index + 1, format_duration(marker.duration())),
-            logic_marker_color(index),
+            &format!("{marker_label}  {}", format_duration(marker.duration())),
+            marker.color,
         );
     }
 
@@ -8315,6 +8426,7 @@ fn paint_logic_markers(
                 draft.start_sample,
                 draft.end_sample,
                 waveforms.logic_rate_hz,
+                ACCENT,
             )
             .map(|marker| format_duration(marker.duration()))
             .unwrap_or_else(|| "0.0 ns".to_owned());
@@ -8994,12 +9106,13 @@ fn should_align_scope_trigger(
 fn waveform_sample_x(
     plot: Rect,
     viewport: WaveformViewport,
-    sample_index: f32,
+    sample_index: f64,
     sample_count: usize,
 ) -> f32 {
-    let sample_fraction = sample_index / sample_count.saturating_sub(1).max(1) as f32;
-    let screen_fraction = viewport.screen_fraction_at_domain(sample_fraction);
-    plot.left() + screen_fraction * plot.width()
+    let sample_fraction = sample_index / sample_count.saturating_sub(1).max(1) as f64;
+    let screen_fraction =
+        (sample_fraction - f64::from(viewport.start)) / f64::from(viewport.span).max(f64::EPSILON);
+    plot.left() + screen_fraction as f32 * plot.width()
 }
 
 fn scope_plot_sample_indices(
@@ -9077,7 +9190,7 @@ fn scope_plot_sample_segments(
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ScopeDisplayBucket {
-    center_index: f32,
+    center_index: f64,
     average: f32,
 }
 
@@ -9109,7 +9222,7 @@ fn scope_downsampled_segments(
                 .map(|value| f64::from(*value))
                 .sum::<f64>();
             buckets.push(ScopeDisplayBucket {
-                center_index: (bucket_start as f32 + (bucket_end - 1) as f32) * 0.5,
+                center_index: (bucket_start as f64 + (bucket_end - 1) as f64) * 0.5,
                 average: (sum / (bucket_end - bucket_start) as f64) as f32,
             });
         }
@@ -10034,7 +10147,7 @@ fn paint_scope_math_trace(
             .into_iter()
             .filter_map(|index| {
                 scope_math_value(waveforms, settings, index).map(|value| {
-                    let x = waveform_sample_x(plot, viewport, index as f32, sample_count);
+                    let x = waveform_sample_x(plot, viewport, index as f64, sample_count);
                     let y = plot.center().y - value / maximum * plot.height() * 0.44;
                     Pos2::new(x, y)
                 })
@@ -10845,7 +10958,7 @@ fn paint_scope_time_domain(
             let points = segment
                 .into_iter()
                 .map(|index| {
-                    let x = waveform_sample_x(plot, *viewport, index as f32, display_sample_count);
+                    let x = waveform_sample_x(plot, *viewport, index as f64, display_sample_count);
                     let y = scope_sample_y(plot, channel_settings, channel[index]);
                     Pos2::new(x, y)
                 })
@@ -11936,6 +12049,12 @@ mod tests {
         assert_eq!(settings.markers[0].start_sample, 0);
         assert_eq!(settings.markers[0].end_sample, 9);
         assert_eq!(settings.markers[0].duration(), Duration::from_millis(9));
+        assert!(settings.markers[0].name.is_empty());
+        assert_eq!(settings.markers[0].color, logic_marker_color(0));
+        settings.markers[0].name = "Clock pulse".to_owned();
+        settings.markers[0].color = Color32::RED;
+        assert_eq!(settings.markers[0].name, "Clock pulse");
+        assert_eq!(settings.markers[0].color, Color32::RED);
         assert!(!settings.arm());
     }
 
@@ -12475,6 +12594,60 @@ mod tests {
             .count();
 
         assert_eq!(pulses_in_first_200_ms, 200);
+    }
+
+    #[test]
+    fn logic_waveform_fills_the_plot_when_high_zoom_shows_one_sample() {
+        let samples = VecDeque::from(vec![0_u32, 1, 1, 0]);
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_000.0, 320.0));
+        let viewport = WaveformViewport {
+            start: 0.4,
+            span: 0.01,
+            anchor_locked: false,
+        };
+        let visible_range = viewport.sample_range(samples.len());
+        assert_eq!(visible_range, 1..2);
+        let mut enabled_channels = [false; LOGIC_CHANNEL_COUNT];
+        enabled_channels[0] = true;
+        let layout = logic_signal_layout(plot.top(), plot.height(), &[1; LOGIC_CHANNEL_COUNT]);
+        let buckets = samples
+            .iter()
+            .copied()
+            .filter_map(|sample| LogicSampleBucket::from_samples(&[sample]))
+            .collect::<VecDeque<_>>();
+
+        let points = logic_waveform_points(
+            LogicSampleView {
+                samples: &buckets,
+                sample_count: samples.len(),
+                sample_stride: 1,
+            },
+            visible_range,
+            plot,
+            viewport,
+            &layout.levels,
+            &enabled_channels,
+        );
+
+        assert_eq!(points[0].first().unwrap().x, plot.left());
+        assert_eq!(points[0].last().unwrap().x, plot.right());
+        assert_eq!(points[0].first().unwrap().y, points[0].last().unwrap().y);
+    }
+
+    #[test]
+    fn high_zoom_keeps_a_visible_range_for_large_logic_captures() {
+        let sample_count = 1_250_000_128;
+        let viewport = WaveformViewport {
+            start: 0.75,
+            span: 1.0 / sample_count as f32,
+            anchor_locked: false,
+        };
+        assert_eq!(viewport.start + viewport.span, viewport.start);
+
+        let visible_range = viewport.sample_range(sample_count);
+
+        assert!(!visible_range.is_empty());
+        assert!(visible_range.len() <= 2);
     }
 
     #[test]
