@@ -1482,13 +1482,17 @@ impl WaveformViewport {
     ) -> bool {
         let cursor_fraction = cursor_fraction.clamp(0.0, 1.0);
         let sample_fraction = self.start + cursor_fraction * self.span;
-        self.step_timebase_at_sample(
+        let changed = self.step_timebase_at_sample(
             scroll_delta,
             sample_count,
             sample_rate_hz,
             sample_fraction,
             cursor_fraction,
-        )
+        );
+        if changed {
+            self.anchor_locked = false;
+        }
+        changed
     }
 
     fn sample_range(self, sample_count: usize) -> Range<usize> {
@@ -1528,6 +1532,14 @@ impl WaveformViewport {
 
     fn zoom_factor(self) -> f32 {
         1.0 / self.span
+    }
+
+    fn domain_fraction_at_screen(self, screen_fraction: f32) -> f32 {
+        self.start + screen_fraction * self.span
+    }
+
+    fn screen_fraction_at_domain(self, domain_fraction: f32) -> f32 {
+        (domain_fraction - self.start) / self.span.max(f32::EPSILON)
     }
 
     fn move_screen_anchor(&mut self, old_fraction: f32, new_fraction: f32) {
@@ -6698,11 +6710,6 @@ fn paint_waveform_time_scale(
     paint_time_scale(painter, rect, first_sample, last_sample, sample_rate_hz);
 }
 
-struct WaveformViewportInteractionOptions {
-    zoom_anchor: Option<(f32, f32)>,
-    reset_on_double_click: bool,
-}
-
 enum WaveformPlotClick {
     Primary { double_clicked: bool, position: f32 },
     Secondary,
@@ -6715,12 +6722,8 @@ fn update_waveform_viewport(
     viewport: &mut WaveformViewport,
     sample_count: usize,
     sample_rate_hz: u64,
-    options: WaveformViewportInteractionOptions,
+    reset_on_double_click: bool,
 ) -> (bool, bool, Option<WaveformPlotClick>) {
-    let WaveformViewportInteractionOptions {
-        zoom_anchor,
-        reset_on_double_click,
-    } = options;
     let mut panned = false;
     let mut timebase_changed = false;
     let response = ui.interact(
@@ -6768,28 +6771,16 @@ fn update_waveform_viewport(
     if response.hovered() {
         let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
         if scroll_delta != 0.0 {
-            if let Some((sample_fraction, screen_fraction)) =
-                zoom_anchor.filter(|_| viewport.anchor_locked)
-            {
-                timebase_changed = viewport.step_timebase_at_sample(
-                    scroll_delta,
-                    sample_count,
-                    sample_rate_hz,
-                    sample_fraction,
-                    screen_fraction,
-                );
-            } else {
-                let pointer_fraction = response
-                    .hover_pos()
-                    .map(|pointer| (pointer.x - rect.left()) / rect.width().max(1.0))
-                    .unwrap_or(0.5);
-                timebase_changed = viewport.step_timebase(
-                    scroll_delta,
-                    sample_count,
-                    sample_rate_hz,
-                    pointer_fraction,
-                );
-            }
+            let pointer_fraction = response
+                .hover_pos()
+                .map(|pointer| (pointer.x - rect.left()) / rect.width().max(1.0))
+                .unwrap_or(0.5);
+            timebase_changed = viewport.step_timebase(
+                scroll_delta,
+                sample_count,
+                sample_rate_hz,
+                pointer_fraction,
+            );
             ui.ctx().request_repaint();
         }
     }
@@ -7034,15 +7025,12 @@ fn paint_logic(
     };
     let _ = update_waveform_viewport(
         ui,
-        waveform_area,
+        plot,
         "logic_waveform_zoom",
         viewport,
         display_sample_count,
         display_sample_rate_hz,
-        WaveformViewportInteractionOptions {
-            zoom_anchor: None,
-            reset_on_double_click: true,
-        },
+        true,
     );
     let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
     for channel in 0..LOGIC_CHANNEL_COUNT {
@@ -7651,7 +7639,7 @@ fn waveform_sample_x(
     sample_count: usize,
 ) -> f32 {
     let sample_fraction = sample_index / sample_count.saturating_sub(1).max(1) as f32;
-    let screen_fraction = (sample_fraction - viewport.start) / viewport.span.max(f32::EPSILON);
+    let screen_fraction = viewport.screen_fraction_at_domain(sample_fraction);
     plot.left() + screen_fraction * plot.width()
 }
 
@@ -7748,6 +7736,19 @@ fn scope_trigger_position_in_view(trigger_sample_fraction: f32, viewport: Wavefo
         i32::from(DSCOPE_TRIGGER_POSITION_MIN_PERCENT),
         i32::from(DSCOPE_TRIGGER_POSITION_MAX_PERCENT),
     ) as u8
+}
+
+fn finish_scope_viewport_pan(
+    trigger_sample_fraction: f32,
+    viewport: &mut WaveformViewport,
+    trigger_settings: &mut ScopeTriggerSettings,
+) {
+    trigger_settings.position_percent =
+        scope_trigger_position_in_view(trigger_sample_fraction, *viewport);
+    // A manual waveform pan must remain detached from the trigger. Relocking
+    // here causes the next frame to recenter the viewport and makes time
+    // markers appear to jump away from their capture positions.
+    viewport.anchor_locked = false;
 }
 
 fn paint_scope_trigger_position(
@@ -8141,29 +8142,40 @@ fn paint_scope_markers(
             .enumerate()
         {
             let color = channel_markers.horizontal_colors[index];
-            let x = egui::lerp(plot.x_range(), position.clamp(0.0, 1.0));
-            let hit_rect = Rect::from_min_max(
-                Pos2::new(x - 7.0, plot.top()),
-                Pos2::new(x + 7.0, plot.bottom()),
+            let x = egui::lerp(
+                plot.x_range(),
+                viewport.screen_fraction_at_domain(position.clamp(0.0, 1.0)),
             );
-            let response = ui
-                .interact(
-                    hit_rect,
-                    ui.make_persistent_id(("scope_time_marker", channel, index)),
-                    Sense::drag(),
-                )
-                .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
-                .on_hover_text(format!(
-                    "Drag {} T{} horizontally",
-                    scope_channel_label(channel, channel_names),
-                    index + 1
-                ));
-            if response.dragged() {
-                if let Some(pointer) = response.interact_pointer_pos() {
-                    *position = ((pointer.x - plot.left()) / plot.width().max(1.0)).clamp(0.0, 1.0);
+            if (plot.left()..=plot.right()).contains(&x) {
+                let hit_rect = Rect::from_min_max(
+                    Pos2::new(x - 7.0, plot.top()),
+                    Pos2::new(x + 7.0, plot.bottom()),
+                );
+                let response = ui
+                    .interact(
+                        hit_rect,
+                        ui.make_persistent_id(("scope_time_marker", channel, index)),
+                        Sense::drag(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+                    .on_hover_text(format!(
+                        "Drag {} T{} horizontally",
+                        scope_channel_label(channel, channel_names),
+                        index + 1
+                    ));
+                if response.dragged() {
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        let screen_fraction = (pointer.x - plot.left()) / plot.width().max(1.0);
+                        *position = viewport
+                            .domain_fraction_at_screen(screen_fraction)
+                            .clamp(0.0, 1.0);
+                    }
                 }
             }
-            let x = egui::lerp(plot.x_range(), position.clamp(0.0, 1.0));
+            let x = egui::lerp(
+                plot.x_range(),
+                viewport.screen_fraction_at_domain(position.clamp(0.0, 1.0)),
+            );
             paint_dashed_line(
                 painter,
                 Pos2::new(x, plot.top()),
@@ -8189,7 +8201,7 @@ fn paint_scope_markers(
             let first = channel_markers.horizontal_positions[index];
             let second = channel_markers.horizontal_positions[other];
             let Some(delta_seconds) =
-                scope_time_marker_delta(first, second, sample_count, sample_rate_hz, viewport)
+                scope_time_marker_delta(first, second, sample_count, sample_rate_hz)
             else {
                 continue;
             };
@@ -8211,7 +8223,10 @@ fn paint_scope_markers(
                     format_duration(Duration::from_secs_f64(delta_seconds))
                 ),
             };
-            let center_x = egui::lerp(plot.x_range(), (first + second) * 0.5);
+            let center_x = egui::lerp(
+                plot.x_range(),
+                viewport.screen_fraction_at_domain((first + second) * 0.5),
+            );
             paint_marker_readout(
                 painter,
                 plot,
@@ -8320,7 +8335,10 @@ fn paint_scope_quick_time_measurement(
             second_position,
         } => (first_position, Some(second_position)),
     };
-    let first_x = egui::lerp(plot.x_range(), first_position);
+    let first_x = egui::lerp(
+        plot.x_range(),
+        viewport.screen_fraction_at_domain(first_position),
+    );
     paint_dashed_line(
         painter,
         Pos2::new(first_x, plot.top()),
@@ -8345,7 +8363,10 @@ fn paint_scope_quick_time_measurement(
         return;
     };
 
-    let second_x = egui::lerp(plot.x_range(), second_position);
+    let second_x = egui::lerp(
+        plot.x_range(),
+        viewport.screen_fraction_at_domain(second_position),
+    );
     paint_dashed_line(
         painter,
         Pos2::new(second_x, plot.top()),
@@ -8363,7 +8384,6 @@ fn paint_scope_quick_time_measurement(
         second_position,
         sample_count,
         sample_rate_hz,
-        viewport,
     ) else {
         return;
     };
@@ -8480,11 +8500,12 @@ fn scope_time_marker_delta(
     second_position: f32,
     sample_count: usize,
     sample_rate_hz: u64,
-    viewport: WaveformViewport,
 ) -> Option<f64> {
-    let visible_seconds = viewport.time_per_division(sample_count, sample_rate_hz)?
-        * SCOPE_HORIZONTAL_DIVISIONS as f64;
-    Some(f64::from((second_position - first_position).abs()) * visible_seconds)
+    if sample_count == 0 || sample_rate_hz == 0 {
+        return None;
+    }
+    let capture_seconds = sample_count as f64 / sample_rate_hz as f64;
+    Some(f64::from((second_position - first_position).abs()) * capture_seconds)
 }
 
 fn scope_voltage_marker_delta(
@@ -9235,30 +9256,26 @@ fn paint_scope_time_domain(
         viewport,
         display_sample_count,
         display_sample_rate_hz,
-        WaveformViewportInteractionOptions {
-            zoom_anchor: (!waveforms.scope_rolling)
-                .then_some((trigger_sample_fraction, trigger_screen_fraction)),
-            reset_on_double_click: false,
-        },
+        false,
     );
     if let Some(click) = waveform_click {
         match click {
             WaveformPlotClick::Primary {
                 double_clicked: true,
                 position,
-            } => quick_time_measurement.start(position),
+            } => quick_time_measurement
+                .start(viewport.domain_fraction_at_screen(position).clamp(0.0, 1.0)),
             WaveformPlotClick::Primary {
                 double_clicked: false,
                 position,
-            } => quick_time_measurement.finish(position),
+            } => quick_time_measurement
+                .finish(viewport.domain_fraction_at_screen(position).clamp(0.0, 1.0)),
             WaveformPlotClick::Secondary => quick_time_measurement.clear(),
         }
     }
     *timebase_changed |= viewport_timebase_changed;
     if viewport_panned && !waveforms.scope_rolling {
-        trigger_settings.position_percent =
-            scope_trigger_position_in_view(trigger_sample_fraction, *viewport);
-        viewport.anchor_locked = true;
+        finish_scope_viewport_pan(trigger_sample_fraction, viewport, trigger_settings);
     }
     *time_per_division_seconds =
         viewport.time_per_division(display_sample_count, display_sample_rate_hz);
@@ -10370,7 +10387,6 @@ mod tests {
     #[test]
     fn scope_markers_measure_horizontal_time_and_vertical_amplitude() {
         let markers = ScopeMarkerSettings::default();
-        let viewport = WaveformViewport::default();
 
         assert!(
             (scope_time_marker_delta(
@@ -10378,7 +10394,6 @@ mod tests {
                 markers.channels[0].horizontal_positions[1],
                 1_000,
                 1_000,
-                viewport,
             )
             .unwrap()
                 - 0.1)
@@ -10495,7 +10510,6 @@ mod tests {
                 channel.horizontal_positions[0],
                 1_000,
                 1_000,
-                WaveformViewport::default(),
             )
             .unwrap()
                 - 0.5)
@@ -10648,6 +10662,7 @@ mod tests {
 
         assert!((viewport.span - 0.5).abs() < f32::EPSILON);
         assert!((viewport.start + viewport.span * 0.25 - 0.25).abs() < 0.000_001);
+        assert!(!viewport.anchor_locked);
         assert!(viewport.sample_range(1_000).len() < 1_000);
         assert_eq!(viewport.time_per_division(1_000_000, 1_000_000), Some(0.05));
     }
@@ -10659,7 +10674,9 @@ mod tests {
 
         viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.75);
 
-        assert_eq!(viewport, WaveformViewport::default());
+        assert_eq!(viewport.start, 0.0);
+        assert_eq!(viewport.span, 1.0);
+        assert!(!viewport.anchor_locked);
         assert_eq!(viewport.sample_range(1_000), 0..1_000);
     }
 
@@ -11125,6 +11142,40 @@ mod tests {
     }
 
     #[test]
+    fn scope_time_marker_coordinates_stay_attached_to_the_capture() {
+        let plot = Rect::from_min_max(Pos2::new(100.0, 20.0), Pos2::new(900.0, 420.0));
+        let mut viewport = WaveformViewport {
+            start: 0.25,
+            span: 0.5,
+            ..WaveformViewport::default()
+        };
+        let marker_position = viewport.domain_fraction_at_screen(0.5);
+
+        assert!((marker_position - 0.5).abs() < f32::EPSILON);
+        assert!(
+            (egui::lerp(
+                plot.x_range(),
+                viewport.screen_fraction_at_domain(marker_position)
+            ) - 500.0)
+                .abs()
+                < f32::EPSILON
+        );
+
+        assert!(viewport.pan_by_screen_delta(-100.0, plot.width()));
+        assert!(
+            (egui::lerp(
+                plot.x_range(),
+                viewport.screen_fraction_at_domain(marker_position)
+            ) - 400.0)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (scope_time_marker_delta(0.25, 0.5, 1_000, 1_000).unwrap() - 0.25).abs() < 0.000_001
+        );
+    }
+
+    #[test]
     fn scope_downsampling_preserves_trigger_crossing_samples() {
         let indices = scope_plot_sample_indices(
             0..1_000,
@@ -11165,6 +11216,12 @@ mod tests {
         assert_eq!(scope_trigger_position_in_view(0.5, viewport), 50);
         assert!(viewport.pan_by_screen_delta(-100.0, 1_000.0));
         assert_eq!(scope_trigger_position_in_view(0.5, viewport), 40);
+        let panned_start = viewport.start;
+        let mut trigger_settings = ScopeTriggerSettings::default();
+        finish_scope_viewport_pan(0.5, &mut viewport, &mut trigger_settings);
+        assert_eq!(trigger_settings.position_percent, 40);
+        assert_eq!(viewport.start, panned_start);
+        assert!(!viewport.anchor_locked);
 
         viewport.start = 0.25;
         viewport.anchor_locked = true;
