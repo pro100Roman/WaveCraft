@@ -736,6 +736,13 @@ impl ScopeMarkerKind {
     }
 }
 
+fn scope_marker_default_position(kind: ScopeMarkerKind, viewport: WaveformViewport) -> f32 {
+    match kind {
+        ScopeMarkerKind::Time => viewport.domain_fraction_at_screen(0.5).clamp(0.0, 1.0),
+        ScopeMarkerKind::Voltage => 0.5,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ScopeMarkerKey {
     channel: usize,
@@ -754,24 +761,27 @@ struct ScopeMarkerEditor {
 }
 
 impl ScopeMarkerEditor {
-    fn for_new(settings: ScopeMarkerSettings, channel: usize, kind: ScopeMarkerKind) -> Self {
+    fn for_new(
+        settings: ScopeMarkerSettings,
+        viewport: WaveformViewport,
+        channel: usize,
+        kind: ScopeMarkerKind,
+    ) -> Self {
         let channel_settings = settings.channels[channel];
         let index = channel_settings.count(kind);
-        let (position, color) = match kind {
-            ScopeMarkerKind::Time => (
-                channel_settings.horizontal_positions[index.min(SCOPE_MARKER_LIMIT - 1)],
-                channel_settings.horizontal_colors[index.min(SCOPE_MARKER_LIMIT - 1)],
-            ),
-            ScopeMarkerKind::Voltage => (
-                channel_settings.vertical_positions[index.min(SCOPE_MARKER_LIMIT - 1)],
-                channel_settings.vertical_colors[index.min(SCOPE_MARKER_LIMIT - 1)],
-            ),
+        let color = match kind {
+            ScopeMarkerKind::Time => {
+                channel_settings.horizontal_colors[index.min(SCOPE_MARKER_LIMIT - 1)]
+            }
+            ScopeMarkerKind::Voltage => {
+                channel_settings.vertical_colors[index.min(SCOPE_MARKER_LIMIT - 1)]
+            }
         };
         Self {
             original: None,
             channel,
             kind,
-            position,
+            position: scope_marker_default_position(kind, viewport),
             comparison: None,
             color,
         }
@@ -3611,6 +3621,7 @@ fn paint_scope_marker_settings(
     ui: &mut egui::Ui,
     settings: &mut ScopeMarkerSettings,
     editor: &mut Option<ScopeMarkerEditor>,
+    viewport: WaveformViewport,
     channels: [bool; 2],
     channel_names: &[String; 2],
 ) {
@@ -3642,6 +3653,7 @@ fn paint_scope_marker_settings(
                                     {
                                         *editor = Some(ScopeMarkerEditor::for_new(
                                             *settings,
+                                            viewport,
                                             channel,
                                             ScopeMarkerKind::Time,
                                         ));
@@ -3737,6 +3749,7 @@ fn paint_scope_marker_editor(
     context: &egui::Context,
     editor_state: &mut Option<ScopeMarkerEditor>,
     settings: &mut ScopeMarkerSettings,
+    viewport: WaveformViewport,
     channels: [bool; 2],
     channel_names: &[String; 2],
 ) {
@@ -3789,6 +3802,9 @@ fn paint_scope_marker_editor(
             });
             if kind_before != editor.kind {
                 editor.comparison = None;
+                if editor.original.is_none() {
+                    editor.position = scope_marker_default_position(editor.kind, viewport);
+                }
             }
 
             ui.add_space(8.0);
@@ -4466,6 +4482,11 @@ fn paint_capture_settings(
     scope_settings.clamp_to_channel_limits();
 }
 
+struct ScopeToolsOptions {
+    viewport: WaveformViewport,
+    trigger_controls_enabled: bool,
+}
+
 fn paint_scope_tools(
     ui: &mut egui::Ui,
     scope_settings: &mut ScopeCaptureSettings,
@@ -4473,8 +4494,12 @@ fn paint_scope_tools(
     marker_settings: &mut ScopeMarkerSettings,
     marker_editor: &mut Option<ScopeMarkerEditor>,
     channel_names: &[String; 2],
-    trigger_controls_enabled: bool,
+    options: ScopeToolsOptions,
 ) {
+    let ScopeToolsOptions {
+        viewport,
+        trigger_controls_enabled,
+    } = options;
     let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
     scope_settings.trigger.clamp_to_channels(channel_enabled);
     function_settings.clamp_to_channels(channel_enabled);
@@ -4500,6 +4525,7 @@ fn paint_scope_tools(
         ui,
         marker_settings,
         marker_editor,
+        viewport,
         channel_enabled,
         channel_names,
     );
@@ -5006,7 +5032,10 @@ impl eframe::App for DsViewApp {
                                         &mut self.scope_marker_settings,
                                         &mut self.scope_marker_editor,
                                         &self.scope_channel_names,
-                                        trigger_controls_enabled,
+                                        ScopeToolsOptions {
+                                            viewport: self.scope_viewport,
+                                            trigger_controls_enabled,
+                                        },
                                     );
                                 });
                         });
@@ -5532,6 +5561,7 @@ impl eframe::App for DsViewApp {
             context,
             &mut self.scope_marker_editor,
             &mut self.scope_marker_settings,
+            self.scope_viewport,
             self.scope_settings.channels.map(|channel| channel.enabled),
             &self.scope_channel_names,
         );
@@ -10484,14 +10514,31 @@ mod tests {
     }
 
     #[test]
+    fn new_scope_markers_start_in_the_visible_pane_center() {
+        let settings = ScopeMarkerSettings::default();
+        let viewport = WaveformViewport {
+            start: 0.6,
+            span: 0.2,
+            ..WaveformViewport::default()
+        };
+
+        let time = ScopeMarkerEditor::for_new(settings, viewport, 0, ScopeMarkerKind::Time);
+        let voltage = ScopeMarkerEditor::for_new(settings, viewport, 0, ScopeMarkerKind::Voltage);
+
+        assert!((time.position - 0.7).abs() < f32::EPSILON);
+        assert!((voltage.position - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn scope_markers_are_saved_and_compared_individually() {
         let mut settings = ScopeMarkerSettings::default();
-        let mut first = ScopeMarkerEditor::for_new(settings, 0, ScopeMarkerKind::Time);
+        let viewport = WaveformViewport::default();
+        let mut first = ScopeMarkerEditor::for_new(settings, viewport, 0, ScopeMarkerKind::Time);
         first.position = 0.2;
         first.color = Color32::RED;
         assert!(first.save(&mut settings));
 
-        let mut second = ScopeMarkerEditor::for_new(settings, 0, ScopeMarkerKind::Time);
+        let mut second = ScopeMarkerEditor::for_new(settings, viewport, 0, ScopeMarkerKind::Time);
         second.position = 0.7;
         second.comparison = Some(0);
         assert!(second.save(&mut settings));
@@ -10526,18 +10573,20 @@ mod tests {
     #[test]
     fn scope_marker_limit_is_shared_across_types_and_markers_can_change_type() {
         let mut settings = ScopeMarkerSettings::default();
+        let viewport = WaveformViewport::default();
         for index in 0..SCOPE_MARKER_LIMIT {
             let kind = if index % 2 == 0 {
                 ScopeMarkerKind::Time
             } else {
                 ScopeMarkerKind::Voltage
             };
-            let editor = ScopeMarkerEditor::for_new(settings, 0, kind);
+            let editor = ScopeMarkerEditor::for_new(settings, viewport, 0, kind);
             assert!(editor.save(&mut settings));
         }
         assert_eq!(settings.channels[0].total_count(), SCOPE_MARKER_LIMIT);
         assert!(
-            !ScopeMarkerEditor::for_new(settings, 0, ScopeMarkerKind::Time).save(&mut settings)
+            !ScopeMarkerEditor::for_new(settings, viewport, 0, ScopeMarkerKind::Time)
+                .save(&mut settings)
         );
 
         let key = ScopeMarkerKey {
