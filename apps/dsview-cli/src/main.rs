@@ -1,5 +1,8 @@
 use dsview_core::{CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSource, DeviceId};
-use dsview_recording::{CompletionStatus, RecordingReader, RecordingWriter, FORMAT_VERSION};
+use dsview_recording::{
+    export_saleae_recording, import_saleae_recording, CompletionStatus, RecordingReader,
+    RecordingWriter, FORMAT_VERSION,
+};
 use dsview_sim::{SimulatedLogicAnalyzer, SimulatedOscilloscope};
 use dsview_usb::{
     discover_supported_devices, load_device_fpga, prepare_device, probe_device, DeviceModel,
@@ -13,7 +16,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: dsview-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
+const USAGE: &str = "usage: dsview-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
 
 type FileRecorder = RecordingWriter<BufWriter<File>>;
 
@@ -31,6 +34,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         [command] if command == "list" => return list_devices(),
         [command] if command == "probe" => return probe_devices(),
         [command, path] if command == "inspect" => return inspect_recording(Path::new(path)),
+        [command, input, output] if command == "import" => {
+            return import_saleae(Path::new(input), Path::new(output));
+        }
+        [command, input, output] if command == "export" => {
+            return export_saleae(Path::new(input), Path::new(output));
+        }
         [command, resource_directory] if command == "load-fpga" => {
             return load_fpgas(Path::new(resource_directory));
         }
@@ -87,6 +96,36 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     run_simulation(run_seconds, None)
+}
+
+fn import_saleae(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+    let input_file = File::open(input)?;
+    let output_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    import_saleae_recording(BufReader::new(input_file), BufWriter::new(output_file))?;
+    println!(
+        "imported Saleae capture {} to {}",
+        input.display(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn export_saleae(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+    let input_file = File::open(input)?;
+    let output_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    export_saleae_recording(BufReader::new(input_file), BufWriter::new(output_file))?;
+    println!(
+        "exported DSView capture {} to {}",
+        input.display(),
+        output.display()
+    );
+    Ok(())
 }
 
 fn capture_usb(resource_directory: &Path, output: Option<&Path>) -> Result<(), Box<dyn Error>> {

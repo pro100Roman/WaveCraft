@@ -1,5 +1,13 @@
 //! Versioned, lossless, streaming capture recordings.
 
+mod saleae;
+
+pub use saleae::{
+    export_saleae_recording, import_saleae_recording, read_saleae, write_saleae,
+    SaleaeAnalogChannel, SaleaeCapture, SaleaeChannel, SaleaeConversionError, SaleaeDigitalCapture,
+    SaleaeError,
+};
+
 use crc32fast::hash;
 use dsview_core::{
     CaptureBatch, CaptureError, CaptureEvent, CaptureFrame, DeviceDescriptor, DeviceId,

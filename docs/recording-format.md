@@ -46,3 +46,17 @@ counts before allocation, and verify the footer's event count.
 
 The native file is the source of truth. Future CSV, VCD, or decoder exports may
 represent only compatible subsets, but must not modify the original recording.
+
+## Saleae Logic 2 interoperability
+
+The recording crate can import and export the ZIP-based `.sal` container used
+by Saleae Logic 2. It reads and writes `<SALEAE>` binary version 3 digital RLE
+channels, analog `i16` channels and their rendering pyramids, schema-version-22
+metadata, and the empty trigger store. Conversion preserves sample rates,
+channel indices and names, packed digital values, and analog voltages (subject
+to the format's 12-bit signed quantization). It does not translate triggers,
+protocol analyzers, measurements, or view state.
+
+`.sal` is an internal, explicitly unstable format. Readers reject unknown
+binary versions rather than guessing at their layout. The native `.dsv` file
+remains the lossless source of truth.

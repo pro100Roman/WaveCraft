@@ -123,6 +123,23 @@ overwritten. Use `inspect <capture.dsv>` to validate a recording and print its
 per-device totals without connected hardware. The format is documented in
 `docs/recording-format.md`.
 
+Saleae Logic 2 captures can be converted without connected hardware:
+
+```sh
+cargo run -p dsview-cli -- import capture.sal capture.dsv
+cargo run -p dsview-cli -- export capture.dsv capture.sal
+```
+
+The GUI's **Open** dialog accepts `.dsv` and `.sal`; **Export** writes the
+completed in-memory capture as `.sal`. For a capture that the GUI had to
+decimate or trim for display, use the CLI on the original `.dsv` to preserve
+every sample. Saleae export carries digital samples, analog voltages, sample
+rates, enabled channels, and channel names. Trigger configuration, analyzers,
+and DSView-only settings are not representable and are omitted. DSView supports
+the current `<SALEAE>` binary version 3 layout and reports other internal
+revisions as unsupported because Saleae does not promise `.sal` format
+stability.
+
 ## Run the desktop application
 
 Install Rust 1.76 or newer and run these commands from the workspace root.
@@ -250,7 +267,7 @@ cargo test --workspace
 ## Workspace layout
 
 - `crates/dsview-core`: device-independent capture types and concurrency.
-- `crates/dsview-recording`: versioned lossless capture writer and reader.
+- `crates/dsview-recording`: native recording plus Saleae `.sal` import/export.
 - `crates/dsview-sim`: deterministic simulated logic and scope sources.
 - `crates/dsview-usb`: USB discovery, claimed sessions, control transport, FPGA loading, and DSLogic/DSCope capture.
 - `apps/dsview-cli`: simultaneous-capture development harness.

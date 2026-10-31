@@ -7,7 +7,10 @@ use dsview_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSession, CaptureSource,
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
 };
-use dsview_recording::{CompletionStatus, RecordingReader, RecordingWriter};
+use dsview_recording::{
+    read_saleae, write_saleae, CompletionStatus, RecordingReader, RecordingWriter,
+    SaleaeAnalogChannel, SaleaeCapture, SaleaeChannel, SaleaeDigitalCapture,
+};
 use dsview_usb::{
     apply_dscope_configuration, auto_calibrate_dscope_with_progress, discover_supported_devices,
     prepare_device, read_dscope_calibration, write_dscope_calibration, DeviceModel,
@@ -35,7 +38,7 @@ use protocol_analyzer::{
 };
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read};
+use std::io::{BufReader, BufWriter, Read, Seek};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -263,9 +266,50 @@ fn choose_recording_save_path(current_path: &str) -> Option<PathBuf> {
 
 fn choose_recording_to_open() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("Open DSView capture")
+        .set_title("Open capture")
+        .add_filter("Supported captures", &["dsv", "sal"])
         .add_filter("DSView capture", &["dsv"])
+        .add_filter("Saleae Logic 2 capture", &["sal"])
         .pick_file()
+}
+
+fn normalize_saleae_path(mut path: PathBuf) -> PathBuf {
+    let has_sal_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("sal"));
+    if !has_sal_extension {
+        path.set_extension("sal");
+    }
+    path
+}
+
+fn available_saleae_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("capture");
+    for index in 2_u32.. {
+        let candidate = parent.join(format!("{stem}-{index}.sal"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("the Saleae file suffix cannot be exhausted")
+}
+
+fn choose_saleae_export_path() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Export Saleae Logic 2 capture")
+        .add_filter("Saleae Logic 2 capture", &["sal"])
+        .set_file_name("capture.sal")
+        .save_file()
+        .map(normalize_saleae_path)
+        .map(available_saleae_path)
 }
 
 fn main() -> eframe::Result<()> {
@@ -2219,6 +2263,7 @@ enum WorkerSuccess {
         path: PathBuf,
         recording: Box<LoadedRecording>,
     },
+    SaleaeExported(PathBuf),
 }
 
 type WorkerResult = Result<WorkerSuccess, String>;
@@ -2410,6 +2455,44 @@ impl DsViewApp {
                     path,
                     recording: Box::new(recording),
                 });
+            let _ = sender.send(result);
+        });
+    }
+
+    fn begin_export_saleae(&mut self, path: PathBuf) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(completed) = self.completed_capture.as_ref() else {
+            self.set_error("There is no completed capture to export".to_owned());
+            return;
+        };
+        let capture = match saleae_capture_from_display(
+            completed,
+            &self.logic_settings,
+            &self.logic_channel_names,
+            &self.scope_channel_names,
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.pending = Some(receiver);
+        self.status = format!("Exporting Saleae capture {}…", path.display());
+        self.last_error = None;
+        thread::spawn(move || {
+            let result = (|| {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+                write_saleae(BufWriter::new(file), &capture).map_err(|error| error.to_string())?;
+                Ok(WorkerSuccess::SaleaeExported(path))
+            })();
             let _ = sender.send(result);
         });
     }
@@ -3141,6 +3224,10 @@ impl DsViewApp {
                     path.display(),
                     recording_completion_label(completion)
                 );
+                self.last_error = None;
+            }
+            Ok(WorkerSuccess::SaleaeExported(path)) => {
+                self.status = format!("Exported Saleae capture to {}", path.display());
                 self.last_error = None;
             }
             Ok(WorkerSuccess::ScopeConfigured(device_count)) => {
@@ -5850,6 +5937,7 @@ impl eframe::App for DsViewApp {
         let mut snapshot_clicked = false;
         let mut record_now_clicked = false;
         let mut open_recording_clicked = false;
+        let mut export_saleae_clicked = false;
         let mut start_request = None;
         let mut stop_clicked = false;
         let mut calibration_action = None;
@@ -5961,6 +6049,17 @@ impl eframe::App for DsViewApp {
                         .clicked()
                     {
                         open_recording_clicked = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.is_busy() && self.completed_capture.is_some(),
+                            toolbar_action_button("Export", TEXT_MUTED)
+                                .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
+                        )
+                        .on_hover_text("Export the completed capture as a Saleae Logic 2 .sal file")
+                        .clicked()
+                    {
+                        export_saleae_clicked = true;
                     }
                     ui.separator();
                     if ui
@@ -6759,6 +6858,11 @@ impl eframe::App for DsViewApp {
                 self.begin_open_recording(path);
             }
         }
+        if export_saleae_clicked {
+            if let Some(path) = choose_saleae_export_path() {
+                self.begin_export_saleae(path);
+            }
+        }
         if refresh_clicked {
             self.begin_refresh();
         }
@@ -7421,8 +7525,203 @@ fn read_gui_recording(input: impl Read) -> Result<LoadedRecording, String> {
 fn load_gui_recording(path: &Path) -> Result<LoadedRecording, String> {
     let file = File::open(path)
         .map_err(|error| format!("failed to open recording {}: {error}", path.display()))?;
-    read_gui_recording(BufReader::new(file))
-        .map_err(|error| format!("failed to read recording {}: {error}", path.display()))
+    let is_saleae = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("sal"));
+    let result = if is_saleae {
+        read_gui_saleae(BufReader::new(file))
+    } else {
+        read_gui_recording(BufReader::new(file))
+    };
+    result.map_err(|error| format!("failed to read recording {}: {error}", path.display()))
+}
+
+fn read_gui_saleae(input: impl Read + Seek) -> Result<LoadedRecording, String> {
+    let saleae = read_saleae(input).map_err(|error| error.to_string())?;
+    let has_logic = saleae.digital.is_some();
+    let has_scope = !saleae.analog.is_empty();
+    if !has_logic && !has_scope {
+        return Err("Saleae capture contains no supported channels".to_owned());
+    }
+
+    let mut logic_settings = LogicCaptureSettings {
+        enabled_channels: [false; LOGIC_CHANNEL_COUNT],
+        ..LogicCaptureSettings::default()
+    };
+    let mut logic_names = empty_logic_channel_names();
+    let mut waveforms = WaveformStore::default();
+    if let Some(digital) = &saleae.digital {
+        for channel in &digital.channels {
+            let index = usize::from(channel.index);
+            if index >= LOGIC_CHANNEL_COUNT {
+                return Err(format!(
+                    "Saleae digital channel {} exceeds the GUI's {} channels",
+                    channel.index, LOGIC_CHANNEL_COUNT
+                ));
+            }
+            logic_settings.enabled_channels[index] = true;
+            logic_names[index] = normalized_channel_name(&channel.name);
+        }
+        if DSLOGIC_SAMPLE_RATES_HZ.contains(&digital.sample_rate_hz) {
+            logic_settings.sample_rate_hz = digital.sample_rate_hz;
+        }
+        waveforms.configure_logic_capture(digital.samples.len() as u64, false);
+        waveforms.ingest(
+            &CaptureBatch::Logic(dsview_core::LogicBatch {
+                sample_rate_hz: digital.sample_rate_hz,
+                channel_count: digital
+                    .channels
+                    .iter()
+                    .map(|channel| channel.index + 1)
+                    .max()
+                    .unwrap_or(0),
+                samples: digital.samples.clone(),
+            }),
+            [false; 2],
+        );
+    }
+
+    let mut scope_settings = ScopeCaptureSettings::default();
+    for channel in &mut scope_settings.channels {
+        channel.enabled = false;
+    }
+    let mut scope_names = empty_scope_channel_names();
+    if has_scope {
+        let rate = saleae
+            .analog_sample_rate_hz
+            .ok_or_else(|| "Saleae analog sample rate is missing".to_owned())?;
+        if DSCOPE_SAMPLE_RATES_HZ.contains(&rate) {
+            scope_settings.sample_rate_hz = rate;
+        }
+        let maximum_samples = saleae
+            .analog
+            .iter()
+            .map(|channel| channel.samples.len())
+            .max()
+            .unwrap_or(0);
+        waveforms.scope_capacity = maximum_samples.clamp(1, MAX_WAVEFORM_SAMPLES);
+        let mut enabled = [false; 2];
+        let mut channels = Vec::with_capacity(saleae.analog.len());
+        for channel in &saleae.analog {
+            let index = usize::from(channel.index);
+            if index >= 2 {
+                return Err(format!(
+                    "Saleae analog channel {} exceeds the GUI's two scope channels",
+                    channel.index
+                ));
+            }
+            enabled[index] = true;
+            scope_settings.channels[index].enabled = true;
+            scope_names[index] = normalized_channel_name(&channel.name);
+            channels.push(channel.samples.clone());
+        }
+        waveforms.ingest(
+            &CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: rate,
+                trigger_sample_index: None,
+                channels,
+            }),
+            enabled,
+        );
+    }
+
+    Ok(LoadedRecording {
+        capture: CompletedCapture {
+            waveforms,
+            has_logic,
+            has_scope,
+        },
+        logic_settings: has_logic.then_some(logic_settings),
+        scope_settings: has_scope.then_some(scope_settings),
+        logic_channel_names: logic_names,
+        scope_channel_names: scope_names,
+        completion: CompletionStatus::Complete,
+    })
+}
+
+fn saleae_capture_from_display(
+    completed: &CompletedCapture,
+    logic_settings: &LogicCaptureSettings,
+    logic_names: &[String; LOGIC_CHANNEL_COUNT],
+    scope_names: &[String; 2],
+) -> Result<SaleaeCapture, String> {
+    let waveforms = &completed.waveforms;
+    let digital = if completed.has_logic && !waveforms.logic_samples.is_empty() {
+        if waveforms.logic_sample_stride != 1 || waveforms.logic_sample_offset != 0 {
+            return Err(
+                "This logic capture was decimated for display; export its original .dsv file with dsview-cli to preserve every sample"
+                    .to_owned(),
+            );
+        }
+        if waveforms
+            .logic_samples
+            .iter()
+            .any(|bucket| bucket.sample_count != 1)
+        {
+            return Err(
+                "The displayed logic capture does not contain individual samples".to_owned(),
+            );
+        }
+        let mut channels = (0..usize::from(waveforms.logic_channels).min(LOGIC_CHANNEL_COUNT))
+            .filter(|index| logic_settings.enabled_channels[*index])
+            .map(|index| SaleaeChannel {
+                index: index as u8,
+                name: normalized_channel_name(&logic_names[index]),
+            })
+            .collect::<Vec<_>>();
+        if channels.is_empty() {
+            channels = (0..usize::from(waveforms.logic_channels).min(LOGIC_CHANNEL_COUNT))
+                .map(|index| SaleaeChannel {
+                    index: index as u8,
+                    name: normalized_channel_name(&logic_names[index]),
+                })
+                .collect();
+        }
+        Some(SaleaeDigitalCapture {
+            sample_rate_hz: waveforms.logic_rate_hz,
+            samples: waveforms
+                .logic_samples
+                .iter()
+                .map(|bucket| bucket.first)
+                .collect(),
+            channels,
+        })
+    } else {
+        None
+    };
+
+    if waveforms.scope_sample_offset != 0 {
+        return Err(
+            "This scope capture was trimmed for display; export its original .dsv file with dsview-cli to preserve every sample"
+                .to_owned(),
+        );
+    }
+    let analog = if completed.has_scope {
+        waveforms
+            .scope_channels
+            .iter()
+            .enumerate()
+            .filter(|(_, samples)| !samples.is_empty())
+            .map(|(index, samples)| {
+                SaleaeAnalogChannel::with_automatic_range(
+                    index as u8,
+                    normalized_channel_name(&scope_names[index]),
+                    samples.iter().copied().collect(),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if digital.is_none() && analog.is_empty() {
+        return Err("There are no captured samples to export".to_owned());
+    }
+    Ok(SaleaeCapture {
+        digital,
+        analog_sample_rate_hz: (!analog.is_empty()).then_some(waveforms.scope_rate_hz),
+        analog,
+    })
 }
 
 fn recording_completion_label(completion: CompletionStatus) -> &'static str {
@@ -11820,6 +12119,65 @@ mod tests {
             normalize_recording_path(PathBuf::from("capture.txt")),
             PathBuf::from("capture.dsv")
         );
+    }
+
+    #[test]
+    fn saleae_paths_use_the_sal_extension() {
+        assert_eq!(
+            normalize_saleae_path(PathBuf::from("capture")),
+            PathBuf::from("capture.sal")
+        );
+        assert_eq!(
+            normalize_saleae_path(PathBuf::from("capture.SAL")),
+            PathBuf::from("capture.SAL")
+        );
+        assert_eq!(
+            normalize_saleae_path(PathBuf::from("capture.zip")),
+            PathBuf::from("capture.sal")
+        );
+    }
+
+    #[test]
+    fn gui_saleae_reader_restores_channels_names_and_samples() {
+        let capture = SaleaeCapture {
+            digital: Some(SaleaeDigitalCapture {
+                sample_rate_hz: 1_000_000,
+                samples: vec![0, 1, 3, 2],
+                channels: vec![
+                    SaleaeChannel {
+                        index: 0,
+                        name: "Clock".to_owned(),
+                    },
+                    SaleaeChannel {
+                        index: 1,
+                        name: "Data".to_owned(),
+                    },
+                ],
+            }),
+            analog_sample_rate_hz: Some(1_000_000),
+            analog: vec![SaleaeAnalogChannel {
+                index: 0,
+                name: "Input".to_owned(),
+                samples: vec![-1.0, 0.0, 1.0, 0.5],
+                minimum_voltage: -2.0,
+                maximum_voltage: 2.0,
+            }],
+        };
+        let mut bytes = Cursor::new(Vec::new());
+        write_saleae(&mut bytes, &capture).expect("Saleae capture should serialize");
+        bytes.set_position(0);
+
+        let loaded = read_gui_saleae(bytes).expect("Saleae capture should open");
+
+        assert!(loaded.capture.has_logic);
+        assert!(loaded.capture.has_scope);
+        assert_eq!(loaded.logic_channel_names[0], "Clock");
+        assert_eq!(loaded.logic_channel_names[1], "Data");
+        assert_eq!(loaded.scope_channel_names[0], "Input");
+        assert_eq!(loaded.capture.waveforms.logic_samples.len(), 4);
+        assert_eq!(loaded.capture.waveforms.logic_samples[2].first, 3);
+        assert_eq!(loaded.capture.waveforms.scope_channels[0].len(), 4);
+        assert!((loaded.capture.waveforms.scope_channels[0][2] - 1.0).abs() < 0.002);
     }
 
     #[test]
