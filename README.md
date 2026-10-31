@@ -203,11 +203,11 @@ for diagnostics.
 
 The application discovers supported USB instruments without blocking the UI,
 then prepares and captures from the selected sources concurrently. Instrument
-discovery, refresh, and selection are managed from **App → Settings…** alongside
-the FPGA resource directory, which validates that both required bitstreams are
-present and can restore the bundled resource location. The application displays
-all 16 digital channels, both calibrated scope channels, per-device sample
-totals, errors, and shared-timeline start skew. Capture Setup provides separate
+discovery, refresh, and selection are managed from **App → Settings…**. Required
+FPGA and firmware resources are selected automatically from the application
+bundle or workspace resource directory. The application displays all 16 digital
+channels, both calibrated scope channels, per-device sample totals, errors, and
+shared-timeline start skew. Capture Setup provides separate
 DSLogic and DSCope settings tabs while recording controls remain shared across
 the synchronized session in a fixed-width sidebar. DSCope settings provide a
 common sample rate and capture buffer plus independent volts/div, AC/DC

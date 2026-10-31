@@ -6610,51 +6610,30 @@ impl eframe::App for DsViewApp {
         let mut settings_open = self.settings_open;
         let mut close_settings = false;
         let settings_locked = self.is_busy();
+        if settings_open {
+            let screen_rect = context.input(|input| input.screen_rect());
+            egui::Area::new(egui::Id::new("settings_modal_backdrop"))
+                .order(egui::Order::Middle)
+                .fixed_pos(screen_rect.min)
+                .show(context, |ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(screen_rect.size(), Sense::click_and_drag());
+                    ui.painter().rect_filled(
+                        rect,
+                        egui::Rounding::ZERO,
+                        Color32::from_black_alpha(112),
+                    );
+                });
+        }
         egui::Window::new("Settings")
             .open(&mut settings_open)
+            .order(egui::Order::Foreground)
             .collapsible(false)
-            .resizable(true)
-            .default_size([560.0, 620.0])
-            .min_width(480.0)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size([250.0, 240.0])
             .show(context, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.label(RichText::new("FPGA RESOURCES").strong().color(ACCENT));
-                    ui.add_space(8.0);
-                    ui.label("Resource directory");
-                    ui.add_enabled(
-                        !settings_locked,
-                        egui::TextEdit::singleline(&mut self.resource_directory)
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.small(
-                        RichText::new("Contains the complete original DSView FPGA/firmware set")
-                            .color(TEXT_MUTED),
-                    );
-                    ui.add_space(10.0);
-
-                    let resource_directory = Path::new(self.resource_directory.trim());
-                    if has_required_fpga_resources(resource_directory) {
-                        ui.label(RichText::new("✓ Required FPGA bitstreams found").color(ACCENT));
-                    } else {
-                        ui.label(
-                            RichText::new(
-                                "Required FPGA bitstreams were not found in this directory",
-                            )
-                            .color(Color32::LIGHT_RED),
-                        );
-                    }
-
-                    ui.add_space(10.0);
-                    if ui
-                        .add_enabled(!settings_locked, egui::Button::new("Use bundled resources"))
-                        .clicked()
-                    {
-                        self.resource_directory = default_resource_directory();
-                    }
-
-                    ui.add_space(18.0);
-                    ui.separator();
-                    ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("INSTRUMENTS").strong().color(ACCENT));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
