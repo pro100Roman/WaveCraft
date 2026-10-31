@@ -4,7 +4,7 @@ mod measurements;
 mod protocol_analyzer;
 
 use dsview_core::{
-    CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSession, CaptureSource,
+    CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
 };
 use dsview_recording::{
@@ -1613,12 +1613,14 @@ struct WaveformStore {
     logic_samples: VecDeque<LogicSampleBucket>,
     logic_channels: u8,
     logic_rate_hz: u64,
+    logic_captured_at: Option<Duration>,
     logic_sample_offset: u64,
     logic_sample_count: usize,
     logic_sample_stride: usize,
     logic_capacity: usize,
     scope_channels: Vec<VecDeque<f32>>,
     scope_rate_hz: u64,
+    scope_captured_at: Option<Duration>,
     scope_sample_offset: u64,
     scope_trigger_sample_index: Option<u64>,
     scope_capture_boundaries: VecDeque<u64>,
@@ -1633,12 +1635,14 @@ impl Default for WaveformStore {
             logic_samples: VecDeque::new(),
             logic_channels: 0,
             logic_rate_hz: 0,
+            logic_captured_at: None,
             logic_sample_offset: 0,
             logic_sample_count: 0,
             logic_sample_stride: 1,
             logic_capacity: MAX_WAVEFORM_SAMPLES,
             scope_channels: Vec::new(),
             scope_rate_hz: 0,
+            scope_captured_at: None,
             scope_sample_offset: 0,
             scope_trigger_sample_index: None,
             scope_capture_boundaries: VecDeque::new(),
@@ -1811,6 +1815,68 @@ struct WaveformViewport {
     start: f32,
     span: f32,
     anchor_locked: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CaptureTimeRange {
+    start_seconds: f64,
+    end_seconds: f64,
+}
+
+impl CaptureTimeRange {
+    fn duration_seconds(self) -> f64 {
+        (self.end_seconds - self.start_seconds).max(0.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CombinedTimeline {
+    shared: CaptureTimeRange,
+    logic: CaptureTimeRange,
+    scope: CaptureTimeRange,
+}
+
+impl CombinedTimeline {
+    fn source_viewport(
+        self,
+        shared_viewport: WaveformViewport,
+        source: CaptureTimeRange,
+    ) -> WaveformViewport {
+        let source_duration = source.duration_seconds();
+        let shared_duration = self.shared.duration_seconds();
+        if source_duration <= 0.0 || shared_duration <= 0.0 {
+            return WaveformViewport::default();
+        }
+        let visible_start =
+            self.shared.start_seconds + f64::from(shared_viewport.start) * shared_duration;
+        WaveformViewport {
+            start: ((visible_start - source.start_seconds) / source_duration) as f32,
+            span: (f64::from(shared_viewport.span) * shared_duration / source_duration) as f32,
+            anchor_locked: shared_viewport.anchor_locked,
+        }
+    }
+
+    fn shared_viewport(
+        self,
+        source_viewport: WaveformViewport,
+        source: CaptureTimeRange,
+    ) -> WaveformViewport {
+        let source_duration = source.duration_seconds();
+        let shared_duration = self.shared.duration_seconds();
+        if source_duration <= 0.0 || shared_duration <= 0.0 {
+            return WaveformViewport::default();
+        }
+        let visible_start =
+            source.start_seconds + f64::from(source_viewport.start) * source_duration;
+        let mut viewport = WaveformViewport {
+            start: ((visible_start - self.shared.start_seconds) / shared_duration) as f32,
+            span: (f64::from(source_viewport.span) * source_duration / shared_duration) as f32,
+            anchor_locked: source_viewport.anchor_locked,
+        };
+        viewport.span = viewport.span.clamp(f32::EPSILON, 1.0);
+        viewport.start = viewport.clamp_start(viewport.start);
+        viewport
+    }
 }
 
 impl Default for WaveformViewport {
@@ -2051,6 +2117,52 @@ fn adjacent_timebase(current_seconds: f64, zoom_in: bool) -> Option<f64> {
 }
 
 impl WaveformStore {
+    fn logic_time_range(&self) -> Option<CaptureTimeRange> {
+        let captured_at = self.logic_captured_at?.as_secs_f64();
+        if self.logic_rate_hz == 0 || self.logic_sample_count == 0 {
+            return None;
+        }
+        let rate = self.logic_rate_hz as f64;
+        let start_seconds = captured_at + self.logic_sample_offset as f64 / rate;
+        Some(CaptureTimeRange {
+            start_seconds,
+            end_seconds: start_seconds + self.logic_sample_count as f64 / rate,
+        })
+    }
+
+    fn scope_time_range(&self) -> Option<CaptureTimeRange> {
+        let captured_at = self.scope_captured_at?.as_secs_f64();
+        if self.scope_rate_hz == 0 {
+            return None;
+        }
+        let sample_count = self
+            .scope_channels
+            .iter()
+            .filter(|samples| !samples.is_empty())
+            .map(VecDeque::len)
+            .min()?;
+        let rate = self.scope_rate_hz as f64;
+        let start_seconds = captured_at + self.scope_sample_offset as f64 / rate;
+        Some(CaptureTimeRange {
+            start_seconds,
+            end_seconds: start_seconds + sample_count as f64 / rate,
+        })
+    }
+
+    fn combined_timeline(&self) -> Option<CombinedTimeline> {
+        let logic = self.logic_time_range()?;
+        let scope = self.scope_time_range()?;
+        let shared = CaptureTimeRange {
+            start_seconds: logic.start_seconds.max(scope.start_seconds),
+            end_seconds: logic.end_seconds.min(scope.end_seconds),
+        };
+        (shared.duration_seconds() > 0.0).then_some(CombinedTimeline {
+            shared,
+            logic,
+            scope,
+        })
+    }
+
     fn configure_logic_capture(&mut self, expected_sample_count: u64, rolling: bool) {
         let expected_sample_count = usize::try_from(expected_sample_count).unwrap_or(usize::MAX);
         self.logic_capacity = expected_sample_count.clamp(1, MAX_WAVEFORM_SAMPLES);
@@ -2062,6 +2174,7 @@ impl WaveformStore {
         }
         .clamp(1, u32::MAX as usize);
         self.logic_samples.clear();
+        self.logic_captured_at = None;
         self.logic_sample_offset = 0;
         self.logic_sample_count = 0;
     }
@@ -2117,6 +2230,18 @@ impl WaveformStore {
             self.scope_capture_boundaries
                 .push_back(self.scope_sample_offset + sample_count);
         }
+    }
+
+    fn ingest_frame(&mut self, frame: &CaptureFrame, scope_channels: [bool; 2]) {
+        match &frame.payload {
+            CaptureBatch::Logic(_) => {
+                self.logic_captured_at.get_or_insert(frame.captured_at);
+            }
+            CaptureBatch::Scope(_) => {
+                self.scope_captured_at.get_or_insert(frame.captured_at);
+            }
+        }
+        self.ingest(&frame.payload, scope_channels);
     }
 
     fn ingest(&mut self, batch: &CaptureBatch, scope_channels: [bool; 2]) {
@@ -2304,6 +2429,7 @@ struct DsViewApp {
     scope_channel_names: [String; 2],
     logic_viewport: WaveformViewport,
     scope_viewport: WaveformViewport,
+    combined_viewport: WaveformViewport,
     scope_fft_viewport: ScopeFftViewport,
     scope_measurement_caches: [ScopeMeasurementCache; 2],
     scope_measurement_window_positions: [Vec2; 2],
@@ -2366,6 +2492,7 @@ impl DsViewApp {
             scope_channel_names: empty_scope_channel_names(),
             logic_viewport: WaveformViewport::default(),
             scope_viewport: WaveformViewport::default(),
+            combined_viewport: WaveformViewport::default(),
             scope_fft_viewport: ScopeFftViewport::default(),
             scope_measurement_caches: [ScopeMeasurementCache::default(); 2],
             scope_measurement_window_positions: default_scope_measurement_window_positions(),
@@ -3218,6 +3345,7 @@ impl DsViewApp {
                 self.record_capture = false;
                 self.logic_viewport.reset();
                 self.scope_viewport.reset();
+                self.combined_viewport.reset();
                 self.scope_fft_viewport.reset();
                 self.scope_measurement_caches = [ScopeMeasurementCache::default(); 2];
                 self.scope_time_per_division_seconds = None;
@@ -3379,7 +3507,7 @@ impl DsViewApp {
                                 }
                                 active
                                     .waveforms
-                                    .ingest(&frame.payload, enabled_scope_channels);
+                                    .ingest_frame(&frame, enabled_scope_channels);
                             }
                             CaptureEvent::SourceFailed { device_id, error } => {
                                 active.session.request_stop();
@@ -6394,6 +6522,7 @@ impl eframe::App for DsViewApp {
                 let mut logic_maximum_heights = self.logic_settings.maximum_heights;
                 let mut logic_viewport = self.logic_viewport;
                 let mut scope_viewport = self.scope_viewport;
+                let mut combined_viewport = self.combined_viewport;
                 let mut scope_fft_viewport = self.scope_fft_viewport;
                 let mut scope_measurement_caches = self.scope_measurement_caches;
                 let mut scope_measurement_window_positions =
@@ -6440,6 +6569,7 @@ impl eframe::App for DsViewApp {
                                         marker_settings: &mut logic_marker_settings,
                                         maximum_heights: &mut logic_maximum_heights,
                                         enabled_channels: &mut logic_enabled_channels,
+                                        time_axis: None,
                                     },
                                     &mut logic_viewport,
                                 )
@@ -6477,6 +6607,7 @@ impl eframe::App for DsViewApp {
                                         timebase_changed: &mut scope_timebase_changed,
                                         offset_controls_enabled: frontend_controls_enabled,
                                         trigger_controls_enabled,
+                                        time_axis: None,
                                     },
                                 )
                             },
@@ -6530,10 +6661,12 @@ impl eframe::App for DsViewApp {
                                 marker_settings: &mut logic_marker_settings,
                                 maximum_heights: &mut logic_maximum_heights,
                                 enabled_channels: &mut logic_enabled_channels,
+                                time_axis: None,
                             },
                             CombinedWaveformViewports {
                                 logic: &mut logic_viewport,
                                 scope: &mut scope_viewport,
+                                combined: &mut combined_viewport,
                                 fft: &mut scope_fft_viewport,
                             },
                             ScopeWaveformOptions {
@@ -6552,6 +6685,7 @@ impl eframe::App for DsViewApp {
                                 timebase_changed: &mut scope_timebase_changed,
                                 offset_controls_enabled: frontend_controls_enabled,
                                 trigger_controls_enabled,
+                                time_axis: None,
                             },
                         ));
                     }
@@ -6567,6 +6701,7 @@ impl eframe::App for DsViewApp {
                 self.logic_settings.maximum_heights = logic_maximum_heights;
                 self.logic_viewport = logic_viewport;
                 self.scope_viewport = scope_viewport;
+                self.combined_viewport = combined_viewport;
                 self.scope_fft_viewport = scope_fft_viewport;
                 self.scope_measurement_caches = scope_measurement_caches;
                 self.scope_measurement_window_positions = scope_measurement_window_positions;
@@ -7473,7 +7608,7 @@ fn read_gui_recording(input: impl Read) -> Result<LoadedRecording, String> {
     }
     while let Some(event) = reader.read_event().map_err(|error| error.to_string())? {
         if let CaptureEvent::Frame(frame) = event {
-            waveforms.ingest(&frame.payload, enabled_scope_channels);
+            waveforms.ingest_frame(&frame, enabled_scope_channels);
         }
     }
     let completion = reader
@@ -7576,6 +7711,7 @@ fn read_gui_saleae(input: impl Read + Seek) -> Result<LoadedRecording, String> {
             }),
             [false; 2],
         );
+        waveforms.logic_captured_at = Some(Duration::ZERO);
     }
 
     let mut scope_settings = ScopeCaptureSettings::default();
@@ -7620,6 +7756,7 @@ fn read_gui_saleae(input: impl Read + Seek) -> Result<LoadedRecording, String> {
             }),
             enabled,
         );
+        waveforms.scope_captured_at = Some(Duration::ZERO);
     }
 
     Ok(LoadedRecording {
@@ -7833,6 +7970,7 @@ struct ScopeWaveformOptions<'a> {
     timebase_changed: &'a mut bool,
     offset_controls_enabled: bool,
     trigger_controls_enabled: bool,
+    time_axis: Option<WaveformTimeAxis>,
 }
 
 fn waveform_card_fill(
@@ -7862,6 +8000,7 @@ fn combined_pane_heights(total_height: f32, logic_ratio: f32) -> (f32, f32) {
 struct CombinedWaveformViewports<'a> {
     logic: &'a mut WaveformViewport,
     scope: &'a mut WaveformViewport,
+    combined: &'a mut WaveformViewport,
     fft: &'a mut ScopeFftViewport,
 }
 
@@ -7873,21 +8012,42 @@ struct LogicWaveformOptions<'a> {
     marker_settings: &'a mut LogicMarkerSettings,
     maximum_heights: &'a mut [u8; LOGIC_CHANNEL_COUNT],
     enabled_channels: &'a mut [bool; LOGIC_CHANNEL_COUNT],
+    time_axis: Option<WaveformTimeAxis>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WaveformTimeAxis {
+    start_seconds: f64,
+    duration_seconds: f64,
 }
 
 fn combined_waveform_cards(
     ui: &mut egui::Ui,
     waveforms: &WaveformStore,
     logic_ratio: &mut f32,
-    logic_options: LogicWaveformOptions<'_>,
+    mut logic_options: LogicWaveformOptions<'_>,
     viewports: CombinedWaveformViewports<'_>,
-    scope_options: ScopeWaveformOptions<'_>,
+    mut scope_options: ScopeWaveformOptions<'_>,
 ) -> Rect {
     let CombinedWaveformViewports {
         logic: logic_viewport,
         scope: scope_viewport,
+        combined: combined_viewport,
         fft: scope_fft_viewport,
     } = viewports;
+    let timeline = waveforms.combined_timeline();
+    if let Some(timeline) = timeline {
+        *logic_viewport = timeline.source_viewport(*combined_viewport, timeline.logic);
+        *scope_viewport = timeline.source_viewport(*combined_viewport, timeline.scope);
+        logic_options.time_axis = Some(WaveformTimeAxis {
+            start_seconds: timeline.logic.start_seconds - timeline.shared.start_seconds,
+            duration_seconds: timeline.logic.duration_seconds(),
+        });
+        scope_options.time_axis = Some(WaveformTimeAxis {
+            start_seconds: timeline.scope.start_seconds - timeline.shared.start_seconds,
+            duration_seconds: timeline.scope.duration_seconds(),
+        });
+    }
     let available = ui.available_rect_before_wrap();
     let (logic_height, _) = combined_pane_heights(available.height(), *logic_ratio);
     let divider_y = available.top() + logic_height;
@@ -7941,6 +8101,15 @@ fn combined_waveform_cards(
         |ui, rect| paint_logic(ui, rect, waveforms, logic_options, logic_viewport),
     );
 
+    if let Some(timeline) = timeline {
+        *combined_viewport = timeline.shared_viewport(*logic_viewport, timeline.logic);
+        *scope_viewport = timeline.source_viewport(*combined_viewport, timeline.scope);
+        *scope_options.time_per_division_seconds = Some(
+            f64::from(combined_viewport.span) * timeline.shared.duration_seconds()
+                / SCOPE_HORIZONTAL_DIVISIONS as f64,
+        );
+    }
+
     let mut scope_ui = ui.new_child(
         egui::UiBuilder::new()
             .id_salt("combined_scope_waveform")
@@ -7964,6 +8133,12 @@ fn combined_waveform_cards(
             )
         },
     );
+
+    if let Some(timeline) = timeline {
+        *combined_viewport = timeline.shared_viewport(*scope_viewport, timeline.scope);
+        *logic_viewport = timeline.source_viewport(*combined_viewport, timeline.logic);
+        *scope_viewport = timeline.source_viewport(*combined_viewport, timeline.scope);
+    }
 
     let divider_color = if divider_response.hovered() || divider_response.dragged() {
         ACCENT
@@ -8212,14 +8387,27 @@ fn paint_waveform_time_scale(
     sample_rate_hz: u64,
     sample_offset: u64,
     viewport: WaveformViewport,
+    time_axis: Option<WaveformTimeAxis>,
 ) {
+    if let Some(time_axis) = time_axis {
+        let first_seconds =
+            time_axis.start_seconds + f64::from(viewport.start) * time_axis.duration_seconds;
+        let last_seconds = first_seconds + f64::from(viewport.span) * time_axis.duration_seconds;
+        paint_time_scale(painter, rect, first_seconds, last_seconds, 1);
+        return;
+    }
     let Some((first_sample, last_sample)) =
         time_scale_sample_window(sample_count, sample_offset, viewport)
     else {
         paint_time_scale(painter, rect, 0.0, 0.0, 0);
         return;
     };
-    paint_time_scale(painter, rect, first_sample, last_sample, sample_rate_hz);
+    if sample_rate_hz == 0 {
+        paint_time_scale(painter, rect, 0.0, 0.0, 0);
+        return;
+    }
+    let rate = sample_rate_hz as f64;
+    paint_time_scale(painter, rect, first_sample / rate, last_sample / rate, 1);
 }
 
 enum WaveformPlotClick {
@@ -9130,6 +9318,7 @@ fn paint_logic(
         marker_settings,
         maximum_heights,
         enabled_channels,
+        time_axis,
     } = options;
     paint_plot_background(ui, rect);
     let painter = ui.painter();
@@ -9338,6 +9527,7 @@ fn paint_logic(
         display_sample_rate_hz,
         waveforms.logic_sample_offset,
         *viewport,
+        time_axis,
     );
     paint_waveform_status(
         painter,
@@ -11415,6 +11605,7 @@ fn paint_scope_time_domain(
         timebase_changed,
         offset_controls_enabled,
         trigger_controls_enabled,
+        time_axis,
     } = scope_options;
     for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
         channel.vertical_offset = vertical_offset;
@@ -11569,6 +11760,7 @@ fn paint_scope_time_domain(
             display_sample_rate_hz,
             waveforms.scope_sample_offset,
             *viewport,
+            time_axis,
         );
         paint_waveform_status(
             painter,
@@ -11726,6 +11918,7 @@ fn paint_scope_time_domain(
         display_sample_rate_hz,
         waveforms.scope_sample_offset,
         *viewport,
+        time_axis,
     );
     paint_waveform_status(
         painter,
@@ -11769,7 +11962,7 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsview_core::{CaptureFrame, LogicBatch, ScopeBatch};
+    use dsview_core::{LogicBatch, ScopeBatch};
     use std::io::Cursor;
 
     #[test]
@@ -12408,6 +12601,86 @@ mod tests {
         assert_eq!(store.scope_trigger_sample_index, Some(1));
         assert_eq!(store.scope_channels[0].back(), Some(&0.2));
         assert_eq!(store.scope_channels[1].back(), Some(&-0.2));
+    }
+
+    #[test]
+    fn combined_timeline_uses_timestamped_sample_overlap() {
+        let mut store = WaveformStore::default();
+        store.ingest_frame(
+            &CaptureFrame {
+                device_id: DeviceId::new("logic"),
+                sequence: 0,
+                captured_at: Duration::from_millis(10),
+                payload: CaptureBatch::Logic(LogicBatch {
+                    sample_rate_hz: 1_000,
+                    channel_count: 1,
+                    samples: vec![0; 100],
+                }),
+            },
+            [true, true],
+        );
+        store.ingest_frame(
+            &CaptureFrame {
+                device_id: DeviceId::new("scope"),
+                sequence: 0,
+                captured_at: Duration::from_millis(20),
+                payload: CaptureBatch::Scope(ScopeBatch {
+                    sample_rate_hz: 2_000,
+                    trigger_sample_index: None,
+                    channels: vec![vec![0.0; 200], vec![0.0; 200]],
+                }),
+            },
+            [true, true],
+        );
+
+        let timeline = store
+            .combined_timeline()
+            .expect("logic and scope ranges should overlap");
+        assert!((timeline.logic.start_seconds - 0.010).abs() < f64::EPSILON);
+        assert!((timeline.logic.end_seconds - 0.110).abs() < f64::EPSILON);
+        assert!((timeline.scope.start_seconds - 0.020).abs() < f64::EPSILON);
+        assert!((timeline.scope.end_seconds - 0.120).abs() < f64::EPSILON);
+        assert!((timeline.shared.start_seconds - 0.020).abs() < f64::EPSILON);
+        assert!((timeline.shared.end_seconds - 0.110).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn combined_timeline_maps_both_viewports_to_the_same_time_window() {
+        let timeline = CombinedTimeline {
+            shared: CaptureTimeRange {
+                start_seconds: 0.020,
+                end_seconds: 0.110,
+            },
+            logic: CaptureTimeRange {
+                start_seconds: 0.010,
+                end_seconds: 0.110,
+            },
+            scope: CaptureTimeRange {
+                start_seconds: 0.020,
+                end_seconds: 0.120,
+            },
+        };
+        let shared = WaveformViewport {
+            start: 0.25,
+            span: 0.5,
+            anchor_locked: false,
+        };
+
+        let logic = timeline.source_viewport(shared, timeline.logic);
+        let scope = timeline.source_viewport(shared, timeline.scope);
+        let logic_start = timeline.logic.start_seconds
+            + f64::from(logic.start) * timeline.logic.duration_seconds();
+        let scope_start = timeline.scope.start_seconds
+            + f64::from(scope.start) * timeline.scope.duration_seconds();
+        let logic_span = f64::from(logic.span) * timeline.logic.duration_seconds();
+        let scope_span = f64::from(scope.span) * timeline.scope.duration_seconds();
+
+        assert!((logic_start - scope_start).abs() < 1.0e-8);
+        assert!((logic_span - scope_span).abs() < 1.0e-8);
+        let round_trip = timeline.shared_viewport(logic, timeline.logic);
+        assert!((round_trip.start - shared.start).abs() < 1.0e-6);
+        assert!((round_trip.span - shared.span).abs() < 1.0e-6);
+        assert_eq!(round_trip.anchor_locked, shared.anchor_locked);
     }
 
     #[test]

@@ -148,4 +148,12 @@ arm independently, synchronize immediately before their USB start commands,
 emit on the common monotonic timeline, and stop independently. The reported
 software start skew remains distinct from exact hardware sample alignment.
 
+The GUI's combined view uses the overlap of the timestamped DSLogic and DSCope
+sample ranges as one time domain. Both panes derive their ruler, pan, and zoom
+from that shared viewport, so a vertical grid line represents the same
+coordinator time in each pane even when the instruments use different sample
+rates or begin a few microseconds apart. This is software-time synchronization;
+the independent hardware sample clocks are not phase-locked and can still drift
+over long captures unless the instruments share an external clock or trigger.
+
 The original GPL DSView implementation under `../DSView/libsigrok4DSL/hardware/DSL` is the behavior reference for vendor IDs, firmware loading, command transfers, and bulk endpoint framing.
