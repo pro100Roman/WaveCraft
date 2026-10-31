@@ -19,7 +19,8 @@ use dsview_usb::{
     DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
     DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
     DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
-    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_RATES_HZ,
+    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_MAX_SAMPLE_COUNT,
+    DSLOGIC_SAMPLE_ALIGNMENT, DSLOGIC_SAMPLE_RATES_HZ,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use image::ImageFormat;
@@ -913,6 +914,7 @@ struct ScopeCaptureSettings {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LogicCaptureSettings {
     sample_rate_hz: u64,
+    sample_count: u64,
     enabled_channels: [bool; LOGIC_CHANNEL_COUNT],
     maximum_heights: [u8; LOGIC_CHANNEL_COUNT],
     operation_mode: DsLogicOperationMode,
@@ -928,9 +930,10 @@ impl Default for LogicCaptureSettings {
     fn default() -> Self {
         Self {
             sample_rate_hz: SAMPLE_RATE_HZ,
+            sample_count: SAMPLE_COUNT,
             enabled_channels: [true; LOGIC_CHANNEL_COUNT],
             maximum_heights: [1; LOGIC_CHANNEL_COUNT],
-            operation_mode: DsLogicOperationMode::Buffer,
+            operation_mode: DsLogicOperationMode::Stream,
             stop_option: DsLogicStopOption::UploadCapturedData,
             threshold_voltage: 1.0,
             input_filter: DsLogicInputFilter::None,
@@ -951,7 +954,7 @@ impl LogicCaptureSettings {
             } else {
                 self.sample_rate_hz
             },
-            SAMPLE_COUNT,
+            self.sample_count,
         )
         .map_err(|error| error.to_string())?
         .with_threshold_voltage(self.threshold_voltage)
@@ -992,6 +995,72 @@ impl LogicCaptureSettings {
             .expect("at least one logic channel is enabled")
             .maximum_sample_rate_hz(speed)
     }
+}
+
+fn aligned_logic_sample_count(duration_seconds: f64, sample_rate_hz: u64) -> Option<u64> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 || sample_rate_hz == 0 {
+        return None;
+    }
+    let requested = (duration_seconds * sample_rate_hz as f64).ceil();
+    if requested < DSLOGIC_SAMPLE_ALIGNMENT as f64 || requested > u64::MAX as f64 {
+        return None;
+    }
+    let aligned = (requested as u64).div_ceil(DSLOGIC_SAMPLE_ALIGNMENT) * DSLOGIC_SAMPLE_ALIGNMENT;
+    (aligned <= DSLOGIC_MAX_SAMPLE_COUNT && aligned <= MAX_WAVEFORM_SAMPLES as u64)
+        .then_some(aligned)
+}
+
+fn logic_capture_duration_options(sample_rate_hz: u64) -> Vec<(f64, u64)> {
+    let mut options = Vec::new();
+    for duration_seconds in TIMEBASE_STEPS_SECONDS {
+        let Some(sample_count) = aligned_logic_sample_count(duration_seconds, sample_rate_hz)
+        else {
+            continue;
+        };
+        if options
+            .last()
+            .is_some_and(|(_, previous_count)| *previous_count == sample_count)
+        {
+            continue;
+        }
+        options.push((duration_seconds, sample_count));
+    }
+    options
+}
+
+fn logic_capture_duration_seconds(settings: LogicCaptureSettings) -> f64 {
+    logic_capture_duration_options(settings.sample_rate_hz)
+        .into_iter()
+        .find_map(|(duration, sample_count)| {
+            (sample_count == settings.sample_count).then_some(duration)
+        })
+        .unwrap_or(settings.sample_count as f64 / settings.sample_rate_hz as f64)
+}
+
+fn logic_capture_duration_label(settings: LogicCaptureSettings) -> String {
+    format_duration(Duration::from_secs_f64(logic_capture_duration_seconds(
+        settings,
+    )))
+}
+
+fn set_logic_sample_rate_preserving_duration(
+    settings: &mut LogicCaptureSettings,
+    sample_rate_hz: u64,
+) {
+    if settings.sample_rate_hz == sample_rate_hz {
+        return;
+    }
+    let duration_seconds = logic_capture_duration_seconds(*settings);
+    settings.sample_rate_hz = sample_rate_hz;
+    settings.sample_count = aligned_logic_sample_count(duration_seconds, sample_rate_hz)
+        .unwrap_or_else(|| {
+            if duration_seconds * (sample_rate_hz as f64) < DSLOGIC_SAMPLE_ALIGNMENT as f64 {
+                DSLOGIC_SAMPLE_ALIGNMENT
+            } else {
+                let maximum = DSLOGIC_MAX_SAMPLE_COUNT.min(MAX_WAVEFORM_SAMPLES as u64);
+                maximum / DSLOGIC_SAMPLE_ALIGNMENT * DSLOGIC_SAMPLE_ALIGNMENT
+            }
+        });
 }
 
 impl Default for ScopeCaptureSettings {
@@ -1218,6 +1287,14 @@ impl WaveformTab {
             Self::Combined => CaptureTarget::Combined,
         }
     }
+
+    fn capture_settings_tab(self) -> Option<CaptureSettingsTab> {
+        match self {
+            Self::LogicAnalyzer => Some(CaptureSettingsTab::DsLogic),
+            Self::Oscilloscope | Self::Lissajous => Some(CaptureSettingsTab::DsCope),
+            Self::Combined => None,
+        }
+    }
 }
 
 fn waveform_tabs(
@@ -1298,6 +1375,7 @@ struct WaveformStore {
     logic_channels: u8,
     logic_rate_hz: u64,
     logic_sample_offset: u64,
+    logic_capacity: usize,
     scope_channels: Vec<VecDeque<f32>>,
     scope_rate_hz: u64,
     scope_sample_offset: u64,
@@ -1315,6 +1393,7 @@ impl Default for WaveformStore {
             logic_channels: 0,
             logic_rate_hz: 0,
             logic_sample_offset: 0,
+            logic_capacity: MAX_WAVEFORM_SAMPLES,
             scope_channels: Vec::new(),
             scope_rate_hz: 0,
             scope_sample_offset: 0,
@@ -1372,13 +1451,36 @@ impl ScopeMeasurementCache {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AcquisitionMode {
     Single,
+    Repetitive,
+    Loop,
     Run,
 }
 
 impl AcquisitionMode {
     fn runs_continuously(self) -> bool {
-        self == Self::Run
+        matches!(self, Self::Repetitive | Self::Loop | Self::Run)
     }
+
+    fn logic_label(self) -> &'static str {
+        match self {
+            Self::Single => "Single",
+            Self::Repetitive => "Repetitive",
+            Self::Loop => "Loop",
+            Self::Run => "Run",
+        }
+    }
+
+    fn rearms_on_completion(self) -> bool {
+        matches!(self, Self::Repetitive | Self::Run)
+    }
+}
+
+fn repetitive_interval(operation_mode: DsLogicOperationMode, configured_seconds: f32) -> Duration {
+    if operation_mode == DsLogicOperationMode::Stream {
+        return Duration::from_millis(100);
+    }
+    let tenths = (configured_seconds.clamp(0.1, 10.0) * 10.0).round() as u64;
+    Duration::from_millis(tenths * 100)
 }
 
 fn should_rearm_acquisition(
@@ -1387,7 +1489,10 @@ fn should_rearm_acquisition(
     completion: CompletionStatus,
     failed: bool,
 ) -> bool {
-    mode.runs_continuously() && run_requested && completion == CompletionStatus::Complete && !failed
+    mode.rearms_on_completion()
+        && run_requested
+        && completion == CompletionStatus::Complete
+        && !failed
 }
 
 fn uses_rolling_scope_buffer(
@@ -1722,8 +1827,11 @@ impl WaveformStore {
             CaptureBatch::Logic(logic) => {
                 self.logic_channels = logic.channel_count;
                 self.logic_rate_hz = logic.sample_rate_hz;
-                self.logic_sample_offset +=
-                    extend_bounded(&mut self.logic_samples, logic.samples.iter().copied()) as u64;
+                self.logic_sample_offset += extend_bounded_to(
+                    &mut self.logic_samples,
+                    logic.samples.iter().copied(),
+                    self.logic_capacity,
+                ) as u64;
             }
             CaptureBatch::Scope(scope) => {
                 self.scope_revision = SCOPE_WAVEFORM_REVISION.fetch_add(1, Ordering::Relaxed);
@@ -1772,10 +1880,6 @@ impl WaveformStore {
     }
 }
 
-fn extend_bounded<T>(destination: &mut VecDeque<T>, values: impl IntoIterator<Item = T>) -> usize {
-    extend_bounded_to(destination, values, MAX_WAVEFORM_SAMPLES)
-}
-
 fn extend_bounded_to<T>(
     destination: &mut VecDeque<T>,
     values: impl IntoIterator<Item = T>,
@@ -1801,6 +1905,12 @@ struct ActiveCapture {
     recording_path: Option<PathBuf>,
     has_logic: bool,
     has_scope: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScheduledRepetitiveCapture {
+    due: Instant,
+    target: CaptureTarget,
 }
 
 struct CompletedCapture {
@@ -1876,6 +1986,9 @@ struct DsViewApp {
     recording_path: String,
     capture_run_requested: bool,
     requested_capture_target: Option<CaptureTarget>,
+    logic_acquisition_mode: AcquisitionMode,
+    repetitive_interval_seconds: f32,
+    scheduled_repetitive_capture: Option<ScheduledRepetitiveCapture>,
     devices: Vec<DeviceEntry>,
     active_capture_settings_tab: CaptureSettingsTab,
     logic_settings: LogicCaptureSettings,
@@ -1933,6 +2046,9 @@ impl DsViewApp {
             recording_path: "capture.dsv".to_owned(),
             capture_run_requested: false,
             requested_capture_target: None,
+            logic_acquisition_mode: AcquisitionMode::Single,
+            repetitive_interval_seconds: 1.0,
+            scheduled_repetitive_capture: None,
             devices: Vec::new(),
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
             logic_settings: LogicCaptureSettings::default(),
@@ -2032,6 +2148,7 @@ impl DsViewApp {
         self.pending = Some(receiver);
         self.capture_run_requested = false;
         self.requested_capture_target = None;
+        self.scheduled_repetitive_capture = None;
         self.scope_configuration_due = None;
         self.status = format!("Opening capture {}…", path.display());
         self.last_error = None;
@@ -2052,6 +2169,7 @@ impl DsViewApp {
         let (sender, receiver) = mpsc::channel();
         self.capture_run_requested = false;
         self.requested_capture_target = None;
+        self.scheduled_repetitive_capture = None;
         self.scope_capture_restart_requested = false;
         self.scope_configuration_due = None;
         self.pending = Some(receiver);
@@ -2070,9 +2188,11 @@ impl DsViewApp {
         if self.pending.is_some() || self.capture.is_some() {
             return;
         }
+        self.scheduled_repetitive_capture = None;
         if self.record_capture && mode.runs_continuously() {
             self.capture_run_requested = false;
             self.requested_capture_target = None;
+            self.record_capture = false;
             self.last_error =
                 Some("Complete-capture recording is available in Single mode only".to_owned());
             return;
@@ -2087,6 +2207,7 @@ impl DsViewApp {
         if !target.is_available(has_logic_analyzer, has_oscilloscope) {
             self.capture_run_requested = false;
             self.requested_capture_target = None;
+            self.record_capture = false;
             self.last_error = Some(match target {
                 CaptureTarget::LogicAnalyzer => {
                     "Select at least one Logic Analyzer instrument".to_owned()
@@ -2109,6 +2230,7 @@ impl DsViewApp {
         if self.record_capture && self.recording_path.trim().is_empty() {
             self.capture_run_requested = false;
             self.requested_capture_target = None;
+            self.record_capture = false;
             self.last_error = Some("Enter a recording file path".to_owned());
             return;
         }
@@ -2117,6 +2239,7 @@ impl DsViewApp {
             Err(error) => {
                 self.capture_run_requested = false;
                 self.requested_capture_target = None;
+                self.record_capture = false;
                 self.last_error = Some(error);
                 return;
             }
@@ -2126,24 +2249,54 @@ impl DsViewApp {
             Err(error) => {
                 self.capture_run_requested = false;
                 self.requested_capture_target = None;
+                self.record_capture = false;
                 self.last_error = Some(error);
                 return;
             }
-        };
+        }
+        .with_loop_mode(mode == AcquisitionMode::Loop);
+        if matches!(mode, AcquisitionMode::Repetitive | AcquisitionMode::Loop)
+            && target != CaptureTarget::LogicAnalyzer
+        {
+            self.capture_run_requested = false;
+            self.requested_capture_target = None;
+            self.record_capture = false;
+            self.last_error = Some(
+                "Repetitive and Loop modes are available for Logic Analyzer capture only"
+                    .to_owned(),
+            );
+            return;
+        }
+        if mode == AcquisitionMode::Loop
+            && logic_config.operation_mode() != DsLogicOperationMode::Stream
+        {
+            self.capture_run_requested = false;
+            self.requested_capture_target = None;
+            self.record_capture = false;
+            self.last_error = Some("Loop mode requires DSLogic Stream mode".to_owned());
+            return;
+        }
         let calibration_values = self.manual_calibration.as_ref().map(|editor| editor.values);
 
+        let continuing_loop = mode == AcquisitionMode::Loop && self.capture_run_requested;
         self.capture_run_requested = true;
         self.requested_capture_target = Some(target);
         let resource_directory = PathBuf::from(self.resource_directory.trim());
         let (sender, receiver) = mpsc::channel();
         self.scope_configuration_due = None;
         self.pending = Some(receiver);
-        if mode == AcquisitionMode::Single {
+        if mode == AcquisitionMode::Single || (mode == AcquisitionMode::Loop && !continuing_loop) {
             self.completed_capture = None;
         }
         self.status = match mode {
             AcquisitionMode::Single => {
                 format!("Preparing {} single acquisition…", target.label())
+            }
+            AcquisitionMode::Repetitive => {
+                format!("Preparing {} repetitive acquisition…", target.label())
+            }
+            AcquisitionMode::Loop => {
+                format!("Preparing {} loop acquisition…", target.label())
             }
             AcquisitionMode::Run => {
                 format!("Preparing {} continuous acquisition…", target.label())
@@ -2261,7 +2414,7 @@ impl DsViewApp {
             completed: false,
             values: None,
         });
-        self.active_waveform_tab = Some(WaveformTab::Oscilloscope);
+        self.select_waveform_tab(WaveformTab::Oscilloscope);
         self.status = "Auto-calibrating DSCope offsets and ADC branches…".to_owned();
         self.last_error = None;
         thread::spawn(move || {
@@ -2408,6 +2561,7 @@ impl DsViewApp {
     fn stop_capture(&mut self) {
         self.capture_run_requested = false;
         self.requested_capture_target = None;
+        self.scheduled_repetitive_capture = None;
         let Some(mut active) = self.capture.take() else {
             return;
         };
@@ -2615,10 +2769,17 @@ impl DsViewApp {
                             .waveforms
                             .can_continue_scope_roll(scope_config, scope_capacity)
                     });
-                let preserve_display_until_complete = mode == AcquisitionMode::Run
+                let continue_logic_loop = mode == AcquisitionMode::Loop
+                    && self
+                        .completed_capture
+                        .as_ref()
+                        .is_some_and(|capture| capture.has_logic);
+                let preserve_display_until_complete =
+                    mode == AcquisitionMode::Run || mode == AcquisitionMode::Repetitive;
+                let preserve_display_until_complete = preserve_display_until_complete
                     && self.completed_capture.is_some()
                     && !continue_roll;
-                let mut waveforms = if continue_roll {
+                let mut waveforms = if continue_roll || continue_logic_loop {
                     self.completed_capture
                         .take()
                         .map(|capture| capture.waveforms)
@@ -2626,6 +2787,8 @@ impl DsViewApp {
                 } else {
                     WaveformStore::default()
                 };
+                waveforms.logic_capacity =
+                    (logic_config.sample_count() as usize).clamp(1, MAX_WAVEFORM_SAMPLES);
                 waveforms.scope_capacity = scope_capacity;
                 waveforms.scope_rolling = rolling;
                 self.capture = Some(ActiveCapture {
@@ -2663,6 +2826,14 @@ impl DsViewApp {
                             )
                         }
                     }
+                    (AcquisitionMode::Repetitive, _) => format!(
+                        "{} Repetitive acquisition from {count} instrument(s)",
+                        target.label()
+                    ),
+                    (AcquisitionMode::Loop, _) => format!(
+                        "{} Loop acquisition from {count} instrument(s)",
+                        target.label()
+                    ),
                     (AcquisitionMode::Run, _) => {
                         if has_scope_trigger
                             && scope_config.trigger().source() == DsCopeTriggerSource::Auto
@@ -2973,15 +3144,46 @@ impl DsViewApp {
                     }
                 }
                 if repeat {
-                    self.begin_capture(mode, target);
+                    if mode == AcquisitionMode::Repetitive && !restart_for_frontend {
+                        let interval = repetitive_interval(
+                            self.logic_settings.operation_mode,
+                            self.repetitive_interval_seconds,
+                        );
+                        self.scheduled_repetitive_capture = Some(ScheduledRepetitiveCapture {
+                            due: Instant::now() + interval,
+                            target,
+                        });
+                        self.status = format!(
+                            "Repetitive · next acquisition in {:.1} s",
+                            interval.as_secs_f32()
+                        );
+                    } else {
+                        self.begin_capture(mode, target);
+                    }
                 }
             }
         }
     }
 
+    fn poll_repetitive_capture(&mut self) {
+        let Some(scheduled) = self.scheduled_repetitive_capture else {
+            return;
+        };
+        if !self.capture_run_requested {
+            self.scheduled_repetitive_capture = None;
+            return;
+        }
+        if Instant::now() < scheduled.due {
+            return;
+        }
+        self.scheduled_repetitive_capture = None;
+        self.begin_capture(AcquisitionMode::Repetitive, scheduled.target);
+    }
+
     fn set_error(&mut self, error: String) {
         self.capture_run_requested = false;
         self.requested_capture_target = None;
+        self.scheduled_repetitive_capture = None;
         self.scope_capture_restart_requested = false;
         self.manual_calibration_load_requested = false;
         self.manual_calibration_save_requested = None;
@@ -3021,6 +3223,13 @@ impl DsViewApp {
         )
     }
 
+    fn select_waveform_tab(&mut self, tab: WaveformTab) {
+        self.active_waveform_tab = Some(tab);
+        if let Some(settings_tab) = tab.capture_settings_tab() {
+            self.active_capture_settings_tab = settings_tab;
+        }
+    }
+
     fn available_capture_settings_tabs(&self) -> Vec<CaptureSettingsTab> {
         let has_logic_analyzer = self
             .devices
@@ -3051,15 +3260,22 @@ impl DsViewApp {
         {
             return;
         }
-        self.active_waveform_tab = if available.contains(&WaveformTab::Combined) {
+        let selected = if available.contains(&WaveformTab::Combined) {
             Some(WaveformTab::Combined)
         } else {
             available.first().copied()
         };
+        if let Some(tab) = selected {
+            self.select_waveform_tab(tab);
+        } else {
+            self.active_waveform_tab = None;
+        }
     }
 
     fn is_busy(&self) -> bool {
-        self.pending.is_some() || self.capture.is_some()
+        self.pending.is_some()
+            || self.capture.is_some()
+            || self.scheduled_repetitive_capture.is_some()
     }
 }
 
@@ -4030,6 +4246,8 @@ struct ScopeCaptureSettingsEditor<'a> {
 struct LogicCaptureSettingsEditor<'a> {
     settings: &'a mut LogicCaptureSettings,
     speed: UsbSpeedClass,
+    acquisition_mode: &'a mut AcquisitionMode,
+    repetitive_interval_seconds: &'a mut f32,
 }
 
 struct ScopeVisualizationSettingsEditor<'a> {
@@ -4049,6 +4267,8 @@ fn paint_capture_settings(
     let LogicCaptureSettingsEditor {
         settings: logic_settings,
         speed: logic_speed,
+        acquisition_mode: logic_acquisition_mode,
+        repetitive_interval_seconds,
     } = logic_editor;
     let ScopeCaptureSettingsEditor {
         settings: scope_settings,
@@ -4079,17 +4299,24 @@ fn paint_capture_settings(
                 CaptureSettingsTab::DsLogic => {
                     if logic_settings.operation_mode == DsLogicOperationMode::InternalTest {
                         logic_settings.enabled_channels = [true; LOGIC_CHANNEL_COUNT];
-                        logic_settings.sample_rate_hz = 100_000_000;
+                        set_logic_sample_rate_preserving_duration(
+                            logic_settings,
+                            100_000_000,
+                        );
                     }
                     let maximum_sample_rate_hz =
                         logic_settings.maximum_sample_rate_hz(logic_speed);
                     if logic_settings.sample_rate_hz > maximum_sample_rate_hz {
-                        logic_settings.sample_rate_hz = DSLOGIC_SAMPLE_RATES_HZ
+                        let sample_rate_hz = DSLOGIC_SAMPLE_RATES_HZ
                             .iter()
                             .rev()
                             .copied()
                             .find(|rate| *rate <= maximum_sample_rate_hz)
                             .unwrap_or(SAMPLE_RATE_HZ);
+                        set_logic_sample_rate_preserving_duration(
+                            logic_settings,
+                            sample_rate_hz,
+                        );
                     }
                     let enabled_channel_count = logic_settings
                         .enabled_channels
@@ -4102,45 +4329,150 @@ fn paint_capture_settings(
                         .max_col_width(((content_width - 12.0) * 0.5).max(90.0))
                         .spacing([12.0, 6.0])
                         .show(ui, |ui| {
-                            ui.label("Sample rate");
-                            ui.add_enabled_ui(
-                                availability.capture
-                                    && logic_settings.operation_mode
-                                        != DsLogicOperationMode::InternalTest,
-                                |ui| {
-                                    egui::ComboBox::from_id_salt("logic_sample_rate")
-                                        .width(100.0)
-                                        .selected_text(format_sample_rate(
-                                            logic_settings.sample_rate_hz,
-                                        ))
-                                        .show_ui(ui, |ui| {
-                                            for rate in DSLOGIC_SAMPLE_RATES_HZ
-                                                .iter()
-                                                .copied()
-                                                .filter(|rate| *rate <= maximum_sample_rate_hz)
-                                            {
-                                                ui.selectable_value(
-                                                    &mut logic_settings.sample_rate_hz,
-                                                    rate,
-                                                    format_sample_rate(rate),
-                                                );
-                                            }
-                                        });
-                                },
-                            );
-                            ui.end_row();
-                            ui.label("Buffer");
-                            ui.monospace("1M samples");
-                            ui.end_row();
-                            ui.label("Channels");
-                            ui.monospace(format!("{enabled_channel_count}/16 enabled"));
+                            ui.label("Samples");
+                            ui.monospace(format_sample_count(logic_settings.sample_count));
                             ui.end_row();
                             ui.label("Maximum");
                             ui.monospace(format_sample_rate(maximum_sample_rate_hz));
                             ui.end_row();
-                            ui.label("Display");
-                            ui.monospace("Per-channel names and colors");
-                            ui.end_row();
+                        });
+                    ui.add_space(8.0);
+                    let capture_summary = format!(
+                        "Capture · {} @ {}",
+                        logic_capture_duration_label(*logic_settings),
+                        format_sample_rate(logic_settings.sample_rate_hz)
+                    );
+                    egui::CollapsingHeader::new(RichText::new(capture_summary).strong())
+                        .id_salt("dslogic_capture_section")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.set_max_width(ui.available_width());
+                            egui::Grid::new("dslogic_capture_menu")
+                                .num_columns(2)
+                                .max_col_width(126.0)
+                                .spacing([8.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Mode");
+                                    ui.add_enabled_ui(availability.capture, |ui| {
+                                        let loop_available = logic_settings.operation_mode
+                                            == DsLogicOperationMode::Stream;
+                                        egui::ComboBox::from_id_salt("logic_acquisition_mode")
+                                            .width(100.0)
+                                            .selected_text(logic_acquisition_mode.logic_label())
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    logic_acquisition_mode,
+                                                    AcquisitionMode::Single,
+                                                    "Single",
+                                                );
+                                                ui.selectable_value(
+                                                    logic_acquisition_mode,
+                                                    AcquisitionMode::Repetitive,
+                                                    "Repetitive",
+                                                );
+                                                ui.add_enabled_ui(loop_available, |ui| {
+                                                    ui.selectable_value(
+                                                        logic_acquisition_mode,
+                                                        AcquisitionMode::Loop,
+                                                        "Loop",
+                                                    )
+                                                    .on_disabled_hover_text(
+                                                        "Loop requires DSLogic Stream mode",
+                                                    );
+                                                });
+                                            });
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Duration");
+                                    ui.add_enabled_ui(availability.capture, |ui| {
+                                        egui::ComboBox::from_id_salt("logic_capture_duration")
+                                            .width(100.0)
+                                            .selected_text(logic_capture_duration_label(
+                                                *logic_settings,
+                                            ))
+                                            .show_ui(ui, |ui| {
+                                                for (duration_seconds, sample_count) in
+                                                    logic_capture_duration_options(
+                                                        logic_settings.sample_rate_hz,
+                                                    )
+                                                {
+                                                    ui.selectable_value(
+                                                        &mut logic_settings.sample_count,
+                                                        sample_count,
+                                                        format_duration(Duration::from_secs_f64(
+                                                            duration_seconds,
+                                                        )),
+                                                    );
+                                                }
+                                            });
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Sample rate");
+                                    ui.add_enabled_ui(
+                                        availability.capture
+                                            && logic_settings.operation_mode
+                                                != DsLogicOperationMode::InternalTest,
+                                        |ui| {
+                                            let previous_rate = logic_settings.sample_rate_hz;
+                                            egui::ComboBox::from_id_salt("logic_sample_rate")
+                                                .width(100.0)
+                                                .selected_text(format_sample_rate(
+                                                    logic_settings.sample_rate_hz,
+                                                ))
+                                                .show_ui(ui, |ui| {
+                                                    for rate in DSLOGIC_SAMPLE_RATES_HZ
+                                                        .iter()
+                                                        .copied()
+                                                        .filter(|rate| {
+                                                            *rate <= maximum_sample_rate_hz
+                                                        })
+                                                    {
+                                                        ui.selectable_value(
+                                                            &mut logic_settings.sample_rate_hz,
+                                                            rate,
+                                                            format_sample_rate(rate),
+                                                        );
+                                                    }
+                                                });
+                                            if logic_settings.sample_rate_hz != previous_rate {
+                                                let selected_rate = logic_settings.sample_rate_hz;
+                                                logic_settings.sample_rate_hz = previous_rate;
+                                                set_logic_sample_rate_preserving_duration(
+                                                    logic_settings,
+                                                    selected_rate,
+                                                );
+                                            }
+                                        },
+                                    );
+                                    ui.end_row();
+
+                                    if *logic_acquisition_mode == AcquisitionMode::Repetitive {
+                                        ui.label("Repeat interval");
+                                        if logic_settings.operation_mode
+                                            == DsLogicOperationMode::Stream
+                                        {
+                                            ui.label(RichText::new("0.1 s").color(TEXT_MUTED))
+                                                .on_hover_text(
+                                                    "Stream-mode Repetitive uses the original fixed 0.1 s interval",
+                                                );
+                                        } else {
+                                            ui.add_enabled(
+                                                availability.capture,
+                                                egui::DragValue::new(
+                                                    repetitive_interval_seconds,
+                                                )
+                                                .range(0.1..=10.0)
+                                                .speed(0.1)
+                                                .fixed_decimals(1)
+                                                .suffix(" s"),
+                                            )
+                                            .on_hover_text("Delay between complete captures");
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
                         });
                     ui.add_space(8.0);
                     egui::CollapsingHeader::new(RichText::new("Options").strong())
@@ -4270,9 +4602,15 @@ fn paint_capture_settings(
                             });
                         });
                     ui.add_space(8.0);
-                    egui::CollapsingHeader::new(RichText::new("Channels").strong())
-                        .default_open(true)
-                        .show(ui, |ui| {
+                    egui::CollapsingHeader::new(
+                        RichText::new(format!(
+                            "Channels ({enabled_channel_count}/{LOGIC_CHANNEL_COUNT} enabled)"
+                        ))
+                        .strong(),
+                    )
+                    .id_salt("dslogic_channels_section")
+                    .default_open(false)
+                    .show(ui, |ui| {
                             let channel_controls_enabled = availability.capture
                                 && logic_settings.operation_mode
                                     != DsLogicOperationMode::InternalTest;
@@ -4695,13 +5033,12 @@ impl eframe::App for DsViewApp {
         self.reconcile_capture_settings_tab();
         self.reconcile_waveform_tab();
         self.poll_capture();
+        self.poll_repetitive_capture();
         self.finish_pending_snapshot(context);
 
         let mut refresh_clicked = false;
         let mut snapshot_clicked = false;
         let mut record_now_clicked = false;
-        let mut choose_recording_path_clicked = false;
-        let mut recording_path_required = false;
         let mut open_recording_clicked = false;
         let mut start_request = None;
         let mut stop_clicked = false;
@@ -4778,13 +5115,6 @@ impl eframe::App for DsViewApp {
                     ui.label(RichText::new("DSVIEW").strong().size(18.0).color(ACCENT));
                     ui.separator();
                     ui.menu_button("App", |ui| {
-                        if ui
-                            .add_enabled(!self.is_busy(), egui::Button::new("Open capture…"))
-                            .clicked()
-                        {
-                            open_recording_clicked = true;
-                            ui.close_menu();
-                        }
                         if ui.button("Settings…").clicked() {
                             self.settings_open = true;
                             ui.close_menu();
@@ -4792,10 +5122,24 @@ impl eframe::App for DsViewApp {
                     });
                     ui.separator();
                     ui.label(RichText::new("USB capture workbench").color(TEXT_MUTED));
+                    refresh_clicked = ui
+                        .add_enabled(
+                            !self.is_busy(),
+                            toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
+                        )
+                        .clicked();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let logic_only = control_target == Some(CaptureTarget::LogicAnalyzer);
                         let acquisition_active = self.capture_run_requested
                             && self.requested_capture_target == control_target
-                            && (self.capture.is_some() || self.pending.is_some());
+                            && (self.capture.is_some()
+                                || self.pending.is_some()
+                                || self.scheduled_repetitive_capture.is_some());
+                        let start_mode = if logic_only {
+                            self.logic_acquisition_mode
+                        } else {
+                            AcquisitionMode::Run
+                        };
                         let run_stop_clicked = ui
                             .add_enabled(
                                 acquisition_active
@@ -4810,6 +5154,19 @@ impl eframe::App for DsViewApp {
                             )
                             .on_hover_text(if acquisition_active {
                                 "Stop the active acquisition"
+                            } else if logic_only {
+                                match start_mode {
+                                    AcquisitionMode::Single => {
+                                        "Wait for one trigger, acquire once, then stop"
+                                    }
+                                    AcquisitionMode::Repetitive => {
+                                        "Repeatedly acquire complete captures"
+                                    }
+                                    AcquisitionMode::Loop => {
+                                        "Continuously append stream captures to the rolling display"
+                                    }
+                                    AcquisitionMode::Run => "Start the selected acquisition",
+                                }
                             } else {
                                 "Run continuously; Auto trigger rolls, edge triggers update the display"
                             })
@@ -4818,7 +5175,7 @@ impl eframe::App for DsViewApp {
                             if acquisition_active {
                                 stop_clicked = true;
                             } else if let Some(target) = control_target {
-                                start_request = Some((AcquisitionMode::Run, target));
+                                start_request = Some((start_mode, target));
                             }
                         }
                         if ui
@@ -4832,6 +5189,16 @@ impl eframe::App for DsViewApp {
                             if let Some(target) = control_target {
                                 start_request = Some((AcquisitionMode::Single, target));
                             }
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.is_busy(),
+                                toolbar_action_button("↑ Open capture", TEXT_MUTED),
+                            )
+                            .on_hover_text("Open a saved .dsv capture")
+                            .clicked()
+                        {
+                            open_recording_clicked = true;
                         }
                         if ui
                             .add_enabled(
@@ -4855,12 +5222,6 @@ impl eframe::App for DsViewApp {
                         {
                             snapshot_clicked = true;
                         }
-                        refresh_clicked = ui
-                            .add_enabled(
-                                !self.is_busy(),
-                                toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
-                            )
-                            .clicked();
                     });
                 });
             });
@@ -4885,7 +5246,7 @@ impl eframe::App for DsViewApp {
                                 )
                                 .clicked()
                             {
-                                self.active_waveform_tab = Some(*tab);
+                                self.select_waveform_tab(*tab);
                             }
                         }
                     });
@@ -4937,6 +5298,9 @@ impl eframe::App for DsViewApp {
                                 LogicCaptureSettingsEditor {
                                     settings: &mut self.logic_settings,
                                     speed: logic_settings_speed,
+                                    acquisition_mode: &mut self.logic_acquisition_mode,
+                                    repetitive_interval_seconds: &mut self
+                                        .repetitive_interval_seconds,
                                 },
                                 ScopeCaptureSettingsEditor {
                                     settings: &mut self.scope_settings,
@@ -4956,51 +5320,14 @@ impl eframe::App for DsViewApp {
                                 &mut calibration_action,
                             );
                         }
-
-                        ui.add_space(14.0);
-                        ui.label(RichText::new("RECORDING").strong().color(TEXT_MUTED));
-                        ui.add_space(6.0);
-                        let recording_toggle = ui.add_enabled(
-                            !self.is_busy(),
-                            egui::Checkbox::new(
-                                &mut self.record_capture,
-                                "Record next Single capture",
-                            ),
-                        );
-                        if recording_toggle.changed() && self.record_capture {
-                            choose_recording_path_clicked = true;
-                            recording_path_required = true;
-                        }
-                        if self.record_capture {
-                            ui.label("DSView recording file");
-                            ui.horizontal(|ui| {
-                                ui.add_enabled(
-                                    false,
-                                    egui::TextEdit::singleline(&mut self.recording_path)
-                                        .desired_width((ui.available_width() - 72.0).max(80.0)),
-                                );
-                                if ui
-                                    .add_enabled(!self.is_busy(), egui::Button::new("Change…"))
-                                    .clicked()
-                                {
-                                    choose_recording_path_clicked = true;
-                                }
-                            });
-                            ui.small(
-                                RichText::new(
-                                    "Lossless .dsv · full Single capture · existing files are not overwritten",
-                                )
-                                .color(TEXT_MUTED),
-                            );
-                        }
-                        if ui
-                            .add_enabled(!self.is_busy(), egui::Button::new("Open capture…"))
-                            .clicked()
-                        {
-                            open_recording_clicked = true;
-                        }
                     });
             });
+
+        if self.logic_acquisition_mode == AcquisitionMode::Loop
+            && self.logic_settings.operation_mode != DsLogicOperationMode::Stream
+        {
+            self.logic_acquisition_mode = AcquisitionMode::Single;
+        }
 
         if scope_tools_panel_is_visible(self.active_waveform_tab) {
             egui::SidePanel::right("scope_tools_fixed")
@@ -5576,26 +5903,13 @@ impl eframe::App for DsViewApp {
         }
 
         if record_now_clicked {
+            self.record_capture = false;
             if let Some(path) = choose_recording_save_path(&self.recording_path) {
                 self.recording_path = path.to_string_lossy().into_owned();
                 self.record_capture = true;
                 if let Some(target) = control_target {
                     start_request = Some((AcquisitionMode::Single, target));
                 }
-            }
-        } else if choose_recording_path_clicked {
-            match choose_recording_save_path(&self.recording_path) {
-                Some(path) => {
-                    self.recording_path = path.to_string_lossy().into_owned();
-                    self.record_capture = true;
-                    self.status = format!(
-                        "The next Single capture will be recorded to {}",
-                        path.display()
-                    );
-                    self.last_error = None;
-                }
-                None if recording_path_required => self.record_capture = false,
-                None => {}
             }
         }
         if open_recording_clicked {
@@ -5614,12 +5928,15 @@ impl eframe::App for DsViewApp {
         if stop_clicked {
             self.capture_run_requested = false;
             self.requested_capture_target = None;
+            let repetitive_waiting = self.scheduled_repetitive_capture.take().is_some();
             self.scope_capture_restart_requested = false;
             self.scope_configuration_due = None;
             if self.capture.is_some() {
                 self.stop_capture();
             } else if self.pending.is_some() {
                 self.status = "Stopping acquisition after device preparation…".to_owned();
+            } else if repetitive_waiting {
+                self.status = "Acquisition stopped".to_owned();
             }
         }
         match calibration_action {
@@ -5735,6 +6052,8 @@ impl eframe::App for DsViewApp {
         }
         if self.pending.is_some() || self.capture.is_some() {
             context.request_repaint_after(Duration::from_millis(16));
+        } else if let Some(scheduled) = self.scheduled_repetitive_capture {
+            context.request_repaint_after(scheduled.due.saturating_duration_since(Instant::now()));
         } else if let Some(due) = self.scope_configuration_due {
             context.request_repaint_after(due.saturating_duration_since(Instant::now()));
         }
@@ -6011,6 +6330,11 @@ fn logic_settings_from_recording_metadata(
     {
         if DSLOGIC_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
             settings.sample_rate_hz = sample_rate_hz;
+        }
+    }
+    if let Some(sample_count) = recording_metadata_value::<u64>(metadata, "logic.sample_count") {
+        if (DSLOGIC_SAMPLE_ALIGNMENT..=DSLOGIC_MAX_SAMPLE_COUNT).contains(&sample_count) {
+            settings.sample_count = sample_count;
         }
     }
     for (channel, enabled) in settings.enabled_channels.iter_mut().enumerate() {
@@ -6625,6 +6949,14 @@ fn time_scale_precision(label_step: f64) -> usize {
     }
 }
 
+fn time_scale_label_stride(width: f32) -> usize {
+    const MAJOR_INTERVALS: usize = 10;
+    const MINIMUM_LABEL_SPACING: f32 = 68.0;
+    let maximum_labels = (width / MINIMUM_LABEL_SPACING).floor() as usize;
+    let maximum_labels = maximum_labels.clamp(2, MAJOR_INTERVALS + 1);
+    MAJOR_INTERVALS.div_ceil(maximum_labels - 1)
+}
+
 fn time_scale_sample_window(
     sample_count: usize,
     sample_offset: u64,
@@ -6667,7 +6999,7 @@ fn paint_time_scale(
     const SUBDIVISIONS_PER_INTERVAL: usize = 5;
     let maximum_seconds = first_sample.abs().max(last_sample.abs()) / sample_rate_hz as f64;
     let (unit, multiplier) = time_scale_unit(maximum_seconds);
-    let label_stride = if rect.width() >= 650.0 { 2 } else { 5 };
+    let label_stride = time_scale_label_stride(rect.width());
     let label_step = (last_sample - first_sample) / MAJOR_INTERVALS as f64 * label_stride as f64
         / sample_rate_hz as f64
         * multiplier;
@@ -6679,7 +7011,8 @@ fn paint_time_scale(
         let x = egui::lerp(rect.x_range(), fraction);
         let is_major = index % SUBDIVISIONS_PER_INTERVAL == 0;
         let major_index = index / SUBDIVISIONS_PER_INTERVAL;
-        let is_labelled = is_major && major_index % label_stride == 0;
+        let is_labelled =
+            is_major && (major_index % label_stride == 0 || major_index == MAJOR_INTERVALS);
         let tick_height = if is_labelled {
             7.0
         } else if is_major {
@@ -9687,12 +10020,52 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn logic_capture_defaults_to_stream_mode() {
+        assert_eq!(
+            LogicCaptureSettings::default().operation_mode,
+            DsLogicOperationMode::Stream
+        );
+    }
+
+    #[test]
+    fn logic_capture_menu_offers_five_milliseconds_at_125_megahertz() {
+        let option = logic_capture_duration_options(125_000_000)
+            .into_iter()
+            .find(|(duration, _)| (*duration - 0.005).abs() < f64::EPSILON)
+            .expect("5 ms should be available");
+
+        assert_eq!(option.1, 625_664);
+        let settings = LogicCaptureSettings {
+            sample_rate_hz: 125_000_000,
+            sample_count: option.1,
+            ..LogicCaptureSettings::default()
+        };
+        assert_eq!(logic_capture_duration_label(settings), "5.00 ms");
+    }
+
+    #[test]
+    fn changing_logic_sample_rate_preserves_capture_duration() {
+        let mut settings = LogicCaptureSettings {
+            sample_rate_hz: 125_000_000,
+            sample_count: 625_664,
+            ..LogicCaptureSettings::default()
+        };
+
+        set_logic_sample_rate_preserving_duration(&mut settings, 250_000_000);
+
+        assert_eq!(settings.sample_rate_hz, 250_000_000);
+        assert_eq!(settings.sample_count, 1_250_304);
+        assert_eq!(logic_capture_duration_label(settings), "5.00 ms");
+    }
+
+    #[test]
     fn logic_settings_map_every_device_option() {
         let mut enabled_channels = [false; LOGIC_CHANNEL_COUNT];
         enabled_channels[0] = true;
         enabled_channels[3] = true;
         let settings = LogicCaptureSettings {
             sample_rate_hz: 250_000_000,
+            sample_count: 625_664,
             enabled_channels,
             maximum_heights: [4; LOGIC_CHANNEL_COUNT],
             operation_mode: DsLogicOperationMode::Buffer,
@@ -9710,6 +10083,7 @@ mod tests {
 
         assert_eq!(config.operation_mode(), settings.operation_mode);
         assert_eq!(config.sample_rate_hz(), settings.sample_rate_hz);
+        assert_eq!(config.sample_count(), settings.sample_count);
         assert_eq!(config.enabled_channels(), settings.enabled_channels);
         assert_eq!(config.stop_option(), settings.stop_option);
         assert_eq!(config.threshold_voltage(), settings.threshold_voltage);
@@ -9760,6 +10134,7 @@ mod tests {
         metadata.insert("scope.ch1.probe_attenuation".to_owned(), "10".to_owned());
         metadata.insert("logic.operation_mode".to_owned(), "stream".to_owned());
         metadata.insert("logic.sample_rate_hz".to_owned(), "250000000".to_owned());
+        metadata.insert("logic.sample_count".to_owned(), "1250304".to_owned());
         for channel in 0..LOGIC_CHANNEL_COUNT {
             metadata.insert(
                 format!("logic.ch{channel}.enabled"),
@@ -9843,6 +10218,7 @@ mod tests {
         let logic_settings = loaded.logic_settings.expect("logic metadata should load");
         assert_eq!(logic_settings.operation_mode, DsLogicOperationMode::Stream);
         assert_eq!(logic_settings.sample_rate_hz, 250_000_000);
+        assert_eq!(logic_settings.sample_count, 1_250_304);
         assert_eq!(
             logic_settings.enabled_channels,
             [
@@ -9965,8 +10341,16 @@ mod tests {
 
     #[test]
     fn acquisition_modes_rearm_only_successful_continuous_runs() {
-        assert!(should_rearm_acquisition(
-            AcquisitionMode::Run,
+        for mode in [AcquisitionMode::Repetitive, AcquisitionMode::Run] {
+            assert!(should_rearm_acquisition(
+                mode,
+                true,
+                CompletionStatus::Complete,
+                false,
+            ));
+        }
+        assert!(!should_rearm_acquisition(
+            AcquisitionMode::Loop,
             true,
             CompletionStatus::Complete,
             false,
@@ -9989,6 +10373,26 @@ mod tests {
             CompletionStatus::Complete,
             false,
         ));
+    }
+
+    #[test]
+    fn repetitive_interval_matches_original_stream_and_buffer_behavior() {
+        assert_eq!(
+            repetitive_interval(DsLogicOperationMode::Stream, 7.5),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            repetitive_interval(DsLogicOperationMode::Buffer, 1.5),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            repetitive_interval(DsLogicOperationMode::Buffer, 0.0),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            repetitive_interval(DsLogicOperationMode::Buffer, 20.0),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]
@@ -10428,6 +10832,20 @@ mod tests {
             WaveformTab::Combined.capture_target(),
             CaptureTarget::Combined
         );
+
+        assert_eq!(
+            WaveformTab::LogicAnalyzer.capture_settings_tab(),
+            Some(CaptureSettingsTab::DsLogic)
+        );
+        assert_eq!(
+            WaveformTab::Oscilloscope.capture_settings_tab(),
+            Some(CaptureSettingsTab::DsCope)
+        );
+        assert_eq!(
+            WaveformTab::Lissajous.capture_settings_tab(),
+            Some(CaptureSettingsTab::DsCope)
+        );
+        assert_eq!(WaveformTab::Combined.capture_settings_tab(), None);
 
         assert!(CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsLogicU3Pro16));
         assert!(!CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsCopeU3P100));
@@ -10964,6 +11382,9 @@ mod tests {
         assert_eq!(time_scale_precision(12.0), 0);
         assert_eq!(time_scale_precision(1.2), 1);
         assert_eq!(time_scale_precision(0.008), 4);
+        assert_eq!(time_scale_label_stride(1_000.0), 1);
+        assert_eq!(time_scale_label_stride(500.0), 2);
+        assert_eq!(time_scale_label_stride(250.0), 5);
         assert_eq!(format_duration(Duration::from_nanos(2)), "2.0 ns");
     }
 

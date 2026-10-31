@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 const CHANNEL_COUNT: u8 = 16;
 const HARDWARE_SAMPLE_RATE_HZ: u64 = 500_000_000;
 const PRE_DIVIDER: u32 = 5;
-const SAMPLE_ALIGNMENT: u64 = 1_024;
+pub const DSLOGIC_SAMPLE_ALIGNMENT: u64 = 1_024;
 const ATOMIC_SAMPLES: usize = 64;
 const BYTES_PER_CHANNEL_BLOCK: usize = 8;
 const TRIGGER_HEADER_BYTES: usize = 1_024;
@@ -20,7 +20,10 @@ const TRIGGER_CHECK_ID: u32 = 0x5555_5555;
 const SETTINGS_BYTES: usize = 372;
 const CAPTURE_READ_BYTES: usize = 128 * 1_024;
 const PREQUEUED_DATA_BYTES: usize = 1_024 * 1_024;
-const MAX_SAMPLE_COUNT: u64 = 134_217_728;
+const LOOP_TRANSFER_MILLISECONDS: u64 = 20;
+pub const DSLOGIC_MAX_SAMPLE_COUNT: u64 = 134_217_728;
+const SAMPLE_ALIGNMENT: u64 = DSLOGIC_SAMPLE_ALIGNMENT;
+const MAX_SAMPLE_COUNT: u64 = DSLOGIC_MAX_SAMPLE_COUNT;
 const CAPTURE_COMPLETION_GRACE: Duration = Duration::from_secs(5);
 const PAYLOAD_TRANSFER_GRACE: Duration = Duration::from_secs(5);
 
@@ -30,6 +33,7 @@ const RLE_MODE_BIT: u16 = 3;
 const HALF_MODE_BIT: u16 = 5;
 const QUARTER_MODE_BIT: u16 = 6;
 const FILTER_BIT: u16 = 8;
+const LOOP_MODE_BIT: u16 = 7;
 const STREAM_MODE_BIT: u16 = 12;
 const INTERNAL_TEST_BIT: u16 = 15;
 
@@ -73,6 +77,7 @@ pub struct DsLogicCaptureConfig {
     sample_rate_hz: u64,
     sample_count: u64,
     operation_mode: DsLogicOperationMode,
+    loop_mode: bool,
     stop_option: DsLogicStopOption,
     threshold_mv: u16,
     input_filter: DsLogicInputFilter,
@@ -98,6 +103,7 @@ impl DsLogicCaptureConfig {
             sample_rate_hz,
             sample_count,
             operation_mode: DsLogicOperationMode::Buffer,
+            loop_mode: false,
             stop_option: DsLogicStopOption::UploadCapturedData,
             threshold_mv: 1_000,
             input_filter: DsLogicInputFilter::None,
@@ -110,6 +116,11 @@ impl DsLogicCaptureConfig {
 
     pub fn with_operation_mode(mut self, operation_mode: DsLogicOperationMode) -> Self {
         self.operation_mode = operation_mode;
+        self
+    }
+
+    pub fn with_loop_mode(mut self, loop_mode: bool) -> Self {
+        self.loop_mode = loop_mode;
         self
     }
 
@@ -171,6 +182,10 @@ impl DsLogicCaptureConfig {
 
     pub fn operation_mode(self) -> DsLogicOperationMode {
         self.operation_mode
+    }
+
+    pub fn loop_mode(self) -> bool {
+        self.loop_mode
     }
 
     pub fn stop_option(self) -> DsLogicStopOption {
@@ -246,6 +261,11 @@ impl DsLogicCaptureConfig {
     }
 
     fn validate_for_speed(self, speed: UsbSpeedClass) -> Result<(), CaptureError> {
+        if self.loop_mode && self.operation_mode != DsLogicOperationMode::Stream {
+            return Err(CaptureError::new(
+                "DSLogic loop mode requires stream operation mode",
+            ));
+        }
         let maximum = self.maximum_sample_rate_hz(speed);
         if self.sample_rate_hz > maximum {
             return Err(CaptureError::new(format!(
@@ -283,6 +303,7 @@ impl DsLogicCaptureConfig {
             | (u16::from(self.external_clock) << CLOCK_TYPE_BIT)
             | (u16::from(self.falling_clock_edge) << CLOCK_EDGE_BIT)
             | (u16::from(self.rle_enabled) << RLE_MODE_BIT)
+            | (u16::from(self.loop_mode) << LOOP_MODE_BIT)
             | (u16::from(self.sample_rate_hz == 500_000_000) << HALF_MODE_BIT)
             | (u16::from(self.sample_rate_hz == 1_000_000_000) << QUARTER_MODE_BIT)
             | (u16::from(self.input_filter == DsLogicInputFilter::OneSampleClock) << FILTER_BIT);
@@ -447,7 +468,7 @@ fn read_capture(
     context: &CaptureContext,
 ) -> Result<(), CaptureError> {
     let trigger = TriggerPosition::decode(&prequeued.header)?;
-    let available_samples = trigger.available_samples(config.sample_count)?;
+    let available_samples = captured_sample_count(config, trigger)?;
     let total_bytes = usize::try_from(available_samples)
         .ok()
         .and_then(|samples| samples.checked_mul(config.enabled_channel_count() as usize))
@@ -461,9 +482,12 @@ fn read_capture(
         )));
     }
     let cross_block_bytes = config.enabled_channel_count() as usize * BYTES_PER_CHANNEL_BLOCK;
-    let read_buffer_bytes = CAPTURE_READ_BYTES / cross_block_bytes * cross_block_bytes;
+    let read_buffer_bytes = if config.loop_mode {
+        loop_transfer_bytes(config)
+    } else {
+        CAPTURE_READ_BYTES / cross_block_bytes * cross_block_bytes
+    };
     let mut wire_buffer = vec![0_u8; read_buffer_bytes];
-    let mut bytes_remaining = total_bytes - prequeued.payload.len();
     let mut sample_offset = 0_u64;
     let mut sequence = 0_u64;
     if !prequeued.payload.is_empty() {
@@ -476,6 +500,19 @@ fn read_capture(
             &mut sample_offset,
         )?;
     }
+    if config.loop_mode {
+        return read_loop_capture(
+            session,
+            config,
+            context,
+            &mut wire_buffer,
+            prequeued.capture_origin,
+            &mut sequence,
+            &mut sample_offset,
+        );
+    }
+
+    let mut bytes_remaining = total_bytes - prequeued.payload.len();
     let conservative_transfer_time = Duration::from_secs_f64(total_bytes as f64 / 10_000_000.0);
     let payload_deadline = Instant::now() + conservative_transfer_time + PAYLOAD_TRANSFER_GRACE;
     while bytes_remaining > 0 {
@@ -504,6 +541,54 @@ fn read_capture(
         bytes_remaining -= bytes_to_read;
     }
     Ok(())
+}
+
+fn loop_transfer_bytes(config: DsLogicCaptureConfig) -> usize {
+    let cross_block_bytes = config.enabled_channel_count() as usize * BYTES_PER_CHANNEL_BLOCK;
+    let bytes_per_second =
+        config.sample_rate_hz as u128 * u128::from(config.enabled_channel_count()) / 8;
+    let target = (bytes_per_second * u128::from(LOOP_TRANSFER_MILLISECONDS) / 1_000)
+        .min(PREQUEUED_DATA_BYTES as u128) as usize;
+    (target / cross_block_bytes * cross_block_bytes).max(cross_block_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_loop_capture(
+    session: &UsbDeviceSession,
+    config: DsLogicCaptureConfig,
+    context: &CaptureContext,
+    wire_buffer: &mut [u8],
+    capture_origin: Duration,
+    sequence: &mut u64,
+    sample_offset: &mut u64,
+) -> Result<(), CaptureError> {
+    loop {
+        if !read_exact_until_cancelled(session, wire_buffer, context)? {
+            return Ok(());
+        }
+        emit_wire_batch(
+            wire_buffer,
+            config,
+            capture_origin,
+            context,
+            sequence,
+            sample_offset,
+        )?;
+    }
+}
+
+fn captured_sample_count(
+    config: DsLogicCaptureConfig,
+    trigger: TriggerPosition,
+) -> Result<u64, CaptureError> {
+    if config.operation_mode == DsLogicOperationMode::Stream {
+        // The vendor driver deliberately ignores the trigger header's
+        // remaining-sample count in stream mode. Stream transfers can already
+        // contain a full USB buffer while that counter still describes only a
+        // small completed portion of the current hardware capture window.
+        return Ok(config.sample_count & !(SAMPLE_ALIGNMENT - 1));
+    }
+    trigger.available_samples(config.sample_count)
 }
 
 struct PrequeuedCapture {
@@ -684,6 +769,31 @@ fn read_exact_cancellable(
         }
     }
     Ok(ReadOutcome::Complete)
+}
+
+fn read_exact_until_cancelled(
+    session: &UsbDeviceSession,
+    mut buffer: &mut [u8],
+    context: &CaptureContext,
+) -> Result<bool, CaptureError> {
+    while !buffer.is_empty() {
+        match session
+            .read_bulk_cancellable(buffer, || context.is_cancelled())
+            .map_err(capture_error)?
+        {
+            BulkReadOutcome::Data(0) => {
+                return Err(CaptureError::new(
+                    "the DSLogic bulk endpoint returned an empty loop transfer",
+                ));
+            }
+            BulkReadOutcome::Data(bytes_read) => {
+                let (_, remaining) = buffer.split_at_mut(bytes_read);
+                buffer = remaining;
+            }
+            BulkReadOutcome::Cancelled => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -911,6 +1021,50 @@ mod tests {
     }
 
     #[test]
+    fn encodes_loop_mode_for_continuous_stream_capture() {
+        let config = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_loop_mode(true);
+
+        assert!(config.loop_mode());
+        assert_eq!(
+            read_u16(&config.encode_settings(), 6),
+            (1 << STREAM_MODE_BIT) | (1 << LOOP_MODE_BIT)
+        );
+        assert!(config.validate_for_speed(UsbSpeedClass::SuperSpeed).is_ok());
+
+        let invalid = config.with_operation_mode(DsLogicOperationMode::Buffer);
+        assert!(invalid
+            .validate_for_speed(UsbSpeedClass::SuperSpeed)
+            .is_err());
+    }
+
+    #[test]
+    fn loop_transfer_size_targets_frequent_aligned_updates() {
+        let mut one_channel = [false; CHANNEL_COUNT as usize];
+        one_channel[0] = true;
+        let slow = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_loop_mode(true)
+            .with_enabled_channels(one_channel)
+            .expect("channel selection should be valid");
+        assert_eq!(loop_transfer_bytes(slow), 2_496);
+
+        let fast = DsLogicCaptureConfig::new(125_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_loop_mode(true);
+        assert_eq!(loop_transfer_bytes(fast), PREQUEUED_DATA_BYTES);
+        assert_eq!(
+            loop_transfer_bytes(fast)
+                % (fast.enabled_channel_count() as usize * BYTES_PER_CHANNEL_BLOCK),
+            0
+        );
+    }
+
+    #[test]
     fn encodes_enabled_channel_count_mask_and_high_rate_modes() {
         let mut enabled_channels = [false; CHANNEL_COUNT as usize];
         enabled_channels[2] = true;
@@ -1037,6 +1191,31 @@ mod tests {
 
         assert_eq!(trigger.remaining_samples, 64);
         assert_eq!(trigger.available_samples(1_000_000).unwrap(), 999_424);
+    }
+
+    #[test]
+    fn stream_capture_ignores_partial_trigger_remaining_count() {
+        let trigger = TriggerPosition {
+            remaining_samples: 996_928,
+        };
+        let buffer_config = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .expect("buffer configuration should be valid");
+        let stream_config = buffer_config.with_operation_mode(DsLogicOperationMode::Stream);
+
+        assert_eq!(
+            captured_sample_count(buffer_config, trigger).unwrap(),
+            3_072
+        );
+        assert_eq!(
+            captured_sample_count(stream_config, trigger).unwrap(),
+            999_424
+        );
+        assert_eq!(
+            captured_sample_count(stream_config, trigger).unwrap()
+                * u64::from(stream_config.enabled_channel_count())
+                / 8,
+            1_998_848
+        );
     }
 
     #[test]
