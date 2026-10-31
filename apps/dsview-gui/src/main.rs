@@ -77,6 +77,7 @@ const SCOPE_MARKER_LIMIT: usize = 10;
 const CHANNEL_NAME_MAX_CHARS: usize = 32;
 const LOGIC_CHANNEL_NAME_MAX_CHARS: usize = 8;
 const DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY: u8 = 128;
+const CAPTURE_FILE_BUTTON_WIDTH: f32 = 82.0;
 static SCOPE_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
 
 fn toolbar_action_button(label: &str, color: Color32) -> egui::Button<'static> {
@@ -5122,12 +5123,36 @@ impl eframe::App for DsViewApp {
                     });
                     ui.separator();
                     ui.label(RichText::new("USB capture workbench").color(TEXT_MUTED));
+                    ui.separator();
                     refresh_clicked = ui
                         .add_enabled(
                             !self.is_busy(),
                             toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
                         )
                         .clicked();
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            !self.is_busy() && control_target_available,
+                            toolbar_action_button("⏺ Record", Color32::LIGHT_RED)
+                                .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
+                        )
+                        .on_hover_text("Record a complete Single capture to a .dsv file")
+                        .clicked()
+                    {
+                        record_now_clicked = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.is_busy(),
+                            toolbar_action_button("📂 Open", TEXT_MUTED)
+                                .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
+                        )
+                        .on_hover_text("Open a saved .dsv capture")
+                        .clicked()
+                    {
+                        open_recording_clicked = true;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let logic_only = control_target == Some(CaptureTarget::LogicAnalyzer);
                         let acquisition_active = self.capture_run_requested
@@ -5190,27 +5215,7 @@ impl eframe::App for DsViewApp {
                                 start_request = Some((AcquisitionMode::Single, target));
                             }
                         }
-                        if ui
-                            .add_enabled(
-                                !self.is_busy(),
-                                toolbar_action_button("↑ Open capture", TEXT_MUTED),
-                            )
-                            .on_hover_text("Open a saved .dsv capture")
-                            .clicked()
-                        {
-                            open_recording_clicked = true;
-                        }
-                        if ui
-                            .add_enabled(
-                                !self.is_busy() && control_target_available,
-                                toolbar_action_button("● Record", Color32::LIGHT_RED),
-                            )
-                            .on_hover_text("Record a complete Single capture to a .dsv file")
-                            .clicked()
-                        {
-                            record_now_clicked = true;
-                        }
-                        ui.add_space(12.0);
+                        ui.separator();
                         if ui
                             .add_enabled(
                                 self.snapshot_plot_rect.is_some()
