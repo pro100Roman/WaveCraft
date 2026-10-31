@@ -1585,6 +1585,14 @@ fn uses_continuous_scope_source(mode: AcquisitionMode, target: CaptureTarget) ->
     mode == AcquisitionMode::Run && target == CaptureTarget::Oscilloscope
 }
 
+fn should_reveal_continuous_scope_capture(
+    mode: AcquisitionMode,
+    target: CaptureTarget,
+    batch: &CaptureBatch,
+) -> bool {
+    uses_continuous_scope_source(mode, target) && matches!(batch, CaptureBatch::Scope(_))
+}
+
 fn is_scope_frame_start(sequence: u64) -> bool {
     sequence % DSCOPE_FRAME_SEQUENCE_STRIDE == 0
 }
@@ -3149,6 +3157,13 @@ impl DsViewApp {
                                     .scope_config
                                     .channels()
                                     .map(|channel| channel.enabled());
+                                let reveal_continuous_scope = active
+                                    .preserve_display_until_complete
+                                    && should_reveal_continuous_scope_capture(
+                                        active.mode,
+                                        active.target,
+                                        &frame.payload,
+                                    );
                                 if active.waveforms.scope_rolling
                                     && is_scope_frame_start(frame.sequence)
                                     && matches!(&frame.payload, CaptureBatch::Scope(_))
@@ -3160,6 +3175,9 @@ impl DsViewApp {
                                 active
                                     .waveforms
                                     .ingest(&frame.payload, enabled_scope_channels);
+                                if reveal_continuous_scope {
+                                    active.preserve_display_until_complete = false;
+                                }
                             }
                             CaptureEvent::SourceFailed { device_id, error } => {
                                 active.session.request_stop();
@@ -8340,6 +8358,14 @@ fn scope_sample_fraction(sample: f32, sample_offset: u64, sample_count: usize) -
     local_sample / sample_count.saturating_sub(1).max(1) as f32
 }
 
+fn should_align_scope_trigger(
+    anchor_locked: bool,
+    scope_rolling: bool,
+    has_trigger_crossing: bool,
+) -> bool {
+    anchor_locked && (!scope_rolling || has_trigger_crossing)
+}
+
 fn waveform_sample_x(
     plot: Rect,
     viewport: WaveformViewport,
@@ -9954,7 +9980,11 @@ fn paint_scope_time_domain(
         })
         .unwrap_or_else(|| f32::from(settings.trigger.position_percent) / 100.0);
     let trigger_screen_fraction = f32::from(trigger_settings.position_percent) / 100.0;
-    if viewport.anchor_locked && !waveforms.scope_rolling {
+    if should_align_scope_trigger(
+        viewport.anchor_locked,
+        waveforms.scope_rolling,
+        trigger_crossing.is_some(),
+    ) {
         viewport.align_trigger_to_screen(trigger_sample_fraction, trigger_screen_fraction);
     }
     let (viewport_panned, viewport_timebase_changed, waveform_click) = update_waveform_viewport(
@@ -10637,6 +10667,36 @@ mod tests {
         assert!(!uses_continuous_scope_source(
             AcquisitionMode::Run,
             CaptureTarget::Combined,
+        ));
+    }
+
+    #[test]
+    fn first_continuous_scope_batch_replaces_the_preserved_single_trace() {
+        let scope = CaptureBatch::Scope(ScopeBatch {
+            sample_rate_hz: 1_000_000,
+            trigger_sample_index: None,
+            channels: vec![vec![0.0]],
+        });
+        let logic = CaptureBatch::Logic(LogicBatch {
+            sample_rate_hz: 1_000_000,
+            channel_count: 1,
+            samples: vec![0],
+        });
+
+        assert!(should_reveal_continuous_scope_capture(
+            AcquisitionMode::Run,
+            CaptureTarget::Oscilloscope,
+            &scope,
+        ));
+        assert!(!should_reveal_continuous_scope_capture(
+            AcquisitionMode::Single,
+            CaptureTarget::Oscilloscope,
+            &scope,
+        ));
+        assert!(!should_reveal_continuous_scope_capture(
+            AcquisitionMode::Run,
+            CaptureTarget::Oscilloscope,
+            &logic,
         ));
     }
 
@@ -12061,6 +12121,14 @@ mod tests {
             scope_trigger_crossing_sample(&waveforms, ScopeCaptureSettings::default(), trigger),
             None
         );
+    }
+
+    #[test]
+    fn rolling_scope_aligns_when_auto_trigger_finds_an_edge() {
+        assert!(should_align_scope_trigger(true, true, true));
+        assert!(!should_align_scope_trigger(true, true, false));
+        assert!(should_align_scope_trigger(true, false, false));
+        assert!(!should_align_scope_trigger(false, true, true));
     }
 
     #[test]
