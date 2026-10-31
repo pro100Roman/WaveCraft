@@ -6778,10 +6778,81 @@ const LOGIC_CHANNEL_MARKER_MIN_BODY_WIDTH: f32 = 16.0;
 const LOGIC_CHANNEL_MARKER_TIP_WIDTH: f32 = 6.0;
 const LOGIC_CHANNEL_MARKER_CHARACTER_WIDTH: f32 = 6.0;
 const LOGIC_CHANNEL_MARKER_HORIZONTAL_PADDING: f32 = 8.0;
-const LOGIC_SIGNAL_HEIGHT_AT_1X: f32 = 0.3;
+const LOGIC_SIGNAL_DEFAULT_STEPS_PER_LANE: usize = 4;
 
-fn logic_signal_height(lane_height: f32, maximum_height: u8) -> f32 {
-    lane_height * LOGIC_SIGNAL_HEIGHT_AT_1X * f32::from(maximum_height.clamp(1, 5))
+#[derive(Clone, Copy, Debug)]
+struct LogicSignalLayout {
+    base_height: f32,
+    levels: [(f32, f32); LOGIC_CHANNEL_COUNT],
+}
+
+fn logic_signal_layout(
+    plot_top: f32,
+    plot_height: f32,
+    maximum_heights: &[u8; LOGIC_CHANNEL_COUNT],
+) -> LogicSignalLayout {
+    let requested_height_steps = maximum_heights
+        .iter()
+        .map(|height| usize::from((*height).clamp(1, 5)))
+        .sum::<usize>();
+    let minimum_steps = LOGIC_CHANNEL_COUNT * LOGIC_SIGNAL_DEFAULT_STEPS_PER_LANE;
+    let required_steps = requested_height_steps + LOGIC_CHANNEL_COUNT + 1;
+    let total_steps = required_steps
+        .max(minimum_steps)
+        .div_ceil(LOGIC_CHANNEL_COUNT)
+        * LOGIC_CHANNEL_COUNT;
+    let lane_steps = total_steps / LOGIC_CHANNEL_COUNT;
+    let base_height = plot_height / total_steps as f32;
+    let mut step_levels = [(0_i32, 0_i32); LOGIC_CHANNEL_COUNT];
+
+    for channel in 0..LOGIC_CHANNEL_COUNT {
+        let maximum_height = i32::from(maximum_heights[channel].clamp(1, 5));
+        let nominal_low = (channel * lane_steps + lane_steps - 1) as i32;
+        let mut high = nominal_low - maximum_height;
+        let mut low = nominal_low;
+        let minimum_high = if channel == 0 {
+            1
+        } else {
+            step_levels[channel - 1].1 + 1
+        };
+        if high < minimum_high {
+            let movement = minimum_high - high;
+            high += movement;
+            low += movement;
+        }
+        step_levels[channel] = (high, low);
+    }
+
+    for channel in (0..LOGIC_CHANNEL_COUNT).rev() {
+        let maximum_low = if channel + 1 == LOGIC_CHANNEL_COUNT {
+            total_steps as i32 - 1
+        } else {
+            step_levels[channel + 1].0 - 1
+        };
+        let (mut high, mut low) = step_levels[channel];
+        if low > maximum_low {
+            let movement = low - maximum_low;
+            high -= movement;
+            low -= movement;
+        }
+        step_levels[channel] = (high, low);
+    }
+
+    debug_assert!(step_levels[0].0 >= 1);
+    debug_assert!(step_levels[LOGIC_CHANNEL_COUNT - 1].1 < total_steps as i32);
+    for channel in 1..LOGIC_CHANNEL_COUNT {
+        debug_assert!(step_levels[channel - 1].1 < step_levels[channel].0);
+    }
+
+    LogicSignalLayout {
+        base_height,
+        levels: step_levels.map(|(high, low)| {
+            (
+                plot_top + high as f32 * base_height,
+                plot_top + low as f32 * base_height,
+            )
+        }),
+    }
 }
 
 fn logic_channel_marker_text(channel: usize, channel_name: &str) -> String {
@@ -6912,6 +6983,8 @@ fn paint_logic(
     let step = (visible_count as f32 / plot.width().max(1.0))
         .floor()
         .max(1.0) as usize;
+    let signal_layout = logic_signal_layout(plot.top(), plot.height(), &*maximum_heights);
+    let marker_lane_height = signal_layout.base_height * LOGIC_SIGNAL_DEFAULT_STEPS_PER_LANE as f32;
     for channel in 0..LOGIC_CHANNEL_COUNT {
         if !enabled_channels[channel] {
             continue;
@@ -6921,12 +6994,9 @@ fn paint_logic(
         let channel_name = &mut channel_names[channel];
         let channel_label = channel_label("D", channel, channel_name);
         let marker_text = logic_channel_marker_text(channel, channel_name);
-        let lane_top = plot.top() + channel as f32 * lane_height;
-        let low = lane_top + lane_height * 0.9;
-        let signal_height = logic_signal_height(lane_height, maximum_heights[channel]);
-        let high = low - signal_height;
+        let (high, low) = signal_layout.levels[channel];
         paint_logic_zero_reference(painter, plot, low, *channel_color);
-        let marker_rect = logic_channel_marker_rect(plot, low, lane_height, &marker_text);
+        let marker_rect = logic_channel_marker_rect(plot, low, marker_lane_height, &marker_text);
         let marker_response = ui
             .interact(
                 marker_rect.expand(3.0),
@@ -7053,7 +7123,7 @@ fn paint_logic(
             painter,
             plot,
             low,
-            lane_height,
+            marker_lane_height,
             &marker_text,
             *channel_color,
             *channel_marker_opacity,
@@ -10276,12 +10346,56 @@ mod tests {
 
     #[test]
     fn logic_maximum_height_uses_the_selected_multiple() {
-        let height_at_1x = logic_signal_height(20.0, 1);
+        let mut maximum_heights = [1; LOGIC_CHANNEL_COUNT];
 
         for multiple in 1..=5 {
-            let scaled_height = logic_signal_height(20.0, multiple);
-            assert!((scaled_height - height_at_1x * f32::from(multiple)).abs() < f32::EPSILON);
+            maximum_heights[8] = multiple;
+            let layout = logic_signal_layout(0.0, 320.0, &maximum_heights);
+            let (high, low) = layout.levels[8];
+            assert!((low - high - layout.base_height * f32::from(multiple)).abs() < f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn logic_maximum_height_reflows_channels_inside_the_plot() {
+        let height_patterns = [
+            [1; LOGIC_CHANNEL_COUNT],
+            [5; LOGIC_CHANNEL_COUNT],
+            [5, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 5],
+            [5, 1, 5, 1, 5, 1, 5, 1, 5, 1, 5, 1, 5, 1, 5, 1],
+        ];
+
+        for maximum_heights in height_patterns {
+            let layout = logic_signal_layout(40.0, 320.0, &maximum_heights);
+            assert!(layout.levels[0].0 >= 40.0 + layout.base_height);
+            assert!(layout.levels[LOGIC_CHANNEL_COUNT - 1].1 <= 360.0 - layout.base_height);
+            for channel in 1..LOGIC_CHANNEL_COUNT {
+                assert!(
+                    layout.levels[channel - 1].1 + layout.base_height
+                        <= layout.levels[channel].0 + f32::EPSILON
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn logic_reflow_moves_neighbors_in_base_height_steps() {
+        let defaults = logic_signal_layout(0.0, 320.0, &[1; LOGIC_CHANNEL_COUNT]);
+        let mut maximum_heights = [1; LOGIC_CHANNEL_COUNT];
+        maximum_heights[0] = 5;
+        let enlarged_first = logic_signal_layout(0.0, 320.0, &maximum_heights);
+        assert!((defaults.base_height - enlarged_first.base_height).abs() < f32::EPSILON);
+        assert!(
+            (enlarged_first.levels[1].0 - defaults.levels[1].0 - defaults.base_height).abs()
+                < f32::EPSILON
+        );
+
+        maximum_heights = [1; LOGIC_CHANNEL_COUNT];
+        maximum_heights[LOGIC_CHANNEL_COUNT - 1] = 5;
+        let enlarged_last = logic_signal_layout(0.0, 320.0, &maximum_heights);
+        let movement = (defaults.levels[14].0 - enlarged_last.levels[14].0) / defaults.base_height;
+        assert!((movement - movement.round()).abs() < f32::EPSILON);
+        assert!(movement >= 1.0);
     }
 
     #[test]
