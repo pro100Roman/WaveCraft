@@ -1,18 +1,19 @@
-# Automation, Scenario, and MCP Architecture
+# Automation, Scenario, VISA/SCPI, and MCP Architecture
 
 Status: proposed
 
 DSView should support unattended hardware operation, repeatable diagnostic
 scenarios, conventional scripting, and AI-assisted debugging. These use cases
 share the same device and capture operations, but they require different
-adapters. The CLI, a future local service, and an MCP server must therefore be
-thin clients of one application service rather than independent
-implementations of hardware control.
+adapters. The CLI, a future local service, a SCPI endpoint, and an MCP server
+must therefore be thin clients of one application service rather than
+independent implementations of hardware control.
 
 ```text
                  +-- dsview CLI ----- humans, scripts, and CI
 Hardware/core ---+-- application ---- GUI and native integrations
                  +-- local daemon --- persistent sessions and Python clients
+                 +-- SCPI endpoint -- VISA clients and test systems
                  `-- MCP adapter ---- AI agents
 ```
 
@@ -28,14 +29,16 @@ recording, decoding, cancellation, and errors. Hardware drivers remain in
 - Produce stable machine-readable results and live progress events.
 - Preserve the lossless `.dsv` recording as the source of truth.
 - Give AI agents bounded, structured access to diagnostics and signal data.
-- Keep the same operations and schemas across CLI, daemon, and MCP adapters.
+- Keep the same operations and schemas across CLI, daemon, SCPI, and MCP
+  adapters.
 - Test automation against `dsview-sim` without connected USB hardware.
 
 ## Non-goals
 
 - MCP is not the primary or only automation API.
+- SCPI is an adapter for laboratory automation, not the canonical internal API.
 - Scenarios do not embed arbitrary shell commands.
-- Raw captures are not serialized into large JSON or MCP responses.
+- Raw captures are not serialized into large JSON, SCPI, or MCP responses.
 - The first version does not expose DSView as a remotely accessible hardware
   service.
 - Automation does not weaken device validation, transfer bounds, timeouts, or
@@ -228,6 +231,83 @@ transport session. It binds locally by default. Remote access, authentication,
 and authorization are a separate deployment feature rather than a consequence
 of enabling automation.
 
+## VISA and SCPI adapter
+
+DSView may expose a SCPI endpoint for integration with PyVISA, LabVIEW,
+MATLAB, and existing automated test systems. VISA is the client-side I/O API;
+DSView implements the instrument-side command protocol. The endpoint must be a
+thin adapter over the application service or `dsviewd`, not an automation layer
+over GUI controls. GUI view state is outside the SCPI contract.
+
+The initial transport should be a newline-delimited SCPI TCP socket bound to
+the loopback interface by default. A client can address it as a VISA socket
+resource such as:
+
+```text
+TCPIP0::127.0.0.1::5025::SOCKET
+```
+
+The port is configurable. VXI-11 or HiSLIP may be added later when discovery,
+service requests, or `TCPIP::...::INSTR` compatibility justify the additional
+protocol complexity. A raw socket endpoint must not advertise capabilities,
+discovery, or VISA event semantics that it does not implement.
+
+The adapter should support the applicable IEEE 488.2 common commands,
+including `*IDN?`, `*CLS`, `*OPC?`, and status queries, together with
+`SYSTem:ERRor?`. DSView-specific commands should map directly to typed service
+operations. An illustrative command tree is:
+
+```text
+DSView:DEVice:LIST?
+DSView:DEVice:SELect "usb:3-2"
+DSView:DEVice:PROBe?
+DSView:SCENario:VALidate? "spi-boot.yaml"
+DSView:SCENario:LOAD "spi-boot.yaml"
+DSView:RUN:STARt?
+DSView:RUN:STATus? "run-id"
+DSView:RUN:STOP "run-id"
+DSView:RUN:RESult? "run-id"
+DSView:RECording:INSPect? "capture.dsv"
+```
+
+Exact command names, abbreviations, response formats, and error mappings are a
+versioned public contract. Commands that start long operations return opaque
+run IDs. Clients normally poll status or the standard operation status model;
+`*OPC?` may wait for operations started by the same connection. Live NDJSON is
+not multiplexed into SCPI query responses. Clients needing a rich event stream
+should use the CLI or daemon API.
+
+SCPI session state, such as the selected device and pending error queue, is per
+connection. Device ownership and runs are service-level state shared with all
+other adapters. The contract must define whether a run continues or is
+cancelled when its initiating connection closes. `*RST` must have a bounded,
+documented meaning and must not silently perform maintenance operations.
+
+Responses contain bounded summaries and artifact references. Raw captures
+remain in `.dsv` files. If bounded waveform transfer is later supported, it
+uses IEEE binary blocks with explicit channel, sample, response-size, and
+execution-time limits. Scenario and artifact paths are restricted to allowed
+directories. The server binds locally by default; remote exposure requires a
+separate authentication, authorization, and transport-security design.
+
+A Python client may use a VISA implementation without a native DSView binding:
+
+```python
+import pyvisa
+
+resources = pyvisa.ResourceManager("@py")
+instrument = resources.open_resource("TCPIP0::127.0.0.1::5025::SOCKET")
+instrument.write_termination = "\n"
+instrument.read_termination = "\n"
+instrument.timeout = 20_000
+
+print(instrument.query("*IDN?"))
+instrument.write('DSVIEW:DEVICE:SELECT "usb:3-2"')
+instrument.write('DSVIEW:SCENARIO:LOAD "spi-boot.yaml"')
+run_id = instrument.query("DSVIEW:RUN:START?").strip()
+print(instrument.query(f'DSVIEW:RUN:STATUS? "{run_id}"'))
+```
+
 ## MCP adapter
 
 MCP is an adapter for AI agents, not a replacement for the application service
@@ -343,6 +423,10 @@ Tests should cover:
 - complete and interrupted `.dsv` artifacts;
 - representative Python clients on every supported platform;
 - MCP tool schema validation and response bounds;
+- SCPI parsing, abbreviations, status registers, error queues, and response
+  bounds;
+- representative PyVISA clients over the loopback TCP socket;
+- SCPI disconnect, cancellation, and cross-adapter device ownership behavior;
 - exclusive device ownership and cancellation in the daemon.
 
 Hardware tests remain opt-in. Every automation behavior that does not depend on
@@ -358,8 +442,9 @@ sources and recorded fixtures.
 4. Implement `dsview.scenario/v1`, validation, and simulator integration tests.
 5. Add first-party decoders and bounded signal-analysis operations.
 6. Generate portable debug bundles.
-7. Add a thin local MCP adapter over the CLI or application service.
-8. Introduce `dsviewd` when persistent ownership and background runs are
+7. Add a loopback SCPI socket adapter over the application service or daemon.
+8. Add a thin local MCP adapter over the CLI or application service.
+9. Introduce `dsviewd` when persistent ownership and background runs are
    required.
 
 The first milestone is a YAML scenario that runs against `dsview-sim`, emits
