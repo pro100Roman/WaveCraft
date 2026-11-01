@@ -15,6 +15,9 @@ use zip::write::FileOptions;
 const SALEAE_MAGIC: [u8; 8] = *b"<SALEAE>";
 const SALEAE_BINARY_VERSION: u32 = 3;
 const SALEAE_META_VERSION: u32 = 22;
+// Logic reserves 32-bit device IDs for simulator profiles. This synthetic
+// 64-bit ID identifies data imported from a physical, non-Saleae instrument.
+const DSVIEW_IMPORT_DEVICE_ID: &str = "4294967296";
 const TYPE_DIGITAL: u32 = 100;
 const TYPE_ANALOG: u32 = 101;
 const TYPE_TRIGGER: u32 = 103;
@@ -993,13 +996,13 @@ fn build_metadata(capture: &SaleaeCapture) -> Value {
             "measurements": [], "highLevelAnalyzers": [], "analyzers": [],
             "rowsSettings": rows,
             "legacyDevice": {
-                "deviceId": "1000005", "name": "Logic Pro 16", "deviceType": "LogicPro16",
-                "isSimulation": true,
+                "deviceId": DSVIEW_IMPORT_DEVICE_ID, "name": "DSView import", "deviceType": "LogicPro16",
+                "isSimulation": false,
                 "capabilities": {
                     "channelCapabilities": capabilities,
                     "sampleRateOptions": [{"digital": digital_rate, "analog": analog_rate}],
                     "digitalThresholdOptions": [{"description": "1.2 Volts"}, {"description": "1.8 Volts"}, {"description": "3.3+ Volts"}],
-                    "isPhysicalDevice": false
+                    "isPhysicalDevice": true
                 }
             },
             "legacyDeviceCalibration": {"fullScaleVoltageRanges": ranges},
@@ -1400,6 +1403,17 @@ mod tests {
         let mut high_first = Vec::new();
         write_digital_bin(&mut high_first, &high_capture, 0).unwrap();
         assert_eq!(&high_first[CHUNK_RLE_OFFSET..CHUNK_RLE_OFFSET + 2], &[1, 0]);
+    }
+
+    #[test]
+    fn exported_metadata_identifies_dsview_data_as_non_simulated() {
+        let metadata = build_metadata(&example_capture());
+        let device = &metadata["data"]["legacyDevice"];
+
+        assert_eq!(device["name"], "DSView import");
+        assert_eq!(device["isSimulation"], false);
+        assert_eq!(device["capabilities"]["isPhysicalDevice"], true);
+        assert!(device["deviceId"].as_str().unwrap().parse::<u64>().unwrap() > u64::from(u32::MAX));
     }
 
     #[test]
