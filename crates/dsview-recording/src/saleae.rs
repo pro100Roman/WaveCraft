@@ -622,15 +622,12 @@ fn read_digital_bin(input: &mut impl Read) -> Result<(u64, Vec<bool>), SaleaeErr
         if samples.len().saturating_add(expected) > MAX_SAMPLES_PER_CHANNEL {
             return Err(SaleaeError::invalid("digital channel is too large"));
         }
-        let mut high = match read_u16(input)? {
-            0 => false,
-            1 => true,
-            other => {
-                return Err(SaleaeError::invalid(format!(
-                    "digital chunk has invalid initial state {other}"
-                )))
-            }
-        };
+        if read_u16(input)? != 0 {
+            return Err(SaleaeError::invalid(
+                "digital chunk metadata is unsupported",
+            ));
+        }
+        let mut high = true;
         let mut encoded = vec![0_u8; byte_count];
         input.read_exact(&mut encoded)?;
         let mut cursor = 0;
@@ -767,7 +764,6 @@ fn write_universal_header(
 struct DigitalChunk {
     start: u64,
     end: u64,
-    initial_high: bool,
     encoded: Vec<u8>,
 }
 
@@ -780,17 +776,19 @@ fn write_digital_bin(
     let mut chunks = Vec::new();
     let mut start = 0_usize;
     while start < digital.samples.len() {
-        let initial_high = digital.samples[start] & mask != 0;
         let mut encoded = Vec::new();
         let mut cursor = start;
         while cursor < digital.samples.len() {
-            let state = digital.samples[cursor] & mask != 0;
+            // Saleae RLE chunks implicitly start high. Native Logic captures
+            // represent a low-starting signal with a one-sample high prefix.
+            let state = cursor == 0 || digital.samples[cursor] & mask != 0;
             let mut end = cursor + 1;
             while end < digital.samples.len() && (digital.samples[end] & mask != 0) == state {
                 end += 1;
             }
             let run = encode_run((end - cursor) as u64);
-            if !encoded.is_empty() && encoded.len() + run.len() > DIGITAL_CHUNK_DATA_BYTES {
+            if !encoded.is_empty() && encoded.len() + run.len() > DIGITAL_CHUNK_DATA_BYTES && state
+            {
                 break;
             }
             encoded.extend_from_slice(&run);
@@ -799,7 +797,6 @@ fn write_digital_bin(
         chunks.push(DigitalChunk {
             start: start as u64,
             end: cursor as u64,
-            initial_high,
             encoded,
         });
         start = cursor;
@@ -817,7 +814,7 @@ fn write_digital_bin(
         output.write_all(&chunk.start.to_le_bytes())?;
         output.write_all(&chunk.end.to_le_bytes())?;
         output.write_all(&packed.to_le_bytes())?;
-        output.write_all(&u16::from(chunk.initial_high).to_le_bytes())?;
+        output.write_all(&0_u16.to_le_bytes())?;
         output.write_all(&chunk.encoded)?;
     }
     Ok(())
@@ -1329,7 +1326,7 @@ mod tests {
         SaleaeCapture {
             digital: Some(SaleaeDigitalCapture {
                 sample_rate_hz: 10_000_000,
-                samples: vec![0, 1, 1, 3, 2, 0, 0, 1],
+                samples: vec![3, 1, 1, 3, 2, 0, 0, 1],
                 channels: vec![
                     SaleaeChannel {
                         index: 0,
@@ -1380,6 +1377,29 @@ mod tests {
             assert_eq!(decode_run(&encoded, &mut cursor).unwrap(), run);
             assert_eq!(cursor, encoded.len());
         }
+    }
+
+    #[test]
+    fn digital_chunks_start_high_as_required_by_saleae_rle() {
+        const CHUNK_RLE_OFFSET: usize = 51 + 26;
+        let low_capture = SaleaeDigitalCapture {
+            sample_rate_hz: 1_000_000,
+            samples: vec![0, 0, 0],
+            channels: Vec::new(),
+        };
+
+        let mut low_first = Vec::new();
+        write_digital_bin(&mut low_first, &low_capture, 0).unwrap();
+        assert_eq!(&low_first[CHUNK_RLE_OFFSET..CHUNK_RLE_OFFSET + 2], &[0, 1]);
+
+        let high_capture = SaleaeDigitalCapture {
+            sample_rate_hz: 1_000_000,
+            samples: vec![1, 1, 0],
+            channels: Vec::new(),
+        };
+        let mut high_first = Vec::new();
+        write_digital_bin(&mut high_first, &high_capture, 0).unwrap();
+        assert_eq!(&high_first[CHUNK_RLE_OFFSET..CHUNK_RLE_OFFSET + 2], &[1, 0]);
     }
 
     #[test]
