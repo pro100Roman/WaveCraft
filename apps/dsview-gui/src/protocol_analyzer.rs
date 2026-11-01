@@ -85,7 +85,7 @@ pub struct ProtocolAnalyzerEditor {
     pub target_index: Option<usize>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ProtocolAnalyzerSettings {
     pub search: String,
     pub picker_open: bool,
