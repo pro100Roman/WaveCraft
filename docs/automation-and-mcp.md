@@ -143,7 +143,22 @@ Lossless frames flow to the recorder; progress events delivered to clients are
 bounded and may be aggregated. A slow JSON, SCPI, or MCP consumer must not
 stall USB acquisition or cause unbounded memory growth.
 
-### Automation device description
+### Device discovery, selection, and ownership
+
+Device selection is the first automation milestone and must be complete before
+capture control is exposed. The required lifecycle is:
+
+```text
+discover devices
+      |
+      `-- describe identity and capabilities
+              |
+              `-- resolve selector to exactly one device
+                      |
+                      `-- acquire exclusive lease
+                              |
+                              `-- return DeviceHandle
+```
 
 The current device-independent `DeviceDescriptor` is intentionally small.
 Automation needs a richer, schema-stable description containing at least:
@@ -161,13 +176,41 @@ The connection ID and persistent identity are separate concepts: a topology
 identifier may change when an instrument moves to another port, while a serial
 number identifies the physical instrument when the hardware exposes one.
 
-Device selectors must resolve to exactly one instrument. A selector matching no
-devices returns `device_not_found`; one matching multiple devices returns
-`ambiguous_device_match`. Automation must never silently select the first
-matching physical instrument. A UI or SCPI connection may retain a convenient
-per-client selected device, but internally each operation uses the resolved
-device handle. Device busy state is advisory until an exclusive lease is
-actually acquired.
+Initial selectors should support an exact connection ID, a persistent serial
+number when available, and model or capability predicates. Device selectors
+must resolve to exactly one instrument. A selector matching no devices returns
+`device_not_found`; one matching multiple devices returns
+`ambiguous_device_match` together with bounded candidate descriptions.
+Automation must never silently select the first matching physical instrument.
+
+For example, three connected DSCope U3P100 instruments are three independent
+devices even though their models and capabilities are identical:
+
+```text
+usb:1-2.1  DSCope U3P100
+usb:1-2.2  DSCope U3P100
+usb:1-3    DSCope U3P100
+```
+
+Selecting only `model = dscope_u3p100` is ambiguous. Selecting
+`connection_id = usb:1-2.2` resolves exactly one instrument. Multi-device
+capture is a separate, explicit operation that resolves every requested role
+or selector independently; it is never inferred from an ambiguous single-
+device selector.
+
+Resolution and ownership are separate steps. A successful match does not imply
+that the device is still available, so `open_device` must atomically acquire an
+exclusive lease or return `device_busy`. The lease is held by `DeviceHandle`
+and released when that handle is closed or dropped. A UI or SCPI connection may
+retain a convenient per-client selected device, but internally every operation
+uses its resolved handle. A future daemon makes leases authoritative across
+multiple external clients; without it, the process-local lease and operating-
+system USB interface claim provide the available protection.
+
+Simulator discovery, selection, ambiguity handling, and leasing must use the
+same public contract as USB devices. Tests for zero matches, one match, multiple
+matches, busy devices, disconnect-after-selection, and lease release do not
+require physical hardware except for opt-in transport coverage.
 
 ### Structured errors
 
@@ -661,38 +704,47 @@ sources and recorded fixtures.
 
 ## Delivery plan
 
-1. Define structured automation device, capability, selector, capture
-   configuration, error, event, status, and result types.
-2. Add `AutomationManager`, `DeviceHandle`, `CaptureHandle`, and
-   `CompletedCapture` to `wavecraft-automation`.
-3. Implement exact simulated-device discovery and selection plus deterministic,
-   finite capture in `wavecraft-sim`.
-4. Centralize capture execution, progress aggregation, cancellation, timeout,
+1. Define structured device identity, description, capability, selector, and
+   device-resolution error types.
+2. Add `AutomationManager` discovery for simulated and USB devices and expose
+   schema-versioned device listings through the CLI.
+3. Implement exact selector resolution with tests for zero, one, and multiple
+   matches; remove implicit first-match selection from public automation paths.
+4. Implement exclusive process-local leases and `DeviceHandle`, including busy,
+   disconnect, and release behavior.
+5. Expose capability inspection and read-only probing through the selected
+   device handle.
+6. Define capture configuration, capture error, event, status, result,
+   `CaptureHandle`, and `CompletedCapture` types.
+7. Implement deterministic, finite simulated capture through a selected
+   simulated device.
+8. Centralize capture execution, progress aggregation, cancellation, timeout,
    incremental recording, and terminal footer selection in the automation
    crate.
-5. Replace development-only CLI parsing with direct `devices` and `capture`
-   command groups plus schema-versioned JSON and NDJSON.
-6. Add simulator end-to-end tests for successful, cancelled, timed-out, failed,
-   and non-overwriting capture behavior.
-7. Implement the same device-and-capture contract for explicitly selected USB
-   instruments and keep hardware tests opt-in.
-8. Extend `.dsv` metadata with requested and effective configuration, resolved
-   device identity, build information, and structured completion context.
-9. Implement `wavecraft.scenario/v1` as orchestration over the proven direct
-   capture API, including explicit role-to-device bindings.
-10. Add first-party decoders, bounded signal-analysis operations, and portable
+9. Add direct CLI `capture` commands plus schema-versioned JSON and NDJSON.
+10. Add simulator end-to-end tests for successful, cancelled, timed-out,
+    failed, and non-overwriting capture behavior.
+11. Implement the same selected-device capture contract for USB instruments and
+    keep hardware tests opt-in.
+12. Extend `.dsv` metadata with requested and effective configuration, resolved
+    device identity, build information, and structured completion context.
+13. Implement `wavecraft.scenario/v1` as orchestration over the proven direct
+    capture API, including explicit role-to-device bindings.
+14. Add first-party decoders, bounded signal-analysis operations, and portable
     debug bundles.
-11. Add MCP read-only tools, then bounded direct capture tools, over the same
+15. Add MCP read-only tools, then bounded direct capture tools, over the same
     service.
-12. Introduce `wavecraftd` when persistent ownership, shared capture handles,
+16. Introduce `wavecraftd` when persistent ownership, shared capture handles,
     or background runs are required.
-13. Add a loopback SCPI socket adapter after shared leases and persistent
+17. Add a loopback SCPI socket adapter after shared leases and persistent
     capture ownership are established.
 
-The first milestone is direct control of one explicitly selected simulated
-logic analyzer. A CLI command supplies the complete capture configuration,
-emits versioned NDJSON, supports cancellation and timeout, writes a valid
-`.dsv`, and returns a structured result. The next milestone runs that same
-operation against one explicitly selected USB instrument. Scenarios and MCP
-then reuse the proven device-and-capture lifecycle rather than defining a
-separate control path.
+The first milestone is deterministic discovery, exact selection, and exclusive
+ownership of one simulated or USB device, with structured results for no match,
+ambiguous match, and busy state. The second milestone is direct control of one
+explicitly selected simulated logic analyzer: a CLI command supplies the
+complete capture configuration, emits versioned NDJSON, supports cancellation
+and timeout, writes a valid `.dsv`, and returns a structured result. The next
+milestone runs that same operation against one explicitly selected USB
+instrument. Scenarios and MCP then reuse the proven device-and-capture
+lifecycle rather than defining a separate control path.
