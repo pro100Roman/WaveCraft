@@ -2512,6 +2512,7 @@ impl Default for LogicSessionSettings {
 struct ScopeSessionSettings {
     capture: ScopeCaptureSettings,
     auto_sample_rate: bool,
+    smart_timing_enabled: bool,
     function_settings: ScopeFunctionSettings,
     marker_settings: ScopeMarkerSettings,
     quick_time_measurement: ScopeQuickTimeMeasurement,
@@ -2529,6 +2530,7 @@ impl Default for ScopeSessionSettings {
         Self {
             capture: ScopeCaptureSettings::default(),
             auto_sample_rate: true,
+            smart_timing_enabled: false,
             function_settings: ScopeFunctionSettings::default(),
             marker_settings: ScopeMarkerSettings::default(),
             quick_time_measurement: ScopeQuickTimeMeasurement::default(),
@@ -2597,6 +2599,7 @@ struct WaveCraftApp {
     logic_settings: LogicCaptureSettings,
     scope_settings: ScopeCaptureSettings,
     scope_auto_sample_rate: bool,
+    scope_smart_timing_enabled: bool,
     scope_function_settings: ScopeFunctionSettings,
     scope_marker_settings: ScopeMarkerSettings,
     scope_quick_time_measurement: ScopeQuickTimeMeasurement,
@@ -2664,6 +2667,7 @@ impl WaveCraftApp {
             logic_settings: LogicCaptureSettings::default(),
             scope_settings: ScopeCaptureSettings::default(),
             scope_auto_sample_rate: true,
+            scope_smart_timing_enabled: false,
             scope_function_settings: ScopeFunctionSettings::default(),
             scope_marker_settings: ScopeMarkerSettings::default(),
             scope_quick_time_measurement: ScopeQuickTimeMeasurement::default(),
@@ -3973,6 +3977,7 @@ impl WaveCraftApp {
         ScopeSessionSettings {
             capture: self.scope_settings,
             auto_sample_rate: self.scope_auto_sample_rate,
+            smart_timing_enabled: self.scope_smart_timing_enabled,
             function_settings: self.scope_function_settings,
             marker_settings: self.scope_marker_settings,
             quick_time_measurement: self.scope_quick_time_measurement,
@@ -3989,6 +3994,7 @@ impl WaveCraftApp {
     fn apply_scope_session_settings(&mut self, settings: ScopeSessionSettings) {
         self.scope_settings = settings.capture;
         self.scope_auto_sample_rate = settings.auto_sample_rate;
+        self.scope_smart_timing_enabled = settings.smart_timing_enabled;
         self.scope_function_settings = settings.function_settings;
         self.scope_marker_settings = settings.marker_settings;
         self.scope_quick_time_measurement = settings.quick_time_measurement;
@@ -5134,6 +5140,7 @@ struct CaptureSettingsAvailability {
 struct ScopeCaptureSettingsEditor<'a> {
     settings: &'a mut ScopeCaptureSettings,
     auto_sample_rate: &'a mut bool,
+    smart_timing_enabled: &'a mut bool,
 }
 
 struct LogicCaptureSettingsEditor<'a> {
@@ -5176,6 +5183,7 @@ fn paint_capture_settings(
     let ScopeCaptureSettingsEditor {
         settings: scope_settings,
         auto_sample_rate: scope_auto_sample_rate,
+        smart_timing_enabled: scope_smart_timing_enabled,
     } = scope_editor;
     let ScopeVisualizationSettingsEditor {
         channel_colors: scope_channel_colors,
@@ -5661,6 +5669,14 @@ fn paint_capture_settings(
                             ui.monospace(format_sample_rate(maximum_sample_rate_hz));
                             ui.end_row();
                         });
+                    ui.add_space(8.0);
+                    ui.checkbox(
+                        scope_smart_timing_enabled,
+                        "Smart timing on waveform hover",
+                    )
+                    .on_hover_text(
+                        "Show elapsed time from the trigger crossing and the voltage at the waveform point under the mouse",
+                    );
                     ui.add_space(8.0);
                     egui::CollapsingHeader::new(RichText::new("Options").strong())
                         .default_open(false)
@@ -6803,6 +6819,7 @@ impl eframe::App for WaveCraftApp {
                                 ScopeCaptureSettingsEditor {
                                     settings: &mut self.scope_settings,
                                     auto_sample_rate: &mut self.scope_auto_sample_rate,
+                                    smart_timing_enabled: &mut self.scope_smart_timing_enabled,
                                 },
                                 ScopeVisualizationSettingsEditor {
                                     channel_colors: &mut self.scope_channel_colors,
@@ -7127,6 +7144,7 @@ impl eframe::App for WaveCraftApp {
                                     true,
                                     ScopeWaveformOptions {
                                         settings: scope_settings,
+                                        smart_timing_enabled: self.scope_smart_timing_enabled,
                                         function_settings: self.scope_function_settings,
                                         channel_names: &self.scope_channel_names,
                                         measurement_caches: &mut scope_measurement_caches,
@@ -7207,6 +7225,7 @@ impl eframe::App for WaveCraftApp {
                             },
                             ScopeWaveformOptions {
                                 settings: scope_settings,
+                                smart_timing_enabled: self.scope_smart_timing_enabled,
                                 function_settings: self.scope_function_settings,
                                 channel_names: &self.scope_channel_names,
                                 measurement_caches: &mut scope_measurement_caches,
@@ -8493,6 +8512,7 @@ const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;
 
 struct ScopeWaveformOptions<'a> {
     settings: ScopeCaptureSettings,
+    smart_timing_enabled: bool,
     function_settings: ScopeFunctionSettings,
     channel_names: &'a [String; 2],
     measurement_caches: &'a mut [ScopeMeasurementCache; 2],
@@ -9985,6 +10005,33 @@ fn paint_logic_timing_hint(
     }
     let channel = measurement.channel;
 
+    if let Some(timing) = measurement.cycle {
+        if let (Some(start_x), Some(end_x)) = (
+            logic_marker_x(
+                plot,
+                viewport,
+                waveforms.logic_sample_offset,
+                waveforms.logic_sample_count,
+                timing.period_start_sample,
+            ),
+            logic_marker_x(
+                plot,
+                viewport,
+                waveforms.logic_sample_offset,
+                waveforms.logic_sample_count,
+                timing.period_end_sample,
+            ),
+        ) {
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(start_x.min(end_x), plot.top()),
+                    Pos2::new(start_x.max(end_x), plot.bottom()),
+                ),
+                0.0,
+                color.gamma_multiply(0.08),
+            );
+        }
+    }
     for sample in [measurement.edge_start_sample, measurement.edge_end_sample] {
         if let Some(x) = logic_marker_x(
             plot,
@@ -10664,6 +10711,24 @@ struct ScopeTriggerCrossing {
     channel_index: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScopeSmartTimingMeasurement {
+    start_sample: f64,
+    end_sample: f64,
+    channel_index: usize,
+    end_voltage: f32,
+}
+
+impl ScopeSmartTimingMeasurement {
+    fn duration(self, sample_rate_hz: u64) -> Option<Duration> {
+        (sample_rate_hz != 0).then(|| {
+            Duration::from_secs_f64(
+                (self.end_sample - self.start_sample).abs() / sample_rate_hz as f64,
+            )
+        })
+    }
+}
+
 fn scope_trigger_crossing_sample(
     waveforms: &WaveformStore,
     settings: ScopeCaptureSettings,
@@ -10765,6 +10830,156 @@ fn scope_trigger_crossing_sample(
 fn scope_sample_fraction(sample: f64, sample_offset: u64, sample_count: usize) -> f32 {
     let local_sample = sample - sample_offset as f64;
     (local_sample / sample_count.saturating_sub(1).max(1) as f64) as f32
+}
+
+fn scope_smart_timing_measurement(
+    waveforms: &WaveformStore,
+    trigger_crossing: ScopeTriggerCrossing,
+    plot: Rect,
+    viewport: WaveformViewport,
+    display_sample_count: usize,
+    pointer: Pos2,
+) -> Option<ScopeSmartTimingMeasurement> {
+    if !plot.contains(pointer) || display_sample_count == 0 {
+        return None;
+    }
+    let samples = waveforms
+        .scope_channels
+        .get(trigger_crossing.channel_index)?;
+    if samples.is_empty() {
+        return None;
+    }
+    let screen_fraction = (pointer.x - plot.left()) / plot.width().max(1.0);
+    let domain_fraction = viewport.domain_fraction_at_screen(screen_fraction);
+    let end_sample_index =
+        (f64::from(domain_fraction) * display_sample_count.saturating_sub(1) as f64).round();
+    if end_sample_index < 0.0 || end_sample_index > samples.len().saturating_sub(1) as f64 {
+        return None;
+    }
+    let end_sample_index = end_sample_index as usize;
+    Some(ScopeSmartTimingMeasurement {
+        start_sample: trigger_crossing.sample,
+        end_sample: waveforms.scope_sample_offset as f64 + end_sample_index as f64,
+        channel_index: trigger_crossing.channel_index,
+        end_voltage: samples[end_sample_index],
+    })
+}
+
+fn scope_smart_timing_has_nonzero_trigger(
+    settings: ScopeCaptureSettings,
+    trigger_crossing: ScopeTriggerCrossing,
+) -> bool {
+    settings
+        .channels
+        .get(trigger_crossing.channel_index)
+        .is_some_and(|channel| {
+            scope_trigger_threshold_voltage(
+                *channel,
+                settings.trigger.levels[trigger_crossing.channel_index],
+            )
+            .abs()
+                > f32::EPSILON
+        })
+}
+
+struct ScopeSmartTimingPaintOptions {
+    settings: ScopeCaptureSettings,
+    viewport: WaveformViewport,
+    display_sample_count: usize,
+    sample_rate_hz: u64,
+    color: Color32,
+}
+
+fn paint_scope_timing_hint(
+    painter: &egui::Painter,
+    plot: Rect,
+    waveforms: &WaveformStore,
+    measurement: ScopeSmartTimingMeasurement,
+    options: ScopeSmartTimingPaintOptions,
+) {
+    let ScopeSmartTimingPaintOptions {
+        settings,
+        viewport,
+        display_sample_count,
+        sample_rate_hz,
+        color,
+    } = options;
+    let Some(duration) = measurement.duration(sample_rate_hz) else {
+        return;
+    };
+    let Some(channel) = settings.channels.get(measurement.channel_index).copied() else {
+        return;
+    };
+    let start_x = waveform_sample_x(
+        plot,
+        viewport,
+        measurement.start_sample - waveforms.scope_sample_offset as f64,
+        display_sample_count,
+    );
+    let end_x = waveform_sample_x(
+        plot,
+        viewport,
+        measurement.end_sample - waveforms.scope_sample_offset as f64,
+        display_sample_count,
+    );
+    let start_y = scope_trigger_level_y(
+        plot,
+        channel,
+        settings.trigger.levels[measurement.channel_index],
+    );
+    let end_y = scope_sample_y(plot, channel, measurement.end_voltage);
+
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(start_x.min(end_x), plot.top()),
+            Pos2::new(start_x.max(end_x), plot.bottom()),
+        ),
+        0.0,
+        color.gamma_multiply(0.08),
+    );
+    for (x, opacity) in [(start_x, 0.3), (end_x, 0.5)] {
+        painter.line_segment(
+            [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+            Stroke::new(0.75_f32, color.gamma_multiply(opacity)),
+        );
+    }
+    for point in [Pos2::new(start_x, start_y), Pos2::new(end_x, end_y)] {
+        painter.circle_filled(point, 2.0, color.gamma_multiply(0.5));
+    }
+
+    if plot.width() < 120.0 || plot.height() < 70.0 {
+        return;
+    }
+    let width = 190.0_f32.min(plot.width() - 16.0);
+    let hint = Rect::from_min_size(
+        Pos2::new(plot.right() - width - 8.0, plot.top() + 26.0),
+        Vec2::new(width, 42.0),
+    );
+    painter.rect_filled(hint, 5.0, PANEL.gamma_multiply(0.88));
+    let border = Stroke::new(0.75_f32, color.gamma_multiply(0.65));
+    painter.line_segment([hint.left_top(), hint.right_top()], border);
+    painter.line_segment([hint.right_top(), hint.right_bottom()], border);
+    painter.line_segment([hint.right_bottom(), hint.left_bottom()], border);
+    painter.line_segment([hint.left_bottom(), hint.left_top()], border);
+
+    let left = hint.left() + 8.0;
+    painter.text(
+        Pos2::new(left, hint.top() + 6.0),
+        egui::Align2::LEFT_TOP,
+        format!("DURATION   {}", format_duration(duration)),
+        FontId::monospace(10.0),
+        Color32::WHITE,
+    );
+    painter.text(
+        Pos2::new(left, hint.top() + 22.0),
+        egui::Align2::LEFT_TOP,
+        format!(
+            "AMPLITUDE  {}",
+            format_trigger_voltage(measurement.end_voltage)
+        ),
+        FontId::monospace(10.0),
+        color,
+    );
 }
 
 fn should_align_scope_trigger(
@@ -12401,6 +12616,7 @@ fn paint_scope_time_domain(
 ) {
     let ScopeWaveformOptions {
         mut settings,
+        smart_timing_enabled,
         function_settings,
         channel_names,
         measurement_caches,
@@ -12720,6 +12936,38 @@ fn paint_scope_time_domain(
             window_positions: measurement_window_positions,
         },
     );
+    let smart_timing = smart_timing_enabled
+        .then(|| ui.input(|input| input.pointer.hover_pos()))
+        .flatten()
+        .zip(
+            trigger_crossing
+                .filter(|crossing| scope_smart_timing_has_nonzero_trigger(settings, *crossing)),
+        )
+        .and_then(|(pointer, crossing)| {
+            scope_smart_timing_measurement(
+                waveforms,
+                crossing,
+                plot,
+                *viewport,
+                display_sample_count,
+                pointer,
+            )
+        });
+    if let Some(measurement) = smart_timing {
+        paint_scope_timing_hint(
+            &scope_painter,
+            plot,
+            waveforms,
+            measurement,
+            ScopeSmartTimingPaintOptions {
+                settings,
+                viewport: *viewport,
+                display_sample_count,
+                sample_rate_hz: display_sample_rate_hz,
+                color: channel_colors[measurement.channel_index],
+            },
+        );
+    }
     paint_waveform_time_scale(
         painter,
         time_ruler,
@@ -15109,6 +15357,72 @@ mod tests {
 
         assert!((scope_sample_fraction(1_050.0, 1_000, 101) - 0.5).abs() < f32::EPSILON);
         assert!((waveform_sample_x(plot, viewport, 50.0, 101) - 500.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn scope_smart_timing_snaps_the_pointer_to_the_triggering_signal() {
+        let waveforms = WaveformStore {
+            scope_channels: vec![
+                VecDeque::from(vec![-1.0, -1.0, 1.0, 0.25, 0.5]),
+                VecDeque::from(vec![0.0; 5]),
+            ],
+            scope_rate_hz: 1_000_000,
+            scope_sample_offset: 1_000,
+            scope_trigger_sample_index: Some(1_002),
+            ..WaveformStore::default()
+        };
+        let settings = ScopeCaptureSettings::default();
+        let trigger = ScopeTriggerSettings {
+            source: DsCopeTriggerSource::ChannelZero,
+            slope: DsCopeTriggerSlope::Rising,
+            ..ScopeTriggerSettings::default()
+        };
+        let crossing = scope_trigger_crossing_sample(&waveforms, settings, trigger).unwrap();
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0));
+
+        let measurement = scope_smart_timing_measurement(
+            &waveforms,
+            crossing,
+            plot,
+            WaveformViewport::default(),
+            5,
+            Pos2::new(75.0, 90.0),
+        )
+        .unwrap();
+
+        assert_eq!(measurement.start_sample, 1_001.5);
+        assert_eq!(measurement.end_sample, 1_003.0);
+        assert_eq!(measurement.channel_index, 0);
+        assert_eq!(measurement.end_voltage, 0.25);
+        assert_eq!(
+            measurement.duration(waveforms.scope_rate_hz),
+            Some(Duration::from_nanos(1_500))
+        );
+        assert_eq!(
+            scope_smart_timing_measurement(
+                &waveforms,
+                crossing,
+                plot,
+                WaveformViewport::default(),
+                5,
+                Pos2::new(101.0, 50.0),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn scope_smart_timing_ignores_a_zero_volt_trigger_level() {
+        let crossing = ScopeTriggerCrossing {
+            sample: 10.0,
+            channel_index: 0,
+        };
+        let mut settings = ScopeCaptureSettings::default();
+
+        assert!(!scope_smart_timing_has_nonzero_trigger(settings, crossing));
+
+        settings.trigger.levels[0] = 104;
+        assert!(scope_smart_timing_has_nonzero_trigger(settings, crossing));
     }
 
     #[test]
