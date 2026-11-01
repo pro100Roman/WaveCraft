@@ -1494,6 +1494,29 @@ impl LogicMarker {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogicTimingMeasurement {
+    channel: usize,
+    period_start_sample: u64,
+    period_end_sample: u64,
+    period_samples: u64,
+    high_samples: u64,
+}
+
+impl LogicTimingMeasurement {
+    fn period(self, sample_rate_hz: u64) -> Duration {
+        Duration::from_secs_f64(self.period_samples as f64 / sample_rate_hz as f64)
+    }
+
+    fn frequency_hz(self, sample_rate_hz: u64) -> f64 {
+        sample_rate_hz as f64 / self.period_samples as f64
+    }
+
+    fn duty_cycle_percent(self) -> f64 {
+        self.high_samples as f64 / self.period_samples as f64 * 100.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LogicMarkerDraft {
     start_sample: u64,
     end_sample: u64,
@@ -2412,6 +2435,7 @@ struct DsViewApp {
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
     logic_channel_marker_opacities: [u8; LOGIC_CHANNEL_COUNT],
     logic_channel_settings_drafts: [LogicChannelSettingsDraft; LOGIC_CHANNEL_COUNT],
+    logic_smart_timing_enabled: bool,
     logic_marker_settings: LogicMarkerSettings,
     protocol_analyzer: ProtocolAnalyzerSettings,
     scope_channel_colors: [Color32; 2],
@@ -2475,6 +2499,7 @@ impl DsViewApp {
             logic_channel_colors: default_logic_channel_colors(),
             logic_channel_marker_opacities: default_logic_channel_marker_opacities(),
             logic_channel_settings_drafts: default_logic_channel_settings_drafts(),
+            logic_smart_timing_enabled: true,
             logic_marker_settings: LogicMarkerSettings::default(),
             protocol_analyzer: ProtocolAnalyzerSettings::default(),
             scope_channel_colors: SCOPE_COLORS,
@@ -4712,6 +4737,7 @@ struct LogicCaptureSettingsEditor<'a> {
     speed: UsbSpeedClass,
     acquisition_mode: &'a mut AcquisitionMode,
     repetitive_interval_seconds: &'a mut f32,
+    smart_timing_enabled: &'a mut bool,
     marker_settings: &'a mut LogicMarkerSettings,
     protocol_analyzer: &'a mut ProtocolAnalyzerSettings,
     displayed_sample_count: usize,
@@ -4737,6 +4763,7 @@ fn paint_capture_settings(
         speed: logic_speed,
         acquisition_mode: logic_acquisition_mode,
         repetitive_interval_seconds,
+        smart_timing_enabled: logic_smart_timing_enabled,
         marker_settings: logic_marker_settings,
         protocol_analyzer,
         displayed_sample_count: displayed_logic_sample_count,
@@ -4808,6 +4835,14 @@ fn paint_capture_settings(
                             ui.monospace(format_sample_rate(maximum_sample_rate_hz));
                             ui.end_row();
                         });
+                    ui.add_space(8.0);
+                    ui.checkbox(
+                        logic_smart_timing_enabled,
+                        "Smart timing on waveform hover",
+                    )
+                    .on_hover_text(
+                        "Show edge width, rising-edge period, frequency, and duty cycle for the digital waveform under the mouse",
+                    );
                     ui.add_space(8.0);
                     let capture_summary = format!(
                         "Capture · {} @ {}",
@@ -6356,6 +6391,7 @@ impl eframe::App for DsViewApp {
                                     acquisition_mode: &mut self.logic_acquisition_mode,
                                     repetitive_interval_seconds: &mut self
                                         .repetitive_interval_seconds,
+                                    smart_timing_enabled: &mut self.logic_smart_timing_enabled,
                                     marker_settings: &mut self.logic_marker_settings,
                                     protocol_analyzer: &mut self.protocol_analyzer,
                                     displayed_sample_count: displayed_logic_sample_count,
@@ -6552,6 +6588,7 @@ impl eframe::App for DsViewApp {
                                             &mut logic_channel_marker_opacities,
                                         channel_names: &mut logic_channel_names,
                                         channel_settings_drafts: &mut logic_channel_settings_drafts,
+                                        smart_timing_enabled: self.logic_smart_timing_enabled,
                                         marker_settings: &mut logic_marker_settings,
                                         maximum_heights: &mut logic_maximum_heights,
                                         enabled_channels: &mut logic_enabled_channels,
@@ -6644,6 +6681,7 @@ impl eframe::App for DsViewApp {
                                 channel_marker_opacities: &mut logic_channel_marker_opacities,
                                 channel_names: &mut logic_channel_names,
                                 channel_settings_drafts: &mut logic_channel_settings_drafts,
+                                smart_timing_enabled: self.logic_smart_timing_enabled,
                                 marker_settings: &mut logic_marker_settings,
                                 maximum_heights: &mut logic_maximum_heights,
                                 enabled_channels: &mut logic_enabled_channels,
@@ -7995,6 +8033,7 @@ struct LogicWaveformOptions<'a> {
     channel_marker_opacities: &'a mut [u8; LOGIC_CHANNEL_COUNT],
     channel_names: &'a mut [String; LOGIC_CHANNEL_COUNT],
     channel_settings_drafts: &'a mut [LogicChannelSettingsDraft; LOGIC_CHANNEL_COUNT],
+    smart_timing_enabled: bool,
     marker_settings: &'a mut LogicMarkerSettings,
     maximum_heights: &'a mut [u8; LOGIC_CHANNEL_COUNT],
     enabled_channels: &'a mut [bool; LOGIC_CHANNEL_COUNT],
@@ -9027,6 +9066,138 @@ fn nearest_logic_transition_sample(
     closest.map(|(sample, _)| sample)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogicSmartTimingMeasurement {
+    channel: usize,
+    edge_start_sample: u64,
+    edge_end_sample: u64,
+    cycle: Option<LogicTimingMeasurement>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogicTransition {
+    sample: u64,
+    new_state_high: bool,
+}
+
+fn exact_logic_bucket_state(bucket: LogicSampleBucket, mask: u32) -> Option<bool> {
+    (bucket.activity & mask == 0).then_some(bucket.first & mask != 0)
+}
+
+fn logic_transition_before_bucket(
+    waveforms: &WaveformStore,
+    mask: u32,
+    before_bucket: usize,
+) -> Option<LogicTransition> {
+    for right_index in (1..=before_bucket).rev() {
+        let left_state = exact_logic_bucket_state(waveforms.logic_samples[right_index - 1], mask)?;
+        let right_state = exact_logic_bucket_state(waveforms.logic_samples[right_index], mask)?;
+        if left_state != right_state {
+            return Some(LogicTransition {
+                sample: waveforms.logic_sample_offset.saturating_add(
+                    (right_index as u64).saturating_mul(waveforms.logic_sample_stride as u64),
+                ),
+                new_state_high: right_state,
+            });
+        }
+    }
+    None
+}
+
+fn logic_transition_after_bucket(
+    waveforms: &WaveformStore,
+    mask: u32,
+    after_bucket: usize,
+) -> Option<LogicTransition> {
+    for right_index in after_bucket.saturating_add(1)..waveforms.logic_samples.len() {
+        let left_state = exact_logic_bucket_state(waveforms.logic_samples[right_index - 1], mask)?;
+        let right_state = exact_logic_bucket_state(waveforms.logic_samples[right_index], mask)?;
+        if left_state != right_state {
+            return Some(LogicTransition {
+                sample: waveforms.logic_sample_offset.saturating_add(
+                    (right_index as u64).saturating_mul(waveforms.logic_sample_stride as u64),
+                ),
+                new_state_high: right_state,
+            });
+        }
+    }
+    None
+}
+
+fn logic_smart_timing_measurement(
+    waveforms: &WaveformStore,
+    channel: usize,
+    anchor_sample: u64,
+) -> Option<LogicSmartTimingMeasurement> {
+    if channel >= LOGIC_CHANNEL_COUNT
+        || waveforms.logic_rate_hz == 0
+        || waveforms.logic_sample_stride == 0
+        || waveforms.logic_samples.is_empty()
+    {
+        return None;
+    }
+    let local_sample = anchor_sample.saturating_sub(waveforms.logic_sample_offset);
+    let bucket_index = usize::try_from(local_sample / waveforms.logic_sample_stride as u64)
+        .ok()?
+        .min(waveforms.logic_samples.len().saturating_sub(1));
+    let mask = 1_u32 << channel;
+    let state_high = exact_logic_bucket_state(waveforms.logic_samples[bucket_index], mask)?;
+    let previous = logic_transition_before_bucket(waveforms, mask, bucket_index)?;
+    let next = logic_transition_after_bucket(waveforms, mask, bucket_index)?;
+    if previous.new_state_high != state_high || next.new_state_high == state_high {
+        return None;
+    }
+
+    let cycle = if state_high {
+        logic_transition_after_bucket(
+            waveforms,
+            mask,
+            usize::try_from(
+                next.sample.saturating_sub(waveforms.logic_sample_offset)
+                    / waveforms.logic_sample_stride as u64,
+            )
+            .ok()?,
+        )
+        .filter(|transition| transition.new_state_high)
+        .map(|next_rising| LogicTimingMeasurement {
+            channel,
+            period_start_sample: previous.sample,
+            period_end_sample: next_rising.sample,
+            period_samples: next_rising.sample.saturating_sub(previous.sample),
+            high_samples: next.sample.saturating_sub(previous.sample),
+        })
+    } else {
+        let falling_bucket = usize::try_from(
+            previous
+                .sample
+                .saturating_sub(waveforms.logic_sample_offset)
+                / waveforms.logic_sample_stride as u64,
+        )
+        .ok()?;
+        logic_transition_before_bucket(waveforms, mask, falling_bucket.saturating_sub(1))
+            .filter(|transition| transition.new_state_high)
+            .map(|previous_rising| LogicTimingMeasurement {
+                channel,
+                period_start_sample: previous_rising.sample,
+                period_end_sample: next.sample,
+                period_samples: next.sample.saturating_sub(previous_rising.sample),
+                high_samples: previous.sample.saturating_sub(previous_rising.sample),
+            })
+    }
+    .filter(|timing| {
+        timing.period_samples > 0
+            && timing.high_samples > 0
+            && timing.high_samples < timing.period_samples
+    });
+
+    Some(LogicSmartTimingMeasurement {
+        channel,
+        edge_start_sample: previous.sample,
+        edge_end_sample: next.sample,
+        cycle,
+    })
+}
+
 fn logic_marker_sample_at_pointer(
     plot: Rect,
     viewport: WaveformViewport,
@@ -9289,6 +9460,116 @@ fn paint_logic_markers(
     }
 }
 
+fn paint_logic_timing_hint(
+    painter: &egui::Painter,
+    plot: Rect,
+    waveforms: &WaveformStore,
+    viewport: WaveformViewport,
+    measurement: LogicSmartTimingMeasurement,
+    color: Color32,
+) {
+    if plot.width() < 120.0 || plot.height() < 80.0 {
+        return;
+    }
+    let channel = measurement.channel;
+
+    for sample in [measurement.edge_start_sample, measurement.edge_end_sample] {
+        if let Some(x) = logic_marker_x(
+            plot,
+            viewport,
+            waveforms.logic_sample_offset,
+            waveforms.logic_sample_count,
+            sample,
+        ) {
+            painter.line_segment(
+                [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+                Stroke::new(1.0_f32, color.gamma_multiply(0.65)),
+            );
+        }
+    }
+    if let Some(timing) = measurement.cycle {
+        for sample in [timing.period_start_sample, timing.period_end_sample] {
+            if let Some(x) = logic_marker_x(
+                plot,
+                viewport,
+                waveforms.logic_sample_offset,
+                waveforms.logic_sample_count,
+                sample,
+            ) {
+                painter.line_segment(
+                    [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+                    Stroke::new(1.5_f32, color),
+                );
+                painter.circle_filled(Pos2::new(x, plot.top() + 3.0), 2.5, color);
+            }
+        }
+    }
+
+    let width = 205.0_f32.min(plot.width() - 16.0);
+    let height = if measurement.cycle.is_some() {
+        72.0
+    } else {
+        48.0
+    };
+    let hint = Rect::from_min_size(
+        Pos2::new(plot.right() - width - 8.0, plot.top() + 26.0),
+        Vec2::new(width, height),
+    );
+    painter.rect_filled(hint, 5.0, PANEL.gamma_multiply(0.96));
+    let border = Stroke::new(1.0_f32, color.gamma_multiply(0.8));
+    painter.line_segment([hint.left_top(), hint.right_top()], border);
+    painter.line_segment([hint.right_top(), hint.right_bottom()], border);
+    painter.line_segment([hint.right_bottom(), hint.left_bottom()], border);
+    painter.line_segment([hint.left_bottom(), hint.left_top()], border);
+
+    let left = hint.left() + 8.0;
+    painter.text(
+        Pos2::new(left, hint.top() + 7.0),
+        egui::Align2::LEFT_TOP,
+        format!("D{channel}  SMART TIMING"),
+        FontId::monospace(10.0),
+        color,
+    );
+    painter.text(
+        Pos2::new(left, hint.top() + 23.0),
+        egui::Align2::LEFT_TOP,
+        format!(
+            "EDGE-EDGE  {}",
+            format_duration(Duration::from_secs_f64(
+                measurement
+                    .edge_end_sample
+                    .saturating_sub(measurement.edge_start_sample) as f64
+                    / waveforms.logic_rate_hz as f64,
+            ))
+        ),
+        FontId::monospace(10.0),
+        Color32::WHITE,
+    );
+    if let Some(timing) = measurement.cycle {
+        painter.text(
+            Pos2::new(left, hint.top() + 39.0),
+            egui::Align2::LEFT_TOP,
+            format!(
+                "RISE-RISE  {}",
+                format_duration(timing.period(waveforms.logic_rate_hz))
+            ),
+            FontId::monospace(10.0),
+            Color32::WHITE,
+        );
+        painter.text(
+            Pos2::new(left, hint.top() + 55.0),
+            egui::Align2::LEFT_TOP,
+            format!(
+                "{}   DUTY {:.1}%",
+                format_frequency(timing.frequency_hz(waveforms.logic_rate_hz)),
+                timing.duty_cycle_percent()
+            ),
+            FontId::monospace(10.0),
+            ACCENT,
+        );
+    }
+}
+
 fn paint_logic(
     ui: &egui::Ui,
     rect: Rect,
@@ -9301,6 +9582,7 @@ fn paint_logic(
         channel_marker_opacities,
         channel_names,
         channel_settings_drafts,
+        smart_timing_enabled,
         marker_settings,
         maximum_heights,
         enabled_channels,
@@ -9503,6 +9785,31 @@ fn paint_logic(
         );
     }
     paint_logic_markers(ui, plot, waveforms, *viewport, marker_settings);
+    let smart_timing = smart_timing_enabled
+        .then(|| ui.input(|input| input.pointer.hover_pos()))
+        .flatten()
+        .filter(|pointer| plot.contains(*pointer))
+        .and_then(|pointer| {
+            let channel = logic_channel_at_y(&signal_layout.levels, enabled_channels, pointer.y)?;
+            let sample = logic_sample_at_x(
+                plot,
+                *viewport,
+                waveforms.logic_sample_offset,
+                waveforms.logic_sample_count,
+                pointer.x,
+            )?;
+            logic_smart_timing_measurement(waveforms, channel, sample)
+        });
+    if let Some(measurement) = smart_timing {
+        paint_logic_timing_hint(
+            painter,
+            plot,
+            waveforms,
+            *viewport,
+            measurement,
+            channel_colors[measurement.channel],
+        );
+    }
     if visible_count == 0 {
         paint_empty(painter, plot, "Waiting for logic samples");
     }
@@ -13184,6 +13491,56 @@ mod tests {
             ),
             Some(77)
         );
+    }
+
+    #[test]
+    fn logic_smart_timing_follows_the_pulse_under_the_pointer() {
+        let mut waveforms = WaveformStore {
+            logic_channels: 1,
+            logic_rate_hz: 1_000_000,
+            ..WaveformStore::default()
+        };
+        waveforms.configure_logic_capture(101, false);
+        let samples = (0..101)
+            .map(|index| u32::from(matches!(index, 10..30 | 50..70 | 90..=100)))
+            .collect::<Vec<_>>();
+        waveforms.ingest_logic_samples(&samples);
+
+        let measurement = logic_smart_timing_measurement(&waveforms, 0, 24).unwrap();
+        assert_eq!(measurement.channel, 0);
+        assert_eq!(measurement.edge_start_sample, 10);
+        assert_eq!(measurement.edge_end_sample, 30);
+        let cycle = measurement.cycle.unwrap();
+        assert_eq!(cycle.period_start_sample, 10);
+        assert_eq!(cycle.period_end_sample, 50);
+        assert_eq!(cycle.period_samples, 40);
+        assert_eq!(cycle.high_samples, 20);
+        assert_eq!(
+            cycle.period(waveforms.logic_rate_hz),
+            Duration::from_micros(40)
+        );
+        assert_eq!(cycle.frequency_hz(waveforms.logic_rate_hz), 25_000.0);
+        assert_eq!(cycle.duty_cycle_percent(), 50.0);
+
+        let low_pulse = logic_smart_timing_measurement(&waveforms, 0, 35).unwrap();
+        assert_eq!(low_pulse.edge_start_sample, 30);
+        assert_eq!(low_pulse.edge_end_sample, 50);
+        assert_eq!(low_pulse.cycle, Some(cycle));
+        assert_eq!(logic_smart_timing_measurement(&waveforms, 0, 0), None);
+    }
+
+    #[test]
+    fn logic_timing_measurement_rejects_unresolved_bucket_activity() {
+        let waveforms = WaveformStore {
+            logic_samples: VecDeque::from([LogicSampleBucket::from_samples(&[0, 1, 0]).unwrap()]),
+            logic_channels: 1,
+            logic_rate_hz: 1_000_000,
+            logic_sample_count: 3,
+            logic_sample_stride: 3,
+            ..WaveformStore::default()
+        };
+
+        assert_eq!(logic_smart_timing_measurement(&waveforms, 0, 1), None);
     }
 
     #[test]
