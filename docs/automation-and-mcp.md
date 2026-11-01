@@ -308,6 +308,110 @@ run_id = instrument.query("DSVIEW:RUN:START?").strip()
 print(instrument.query(f'DSVIEW:RUN:STATUS? "{run_id}"'))
 ```
 
+## Saleae Logic 2 automation and MCP reference
+
+Saleae Logic 2 provides a useful reference for separating deterministic
+automation from AI-agent integration. The interfaces below were verified
+against Logic 2.4.48 and Saleae's published documentation. They apply to the
+Logic 8, Logic Pro 8, and Logic Pro 16 family; Logic MSO uses a separate API
+and is not currently supported by the Logic 2 MCP server.
+
+### Automation API
+
+The supported Automation API is a gRPC service bound to `127.0.0.1:10430` by
+default. Saleae publishes the `logic2-automation` Python package as the primary
+client and the protobuf definition for clients in other languages. The server
+can be enabled from Logic 2's Automation panel or at process startup:
+
+```text
+Logic --automation --automationPort 10430
+```
+
+The API can:
+
+- enumerate physical and simulated instruments;
+- configure analog and digital channels, sample rates, thresholds, glitch
+  filters, capture buffers, and manual, timed, or digital-trigger modes;
+- start, stop, and wait for captures;
+- add and remove protocol analyzers and local high-level analyzers;
+- load and save `.sal` capture files;
+- export raw analog and digital data as CSV or per-channel binary files; and
+- export analyzer results as a filtered data-table CSV or legacy analyzer
+  output.
+
+Automation creates a capture session from an explicit configuration. Existing
+GUI channel settings and analyzers are not an implicit automation contract.
+Large sample data is exported to files rather than returned by gRPC, and the
+API does not provide continuous real-time access to raw samples. Clients are
+expected to handle capture, USB, disconnect, and out-of-memory errors and to
+discard failed captures before retrying.
+
+The official starting points are the
+[Automation API guide](https://docs.saleae.com/automation/guides/getting-started)
+and the
+[API reference](https://docs.saleae.com/automation/api/automation/).
+
+### MCP server
+
+Logic 2.4.48 also contains an experimental MCP server using Streamable HTTP on
+`http://127.0.0.1:10530`. It can be enabled from the Automation panel and
+connected to Codex with:
+
+```text
+codex mcp add --url http://127.0.0.1:10530 logic2
+codex mcp list
+```
+
+The server exposes 15 tools:
+
+```text
+get_devices
+start_capture
+stop_capture
+wait_capture
+load_capture
+save_capture
+close_capture
+add_analyzer
+remove_analyzer
+add_high_level_analyzer
+remove_high_level_analyzer
+export_raw_data_csv
+export_raw_data_binary
+export_data_table_csv
+legacy_export_analyzer
+```
+
+These tools mirror the capture lifecycle and file-oriented exports of the
+Automation API. Capture IDs and analyzer IDs are passed between calls, analyzer
+configuration is schema-validated, and long-running capture completion is an
+explicit `wait_capture` operation. MCP therefore adds an agent-friendly tool
+surface without making GUI state or raw sample transport the protocol.
+
+Saleae documents the server and its experimental status in the
+[Logic 2 MCP guide](https://docs.saleae.com/mcp/guides/getting-started).
+Codex's Streamable HTTP configuration model is described in the
+[OpenAI MCP documentation](https://developers.openai.com/learn/docs-mcp).
+
+### Implications for DSView
+
+The Saleae design supports several choices in this document:
+
+- keep a deterministic automation interface usable without an AI client;
+- make MCP a thin, local adapter over the same capture and analysis service;
+- represent captures as explicit stateful jobs with opaque IDs;
+- require complete capture configuration instead of scripting GUI controls;
+- keep large raw data in recording or export artifacts;
+- expose semantic analyzer and export operations as bounded tools; and
+- test with simulated devices through the same public interface.
+
+DSView should not copy the exact Saleae tool set. DSView scenarios, concurrent
+multi-source capture, native `.dsv` recordings, structured progress events,
+and bounded recording inspection require a broader application-service
+contract. The Saleae interface is most useful as evidence that deterministic
+automation and an AI-facing adapter can share one lifecycle without coupling
+hardware drivers to either client protocol.
+
 ## MCP adapter
 
 MCP is an adapter for AI agents, not a replacement for the application service
