@@ -320,7 +320,76 @@ fn main() -> eframe::Result<()> {
 
 struct DeviceEntry {
     device: DiscoveredDevice,
-    selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeviceRole {
+    LogicAnalyzer,
+    Oscilloscope,
+}
+
+impl DeviceRole {
+    fn matches(self, device: &DiscoveredDevice) -> bool {
+        if device.link_status() == LinkStatus::Unsupported
+            || !device.profile.model.supports_capture()
+        {
+            return false;
+        }
+        match self {
+            Self::LogicAnalyzer => device.profile.model.is_logic_analyzer(),
+            Self::Oscilloscope => device.profile.model == DeviceModel::DsCopeU3P100,
+        }
+    }
+
+    fn empty_label(self) -> &'static str {
+        match self {
+            Self::LogicAnalyzer => "No DSLogic device available",
+            Self::Oscilloscope => "No DSCope device available",
+        }
+    }
+}
+
+fn selected_device_for_role<'a>(
+    devices: &'a [DeviceEntry],
+    selected_id: Option<&str>,
+    role: DeviceRole,
+) -> Option<&'a DiscoveredDevice> {
+    let selected_id = selected_id?;
+    devices
+        .iter()
+        .map(|entry| &entry.device)
+        .find(|device| role.matches(device) && device.location.stable_id() == selected_id)
+}
+
+fn first_device_id_for_role(devices: &[DeviceEntry], role: DeviceRole) -> Option<String> {
+    devices
+        .iter()
+        .map(|entry| &entry.device)
+        .find(|device| role.matches(device))
+        .map(|device| device.location.stable_id())
+}
+
+fn capture_devices_for_target(
+    devices: &[DeviceEntry],
+    selected_logic_device_id: Option<&str>,
+    selected_scope_device_id: Option<&str>,
+    target: CaptureTarget,
+) -> Result<Vec<DiscoveredDevice>, String> {
+    let logic = || {
+        selected_device_for_role(devices, selected_logic_device_id, DeviceRole::LogicAnalyzer)
+            .cloned()
+            .ok_or_else(|| "Select a connected DSLogic instrument in Capture Setup".to_owned())
+    };
+    let scope = || {
+        selected_device_for_role(devices, selected_scope_device_id, DeviceRole::Oscilloscope)
+            .cloned()
+            .ok_or_else(|| "Select a connected DSCope U3P100 in Capture Setup".to_owned())
+    };
+    match target {
+        CaptureTarget::LogicAnalyzer => Ok(vec![logic()?]),
+        CaptureTarget::Oscilloscope => Ok(vec![scope()?]),
+        CaptureTarget::Combined => Ok(vec![logic()?, scope()?]),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1321,14 +1390,6 @@ impl CaptureTarget {
             Self::LogicAnalyzer => "Logic Analyzer",
             Self::Oscilloscope => "Oscilloscope",
             Self::Combined => "Combined",
-        }
-    }
-
-    fn includes_model(self, model: DeviceModel) -> bool {
-        match self {
-            Self::LogicAnalyzer => model.is_logic_analyzer(),
-            Self::Oscilloscope => model.is_oscilloscope(),
-            Self::Combined => true,
         }
     }
 
@@ -2477,6 +2538,7 @@ struct LoadedRecording {
 
 #[derive(Clone)]
 struct LogicSessionSettings {
+    device_id: Option<String>,
     capture: LogicCaptureSettings,
     acquisition_mode: AcquisitionMode,
     repetitive_interval_seconds: f32,
@@ -2493,6 +2555,7 @@ struct LogicSessionSettings {
 impl Default for LogicSessionSettings {
     fn default() -> Self {
         Self {
+            device_id: None,
             capture: LogicCaptureSettings::default(),
             acquisition_mode: AcquisitionMode::Single,
             repetitive_interval_seconds: 1.0,
@@ -2510,6 +2573,7 @@ impl Default for LogicSessionSettings {
 
 #[derive(Clone)]
 struct ScopeSessionSettings {
+    device_id: Option<String>,
     capture: ScopeCaptureSettings,
     auto_sample_rate: bool,
     smart_timing_enabled: bool,
@@ -2528,6 +2592,7 @@ struct ScopeSessionSettings {
 impl Default for ScopeSessionSettings {
     fn default() -> Self {
         Self {
+            device_id: None,
             capture: ScopeCaptureSettings::default(),
             auto_sample_rate: true,
             smart_timing_enabled: false,
@@ -2566,7 +2631,7 @@ enum WorkerSuccess {
         scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
         scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
     },
-    ScopeConfigured(usize),
+    ScopeConfigured,
     ScopeAutoCalibrated(DsCopeCalibrationValues),
     ScopeAutoCalibrationSaved,
     ScopeCalibrationLoaded(DsCopeCalibrationValues),
@@ -2595,6 +2660,8 @@ struct WaveCraftApp {
     repetitive_interval_seconds: f32,
     scheduled_repetitive_capture: Option<ScheduledRepetitiveCapture>,
     devices: Vec<DeviceEntry>,
+    selected_logic_device_id: Option<String>,
+    selected_scope_device_id: Option<String>,
     active_capture_settings_tab: CaptureSettingsTab,
     logic_settings: LogicCaptureSettings,
     scope_settings: ScopeCaptureSettings,
@@ -2663,6 +2730,8 @@ impl WaveCraftApp {
             repetitive_interval_seconds: 1.0,
             scheduled_repetitive_capture: None,
             devices: Vec::new(),
+            selected_logic_device_id: None,
+            selected_scope_device_id: None,
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
             logic_settings: LogicCaptureSettings::default(),
             scope_settings: ScopeCaptureSettings::default(),
@@ -2843,6 +2912,33 @@ impl WaveCraftApp {
         });
     }
 
+    fn reconcile_device_selections(&mut self) {
+        if self.selected_logic_device_id.is_none() {
+            self.selected_logic_device_id =
+                first_device_id_for_role(&self.devices, DeviceRole::LogicAnalyzer);
+        }
+        if self.selected_scope_device_id.is_none() {
+            self.selected_scope_device_id =
+                first_device_id_for_role(&self.devices, DeviceRole::Oscilloscope);
+        }
+    }
+
+    fn selected_logic_device(&self) -> Option<&DiscoveredDevice> {
+        selected_device_for_role(
+            &self.devices,
+            self.selected_logic_device_id.as_deref(),
+            DeviceRole::LogicAnalyzer,
+        )
+    }
+
+    fn selected_scope_device_ref(&self) -> Option<&DiscoveredDevice> {
+        selected_device_for_role(
+            &self.devices,
+            self.selected_scope_device_id.as_deref(),
+            DeviceRole::Oscilloscope,
+        )
+    }
+
     fn begin_capture(&mut self, mode: AcquisitionMode, target: CaptureTarget) {
         if self.pending.is_some() || self.capture.is_some() {
             return;
@@ -2859,37 +2955,21 @@ impl WaveCraftApp {
                 Some("Complete-capture recording is available in Single mode only".to_owned());
             return;
         }
-        let has_logic_analyzer = self
-            .devices
-            .iter()
-            .any(|entry| entry.selected && entry.device.profile.model.is_logic_analyzer());
-        let has_oscilloscope = self
-            .devices
-            .iter()
-            .any(|entry| entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100);
-        if !target.is_available(has_logic_analyzer, has_oscilloscope) {
-            self.capture_run_requested = false;
-            self.requested_capture_target = None;
-            self.record_capture = false;
-            self.last_error = Some(match target {
-                CaptureTarget::LogicAnalyzer => {
-                    "Select at least one Logic Analyzer instrument".to_owned()
-                }
-                CaptureTarget::Oscilloscope => {
-                    "Select at least one Oscilloscope instrument".to_owned()
-                }
-                CaptureTarget::Combined => {
-                    "Select at least one Logic Analyzer and one Oscilloscope instrument".to_owned()
-                }
-            });
-            return;
-        }
-        let devices = self
-            .devices
-            .iter()
-            .filter(|entry| entry.selected && target.includes_model(entry.device.profile.model))
-            .map(|entry| entry.device.clone())
-            .collect::<Vec<_>>();
+        let devices = match capture_devices_for_target(
+            &self.devices,
+            self.selected_logic_device_id.as_deref(),
+            self.selected_scope_device_id.as_deref(),
+            target,
+        ) {
+            Ok(devices) => devices,
+            Err(error) => {
+                self.capture_run_requested = false;
+                self.requested_capture_target = None;
+                self.record_capture = false;
+                self.last_error = Some(error);
+                return;
+            }
+        };
         if self.record_capture && self.recording_path.trim().is_empty() {
             self.capture_run_requested = false;
             self.requested_capture_target = None;
@@ -2992,18 +3072,10 @@ impl WaveCraftApp {
             return;
         }
         self.scope_configuration_due = None;
-        let devices = self
-            .devices
-            .iter()
-            .filter(|entry| {
-                entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100
-            })
-            .map(|entry| entry.device.clone())
-            .collect::<Vec<_>>();
-        if devices.is_empty() {
+        let Some(device) = self.selected_scope_device_ref().cloned() else {
             self.status = "DSCope settings will be applied when capture starts".to_owned();
             return;
-        }
+        };
         let scope_config = match self.scope_settings.capture_config() {
             Ok(config) => config,
             Err(error) => {
@@ -3012,48 +3084,38 @@ impl WaveCraftApp {
             }
         };
         let resource_directory = PathBuf::from(self.resource_directory.trim());
-        let device_count = devices.len();
         let (sender, receiver) = mpsc::channel();
         self.pending = Some(receiver);
-        self.status = format!("Applying DSCope configuration to {device_count} instrument(s)…");
+        self.status = format!(
+            "Applying DSCope configuration to {}…",
+            device.location.stable_id()
+        );
         self.last_error = None;
         thread::spawn(move || {
             let result = (|| {
-                for device in devices {
-                    let bitstream_path =
-                        resource_directory.join(device.profile.fpga_bitstream_name);
-                    prepare_device(&device, &bitstream_path).map_err(|error| error.to_string())?;
-                    apply_dscope_configuration(&device, scope_config)
-                        .map_err(|error| error.to_string())?;
-                }
-                Ok(WorkerSuccess::ScopeConfigured(device_count))
+                let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
+                prepare_device(&device, &bitstream_path).map_err(|error| error.to_string())?;
+                apply_dscope_configuration(&device, scope_config)
+                    .map_err(|error| error.to_string())?;
+                Ok(WorkerSuccess::ScopeConfigured)
             })();
             let _ = sender.send(result);
         });
     }
 
-    fn selected_scope_device(&mut self) -> Option<DiscoveredDevice> {
-        let devices = self
-            .devices
-            .iter()
-            .filter(|entry| {
-                entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100
-            })
-            .map(|entry| entry.device.clone())
-            .collect::<Vec<_>>();
-        if devices.len() != 1 {
-            self.last_error =
-                Some("Select exactly one connected DSCope U3P100 for calibration".to_owned());
-            return None;
+    fn selected_scope_device_for_operation(&mut self) -> Option<DiscoveredDevice> {
+        let device = self.selected_scope_device_ref().cloned();
+        if device.is_none() {
+            self.last_error = Some("Select a connected DSCope U3P100 in Capture Setup".to_owned());
         }
-        devices.into_iter().next()
+        device
     }
 
     fn begin_auto_calibration(&mut self) {
         if self.is_busy() {
             return;
         }
-        let Some(device) = self.selected_scope_device() else {
+        let Some(device) = self.selected_scope_device_for_operation() else {
             return;
         };
         let scope_config = match self.scope_settings.capture_config() {
@@ -3100,7 +3162,7 @@ impl WaveCraftApp {
         if self.is_busy() {
             return;
         }
-        let Some(device) = self.selected_scope_device() else {
+        let Some(device) = self.selected_scope_device_for_operation() else {
             return;
         };
         let scope_config = match self.scope_settings.capture_config() {
@@ -3135,7 +3197,7 @@ impl WaveCraftApp {
         if self.is_busy() {
             return;
         }
-        let Some(device) = self.selected_scope_device() else {
+        let Some(device) = self.selected_scope_device_for_operation() else {
             return;
         };
         let resource_directory = PathBuf::from(self.resource_directory.trim());
@@ -3177,7 +3239,7 @@ impl WaveCraftApp {
         if self.is_busy() {
             return;
         }
-        let Some(device) = self.selected_scope_device() else {
+        let Some(device) = self.selected_scope_device_for_operation() else {
             return;
         };
         let scope_config = match self.scope_settings.capture_config() {
@@ -3282,24 +3344,11 @@ impl WaveCraftApp {
         match result {
             Ok(WorkerSuccess::Devices(devices)) => {
                 self.usb_speed_warning = usb_speed_warning(&devices);
-                let selected = self
-                    .devices
-                    .iter()
-                    .filter(|entry| entry.selected)
-                    .map(|entry| entry.device.location.stable_id())
-                    .collect::<HashSet<_>>();
                 self.devices = devices
                     .into_iter()
-                    .map(|device| {
-                        let stable_id = device.location.stable_id();
-                        let selected = if selected.is_empty() {
-                            device.link_status() != LinkStatus::Unsupported
-                        } else {
-                            selected.contains(&stable_id)
-                        };
-                        DeviceEntry { device, selected }
-                    })
+                    .map(|device| DeviceEntry { device })
                     .collect();
+                self.reconcile_device_selections();
                 self.status = if self.devices.is_empty() {
                     "No supported instruments detected".to_owned()
                 } else {
@@ -3583,9 +3632,8 @@ impl WaveCraftApp {
                 self.status = format!("Exported Saleae capture to {}", path.display());
                 self.last_error = None;
             }
-            Ok(WorkerSuccess::ScopeConfigured(device_count)) => {
-                self.status =
-                    format!("Applied DSCope configuration to {device_count} instrument(s)");
+            Ok(WorkerSuccess::ScopeConfigured) => {
+                self.status = "Applied DSCope configuration to the selected instrument".to_owned();
             }
             Ok(WorkerSuccess::ScopeAutoCalibrated(values)) => {
                 self.calibration_active = false;
@@ -3940,6 +3988,7 @@ impl WaveCraftApp {
 
     fn current_logic_session_settings(&self) -> LogicSessionSettings {
         LogicSessionSettings {
+            device_id: self.selected_logic_device_id.clone(),
             capture: self.logic_settings,
             acquisition_mode: self.logic_acquisition_mode,
             repetitive_interval_seconds: self.repetitive_interval_seconds,
@@ -3955,6 +4004,7 @@ impl WaveCraftApp {
     }
 
     fn apply_logic_session_settings(&mut self, settings: LogicSessionSettings) {
+        self.selected_logic_device_id = settings.device_id;
         self.logic_settings = settings.capture;
         self.logic_acquisition_mode = settings.acquisition_mode;
         self.repetitive_interval_seconds = settings.repetitive_interval_seconds;
@@ -3975,6 +4025,7 @@ impl WaveCraftApp {
 
     fn current_scope_session_settings(&self) -> ScopeSessionSettings {
         ScopeSessionSettings {
+            device_id: self.selected_scope_device_id.clone(),
             capture: self.scope_settings,
             auto_sample_rate: self.scope_auto_sample_rate,
             smart_timing_enabled: self.scope_smart_timing_enabled,
@@ -3992,6 +4043,7 @@ impl WaveCraftApp {
     }
 
     fn apply_scope_session_settings(&mut self, settings: ScopeSessionSettings) {
+        self.selected_scope_device_id = settings.device_id;
         self.scope_settings = settings.capture;
         self.scope_auto_sample_rate = settings.auto_sample_rate;
         self.scope_smart_timing_enabled = settings.smart_timing_enabled;
@@ -4138,7 +4190,15 @@ impl WaveCraftApp {
             .devices
             .iter()
             .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100);
-        capture_settings_tabs(has_logic_analyzer, has_oscilloscope)
+        match self.active_waveform_tab {
+            Some(WaveformTab::LogicAnalyzer) => capture_settings_tabs(has_logic_analyzer, false),
+            Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
+                capture_settings_tabs(false, has_oscilloscope)
+            }
+            Some(WaveformTab::Combined) | None => {
+                capture_settings_tabs(has_logic_analyzer, has_oscilloscope)
+            }
+        }
     }
 
     fn reconcile_capture_settings_tab(&mut self) {
@@ -6398,11 +6458,7 @@ fn paint_calibration_progress_modal(
     action
 }
 
-fn paint_instrument_settings(
-    ui: &mut egui::Ui,
-    devices: &mut [DeviceEntry],
-    selection_enabled: bool,
-) {
+fn paint_instrument_settings(ui: &mut egui::Ui, devices: &[DeviceEntry]) {
     if devices.is_empty() {
         ui.label(RichText::new("No supported devices").color(TEXT_MUTED));
         return;
@@ -6415,13 +6471,7 @@ fn paint_instrument_settings(
             .rounding(egui::Rounding::same(6.0))
             .inner_margin(egui::Margin::same(10.0))
             .show(ui, |ui| {
-                ui.add_enabled(
-                    selection_enabled,
-                    egui::Checkbox::new(
-                        &mut entry.selected,
-                        RichText::new(entry.device.profile.display_name).strong(),
-                    ),
-                );
+                ui.label(RichText::new(entry.device.profile.display_name).strong());
                 ui.small(RichText::new(entry.device.location.stable_id()).color(TEXT_MUTED));
                 let (link_text, link_color) = match entry.device.link_status() {
                     LinkStatus::Optimal => (
@@ -6447,6 +6497,114 @@ fn paint_instrument_settings(
                 );
             });
     }
+}
+
+fn selected_device_text(
+    devices: &[DeviceEntry],
+    selected_id: Option<&str>,
+    role: DeviceRole,
+) -> String {
+    match selected_id {
+        Some(id) => selected_device_for_role(devices, Some(id), role)
+            .map(|device| format!("{} · {id}", device.profile.display_name))
+            .unwrap_or_else(|| format!("Unavailable · {id}")),
+        None => role.empty_label().to_owned(),
+    }
+}
+
+fn paint_device_selector(
+    ui: &mut egui::Ui,
+    id_salt: &'static str,
+    label: &str,
+    devices: &[DeviceEntry],
+    selected_id: &mut Option<String>,
+    role: DeviceRole,
+    enabled: bool,
+) -> bool {
+    let choices = devices
+        .iter()
+        .map(|entry| &entry.device)
+        .filter(|device| role.matches(device))
+        .map(|device| {
+            let id = device.location.stable_id();
+            (
+                id.clone(),
+                format!("{} · {id}", device.profile.display_name),
+            )
+        })
+        .collect::<Vec<_>>();
+    let before = selected_id.clone();
+    ui.label(RichText::new(label).small().color(TEXT_MUTED));
+    ui.add_enabled_ui(enabled && !choices.is_empty(), |ui| {
+        egui::ComboBox::from_id_salt(id_salt)
+            .width(ui.available_width())
+            .selected_text(selected_device_text(devices, selected_id.as_deref(), role))
+            .show_ui(ui, |ui| {
+                for (id, text) in choices {
+                    ui.selectable_value(selected_id, Some(id), text);
+                }
+            });
+    });
+    before != *selected_id
+}
+
+fn paint_capture_device_selectors(
+    ui: &mut egui::Ui,
+    active_tab: Option<WaveformTab>,
+    devices: &[DeviceEntry],
+    selected_logic_device_id: &mut Option<String>,
+    selected_scope_device_id: &mut Option<String>,
+    enabled: bool,
+) -> (bool, bool) {
+    let mut logic_changed = false;
+    let mut scope_changed = false;
+    match active_tab {
+        Some(WaveformTab::LogicAnalyzer) => {
+            logic_changed = paint_device_selector(
+                ui,
+                "logic_device_selector",
+                "Device",
+                devices,
+                selected_logic_device_id,
+                DeviceRole::LogicAnalyzer,
+                enabled,
+            );
+        }
+        Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
+            scope_changed = paint_device_selector(
+                ui,
+                "scope_device_selector",
+                "Device",
+                devices,
+                selected_scope_device_id,
+                DeviceRole::Oscilloscope,
+                enabled,
+            );
+        }
+        Some(WaveformTab::Combined) => {
+            logic_changed = paint_device_selector(
+                ui,
+                "combined_logic_device_selector",
+                "Logic analyzer",
+                devices,
+                selected_logic_device_id,
+                DeviceRole::LogicAnalyzer,
+                enabled,
+            );
+            ui.add_space(4.0);
+            scope_changed = paint_device_selector(
+                ui,
+                "combined_scope_device_selector",
+                "Oscilloscope",
+                devices,
+                selected_scope_device_id,
+                DeviceRole::Oscilloscope,
+                enabled,
+            );
+        }
+        None => {}
+    }
+    (logic_changed, scope_changed)
 }
 
 fn usb_speed_warning(devices: &[DiscoveredDevice]) -> Option<UsbSpeedWarning> {
@@ -6514,6 +6672,7 @@ impl eframe::App for WaveCraftApp {
         self.poll_worker();
         self.reconcile_capture_settings_tab();
         self.reconcile_waveform_tab();
+        self.reconcile_device_selections();
         self.poll_capture();
         self.poll_repetitive_capture();
         self.finish_pending_snapshot(context);
@@ -6526,18 +6685,14 @@ impl eframe::App for WaveCraftApp {
         let mut start_request = None;
         let mut stop_clicked = false;
         let mut calibration_action = None;
+        let mut logic_device_selection_changed = false;
+        let mut scope_device_selection_changed = false;
         let capture_settings_enabled = !self.is_busy();
         let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
-        let selected_logic_device = self
-            .devices
-            .iter()
-            .any(|entry| entry.selected && entry.device.profile.model.is_logic_analyzer());
+        let selected_logic_device = self.selected_logic_device().is_some();
         let logic_settings_speed = self
-            .devices
-            .iter()
-            .filter(|entry| entry.selected && entry.device.profile.model.is_logic_analyzer())
-            .map(|entry| entry.device.speed)
-            .min()
+            .selected_logic_device()
+            .map(|device| device.speed)
             .or_else(|| {
                 self.devices
                     .iter()
@@ -6546,10 +6701,7 @@ impl eframe::App for WaveCraftApp {
                     .min()
             })
             .unwrap_or(UsbSpeedClass::HighSpeed);
-        let selected_scope_device = self
-            .devices
-            .iter()
-            .any(|entry| entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100);
+        let selected_scope_device = self.selected_scope_device_ref().is_some();
         let control_target_available = control_target.is_some_and(|target| {
             target.is_available(selected_logic_device, selected_scope_device)
         });
@@ -6781,6 +6933,19 @@ impl eframe::App for WaveCraftApp {
                         ui.set_max_width(content_width);
                         ui.label(RichText::new("CAPTURE SETUP").strong().color(TEXT_MUTED));
                         ui.add_space(8.0);
+                        let (logic_changed, scope_changed) = paint_capture_device_selectors(
+                            ui,
+                            self.active_waveform_tab,
+                            &self.devices,
+                            &mut self.selected_logic_device_id,
+                            &mut self.selected_scope_device_id,
+                            capture_settings_enabled && self.manual_calibration.is_none(),
+                        );
+                        logic_device_selection_changed |= logic_changed;
+                        scope_device_selection_changed |= scope_changed;
+                        if self.active_waveform_tab.is_some() {
+                            ui.add_space(12.0);
+                        }
                         if available_capture_settings_tabs.len() > 1 {
                             ui.horizontal(|ui| {
                                 for tab in &available_capture_settings_tabs {
@@ -7336,7 +7501,7 @@ impl eframe::App for WaveCraftApp {
                         });
                     });
                     ui.add_space(6.0);
-                    paint_instrument_settings(ui, &mut self.devices, !settings_locked);
+                    paint_instrument_settings(ui, &self.devices);
 
                     if settings_locked {
                         ui.add_space(8.0);
@@ -7581,6 +7746,19 @@ impl eframe::App for WaveCraftApp {
         }
         if let Some(values) = save_manual_values {
             self.request_save_manual_calibration(values);
+        }
+        if logic_device_selection_changed || scope_device_selection_changed {
+            if let Some(active) = self.active_waveform_tab {
+                self.save_waveform_view_settings(active);
+            }
+            self.last_error = None;
+            self.status = "Capture device selection updated".to_owned();
+        }
+        if scope_device_selection_changed
+            && self.selected_scope_device_ref().is_some()
+            && !self.is_busy()
+        {
+            self.scope_configuration_due = Some(Instant::now() + SCOPE_CONFIGURATION_DEBOUNCE);
         }
         let manual_calibration_range_after_ui =
             self.manual_calibration.as_ref().map(|editor| editor.range);
@@ -13058,6 +13236,108 @@ mod tests {
     }
 
     #[test]
+    fn session_tabs_preserve_selected_device_ids() {
+        let first = LogicSessionSettings {
+            device_id: Some("usb-logic-a".to_owned()),
+            ..LogicSessionSettings::default()
+        };
+        let mut sessions = SessionTabs::<(), _>::new(first);
+        let second = LogicSessionSettings {
+            device_id: Some("usb-logic-b".to_owned()),
+            ..LogicSessionSettings::default()
+        };
+
+        assert!(sessions.add(second));
+        assert_eq!(
+            sessions.active_settings().device_id.as_deref(),
+            Some("usb-logic-b")
+        );
+        assert!(sessions.select(0));
+        assert_eq!(
+            sessions.active_settings().device_id.as_deref(),
+            Some("usb-logic-a")
+        );
+    }
+
+    #[test]
+    fn combined_session_settings_preserve_both_device_ids() {
+        let settings = CombinedSessionSettings {
+            logic: LogicSessionSettings {
+                device_id: Some("usb-logic".to_owned()),
+                ..LogicSessionSettings::default()
+            },
+            scope: ScopeSessionSettings {
+                device_id: Some("usb-scope".to_owned()),
+                ..ScopeSessionSettings::default()
+            },
+            ..CombinedSessionSettings::default()
+        };
+        let restored = settings.clone();
+
+        assert_eq!(restored.logic.device_id.as_deref(), Some("usb-logic"));
+        assert_eq!(restored.scope.device_id.as_deref(), Some("usb-scope"));
+    }
+
+    #[test]
+    fn identical_devices_are_selected_by_connection_id() {
+        let entry = |profile, platform_path: &str| DeviceEntry {
+            device: DiscoveredDevice {
+                profile,
+                location: wavecraft_usb::DeviceLocation {
+                    platform_path: platform_path.to_owned(),
+                },
+                speed: UsbSpeedClass::HighSpeed,
+            },
+        };
+        let devices = vec![
+            entry(&wavecraft_usb::DSCOPE_U3P100, "usb:1-2.1"),
+            entry(&wavecraft_usb::DSCOPE_U3P100, "usb:1-2.2"),
+            entry(&wavecraft_usb::DSLOGIC_U3PRO16, "usb:1-3"),
+        ];
+        let selected_scope_id = devices[1].device.location.stable_id();
+        let selected_logic_id = devices[2].device.location.stable_id();
+        let selected_scope =
+            selected_device_for_role(&devices, Some(&selected_scope_id), DeviceRole::Oscilloscope)
+                .expect("the exact scope connection should resolve");
+
+        assert_eq!(
+            selected_scope.location.platform_path,
+            devices[1].device.location.platform_path
+        );
+        assert_eq!(
+            first_device_id_for_role(&devices, DeviceRole::Oscilloscope),
+            Some(devices[0].device.location.stable_id())
+        );
+        assert!(selected_device_for_role(
+            &devices,
+            Some(&selected_scope_id),
+            DeviceRole::LogicAnalyzer
+        )
+        .is_none());
+
+        let scope_capture = capture_devices_for_target(
+            &devices,
+            Some(&selected_logic_id),
+            Some(&selected_scope_id),
+            CaptureTarget::Oscilloscope,
+        )
+        .unwrap();
+        assert_eq!(scope_capture.len(), 1);
+        assert_eq!(scope_capture[0].location.stable_id(), selected_scope_id);
+
+        let combined_capture = capture_devices_for_target(
+            &devices,
+            Some(&selected_logic_id),
+            Some(&selected_scope_id),
+            CaptureTarget::Combined,
+        )
+        .unwrap();
+        assert_eq!(combined_capture.len(), 2);
+        assert_eq!(combined_capture[0].location.stable_id(), selected_logic_id);
+        assert_eq!(combined_capture[1].location.stable_id(), selected_scope_id);
+    }
+
+    #[test]
     fn logic_capture_defaults_to_stream_mode() {
         assert_eq!(
             LogicCaptureSettings::default().operation_mode,
@@ -14158,14 +14438,6 @@ mod tests {
             Some(CaptureSettingsTab::DsCope)
         );
         assert_eq!(WaveformTab::Combined.capture_settings_tab(), None);
-
-        assert!(CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsLogicU3Pro16));
-        assert!(CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsLogicU2Pro16));
-        assert!(!CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsCopeU3P100));
-        assert!(CaptureTarget::Oscilloscope.includes_model(DeviceModel::DsCopeU3P100));
-        assert!(!CaptureTarget::Oscilloscope.includes_model(DeviceModel::DsLogicU3Pro16));
-        assert!(CaptureTarget::Combined.includes_model(DeviceModel::DsLogicU3Pro16));
-        assert!(CaptureTarget::Combined.includes_model(DeviceModel::DsCopeU3P100));
     }
 
     #[test]
