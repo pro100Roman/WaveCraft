@@ -1,6 +1,20 @@
 # WaveCraft
 
-A Rust reimplementation of [DSView](https://github.com/DreamSourceLab/DSView) designed to capture from a logic analyzer and an oscilloscope concurrently. The original C/C++ application in `../DSView` is retained as a protocol and behavior reference.
+A Rust reimplementation of [DSView](https://github.com/DreamSourceLab/DSView) designed to capture from a logic analyzer and an oscilloscope concurrently.
+
+## Application views
+
+### Logic Analyzer (LA)
+
+![WaveCraft Logic Analyzer view with sixteen digital channels](docs/images/wavecraft-logic-analyzer.png)
+
+### Oscilloscope (OSC)
+
+![WaveCraft Oscilloscope view with two analog channels and measurements](docs/images/wavecraft-oscilloscope.png)
+
+### Combined view
+
+![WaveCraft Combined view with synchronized logic and oscilloscope waveforms](docs/images/wavecraft-combined.png)
 
 ## Terminology
 
@@ -11,7 +25,7 @@ In project discussions and feature requests, these abbreviations are used:
 
 ## Current milestone
 
-The repository contains the first vertical slice of the new capture engine:
+The repository contains a working vertical slice of the new capture engine:
 
 - independent capture workers for every instrument;
 - a shared monotonic timeline across workers;
@@ -23,11 +37,13 @@ The repository contains the first vertical slice of the new capture engine:
 - finite one- or two-channel capture from DSCope U3P100 with configurable sampling and
   per-channel front-end settings;
 - concurrent physical capture from one DSLogic and one DSCope on a shared timeline;
-- a native desktop capture workbench with device selection and waveform views;
-- versioned, lossless full-capture recording from the GUI and CLI.
+- a native desktop capture workbench with synchronized, interactive waveform views;
+- logic timing tools and oscilloscope measurements, markers, math, FFT, and XY views;
+- versioned, lossless full-capture recording from the GUI and CLI;
+- Saleae Logic 2 `.sal` import and export.
 
-Broader DSCope sample-rate validation, interactive timeline navigation, protocol
-decoders, and structured automation interfaces are the next milestones.
+Broader DSCope sample-rate validation, executable protocol decoders and their
+plugin host, and structured automation interfaces are the next milestones.
 
 The required end state includes a cross-platform decoder plugin system. SPI
 and I2C will be first-party decoders, while third-party decoders run through a
@@ -63,7 +79,7 @@ the original GPL-compatible bitstream resources. DSLogic and DSCope finite
 capture use the same device-independent `CaptureSource` interface as the
 simulators.
 
-## Run the simulator
+## Use the command-line application
 
 Install Rust 1.79 or newer, then run:
 
@@ -118,13 +134,13 @@ reads before starting acquisition, validates the trigger header and measurement
 footer, and emits typed `ScopeBatch` frames. The device-reported valid length is
 authoritative and can be smaller than the requested one-million sample buffer.
 
-`capture-usb <resource-directory>` prepares one instrument of each model. Each
-worker initializes and arms its device independently, then waits at a
-failure-safe gate immediately before issuing the hardware start command. The
-command reports per-device frame and sample totals, voltage ranges, timelines,
-and the observed software start skew. This skew is not a hardware
-synchronization guarantee; an external trigger or clock is still needed for
-exact sample alignment.
+`capture-usb <resource-directory>` prepares the first supported DSLogic analyzer
+and the first connected DSCope U3P100. Each worker initializes and arms its
+device independently, then waits at a failure-safe gate immediately before
+issuing the hardware start command. The command reports per-device frame and
+sample totals, voltage ranges, timelines, and the observed software start skew.
+This skew is not a hardware synchronization guarantee; an external trigger or
+clock is still needed for exact sample alignment.
 
 All capture commands accept `--output <capture.dsv>`. The lossless recording
 contains every logic and scope sample received by the capture session, plus
@@ -207,48 +223,56 @@ discovery, refresh, and selection are managed from **App → Settings…**. Requ
 FPGA and firmware resources are selected automatically from the application
 bundle or workspace resource directory. The application displays all 16 digital
 channels, both calibrated scope channels, per-device sample totals, errors, and
-shared-timeline start skew. Capture Setup provides separate
-DSLogic and DSCope settings tabs while recording controls remain shared across
-the synchronized session in a fixed-width sidebar. DSCope settings provide a
-common sample rate and capture buffer plus independent volts/div, AC/DC
-coupling, probe attenuation, and hardware enablement for CH0 and CH1. Its
+shared-timeline start skew. Independent logic-analyzer and oscilloscope session
+tabs retain captured waveforms and their settings while you work with another
+session. Capture Setup provides separate DSLogic and DSCope settings tabs while
+recording controls remain shared across the synchronized session in a
+fixed-width sidebar. DSCope settings provide a common sample rate and capture
+buffer plus independent volts/div, AC/DC coupling, probe attenuation, and
+hardware enablement for CH0 and CH1. Its
 Trigger menu follows the vendor controls for horizontal position, source,
 rising/falling edge, holdoff, and noise sensitivity; these settings are encoded
 as U3P100 hardware commands and recorded in capture metadata. The toolbar uses
 oscilloscope-style **Run/Stop** and **Single** controls. Run continuously re-arms
 the hardware: Auto trigger behaves as Auto/Roll, while channel edge sources
 replace the displayed waveform after each trigger. Single waits for one trigger
-and then stops. Enabled
-channels support up to 500 MSa/s; disabling either channel raises the remaining
-channel's limit to 1 GSa/s. The
-shared 2M-sample memory provides up to 1M samples/channel in dual-channel mode
-or 2M in single-channel mode. Front-end and trigger changes are applied to the
-selected DSCope while idle; existing waveforms retain the settings with which
-they were captured. Each input range uses a rotary-style encoder that
-supports vertical mouse dragging, the mouse wheel, and arrow keys. Double-clicking
-a scope encoder opens its channel color picker; the selected color is shared by
-the encoder, trace, offset reference, readout, and trigger indication. Logic Analyzer and
-Oscilloscope tabs are
-created only for connected devices; the Combined tab appears when both models
-are present, and Refresh rebuilds the available tab set. Each waveform expands
-with the main window; Combined provides a draggable horizontal divider for
-adjusting the DSLogic/DSCope height ratio. Waveform buffers retain the newest
-8,192 samples so rendering remains bounded; this display limit does not truncate
-data written to a capture file. DSLogic labels D0–D15 remain visible before
+and then stops. Enabled channels support up to 500 MSa/s; disabling either
+channel raises the remaining channel's limit to 1 GSa/s. The shared 2M-sample
+memory provides up to 1M samples/channel in dual-channel mode or 2M in
+single-channel mode. Front-end and trigger changes are applied to the selected
+DSCope while idle; existing waveforms retain the settings with which they were
+captured. Each input range uses a rotary-style encoder that supports vertical
+mouse dragging, the mouse wheel, and arrow keys. Double-clicking a scope encoder
+opens its channel color picker; the selected color is shared by the encoder,
+trace, offset reference, readout, and trigger indication. Logic Analyzer and
+Oscilloscope tabs are created only for connected devices; the Combined tab
+appears when both models are present, and Refresh rebuilds the available tab
+set. Each waveform expands with the main window; Combined provides a draggable
+horizontal divider for adjusting the DSLogic/DSCope height ratio. Finite
+waveform storage is bounded at two million samples and rendering is decimated
+to the plot width; this display limit does not truncate data written to a
+capture file. DSLogic labels D0–D15 remain visible before
 capture, use distinct waveform colors, and open a per-channel color picker when
 clicked. Every logic lane includes a persistent dotted `0`-level reference.
-Scroll over either waveform to zoom its time axis around the pointer;
-double-click the waveform to reset it. The logic and oscilloscope zoom levels
-are independent, including in the Combined tab. Each waveform always has a top
-status strip showing time span, time/div, and zoom ratio, followed by a time
-ruler that remains visible before capture, tracks the visible zoom window, and
-divides every major interval into five minor ticks. The oscilloscope uses a
+Scroll over either waveform to zoom its time axis around the pointer, or drag
+the waveform to pan; double-click the waveform to reset it. The logic and
+oscilloscope zoom levels are independent in their standalone tabs. The Combined
+tab maps both captures onto their overlapping coordinator-time range and uses
+one shared viewport, so its grid lines, pan, and zoom remain aligned. Each
+waveform always has a top status strip showing time span, time/div, and zoom
+ratio, followed by a time ruler that remains visible before capture, tracks the
+visible zoom window, and divides every major interval into five minor ticks.
+Hovering a logic pulse can show its width, period, frequency, and duty cycle;
+persistent logic timing markers snap to nearby edges. The oscilloscope uses a
 conventional 10×8 graticule, zero-centered per-channel volts/div scaling,
 channel ground markers, configured front-end readouts, and illuminated channel
 traces. A draggable trigger-level arrow on the right edge drives the hardware
 threshold and its dotted horizontal reference; it uses the selected channel's
 color, or a live mix of both channel colors for combined CH0/CH1 triggering
-(green with the defaults).
+(green with the defaults). Scope tools provide automatic measurements,
+amplitude and time markers, channel math, windowed FFT, and a Lissajous XY view.
+The protocol-analyzer catalog can configure decoder stacks, channel mappings,
+and display formats; executing those decoders is still a planned milestone.
 
 Enable **Record complete capture** and enter a `.dsv` path before starting to
 write the full session to disk. The GUI uses the same streaming recorder as the
@@ -268,7 +292,8 @@ The opt-in hardware check is:
 cargo test -p wavecraft-usb --test hardware -- --ignored --nocapture
 ```
 
-The optional numeric argument is the simulated capture duration in seconds.
+The numeric shorthand (for example, `wavecraft-cli -- 2`) is the simulated
+capture duration in seconds.
 Run all checks with:
 
 ```sh
@@ -286,5 +311,7 @@ cargo test --workspace
 - `apps/wavecraft-cli`: simultaneous-capture development harness.
 - `apps/wavecraft-gui`: native device selection, capture controls, status, and waveform rendering.
 - `docs/architecture.md`: design constraints and planned hardware integration.
+- `docs/recording-format.md`: native `.dsv` framing and Saleae interoperability.
+- `docs/automation-and-mcp.md`: proposed CLI, service, SCPI, Saleae API, and MCP automation architecture.
 
 The project is licensed under GPL-3.0-or-later to remain compatible with the original DSView codebase.
