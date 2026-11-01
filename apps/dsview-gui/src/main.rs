@@ -285,24 +285,6 @@ fn normalize_saleae_path(mut path: PathBuf) -> PathBuf {
     path
 }
 
-fn available_saleae_path(path: PathBuf) -> PathBuf {
-    if !path.exists() {
-        return path;
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let stem = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("capture");
-    for index in 2_u32.. {
-        let candidate = parent.join(format!("{stem}-{index}.sal"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    unreachable!("the Saleae file suffix cannot be exhausted")
-}
-
 fn choose_saleae_export_path() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("Export Saleae Logic 2 capture")
@@ -310,7 +292,15 @@ fn choose_saleae_export_path() -> Option<PathBuf> {
         .set_file_name("capture.sal")
         .save_file()
         .map(normalize_saleae_path)
-        .map(available_saleae_path)
+}
+
+fn create_saleae_export_file(path: &Path) -> Result<File, String> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|error| format!("failed to create or replace {}: {error}", path.display()))
 }
 
 fn main() -> eframe::Result<()> {
@@ -2613,11 +2603,7 @@ impl DsViewApp {
         self.last_error = None;
         thread::spawn(move || {
             let result = (|| {
-                let file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+                let file = create_saleae_export_file(&path)?;
                 write_saleae(BufWriter::new(file), &capture).map_err(|error| error.to_string())?;
                 Ok(WorkerSuccess::SaleaeExported(path))
             })();
@@ -12332,6 +12318,25 @@ mod tests {
             normalize_saleae_path(PathBuf::from("capture.zip")),
             PathBuf::from("capture.sal")
         );
+    }
+
+    #[test]
+    fn saleae_export_replaces_the_selected_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "dsview-saleae-export-{}-{unique}.sal",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"previous capture").unwrap();
+
+        let file = create_saleae_export_file(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        drop(file);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
