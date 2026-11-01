@@ -9995,7 +9995,7 @@ fn paint_logic_timing_hint(
         ) {
             painter.line_segment(
                 [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
-                Stroke::new(1.0_f32, color.gamma_multiply(0.65)),
+                Stroke::new(0.75_f32, color.gamma_multiply(0.3)),
             );
         }
     }
@@ -10010,9 +10010,13 @@ fn paint_logic_timing_hint(
             ) {
                 painter.line_segment(
                     [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
-                    Stroke::new(1.5_f32, color),
+                    Stroke::new(0.75_f32, color.gamma_multiply(0.5)),
                 );
-                painter.circle_filled(Pos2::new(x, plot.top() + 3.0), 2.5, color);
+                painter.circle_filled(
+                    Pos2::new(x, plot.top() + 3.0),
+                    2.0,
+                    color.gamma_multiply(0.5),
+                );
             }
         }
     }
@@ -10027,8 +10031,8 @@ fn paint_logic_timing_hint(
         Pos2::new(plot.right() - width - 8.0, plot.top() + 26.0),
         Vec2::new(width, height),
     );
-    painter.rect_filled(hint, 5.0, PANEL.gamma_multiply(0.96));
-    let border = Stroke::new(1.0_f32, color.gamma_multiply(0.8));
+    painter.rect_filled(hint, 5.0, PANEL.gamma_multiply(0.88));
+    let border = Stroke::new(0.75_f32, color.gamma_multiply(0.65));
     painter.line_segment([hint.left_top(), hint.right_top()], border);
     painter.line_segment([hint.right_top(), hint.right_bottom()], border);
     painter.line_segment([hint.right_bottom(), hint.left_bottom()], border);
