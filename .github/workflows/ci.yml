@@ -7,7 +7,7 @@ on:
 jobs:
   msrv:
     name: Rust 1.79
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -28,16 +28,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macOS
-            os: macos-latest
-            artifact: wavecraft-macos
-            archive: wavecraft-macos.zip
+          - name: macOS (Apple Silicon)
+            os: macos-15
+            artifact: wavecraft-macos-arm64
+            archive: wavecraft-macos-arm64.zip
+            macos_architecture: arm64
+            macos_deployment_target: "11.0"
+          - name: macOS (Intel)
+            os: macos-15-intel
+            artifact: wavecraft-macos-x86_64
+            archive: wavecraft-macos-x86_64.zip
+            macos_architecture: x86_64
+            macos_deployment_target: "10.15"
           - name: Linux
-            os: ubuntu-latest
+            os: ubuntu-22.04
             artifact: wavecraft-linux-x86_64
             archive: wavecraft-linux-x86_64.tar.gz
           - name: Windows
-            os: windows-latest
+            os: windows-2022
             artifact: wavecraft-windows-x86_64
             archive: wavecraft-windows-x86_64.zip
 
@@ -58,21 +66,46 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - run: cargo build --workspace --release --locked
+
+      - name: Build release binaries
+        if: runner.os != 'Windows'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
+        run: cargo build --workspace --release --locked
+
+      - name: Build Windows release binaries with static MSVC runtime
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --workspace --release --locked
 
       - name: Build macOS application bundle
         if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
         run: bash scripts/package-macos.sh
+
+      - name: Verify macOS release architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          test "$(uname -m)" = "${{ matrix.macos_architecture }}"
+          test "$(lipo -archs target/release/wavecraft-cli)" = \
+            "${{ matrix.macos_architecture }}"
+          test "$(lipo -archs \
+            target/release/bundle/osx/WaveCraft.app/Contents/MacOS/WaveCraft)" = \
+            "${{ matrix.macos_architecture }}"
 
       - name: Package macOS release
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          mkdir -p dist/wavecraft-macos
-          cp -R target/release/bundle/osx/WaveCraft.app dist/wavecraft-macos/
-          cp target/release/wavecraft-cli README.md dist/wavecraft-macos/
+          package_directory="dist/${{ matrix.artifact }}"
+          mkdir -p "$package_directory"
+          cp -R target/release/bundle/osx/WaveCraft.app "$package_directory/"
+          cp target/release/wavecraft-cli README.md "$package_directory/"
           ditto -c -k --sequesterRsrc --keepParent \
-            dist/wavecraft-macos dist/wavecraft-macos.zip
+            "$package_directory" "dist/${{ matrix.archive }}"
 
       - name: Package Linux release
         if: runner.os == 'Linux'

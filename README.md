@@ -16,6 +16,25 @@ A Rust reimplementation of [DSView](https://github.com/DreamSourceLab/DSView) de
 
 ![WaveCraft Combined view with synchronized logic and oscilloscope waveforms](docs/images/wavecraft-combined.png)
 
+## Release packages
+
+WaveCraft publishes separate native macOS packages rather than a larger universal
+application. Choose the package that matches the Mac's processor:
+
+| Platform | Release package | Minimum system |
+| --- | --- | --- |
+| macOS on Apple Silicon (M1 or newer) | `wavecraft-macos-arm64.zip` | macOS 11 |
+| macOS on Intel | `wavecraft-macos-x86_64.zip` | macOS 10.15 |
+| Linux on x86-64 | `wavecraft-linux-x86_64.tar.gz` | glibc 2.35 (Ubuntu 22.04 or equivalent) |
+| Windows on x86-64 | `wavecraft-windows-x86_64.zip` | Windows 10 |
+
+The ARM64 package is recommended for Apple Silicon. It runs natively and avoids
+Rosetta; use the Intel package only on an Intel Mac. The two packages have the
+same features and architecture-native performance. Linux releases are built on
+Ubuntu 22.04 instead of installing another glibc on a newer runner. Windows
+releases statically link the MSVC C runtime, so a separate Visual C++
+Redistributable installation is not required.
+
 ## Terminology
 
 In project discussions and feature requests, these abbreviations are used:
