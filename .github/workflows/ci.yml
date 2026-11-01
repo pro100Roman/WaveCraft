@@ -30,16 +30,16 @@ jobs:
         include:
           - name: macOS
             os: macos-latest
-            artifact: dsview-macos
-            archive: dsview-macos.zip
+            artifact: wavecraft-macos
+            archive: wavecraft-macos.zip
           - name: Linux
             os: ubuntu-latest
-            artifact: dsview-linux-x86_64
-            archive: dsview-linux-x86_64.tar.gz
+            artifact: wavecraft-linux-x86_64
+            archive: wavecraft-linux-x86_64.tar.gz
           - name: Windows
             os: windows-latest
-            artifact: dsview-windows-x86_64
-            archive: dsview-windows-x86_64.zip
+            artifact: wavecraft-windows-x86_64
+            archive: wavecraft-windows-x86_64.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -68,35 +68,35 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          mkdir -p dist/dsview-macos
-          cp -R target/release/bundle/osx/DSView.app dist/dsview-macos/
-          cp target/release/dsview-cli README.md dist/dsview-macos/
+          mkdir -p dist/wavecraft-macos
+          cp -R target/release/bundle/osx/WaveCraft.app dist/wavecraft-macos/
+          cp target/release/wavecraft-cli README.md dist/wavecraft-macos/
           ditto -c -k --sequesterRsrc --keepParent \
-            dist/dsview-macos dist/dsview-macos.zip
+            dist/wavecraft-macos dist/wavecraft-macos.zip
 
       - name: Package Linux release
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          mkdir -p dist/dsview-linux-x86_64/resources
-          install -m 755 target/release/dsview-gui \
-            target/release/dsview-cli dist/dsview-linux-x86_64/
-          cp -R resources/fpga dist/dsview-linux-x86_64/resources/
-          cp README.md dist/dsview-linux-x86_64/
-          tar -C dist -czf dist/dsview-linux-x86_64.tar.gz \
-            dsview-linux-x86_64
+          mkdir -p dist/wavecraft-linux-x86_64/resources
+          install -m 755 target/release/wavecraft-gui \
+            target/release/wavecraft-cli dist/wavecraft-linux-x86_64/
+          cp -R resources/fpga dist/wavecraft-linux-x86_64/resources/
+          cp README.md dist/wavecraft-linux-x86_64/
+          tar -C dist -czf dist/wavecraft-linux-x86_64.tar.gz \
+            wavecraft-linux-x86_64
 
       - name: Package Windows release
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $packageDirectory = "dist/dsview-windows-x86_64"
+          $packageDirectory = "dist/wavecraft-windows-x86_64"
           New-Item -ItemType Directory -Force "$packageDirectory/resources" | Out-Null
-          Copy-Item -Path target/release/dsview-gui.exe -Destination $packageDirectory
-          Copy-Item -Path target/release/dsview-cli.exe -Destination $packageDirectory
+          Copy-Item -Path target/release/wavecraft-gui.exe -Destination $packageDirectory
+          Copy-Item -Path target/release/wavecraft-cli.exe -Destination $packageDirectory
           Copy-Item -Path README.md -Destination $packageDirectory
           Copy-Item -Path resources/fpga -Destination "$packageDirectory/resources/" -Recurse
-          Compress-Archive -Path $packageDirectory -DestinationPath dist/dsview-windows-x86_64.zip
+          Compress-Archive -Path $packageDirectory -DestinationPath dist/wavecraft-windows-x86_64.zip
 
       - name: Upload release package
         uses: actions/upload-artifact@v4
@@ -116,7 +116,7 @@ jobs:
       - name: Download release packages
         uses: actions/download-artifact@v4
         with:
-          pattern: dsview-*
+          pattern: wavecraft-*
           path: dist
           merge-multiple: true
 
