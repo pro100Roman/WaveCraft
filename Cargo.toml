@@ -1,11 +1,11 @@
 [workspace]
 members = [
-    "apps/dsview-cli",
-    "apps/dsview-gui",
-    "crates/dsview-core",
-    "crates/dsview-recording",
-    "crates/dsview-sim",
-    "crates/dsview-usb",
+    "apps/wavecraft-cli",
+    "apps/wavecraft-gui",
+    "crates/wavecraft-core",
+    "crates/wavecraft-recording",
+    "crates/wavecraft-sim",
+    "crates/wavecraft-usb",
 ]
 resolver = "2"
 

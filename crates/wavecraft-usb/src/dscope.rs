@@ -2,13 +2,13 @@ use crate::transport::{QueuedBulkRead, QueuedBulkReadOutcome};
 use crate::{
     DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbError, UsbSpeedClass, DSCOPE_U3P100,
 };
-use dsview_core::{
-    CaptureBatch, CaptureContext, CaptureError, CaptureSource, DeviceDescriptor, DeviceId,
-    InstrumentKind, ScopeBatch,
-};
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
+use wavecraft_core::{
+    CaptureBatch, CaptureContext, CaptureError, CaptureSource, DeviceDescriptor, DeviceId,
+    InstrumentKind, ScopeBatch,
+};
 
 const CHANNEL_COUNT: usize = 2;
 const HARDWARE_SAMPLE_RATE_HZ: u64 = 1_000_000_000;

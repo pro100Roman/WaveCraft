@@ -3,12 +3,12 @@ use crate::{
     BulkReadOutcome, DeviceModel, DeviceProfile, DiscoveredDevice, UsbDeviceSession, UsbError,
     UsbSpeedClass,
 };
-use dsview_core::{
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+use wavecraft_core::{
     CaptureBatch, CaptureContext, CaptureError, CaptureSource, DeviceDescriptor, DeviceId,
     InstrumentKind, LogicBatch,
 };
-use std::collections::VecDeque;
-use std::time::{Duration, Instant};
 
 const CHANNEL_COUNT: u8 = 32;
 const LEGACY_CHANNEL_COUNT: usize = 16;

@@ -1,6 +1,6 @@
-# DSView recording format
+# WaveCraft recording format
 
-DSView's native `.dsv` format is a lossless, little-endian stream of bounded
+WaveCraft's native `.dsv` format is a lossless, little-endian stream of bounded
 records. Format version 1 preserves capture events exactly and can be written
 without retaining the complete capture in memory.
 
@@ -8,7 +8,7 @@ without retaining the complete capture in memory.
 
 | Field | Size | Value |
 | --- | ---: | --- |
-| Magic | 8 bytes | `DSVIEW`, `0x1a`, newline |
+| Magic | 8 bytes | legacy `DSVIEW`, `0x1a`, newline |
 | Format version | `u16` | `1` |
 | Flags | `u16` | `0` |
 

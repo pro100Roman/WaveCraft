@@ -1,11 +1,11 @@
 //! Deterministic simulated instruments used while USB drivers are developed.
 
-use dsview_core::{
+use std::f32::consts::TAU;
+use std::time::{Duration, Instant};
+use wavecraft_core::{
     CaptureBatch, CaptureContext, CaptureError, CaptureSource, DeviceDescriptor, DeviceId,
     InstrumentKind, LogicBatch, ScopeBatch,
 };
-use std::f32::consts::TAU;
-use std::time::{Duration, Instant};
 
 pub struct SimulatedLogicAnalyzer {
     descriptor: DeviceDescriptor,

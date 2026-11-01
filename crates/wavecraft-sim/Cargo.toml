@@ -1,9 +1,9 @@
 [package]
-name = "dsview-sim"
+name = "wavecraft-sim"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-dsview-core = { path = "../dsview-core" }
+wavecraft-core = { path = "../wavecraft-core" }

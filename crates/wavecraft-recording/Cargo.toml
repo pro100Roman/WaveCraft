@@ -1,5 +1,5 @@
 [package]
-name = "dsview-recording"
+name = "wavecraft-recording"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -7,6 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 crc32fast = "1.5.0"
-dsview-core = { path = "../dsview-core" }
+wavecraft-core = { path = "../wavecraft-core" }
 serde_json = "1.0.145"
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }

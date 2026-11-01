@@ -704,57 +704,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
-name = "dsview-cli"
-version = "0.1.0"
-dependencies = [
- "dsview-core",
- "dsview-recording",
- "dsview-sim",
- "dsview-usb",
-]
-
-[[package]]
-name = "dsview-core"
-version = "0.1.0"
-
-[[package]]
-name = "dsview-gui"
-version = "0.1.0"
-dependencies = [
- "dsview-core",
- "dsview-recording",
- "dsview-usb",
- "eframe",
- "image",
- "rfd",
-]
-
-[[package]]
-name = "dsview-recording"
-version = "0.1.0"
-dependencies = [
- "crc32fast",
- "dsview-core",
- "serde_json",
- "zip",
-]
-
-[[package]]
-name = "dsview-sim"
-version = "0.1.0"
-dependencies = [
- "dsview-core",
-]
-
-[[package]]
-name = "dsview-usb"
-version = "0.1.0"
-dependencies = [
- "dsview-core",
- "rusb",
-]
-
-[[package]]
 name = "ecolor"
 version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3028,6 +2977,57 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39129a682a6d2d841b6c429d0c51e5cb0ed1a03829d8b3d1e69a011e62cb3d3b"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wavecraft-cli"
+version = "0.1.0"
+dependencies = [
+ "wavecraft-core",
+ "wavecraft-recording",
+ "wavecraft-sim",
+ "wavecraft-usb",
+]
+
+[[package]]
+name = "wavecraft-core"
+version = "0.1.0"
+
+[[package]]
+name = "wavecraft-gui"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "image",
+ "rfd",
+ "wavecraft-core",
+ "wavecraft-recording",
+ "wavecraft-usb",
+]
+
+[[package]]
+name = "wavecraft-recording"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "serde_json",
+ "wavecraft-core",
+ "zip",
+]
+
+[[package]]
+name = "wavecraft-sim"
+version = "0.1.0"
+dependencies = [
+ "wavecraft-core",
+]
+
+[[package]]
+name = "wavecraft-usb"
+version = "0.1.0"
+dependencies = [
+ "rusb",
+ "wavecraft-core",
 ]
 
 [[package]]

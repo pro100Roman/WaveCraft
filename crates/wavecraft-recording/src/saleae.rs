@@ -1,14 +1,14 @@
 use crate::{CompletionStatus, RecordingError, RecordingReader, RecordingWriter};
-use dsview_core::{
-    CaptureBatch, CaptureEvent, CaptureFrame, DeviceDescriptor, DeviceId, InstrumentKind,
-    LogicBatch, ScopeBatch,
-};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{self, Read, Seek, Write};
 use std::time::Duration;
+use wavecraft_core::{
+    CaptureBatch, CaptureEvent, CaptureFrame, DeviceDescriptor, DeviceId, InstrumentKind,
+    LogicBatch, ScopeBatch,
+};
 use zip::result::ZipError;
 use zip::write::FileOptions;
 
@@ -17,7 +17,7 @@ const SALEAE_BINARY_VERSION: u32 = 3;
 const SALEAE_META_VERSION: u32 = 22;
 // Logic reserves 32-bit device IDs for simulator profiles. This synthetic
 // 64-bit ID identifies data imported from a physical, non-Saleae instrument.
-const DSVIEW_IMPORT_DEVICE_ID: &str = "4294967296";
+const WAVECRAFT_IMPORT_DEVICE_ID: &str = "4294967296";
 const TYPE_DIGITAL: u32 = 100;
 const TYPE_ANALOG: u32 = 101;
 const TYPE_TRIGGER: u32 = 103;
@@ -324,7 +324,7 @@ fn combine_digital_channels(
         }
         if index >= 32 {
             return Err(SaleaeError::invalid(format!(
-                "digital channel {index} cannot fit in DSView's 32-bit samples"
+                "digital channel {index} cannot fit in WaveCraft's 32-bit samples"
             )));
         }
         let mask = 1_u32 << index;
@@ -996,7 +996,7 @@ fn build_metadata(capture: &SaleaeCapture) -> Value {
             "measurements": [], "highLevelAnalyzers": [], "analyzers": [],
             "rowsSettings": rows,
             "legacyDevice": {
-                "deviceId": DSVIEW_IMPORT_DEVICE_ID, "name": "DSView import", "deviceType": "LogicPro16",
+                "deviceId": WAVECRAFT_IMPORT_DEVICE_ID, "name": "WaveCraft import", "deviceType": "LogicPro16",
                 "isSimulation": false,
                 "capabilities": {
                     "channelCapabilities": capabilities,
@@ -1031,7 +1031,7 @@ fn build_metadata(capture: &SaleaeCapture) -> Value {
             "timeManager": {"t0": {"type": "startOfCapture"}},
             "captureNotes": "", "dataTable": {"columns": {}}, "digitalTriggerTime": -1,
             "analyzerTrigger": {"settings": {"holdoffSeconds": 0.2, "searchQuery": ""}},
-            "name": "Exported by DSView"
+            "name": "Exported by WaveCraft"
         },
         "binData": bin_data
     })
@@ -1406,11 +1406,11 @@ mod tests {
     }
 
     #[test]
-    fn exported_metadata_identifies_dsview_data_as_non_simulated() {
+    fn exported_metadata_identifies_wavecraft_data_as_non_simulated() {
         let metadata = build_metadata(&example_capture());
         let device = &metadata["data"]["legacyDevice"];
 
-        assert_eq!(device["name"], "DSView import");
+        assert_eq!(device["name"], "WaveCraft import");
         assert_eq!(device["isSimulation"], false);
         assert_eq!(device["capabilities"]["isPhysicalDevice"], true);
         assert!(device["deviceId"].as_str().unwrap().parse::<u64>().unwrap() > u64::from(u32::MAX));

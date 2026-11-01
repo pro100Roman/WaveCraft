@@ -3,30 +3,6 @@
 mod measurements;
 mod protocol_analyzer;
 
-use dsview_core::{
-    CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
-    DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
-};
-use dsview_recording::{
-    read_saleae, write_saleae, CompletionStatus, RecordingReader, RecordingWriter,
-    SaleaeAnalogChannel, SaleaeCapture, SaleaeChannel, SaleaeDigitalCapture,
-};
-use dsview_usb::{
-    apply_dscope_configuration, auto_calibrate_dscope_with_progress, discover_supported_devices,
-    prepare_device, read_dscope_calibration, write_dscope_calibration, DeviceModel,
-    DiscoveredDevice, DsCopeBandwidthLimit, DsCopeCalibrationFrame, DsCopeCalibrationValues,
-    DsCopeCaptureConfig, DsCopeCaptureSource, DsCopeChannelConfig, DsCopeCoupling,
-    DsCopeOperationMode, DsCopeRuntimeCalibrationControl, DsCopeRuntimeTriggerControl,
-    DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig,
-    DsLogicCaptureSource, DsLogicInputFilter, DsLogicOperationMode, DsLogicStopOption, LinkStatus,
-    UsbSpeedClass, DSCOPE_FRAME_SEQUENCE_STRIDE, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
-    DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX,
-    DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
-    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
-    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
-    DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_ALIGNMENT, DSLOGIC_SAMPLE_RATES_HZ,
-    REQUIRED_RESOURCE_FILES,
-};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use image::ImageFormat;
 use measurements::{
@@ -46,6 +22,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
+use wavecraft_core::{
+    CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
+    DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
+};
+use wavecraft_recording::{
+    read_saleae, write_saleae, CompletionStatus, RecordingReader, RecordingWriter,
+    SaleaeAnalogChannel, SaleaeCapture, SaleaeChannel, SaleaeDigitalCapture,
+};
+use wavecraft_usb::{
+    apply_dscope_configuration, auto_calibrate_dscope_with_progress, discover_supported_devices,
+    prepare_device, read_dscope_calibration, write_dscope_calibration, DeviceModel,
+    DiscoveredDevice, DsCopeBandwidthLimit, DsCopeCalibrationFrame, DsCopeCalibrationValues,
+    DsCopeCaptureConfig, DsCopeCaptureSource, DsCopeChannelConfig, DsCopeCoupling,
+    DsCopeOperationMode, DsCopeRuntimeCalibrationControl, DsCopeRuntimeTriggerControl,
+    DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig,
+    DsLogicCaptureSource, DsLogicInputFilter, DsLogicOperationMode, DsLogicStopOption, LinkStatus,
+    UsbSpeedClass, DSCOPE_FRAME_SEQUENCE_STRIDE, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
+    DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX,
+    DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
+    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
+    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
+    DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_ALIGNMENT, DSLOGIC_SAMPLE_RATES_HZ,
+    REQUIRED_RESOURCE_FILES,
+};
 
 const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
@@ -194,12 +194,12 @@ fn crop_snapshot_image(
 }
 
 fn available_snapshot_path(directory: &Path) -> PathBuf {
-    let default_path = directory.join("dsview-snapshot.png");
+    let default_path = directory.join("wavecraft-snapshot.png");
     if !default_path.exists() {
         return default_path;
     }
     for index in 2_u32.. {
-        let path = directory.join(format!("dsview-snapshot-{index}.png"));
+        let path = directory.join(format!("wavecraft-snapshot-{index}.png"));
         if !path.exists() {
             return path;
         }
@@ -258,8 +258,8 @@ fn choose_recording_save_path(current_path: &str) -> Option<PathBuf> {
         .filter(|name| !name.is_empty())
         .unwrap_or("capture.dsv");
     rfd::FileDialog::new()
-        .set_title("Save complete DSView capture")
-        .add_filter("DSView capture", &["dsv"])
+        .set_title("Save complete WaveCraft capture")
+        .add_filter("WaveCraft capture", &["dsv"])
         .set_file_name(default_name)
         .save_file()
         .map(normalize_recording_path)
@@ -270,7 +270,7 @@ fn choose_recording_to_open() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("Open capture")
         .add_filter("Supported captures", &["dsv", "sal"])
-        .add_filter("DSView capture", &["dsv"])
+        .add_filter("WaveCraft capture", &["dsv"])
         .add_filter("Saleae Logic 2 capture", &["sal"])
         .pick_file()
 }
@@ -312,9 +312,9 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "DSView",
+        "WaveCraft",
         options,
-        Box::new(|creation_context| Ok(Box::new(DsViewApp::new(creation_context)))),
+        Box::new(|creation_context| Ok(Box::new(WaveCraftApp::new(creation_context)))),
     )
 }
 
@@ -2578,7 +2578,7 @@ enum WorkerSuccess {
 
 type WorkerResult = Result<WorkerSuccess, String>;
 
-struct DsViewApp {
+struct WaveCraftApp {
     resource_directory: String,
     settings_open: bool,
     auto_calibration_confirmation_open: bool,
@@ -2642,7 +2642,7 @@ fn default_scope_measurement_window_positions() -> [Vec2; 2] {
     [Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0)]
 }
 
-impl DsViewApp {
+impl WaveCraftApp {
     fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         configure_style(&creation_context.egui_ctx);
         let mut app = Self {
@@ -6492,7 +6492,7 @@ fn paint_usb_speed_warning(context: &egui::Context, warning: &UsbSpeedWarning) -
     dismissed
 }
 
-impl eframe::App for DsViewApp {
+impl eframe::App for WaveCraftApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_calibration_progress();
         self.poll_worker();
@@ -6578,7 +6578,7 @@ impl eframe::App for DsViewApp {
             )
             .show(context, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("DSVIEW").strong().size(18.0).color(ACCENT));
+                    ui.label(RichText::new("WAVECRAFT").strong().size(18.0).color(ACCENT));
                     ui.separator();
                     ui.menu_button("App", |ui| {
                         if ui.button("Settings…").clicked() {
@@ -7360,7 +7360,7 @@ impl eframe::App for DsViewApp {
                 ui.label(RichText::new("Disconnect all probes before continuing.").strong());
                 ui.add_space(6.0);
                 ui.label(
-                    "DSView will run the vendor calibration sequence for both channels: offset transfer, all input ranges, and ADC branch balance. It can take a while. Device NVM is changed only if you choose Save when calibration finishes.",
+                    "WaveCraft will run the vendor calibration sequence for both channels: offset transfer, all input ranges, and ADC branch balance. It can take a while. Device NVM is changed only if you choose Save when calibration finishes.",
                 );
                 ui.add_space(6.0);
                 ui.label(
@@ -8235,7 +8235,7 @@ fn read_gui_saleae(input: impl Read + Seek) -> Result<LoadedRecording, String> {
         }
         waveforms.configure_logic_capture(digital.samples.len() as u64, false);
         waveforms.ingest(
-            &CaptureBatch::Logic(dsview_core::LogicBatch {
+            &CaptureBatch::Logic(wavecraft_core::LogicBatch {
                 sample_rate_hz: digital.sample_rate_hz,
                 channel_count: digital
                     .channels
@@ -8319,7 +8319,7 @@ fn saleae_capture_from_display(
     let digital = if completed.has_logic && !waveforms.logic_samples.is_empty() {
         if waveforms.logic_sample_stride != 1 || waveforms.logic_sample_offset != 0 {
             return Err(
-                "This logic capture was decimated for display; export its original .dsv file with dsview-cli to preserve every sample"
+                "This logic capture was decimated for display; export its original .dsv file with wavecraft-cli to preserve every sample"
                     .to_owned(),
             );
         }
@@ -8362,7 +8362,7 @@ fn saleae_capture_from_display(
 
     if waveforms.scope_sample_offset != 0 {
         return Err(
-            "This scope capture was trimmed for display; export its original .dsv file with dsview-cli to preserve every sample"
+            "This scope capture was trimmed for display; export its original .dsv file with wavecraft-cli to preserve every sample"
                 .to_owned(),
         );
     }
@@ -12767,8 +12767,8 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsview_core::{LogicBatch, ScopeBatch};
     use std::io::Cursor;
+    use wavecraft_core::{LogicBatch, ScopeBatch};
 
     #[test]
     fn session_tabs_preserve_each_tabs_capture_and_settings() {
@@ -13181,7 +13181,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "dsview-saleae-export-{}-{unique}.sal",
+            "wavecraft-saleae-export-{}-{unique}.sal",
             std::process::id()
         ));
         std::fs::write(&path, b"previous capture").unwrap();
@@ -14150,8 +14150,8 @@ mod tests {
     #[test]
     fn usb_speed_warning_only_lists_reduced_performance_links() {
         let device = |platform_path: &str, speed| DiscoveredDevice {
-            profile: &dsview_usb::DSLOGIC_U3PRO16,
-            location: dsview_usb::DeviceLocation {
+            profile: &wavecraft_usb::DSLOGIC_U3PRO16,
+            location: wavecraft_usb::DeviceLocation {
                 platform_path: platform_path.to_owned(),
             },
             speed,

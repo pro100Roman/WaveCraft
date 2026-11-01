@@ -3,9 +3,9 @@
 //! Discovery uses libusb and never opens, claims, or modifies a device. Device
 //! handles and direct USB transport belong to the acquisition layer.
 
-use dsview_core::InstrumentKind;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use wavecraft_core::InstrumentKind;
 
 mod dscope;
 mod dslogic;

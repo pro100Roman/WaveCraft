@@ -1,6 +1,6 @@
 # Capture Architecture
 
-DSView models every physical instrument as an independent `CaptureSource`.
+WaveCraft models every physical instrument as an independent `CaptureSource`.
 The `CaptureCoordinator` starts one worker per source, synchronizes prepared
 workers immediately before acquisition, and assigns all frames to one monotonic
 process timeline. This removes the original application's global “active
@@ -16,7 +16,7 @@ DSCope worker  ── scope batches ──┘
 
 Each frame contains a device ID, monotonically increasing sequence number, capture timestamp, sample rate, and typed payload. Digital samples are bit-packed into `u32`; scope samples are channel-major `f32` voltages.
 
-The native `dsview-gui` application consumes the same `CaptureSession` event
+The native `wavecraft-gui` application consumes the same `CaptureSession` event
 stream as the CLI. USB discovery and device preparation run on background
 threads, while the UI polls typed capture events without blocking the window
 loop. It keeps bounded display buffers and paints digital and scope traces
@@ -102,7 +102,7 @@ The synchronization layer will therefore preserve raw device timing metadata ins
 
 ## Hardware integration plan
 
-The `dsview-usb` crate owns model profiles, read-only discovery, claimed device
+The `wavecraft-usb` crate owns model profiles, read-only discovery, claimed device
 sessions, and the vendor control transport. Its profile table contains all 22
 unique DSLogic and DSCope IDs in the upstream driver: the legacy DSLogic,
 DSLogic Pro/Plus/Basic, U2/U3 and PGL12 logic analyzers, plus the DSCope,

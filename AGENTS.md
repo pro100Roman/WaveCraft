@@ -2,14 +2,14 @@
 
 ## Project Structure & Module Organization
 
-This is a Cargo workspace for a Rust rewrite of DSView. Device-independent types and capture coordination live in `crates/dsview-core`; USB profiles and discovery live in `crates/dsview-usb`; deterministic test devices live in `crates/dsview-sim`; executable applications belong under `apps/`. Architecture decisions are documented in `docs/`. The original implementation in `../DSView` is a read-only behavior and USB-protocol reference.
+This is a Cargo workspace for WaveCraft, a Rust rewrite of DSView. Device-independent types and capture coordination live in `crates/wavecraft-core`; USB profiles and discovery live in `crates/wavecraft-usb`; deterministic test devices live in `crates/wavecraft-sim`; executable applications belong under `apps/`. Architecture decisions are documented in `docs/`. The original DSView implementation in `../DSView` is a read-only behavior and USB-protocol reference.
 
 Keep hardware drivers independent of the UI. New device backends should implement `CaptureSource` and emit typed batches through `CaptureContext`.
 
 ## Build, Test, and Development Commands
 
-- `cargo run -p dsview-cli -- 2` — run simultaneous simulated capture for two seconds.
-- `cargo run -p dsview-cli -- list` — list supported connected USB instruments.
+- `cargo run -p wavecraft-cli -- 2` — run simultaneous simulated capture for two seconds.
+- `cargo run -p wavecraft-cli -- list` — list supported connected USB instruments.
 - `cargo test --workspace` — run all unit and integration tests.
 - `cargo fmt --all --check` — verify standard Rust formatting.
 - `cargo clippy --workspace --all-targets -- -D warnings` — reject lint warnings.

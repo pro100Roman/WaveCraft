@@ -1,22 +1,22 @@
-use dsview_core::{CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSource, DeviceId};
-use dsview_recording::{
-    export_saleae_recording, import_saleae_recording, CompletionStatus, RecordingReader,
-    RecordingWriter, FORMAT_VERSION,
-};
-use dsview_sim::{SimulatedLogicAnalyzer, SimulatedOscilloscope};
-use dsview_usb::{
-    discover_supported_devices, load_device_fpga, prepare_device, probe_device, DeviceModel,
-    DsCopeCaptureConfig, DsCopeCaptureSource, DsLogicCaptureConfig, DsLogicCaptureSource, FpgaLoad,
-    LinkStatus,
-};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::time::{Duration, Instant};
+use wavecraft_core::{CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSource, DeviceId};
+use wavecraft_recording::{
+    export_saleae_recording, import_saleae_recording, CompletionStatus, RecordingReader,
+    RecordingWriter, FORMAT_VERSION,
+};
+use wavecraft_sim::{SimulatedLogicAnalyzer, SimulatedOscilloscope};
+use wavecraft_usb::{
+    discover_supported_devices, load_device_fpga, prepare_device, probe_device, DeviceModel,
+    DsCopeCaptureConfig, DsCopeCaptureSource, DsLogicCaptureConfig, DsLogicCaptureSource, FpgaLoad,
+    LinkStatus,
+};
 
-const USAGE: &str = "usage: dsview-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
+const USAGE: &str = "usage: wavecraft-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
 
 type FileRecorder = RecordingWriter<BufWriter<File>>;
 
@@ -121,7 +121,7 @@ fn export_saleae(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
         .open(output)?;
     export_saleae_recording(BufReader::new(input_file), BufWriter::new(output_file))?;
     println!(
-        "exported DSView capture {} to {}",
+        "exported WaveCraft capture {} to {}",
         input.display(),
         output.display()
     );
@@ -134,7 +134,7 @@ fn capture_usb(resource_directory: &Path, output: Option<&Path>) -> Result<(), B
     const CAPTURE_TIMEOUT: Duration = Duration::from_secs(11);
 
     let logic_config = DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)?
-        .with_operation_mode(dsview_usb::DsLogicOperationMode::Stream);
+        .with_operation_mode(wavecraft_usb::DsLogicOperationMode::Stream);
     let scope_config = DsCopeCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)?;
     let report = discover_supported_devices()?;
     let logic_device = report
@@ -297,7 +297,7 @@ fn capture_metadata(
 
 fn start_recording(
     output: Option<&Path>,
-    devices: &[dsview_core::DeviceDescriptor],
+    devices: &[wavecraft_core::DeviceDescriptor],
     metadata: BTreeMap<String, String>,
 ) -> Result<Option<FileRecorder>, Box<dyn Error>> {
     let Some(path) = output else {
@@ -343,7 +343,7 @@ fn inspect_recording(path: &Path) -> Result<(), Box<dyn Error>> {
         .map_err(|error| format!("failed to open recording {}: {error}", path.display()))?;
     let mut reader = RecordingReader::new(BufReader::new(file))?;
     println!(
-        "DSView recording format {}, {} device(s)",
+        "WaveCraft recording format {}, {} device(s)",
         FORMAT_VERSION,
         reader.header().devices.len()
     );
@@ -508,7 +508,7 @@ fn capture_logic(
         .checked_mul(seconds)
         .ok_or("capture duration is too large")?;
     let config = DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, sample_count)?
-        .with_operation_mode(dsview_usb::DsLogicOperationMode::Stream);
+        .with_operation_mode(wavecraft_usb::DsLogicOperationMode::Stream);
     let report = discover_supported_devices()?;
     let device = report
         .devices

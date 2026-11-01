@@ -1,4 +1,4 @@
-//! Device-independent capture primitives for DSView.
+//! Device-independent capture primitives for WaveCraft.
 
 mod model;
 mod session;

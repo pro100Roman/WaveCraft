@@ -1,7 +1,7 @@
 # FPGA and firmware resources
 
 These runtime resources are unmodified copies from the GPL-3.0-or-later DSView
-reference checkout at `../DSView/DSView/res`, relative to this Rust DSView
+reference checkout at `../DSView/DSView/res`, relative to this WaveCraft
 repository root. The `.bin` files configure the matching instrument FPGA. The
 legacy `.fw` files are retained for the FX2 models that use them in the original
 application; firmware upload is not yet performed by this Rust transport. The

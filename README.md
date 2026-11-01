@@ -1,6 +1,6 @@
-# DSView
+# WaveCraft
 
-A Rust reimplementation of DSView designed to capture from a logic analyzer and an oscilloscope concurrently. The original C/C++ application in `../DSView` is retained as a protocol and behavior reference.
+A Rust reimplementation of [DSView](https://github.com/DreamSourceLab/DSView) designed to capture from a logic analyzer and an oscilloscope concurrently. The original C/C++ application in `../DSView` is retained as a protocol and behavior reference.
 
 ## Terminology
 
@@ -68,17 +68,17 @@ simulators.
 Install Rust 1.79 or newer, then run:
 
 ```sh
-cargo run -p dsview-cli -- 2
-cargo run -p dsview-cli -- list
-cargo run -p dsview-cli -- probe
-cargo run -p dsview-cli -- load-fpga resources/fpga
-cargo run -p dsview-cli -- prepare resources/fpga
-cargo run -p dsview-cli -- capture-logic resources/fpga 1
-cargo run -p dsview-cli -- capture-scope resources/fpga
-cargo run -p dsview-cli -- capture-usb resources/fpga
-cargo run -p dsview-cli -- capture-usb resources/fpga --output capture.dsv
-cargo run -p dsview-cli -- inspect capture.dsv
-cargo run -p dsview-cli -- simulate 1 --output simulated.dsv
+cargo run -p wavecraft-cli -- 2
+cargo run -p wavecraft-cli -- list
+cargo run -p wavecraft-cli -- probe
+cargo run -p wavecraft-cli -- load-fpga resources/fpga
+cargo run -p wavecraft-cli -- prepare resources/fpga
+cargo run -p wavecraft-cli -- capture-logic resources/fpga 1
+cargo run -p wavecraft-cli -- capture-scope resources/fpga
+cargo run -p wavecraft-cli -- capture-usb resources/fpga
+cargo run -p wavecraft-cli -- capture-usb resources/fpga --output capture.dsv
+cargo run -p wavecraft-cli -- inspect capture.dsv
+cargo run -p wavecraft-cli -- simulate 1 --output simulated.dsv
 ```
 
 Here `<resource-directory>` contains the complete set of 25 `.bin` and `.fw`
@@ -139,8 +139,8 @@ per-device totals without connected hardware. The format is documented in
 Saleae Logic 2 captures can be converted without connected hardware:
 
 ```sh
-cargo run -p dsview-cli -- import capture.sal capture.dsv
-cargo run -p dsview-cli -- export capture.dsv capture.sal
+cargo run -p wavecraft-cli -- import capture.sal capture.dsv
+cargo run -p wavecraft-cli -- export capture.dsv capture.sal
 ```
 
 The GUI's **Open** dialog accepts `.dsv` and `.sal`; **Export** writes the
@@ -148,7 +148,7 @@ completed in-memory capture as `.sal`. For a capture that the GUI had to
 decimate or trim for display, use the CLI on the original `.dsv` to preserve
 every sample. Saleae export carries digital samples, analog voltages, sample
 rates, enabled channels, and channel names. Trigger configuration, analyzers,
-and DSView-only settings are not representable and are omitted. DSView supports
+and WaveCraft-only settings are not representable and are omitted. WaveCraft supports
 the current `<SALEAE>` binary version 3 layout and reports other internal
 revisions as unsupported because Saleae does not promise `.sal` format
 stability.
@@ -159,23 +159,23 @@ Install Rust 1.79 or newer and run these commands from the workspace root.
 Build an unoptimized development executable with:
 
 ```sh
-cargo build -p dsview-gui
+cargo build -p wavecraft-gui
 ```
 
 Launch the development build directly through Cargo with:
 
 ```sh
-cargo run -p dsview-gui
+cargo run -p wavecraft-gui
 ```
 
 Build the optimized release executable with:
 
 ```sh
-cargo build -p dsview-gui --release
+cargo build -p wavecraft-gui --release
 ```
 
-The release executable is written to `target/release/dsview-gui` on macOS and
-Linux, or `target/release/dsview-gui.exe` on Windows.
+The release executable is written to `target/release/wavecraft-gui` on macOS and
+Linux, or `target/release/wavecraft-gui.exe` on Windows.
 
 On macOS, build a self-contained, Finder-launchable release application bundle
 with:
@@ -184,16 +184,16 @@ with:
 ./scripts/package-macos.sh
 ```
 
-The bundle is written to `target/release/bundle/osx/DSView.app`. Launch it by
+The bundle is written to `target/release/bundle/osx/WaveCraft.app`. Launch it by
 double-clicking it in Finder or from a shell with:
 
 ```sh
-open target/release/bundle/osx/DSView.app
+open target/release/bundle/osx/WaveCraft.app
 ```
 
-Double-clicking `DSView.app` launches the GUI without opening Terminal. The
+Double-clicking `WaveCraft.app` launches the GUI without opening Terminal. The
 bundle includes the FPGA resources and the application locates them relative to
-its executable. Double-clicking the raw `target/release/dsview-gui` Unix binary
+its executable. Double-clicking the raw `target/release/wavecraft-gui` Unix binary
 will still open Terminal because it is not an application bundle.
 
 Windows builds use the GUI subsystem and therefore do not create a console
@@ -265,7 +265,7 @@ and interrupted operations, and distinguishes cancellation from USB failures.
 The opt-in hardware check is:
 
 ```sh
-cargo test -p dsview-usb --test hardware -- --ignored --nocapture
+cargo test -p wavecraft-usb --test hardware -- --ignored --nocapture
 ```
 
 The optional numeric argument is the simulated capture duration in seconds.
@@ -279,12 +279,12 @@ cargo test --workspace
 
 ## Workspace layout
 
-- `crates/dsview-core`: device-independent capture types and concurrency.
-- `crates/dsview-recording`: native recording plus Saleae `.sal` import/export.
-- `crates/dsview-sim`: deterministic simulated logic and scope sources.
-- `crates/dsview-usb`: USB discovery, claimed sessions, control transport, FPGA loading, and DSLogic/DSCope capture.
-- `apps/dsview-cli`: simultaneous-capture development harness.
-- `apps/dsview-gui`: native device selection, capture controls, status, and waveform rendering.
+- `crates/wavecraft-core`: device-independent capture types and concurrency.
+- `crates/wavecraft-recording`: native recording plus Saleae `.sal` import/export.
+- `crates/wavecraft-sim`: deterministic simulated logic and scope sources.
+- `crates/wavecraft-usb`: USB discovery, claimed sessions, control transport, FPGA loading, and DSLogic/DSCope capture.
+- `apps/wavecraft-cli`: simultaneous-capture development harness.
+- `apps/wavecraft-gui`: native device selection, capture controls, status, and waveform rendering.
 - `docs/architecture.md`: design constraints and planned hardware integration.
 
 The project is licensed under GPL-3.0-or-later to remain compatible with the original DSView codebase.

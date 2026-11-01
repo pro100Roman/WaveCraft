@@ -9,15 +9,15 @@ pub use saleae::{
 };
 
 use crc32fast::hash;
-use dsview_core::{
-    CaptureBatch, CaptureError, CaptureEvent, CaptureFrame, DeviceDescriptor, DeviceId,
-    InstrumentKind, LogicBatch, ScopeBatch,
-};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{self, Read, Write};
 use std::time::Duration;
+use wavecraft_core::{
+    CaptureBatch, CaptureError, CaptureEvent, CaptureFrame, DeviceDescriptor, DeviceId,
+    InstrumentKind, LogicBatch, ScopeBatch,
+};
 
 const FILE_MAGIC: [u8; 8] = *b"DSVIEW\x1a\n";
 const FILE_HEADER_BYTES: usize = 12;
@@ -174,7 +174,9 @@ impl<R: Read> RecordingReader<R> {
         let mut file_header = [0_u8; FILE_HEADER_BYTES];
         read_exact_or_invalid(&mut input, &mut file_header, "file header is truncated")?;
         if file_header[..FILE_MAGIC.len()] != FILE_MAGIC {
-            return Err(RecordingError::invalid("file magic does not match DSView"));
+            return Err(RecordingError::invalid(
+                "file magic does not match WaveCraft",
+            ));
         }
         let version = u16::from_le_bytes([file_header[8], file_header[9]]);
         if version != FORMAT_VERSION {

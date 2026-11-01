@@ -1,5 +1,5 @@
-use dsview_usb::{discover_supported_devices, BulkReadOutcome, UsbDeviceSession};
 use std::time::{Duration, Instant};
+use wavecraft_usb::{discover_supported_devices, BulkReadOutcome, UsbDeviceSession};
 
 #[test]
 #[ignore = "requires supported USB instruments connected and idle"]

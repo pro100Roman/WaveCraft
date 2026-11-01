@@ -2,7 +2,7 @@
 
 Status: proposed
 
-DSView should support unattended hardware operation, repeatable diagnostic
+WaveCraft should support unattended hardware operation, repeatable diagnostic
 scenarios, conventional scripting, and AI-assisted debugging. These use cases
 share the same device and capture operations, but they require different
 adapters. The CLI, a future local service, a SCPI endpoint, and an MCP server
@@ -10,7 +10,7 @@ must therefore be thin clients of one application service rather than
 independent implementations of hardware control.
 
 ```text
-                 +-- dsview CLI ----- humans, scripts, and CI
+                 +-- wavecraft CLI ----- humans, scripts, and CI
 Hardware/core ---+-- application ---- GUI and native integrations
                  +-- local daemon --- persistent sessions and Python clients
                  +-- SCPI endpoint -- VISA clients and test systems
@@ -19,7 +19,7 @@ Hardware/core ---+-- application ---- GUI and native integrations
 
 The application service owns discovery, selection, preparation, capture,
 recording, decoding, cancellation, and errors. Hardware drivers remain in
-`dsview-usb`, independent of every user interface and automation protocol.
+`wavecraft-usb`, independent of every user interface and automation protocol.
 
 ## Goals
 
@@ -31,7 +31,7 @@ recording, decoding, cancellation, and errors. Hardware drivers remain in
 - Give AI agents bounded, structured access to diagnostics and signal data.
 - Keep the same operations and schemas across CLI, daemon, SCPI, and MCP
   adapters.
-- Test automation against `dsview-sim` without connected USB hardware.
+- Test automation against `wavecraft-sim` without connected USB hardware.
 
 ## Non-goals
 
@@ -39,14 +39,14 @@ recording, decoding, cancellation, and errors. Hardware drivers remain in
 - SCPI is an adapter for laboratory automation, not the canonical internal API.
 - Scenarios do not embed arbitrary shell commands.
 - Raw captures are not serialized into large JSON, SCPI, or MCP responses.
-- The first version does not expose DSView as a remotely accessible hardware
+- The first version does not expose WaveCraft as a remotely accessible hardware
   service.
 - Automation does not weaken device validation, transfer bounds, timeouts, or
   cancellation requirements.
 
 ## Application service
 
-Add a crate such as `crates/dsview-automation` that exposes typed operations
+Add a crate such as `crates/wavecraft-automation` that exposes typed operations
 used by the CLI, GUI, and future adapters. It should coordinate existing core,
 USB, simulator, recording, and decoder crates without containing device-model
 specific transport code.
@@ -54,7 +54,7 @@ specific transport code.
 An initial interface may resemble:
 
 ```rust,ignore
-pub trait DsViewService {
+pub trait WaveCraftService {
     fn list_devices(&self) -> Result<Vec<AutomationDevice>, AutomationError>;
     fn validate_scenario(&self, scenario: Scenario) -> ValidationReport;
     fn run_scenario(&self, scenario: Scenario) -> Result<ScenarioRun, AutomationError>;
@@ -97,7 +97,7 @@ error schema should contain:
 
 ```json
 {
-  "schema": "dsview.error/v1",
+  "schema": "wavecraft.error/v1",
   "code": "device_busy",
   "message": "DSLogic U3Pro32 is already in use",
   "device_id": "usb:3-2",
@@ -118,12 +118,12 @@ The CLI is the first public automation surface. It should use a conventional
 argument parser and organize operations under stable command groups:
 
 ```text
-dsview devices list --format json
-dsview devices probe --id usb:3-2 --format json
-dsview scenario validate spi-boot.yaml
-dsview scenario run spi-boot.yaml --events ndjson --artifacts runs/001
-dsview recording inspect runs/001/capture.dsv --format json
-dsview recording decode runs/001/capture.dsv --decoder spi
+wavecraft devices list --format json
+wavecraft devices probe --id usb:3-2 --format json
+wavecraft scenario validate spi-boot.yaml
+wavecraft scenario run spi-boot.yaml --events ndjson --artifacts runs/001
+wavecraft recording inspect runs/001/capture.dsv --format json
+wavecraft recording decode runs/001/capture.dsv --decoder spi
 ```
 
 The machine interface follows these rules:
@@ -147,11 +147,11 @@ before a resident service exists.
 ## Scenario format
 
 Scenarios are declarative YAML or JSON documents with an explicit schema
-identifier. They describe desired DSView operations, not implementation steps
+identifier. They describe desired WaveCraft operations, not implementation steps
 or shell scripts.
 
 ```yaml
-schema: dsview.scenario/v1
+schema: wavecraft.scenario/v1
 name: spi-boot-check
 
 devices:
@@ -207,14 +207,14 @@ configuration. Validation against connected hardware additionally checks model
 capabilities and resource availability before making state changes.
 
 Arbitrary commands are excluded from the first schema. External test systems
-can control the device under test and call DSView at the appropriate time. If
+can control the device under test and call WaveCraft at the appropriate time. If
 integrated actions become necessary, add a manifest-based, explicitly enabled,
 out-of-process action plugin contract with argument schemas, timeouts, output
 limits, and cancellation.
 
 ## Local daemon
 
-A resident `dsviewd` service is useful after automation needs persistent device
+A resident `wavecraftd` service is useful after automation needs persistent device
 ownership or sessions that outlive one CLI process. It can provide:
 
 - exclusive device leases;
@@ -233,10 +233,10 @@ of enabling automation.
 
 ## VISA and SCPI adapter
 
-DSView may expose a SCPI endpoint for integration with PyVISA, LabVIEW,
+WaveCraft may expose a SCPI endpoint for integration with PyVISA, LabVIEW,
 MATLAB, and existing automated test systems. VISA is the client-side I/O API;
-DSView implements the instrument-side command protocol. The endpoint must be a
-thin adapter over the application service or `dsviewd`, not an automation layer
+WaveCraft implements the instrument-side command protocol. The endpoint must be a
+thin adapter over the application service or `wavecraftd`, not an automation layer
 over GUI controls. GUI view state is outside the SCPI contract.
 
 The initial transport should be a newline-delimited SCPI TCP socket bound to
@@ -254,20 +254,20 @@ discovery, or VISA event semantics that it does not implement.
 
 The adapter should support the applicable IEEE 488.2 common commands,
 including `*IDN?`, `*CLS`, `*OPC?`, and status queries, together with
-`SYSTem:ERRor?`. DSView-specific commands should map directly to typed service
+`SYSTem:ERRor?`. WaveCraft-specific commands should map directly to typed service
 operations. An illustrative command tree is:
 
 ```text
-DSView:DEVice:LIST?
-DSView:DEVice:SELect "usb:3-2"
-DSView:DEVice:PROBe?
-DSView:SCENario:VALidate? "spi-boot.yaml"
-DSView:SCENario:LOAD "spi-boot.yaml"
-DSView:RUN:STARt?
-DSView:RUN:STATus? "run-id"
-DSView:RUN:STOP "run-id"
-DSView:RUN:RESult? "run-id"
-DSView:RECording:INSPect? "capture.dsv"
+WaveCraft:DEVice:LIST?
+WaveCraft:DEVice:SELect "usb:3-2"
+WaveCraft:DEVice:PROBe?
+WaveCraft:SCENario:VALidate? "spi-boot.yaml"
+WaveCraft:SCENario:LOAD "spi-boot.yaml"
+WaveCraft:RUN:STARt?
+WaveCraft:RUN:STATus? "run-id"
+WaveCraft:RUN:STOP "run-id"
+WaveCraft:RUN:RESult? "run-id"
+WaveCraft:RECording:INSPect? "capture.dsv"
 ```
 
 Exact command names, abbreviations, response formats, and error mappings are a
@@ -290,7 +290,7 @@ execution-time limits. Scenario and artifact paths are restricted to allowed
 directories. The server binds locally by default; remote exposure requires a
 separate authentication, authorization, and transport-security design.
 
-A Python client may use a VISA implementation without a native DSView binding:
+A Python client may use a VISA implementation without a native WaveCraft binding:
 
 ```python
 import pyvisa
@@ -302,10 +302,10 @@ instrument.read_termination = "\n"
 instrument.timeout = 20_000
 
 print(instrument.query("*IDN?"))
-instrument.write('DSVIEW:DEVICE:SELECT "usb:3-2"')
-instrument.write('DSVIEW:SCENARIO:LOAD "spi-boot.yaml"')
-run_id = instrument.query("DSVIEW:RUN:START?").strip()
-print(instrument.query(f'DSVIEW:RUN:STATUS? "{run_id}"'))
+instrument.write('WAVECRAFT:DEVICE:SELECT "usb:3-2"')
+instrument.write('WAVECRAFT:SCENARIO:LOAD "spi-boot.yaml"')
+run_id = instrument.query("WAVECRAFT:RUN:START?").strip()
+print(instrument.query(f'WAVECRAFT:RUN:STATUS? "{run_id}"'))
 ```
 
 ## Saleae Logic 2 automation and MCP reference
@@ -393,7 +393,7 @@ Saleae documents the server and its experimental status in the
 Codex's Streamable HTTP configuration model is described in the
 [OpenAI MCP documentation](https://developers.openai.com/learn/docs-mcp).
 
-### Implications for DSView
+### Implications for WaveCraft
 
 The Saleae design supports several choices in this document:
 
@@ -405,7 +405,7 @@ The Saleae design supports several choices in this document:
 - expose semantic analyzer and export operations as bounded tools; and
 - test with simulated devices through the same public interface.
 
-DSView should not copy the exact Saleae tool set. DSView scenarios, concurrent
+WaveCraft should not copy the exact Saleae tool set. WaveCraft scenarios, concurrent
 multi-source capture, native `.dsv` recordings, structured progress events,
 and bounded recording inspection require a broader application-service
 contract. The Saleae interface is most useful as evidence that deterministic
@@ -436,12 +436,12 @@ Useful MCP tools include:
 Read-only MCP resources can expose:
 
 ```text
-dsview://devices/{device_id}
-dsview://runs/{run_id}/summary
-dsview://runs/{run_id}/diagnostics
-dsview://recordings/{recording_id}/metadata
-dsview://recordings/{recording_id}/decoded/{decoder_id}
-dsview://recordings/{recording_id}/window?...bounded parameters...
+wavecraft://devices/{device_id}
+wavecraft://runs/{run_id}/summary
+wavecraft://runs/{run_id}/diagnostics
+wavecraft://recordings/{recording_id}/metadata
+wavecraft://recordings/{recording_id}/decoded/{decoder_id}
+wavecraft://recordings/{recording_id}/window?...bounded parameters...
 ```
 
 Start operations return explicit run IDs that later calls pass back. Tool
@@ -451,9 +451,9 @@ decoder tools must enforce sample, channel, response-size, and execution-time
 limits.
 
 The current official Rust MCP SDK may have a newer minimum supported Rust
-version than DSView. Adding it must not silently raise the workspace MSRV. The
+version than WaveCraft. Adding it must not silently raise the workspace MSRV. The
 implementation options are to begin with a Python MCP adapter over the stable
-CLI, deliberately raise the DSView MSRV, or build the MCP adapter as a
+CLI, deliberately raise the WaveCraft MSRV, or build the MCP adapter as a
 separately versioned component. Implementing an ad hoc subset of MCP is not a
 preferred alternative.
 
@@ -491,7 +491,7 @@ run-001/
 
 The bundle should record:
 
-- DSView build, schema versions, platform, and timestamps;
+- WaveCraft build, schema versions, platform, and timestamps;
 - device model, stable ID or redacted serial, USB topology, and link speed;
 - firmware, HDL, calibration identity, and FPGA resource hashes;
 - requested and effective capture configuration;
@@ -541,16 +541,16 @@ sources and recorded fixtures.
 
 1. Define structured automation device, error, result, and event types.
 2. Extract shared discovery, selection, capture, and recording operations into
-   `dsview-automation`.
+   `wavecraft-automation`.
 3. Replace development-only CLI parsing with command groups and JSON/NDJSON.
-4. Implement `dsview.scenario/v1`, validation, and simulator integration tests.
+4. Implement `wavecraft.scenario/v1`, validation, and simulator integration tests.
 5. Add first-party decoders and bounded signal-analysis operations.
 6. Generate portable debug bundles.
 7. Add a loopback SCPI socket adapter over the application service or daemon.
 8. Add a thin local MCP adapter over the CLI or application service.
-9. Introduce `dsviewd` when persistent ownership and background runs are
+9. Introduce `wavecraftd` when persistent ownership and background runs are
    required.
 
-The first milestone is a YAML scenario that runs against `dsview-sim`, emits
+The first milestone is a YAML scenario that runs against `wavecraft-sim`, emits
 versioned NDJSON, writes a valid `.dsv`, and then runs unchanged against one
 explicitly selected USB instrument.
