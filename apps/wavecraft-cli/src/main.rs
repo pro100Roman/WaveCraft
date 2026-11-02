@@ -20,7 +20,7 @@ use wavecraft_usb::{
     LinkStatus,
 };
 
-const USAGE: &str = "usage: wavecraft-cli [devices list [--format json] | devices probe --id <connection-id> [--format json] | capture run --device <connection-id> --sample-rate <hz> --samples <count> --channels <0,1,...> --output <capture.dsv> [--timeout-ms <ms>] [--events ndjson] | list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
+const USAGE: &str = "usage: wavecraft-cli [devices list [--format json] | devices probe --id <connection-id> [--format json] | capture run --device <connection-id> --sample-rate <hz> --samples <count> --channels <0,1,...> --output <capture.dsv> [--resource-directory <resources/fpga>] [--timeout-ms <ms>] [--events ndjson] | list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
 
 type FileRecorder = RecordingWriter<BufWriter<File>>;
 
@@ -139,13 +139,17 @@ struct AutomationCaptureArguments {
     sample_count: u64,
     channels: Vec<u8>,
     output: String,
+    resource_directory: Option<String>,
     timeout_ms: Option<u64>,
     ndjson_events: bool,
 }
 
 fn automation_capture_run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let arguments = parse_automation_capture_arguments(arguments)?;
-    let manager = automation_manager_for_device(&arguments.device_id);
+    let mut manager = automation_manager_for_device(&arguments.device_id);
+    if let Some(resource_directory) = &arguments.resource_directory {
+        manager = manager.with_resource_directory(resource_directory);
+    }
     let device = match manager.open_device(DeviceSelector::connection_id(&arguments.device_id)) {
         Ok(device) => device,
         Err(error) => return report_capture_error(error, arguments.ndjson_events),
@@ -203,6 +207,7 @@ fn parse_automation_capture_arguments(
     let mut sample_count = None;
     let mut channels = None;
     let mut output = None;
+    let mut resource_directory = None;
     let mut timeout_ms = None;
     let mut ndjson_events = false;
     let mut index = 0;
@@ -239,6 +244,9 @@ fn parse_automation_capture_arguments(
                 channels = Some(parsed);
             }
             "--output" if output.is_none() => output = Some(value.clone()),
+            "--resource-directory" if resource_directory.is_none() => {
+                resource_directory = Some(value.clone())
+            }
             "--timeout-ms" if timeout_ms.is_none() => {
                 timeout_ms = Some(
                     value
@@ -259,6 +267,7 @@ fn parse_automation_capture_arguments(
         sample_count: sample_count.ok_or("capture run requires --samples")?,
         channels: channels.ok_or("capture run requires --channels")?,
         output: output.ok_or("capture run requires --output")?,
+        resource_directory,
         timeout_ms,
         ndjson_events,
     })
@@ -1166,6 +1175,8 @@ mod automation_cli_tests {
             "0,2,7",
             "--output",
             "capture.dsv",
+            "--resource-directory",
+            "resources/fpga",
             "--sample-rate",
             "100000",
             "--events",
@@ -1180,6 +1191,7 @@ mod automation_cli_tests {
         assert_eq!(parsed.sample_count, 10_000);
         assert_eq!(parsed.channels, [0, 2, 7]);
         assert_eq!(parsed.output, "capture.dsv");
+        assert_eq!(parsed.resource_directory.as_deref(), Some("resources/fpga"));
         assert_eq!(parsed.timeout_ms, Some(5_000));
         assert!(parsed.ndjson_events);
     }

@@ -23,8 +23,9 @@ use wavecraft_core::{
 use wavecraft_recording::{CompletionStatus, RecordingWriter};
 use wavecraft_sim::{SimulatedDeviceProfile, SimulatedLogicAnalyzer, SIMULATED_DEVICE_PROFILES};
 use wavecraft_usb::{
-    discover_supported_devices, probe_device, DeviceModel, DiscoveredDevice, LinkStatus,
-    UsbSpeedClass, DSCOPE_SAMPLE_RATES_HZ, DSLOGIC_SAMPLE_RATES_HZ,
+    discover_supported_devices, prepare_device, probe_device, DeviceModel, DiscoveredDevice,
+    DsLogicCaptureConfig, DsLogicCaptureSource, DsLogicOperationMode, LinkStatus, UsbSpeedClass,
+    DSCOPE_SAMPLE_RATES_HZ, DSLOGIC_SAMPLE_ALIGNMENT, DSLOGIC_SAMPLE_RATES_HZ,
 };
 
 pub const DEVICE_LIST_SCHEMA: &str = "wavecraft.devices/v1";
@@ -38,6 +39,8 @@ const CAPTURE_EVENT_CAPACITY: usize = 64;
 const SIMULATOR_BATCH_SIZE: usize = 4_096;
 const MAX_CAPTURE_SAMPLE_COUNT: u64 = 1_000_000_000;
 const MAX_CAPTURE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const USB_DISCOVERY_ATTEMPTS: usize = 5;
+const USB_DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -418,6 +421,7 @@ pub enum AutomationErrorCode {
     DiscoveryFailed,
     DuplicateDeviceId,
     ProbeFailed,
+    PreparationFailed,
     UnsupportedConfiguration,
     OutputExists,
     RecordingFailed,
@@ -437,6 +441,7 @@ impl Display for AutomationErrorCode {
             Self::DiscoveryFailed => "discovery_failed",
             Self::DuplicateDeviceId => "duplicate_device_id",
             Self::ProbeFailed => "probe_failed",
+            Self::PreparationFailed => "preparation_failed",
             Self::UnsupportedConfiguration => "unsupported_configuration",
             Self::OutputExists => "output_exists",
             Self::RecordingFailed => "recording_failed",
@@ -585,12 +590,38 @@ impl DeviceCatalog {
         }
         Ok(records)
     }
+
+    fn discover_for_selector(
+        &self,
+        selector: &DeviceSelector,
+        operation: &'static str,
+    ) -> Result<Vec<DeviceRecord>, AutomationError> {
+        let exact_usb_id = selector
+            .connection_id
+            .as_deref()
+            .filter(|connection_id| connection_id.starts_with("usb-"));
+        let attempts = exact_usb_id.map_or(1, |_| USB_DISCOVERY_ATTEMPTS);
+        for attempt in 0..attempts {
+            let records = self.discover(operation)?;
+            if exact_usb_id.map_or(true, |connection_id| {
+                records
+                    .iter()
+                    .any(|record| record.describe().connection_id == connection_id)
+            }) || attempt + 1 == attempts
+            {
+                return Ok(records);
+            }
+            thread::sleep(USB_DISCOVERY_RETRY_DELAY);
+        }
+        unreachable!("USB discovery attempt count is always positive")
+    }
 }
 
 #[derive(Clone)]
 pub struct AutomationManager {
     catalog: Arc<DeviceCatalog>,
     leases: Arc<Mutex<HashSet<String>>>,
+    resource_directory: Option<Arc<PathBuf>>,
 }
 
 impl Default for AutomationManager {
@@ -624,6 +655,13 @@ impl AutomationManager {
         )
     }
 
+    /// Configure the directory containing the model-specific FPGA resources
+    /// required to prepare physical instruments.
+    pub fn with_resource_directory(mut self, path: impl Into<PathBuf>) -> Self {
+        self.resource_directory = Some(Arc::new(path.into()));
+        self
+    }
+
     #[cfg(test)]
     fn from_usb_discovery(
         usb_discovery: impl Fn() -> Result<Vec<DiscoveredDevice>, String> + Send + Sync + 'static,
@@ -647,6 +685,7 @@ impl AutomationManager {
                 simulators,
             }),
             leases,
+            resource_directory: None,
         }
     }
 
@@ -681,7 +720,9 @@ impl AutomationManager {
     }
 
     pub fn open_device(&self, selector: DeviceSelector) -> Result<DeviceHandle, AutomationError> {
-        let records = self.catalog.discover("device.open")?;
+        let records = self
+            .catalog
+            .discover_for_selector(&selector, "device.open")?;
         let mut matches = records
             .into_iter()
             .filter(|record| selector.matches(&record.describe()))
@@ -742,6 +783,7 @@ impl AutomationManager {
         Ok(DeviceHandle {
             descriptor,
             catalog: Arc::clone(&self.catalog),
+            resource_directory: self.resource_directory.clone(),
             lease: Arc::new(DeviceLease {
                 connection_id: record.describe().connection_id,
                 registry: Arc::clone(&self.leases),
@@ -788,6 +830,7 @@ impl Drop for DeviceLease {
 pub struct DeviceHandle {
     descriptor: AutomationDevice,
     catalog: Arc<DeviceCatalog>,
+    resource_directory: Option<Arc<PathBuf>>,
     lease: Arc<DeviceLease>,
 }
 
@@ -887,6 +930,21 @@ impl DeviceHandle {
 
         let mut effective_configuration = requested_configuration.clone();
         effective_configuration.channels.sort_unstable();
+        match self.descriptor.backend {
+            DeviceBackend::Simulator => {
+                self.start_simulated_logic_capture(requested_configuration, effective_configuration)
+            }
+            DeviceBackend::Usb => {
+                self.start_usb_logic_capture(requested_configuration, effective_configuration)
+            }
+        }
+    }
+
+    fn start_simulated_logic_capture(
+        &self,
+        requested_configuration: CaptureConfiguration,
+        effective_configuration: CaptureConfiguration,
+    ) -> Result<CaptureHandle, AutomationError> {
         let enabled_channel_mask = effective_configuration
             .channels
             .iter()
@@ -909,18 +967,132 @@ impl DeviceHandle {
             .for_device(&self.descriptor.connection_id)
         })?;
 
-        self.start_capture_with_source(
+        self.start_capture_with_factory(
             requested_configuration,
             effective_configuration,
-            Box::new(source),
+            Box::new(move || Ok(Box::new(source))),
         )
     }
 
-    fn start_capture_with_source(
+    fn start_usb_logic_capture(
+        &self,
+        requested_configuration: CaptureConfiguration,
+        mut effective_configuration: CaptureConfiguration,
+    ) -> Result<CaptureHandle, AutomationError> {
+        effective_configuration.sample_count = requested_configuration.sample_count
+            - (requested_configuration.sample_count % DSLOGIC_SAMPLE_ALIGNMENT);
+        if effective_configuration.sample_count < DSLOGIC_SAMPLE_ALIGNMENT {
+            return Err(AutomationError::new(
+                AutomationErrorCode::UnsupportedConfiguration,
+                format!("DSLogic captures require at least {DSLOGIC_SAMPLE_ALIGNMENT} samples"),
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id));
+        }
+
+        let usb_device = self.current_usb_device("capture.start")?;
+        if !usb_device.profile.model.is_logic_analyzer()
+            || !usb_device.profile.model.supports_capture()
+        {
+            return Err(AutomationError::new(
+                AutomationErrorCode::UnsupportedConfiguration,
+                format!(
+                    "{} is not a supported DSLogic capture device",
+                    usb_device.profile.display_name
+                ),
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id));
+        }
+        let resource_directory = self.resource_directory.as_ref().ok_or_else(|| {
+            AutomationError::new(
+                AutomationErrorCode::PreparationFailed,
+                "USB capture requires an FPGA resource directory",
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id)
+        })?;
+        let bitstream_path = resource_directory.join(usb_device.profile.fpga_bitstream_name);
+        if !bitstream_path.is_file() {
+            return Err(AutomationError::new(
+                AutomationErrorCode::PreparationFailed,
+                format!("FPGA bitstream {} is missing", bitstream_path.display()),
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id));
+        }
+
+        let config =
+            dslogic_capture_config(&self.descriptor.connection_id, &effective_configuration)?;
+        let source = DsLogicCaptureSource::new(usb_device.clone(), config).map_err(|error| {
+            AutomationError::new(
+                AutomationErrorCode::UnsupportedConfiguration,
+                error.to_string(),
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id)
+        })?;
+        let device_id = self.descriptor.connection_id.clone();
+        self.start_capture_with_factory(
+            requested_configuration,
+            effective_configuration,
+            Box::new(move || {
+                prepare_device(&usb_device, &bitstream_path).map_err(|error| {
+                    AutomationError::new(
+                        AutomationErrorCode::PreparationFailed,
+                        format!("failed to prepare {device_id}: {error}"),
+                        "capture.prepare",
+                        true,
+                    )
+                    .for_device(&device_id)
+                })?;
+                Ok(Box::new(source))
+            }),
+        )
+    }
+
+    fn current_usb_device(
+        &self,
+        operation: &'static str,
+    ) -> Result<DiscoveredDevice, AutomationError> {
+        let connection_id = &self.descriptor.connection_id;
+        let selector = DeviceSelector::connection_id(connection_id);
+        let record = self
+            .catalog
+            .discover_for_selector(&selector, operation)?
+            .into_iter()
+            .find(|record| record.describe().connection_id == *connection_id)
+            .ok_or_else(|| {
+                AutomationError::new(
+                    AutomationErrorCode::DeviceDisconnected,
+                    format!("device {connection_id} disconnected after selection"),
+                    operation,
+                    true,
+                )
+                .for_device(connection_id)
+            })?;
+        match record {
+            DeviceRecord::Usb(device) => Ok(device),
+            DeviceRecord::Simulator(_) => Err(AutomationError::new(
+                AutomationErrorCode::ServiceUnavailable,
+                format!("device {connection_id} changed backend after selection"),
+                operation,
+                true,
+            )
+            .for_device(connection_id)),
+        }
+    }
+
+    fn start_capture_with_factory(
         &self,
         requested_configuration: CaptureConfiguration,
         effective_configuration: CaptureConfiguration,
-        source: Box<dyn CaptureSource>,
+        source_factory: CaptureSourceFactory,
     ) -> Result<CaptureHandle, AutomationError> {
         let output = OpenOptions::new()
             .write(true)
@@ -935,7 +1107,11 @@ impl DeviceHandle {
             name: self.descriptor.display_name.clone(),
             kind: CoreInstrumentKind::LogicAnalyzer,
         };
-        let metadata = capture_metadata(&self.descriptor, &effective_configuration);
+        let metadata = capture_metadata(
+            &self.descriptor,
+            &requested_configuration,
+            &effective_configuration,
+        );
         let recorder = RecordingWriter::new(BufWriter::new(output), &[core_descriptor], metadata)
             .map_err(|error| {
             AutomationError::new(
@@ -967,12 +1143,12 @@ impl DeviceHandle {
             .name(format!("wavecraft-{capture_id}"))
             .spawn(move || {
                 let _lease = worker_lease;
-                let result = run_simulated_logic_capture(
+                let result = run_logic_capture(
                     worker_capture_id,
                     worker_device,
                     requested_configuration,
                     effective_configuration,
-                    source,
+                    source_factory,
                     recorder,
                     &worker_stop_requested,
                     &mut publisher,
@@ -1164,24 +1340,45 @@ enum CaptureRunOutcome {
     Failed(AutomationError),
 }
 
+type CaptureSourceFactory =
+    Box<dyn FnOnce() -> Result<Box<dyn CaptureSource>, AutomationError> + Send + 'static>;
+
 #[allow(clippy::too_many_arguments)]
-fn run_simulated_logic_capture(
+fn run_logic_capture(
     capture_id: CaptureId,
     device: AutomationDevice,
     requested_configuration: CaptureConfiguration,
     effective_configuration: CaptureConfiguration,
-    source: Box<dyn CaptureSource>,
+    source_factory: CaptureSourceFactory,
     mut recorder: RecordingWriter<BufWriter<File>>,
     stop_requested: &AtomicBool,
     publisher: &mut CaptureEventPublisher,
 ) -> Result<CompletedCapture, AutomationError> {
     let started_at = Instant::now();
+    let source = match source_factory() {
+        Ok(source) => source,
+        Err(error) => {
+            recorder.finish(CompletionStatus::Failed).map_err(|recording_error| {
+                AutomationError::new(
+                    AutomationErrorCode::RecordingFailed,
+                    format!(
+                        "capture setup failed ({error}); additionally failed to finalize recording {}: {recording_error}",
+                        effective_configuration.output_path.display()
+                    ),
+                    "capture.finalize",
+                    false,
+                )
+                .for_device(&device.connection_id)
+            })?;
+            return Err(error);
+        }
+    };
     publisher.set_status(CaptureStatus::Armed);
     let session = CaptureCoordinator::start(vec![source]).map_err(|error| {
         let _ = recorder.finish(CompletionStatus::Failed);
         AutomationError::new(
             AutomationErrorCode::CaptureFailed,
-            format!("failed to arm simulated capture: {error}"),
+            format!("failed to arm capture: {error}"),
             "capture.run",
             true,
         )
@@ -1341,6 +1538,28 @@ fn run_simulated_logic_capture(
     }
 }
 
+fn dslogic_capture_config(
+    device_id: &str,
+    configuration: &CaptureConfiguration,
+) -> Result<DsLogicCaptureConfig, AutomationError> {
+    let mut enabled_channels = [false; 32];
+    for channel in &configuration.channels {
+        enabled_channels[usize::from(*channel)] = true;
+    }
+    DsLogicCaptureConfig::new(configuration.sample_rate_hz, configuration.sample_count)
+        .and_then(|config| config.with_enabled_channels_32(enabled_channels))
+        .map(|config| config.with_operation_mode(DsLogicOperationMode::Stream))
+        .map_err(|error| {
+            AutomationError::new(
+                AutomationErrorCode::UnsupportedConfiguration,
+                error.to_string(),
+                "capture.start",
+                false,
+            )
+            .for_device(device_id)
+        })
+}
+
 fn validate_capture_configuration(
     device: &AutomationDevice,
     configuration: &CaptureConfiguration,
@@ -1360,9 +1579,9 @@ fn validate_capture_configuration(
             configuration.schema
         )));
     }
-    if device.backend != DeviceBackend::Simulator || device.kind != InstrumentKind::LogicAnalyzer {
+    if device.kind != InstrumentKind::LogicAnalyzer {
         return Err(unsupported(
-            "this milestone supports finite simulated logic capture only".to_owned(),
+            "finite logic capture requires a logic analyzer".to_owned(),
         ));
     }
     if !device.capabilities.supports_capture {
@@ -1453,29 +1672,35 @@ fn output_open_error(path: &Path, error: std::io::Error) -> AutomationError {
 
 fn capture_metadata(
     device: &AutomationDevice,
-    configuration: &CaptureConfiguration,
+    requested: &CaptureConfiguration,
+    effective: &CaptureConfiguration,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     metadata.insert(
         "automation.configuration_schema".to_owned(),
-        configuration.schema.clone(),
+        requested.schema.clone(),
     );
     metadata.insert(
         "capture.connection_id".to_owned(),
         device.connection_id.clone(),
     );
     metadata.insert("capture.model".to_owned(), device.model.clone());
+    metadata.insert("capture.backend".to_owned(), device.backend.to_string());
     metadata.insert(
         "capture.sample_rate_hz".to_owned(),
-        configuration.sample_rate_hz.to_string(),
+        effective.sample_rate_hz.to_string(),
     );
     metadata.insert(
         "capture.requested_sample_count".to_owned(),
-        configuration.sample_count.to_string(),
+        requested.sample_count.to_string(),
+    );
+    metadata.insert(
+        "capture.effective_sample_count".to_owned(),
+        effective.sample_count.to_string(),
     );
     metadata.insert(
         "capture.enabled_channels".to_owned(),
-        configuration
+        effective
             .channels
             .iter()
             .map(u8::to_string)
@@ -1609,7 +1834,7 @@ mod tests {
     use std::io::BufReader;
     use std::sync::MutexGuard;
     use wavecraft_recording::{CompletionStatus, RecordingReader};
-    use wavecraft_usb::{DeviceLocation, DSCOPE_U3P100};
+    use wavecraft_usb::{DeviceLocation, DSCOPE_U3P100, DSLOGIC_U3PRO16};
 
     struct TestRecordingPath(PathBuf);
 
@@ -1644,6 +1869,16 @@ mod tests {
         }
     }
 
+    fn usb_logic_device(path: &str) -> DiscoveredDevice {
+        DiscoveredDevice {
+            profile: &DSLOGIC_U3PRO16,
+            location: DeviceLocation {
+                platform_path: path.to_owned(),
+            },
+            speed: UsbSpeedClass::SuperSpeed,
+        }
+    }
+
     fn test_manager(devices: Arc<Mutex<Vec<DiscoveredDevice>>>) -> AutomationManager {
         AutomationManager::from_usb_discovery(
             move || {
@@ -1662,6 +1897,11 @@ mod tests {
 
     fn logic_configuration(path: &Path, sample_count: u64) -> CaptureConfiguration {
         CaptureConfiguration::finite_logic(100_000, sample_count, vec![2, 0], path)
+            .with_timeout(Duration::from_secs(2))
+    }
+
+    fn usb_logic_configuration(path: &Path, sample_count: u64) -> CaptureConfiguration {
+        CaptureConfiguration::finite_logic(1_000_000, sample_count, vec![2, 0], path)
             .with_timeout(Duration::from_secs(2))
     }
 
@@ -1849,6 +2089,59 @@ mod tests {
             error.device_id,
             Some(handle.descriptor().connection_id.clone())
         );
+    }
+
+    #[test]
+    fn usb_capture_reports_disconnect_after_selection() {
+        let path = TestRecordingPath::new("usb-disconnected");
+        let state = Arc::new(Mutex::new(vec![usb_logic_device("logic-port")]));
+        let manager = test_manager(Arc::clone(&state));
+        let handle = manager
+            .open_device(DeviceSelector::model("dslogic_u3pro16"))
+            .expect("logic device should initially resolve");
+        devices(&state).clear();
+
+        let error = handle
+            .start_capture(usb_logic_configuration(path.as_path(), 10_001))
+            .expect_err("disconnected selection should fail");
+
+        assert_eq!(error.code, AutomationErrorCode::DeviceDisconnected);
+        assert!(!path.as_path().exists());
+    }
+
+    #[test]
+    fn usb_capture_requires_configured_fpga_resources() {
+        let path = TestRecordingPath::new("usb-resources");
+        let state = Arc::new(Mutex::new(vec![usb_logic_device("logic-port")]));
+        let manager = test_manager(state);
+        let handle = manager
+            .open_device(DeviceSelector::model("dslogic_u3pro16"))
+            .expect("logic device should resolve");
+
+        let error = handle
+            .start_capture(usb_logic_configuration(path.as_path(), 10_001))
+            .expect_err("USB capture without resources should fail");
+
+        assert_eq!(error.code, AutomationErrorCode::PreparationFailed);
+        assert!(!path.as_path().exists());
+    }
+
+    #[test]
+    fn dslogic_configuration_uses_sorted_channels_and_aligned_sample_count() {
+        let mut requested = usb_logic_configuration(Path::new("unused.dsv"), 10_001);
+        requested.channels = vec![7, 1, 3];
+        let mut effective = requested.clone();
+        effective.channels.sort_unstable();
+        effective.sample_count =
+            requested.sample_count - requested.sample_count % DSLOGIC_SAMPLE_ALIGNMENT;
+        let config = dslogic_capture_config("usb:test", &effective)
+            .expect("effective DSLogic configuration should be valid");
+
+        assert_eq!(effective.channels, [1, 3, 7]);
+        assert_eq!(effective.sample_count, 9_216);
+        assert_eq!(config.sample_count(), 9_216);
+        assert_eq!(config.enabled_channel_count(), 3);
+        assert_eq!(config.operation_mode(), DsLogicOperationMode::Stream);
     }
 
     #[test]
@@ -2104,7 +2397,11 @@ mod tests {
             },
         };
         let capture = device
-            .start_capture_with_source(requested, effective, Box::new(source))
+            .start_capture_with_factory(
+                requested,
+                effective,
+                Box::new(move || Ok(Box::new(source))),
+            )
             .expect("capture should start");
 
         let error = capture

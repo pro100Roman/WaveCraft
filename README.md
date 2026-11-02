@@ -112,6 +112,9 @@ cargo run -p wavecraft-cli -- capture-logic resources/fpga 1
 cargo run -p wavecraft-cli -- capture-scope resources/fpga
 cargo run -p wavecraft-cli -- capture-usb resources/fpga
 cargo run -p wavecraft-cli -- capture-usb resources/fpga --output capture.dsv
+cargo run -p wavecraft-cli -- capture run --device <usb-connection-id> \
+  --resource-directory resources/fpga --sample-rate 1000000 \
+  --samples 65536 --channels 0,1,2,3 --output capture.dsv --events ndjson
 cargo run -p wavecraft-cli -- inspect capture.dsv
 cargo run -p wavecraft-cli -- simulate 1 --output simulated.dsv
 ```
@@ -309,7 +312,13 @@ The opt-in hardware check is:
 
 ```sh
 cargo test -p wavecraft-usb --test hardware -- --ignored --nocapture
+cargo test -p wavecraft-automation --test hardware -- --ignored --nocapture
 ```
+
+The first command checks cancellable idle USB reads on every supported
+instrument. The second prepares and captures from one explicitly selected
+DSLogic device through the automation contract. Close WaveCraft and DSView so
+the instruments are idle before running either command.
 
 The numeric shorthand (for example, `wavecraft-cli -- 2`) is the simulated
 capture duration in seconds.
