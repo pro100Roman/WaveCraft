@@ -10682,37 +10682,85 @@ fn paint_logic_timing_hint(
 const LOGIC_PROTOCOL_LANE_HEIGHT: f32 = 30.0;
 const LOGIC_PROTOCOL_LABEL_WIDTH: f32 = 82.0;
 
-fn logic_protocol_lane_layout(plot: Rect, lane_count: usize) -> (Rect, Vec<Rect>) {
-    if lane_count == 0 {
-        return (plot, Vec::new());
+fn protocol_data_channel(analyzer: &ProtocolAnalyzerInstance) -> usize {
+    let base_id = protocol_stack(analyzer.protocol_id)
+        .and_then(|stack| stack.first().map(|protocol| protocol.id));
+    let preferred_mapping = match base_id {
+        Some("0:i2c" | "1:i2c") => analyzer.channel_mappings.get(1),
+        Some("0:spi" | "1:spi") => analyzer
+            .channel_mappings
+            .get(2)
+            .filter(|mapping| mapping.is_some())
+            .or_else(|| analyzer.channel_mappings.get(1)),
+        _ => None,
+    };
+    preferred_mapping
+        .copied()
+        .flatten()
+        .or_else(|| {
+            analyzer
+                .channel_mappings
+                .iter()
+                .rev()
+                .flatten()
+                .copied()
+                .next()
+        })
+        .unwrap_or(0)
+        .min(LOGIC_CHANNEL_COUNT - 1)
+}
+
+fn logic_protocol_lane_layout(
+    plot: Rect,
+    maximum_heights: &[u8; LOGIC_CHANNEL_COUNT],
+    analyzers: &[ProtocolAnalyzerInstance],
+) -> (LogicSignalLayout, Vec<Rect>) {
+    if analyzers.is_empty() {
+        return (
+            logic_signal_layout(plot.top(), plot.height(), maximum_heights),
+            Vec::new(),
+        );
     }
     let available_height = (plot.height() - 80.0).max(0.0);
-    let total_height = (lane_count as f32 * LOGIC_PROTOCOL_LANE_HEIGHT)
+    let total_height = (analyzers.len() as f32 * LOGIC_PROTOCOL_LANE_HEIGHT)
         .min(available_height)
         .min(plot.height() * 0.4);
     if total_height <= 0.0 {
-        return (plot, Vec::new());
+        return (
+            logic_signal_layout(plot.top(), plot.height(), maximum_heights),
+            Vec::new(),
+        );
     }
-    let signal_plot = Rect::from_min_max(
-        plot.min,
-        Pos2::new(plot.right(), plot.bottom() - total_height),
-    );
-    let lane_height = total_height / lane_count as f32;
-    let lanes = (0..lane_count)
-        .map(|index| {
-            Rect::from_min_max(
-                Pos2::new(
-                    plot.left(),
-                    signal_plot.bottom() + index as f32 * lane_height,
-                ),
-                Pos2::new(
-                    plot.right(),
-                    signal_plot.bottom() + (index + 1) as f32 * lane_height,
-                ),
-            )
-        })
-        .collect();
-    (signal_plot, lanes)
+    let lane_height = total_height / analyzers.len() as f32;
+    let mut signal_layout =
+        logic_signal_layout(plot.top(), plot.height() - total_height, maximum_heights);
+    let base_levels = signal_layout.levels;
+    let targets = analyzers
+        .iter()
+        .map(protocol_data_channel)
+        .collect::<Vec<_>>();
+    let mut insertion_order = targets.iter().copied().enumerate().collect::<Vec<_>>();
+    insertion_order.sort_by_key(|(analyzer_index, target)| (*target, *analyzer_index));
+    let mut lanes = vec![plot; analyzers.len()];
+    for (insertion_index, (analyzer_index, target)) in insertion_order.iter().copied().enumerate() {
+        let base_y = if target == 0 {
+            plot.top()
+        } else {
+            (base_levels[target - 1].1 + base_levels[target].0) * 0.5
+        };
+        let top = base_y + insertion_index as f32 * lane_height;
+        lanes[analyzer_index] = Rect::from_min_max(
+            Pos2::new(plot.left(), top),
+            Pos2::new(plot.right(), top + lane_height),
+        );
+    }
+    for (channel, (high, low)) in signal_layout.levels.iter_mut().enumerate() {
+        let preceding_lanes = targets.iter().filter(|target| **target <= channel).count();
+        let offset = preceding_lanes as f32 * lane_height;
+        *high += offset;
+        *low += offset;
+    }
+    (signal_layout, lanes)
 }
 
 fn paint_logic_protocol_lanes(
@@ -10897,10 +10945,9 @@ fn paint_logic(
     } else {
         waveforms.logic_rate_hz
     };
-    let (signal_plot, protocol_lanes) =
-        logic_protocol_lane_layout(plot, protocol_analyzer.analyzers.len());
-    let signal_layout =
-        logic_signal_layout(signal_plot.top(), signal_plot.height(), &*maximum_heights);
+    let (signal_layout, protocol_lanes) =
+        logic_protocol_lane_layout(plot, maximum_heights, &protocol_analyzer.analyzers);
+    let signal_plot = plot;
     let _ = update_waveform_viewport(
         ui,
         plot,
@@ -10924,9 +10971,12 @@ fn paint_logic(
         enabled_channels,
         marker_settings,
     );
-    let lane_height = signal_plot.height() / LOGIC_CHANNEL_COUNT as f32;
     for channel in 0..LOGIC_CHANNEL_COUNT {
-        let lane_top = signal_plot.top() + channel as f32 * lane_height;
+        let lane_top = if channel == 0 {
+            signal_plot.top()
+        } else {
+            (signal_layout.levels[channel - 1].1 + signal_layout.levels[channel].0) * 0.5
+        };
         painter.line_segment(
             [
                 Pos2::new(signal_plot.left(), lane_top),
@@ -11092,7 +11142,10 @@ fn paint_logic(
     let smart_timing = smart_timing_enabled
         .then(|| ui.input(|input| input.pointer.hover_pos()))
         .flatten()
-        .filter(|pointer| signal_plot.contains(*pointer))
+        .filter(|pointer| {
+            signal_plot.contains(*pointer)
+                && !protocol_lanes.iter().any(|lane| lane.contains(*pointer))
+        })
         .and_then(|pointer| {
             let channel = logic_channel_at_y(&signal_layout.levels, enabled_channels, pointer.y)?;
             let sample = logic_sample_at_x(
@@ -13976,6 +14029,24 @@ mod tests {
             LogicCaptureSettings::default().operation_mode,
             DsLogicOperationMode::Stream
         );
+    }
+
+    #[test]
+    fn i2c_decode_lane_is_inserted_above_mapped_sda_channel() {
+        let analyzer = ProtocolAnalyzerInstance {
+            instance_id: 0,
+            protocol_id: "1:i2c",
+            channel_mappings: vec![Some(0), Some(5)],
+            data_format: ProtocolDataFormat::Hexadecimal,
+        };
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_000.0, 800.0));
+        let maximum_heights = LogicCaptureSettings::default().maximum_heights;
+
+        let (layout, lanes) = logic_protocol_lane_layout(plot, &maximum_heights, &[analyzer]);
+
+        assert_eq!(lanes.len(), 1);
+        assert!(lanes[0].top() > layout.levels[4].1);
+        assert!(lanes[0].bottom() < layout.levels[5].0);
     }
 
     #[test]
