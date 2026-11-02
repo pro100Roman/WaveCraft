@@ -2176,6 +2176,27 @@ fn apply_time_per_division(
     viewport.start = viewport.clamp_start(center_sample_fraction - new_span * 0.5);
 }
 
+fn resolve_scope_timebase(
+    selected_timebase: Option<f64>,
+    displayed_timebase: Option<f64>,
+    requested_timebase: Option<f64>,
+    viewport_span: f32,
+    auto_sample_rate: bool,
+) -> Option<f64> {
+    requested_timebase.or_else(|| {
+        if auto_sample_rate
+            && viewport_span >= 1.0 - f32::EPSILON
+            && selected_timebase
+                .zip(displayed_timebase)
+                .is_some_and(|(selected, displayed)| selected > displayed * (1.0 + 1.0e-9))
+        {
+            selected_timebase
+        } else {
+            displayed_timebase
+        }
+    })
+}
+
 fn adjacent_timebase(current_seconds: f64, zoom_in: bool) -> Option<f64> {
     const COMPARISON_EPSILON: f64 = 1.0e-6;
     if zoom_in {
@@ -7534,6 +7555,7 @@ impl eframe::App for WaveCraftApp {
                                     true,
                                     ScopeWaveformOptions {
                                         settings: scope_settings,
+                                        auto_sample_rate: self.scope_auto_sample_rate,
                                         smart_timing_enabled: self.scope_smart_timing_enabled,
                                         function_settings: self.scope_function_settings,
                                         channel_names: &self.scope_channel_names,
@@ -7615,6 +7637,7 @@ impl eframe::App for WaveCraftApp {
                             },
                             ScopeWaveformOptions {
                                 settings: scope_settings,
+                                auto_sample_rate: self.scope_auto_sample_rate,
                                 smart_timing_enabled: self.scope_smart_timing_enabled,
                                 function_settings: self.scope_function_settings,
                                 channel_names: &self.scope_channel_names,
@@ -8915,6 +8938,7 @@ const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;
 
 struct ScopeWaveformOptions<'a> {
     settings: ScopeCaptureSettings,
+    auto_sample_rate: bool,
     smart_timing_enabled: bool,
     function_settings: ScopeFunctionSettings,
     channel_names: &'a [String; 2],
@@ -9389,6 +9413,7 @@ struct WaveformViewportOptions {
     reset_on_double_click: bool,
     primary_pan_enabled: bool,
     zoom_anchor: WaveformZoomAnchor,
+    timebase_basis: Option<f64>,
 }
 
 fn update_waveform_viewport(
@@ -9399,9 +9424,10 @@ fn update_waveform_viewport(
     sample_count: usize,
     sample_rate_hz: u64,
     options: WaveformViewportOptions,
-) -> (bool, bool, Option<WaveformPlotClick>) {
+) -> (bool, bool, Option<WaveformPlotClick>, Option<f64>) {
     let mut panned = false;
     let mut timebase_changed = false;
+    let mut requested_timebase = None;
     let response = ui.interact(
         rect,
         ui.make_persistent_id(id_salt),
@@ -9449,6 +9475,10 @@ fn update_waveform_viewport(
     if response.hovered() {
         let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
         if scroll_delta != 0.0 {
+            requested_timebase = options
+                .timebase_basis
+                .or_else(|| viewport.time_per_division(sample_count, sample_rate_hz))
+                .and_then(|current| adjacent_timebase(current, scroll_delta > 0.0));
             let pointer_fraction = response
                 .hover_pos()
                 .map(|pointer| (pointer.x - rect.left()) / rect.width().max(1.0))
@@ -9474,7 +9504,7 @@ fn update_waveform_viewport(
             ui.ctx().request_repaint();
         }
     }
-    (panned, timebase_changed, click)
+    (panned, timebase_changed, click, requested_timebase)
 }
 
 fn paint_waveform_status(
@@ -10584,6 +10614,7 @@ fn paint_logic(
             reset_on_double_click: true,
             primary_pan_enabled: !marker_settings.adding,
             zoom_anchor: WaveformZoomAnchor::Pointer,
+            timebase_basis: None,
         },
     );
     update_logic_marker_gesture(
@@ -13019,6 +13050,7 @@ fn paint_scope_time_domain(
 ) {
     let ScopeWaveformOptions {
         mut settings,
+        auto_sample_rate,
         smart_timing_enabled,
         function_settings,
         channel_names,
@@ -13094,22 +13126,24 @@ fn paint_scope_time_domain(
     ) {
         viewport.align_trigger_to_screen(trigger_sample_fraction, trigger_screen_fraction);
     }
-    let (viewport_panned, viewport_timebase_changed, waveform_click) = update_waveform_viewport(
-        ui,
-        plot,
-        "scope_waveform_zoom",
-        viewport,
-        display_sample_count,
-        display_sample_rate_hz,
-        WaveformViewportOptions {
-            reset_on_double_click: false,
-            primary_pan_enabled: true,
-            zoom_anchor: WaveformZoomAnchor::Sample {
-                domain_fraction: trigger_sample_fraction,
-                screen_fraction: trigger_screen_fraction,
+    let (viewport_panned, viewport_timebase_changed, waveform_click, requested_timebase) =
+        update_waveform_viewport(
+            ui,
+            plot,
+            "scope_waveform_zoom",
+            viewport,
+            display_sample_count,
+            display_sample_rate_hz,
+            WaveformViewportOptions {
+                reset_on_double_click: false,
+                primary_pan_enabled: true,
+                zoom_anchor: WaveformZoomAnchor::Sample {
+                    domain_fraction: trigger_sample_fraction,
+                    screen_fraction: trigger_screen_fraction,
+                },
+                timebase_basis: *time_per_division_seconds,
             },
-        },
-    );
+        );
     if let Some(click) = waveform_click {
         match click {
             WaveformPlotClick::Primary {
@@ -13125,12 +13159,19 @@ fn paint_scope_time_domain(
             WaveformPlotClick::Secondary => quick_time_measurement.clear(),
         }
     }
-    *timebase_changed |= viewport_timebase_changed;
+    *timebase_changed |= viewport_timebase_changed || requested_timebase.is_some();
     if viewport_panned && !waveforms.scope_rolling {
         finish_scope_viewport_pan(trigger_sample_fraction, viewport, trigger_settings);
     }
-    *time_per_division_seconds =
+    let displayed_timebase =
         viewport.time_per_division(display_sample_count, display_sample_rate_hz);
+    *time_per_division_seconds = resolve_scope_timebase(
+        *time_per_division_seconds,
+        displayed_timebase,
+        requested_timebase,
+        viewport.span,
+        auto_sample_rate,
+    );
     for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
         channel.vertical_offset = vertical_offset;
     }
@@ -15454,6 +15495,47 @@ mod tests {
         assert!(
             (viewport.time_per_division(250_000, 1_000_000).unwrap() - 0.025).abs() < f64::EPSILON,
             "fit-to-capture should replace a wider persisted timebase"
+        );
+    }
+
+    #[test]
+    fn scope_auto_timebase_preserves_zoom_out_request_beyond_current_capture() {
+        let displayed_timebase = 2.0e-3;
+        let requested_timebase = adjacent_timebase(displayed_timebase, false).unwrap();
+        assert_eq!(requested_timebase, 5.0e-3);
+
+        let selected = resolve_scope_timebase(
+            Some(displayed_timebase),
+            Some(displayed_timebase),
+            Some(requested_timebase),
+            1.0,
+            true,
+        );
+        assert_eq!(selected, Some(requested_timebase));
+        assert_eq!(
+            resolve_scope_timebase(selected, Some(displayed_timebase), None, 1.0, true),
+            Some(requested_timebase),
+            "the request must survive while the old capture is still displayed"
+        );
+        assert_eq!(
+            resolve_scope_timebase(selected, Some(displayed_timebase), None, 1.0, false),
+            Some(displayed_timebase),
+            "manual sample rate remains limited by the captured buffer"
+        );
+
+        let settings = ScopeCaptureSettings::default();
+        let adjusted_rate = settings.sample_rate_for_timebase(requested_timebase);
+        assert_eq!(adjusted_rate, 20_000_000);
+        let mut viewport = WaveformViewport::default();
+        apply_time_per_division(
+            &mut viewport,
+            settings.sample_count as usize,
+            adjusted_rate,
+            requested_timebase,
+        );
+        assert_eq!(
+            viewport.time_per_division(settings.sample_count as usize, adjusted_rate),
+            Some(requested_timebase)
         );
     }
 
