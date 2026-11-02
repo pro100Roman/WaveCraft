@@ -3126,6 +3126,7 @@ struct WaveCraftApp {
     protocol_analyzer: ProtocolAnalyzerSettings,
     protocol_decode_cache: ProtocolDecodeCache,
     decoded_data_panel_open: bool,
+    decoded_data_panel_width: f32,
     scope_channel_colors: [Color32; 2],
     logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
     scope_channel_names: [String; 2],
@@ -3198,7 +3199,8 @@ impl WaveCraftApp {
             logic_marker_settings: LogicMarkerSettings::default(),
             protocol_analyzer: ProtocolAnalyzerSettings::default(),
             protocol_decode_cache: ProtocolDecodeCache::default(),
-            decoded_data_panel_open: true,
+            decoded_data_panel_open: false,
+            decoded_data_panel_width: 360.0,
             scope_channel_colors: SCOPE_COLORS,
             logic_channel_names: empty_logic_channel_names(),
             scope_channel_names: empty_scope_channel_names(),
@@ -7497,99 +7499,6 @@ impl eframe::App for WaveCraftApp {
             self.logic_acquisition_mode = AcquisitionMode::Single;
         }
 
-        if self.active_waveform_tab == Some(WaveformTab::LogicAnalyzer) {
-            if self.decoded_data_panel_open {
-                let analyzers = self.protocol_analyzer.analyzers.clone();
-                let mut decode_cache = std::mem::take(&mut self.protocol_decode_cache);
-                let empty_waveforms = WaveformStore::default();
-                let waveforms = self
-                    .capture
-                    .as_ref()
-                    .filter(|active| !active.preserve_display_until_complete && active.has_logic)
-                    .map(|active| &active.waveforms)
-                    .or_else(|| {
-                        self.displayed_completed_capture()
-                            .filter(|capture| capture.has_logic)
-                            .map(|capture| &capture.waveforms)
-                    })
-                    .unwrap_or(&empty_waveforms);
-                let outcomes = decode_cache.outcomes(waveforms, &analyzers).to_vec();
-                let sample_offset = waveforms.logic_sample_offset;
-                let sample_count = waveforms.logic_sample_count;
-                let sample_rate_hz = waveforms.logic_rate_hz;
-                self.protocol_decode_cache = decode_cache;
-                let mut collapse_panel = false;
-                let mut selected_range = None;
-                egui::SidePanel::right("decoded_data_panel")
-                    .resizable(true)
-                    .default_width(360.0)
-                    .width_range(280.0..=560.0)
-                    .frame(
-                        egui::Frame::none()
-                            .fill(PANEL)
-                            .inner_margin(egui::Margin::same(12.0)),
-                    )
-                    .show(context, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("DECODED DATA").strong().color(TEXT_MUTED));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    collapse_panel = ui
-                                        .small_button(">>")
-                                        .on_hover_text("Collapse decoded data")
-                                        .clicked();
-                                },
-                            );
-                        });
-                        ui.add_space(8.0);
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                selected_range = paint_decoded_data_panel(
-                                    ui,
-                                    &analyzers,
-                                    &outcomes,
-                                    sample_offset,
-                                    sample_rate_hz,
-                                );
-                            });
-                    });
-                if collapse_panel {
-                    self.decoded_data_panel_open = false;
-                }
-                if let Some((start_sample, end_sample)) = selected_range {
-                    focus_logic_sample_range(
-                        &mut self.logic_viewport,
-                        sample_offset,
-                        sample_count,
-                        start_sample,
-                        end_sample,
-                    );
-                }
-            } else {
-                let mut expand_panel = false;
-                egui::SidePanel::right("decoded_data_panel_collapsed")
-                    .resizable(false)
-                    .exact_width(34.0)
-                    .frame(
-                        egui::Frame::none()
-                            .fill(PANEL)
-                            .inner_margin(egui::Margin::same(4.0)),
-                    )
-                    .show(context, |ui| {
-                        expand_panel = ui
-                            .add_sized([ui.available_width(), 24.0], egui::Button::new("<<"))
-                            .on_hover_text("Expand decoded data")
-                            .clicked();
-                    });
-                if expand_panel {
-                    self.decoded_data_panel_open = true;
-                }
-            }
-        }
-
         if scope_tools_panel_is_visible(self.active_waveform_tab) {
             egui::SidePanel::right("scope_tools_fixed")
                 .resizable(false)
@@ -7931,6 +7840,8 @@ impl eframe::App for WaveCraftApp {
         let mut snapshot_plot_rect = None;
         let protocol_analyzer_for_waveform = self.protocol_analyzer.clone();
         let mut protocol_decode_cache = std::mem::take(&mut self.protocol_decode_cache);
+        let mut decoded_data_panel_open = self.decoded_data_panel_open;
+        let mut decoded_data_panel_width = self.decoded_data_panel_width;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -8007,33 +7918,189 @@ impl eframe::App for WaveCraftApp {
                     .unwrap_or(self.scope_settings);
                 match self.active_waveform_tab {
                     Some(WaveformTab::LogicAnalyzer) => {
-                        snapshot_plot_rect = Some(waveform_card_fill(
-                            ui,
-                            "DIGITAL",
-                            "DSLogic · channels 0–15",
-                            |ui, rect| {
-                                paint_logic(
-                                    ui,
-                                    rect,
-                                    waveforms,
-                                    LogicWaveformOptions {
-                                        channel_colors: &mut logic_channel_colors,
-                                        channel_marker_opacities:
-                                            &mut logic_channel_marker_opacities,
-                                        channel_names: &mut logic_channel_names,
-                                        channel_settings_drafts: &mut logic_channel_settings_drafts,
-                                        smart_timing_enabled: self.logic_smart_timing_enabled,
-                                        marker_settings: &mut logic_marker_settings,
-                                        maximum_heights: &mut logic_maximum_heights,
-                                        enabled_channels: &mut logic_enabled_channels,
-                                        protocol_analyzer: &protocol_analyzer_for_waveform,
-                                        protocol_decode_cache: &mut protocol_decode_cache,
-                                        time_axis: None,
+                        let decoded_outcomes = protocol_decode_cache
+                            .outcomes(waveforms, &protocol_analyzer_for_waveform.analyzers)
+                            .to_vec();
+                        let sample_offset = waveforms.logic_sample_offset;
+                        let sample_count = waveforms.logic_sample_count;
+                        let sample_rate_hz = waveforms.logic_rate_hz;
+                        let available_size = ui.available_size();
+                        let spacing = ui.spacing().item_spacing.x;
+                        let splitter_width = 6.0;
+                        let minimum_waveform_width = 260.0;
+                        let mut selected_range = None;
+                        let mut paint_waveform = |waveform_ui: &mut egui::Ui| {
+                            waveform_card_fill(
+                                waveform_ui,
+                                "DIGITAL",
+                                "DSLogic · channels 0–15",
+                                |ui, rect| {
+                                    paint_logic(
+                                        ui,
+                                        rect,
+                                        waveforms,
+                                        LogicWaveformOptions {
+                                            channel_colors: &mut logic_channel_colors,
+                                            channel_marker_opacities:
+                                                &mut logic_channel_marker_opacities,
+                                            channel_names: &mut logic_channel_names,
+                                            channel_settings_drafts:
+                                                &mut logic_channel_settings_drafts,
+                                            smart_timing_enabled: self.logic_smart_timing_enabled,
+                                            marker_settings: &mut logic_marker_settings,
+                                            maximum_heights: &mut logic_maximum_heights,
+                                            enabled_channels: &mut logic_enabled_channels,
+                                            protocol_analyzer: &protocol_analyzer_for_waveform,
+                                            protocol_decode_cache: &mut protocol_decode_cache,
+                                            time_axis: None,
+                                        },
+                                        &mut logic_viewport,
+                                    )
+                                },
+                            )
+                        };
+                        if decoded_data_panel_open {
+                            let maximum_panel_width = (available_size.x
+                                - minimum_waveform_width
+                                - splitter_width
+                                - spacing * 2.0)
+                                .max(120.0);
+                            decoded_data_panel_width = decoded_data_panel_width.clamp(
+                                280.0_f32.min(maximum_panel_width),
+                                maximum_panel_width.min(560.0),
+                            );
+                            let waveform_width = (available_size.x
+                                - decoded_data_panel_width
+                                - splitter_width
+                                - spacing * 2.0)
+                                .max(1.0);
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(waveform_width, available_size.y),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        snapshot_plot_rect = Some(paint_waveform(ui));
                                     },
-                                    &mut logic_viewport,
-                                )
-                            },
-                        ));
+                                );
+                                let (splitter_rect, splitter_response) = ui.allocate_exact_size(
+                                    Vec2::new(splitter_width, available_size.y),
+                                    Sense::drag(),
+                                );
+                                let splitter_response = splitter_response
+                                    .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                                ui.painter().line_segment(
+                                    [splitter_rect.center_top(), splitter_rect.center_bottom()],
+                                    Stroke::new(1.0_f32, GRID),
+                                );
+                                if splitter_response.dragged() {
+                                    let delta = ui.input(|input| input.pointer.delta().x);
+                                    decoded_data_panel_width = (decoded_data_panel_width - delta)
+                                        .clamp(
+                                            280.0_f32.min(maximum_panel_width),
+                                            maximum_panel_width.min(560.0),
+                                        );
+                                }
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(decoded_data_panel_width, available_size.y),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        egui::Frame::none()
+                                            .fill(PANEL)
+                                            .rounding(egui::Rounding::same(6.0))
+                                            .inner_margin(egui::Margin::same(12.0))
+                                            .show(ui, |ui| {
+                                                ui.set_min_height(
+                                                    (available_size.y - 24.0).max(0.0),
+                                                );
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        RichText::new("DECODED DATA")
+                                                            .strong()
+                                                            .color(TEXT_MUTED),
+                                                    );
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            if ui
+                                                                .small_button(">>")
+                                                                .on_hover_text(
+                                                                    "Collapse decoded data",
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                decoded_data_panel_open = false;
+                                                            }
+                                                        },
+                                                    );
+                                                });
+                                                ui.add_space(8.0);
+                                                egui::ScrollArea::vertical()
+                                                    .auto_shrink([false, false])
+                                                    .show(ui, |ui| {
+                                                        ui.set_width(ui.available_width());
+                                                        selected_range = paint_decoded_data_panel(
+                                                            ui,
+                                                            &protocol_analyzer_for_waveform
+                                                                .analyzers,
+                                                            &decoded_outcomes,
+                                                            sample_offset,
+                                                            sample_rate_hz,
+                                                        );
+                                                    });
+                                            });
+                                    },
+                                );
+                            });
+                        } else {
+                            let collapsed_width = 34.0;
+                            let waveform_width =
+                                (available_size.x - collapsed_width - spacing).max(1.0);
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(waveform_width, available_size.y),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        snapshot_plot_rect = Some(paint_waveform(ui));
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(collapsed_width, available_size.y),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        egui::Frame::none()
+                                            .fill(PANEL)
+                                            .rounding(egui::Rounding::same(6.0))
+                                            .inner_margin(egui::Margin::same(4.0))
+                                            .show(ui, |ui| {
+                                                ui.set_min_height(
+                                                    (available_size.y - 8.0).max(0.0),
+                                                );
+                                                if ui
+                                                    .add_sized(
+                                                        [ui.available_width(), 24.0],
+                                                        egui::Button::new("<<"),
+                                                    )
+                                                    .on_hover_text("Expand decoded data")
+                                                    .clicked()
+                                                {
+                                                    decoded_data_panel_open = true;
+                                                }
+                                            });
+                                    },
+                                );
+                            });
+                        }
+                        if let Some((start_sample, end_sample)) = selected_range {
+                            focus_logic_sample_range(
+                                &mut logic_viewport,
+                                sample_offset,
+                                sample_count,
+                                start_sample,
+                                end_sample,
+                            );
+                        }
                     }
                     Some(WaveformTab::Oscilloscope) => {
                         let subtitle = scope_channels_subtitle(&self.scope_channel_names);
@@ -8197,6 +8264,8 @@ impl eframe::App for WaveCraftApp {
                 self.scope_settings.trigger = scope_trigger_settings;
             });
         self.protocol_decode_cache = protocol_decode_cache;
+        self.decoded_data_panel_open = decoded_data_panel_open;
+        self.decoded_data_panel_width = decoded_data_panel_width;
         self.snapshot_plot_rect = snapshot_plot_rect;
         if snapshot_clicked {
             if let Some(plot_rect) = snapshot_plot_rect {
