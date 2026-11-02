@@ -950,8 +950,15 @@ mod tests {
 
     #[test]
     fn production_managers_share_process_wide_leases() {
-        let first_manager = AutomationManager::new();
-        let second_manager = AutomationManager::new();
+        let manager = || {
+            AutomationManager::from_parts(
+                || Ok(Vec::new()),
+                SIMULATED_DEVICE_PROFILES.to_vec(),
+                process_lease_registry(),
+            )
+        };
+        let first_manager = manager();
+        let second_manager = manager();
         let selector = DeviceSelector::connection_id("sim:logic-0");
         let first = first_manager
             .open_device(selector.clone())

@@ -3,6 +3,7 @@
 //! Discovery uses libusb and never opens, claims, or modifies a device. Device
 //! handles and direct USB transport belong to the acquisition layer.
 
+use rusb::UsbContext;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use wavecraft_core::InstrumentKind;
@@ -638,7 +639,10 @@ pub fn discover_supported_devices() -> Result<DiscoveryReport, UsbError> {
 }
 
 fn discover_raw_devices() -> Result<Vec<RawUsbDevice>, UsbError> {
-    let usb_devices = rusb::devices()
+    let context = rusb::Context::new()
+        .map_err(|error| UsbError::new(format!("failed to initialize USB: {error}")))?;
+    let usb_devices = context
+        .devices()
         .map_err(|error| UsbError::new(format!("failed to enumerate USB devices: {error}")))?;
     let mut devices = Vec::new();
     for device in usb_devices.iter() {
