@@ -2422,6 +2422,13 @@ struct SessionTabs<T, S> {
     active: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionTabAction {
+    Select(usize),
+    Add,
+    Close(usize),
+}
+
 impl<T, S> SessionTabs<T, S> {
     fn new(settings: S) -> Self {
         Self {
@@ -2486,6 +2493,19 @@ impl<T, S> SessionTabs<T, S> {
             return false;
         }
         self.active = index;
+        true
+    }
+
+    fn close(&mut self, index: usize) -> bool {
+        if self.tabs.len() <= 1 || index >= self.tabs.len() {
+            return false;
+        }
+        self.tabs.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
         true
     }
 
@@ -7109,23 +7129,44 @@ impl eframe::App for WaveCraftApp {
                                 ui.label(RichText::new("SESSION").strong().color(TEXT_MUTED));
                                 ui.separator();
                                 for index in 0..tab_count {
-                                    if ui
-                                        .add_enabled(
-                                            !self.is_busy(),
-                                            egui::SelectableLabel::new(
-                                                active_tab == index,
-                                                format!("Session {}", index + 1),
-                                            ),
-                                        )
-                                        .on_hover_text(if self.is_busy() {
-                                            "Stop the active acquisition before changing sessions"
-                                        } else {
-                                            "Show this session's captured waveform"
-                                        })
-                                        .clicked()
-                                    {
-                                        session_tab_action = Some((target, Some(index)));
-                                    }
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                !self.is_busy(),
+                                                egui::SelectableLabel::new(
+                                                    active_tab == index,
+                                                    format!("Session {}", index + 1),
+                                                ),
+                                            )
+                                            .on_hover_text(if self.is_busy() {
+                                                "Stop the active acquisition before changing sessions"
+                                            } else {
+                                                "Show this session's captured waveform"
+                                            })
+                                            .clicked()
+                                        {
+                                            session_tab_action =
+                                                Some((target, SessionTabAction::Select(index)));
+                                        }
+                                        let close_enabled = !self.is_busy() && tab_count > 1;
+                                        if ui
+                                            .add_enabled(
+                                                close_enabled,
+                                                egui::Button::new("×").small().frame(false),
+                                            )
+                                            .on_hover_text(if self.is_busy() {
+                                                "Stop the active acquisition before closing a session"
+                                            } else if tab_count <= 1 {
+                                                "At least one session must remain open"
+                                            } else {
+                                                "Close and permanently discard this session"
+                                            })
+                                            .clicked()
+                                        {
+                                            session_tab_action =
+                                                Some((target, SessionTabAction::Close(index)));
+                                        }
+                                    });
                                 }
                                 let add_enabled = !self.is_busy() && tab_count < MAX_SESSION_TABS;
                                 if ui
@@ -7139,54 +7180,94 @@ impl eframe::App for WaveCraftApp {
                                     })
                                     .clicked()
                                 {
-                                    session_tab_action = Some((target, None));
+                                    session_tab_action = Some((target, SessionTabAction::Add));
                                 }
                             });
                         });
                 });
         }
-        if let Some((target, selected)) = session_tab_action {
+        if let Some((target, action)) = session_tab_action {
             let changed = match target {
                 CaptureTarget::LogicAnalyzer => {
                     self.save_active_logic_session_settings();
-                    if let Some(index) = selected {
-                        if self.logic_sessions.select(index) {
-                            let settings = self.logic_sessions.active_settings().clone();
-                            self.apply_logic_session_settings(settings);
-                            true
-                        } else {
-                            false
+                    match action {
+                        SessionTabAction::Select(index) => {
+                            if !self.logic_sessions.select(index) {
+                                false
+                            } else {
+                                let settings = self.logic_sessions.active_settings().clone();
+                                self.apply_logic_session_settings(settings);
+                                true
+                            }
                         }
-                    } else {
-                        let settings = self.current_logic_session_settings();
-                        self.logic_sessions.add(settings)
+                        SessionTabAction::Add => {
+                            let settings = self.current_logic_session_settings();
+                            self.logic_sessions.add(settings)
+                        }
+                        SessionTabAction::Close(index) => {
+                            if !self.logic_sessions.close(index) {
+                                false
+                            } else {
+                                let settings = self.logic_sessions.active_settings().clone();
+                                self.apply_logic_session_settings(settings);
+                                true
+                            }
+                        }
                     }
                 }
                 CaptureTarget::Oscilloscope => {
                     self.save_active_scope_session_settings();
-                    if let Some(index) = selected {
-                        if self.scope_sessions.select(index) {
-                            let settings = self.scope_sessions.active_settings().clone();
-                            self.apply_scope_session_settings(settings);
-                            true
-                        } else {
-                            false
+                    match action {
+                        SessionTabAction::Select(index) => {
+                            if !self.scope_sessions.select(index) {
+                                false
+                            } else {
+                                let settings = self.scope_sessions.active_settings().clone();
+                                self.apply_scope_session_settings(settings);
+                                true
+                            }
                         }
-                    } else {
-                        let settings = self.current_scope_session_settings();
-                        self.scope_sessions.add(settings)
+                        SessionTabAction::Add => {
+                            let settings = self.current_scope_session_settings();
+                            self.scope_sessions.add(settings)
+                        }
+                        SessionTabAction::Close(index) => {
+                            if !self.scope_sessions.close(index) {
+                                false
+                            } else {
+                                let settings = self.scope_sessions.active_settings().clone();
+                                self.apply_scope_session_settings(settings);
+                                true
+                            }
+                        }
                     }
                 }
                 CaptureTarget::Combined => unreachable!("combined view has no session tabs"),
             };
-            if changed && selected.is_none() {
-                let active_index = match target {
-                    CaptureTarget::LogicAnalyzer => self.logic_sessions.active_index(),
-                    CaptureTarget::Oscilloscope => self.scope_sessions.active_index(),
-                    CaptureTarget::Combined => unreachable!("combined view has no session tabs"),
-                };
-                self.status = format!("Added {} session {}", target.label(), active_index + 1);
-                self.last_error = None;
+            if changed {
+                match action {
+                    SessionTabAction::Add => {
+                        let active_index = match target {
+                            CaptureTarget::LogicAnalyzer => self.logic_sessions.active_index(),
+                            CaptureTarget::Oscilloscope => self.scope_sessions.active_index(),
+                            CaptureTarget::Combined => {
+                                unreachable!("combined view has no session tabs")
+                            }
+                        };
+                        self.status =
+                            format!("Added {} session {}", target.label(), active_index + 1);
+                        self.last_error = None;
+                    }
+                    SessionTabAction::Close(index) => {
+                        self.status = format!(
+                            "Closed {} session {}; its data was discarded",
+                            target.label(),
+                            index + 1
+                        );
+                        self.last_error = None;
+                    }
+                    SessionTabAction::Select(_) => {}
+                }
             }
         }
 
@@ -13233,6 +13314,43 @@ mod tests {
         assert!(!sessions.add(()));
         assert_eq!(sessions.active_index(), MAX_SESSION_TABS - 1);
         assert!(!sessions.select(MAX_SESSION_TABS));
+    }
+
+    #[test]
+    fn closing_sessions_discards_the_tab_and_keeps_active_session_valid() {
+        let mut sessions = SessionTabs::new(10_u64);
+        sessions.replace_active("first capture");
+        assert!(sessions.add(20));
+        sessions.replace_active("second capture");
+        assert!(sessions.add(30));
+        sessions.replace_active("third capture");
+
+        assert!(sessions.close(0));
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.active_index(), 1);
+        assert_eq!(*sessions.active_settings(), 30);
+        assert_eq!(sessions.active_capture(), Some(&"third capture"));
+
+        assert!(sessions.close(1));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions.active_index(), 0);
+        assert_eq!(*sessions.active_settings(), 20);
+        assert_eq!(sessions.active_capture(), Some(&"second capture"));
+        assert!(!sessions.close(0));
+        assert!(!sessions.close(1));
+    }
+
+    #[test]
+    fn closing_active_middle_session_selects_the_following_session() {
+        let mut sessions = SessionTabs::<(), _>::new("first");
+        assert!(sessions.add("second"));
+        assert!(sessions.add("third"));
+        assert!(sessions.select(1));
+
+        assert!(sessions.close(1));
+
+        assert_eq!(sessions.active_index(), 1);
+        assert_eq!(*sessions.active_settings(), "third");
     }
 
     #[test]
