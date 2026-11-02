@@ -3,3 +3,7 @@
 *.swp
 *.swo
 *.dsv
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/

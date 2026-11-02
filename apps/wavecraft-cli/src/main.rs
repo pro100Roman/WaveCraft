@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use wavecraft_automation::{
@@ -192,6 +192,7 @@ fn automation_capture_run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Ok(completed) => {
             if arguments.ndjson_events {
                 println!("{}", serde_json::to_string(&completed)?);
+                std::io::stdout().flush()?;
             } else {
                 println!(
                     "capture {} completed: {} samples in {} frame(s), recording {}",
@@ -284,6 +285,7 @@ fn parse_automation_capture_arguments(
 fn print_capture_event(event: &AutomationEvent, ndjson: bool) -> Result<(), Box<dyn Error>> {
     if ndjson {
         println!("{}", serde_json::to_string(event)?);
+        std::io::stdout().flush()?;
         return Ok(());
     }
     match event.event {
@@ -309,6 +311,7 @@ fn report_capture_error(
 ) -> Result<(), Box<dyn Error>> {
     if ndjson {
         println!("{}", serde_json::to_string(&error)?);
+        std::io::stdout().flush()?;
     }
     Err(Box::new(error))
 }

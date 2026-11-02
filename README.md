@@ -62,7 +62,7 @@ The repository contains a working vertical slice of the new capture engine:
 - Saleae Logic 2 `.sal` import and export.
 
 Broader DSCope sample-rate validation, executable protocol decoders and their
-plugin host, and structured automation interfaces are the next milestones.
+plugin host, and versioned automation scenarios are the next milestones.
 
 The required end state includes a cross-platform decoder plugin system. SPI
 and I2C will be first-party decoders, while third-party decoders run through a
@@ -71,13 +71,13 @@ Rust, Python, or another language without sharing the application's native ABI.
 Decoded events remain aligned to source sample ranges and the shared capture
 timeline.
 
-Hardware discovery, configuration, capture, recording, and decoding must also
-be controllable without the GUI. The CLI will provide stable JSON/NDJSON output
-and complete raw capture recording suitable for `subprocess` automation. The
-recording path receives every captured frame and is independent of the GUI's
-bounded waveform display cache. A local service API and thin Python client can
-reuse the same application command layer for long-lived and streaming
-workflows; automation must never depend on parsing human-readable status text.
+Hardware discovery, configuration, capture, and recording are controllable
+without the GUI. The CLI provides stable JSON/NDJSON output and complete raw
+capture recording suitable for `subprocess` automation, and the first-party
+Python client wraps that contract. The recording path receives every captured
+frame and is independent of the GUI's bounded waveform display cache. A local
+service API can later reuse the same application command layer for long-lived
+workflows; automation never depends on parsing human-readable status text.
 
 USB discovery, probing, and FPGA preparation cover all 22 unique DSLogic and
 DSCope USB profiles from the upstream driver (`2a0e:0001` through the current
@@ -333,12 +333,45 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## Use the Python client
+
+The dependency-free client under `python/` wraps the versioned CLI JSON
+contract. Build the CLI and install the local package:
+
+```sh
+cargo build --release -p wavecraft-cli
+python3 -m pip install -e python
+```
+
+Then discover and capture from one exact selected connection:
+
+```python
+from wavecraft import WaveCraftClient
+
+client = WaveCraftClient.from_workspace(".")
+device = client.list_devices(kind="logic_analyzer", backend="usb")[0]
+result = client.capture(
+    device_id=device["connection_id"],
+    sample_rate_hz=1_000_000,
+    sample_count=65_536,
+    channels=[0, 1, 2, 3],
+    output="python-logic.dsv",
+    on_event=lambda event: print(event),
+)
+print(result["summary"]["recording_path"])
+```
+
+`WaveCraftClient` also exposes exact-device probing, DSCope capture through the
+same method, live status/progress callbacks, and structured exceptions. See
+[`python/README.md`](python/README.md) for details.
+
 ## Workspace layout
 
 - `crates/wavecraft-core`: device-independent capture types and concurrency.
 - `crates/wavecraft-recording`: native recording plus Saleae `.sal` import/export.
 - `crates/wavecraft-sim`: deterministic simulated logic and scope sources.
 - `crates/wavecraft-usb`: USB discovery, claimed sessions, control transport, FPGA loading, and DSLogic/DSCope capture.
+- `python`: dependency-free selected-device automation client.
 - `apps/wavecraft-cli`: simultaneous-capture development harness.
 - `apps/wavecraft-gui`: native device selection, capture controls, status, and waveform rendering.
 - `docs/architecture.md`: design constraints and planned hardware integration.

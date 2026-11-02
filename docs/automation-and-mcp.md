@@ -77,6 +77,13 @@ wavecraft-cli capture run --device <dscope-connection-id> \
   --events ndjson
 ```
 
+The first-party dependency-free Python package in `python/` wraps this exact
+contract. `WaveCraftClient` provides structured device listing, exact-device
+probing, selected-device capture, synchronous live event callbacks, and typed
+exceptions for `wavecraft.error/v1`. It launches the built CLI directly rather
+than parsing human-readable output. The CLI flushes every NDJSON event so a
+Python callback observes progress while acquisition is running.
+
 USB persistent identities remain absent when the current non-opening discovery
 path cannot read a serial number. Coordinating one explicitly selected DSLogic
 and one explicitly selected DSCope in a combined capture is the next hardware
@@ -329,8 +336,8 @@ The machine interface follows these rules:
 Human-readable output remains the default for interactive commands, but it is
 not an automation contract and must not be parsed by clients.
 
-An initial Python integration should invoke direct CLI capture commands as a
-subprocess and consume NDJSON incrementally. This avoids a platform-specific
+The first-party Python client invokes direct CLI capture commands as a
+subprocess and consumes NDJSON incrementally. This avoids a platform-specific
 native binding and works before a resident service exists. When persistent
 capture handles or multiple external clients become necessary, a local daemon
 can host the same `AutomationManager` rather than introducing a second API.
