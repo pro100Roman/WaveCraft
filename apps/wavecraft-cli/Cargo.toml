@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde_json = "1.0.154"
+wavecraft-automation = { path = "../../crates/wavecraft-automation" }
 wavecraft-core = { path = "../../crates/wavecraft-core" }
 wavecraft-recording = { path = "../../crates/wavecraft-recording" }
 wavecraft-sim = { path = "../../crates/wavecraft-sim" }

@@ -28,6 +28,30 @@ automation protocol. The service never depends on implicit GUI selection or
 GUI view state; every operation resolves to an explicit device ID or handle and
 a complete capture configuration.
 
+### Current implementation
+
+The first device-service milestone is implemented in
+`crates/wavecraft-automation`. `AutomationManager` discovers USB instruments
+and deterministic simulators, returns schema-versioned descriptions, resolves
+selectors to exactly one connection, and acquires a process-wide exclusive
+lease before returning `DeviceHandle`. Handles expose capabilities and
+read-only probing, detect disconnect-after-selection, and release their lease
+when explicitly closed or dropped. Structured errors distinguish no match,
+ambiguous match, busy state, disconnect, discovery failure, and probe failure.
+
+The initial end-to-end CLI surface is:
+
+```text
+wavecraft-cli devices list --format json
+wavecraft-cli devices probe --id sim:logic-0 --format json
+wavecraft-cli devices probe --id <usb-connection-id> --format json
+```
+
+USB persistent identities remain absent when the current non-opening discovery
+path cannot read a serial number. Capture handles and direct automation capture
+are the next milestone; they must build on this device service rather than GUI
+selection state.
+
 ## Goals
 
 - Run deterministic captures without the GUI.

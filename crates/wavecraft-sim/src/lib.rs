@@ -7,6 +7,42 @@ use wavecraft_core::{
     InstrumentKind, LogicBatch, ScopeBatch,
 };
 
+pub const SIMULATED_LOGIC_ANALYZER_ID: &str = "sim:logic-0";
+pub const SIMULATED_OSCILLOSCOPE_ID: &str = "sim:scope-0";
+
+/// Static discovery information for one deterministic simulated instrument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SimulatedDeviceProfile {
+    pub connection_id: &'static str,
+    pub display_name: &'static str,
+    pub model: &'static str,
+    pub kind: InstrumentKind,
+    pub channel_count: u8,
+    pub sample_rates_hz: &'static [u64],
+}
+
+const SIMULATED_LOGIC_SAMPLE_RATES_HZ: &[u64] = &[100_000, 1_000_000, 10_000_000];
+const SIMULATED_SCOPE_SAMPLE_RATES_HZ: &[u64] = &[50_000, 500_000, 5_000_000];
+
+pub const SIMULATED_DEVICE_PROFILES: &[SimulatedDeviceProfile] = &[
+    SimulatedDeviceProfile {
+        connection_id: SIMULATED_LOGIC_ANALYZER_ID,
+        display_name: "Simulated Logic Analyzer",
+        model: "simulated_logic_analyzer",
+        kind: InstrumentKind::LogicAnalyzer,
+        channel_count: 8,
+        sample_rates_hz: SIMULATED_LOGIC_SAMPLE_RATES_HZ,
+    },
+    SimulatedDeviceProfile {
+        connection_id: SIMULATED_OSCILLOSCOPE_ID,
+        display_name: "Simulated Oscilloscope",
+        model: "simulated_oscilloscope",
+        kind: InstrumentKind::Oscilloscope,
+        channel_count: 2,
+        sample_rates_hz: SIMULATED_SCOPE_SAMPLE_RATES_HZ,
+    },
+];
+
 pub struct SimulatedLogicAnalyzer {
     descriptor: DeviceDescriptor,
     sample_rate_hz: u64,
