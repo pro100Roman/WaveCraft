@@ -18,22 +18,20 @@ A Rust reimplementation of [DSView](https://github.com/DreamSourceLab/DSView) de
 
 ## Release packages
 
-WaveCraft publishes separate native macOS packages rather than a larger universal
-application. Choose the package that matches the Mac's processor:
+WaveCraft publishes one universal macOS package that runs natively on Apple
+Silicon and Intel Macs:
 
 | Platform | Release package | Minimum system |
 | --- | --- | --- |
-| macOS on Apple Silicon (M1 or newer) | `wavecraft-macos-arm64.zip` | macOS 11 |
-| macOS on Intel | `wavecraft-macos-x86_64.zip` | macOS 10.15 |
+| macOS on Apple Silicon or Intel | `wavecraft-macos-universal.zip` | macOS 11 |
 | Linux on x86-64 | `wavecraft-linux-x86_64.tar.gz` | glibc 2.35 (Ubuntu 22.04 or equivalent) |
 | Windows on x86-64 | `wavecraft-windows-x86_64.zip` | Windows 10 |
 
-The ARM64 package is recommended for Apple Silicon. It runs natively and avoids
-Rosetta; use the Intel package only on an Intel Mac. The two packages have the
-same features and architecture-native performance. Linux releases are built on
-Ubuntu 22.04 instead of installing another glibc on a newer runner. Windows
-releases statically link the MSVC C runtime, so a separate Visual C++
-Redistributable installation is not required.
+The universal macOS package contains native ARM64 and x86-64 executables, so it
+does not require Rosetta on Apple Silicon. Linux releases are built on Ubuntu
+22.04 instead of installing another glibc on a newer runner. Windows releases
+statically link the MSVC C runtime, so a separate Visual C++ Redistributable
+installation is not required.
 
 ## Terminology
 
@@ -224,6 +222,14 @@ with:
 
 ```sh
 ./scripts/package-macos.sh
+```
+
+Pass `--universal` to build a bundle containing both ARM64 and x86-64 executable
+slices. The two Rust targets must be installed before making a universal build:
+
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+./scripts/package-macos.sh --universal
 ```
 
 The bundle is written to `target/release/bundle/osx/WaveCraft.app`. Launch it by

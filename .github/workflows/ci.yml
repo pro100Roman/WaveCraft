@@ -43,18 +43,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macOS (Apple Silicon)
+          - name: macOS (Universal)
             os: macos-15
-            artifact: wavecraft-macos-arm64
-            archive: wavecraft-macos-arm64.zip
-            macos_architecture: arm64
+            artifact: wavecraft-macos-universal
+            archive: wavecraft-macos-universal.zip
             macos_deployment_target: "11.0"
-          - name: macOS (Intel)
-            os: macos-15-intel
-            artifact: wavecraft-macos-x86_64
-            archive: wavecraft-macos-x86_64.zip
-            macos_architecture: x86_64
-            macos_deployment_target: "10.15"
           - name: Linux
             os: ubuntu-22.04
             artifact: wavecraft-linux-x86_64
@@ -71,6 +64,10 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install universal macOS targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Install Linux window-system dependencies
         if: runner.os == 'Linux'
         run: >-
@@ -83,10 +80,24 @@ jobs:
       - run: cargo test --workspace
 
       - name: Build release binaries
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
+        run: cargo build --workspace --release --locked
+
+      - name: Build universal macOS release binaries
+        if: runner.os == 'macOS'
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
-        run: cargo build --workspace --release --locked
+        shell: bash
+        run: |
+          cargo build --workspace --release --locked \
+            --target aarch64-apple-darwin
+          cargo build --workspace --release --locked \
+            --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/wavecraft-cli \
+            target/x86_64-apple-darwin/release/wavecraft-cli \
+            -output target/release/wavecraft-cli
 
       - name: Build Windows release binaries with static MSVC runtime
         if: runner.os == 'Windows'
@@ -98,18 +109,17 @@ jobs:
         if: runner.os == 'macOS'
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
-        run: bash scripts/package-macos.sh
+        run: bash scripts/package-macos.sh --universal
 
-      - name: Verify macOS release architecture
+      - name: Verify macOS release architectures
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          test "$(uname -m)" = "${{ matrix.macos_architecture }}"
-          test "$(lipo -archs target/release/wavecraft-cli)" = \
-            "${{ matrix.macos_architecture }}"
-          test "$(lipo -archs \
-            target/release/bundle/osx/WaveCraft.app/Contents/MacOS/WaveCraft)" = \
-            "${{ matrix.macos_architecture }}"
+          app_executable=target/release/bundle/osx/WaveCraft.app/Contents/MacOS/WaveCraft
+          lipo target/release/wavecraft-cli -verify_arch arm64
+          lipo target/release/wavecraft-cli -verify_arch x86_64
+          lipo "$app_executable" -verify_arch arm64
+          lipo "$app_executable" -verify_arch x86_64
 
       - name: Package macOS release
         if: runner.os == 'macOS'
