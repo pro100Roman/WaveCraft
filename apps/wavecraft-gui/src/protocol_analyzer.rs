@@ -72,6 +72,21 @@ impl ProtocolDataFormat {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolDecodedEvent {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub text: String,
+    pub detail: String,
+    pub warning: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProtocolDecodeOutcome {
+    Events(Vec<ProtocolDecodedEvent>),
+    Unavailable(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolAnalyzerInstance {
     pub instance_id: u64,
     pub protocol_id: &'static str,
@@ -364,6 +379,228 @@ pub fn protocol_channels(id: &str) -> Vec<ProtocolChannel> {
         _ => &[],
     };
     channels.to_vec()
+}
+
+pub fn decode_protocol_samples(
+    analyzer: &ProtocolAnalyzerInstance,
+    samples: &[u32],
+    sample_offset: u64,
+) -> ProtocolDecodeOutcome {
+    let Some(base) = protocol_stack(analyzer.protocol_id).and_then(|stack| stack.first().copied())
+    else {
+        return ProtocolDecodeOutcome::Unavailable("Decoder stack is incomplete".to_owned());
+    };
+    match base.id {
+        "0:i2c" | "1:i2c" => decode_i2c(analyzer, samples, sample_offset),
+        "0:spi" | "1:spi" => decode_spi(analyzer, samples, sample_offset),
+        _ => ProtocolDecodeOutcome::Unavailable(format!(
+            "{} decoding is not implemented yet",
+            base.name.trim_start_matches(|character: char| {
+                character.is_ascii_digit() || character == ':'
+            })
+        )),
+    }
+}
+
+fn mapped_channel(analyzer: &ProtocolAnalyzerInstance, index: usize) -> Option<usize> {
+    analyzer.channel_mappings.get(index).copied().flatten()
+}
+
+fn channel_is_high(sample: u32, channel: usize) -> bool {
+    channel < u32::BITS as usize && sample & (1_u32 << channel) != 0
+}
+
+fn format_protocol_byte(value: u8, format: ProtocolDataFormat) -> String {
+    match format {
+        ProtocolDataFormat::Hexadecimal => format!("{value:02X}"),
+        ProtocolDataFormat::Decimal => value.to_string(),
+        ProtocolDataFormat::Binary => format!("{value:08b}"),
+        ProtocolDataFormat::Ascii if value.is_ascii_graphic() || value == b' ' => {
+            format!("'{}'", char::from(value))
+        }
+        ProtocolDataFormat::Ascii => format!("{value:02X}"),
+    }
+}
+
+fn decode_i2c(
+    analyzer: &ProtocolAnalyzerInstance,
+    samples: &[u32],
+    sample_offset: u64,
+) -> ProtocolDecodeOutcome {
+    let (Some(clock_channel), Some(data_channel)) =
+        (mapped_channel(analyzer, 0), mapped_channel(analyzer, 1))
+    else {
+        return ProtocolDecodeOutcome::Unavailable("Map both SCL and SDA channels".to_owned());
+    };
+    let Some(&first) = samples.first() else {
+        return ProtocolDecodeOutcome::Events(Vec::new());
+    };
+    let mut events = Vec::new();
+    let mut previous_clock = channel_is_high(first, clock_channel);
+    let mut previous_data = channel_is_high(first, data_channel);
+    let mut active = false;
+    let mut byte = 0_u8;
+    let mut bit_count = 0_u8;
+    let mut byte_start = sample_offset;
+    let mut byte_end = sample_offset;
+    let mut acknowledge_start = sample_offset;
+    let mut byte_index = 0_usize;
+
+    for (local_index, sample) in samples.iter().copied().enumerate().skip(1) {
+        let sample_index = sample_offset.saturating_add(local_index as u64);
+        let clock = channel_is_high(sample, clock_channel);
+        let data = channel_is_high(sample, data_channel);
+        let start = previous_data && !data && clock;
+        let stop = !previous_data && data && clock;
+
+        if start {
+            active = true;
+            byte = 0;
+            bit_count = 0;
+            byte_index = 0;
+        } else if stop {
+            active = false;
+            byte = 0;
+            bit_count = 0;
+        } else if active && !previous_clock && clock {
+            if bit_count == 0 {
+                byte_start = sample_index;
+            }
+            if bit_count < 8 {
+                byte = (byte << 1) | u8::from(data);
+                bit_count += 1;
+                if bit_count == 8 {
+                    byte_end = sample_index;
+                    acknowledge_start = sample_index;
+                }
+            } else {
+                let acknowledged = !data;
+                let (text, detail) = if byte_index == 0 {
+                    let address = byte >> 1;
+                    let direction = if byte & 1 == 0 { "W" } else { "R" };
+                    (
+                        format!(
+                            "ADDR {} {direction}",
+                            format_protocol_byte(address, analyzer.data_format)
+                        ),
+                        format!(
+                            "I²C address 0x{address:02X} ({address}) · {} · raw byte 0x{byte:02X}",
+                            if byte & 1 == 0 { "write" } else { "read" }
+                        ),
+                    )
+                } else {
+                    (
+                        format_protocol_byte(byte, analyzer.data_format),
+                        format!("I²C data 0x{byte:02X} ({byte})"),
+                    )
+                };
+                events.push(ProtocolDecodedEvent {
+                    start_sample: byte_start,
+                    end_sample: byte_end,
+                    text,
+                    detail,
+                    warning: false,
+                });
+                events.push(ProtocolDecodedEvent {
+                    start_sample: acknowledge_start,
+                    end_sample: sample_index,
+                    text: if acknowledged { "ACK" } else { "NACK" }.to_owned(),
+                    detail: format!(
+                        "I²C {} for {} byte 0x{byte:02X}",
+                        if acknowledged {
+                            "acknowledge"
+                        } else {
+                            "not acknowledged"
+                        },
+                        if byte_index == 0 { "address" } else { "data" }
+                    ),
+                    warning: !acknowledged,
+                });
+                byte = 0;
+                bit_count = 0;
+                byte_index += 1;
+            }
+        } else if active && previous_clock && !clock && bit_count == 8 {
+            acknowledge_start = sample_index;
+        }
+
+        previous_clock = clock;
+        previous_data = data;
+    }
+    ProtocolDecodeOutcome::Events(events)
+}
+
+fn decode_spi(
+    analyzer: &ProtocolAnalyzerInstance,
+    samples: &[u32],
+    sample_offset: u64,
+) -> ProtocolDecodeOutcome {
+    let Some(clock_channel) = mapped_channel(analyzer, 0) else {
+        return ProtocolDecodeOutcome::Unavailable("Map the CLK channel".to_owned());
+    };
+    let miso_channel = mapped_channel(analyzer, 1);
+    let mosi_channel = mapped_channel(analyzer, 2);
+    let chip_select_channel = mapped_channel(analyzer, 3);
+    if miso_channel.is_none() && mosi_channel.is_none() {
+        return ProtocolDecodeOutcome::Unavailable("Map MISO or MOSI".to_owned());
+    }
+    let Some(&first) = samples.first() else {
+        return ProtocolDecodeOutcome::Events(Vec::new());
+    };
+    let mut events = Vec::new();
+    let mut previous_clock = channel_is_high(first, clock_channel);
+    let mut miso = 0_u8;
+    let mut mosi = 0_u8;
+    let mut bit_count = 0_u8;
+    let mut byte_start = sample_offset;
+
+    for (local_index, sample) in samples.iter().copied().enumerate().skip(1) {
+        let sample_index = sample_offset.saturating_add(local_index as u64);
+        let clock = channel_is_high(sample, clock_channel);
+        let selected = chip_select_channel
+            .map(|channel| !channel_is_high(sample, channel))
+            .unwrap_or(true);
+        if !selected {
+            bit_count = 0;
+            miso = 0;
+            mosi = 0;
+        } else if !previous_clock && clock {
+            if bit_count == 0 {
+                byte_start = sample_index;
+            }
+            if let Some(channel) = miso_channel {
+                miso = (miso << 1) | u8::from(channel_is_high(sample, channel));
+            }
+            if let Some(channel) = mosi_channel {
+                mosi = (mosi << 1) | u8::from(channel_is_high(sample, channel));
+            }
+            bit_count += 1;
+            if bit_count == 8 {
+                let text = match (mosi_channel, miso_channel) {
+                    (Some(_), Some(_)) => format!(
+                        "MOSI {} · MISO {}",
+                        format_protocol_byte(mosi, analyzer.data_format),
+                        format_protocol_byte(miso, analyzer.data_format)
+                    ),
+                    (Some(_), None) => format_protocol_byte(mosi, analyzer.data_format),
+                    (None, Some(_)) => format_protocol_byte(miso, analyzer.data_format),
+                    (None, None) => unreachable!("SPI requires at least one data channel"),
+                };
+                events.push(ProtocolDecodedEvent {
+                    start_sample: byte_start,
+                    end_sample: sample_index,
+                    detail: format!("SPI byte · MOSI 0x{mosi:02X} · MISO 0x{miso:02X}"),
+                    text,
+                    warning: false,
+                });
+                bit_count = 0;
+                miso = 0;
+                mosi = 0;
+            }
+        }
+        previous_clock = clock;
+    }
+    ProtocolDecodeOutcome::Events(events)
 }
 
 const GPIB_CHANNELS: [ProtocolChannel; 16] = [
@@ -1067,6 +1304,51 @@ pub const PROTOCOLS: [ProtocolDefinition; 150] = [
 mod tests {
     use super::*;
 
+    fn logic_word(clock: bool, data: bool, chip_select: bool) -> u32 {
+        u32::from(clock)
+            | (u32::from(data) << 1)
+            | (u32::from(data) << 2)
+            | (u32::from(chip_select) << 3)
+    }
+
+    fn i2c_transaction(bytes: &[(u8, bool)]) -> Vec<u32> {
+        let mut samples = vec![logic_word(true, true, true), logic_word(true, false, true)];
+        for &(byte, acknowledged) in bytes {
+            for bit in (0..8).rev() {
+                let data = byte & (1 << bit) != 0;
+                samples.extend([
+                    logic_word(false, data, true),
+                    logic_word(true, data, true),
+                    logic_word(false, data, true),
+                ]);
+            }
+            let acknowledge_level = !acknowledged;
+            samples.extend([
+                logic_word(false, acknowledge_level, true),
+                logic_word(true, acknowledge_level, true),
+                logic_word(false, acknowledge_level, true),
+            ]);
+        }
+        samples.extend([
+            logic_word(false, false, true),
+            logic_word(true, false, true),
+            logic_word(true, true, true),
+        ]);
+        samples
+    }
+
+    fn analyzer(
+        protocol_id: &'static str,
+        mappings: Vec<Option<usize>>,
+    ) -> ProtocolAnalyzerInstance {
+        ProtocolAnalyzerInstance {
+            instance_id: 0,
+            protocol_id,
+            channel_mappings: mappings,
+            data_format: ProtocolDataFormat::Hexadecimal,
+        }
+    }
+
     #[test]
     fn catalog_matches_original_decoder_count_and_has_unique_ids() {
         assert_eq!(PROTOCOLS.len(), 150);
@@ -1125,5 +1407,72 @@ mod tests {
             settings.analyzers[0].data_format,
             ProtocolDataFormat::Hexadecimal
         );
+    }
+
+    #[test]
+    fn i2c_decoder_separates_address_data_and_acknowledgements() {
+        let outcome = decode_protocol_samples(
+            &analyzer("1:i2c", vec![Some(0), Some(1)]),
+            &i2c_transaction(&[(0xa0, true), (0x5a, true)]),
+            100,
+        );
+        let ProtocolDecodeOutcome::Events(events) = outcome else {
+            panic!("I²C should be decoded");
+        };
+
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].text, "ADDR 50 W");
+        assert!(events[0].detail.contains("address 0x50"));
+        assert!(events[0].start_sample >= 100);
+        assert!(events[0].end_sample > events[0].start_sample);
+        assert!(!events[0].warning);
+        assert_eq!(events[1].text, "ACK");
+        assert!(events[1].start_sample >= events[0].end_sample);
+        assert_eq!(events[2].text, "5A");
+        assert!(events[2].detail.contains("data 0x5A"));
+        assert_eq!(events[3].text, "ACK");
+    }
+
+    #[test]
+    fn i2c_decoder_marks_unacknowledged_bytes() {
+        let outcome = decode_protocol_samples(
+            &analyzer("0:i2c", vec![Some(0), Some(1)]),
+            &i2c_transaction(&[(0x43, false)]),
+            0,
+        );
+        let ProtocolDecodeOutcome::Events(events) = outcome else {
+            panic!("I²C should be decoded");
+        };
+
+        assert_eq!(events[0].text, "ADDR 21 R");
+        assert!(!events[0].warning);
+        assert_eq!(events[1].text, "NACK");
+        assert!(events[1].warning);
+    }
+
+    #[test]
+    fn spi_decoder_emits_mosi_and_miso_bytes() {
+        let mut samples = vec![
+            logic_word(false, false, true),
+            logic_word(false, false, false),
+        ];
+        for bit in (0..8).rev() {
+            let mosi = 0xa5 & (1 << bit) != 0;
+            let miso = 0x3c & (1 << bit) != 0;
+            let low = u32::from(miso) << 1 | u32::from(mosi) << 2;
+            samples.extend([low, low | 1, low]);
+        }
+        samples.push(logic_word(false, false, true));
+        let outcome = decode_protocol_samples(
+            &analyzer("1:spi", vec![Some(0), Some(1), Some(2), Some(3)]),
+            &samples,
+            0,
+        );
+        let ProtocolDecodeOutcome::Events(events) = outcome else {
+            panic!("SPI should be decoded");
+        };
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].text, "MOSI A5 · MISO 3C");
     }
 }

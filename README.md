@@ -58,14 +58,15 @@ The repository contains a working vertical slice of the new capture engine:
 - concurrent physical capture from one DSLogic and one DSCope on a shared timeline;
 - a native desktop capture workbench with synchronized, interactive waveform views;
 - logic timing tools and oscilloscope measurements, markers, math, FFT, and XY views;
+- time-aligned I²C and SPI byte decoding in dedicated logic-analyzer rows;
 - versioned, lossless full-capture recording from the GUI and CLI;
 - Saleae Logic 2 `.sal` import and export.
 
-Broader DSCope sample-rate validation, executable protocol decoders and their
-plugin host, and versioned automation scenarios are the next milestones.
+Broader DSCope sample-rate validation, the external protocol-decoder plugin
+host, and versioned automation scenarios are the next milestones.
 
 The required end state includes a cross-platform decoder plugin system. SPI
-and I2C will be first-party decoders, while third-party decoders run through a
+and I2C are first-party decoders, while third-party decoders will run through a
 versioned out-of-process protocol so they can be implemented independently in
 Rust, Python, or another language without sharing the application's native ABI.
 Decoded events remain aligned to source sample ranges and the shared capture
@@ -298,8 +299,11 @@ threshold and its dotted horizontal reference; it uses the selected channel's
 color, or a live mix of both channel colors for combined CH0/CH1 triggering
 (green with the defaults). Scope tools provide automatic measurements,
 amplitude and time markers, channel math, windowed FFT, and a Lissajous XY view.
-The protocol-analyzer catalog can configure decoder stacks, channel mappings,
-and display formats; executing those decoders is still a planned milestone.
+The protocol-analyzer catalog configures decoder stacks, channel mappings, and
+display formats. I²C selections show separate address/direction, data-byte, and
+ACK/NACK cells; SPI selections show MOSI/MISO bytes. The dedicated rows remain
+aligned with their source samples, and unsupported catalog entries report their
+status instead of silently producing no output.
 
 Enable **Record complete capture** and enter a `.dsv` path before starting to
 write the full session to disk. The GUI uses the same streaming recorder as the

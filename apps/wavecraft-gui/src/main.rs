@@ -10,8 +10,9 @@ use measurements::{
     SCOPE_MEASUREMENT_KINDS,
 };
 use protocol_analyzer::{
-    matching_protocols, protocol_by_id, protocol_channels, protocol_stack,
-    ProtocolAnalyzerSettings, ProtocolDataFormat, PROTOCOLS,
+    decode_protocol_samples, matching_protocols, protocol_by_id, protocol_channels, protocol_stack,
+    ProtocolAnalyzerInstance, ProtocolAnalyzerSettings, ProtocolDataFormat, ProtocolDecodeOutcome,
+    PROTOCOLS,
 };
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -94,6 +95,7 @@ const DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY: u8 = 128;
 const LOGIC_MARKER_EDGE_SNAP_DISTANCE: f32 = 8.0;
 const CAPTURE_FILE_BUTTON_WIDTH: f32 = 82.0;
 static SCOPE_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
+static LOGIC_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
 
 fn toolbar_action_button(label: &str, color: Color32) -> egui::Button<'static> {
     egui::Button::new(label.to_owned())
@@ -1709,6 +1711,7 @@ struct WaveformStore {
     logic_samples: VecDeque<LogicSampleBucket>,
     logic_channels: u8,
     logic_rate_hz: u64,
+    logic_revision: u64,
     logic_captured_at: Option<Duration>,
     logic_sample_offset: u64,
     logic_sample_count: usize,
@@ -1731,6 +1734,7 @@ impl Default for WaveformStore {
             logic_samples: VecDeque::new(),
             logic_channels: 0,
             logic_rate_hz: 0,
+            logic_revision: 0,
             logic_captured_at: None,
             logic_sample_offset: 0,
             logic_sample_count: 0,
@@ -1788,6 +1792,66 @@ impl ScopeMeasurementCache {
             self.key = Some(key);
         }
         self.results
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProtocolDecodeCacheKey {
+    waveform_revision: u64,
+    sample_offset: u64,
+    sample_count: usize,
+    analyzers: Vec<ProtocolAnalyzerInstance>,
+}
+
+#[derive(Default)]
+struct ProtocolDecodeCache {
+    key: Option<ProtocolDecodeCacheKey>,
+    outcomes: Vec<ProtocolDecodeOutcome>,
+}
+
+impl ProtocolDecodeCache {
+    fn outcomes<'a>(
+        &'a mut self,
+        waveforms: &WaveformStore,
+        analyzers: &[ProtocolAnalyzerInstance],
+    ) -> &'a [ProtocolDecodeOutcome] {
+        let key = ProtocolDecodeCacheKey {
+            waveform_revision: waveforms.logic_revision,
+            sample_offset: waveforms.logic_sample_offset,
+            sample_count: waveforms.logic_sample_count,
+            analyzers: analyzers.to_vec(),
+        };
+        if self.key.as_ref() != Some(&key) {
+            self.outcomes = if waveforms.logic_sample_stride != 1
+                || waveforms
+                    .logic_samples
+                    .iter()
+                    .any(|bucket| bucket.sample_count != 1)
+            {
+                analyzers
+                    .iter()
+                    .map(|_| {
+                        ProtocolDecodeOutcome::Unavailable(
+                            "Raw samples are unavailable for this display capture".to_owned(),
+                        )
+                    })
+                    .collect()
+            } else {
+                let samples = waveforms
+                    .logic_samples
+                    .iter()
+                    .map(|bucket| bucket.first)
+                    .collect::<Vec<_>>();
+                analyzers
+                    .iter()
+                    .map(|analyzer| {
+                        decode_protocol_samples(analyzer, &samples, waveforms.logic_sample_offset)
+                    })
+                    .collect()
+            };
+            self.key = Some(key);
+        }
+        &self.outcomes
     }
 }
 
@@ -2291,12 +2355,14 @@ impl WaveformStore {
         }
         .clamp(1, u32::MAX as usize);
         self.logic_samples.clear();
+        self.logic_revision = LOGIC_WAVEFORM_REVISION.fetch_add(1, Ordering::Relaxed);
         self.logic_captured_at = None;
         self.logic_sample_offset = 0;
         self.logic_sample_count = 0;
     }
 
     fn ingest_logic_samples(&mut self, samples: &[u32]) {
+        self.logic_revision = LOGIC_WAVEFORM_REVISION.fetch_add(1, Ordering::Relaxed);
         let mut remaining = samples;
         if let Some(bucket) = self.logic_samples.back_mut() {
             let available = self
@@ -2778,6 +2844,7 @@ struct WaveCraftApp {
     logic_smart_timing_enabled: bool,
     logic_marker_settings: LogicMarkerSettings,
     protocol_analyzer: ProtocolAnalyzerSettings,
+    protocol_decode_cache: ProtocolDecodeCache,
     scope_channel_colors: [Color32; 2],
     logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
     scope_channel_names: [String; 2],
@@ -2849,6 +2916,7 @@ impl WaveCraftApp {
             logic_smart_timing_enabled: true,
             logic_marker_settings: LogicMarkerSettings::default(),
             protocol_analyzer: ProtocolAnalyzerSettings::default(),
+            protocol_decode_cache: ProtocolDecodeCache::default(),
             scope_channel_colors: SCOPE_COLORS,
             logic_channel_names: empty_logic_channel_names(),
             scope_channel_names: empty_scope_channel_names(),
@@ -7473,6 +7541,8 @@ impl eframe::App for WaveCraftApp {
         }
 
         let mut snapshot_plot_rect = None;
+        let protocol_analyzer_for_waveform = self.protocol_analyzer.clone();
+        let mut protocol_decode_cache = std::mem::take(&mut self.protocol_decode_cache);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -7568,6 +7638,8 @@ impl eframe::App for WaveCraftApp {
                                         marker_settings: &mut logic_marker_settings,
                                         maximum_heights: &mut logic_maximum_heights,
                                         enabled_channels: &mut logic_enabled_channels,
+                                        protocol_analyzer: &protocol_analyzer_for_waveform,
+                                        protocol_decode_cache: &mut protocol_decode_cache,
                                         time_axis: None,
                                     },
                                     &mut logic_viewport,
@@ -7663,6 +7735,8 @@ impl eframe::App for WaveCraftApp {
                                 marker_settings: &mut logic_marker_settings,
                                 maximum_heights: &mut logic_maximum_heights,
                                 enabled_channels: &mut logic_enabled_channels,
+                                protocol_analyzer: &protocol_analyzer_for_waveform,
+                                protocol_decode_cache: &mut protocol_decode_cache,
                                 time_axis: None,
                             },
                             CombinedWaveformViewports {
@@ -7734,6 +7808,7 @@ impl eframe::App for WaveCraftApp {
                 }
                 self.scope_settings.trigger = scope_trigger_settings;
             });
+        self.protocol_decode_cache = protocol_decode_cache;
         self.snapshot_plot_rect = snapshot_plot_rect;
         if snapshot_clicked {
             if let Some(plot_rect) = snapshot_plot_rect {
@@ -9032,6 +9107,8 @@ struct LogicWaveformOptions<'a> {
     marker_settings: &'a mut LogicMarkerSettings,
     maximum_heights: &'a mut [u8; LOGIC_CHANNEL_COUNT],
     enabled_channels: &'a mut [bool; LOGIC_CHANNEL_COUNT],
+    protocol_analyzer: &'a ProtocolAnalyzerSettings,
+    protocol_decode_cache: &'a mut ProtocolDecodeCache,
     time_axis: Option<WaveformTimeAxis>,
 }
 
@@ -10602,6 +10679,186 @@ fn paint_logic_timing_hint(
     }
 }
 
+const LOGIC_PROTOCOL_LANE_HEIGHT: f32 = 30.0;
+const LOGIC_PROTOCOL_LABEL_WIDTH: f32 = 82.0;
+
+fn logic_protocol_lane_layout(plot: Rect, lane_count: usize) -> (Rect, Vec<Rect>) {
+    if lane_count == 0 {
+        return (plot, Vec::new());
+    }
+    let available_height = (plot.height() - 80.0).max(0.0);
+    let total_height = (lane_count as f32 * LOGIC_PROTOCOL_LANE_HEIGHT)
+        .min(available_height)
+        .min(plot.height() * 0.4);
+    if total_height <= 0.0 {
+        return (plot, Vec::new());
+    }
+    let signal_plot = Rect::from_min_max(
+        plot.min,
+        Pos2::new(plot.right(), plot.bottom() - total_height),
+    );
+    let lane_height = total_height / lane_count as f32;
+    let lanes = (0..lane_count)
+        .map(|index| {
+            Rect::from_min_max(
+                Pos2::new(
+                    plot.left(),
+                    signal_plot.bottom() + index as f32 * lane_height,
+                ),
+                Pos2::new(
+                    plot.right(),
+                    signal_plot.bottom() + (index + 1) as f32 * lane_height,
+                ),
+            )
+        })
+        .collect();
+    (signal_plot, lanes)
+}
+
+fn paint_logic_protocol_lanes(
+    ui: &egui::Ui,
+    lanes: &[Rect],
+    waveforms: &WaveformStore,
+    viewport: WaveformViewport,
+    settings: &ProtocolAnalyzerSettings,
+    cache: &mut ProtocolDecodeCache,
+) {
+    if lanes.is_empty() {
+        return;
+    }
+    let outcomes = cache.outcomes(waveforms, &settings.analyzers);
+    for (lane_index, ((lane, analyzer), outcome)) in lanes
+        .iter()
+        .zip(&settings.analyzers)
+        .zip(outcomes)
+        .enumerate()
+    {
+        let color = logic_marker_color(lane_index);
+        let painter = ui.painter().with_clip_rect(*lane);
+        painter.rect_filled(*lane, 0.0, PANEL.gamma_multiply(0.72));
+        painter.line_segment(
+            [lane.left_top(), lane.right_top()],
+            Stroke::new(1.0_f32, GRID),
+        );
+
+        match outcome {
+            ProtocolDecodeOutcome::Events(events) => {
+                for (event_index, event) in events.iter().enumerate() {
+                    let (Some(start_x), Some(end_x)) = (
+                        logic_marker_x(
+                            *lane,
+                            viewport,
+                            waveforms.logic_sample_offset,
+                            waveforms.logic_sample_count,
+                            event.start_sample,
+                        ),
+                        logic_marker_x(
+                            *lane,
+                            viewport,
+                            waveforms.logic_sample_offset,
+                            waveforms.logic_sample_count,
+                            event.end_sample,
+                        ),
+                    ) else {
+                        continue;
+                    };
+                    if end_x < lane.left() || start_x > lane.right() {
+                        continue;
+                    }
+                    let event_rect = Rect::from_min_max(
+                        Pos2::new(start_x.max(lane.left()), lane.top() + 3.0),
+                        Pos2::new(
+                            end_x.max(start_x + 1.0).min(lane.right()),
+                            lane.bottom() - 3.0,
+                        ),
+                    );
+                    let event_color = if event.warning {
+                        Color32::LIGHT_RED
+                    } else {
+                        color
+                    };
+                    painter.rect_filled(event_rect, 3.0, event_color.gamma_multiply(0.22));
+                    painter.rect_stroke(event_rect, 3.0, Stroke::new(0.8_f32, event_color));
+                    let estimated_text_width = event.text.chars().count() as f32 * 6.5 + 8.0;
+                    if event_rect.width() >= estimated_text_width {
+                        painter.text(
+                            event_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            &event.text,
+                            FontId::monospace(9.0),
+                            Color32::WHITE,
+                        );
+                    }
+                    ui.interact(
+                        event_rect.expand(2.0),
+                        ui.make_persistent_id((
+                            "protocol_decoded_event",
+                            analyzer.instance_id,
+                            event_index,
+                        )),
+                        Sense::hover(),
+                    )
+                    .on_hover_text(format!(
+                        "{}\nSamples {}–{}",
+                        event.detail, event.start_sample, event.end_sample
+                    ));
+                }
+                if events.is_empty() {
+                    painter.text(
+                        Pos2::new(
+                            lane.left() + LOGIC_PROTOCOL_LABEL_WIDTH + 8.0,
+                            lane.center().y,
+                        ),
+                        egui::Align2::LEFT_CENTER,
+                        if waveforms.logic_sample_count == 0 {
+                            "Waiting for logic samples"
+                        } else {
+                            "No decoded bytes"
+                        },
+                        FontId::monospace(9.0),
+                        TEXT_MUTED,
+                    );
+                }
+            }
+            ProtocolDecodeOutcome::Unavailable(message) => {
+                painter.text(
+                    Pos2::new(
+                        lane.left() + LOGIC_PROTOCOL_LABEL_WIDTH + 8.0,
+                        lane.center().y,
+                    ),
+                    egui::Align2::LEFT_CENTER,
+                    message,
+                    FontId::monospace(9.0),
+                    TEXT_MUTED,
+                );
+            }
+        }
+
+        let label_rect = Rect::from_min_max(
+            lane.min,
+            Pos2::new(
+                (lane.left() + LOGIC_PROTOCOL_LABEL_WIDTH).min(lane.right()),
+                lane.bottom(),
+            ),
+        );
+        painter.rect_filled(label_rect, 0.0, PANEL);
+        painter.line_segment(
+            [label_rect.right_top(), label_rect.right_bottom()],
+            Stroke::new(1.0_f32, color.gamma_multiply(0.65)),
+        );
+        let label = protocol_by_id(analyzer.protocol_id)
+            .map(|protocol| protocol.name)
+            .unwrap_or(analyzer.protocol_id);
+        painter.text(
+            label_rect.left_center() + Vec2::new(6.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            label,
+            FontId::monospace(9.0),
+            color,
+        );
+    }
+}
+
 fn paint_logic(
     ui: &egui::Ui,
     rect: Rect,
@@ -10618,6 +10875,8 @@ fn paint_logic(
         marker_settings,
         maximum_heights,
         enabled_channels,
+        protocol_analyzer,
+        protocol_decode_cache,
         time_axis,
     } = options;
     paint_plot_background(ui, rect);
@@ -10638,7 +10897,10 @@ fn paint_logic(
     } else {
         waveforms.logic_rate_hz
     };
-    let signal_layout = logic_signal_layout(plot.top(), plot.height(), &*maximum_heights);
+    let (signal_plot, protocol_lanes) =
+        logic_protocol_lane_layout(plot, protocol_analyzer.analyzers.len());
+    let signal_layout =
+        logic_signal_layout(signal_plot.top(), signal_plot.height(), &*maximum_heights);
     let _ = update_waveform_viewport(
         ui,
         plot,
@@ -10655,20 +10917,20 @@ fn paint_logic(
     );
     update_logic_marker_gesture(
         ui,
-        plot,
+        signal_plot,
         waveforms,
         viewport,
         &signal_layout.levels,
         enabled_channels,
         marker_settings,
     );
-    let lane_height = plot.height() / LOGIC_CHANNEL_COUNT as f32;
+    let lane_height = signal_plot.height() / LOGIC_CHANNEL_COUNT as f32;
     for channel in 0..LOGIC_CHANNEL_COUNT {
-        let lane_top = plot.top() + channel as f32 * lane_height;
+        let lane_top = signal_plot.top() + channel as f32 * lane_height;
         painter.line_segment(
             [
-                Pos2::new(plot.left(), lane_top),
-                Pos2::new(plot.right(), lane_top),
+                Pos2::new(signal_plot.left(), lane_top),
+                Pos2::new(signal_plot.right(), lane_top),
             ],
             Stroke::new(0.6_f32, GRID.gamma_multiply(0.45)),
         );
@@ -10682,7 +10944,7 @@ fn paint_logic(
             sample_stride: waveforms.logic_sample_stride,
         },
         visible_range.clone(),
-        plot,
+        signal_plot,
         *viewport,
         &signal_layout.levels,
         enabled_channels,
@@ -10698,8 +10960,9 @@ fn paint_logic(
         let channel_label = channel_label("D", channel, channel_name);
         let marker_text = logic_channel_marker_text(channel, channel_name);
         let (_, low) = signal_layout.levels[channel];
-        paint_logic_zero_reference(painter, plot, low, *channel_color);
-        let marker_rect = logic_channel_marker_rect(plot, low, marker_lane_height, &marker_text);
+        paint_logic_zero_reference(painter, signal_plot, low, *channel_color);
+        let marker_rect =
+            logic_channel_marker_rect(signal_plot, low, marker_lane_height, &marker_text);
         let marker_response = ui
             .interact(
                 marker_rect.expand(3.0),
@@ -10809,7 +11072,7 @@ fn paint_logic(
         }
         paint_logic_channel_marker(
             painter,
-            plot,
+            signal_plot,
             low,
             marker_lane_height,
             &marker_text,
@@ -10817,15 +11080,23 @@ fn paint_logic(
             *channel_marker_opacity,
         );
     }
+    paint_logic_protocol_lanes(
+        ui,
+        &protocol_lanes,
+        waveforms,
+        *viewport,
+        protocol_analyzer,
+        protocol_decode_cache,
+    );
     paint_logic_markers(ui, plot, waveforms, *viewport, marker_settings);
     let smart_timing = smart_timing_enabled
         .then(|| ui.input(|input| input.pointer.hover_pos()))
         .flatten()
-        .filter(|pointer| plot.contains(*pointer))
+        .filter(|pointer| signal_plot.contains(*pointer))
         .and_then(|pointer| {
             let channel = logic_channel_at_y(&signal_layout.levels, enabled_channels, pointer.y)?;
             let sample = logic_sample_at_x(
-                plot,
+                signal_plot,
                 *viewport,
                 waveforms.logic_sample_offset,
                 waveforms.logic_sample_count,
@@ -10836,7 +11107,7 @@ fn paint_logic(
     if let Some(measurement) = smart_timing {
         paint_logic_timing_hint(
             painter,
-            plot,
+            signal_plot,
             waveforms,
             *viewport,
             measurement,
@@ -10844,7 +11115,7 @@ fn paint_logic(
         );
     }
     if visible_count == 0 {
-        paint_empty(painter, plot, "Waiting for logic samples");
+        paint_empty(painter, signal_plot, "Waiting for logic samples");
     }
     paint_waveform_time_scale(
         painter,
