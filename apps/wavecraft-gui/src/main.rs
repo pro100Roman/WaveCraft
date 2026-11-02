@@ -89,6 +89,7 @@ const LOGIC_MARKER_NAME_MAX_CHARS: usize = 32;
 const CHANNEL_NAME_MAX_CHARS: usize = 32;
 const LOGIC_CHANNEL_NAME_MAX_CHARS: usize = 8;
 const MAX_SESSION_TABS: usize = 10;
+const SESSION_NAME_MAX_CHARS: usize = 48;
 const DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY: u8 = 128;
 const LOGIC_MARKER_EDGE_SNAP_DISTANCE: f32 = 8.0;
 const CAPTURE_FILE_BUTTON_WIDTH: f32 = 82.0;
@@ -2413,6 +2414,7 @@ struct CompletedCapture {
 }
 
 struct SessionTab<T, S> {
+    name: String,
     capture: Option<T>,
     settings: S,
 }
@@ -2420,6 +2422,7 @@ struct SessionTab<T, S> {
 struct SessionTabs<T, S> {
     tabs: Vec<SessionTab<T, S>>,
     active: usize,
+    next_default_number: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2427,16 +2430,26 @@ enum SessionTabAction {
     Select(usize),
     Add,
     Close(usize),
+    BeginRename(usize),
+}
+
+struct SessionNameEditor {
+    target: CaptureTarget,
+    index: usize,
+    draft: String,
+    request_focus: bool,
 }
 
 impl<T, S> SessionTabs<T, S> {
     fn new(settings: S) -> Self {
         Self {
             tabs: vec![SessionTab {
+                name: "Session 1".to_owned(),
                 capture: None,
                 settings,
             }],
             active: 0,
+            next_default_number: 2,
         }
     }
 
@@ -2446,6 +2459,14 @@ impl<T, S> SessionTabs<T, S> {
 
     fn active_index(&self) -> usize {
         self.active
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.tabs.iter().map(|tab| tab.name.clone()).collect()
+    }
+
+    fn name(&self, index: usize) -> Option<&str> {
+        self.tabs.get(index).map(|tab| tab.name.as_str())
     }
 
     fn active_capture(&self) -> Option<&T> {
@@ -2477,14 +2498,29 @@ impl<T, S> SessionTabs<T, S> {
     }
 
     fn add(&mut self, settings: S) -> bool {
-        if self.tabs.len() >= MAX_SESSION_TABS {
+        if self.len() >= MAX_SESSION_TABS {
             return false;
         }
+        let name = format!("Session {}", self.next_default_number);
+        self.next_default_number += 1;
         self.tabs.push(SessionTab {
+            name,
             capture: None,
             settings,
         });
         self.active = self.tabs.len() - 1;
+        true
+    }
+
+    fn rename(&mut self, index: usize, name: &str) -> bool {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return false;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        tab.name = name.chars().take(SESSION_NAME_MAX_CHARS).collect();
         true
     }
 
@@ -2497,7 +2533,7 @@ impl<T, S> SessionTabs<T, S> {
     }
 
     fn close(&mut self, index: usize) -> bool {
-        if self.tabs.len() <= 1 || index >= self.tabs.len() {
+        if self.len() <= 1 || index >= self.len() {
             return false;
         }
         self.tabs.remove(index);
@@ -2512,10 +2548,12 @@ impl<T, S> SessionTabs<T, S> {
     fn reset(&mut self, settings: S) {
         self.tabs.clear();
         self.tabs.push(SessionTab {
+            name: "Session 1".to_owned(),
             capture: None,
             settings,
         });
         self.active = 0;
+        self.next_default_number = 2;
     }
 
     fn any(&self, predicate: impl Fn(&T) -> bool) -> bool {
@@ -2722,6 +2760,7 @@ struct WaveCraftApp {
     capture: Option<ActiveCapture>,
     logic_sessions: SessionTabs<CompletedCapture, LogicSessionSettings>,
     scope_sessions: SessionTabs<CompletedCapture, ScopeSessionSettings>,
+    session_name_editor: Option<SessionNameEditor>,
     combined_capture: Option<CompletedCapture>,
     combined_settings: CombinedSessionSettings,
     status: String,
@@ -2792,6 +2831,7 @@ impl WaveCraftApp {
             capture: None,
             logic_sessions: SessionTabs::new(LogicSessionSettings::default()),
             scope_sessions: SessionTabs::new(ScopeSessionSettings::default()),
+            session_name_editor: None,
             combined_capture: None,
             combined_settings: CombinedSessionSettings {
                 logic_ratio: 0.55,
@@ -4134,6 +4174,7 @@ impl WaveCraftApp {
         let scope_settings = self.current_scope_session_settings();
         self.logic_sessions.reset(logic_settings);
         self.scope_sessions.reset(scope_settings);
+        self.session_name_editor = None;
         self.combined_capture = None;
     }
 
@@ -7103,18 +7144,22 @@ impl eframe::App for WaveCraftApp {
         let session_tab_state = match self.active_waveform_tab {
             Some(WaveformTab::LogicAnalyzer) => Some((
                 CaptureTarget::LogicAnalyzer,
-                self.logic_sessions.len(),
+                self.logic_sessions.names(),
                 self.logic_sessions.active_index(),
             )),
             Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => Some((
                 CaptureTarget::Oscilloscope,
-                self.scope_sessions.len(),
+                self.scope_sessions.names(),
                 self.scope_sessions.active_index(),
             )),
             Some(WaveformTab::Combined) | None => None,
         };
         let mut session_tab_action = None;
-        if let Some((target, tab_count, active_tab)) = session_tab_state {
+        let mut session_name_commit = false;
+        let mut session_name_cancel = false;
+        if let Some((target, tab_names, active_tab)) = session_tab_state {
+            let tab_count = tab_names.len();
+            let sessions_enabled = !self.is_busy();
             egui::TopBottomPanel::bottom("session_tabs")
                 .frame(
                     egui::Frame::none()
@@ -7128,33 +7173,71 @@ impl eframe::App for WaveCraftApp {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("SESSION").strong().color(TEXT_MUTED));
                                 ui.separator();
-                                for index in 0..tab_count {
+                                for (index, name) in tab_names.iter().enumerate() {
                                     ui.horizontal(|ui| {
-                                        if ui
-                                            .add_enabled(
-                                                !self.is_busy(),
-                                                egui::SelectableLabel::new(
-                                                    active_tab == index,
-                                                    format!("Session {}", index + 1),
-                                                ),
-                                            )
-                                            .on_hover_text(if self.is_busy() {
-                                                "Stop the active acquisition before changing sessions"
-                                            } else {
-                                                "Show this session's captured waveform"
-                                            })
-                                            .clicked()
-                                        {
-                                            session_tab_action =
-                                                Some((target, SessionTabAction::Select(index)));
+                                        let editing = self
+                                            .session_name_editor
+                                            .as_ref()
+                                            .is_some_and(|editor| {
+                                                editor.target == target && editor.index == index
+                                            });
+                                        if editing {
+                                            if let Some(editor) = self.session_name_editor.as_mut() {
+                                                let response = ui.add_enabled(
+                                                    sessions_enabled,
+                                                    egui::TextEdit::singleline(&mut editor.draft)
+                                                        .char_limit(SESSION_NAME_MAX_CHARS)
+                                                        .desired_width(140.0),
+                                                );
+                                                if editor.request_focus {
+                                                    response.request_focus();
+                                                    editor.request_focus = false;
+                                                }
+                                                let escape_pressed = ui.input(|input| {
+                                                    input.key_pressed(egui::Key::Escape)
+                                                });
+                                                let enter_pressed = ui.input(|input| {
+                                                    input.key_pressed(egui::Key::Enter)
+                                                });
+                                                if escape_pressed {
+                                                    session_name_cancel = true;
+                                                } else if enter_pressed || response.lost_focus() {
+                                                    session_name_commit = true;
+                                                }
+                                            }
+                                        } else {
+                                            let response = ui
+                                                .add_enabled(
+                                                    sessions_enabled,
+                                                    egui::SelectableLabel::new(
+                                                        active_tab == index,
+                                                        name,
+                                                    ),
+                                                )
+                                                .on_hover_text(if sessions_enabled {
+                                                    "Show this session · double-click to rename"
+                                                } else {
+                                                    "Stop the active acquisition before changing sessions"
+                                                });
+                                            if response.double_clicked() {
+                                                session_tab_action = Some((
+                                                    target,
+                                                    SessionTabAction::BeginRename(index),
+                                                ));
+                                            } else if response.clicked() {
+                                                session_tab_action = Some((
+                                                    target,
+                                                    SessionTabAction::Select(index),
+                                                ));
+                                            }
                                         }
-                                        let close_enabled = !self.is_busy() && tab_count > 1;
+                                        let close_enabled = sessions_enabled && tab_count > 1;
                                         if ui
                                             .add_enabled(
                                                 close_enabled,
                                                 egui::Button::new("×").small().frame(false),
                                             )
-                                            .on_hover_text(if self.is_busy() {
+                                            .on_hover_text(if !sessions_enabled {
                                                 "Stop the active acquisition before closing a session"
                                             } else if tab_count <= 1 {
                                                 "At least one session must remain open"
@@ -7168,12 +7251,12 @@ impl eframe::App for WaveCraftApp {
                                         }
                                     });
                                 }
-                                let add_enabled = !self.is_busy() && tab_count < MAX_SESSION_TABS;
+                                let add_enabled = sessions_enabled && tab_count < MAX_SESSION_TABS;
                                 if ui
                                     .add_enabled(add_enabled, egui::Button::new("+").small())
                                     .on_hover_text(if tab_count >= MAX_SESSION_TABS {
                                         "The 10-session limit has been reached"
-                                    } else if self.is_busy() {
+                                    } else if !sessions_enabled {
                                         "Stop the active acquisition before adding a session"
                                     } else {
                                         "Add a new empty session"
@@ -7186,7 +7269,38 @@ impl eframe::App for WaveCraftApp {
                         });
                 });
         }
+        if session_name_cancel {
+            self.session_name_editor = None;
+        } else if session_name_commit {
+            if let Some(editor) = self.session_name_editor.take() {
+                let renamed = match editor.target {
+                    CaptureTarget::LogicAnalyzer => {
+                        self.logic_sessions.rename(editor.index, &editor.draft)
+                    }
+                    CaptureTarget::Oscilloscope => {
+                        self.scope_sessions.rename(editor.index, &editor.draft)
+                    }
+                    CaptureTarget::Combined => false,
+                };
+                if renamed {
+                    self.status = "Session renamed".to_owned();
+                    self.last_error = None;
+                }
+            }
+        }
         if let Some((target, action)) = session_tab_action {
+            let action_session_name = match action {
+                SessionTabAction::Close(index) => match target {
+                    CaptureTarget::LogicAnalyzer => self.logic_sessions.name(index),
+                    CaptureTarget::Oscilloscope => self.scope_sessions.name(index),
+                    CaptureTarget::Combined => None,
+                }
+                .map(str::to_owned),
+                _ => None,
+            };
+            if !matches!(action, SessionTabAction::BeginRename(_)) {
+                self.session_name_editor = None;
+            }
             let changed = match target {
                 CaptureTarget::LogicAnalyzer => {
                     self.save_active_logic_session_settings();
@@ -7211,6 +7325,19 @@ impl eframe::App for WaveCraftApp {
                                 let settings = self.logic_sessions.active_settings().clone();
                                 self.apply_logic_session_settings(settings);
                                 true
+                            }
+                        }
+                        SessionTabAction::BeginRename(index) => {
+                            if let Some(name) = self.logic_sessions.name(index).map(str::to_owned) {
+                                self.session_name_editor = Some(SessionNameEditor {
+                                    target,
+                                    index,
+                                    draft: name,
+                                    request_focus: true,
+                                });
+                                true
+                            } else {
+                                false
                             }
                         }
                     }
@@ -7240,6 +7367,19 @@ impl eframe::App for WaveCraftApp {
                                 true
                             }
                         }
+                        SessionTabAction::BeginRename(index) => {
+                            if let Some(name) = self.scope_sessions.name(index).map(str::to_owned) {
+                                self.session_name_editor = Some(SessionNameEditor {
+                                    target,
+                                    index,
+                                    draft: name,
+                                    request_focus: true,
+                                });
+                                true
+                            } else {
+                                false
+                            }
+                        }
                     }
                 }
                 CaptureTarget::Combined => unreachable!("combined view has no session tabs"),
@@ -7247,26 +7387,30 @@ impl eframe::App for WaveCraftApp {
             if changed {
                 match action {
                     SessionTabAction::Add => {
-                        let active_index = match target {
-                            CaptureTarget::LogicAnalyzer => self.logic_sessions.active_index(),
-                            CaptureTarget::Oscilloscope => self.scope_sessions.active_index(),
+                        let active_name = match target {
+                            CaptureTarget::LogicAnalyzer => {
+                                self.logic_sessions.name(self.logic_sessions.active_index())
+                            }
+                            CaptureTarget::Oscilloscope => {
+                                self.scope_sessions.name(self.scope_sessions.active_index())
+                            }
                             CaptureTarget::Combined => {
                                 unreachable!("combined view has no session tabs")
                             }
-                        };
-                        self.status =
-                            format!("Added {} session {}", target.label(), active_index + 1);
+                        }
+                        .unwrap_or("session");
+                        self.status = format!("Added {} {active_name}", target.label());
                         self.last_error = None;
                     }
-                    SessionTabAction::Close(index) => {
+                    SessionTabAction::Close(_) => {
                         self.status = format!(
-                            "Closed {} session {}; its data was discarded",
+                            "Closed {} {}; its data was discarded",
                             target.label(),
-                            index + 1
+                            action_session_name.as_deref().unwrap_or("session")
                         );
                         self.last_error = None;
                     }
-                    SessionTabAction::Select(_) => {}
+                    SessionTabAction::Select(_) | SessionTabAction::BeginRename(_) => {}
                 }
             }
         }
@@ -13314,6 +13458,8 @@ mod tests {
         assert!(!sessions.add(()));
         assert_eq!(sessions.active_index(), MAX_SESSION_TABS - 1);
         assert!(!sessions.select(MAX_SESSION_TABS));
+        assert_eq!(sessions.name(0), Some("Session 1"));
+        assert_eq!(sessions.name(MAX_SESSION_TABS - 1), Some("Session 10"));
     }
 
     #[test]
@@ -13327,6 +13473,7 @@ mod tests {
 
         assert!(sessions.close(0));
         assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.names(), ["Session 2", "Session 3"]);
         assert_eq!(sessions.active_index(), 1);
         assert_eq!(*sessions.active_settings(), 30);
         assert_eq!(sessions.active_capture(), Some(&"third capture"));
@@ -13338,6 +13485,9 @@ mod tests {
         assert_eq!(sessions.active_capture(), Some(&"second capture"));
         assert!(!sessions.close(0));
         assert!(!sessions.close(1));
+
+        assert!(sessions.add(40));
+        assert_eq!(sessions.names(), ["Session 2", "Session 4"]);
     }
 
     #[test]
@@ -13351,6 +13501,23 @@ mod tests {
 
         assert_eq!(sessions.active_index(), 1);
         assert_eq!(*sessions.active_settings(), "third");
+    }
+
+    #[test]
+    fn renamed_session_name_persists_across_selection_and_closing_other_tabs() {
+        let mut sessions = SessionTabs::<(), _>::new("first");
+        assert!(sessions.add("second"));
+        assert!(sessions.add("third"));
+        assert!(sessions.rename(1, "  SPI boot  "));
+        assert!(!sessions.rename(1, "   "));
+
+        assert!(sessions.select(0));
+        assert!(sessions.select(1));
+        assert_eq!(sessions.name(1), Some("SPI boot"));
+
+        assert!(sessions.close(0));
+        assert_eq!(sessions.names(), ["SPI boot", "Session 3"]);
+        assert_eq!(sessions.name(0), Some("SPI boot"));
     }
 
     #[test]
