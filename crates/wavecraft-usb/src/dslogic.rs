@@ -48,6 +48,7 @@ const HALF_MODE_BIT: u16 = 5;
 const QUARTER_MODE_BIT: u16 = 6;
 const FILTER_BIT: u16 = 8;
 const LOOP_MODE_BIT: u16 = 7;
+const SLOW_ACQUISITION_BIT: u16 = 10;
 const STREAM_MODE_BIT: u16 = 12;
 const INTERNAL_TEST_BIT: u16 = 15;
 
@@ -424,6 +425,11 @@ impl DsLogicCaptureConfig {
             DsLogicOperationMode::Stream => 1 << STREAM_MODE_BIT,
             DsLogicOperationMode::InternalTest => 1 << INTERNAL_TEST_BIT,
         };
+        // The vendor FPGA needs its slow-acquisition path when the packed
+        // wire rate falls below one 1,024-byte USB packet per millisecond.
+        // Without this bit, low-rate captures arm but never produce bulk data.
+        let bytes_per_millisecond =
+            self.sample_rate_hz as u128 * u128::from(self.enabled_channel_count()) / 8 / 1_000;
         let mode = operation_mode
             | (u16::from(self.external_clock) << CLOCK_TYPE_BIT)
             | (u16::from(self.falling_clock_edge) << CLOCK_EDGE_BIT)
@@ -445,7 +451,9 @@ impl DsLogicCaptureConfig {
                         400_000_000
                     },
             ) << QUARTER_MODE_BIT)
-            | (u16::from(self.input_filter == DsLogicInputFilter::OneSampleClock) << FILTER_BIT);
+            | (u16::from(self.input_filter == DsLogicInputFilter::OneSampleClock) << FILTER_BIT)
+            | (u16::from(bytes_per_millisecond < USB_TRANSFER_ALIGNMENT as u128)
+                << SLOW_ACQUISITION_BIT);
         let enabled_channel_mask_low = self.enabled_channels[..16]
             .iter()
             .enumerate()
@@ -1622,6 +1630,29 @@ mod tests {
         );
         assert_eq!(settings.stop_option(), DsLogicStopOption::StopImmediately);
         assert_eq!(settings.threshold_voltage(), 2.5);
+    }
+
+    #[test]
+    fn encodes_slow_acquisition_for_sub_packet_wire_rates() {
+        let mut one_channel = [false; CHANNEL_COUNT as usize];
+        one_channel[0] = true;
+
+        let slow = DsLogicCaptureConfig::new(5_000_000, 5_000_000)
+            .expect("configuration should be valid")
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_enabled_channels(one_channel)
+            .expect("one channel should be valid");
+        assert_eq!(
+            read_u16(&slow.encode_settings(), 6),
+            (1 << STREAM_MODE_BIT) | (1 << SLOW_ACQUISITION_BIT)
+        );
+
+        let normal = DsLogicCaptureConfig::new(10_000_000, 10_000_000)
+            .expect("configuration should be valid")
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_enabled_channels(one_channel)
+            .expect("one channel should be valid");
+        assert_eq!(read_u16(&normal.encode_settings(), 6), 1 << STREAM_MODE_BIT);
     }
 
     #[test]

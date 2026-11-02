@@ -451,6 +451,14 @@ impl UsbDeviceSession {
             )));
         }
 
+        // The Cypress GPIF word-width setting is not persistent across every
+        // stop/reset sequence. The vendor driver restores it before each arm
+        // operation on USB 2 devices; otherwise the FPGA accepts its settings
+        // but the capture endpoint never starts transferring data.
+        if self.device.speed < crate::UsbSpeedClass::SuperSpeed {
+            self.write_control(WORD_WIDTH_DESTINATION, 0, &[WORD_WIDTH_WIDE])?;
+        }
+
         self.write_control(
             BULK_WRITE_DESTINATION,
             0,
