@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 wavecraft-core = { path = "../wavecraft-core" }
+wavecraft-recording = { path = "../wavecraft-recording" }
 wavecraft-sim = { path = "../wavecraft-sim" }
 wavecraft-usb = { path = "../wavecraft-usb" }
 

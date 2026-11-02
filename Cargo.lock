@@ -2986,6 +2986,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wavecraft-core",
+ "wavecraft-recording",
  "wavecraft-sim",
  "wavecraft-usb",
 ]

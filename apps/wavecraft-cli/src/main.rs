@@ -4,7 +4,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::time::{Duration, Instant};
-use wavecraft_automation::{AutomationManager, DeviceBackend, DeviceSelector};
+use wavecraft_automation::{
+    AutomationEvent, AutomationEventKind, AutomationManager, CaptureConfiguration, DeviceBackend,
+    DeviceSelector,
+};
 use wavecraft_core::{CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSource, DeviceId};
 use wavecraft_recording::{
     export_saleae_recording, import_saleae_recording, CompletionStatus, RecordingReader,
@@ -17,7 +20,7 @@ use wavecraft_usb::{
     LinkStatus,
 };
 
-const USAGE: &str = "usage: wavecraft-cli [devices list [--format json] | devices probe --id <connection-id> [--format json] | list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
+const USAGE: &str = "usage: wavecraft-cli [devices list [--format json] | devices probe --id <connection-id> [--format json] | capture run --device <connection-id> --sample-rate <hz> --samples <count> --channels <0,1,...> --output <capture.dsv> [--timeout-ms <ms>] [--events ndjson] | list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
 
 type FileRecorder = RecordingWriter<BufWriter<File>>;
 
@@ -31,6 +34,11 @@ struct DeviceStats {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments.first().map(String::as_str) == Some("capture")
+        && arguments.get(1).map(String::as_str) == Some("run")
+    {
+        return automation_capture_run(&arguments[2..]);
+    }
     match arguments.as_slice() {
         [group, command] if group == "devices" && command == "list" => {
             return automation_list_devices(false);
@@ -124,6 +132,170 @@ fn main() -> Result<(), Box<dyn Error>> {
     run_simulation(run_seconds, None)
 }
 
+#[derive(Debug)]
+struct AutomationCaptureArguments {
+    device_id: String,
+    sample_rate_hz: u64,
+    sample_count: u64,
+    channels: Vec<u8>,
+    output: String,
+    timeout_ms: Option<u64>,
+    ndjson_events: bool,
+}
+
+fn automation_capture_run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let arguments = parse_automation_capture_arguments(arguments)?;
+    let manager = automation_manager_for_device(&arguments.device_id);
+    let device = match manager.open_device(DeviceSelector::connection_id(&arguments.device_id)) {
+        Ok(device) => device,
+        Err(error) => return report_capture_error(error, arguments.ndjson_events),
+    };
+    let mut configuration = CaptureConfiguration::finite_logic(
+        arguments.sample_rate_hz,
+        arguments.sample_count,
+        arguments.channels,
+        &arguments.output,
+    );
+    if let Some(timeout_ms) = arguments.timeout_ms {
+        configuration = configuration.with_timeout(Duration::from_millis(timeout_ms));
+    }
+    let capture = match device.start_capture(configuration) {
+        Ok(capture) => capture,
+        Err(error) => return report_capture_error(error, arguments.ndjson_events),
+    };
+
+    loop {
+        if let Some(event) = capture.next_event(Duration::from_millis(100))? {
+            print_capture_event(&event, arguments.ndjson_events)?;
+        }
+        if capture.status().is_terminal() {
+            while let Some(event) = capture.next_event(Duration::ZERO)? {
+                print_capture_event(&event, arguments.ndjson_events)?;
+            }
+            break;
+        }
+    }
+
+    match capture.wait() {
+        Ok(completed) => {
+            if arguments.ndjson_events {
+                println!("{}", serde_json::to_string(&completed)?);
+            } else {
+                println!(
+                    "capture {} completed: {} samples in {} frame(s), recording {}",
+                    completed.summary.capture_id,
+                    completed.summary.captured_samples,
+                    completed.summary.frame_count,
+                    completed.recording_path().display()
+                );
+            }
+            Ok(())
+        }
+        Err(error) => report_capture_error(error, arguments.ndjson_events),
+    }
+}
+
+fn parse_automation_capture_arguments(
+    arguments: &[String],
+) -> Result<AutomationCaptureArguments, Box<dyn Error>> {
+    let mut device_id = None;
+    let mut sample_rate_hz = None;
+    let mut sample_count = None;
+    let mut channels = None;
+    let mut output = None;
+    let mut timeout_ms = None;
+    let mut ndjson_events = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = arguments[index].as_str();
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match flag {
+            "--device" if device_id.is_none() => device_id = Some(value.clone()),
+            "--sample-rate" if sample_rate_hz.is_none() => {
+                sample_rate_hz = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid --sample-rate value {value}: {error}"))?,
+                )
+            }
+            "--samples" if sample_count.is_none() => {
+                sample_count = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid --samples value {value}: {error}"))?,
+                )
+            }
+            "--channels" if channels.is_none() => {
+                let parsed = value
+                    .split(',')
+                    .map(|channel| {
+                        channel.parse::<u8>().map_err(|error| {
+                            format!("invalid channel {channel} in --channels: {error}")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                channels = Some(parsed);
+            }
+            "--output" if output.is_none() => output = Some(value.clone()),
+            "--timeout-ms" if timeout_ms.is_none() => {
+                timeout_ms = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid --timeout-ms value {value}: {error}"))?,
+                )
+            }
+            "--events" if !ndjson_events && value == "ndjson" => ndjson_events = true,
+            "--events" => return Err("--events currently supports only ndjson".into()),
+            _ => return Err(format!("unknown or duplicate capture option {flag}").into()),
+        }
+        index += 2;
+    }
+
+    Ok(AutomationCaptureArguments {
+        device_id: device_id.ok_or("capture run requires --device")?,
+        sample_rate_hz: sample_rate_hz.ok_or("capture run requires --sample-rate")?,
+        sample_count: sample_count.ok_or("capture run requires --samples")?,
+        channels: channels.ok_or("capture run requires --channels")?,
+        output: output.ok_or("capture run requires --output")?,
+        timeout_ms,
+        ndjson_events,
+    })
+}
+
+fn print_capture_event(event: &AutomationEvent, ndjson: bool) -> Result<(), Box<dyn Error>> {
+    if ndjson {
+        println!("{}", serde_json::to_string(event)?);
+        return Ok(());
+    }
+    match event.event {
+        AutomationEventKind::Status { status } => {
+            println!("capture {}: {status:?}", event.capture_id);
+        }
+        AutomationEventKind::Progress {
+            captured_samples,
+            requested_samples,
+        } => {
+            println!(
+                "capture {}: {captured_samples}/{requested_samples} samples",
+                event.capture_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn report_capture_error(
+    error: wavecraft_automation::AutomationError,
+    ndjson: bool,
+) -> Result<(), Box<dyn Error>> {
+    if ndjson {
+        println!("{}", serde_json::to_string(&error)?);
+    }
+    Err(Box::new(error))
+}
+
 fn automation_list_devices(json: bool) -> Result<(), Box<dyn Error>> {
     let listing = match AutomationManager::new().device_list() {
         Ok(listing) => listing,
@@ -157,7 +329,7 @@ fn automation_list_devices(json: bool) -> Result<(), Box<dyn Error>> {
 }
 
 fn automation_probe_device(device_id: &str, json: bool) -> Result<(), Box<dyn Error>> {
-    let manager = AutomationManager::new();
+    let manager = automation_manager_for_device(device_id);
     let handle = match manager.open_device(DeviceSelector::connection_id(device_id)) {
         Ok(handle) => handle,
         Err(error) => return report_automation_error(error, json),
@@ -187,6 +359,14 @@ fn automation_probe_device(device_id: &str, json: bool) -> Result<(), Box<dyn Er
         );
     }
     Ok(())
+}
+
+fn automation_manager_for_device(device_id: &str) -> AutomationManager {
+    if device_id.starts_with("sim:") {
+        AutomationManager::simulated()
+    } else {
+        AutomationManager::new()
+    }
 }
 
 fn report_automation_error(
@@ -965,4 +1145,55 @@ fn run_simulation(run_seconds: u64, output: Option<&Path>) -> Result<(), Box<dyn
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod automation_cli_tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn parses_direct_capture_arguments_in_any_order() {
+        let parsed = parse_automation_capture_arguments(&arguments(&[
+            "--samples",
+            "10000",
+            "--device",
+            "sim:logic-0",
+            "--channels",
+            "0,2,7",
+            "--output",
+            "capture.dsv",
+            "--sample-rate",
+            "100000",
+            "--events",
+            "ndjson",
+            "--timeout-ms",
+            "5000",
+        ]))
+        .expect("valid capture arguments should parse");
+
+        assert_eq!(parsed.device_id, "sim:logic-0");
+        assert_eq!(parsed.sample_rate_hz, 100_000);
+        assert_eq!(parsed.sample_count, 10_000);
+        assert_eq!(parsed.channels, [0, 2, 7]);
+        assert_eq!(parsed.output, "capture.dsv");
+        assert_eq!(parsed.timeout_ms, Some(5_000));
+        assert!(parsed.ndjson_events);
+    }
+
+    #[test]
+    fn rejects_duplicate_capture_options() {
+        let error = parse_automation_capture_arguments(&arguments(&[
+            "--device",
+            "sim:logic-0",
+            "--device",
+            "sim:logic-1",
+        ]))
+        .expect_err("duplicate device selection should fail");
+
+        assert!(error.to_string().contains("duplicate"));
+    }
 }

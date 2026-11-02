@@ -8,9 +8,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
+use std::fs::{File, OpenOptions};
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
-use wavecraft_core::InstrumentKind as CoreInstrumentKind;
-use wavecraft_sim::{SimulatedDeviceProfile, SIMULATED_DEVICE_PROFILES};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+use wavecraft_core::{
+    CaptureCoordinator, CaptureEvent as CoreCaptureEvent, CaptureSource, DeviceDescriptor,
+    DeviceId, InstrumentKind as CoreInstrumentKind,
+};
+use wavecraft_recording::{CompletionStatus, RecordingWriter};
+use wavecraft_sim::{SimulatedDeviceProfile, SimulatedLogicAnalyzer, SIMULATED_DEVICE_PROFILES};
 use wavecraft_usb::{
     discover_supported_devices, probe_device, DeviceModel, DiscoveredDevice, LinkStatus,
     UsbSpeedClass, DSCOPE_SAMPLE_RATES_HZ, DSLOGIC_SAMPLE_RATES_HZ,
@@ -18,8 +29,15 @@ use wavecraft_usb::{
 
 pub const DEVICE_LIST_SCHEMA: &str = "wavecraft.devices/v1";
 pub const DEVICE_PROBE_SCHEMA: &str = "wavecraft.device-probe/v1";
+pub const CAPTURE_CONFIGURATION_SCHEMA: &str = "wavecraft.capture-configuration/v1";
+pub const CAPTURE_EVENT_SCHEMA: &str = "wavecraft.capture-event/v1";
+pub const CAPTURE_RESULT_SCHEMA: &str = "wavecraft.capture-result/v1";
 pub const ERROR_SCHEMA: &str = "wavecraft.error/v1";
 const MAX_ERROR_CANDIDATES: usize = 16;
+const CAPTURE_EVENT_CAPACITY: usize = 64;
+const SIMULATOR_BATCH_SIZE: usize = 4_096;
+const MAX_CAPTURE_SAMPLE_COUNT: u64 = 1_000_000_000;
+const MAX_CAPTURE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -239,6 +257,157 @@ impl DeviceSelector {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct CaptureId(String);
+
+impl CaptureId {
+    fn next() -> Self {
+        static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
+        Self(format!(
+            "capture-{}-{}",
+            std::process::id(),
+            NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for CaptureId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    Finite,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureTrigger {
+    None,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CaptureConfiguration {
+    pub schema: String,
+    pub mode: CaptureMode,
+    pub sample_rate_hz: u64,
+    pub sample_count: u64,
+    pub channels: Vec<u8>,
+    pub trigger: CaptureTrigger,
+    pub timeout_ms: u64,
+    pub output_path: PathBuf,
+}
+
+impl CaptureConfiguration {
+    pub fn finite_logic(
+        sample_rate_hz: u64,
+        sample_count: u64,
+        channels: Vec<u8>,
+        output_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            schema: CAPTURE_CONFIGURATION_SCHEMA.to_owned(),
+            mode: CaptureMode::Finite,
+            sample_rate_hz,
+            sample_count,
+            channels,
+            trigger: CaptureTrigger::None,
+            timeout_ms: 30_000,
+            output_path: output_path.into(),
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self
+    }
+
+    fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureStatus {
+    Preparing,
+    Armed,
+    Capturing,
+    Finalizing,
+    Completed,
+    Cancelled,
+    TimedOut,
+    Failed,
+}
+
+impl CaptureStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Cancelled | Self::TimedOut | Self::Failed
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AutomationEventKind {
+    Status {
+        status: CaptureStatus,
+    },
+    Progress {
+        captured_samples: u64,
+        requested_samples: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AutomationEvent {
+    pub schema: String,
+    pub capture_id: CaptureId,
+    pub sequence: u64,
+    pub elapsed_ms: u64,
+    #[serde(flatten)]
+    pub event: AutomationEventKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CaptureSummary {
+    pub capture_id: CaptureId,
+    pub status: CaptureStatus,
+    pub device: AutomationDevice,
+    pub requested_configuration: CaptureConfiguration,
+    pub effective_configuration: CaptureConfiguration,
+    pub frame_count: u64,
+    pub captured_samples: u64,
+    pub elapsed_ms: u64,
+    pub recording_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CompletedCapture {
+    pub schema: String,
+    pub summary: CaptureSummary,
+}
+
+impl CompletedCapture {
+    pub fn summary(&self) -> &CaptureSummary {
+        &self.summary
+    }
+
+    pub fn recording_path(&self) -> &Path {
+        &self.summary.recording_path
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationErrorCode {
@@ -249,6 +418,12 @@ pub enum AutomationErrorCode {
     DiscoveryFailed,
     DuplicateDeviceId,
     ProbeFailed,
+    UnsupportedConfiguration,
+    OutputExists,
+    RecordingFailed,
+    CaptureFailed,
+    CaptureCancelled,
+    CaptureTimedOut,
     ServiceUnavailable,
 }
 
@@ -262,6 +437,12 @@ impl Display for AutomationErrorCode {
             Self::DiscoveryFailed => "discovery_failed",
             Self::DuplicateDeviceId => "duplicate_device_id",
             Self::ProbeFailed => "probe_failed",
+            Self::UnsupportedConfiguration => "unsupported_configuration",
+            Self::OutputExists => "output_exists",
+            Self::RecordingFailed => "recording_failed",
+            Self::CaptureFailed => "capture_failed",
+            Self::CaptureCancelled => "capture_cancelled",
+            Self::CaptureTimedOut => "capture_timed_out",
             Self::ServiceUnavailable => "service_unavailable",
         };
         formatter.write_str(value)
@@ -433,6 +614,16 @@ impl AutomationManager {
         )
     }
 
+    /// Creates a manager containing only deterministic simulated devices.
+    /// This path never initializes libusb and is suitable for CI and tests.
+    pub fn simulated() -> Self {
+        Self::from_parts(
+            || Ok(Vec::new()),
+            SIMULATED_DEVICE_PROFILES.to_vec(),
+            process_lease_registry(),
+        )
+    }
+
     #[cfg(test)]
     fn from_usb_discovery(
         usb_discovery: impl Fn() -> Result<Vec<DiscoveredDevice>, String> + Send + Sync + 'static,
@@ -551,17 +742,53 @@ impl AutomationManager {
         Ok(DeviceHandle {
             descriptor,
             catalog: Arc::clone(&self.catalog),
-            leases: Arc::clone(&self.leases),
-            released: false,
+            lease: Arc::new(DeviceLease {
+                connection_id: record.describe().connection_id,
+                registry: Arc::clone(&self.leases),
+                released: AtomicBool::new(false),
+            }),
         })
+    }
+}
+
+struct DeviceLease {
+    connection_id: String,
+    registry: Arc<Mutex<HashSet<String>>>,
+    released: AtomicBool,
+}
+
+impl DeviceLease {
+    fn release(&self) -> Result<(), AutomationError> {
+        if self.released.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut leases = self.registry.lock().map_err(|_| {
+            AutomationError::new(
+                AutomationErrorCode::ServiceUnavailable,
+                "device lease registry is unavailable",
+                "device.close",
+                true,
+            )
+            .for_device(&self.connection_id)
+        })?;
+        if self.released.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        leases.remove(&self.connection_id);
+        Ok(())
+    }
+}
+
+impl Drop for DeviceLease {
+    fn drop(&mut self) {
+        let _ = self.release();
     }
 }
 
 pub struct DeviceHandle {
     descriptor: AutomationDevice,
     catalog: Arc<DeviceCatalog>,
-    leases: Arc<Mutex<HashSet<String>>>,
-    released: bool,
+    lease: Arc<DeviceLease>,
 }
 
 impl Debug for DeviceHandle {
@@ -569,7 +796,7 @@ impl Debug for DeviceHandle {
         formatter
             .debug_struct("DeviceHandle")
             .field("descriptor", &self.descriptor)
-            .field("released", &self.released)
+            .field("released", &self.lease.released.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
 }
@@ -652,33 +879,614 @@ impl DeviceHandle {
         }
     }
 
-    pub fn close(mut self) -> Result<(), AutomationError> {
-        self.release()
-    }
+    pub fn start_capture(
+        &self,
+        requested_configuration: CaptureConfiguration,
+    ) -> Result<CaptureHandle, AutomationError> {
+        validate_capture_configuration(&self.descriptor, &requested_configuration)?;
 
-    fn release(&mut self) -> Result<(), AutomationError> {
-        if self.released {
-            return Ok(());
-        }
-        let mut leases = self.leases.lock().map_err(|_| {
+        let mut effective_configuration = requested_configuration.clone();
+        effective_configuration.channels.sort_unstable();
+        let enabled_channel_mask = effective_configuration
+            .channels
+            .iter()
+            .fold(0_u32, |mask, channel| mask | (1_u32 << channel));
+        let source = SimulatedLogicAnalyzer::new(
+            &self.descriptor.connection_id,
+            effective_configuration.sample_rate_hz,
+            self.descriptor.capabilities.channel_count,
+            SIMULATOR_BATCH_SIZE,
+        )
+        .and_then(|source| source.with_sample_limit(effective_configuration.sample_count))
+        .and_then(|source| source.with_enabled_channel_mask(enabled_channel_mask))
+        .map_err(|error| {
             AutomationError::new(
-                AutomationErrorCode::ServiceUnavailable,
-                "device lease registry is unavailable",
-                "device.close",
-                true,
+                AutomationErrorCode::UnsupportedConfiguration,
+                error.to_string(),
+                "capture.start",
+                false,
             )
             .for_device(&self.descriptor.connection_id)
         })?;
-        leases.remove(&self.descriptor.connection_id);
-        self.released = true;
+
+        self.start_capture_with_source(
+            requested_configuration,
+            effective_configuration,
+            Box::new(source),
+        )
+    }
+
+    fn start_capture_with_source(
+        &self,
+        requested_configuration: CaptureConfiguration,
+        effective_configuration: CaptureConfiguration,
+        source: Box<dyn CaptureSource>,
+    ) -> Result<CaptureHandle, AutomationError> {
+        let output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&effective_configuration.output_path)
+            .map_err(|error| {
+                output_open_error(&effective_configuration.output_path, error)
+                    .for_device(&self.descriptor.connection_id)
+            })?;
+        let core_descriptor = DeviceDescriptor {
+            id: DeviceId::new(&self.descriptor.connection_id),
+            name: self.descriptor.display_name.clone(),
+            kind: CoreInstrumentKind::LogicAnalyzer,
+        };
+        let metadata = capture_metadata(&self.descriptor, &effective_configuration);
+        let recorder = RecordingWriter::new(BufWriter::new(output), &[core_descriptor], metadata)
+            .map_err(|error| {
+            AutomationError::new(
+                AutomationErrorCode::RecordingFailed,
+                format!(
+                    "failed to initialize recording {}: {error}",
+                    effective_configuration.output_path.display()
+                ),
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id)
+        })?;
+
+        let capture_id = CaptureId::next();
+        let status = Arc::new(Mutex::new(CaptureStatus::Preparing));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let (event_sender, event_receiver) = mpsc::sync_channel(CAPTURE_EVENT_CAPACITY);
+        let (result_sender, result_receiver) = mpsc::channel();
+        let mut publisher =
+            CaptureEventPublisher::new(capture_id.clone(), Arc::clone(&status), event_sender);
+        publisher.set_status(CaptureStatus::Preparing);
+
+        let worker_capture_id = capture_id.clone();
+        let worker_device = self.descriptor.clone();
+        let worker_stop_requested = Arc::clone(&stop_requested);
+        let worker_lease = Arc::clone(&self.lease);
+        let worker = thread::Builder::new()
+            .name(format!("wavecraft-{capture_id}"))
+            .spawn(move || {
+                let _lease = worker_lease;
+                let result = run_simulated_logic_capture(
+                    worker_capture_id,
+                    worker_device,
+                    requested_configuration,
+                    effective_configuration,
+                    source,
+                    recorder,
+                    &worker_stop_requested,
+                    &mut publisher,
+                );
+                let terminal_status = match &result {
+                    Ok(_) => CaptureStatus::Completed,
+                    Err(error) => match error.code {
+                        AutomationErrorCode::CaptureCancelled => CaptureStatus::Cancelled,
+                        AutomationErrorCode::CaptureTimedOut => CaptureStatus::TimedOut,
+                        _ => CaptureStatus::Failed,
+                    },
+                };
+                publisher.set_status(terminal_status);
+                let _ = result_sender.send(result);
+            })
+            .map_err(|error| {
+                AutomationError::new(
+                    AutomationErrorCode::CaptureFailed,
+                    format!("failed to start capture worker: {error}"),
+                    "capture.start",
+                    true,
+                )
+                .for_device(&self.descriptor.connection_id)
+            })?;
+
+        Ok(CaptureHandle {
+            id: capture_id,
+            status,
+            stop_requested,
+            events: event_receiver,
+            result: result_receiver,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn close(self) -> Result<(), AutomationError> {
+        if Arc::strong_count(&self.lease) == 1 {
+            self.lease.release()?;
+        }
         Ok(())
     }
 }
 
-impl Drop for DeviceHandle {
-    fn drop(&mut self) {
-        let _ = self.release();
+pub struct CaptureHandle {
+    id: CaptureId,
+    status: Arc<Mutex<CaptureStatus>>,
+    stop_requested: Arc<AtomicBool>,
+    events: Receiver<AutomationEvent>,
+    result: Receiver<Result<CompletedCapture, AutomationError>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Debug for CaptureHandle {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureHandle")
+            .field("id", &self.id)
+            .field("status", &self.status())
+            .finish_non_exhaustive()
     }
+}
+
+impl CaptureHandle {
+    pub fn id(&self) -> &CaptureId {
+        &self.id
+    }
+
+    pub fn status(&self) -> CaptureStatus {
+        *self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn next_event(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<AutomationEvent>, AutomationError> {
+        match self.events.recv_timeout(timeout) {
+            Ok(event) => Ok(Some(event)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) if self.status().is_terminal() => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(AutomationError::new(
+                AutomationErrorCode::CaptureFailed,
+                "capture event stream ended before reaching a terminal state",
+                "capture.events",
+                true,
+            )),
+        }
+    }
+
+    pub fn request_stop(&self) -> Result<(), AutomationError> {
+        self.stop_requested.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn wait(mut self) -> Result<CompletedCapture, AutomationError> {
+        let result = self.result.recv().map_err(|_| {
+            AutomationError::new(
+                AutomationErrorCode::CaptureFailed,
+                "capture worker ended without returning a result",
+                "capture.wait",
+                true,
+            )
+        })?;
+        self.join_worker()?;
+        result
+    }
+
+    fn join_worker(&mut self) -> Result<(), AutomationError> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker.join().map_err(|_| {
+            AutomationError::new(
+                AutomationErrorCode::CaptureFailed,
+                "capture worker panicked",
+                "capture.wait",
+                true,
+            )
+        })
+    }
+}
+
+impl Drop for CaptureHandle {
+    fn drop(&mut self) {
+        self.stop_requested.store(true, Ordering::Release);
+        let _ = self.join_worker();
+    }
+}
+
+struct CaptureEventPublisher {
+    capture_id: CaptureId,
+    status: Arc<Mutex<CaptureStatus>>,
+    sender: SyncSender<AutomationEvent>,
+    sequence: u64,
+    started_at: Instant,
+}
+
+impl CaptureEventPublisher {
+    fn new(
+        capture_id: CaptureId,
+        status: Arc<Mutex<CaptureStatus>>,
+        sender: SyncSender<AutomationEvent>,
+    ) -> Self {
+        Self {
+            capture_id,
+            status,
+            sender,
+            sequence: 0,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn set_status(&mut self, status: CaptureStatus) {
+        *self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+        self.publish(AutomationEventKind::Status { status });
+    }
+
+    fn progress(&mut self, captured_samples: u64, requested_samples: u64) {
+        self.publish(AutomationEventKind::Progress {
+            captured_samples,
+            requested_samples,
+        });
+    }
+
+    fn publish(&mut self, event: AutomationEventKind) {
+        let automation_event = AutomationEvent {
+            schema: CAPTURE_EVENT_SCHEMA.to_owned(),
+            capture_id: self.capture_id.clone(),
+            sequence: self.sequence,
+            elapsed_ms: duration_millis(self.started_at.elapsed()),
+            event,
+        };
+        self.sequence = self.sequence.saturating_add(1);
+        match self.sender.try_send(automation_event) {
+            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+enum CaptureRunOutcome {
+    Completed,
+    Cancelled,
+    TimedOut,
+    Failed(AutomationError),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_simulated_logic_capture(
+    capture_id: CaptureId,
+    device: AutomationDevice,
+    requested_configuration: CaptureConfiguration,
+    effective_configuration: CaptureConfiguration,
+    source: Box<dyn CaptureSource>,
+    mut recorder: RecordingWriter<BufWriter<File>>,
+    stop_requested: &AtomicBool,
+    publisher: &mut CaptureEventPublisher,
+) -> Result<CompletedCapture, AutomationError> {
+    let started_at = Instant::now();
+    publisher.set_status(CaptureStatus::Armed);
+    let session = CaptureCoordinator::start(vec![source]).map_err(|error| {
+        let _ = recorder.finish(CompletionStatus::Failed);
+        AutomationError::new(
+            AutomationErrorCode::CaptureFailed,
+            format!("failed to arm simulated capture: {error}"),
+            "capture.run",
+            true,
+        )
+        .for_device(&device.connection_id)
+    })?;
+    publisher.set_status(CaptureStatus::Capturing);
+
+    let deadline = started_at + effective_configuration.timeout();
+    let mut frame_count = 0_u64;
+    let mut captured_samples = 0_u64;
+    let outcome = loop {
+        if stop_requested.load(Ordering::Acquire) {
+            session.request_stop();
+            break CaptureRunOutcome::Cancelled;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            session.request_stop();
+            break CaptureRunOutcome::TimedOut;
+        }
+
+        match session.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(event) => {
+                if let Err(error) = recorder.write_event(&event) {
+                    session.request_stop();
+                    break CaptureRunOutcome::Failed(
+                        AutomationError::new(
+                            AutomationErrorCode::RecordingFailed,
+                            format!(
+                                "failed to write recording {}: {error}",
+                                effective_configuration.output_path.display()
+                            ),
+                            "capture.record",
+                            false,
+                        )
+                        .for_device(&device.connection_id),
+                    );
+                }
+                match event {
+                    CoreCaptureEvent::Frame(frame) => {
+                        frame_count = frame_count.saturating_add(1);
+                        captured_samples =
+                            captured_samples.saturating_add(frame.payload.sample_count() as u64);
+                        publisher.progress(captured_samples, effective_configuration.sample_count);
+                    }
+                    CoreCaptureEvent::SourceFailed { error, .. } => {
+                        break CaptureRunOutcome::Failed(
+                            AutomationError::new(
+                                AutomationErrorCode::CaptureFailed,
+                                format!("capture source failed: {error}"),
+                                "capture.run",
+                                true,
+                            )
+                            .for_device(&device.connection_id),
+                        );
+                    }
+                    CoreCaptureEvent::SourceStopped { .. } => {
+                        if captured_samples == effective_configuration.sample_count {
+                            break CaptureRunOutcome::Completed;
+                        }
+                        break CaptureRunOutcome::Failed(
+                            AutomationError::new(
+                                AutomationErrorCode::CaptureFailed,
+                                format!(
+                                    "capture stopped after {captured_samples} of {} requested samples",
+                                    effective_configuration.sample_count
+                                ),
+                                "capture.run",
+                                true,
+                            )
+                            .for_device(&device.connection_id),
+                        );
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                break CaptureRunOutcome::Failed(
+                    AutomationError::new(
+                        AutomationErrorCode::CaptureFailed,
+                        "capture event stream ended unexpectedly",
+                        "capture.run",
+                        true,
+                    )
+                    .for_device(&device.connection_id),
+                );
+            }
+        }
+    };
+
+    publisher.set_status(CaptureStatus::Finalizing);
+    let stop_result = session.stop();
+    let outcome = match (outcome, stop_result) {
+        (CaptureRunOutcome::Completed, Err(error)) => CaptureRunOutcome::Failed(
+            AutomationError::new(
+                AutomationErrorCode::CaptureFailed,
+                format!("failed to stop capture source cleanly: {error}"),
+                "capture.finalize",
+                true,
+            )
+            .for_device(&device.connection_id),
+        ),
+        (outcome, _) => outcome,
+    };
+    let completion_status = match &outcome {
+        CaptureRunOutcome::Completed => CompletionStatus::Complete,
+        CaptureRunOutcome::Cancelled | CaptureRunOutcome::TimedOut => CompletionStatus::Cancelled,
+        CaptureRunOutcome::Failed(_) => CompletionStatus::Failed,
+    };
+    recorder.finish(completion_status).map_err(|error| {
+        AutomationError::new(
+            AutomationErrorCode::RecordingFailed,
+            format!(
+                "failed to finalize recording {}: {error}",
+                effective_configuration.output_path.display()
+            ),
+            "capture.finalize",
+            false,
+        )
+        .for_device(&device.connection_id)
+    })?;
+
+    let elapsed_ms = duration_millis(started_at.elapsed());
+    match outcome {
+        CaptureRunOutcome::Completed => Ok(CompletedCapture {
+            schema: CAPTURE_RESULT_SCHEMA.to_owned(),
+            summary: CaptureSummary {
+                capture_id,
+                status: CaptureStatus::Completed,
+                device,
+                requested_configuration,
+                effective_configuration: effective_configuration.clone(),
+                frame_count,
+                captured_samples,
+                elapsed_ms,
+                recording_path: effective_configuration.output_path,
+            },
+        }),
+        CaptureRunOutcome::Cancelled => Err(AutomationError::new(
+            AutomationErrorCode::CaptureCancelled,
+            format!("capture was cancelled after {captured_samples} samples"),
+            "capture.wait",
+            false,
+        )
+        .for_device(device.connection_id)),
+        CaptureRunOutcome::TimedOut => Err(AutomationError::new(
+            AutomationErrorCode::CaptureTimedOut,
+            format!(
+                "capture timed out after {} ms and {captured_samples} samples",
+                effective_configuration.timeout_ms
+            ),
+            "capture.wait",
+            true,
+        )
+        .for_device(device.connection_id)),
+        CaptureRunOutcome::Failed(error) => Err(error),
+    }
+}
+
+fn validate_capture_configuration(
+    device: &AutomationDevice,
+    configuration: &CaptureConfiguration,
+) -> Result<(), AutomationError> {
+    let unsupported = |message: String| {
+        AutomationError::new(
+            AutomationErrorCode::UnsupportedConfiguration,
+            message,
+            "capture.start",
+            false,
+        )
+        .for_device(&device.connection_id)
+    };
+    if configuration.schema != CAPTURE_CONFIGURATION_SCHEMA {
+        return Err(unsupported(format!(
+            "capture configuration schema {} is unsupported",
+            configuration.schema
+        )));
+    }
+    if device.backend != DeviceBackend::Simulator || device.kind != InstrumentKind::LogicAnalyzer {
+        return Err(unsupported(
+            "this milestone supports finite simulated logic capture only".to_owned(),
+        ));
+    }
+    if !device.capabilities.supports_capture {
+        return Err(unsupported(
+            "selected device does not support capture".to_owned(),
+        ));
+    }
+    if configuration.mode != CaptureMode::Finite {
+        return Err(unsupported(
+            "only finite capture mode is currently supported".to_owned(),
+        ));
+    }
+    if configuration.trigger != CaptureTrigger::None {
+        return Err(unsupported(
+            "only untriggered capture is currently supported".to_owned(),
+        ));
+    }
+    if !device
+        .capabilities
+        .sample_rates_hz
+        .contains(&configuration.sample_rate_hz)
+    {
+        return Err(unsupported(format!(
+            "sample rate {} Hz is not supported by {}",
+            configuration.sample_rate_hz, device.display_name
+        )));
+    }
+    if configuration.sample_count == 0 || configuration.sample_count > MAX_CAPTURE_SAMPLE_COUNT {
+        return Err(unsupported(format!(
+            "sample count must be between 1 and {MAX_CAPTURE_SAMPLE_COUNT}"
+        )));
+    }
+    if configuration.timeout().is_zero() || configuration.timeout() > MAX_CAPTURE_TIMEOUT {
+        return Err(unsupported(format!(
+            "capture timeout must be between 1 ms and {} ms",
+            MAX_CAPTURE_TIMEOUT.as_millis()
+        )));
+    }
+    if configuration.channels.is_empty() {
+        return Err(unsupported(
+            "at least one logic channel must be enabled".to_owned(),
+        ));
+    }
+    let unique_channels = configuration
+        .channels
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if unique_channels.len() != configuration.channels.len() {
+        return Err(unsupported(
+            "enabled logic channels must not contain duplicates".to_owned(),
+        ));
+    }
+    if let Some(channel) = configuration
+        .channels
+        .iter()
+        .find(|channel| **channel >= device.capabilities.channel_count)
+    {
+        return Err(unsupported(format!(
+            "logic channel {channel} is outside the device range 0..{}",
+            device.capabilities.channel_count.saturating_sub(1)
+        )));
+    }
+    if configuration.output_path.as_os_str().is_empty() {
+        return Err(unsupported(
+            "capture output path must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn output_open_error(path: &Path, error: std::io::Error) -> AutomationError {
+    let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
+        AutomationErrorCode::OutputExists
+    } else {
+        AutomationErrorCode::RecordingFailed
+    };
+    AutomationError::new(
+        code,
+        format!(
+            "failed to create capture recording {} without overwriting: {error}",
+            path.display()
+        ),
+        "capture.start",
+        false,
+    )
+}
+
+fn capture_metadata(
+    device: &AutomationDevice,
+    configuration: &CaptureConfiguration,
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "automation.configuration_schema".to_owned(),
+        configuration.schema.clone(),
+    );
+    metadata.insert(
+        "capture.connection_id".to_owned(),
+        device.connection_id.clone(),
+    );
+    metadata.insert("capture.model".to_owned(), device.model.clone());
+    metadata.insert(
+        "capture.sample_rate_hz".to_owned(),
+        configuration.sample_rate_hz.to_string(),
+    );
+    metadata.insert(
+        "capture.requested_sample_count".to_owned(),
+        configuration.sample_count.to_string(),
+    );
+    metadata.insert(
+        "capture.enabled_channels".to_owned(),
+        configuration
+            .channels
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    metadata
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn describe_simulator(profile: &SimulatedDeviceProfile) -> AutomationDevice {
@@ -798,8 +1606,33 @@ fn usb_model_name(model: DeviceModel) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufReader;
     use std::sync::MutexGuard;
+    use wavecraft_recording::{CompletionStatus, RecordingReader};
     use wavecraft_usb::{DeviceLocation, DSCOPE_U3P100};
+
+    struct TestRecordingPath(PathBuf);
+
+    impl TestRecordingPath {
+        fn new(name: &str) -> Self {
+            static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
+            Self(std::env::temp_dir().join(format!(
+                "wavecraft-automation-{}-{}-{name}.dsv",
+                std::process::id(),
+                NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+            )))
+        }
+
+        fn as_path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestRecordingPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     fn usb_device(path: &str) -> DiscoveredDevice {
         DiscoveredDevice {
@@ -821,6 +1654,29 @@ mod tests {
             },
             Vec::new(),
         )
+    }
+
+    fn simulator_manager() -> AutomationManager {
+        AutomationManager::from_usb_discovery(|| Ok(Vec::new()), SIMULATED_DEVICE_PROFILES.to_vec())
+    }
+
+    fn logic_configuration(path: &Path, sample_count: u64) -> CaptureConfiguration {
+        CaptureConfiguration::finite_logic(100_000, sample_count, vec![2, 0], path)
+            .with_timeout(Duration::from_secs(2))
+    }
+
+    fn recording_completion(path: &Path) -> CompletionStatus {
+        let file = File::open(path).expect("recording should exist");
+        let mut reader =
+            RecordingReader::new(BufReader::new(file)).expect("recording header should be valid");
+        while reader
+            .read_event()
+            .expect("recording event should be valid")
+            .is_some()
+        {}
+        reader
+            .completion_status()
+            .expect("recording should have a footer")
     }
 
     fn devices<'a>(
@@ -1042,5 +1898,271 @@ mod tests {
 
         assert_eq!(value["schema"], ERROR_SCHEMA);
         assert_eq!(value["code"], "device_not_found");
+    }
+
+    #[test]
+    fn finite_simulated_capture_writes_exact_recording_and_lifecycle() {
+        let path = TestRecordingPath::new("complete");
+        let manager = simulator_manager();
+        let device = manager
+            .open_device(DeviceSelector::connection_id("sim:logic-0"))
+            .expect("simulator should open");
+        let capture = device
+            .start_capture(logic_configuration(path.as_path(), 4_097))
+            .expect("capture should start");
+        let mut events = Vec::new();
+        while !capture.status().is_terminal() {
+            if let Some(event) = capture
+                .next_event(Duration::from_millis(100))
+                .expect("event read should succeed")
+            {
+                events.push(event);
+            }
+        }
+        while let Some(event) = capture
+            .next_event(Duration::ZERO)
+            .expect("event drain should succeed")
+        {
+            events.push(event);
+        }
+
+        let completed = capture.wait().expect("capture should complete");
+
+        assert_eq!(completed.schema, CAPTURE_RESULT_SCHEMA);
+        assert_eq!(completed.summary.status, CaptureStatus::Completed);
+        assert_eq!(completed.summary.captured_samples, 4_097);
+        assert_eq!(completed.summary.frame_count, 2);
+        assert_eq!(completed.summary.requested_configuration.channels, [2, 0]);
+        assert_eq!(completed.summary.effective_configuration.channels, [0, 2]);
+        assert_eq!(completed.recording_path(), path.as_path());
+        assert_eq!(
+            recording_completion(path.as_path()),
+            CompletionStatus::Complete
+        );
+
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+        let statuses = events
+            .iter()
+            .filter_map(|event| match event.event {
+                AutomationEventKind::Status { status } => Some(status),
+                AutomationEventKind::Progress { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [
+                CaptureStatus::Preparing,
+                CaptureStatus::Armed,
+                CaptureStatus::Capturing,
+                CaptureStatus::Finalizing,
+                CaptureStatus::Completed,
+            ]
+        );
+
+        let file = File::open(path.as_path()).expect("recording should exist");
+        let mut reader =
+            RecordingReader::new(BufReader::new(file)).expect("recording header should be valid");
+        let mut recorded_samples = 0_u64;
+        while let Some(event) = reader.read_event().expect("recording should be readable") {
+            if let CoreCaptureEvent::Frame(frame) = event {
+                recorded_samples += frame.payload.sample_count() as u64;
+                if let wavecraft_core::CaptureBatch::Logic(batch) = frame.payload {
+                    assert!(batch.samples.iter().all(|sample| sample & !0b101 == 0));
+                }
+            }
+        }
+        assert_eq!(recorded_samples, 4_097);
+    }
+
+    #[test]
+    fn capture_rejects_unsupported_configuration_before_creating_output() {
+        let path = TestRecordingPath::new("invalid-rate");
+        let manager = simulator_manager();
+        let device = manager
+            .open_device(DeviceSelector::connection_id("sim:logic-0"))
+            .expect("simulator should open");
+        let configuration =
+            CaptureConfiguration::finite_logic(123_456, 100, vec![0], path.as_path());
+
+        let error = device
+            .start_capture(configuration)
+            .expect_err("unsupported sample rate should fail");
+
+        assert_eq!(error.code, AutomationErrorCode::UnsupportedConfiguration);
+        assert!(!path.as_path().exists());
+    }
+
+    #[test]
+    fn capture_never_overwrites_an_existing_recording() {
+        let path = TestRecordingPath::new("existing");
+        std::fs::write(path.as_path(), b"keep me").expect("fixture should be created");
+        let manager = simulator_manager();
+        let device = manager
+            .open_device(DeviceSelector::connection_id("sim:logic-0"))
+            .expect("simulator should open");
+
+        let error = device
+            .start_capture(logic_configuration(path.as_path(), 100))
+            .expect_err("existing output should fail");
+
+        assert_eq!(error.code, AutomationErrorCode::OutputExists);
+        assert_eq!(
+            std::fs::read(path.as_path()).expect("fixture should remain readable"),
+            b"keep me"
+        );
+    }
+
+    #[test]
+    fn cancelled_capture_writes_cancelled_footer() {
+        let path = TestRecordingPath::new("cancelled");
+        let manager = simulator_manager();
+        let device = manager
+            .open_device(DeviceSelector::connection_id("sim:logic-0"))
+            .expect("simulator should open");
+        let capture = device
+            .start_capture(logic_configuration(path.as_path(), 1_000_000))
+            .expect("capture should start");
+
+        capture.request_stop().expect("stop request should succeed");
+        let error = capture.wait().expect_err("capture should be cancelled");
+
+        assert_eq!(error.code, AutomationErrorCode::CaptureCancelled);
+        assert_eq!(
+            recording_completion(path.as_path()),
+            CompletionStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn timed_out_capture_writes_cancelled_footer() {
+        let path = TestRecordingPath::new("timed-out");
+        let manager = simulator_manager();
+        let device = manager
+            .open_device(DeviceSelector::connection_id("sim:logic-0"))
+            .expect("simulator should open");
+        let configuration =
+            logic_configuration(path.as_path(), 100_000).with_timeout(Duration::from_millis(1));
+        let capture = device
+            .start_capture(configuration)
+            .expect("capture should start");
+
+        let error = capture.wait().expect_err("capture should time out");
+
+        assert_eq!(error.code, AutomationErrorCode::CaptureTimedOut);
+        assert_eq!(
+            recording_completion(path.as_path()),
+            CompletionStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn source_failure_writes_failed_footer_and_structured_error() {
+        struct FailingSource {
+            descriptor: DeviceDescriptor,
+        }
+
+        impl CaptureSource for FailingSource {
+            fn descriptor(&self) -> DeviceDescriptor {
+                self.descriptor.clone()
+            }
+
+            fn run(
+                self: Box<Self>,
+                context: wavecraft_core::CaptureContext,
+            ) -> Result<(), wavecraft_core::CaptureError> {
+                context.synchronize_start()?;
+                context.emit(
+                    0,
+                    context.elapsed(),
+                    wavecraft_core::CaptureBatch::Logic(wavecraft_core::LogicBatch {
+                        sample_rate_hz: 100_000,
+                        channel_count: 8,
+                        samples: vec![0; 16],
+                    }),
+                )?;
+                Err(wavecraft_core::CaptureError::new(
+                    "injected simulator failure",
+                ))
+            }
+        }
+
+        let path = TestRecordingPath::new("failed");
+        let manager = simulator_manager();
+        let device = manager
+            .open_device(DeviceSelector::connection_id("sim:logic-0"))
+            .expect("simulator should open");
+        let requested = logic_configuration(path.as_path(), 100);
+        let mut effective = requested.clone();
+        effective.channels.sort_unstable();
+        let source = FailingSource {
+            descriptor: DeviceDescriptor {
+                id: DeviceId::new("sim:logic-0"),
+                name: "Failing Simulator".to_owned(),
+                kind: CoreInstrumentKind::LogicAnalyzer,
+            },
+        };
+        let capture = device
+            .start_capture_with_source(requested, effective, Box::new(source))
+            .expect("capture should start");
+
+        let error = capture
+            .wait()
+            .expect_err("source failure should fail capture");
+
+        assert_eq!(error.code, AutomationErrorCode::CaptureFailed);
+        assert!(error.message.contains("injected simulator failure"));
+        assert_eq!(
+            recording_completion(path.as_path()),
+            CompletionStatus::Failed
+        );
+    }
+
+    #[test]
+    fn capture_does_not_block_when_progress_events_are_not_consumed() {
+        let path = TestRecordingPath::new("bounded-events");
+        let manager = simulator_manager();
+        let device = manager
+            .open_device(DeviceSelector::connection_id("sim:logic-0"))
+            .expect("simulator should open");
+        let configuration =
+            CaptureConfiguration::finite_logic(10_000_000, 400_000, vec![0], path.as_path())
+                .with_timeout(Duration::from_secs(1));
+        let capture = device
+            .start_capture(configuration)
+            .expect("capture should start");
+
+        let completed = capture
+            .wait()
+            .expect("full bounded event queue must not block capture");
+
+        assert_eq!(completed.summary.captured_samples, 400_000);
+    }
+
+    #[test]
+    fn running_capture_retains_device_lease_after_device_handle_is_dropped() {
+        let path = TestRecordingPath::new("lease");
+        let manager = simulator_manager();
+        let selector = DeviceSelector::connection_id("sim:logic-0");
+        let device = manager
+            .open_device(selector.clone())
+            .expect("simulator should open");
+        let capture = device
+            .start_capture(logic_configuration(path.as_path(), 1_000_000))
+            .expect("capture should start");
+        drop(device);
+
+        let error = manager
+            .open_device(selector.clone())
+            .expect_err("running capture should retain the lease");
+        assert_eq!(error.code, AutomationErrorCode::DeviceBusy);
+
+        capture.request_stop().expect("stop request should succeed");
+        let error = capture.wait().expect_err("capture should be cancelled");
+        assert_eq!(error.code, AutomationErrorCode::CaptureCancelled);
+        manager
+            .open_device(selector)
+            .expect("completed capture should release its retained lease");
     }
 }

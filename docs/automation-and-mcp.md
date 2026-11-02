@@ -30,14 +30,24 @@ a complete capture configuration.
 
 ### Current implementation
 
-The first device-service milestone is implemented in
-`crates/wavecraft-automation`. `AutomationManager` discovers USB instruments
-and deterministic simulators, returns schema-versioned descriptions, resolves
-selectors to exactly one connection, and acquires a process-wide exclusive
-lease before returning `DeviceHandle`. Handles expose capabilities and
-read-only probing, detect disconnect-after-selection, and release their lease
-when explicitly closed or dropped. Structured errors distinguish no match,
-ambiguous match, busy state, disconnect, discovery failure, and probe failure.
+The first device-service milestone and the finite simulated-logic portion of
+the second milestone are implemented in `crates/wavecraft-automation`.
+`AutomationManager` discovers USB instruments and deterministic simulators,
+returns schema-versioned descriptions, resolves selectors to exactly one
+connection, and acquires a process-wide exclusive lease before returning
+`DeviceHandle`. Handles expose capabilities and read-only probing, detect
+disconnect-after-selection, and release their lease when explicitly closed or
+dropped. A running capture retains that lease independently of the original
+device handle.
+
+`DeviceHandle::start_capture` currently accepts complete finite logic-capture
+configuration for `sim:logic-0`. It validates sample rate, sample count,
+channels, timeout, trigger mode, and a non-overwriting output path before
+starting. `CaptureHandle` exposes status, bounded schema-versioned progress
+events, cancellation, and wait. Capture frames are written incrementally to a
+`.dsv`; successful, cancelled, timed-out, and failed operations select the
+appropriate recording footer and return structured results or errors. A
+simulator-only manager path avoids initializing libusb in CI.
 
 The initial end-to-end CLI surface is:
 
@@ -45,12 +55,15 @@ The initial end-to-end CLI surface is:
 wavecraft-cli devices list --format json
 wavecraft-cli devices probe --id sim:logic-0 --format json
 wavecraft-cli devices probe --id <usb-connection-id> --format json
+wavecraft-cli capture run --device sim:logic-0 --sample-rate 100000 \
+  --samples 10000 --channels 0,1,2,3 --output capture.dsv \
+  --events ndjson
 ```
 
 USB persistent identities remain absent when the current non-opening discovery
-path cannot read a serial number. Capture handles and direct automation capture
-are the next milestone; they must build on this device service rather than GUI
-selection state.
+path cannot read a serial number. Running the same selected-device capture
+contract against one USB instrument is the next milestone. It must reuse this
+service rather than GUI selection state.
 
 ## Goals
 
@@ -762,6 +775,11 @@ sources and recorded fixtures.
     or background runs are required.
 17. Add a loopback SCPI socket adapter after shared leases and persistent
     capture ownership are established.
+
+Implementation status: steps 1 through 9 are complete. Step 10 covers the
+successful, cancelled, timed-out, injected-source-failure, bounded-event,
+lease-retention, exact-sample, and non-overwriting simulator paths. Explicit
+mid-stream recording failure injection remains before USB capture work begins.
 
 The first milestone is deterministic discovery, exact selection, and exclusive
 ownership of one simulated or USB device, with structured results for no match,

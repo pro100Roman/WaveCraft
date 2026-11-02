@@ -48,6 +48,8 @@ pub struct SimulatedLogicAnalyzer {
     sample_rate_hz: u64,
     channel_count: u8,
     batch_size: usize,
+    sample_limit: Option<u64>,
+    enabled_channel_mask: u32,
 }
 
 impl SimulatedLogicAnalyzer {
@@ -71,7 +73,43 @@ impl SimulatedLogicAnalyzer {
             sample_rate_hz,
             channel_count,
             batch_size,
+            sample_limit: None,
+            enabled_channel_mask: if channel_count == 32 {
+                u32::MAX
+            } else {
+                (1_u32 << channel_count) - 1
+            },
         })
+    }
+
+    /// Stop after emitting exactly `sample_count` samples.
+    pub fn with_sample_limit(mut self, sample_count: u64) -> Result<Self, CaptureError> {
+        if sample_count == 0 {
+            return Err(CaptureError::new(
+                "simulated capture sample count must be greater than zero",
+            ));
+        }
+        self.sample_limit = Some(sample_count);
+        Ok(self)
+    }
+
+    /// Generate data only for the selected physical channels.
+    pub fn with_enabled_channel_mask(
+        mut self,
+        enabled_channel_mask: u32,
+    ) -> Result<Self, CaptureError> {
+        let available_mask = if self.channel_count == 32 {
+            u32::MAX
+        } else {
+            (1_u32 << self.channel_count) - 1
+        };
+        if enabled_channel_mask == 0 || enabled_channel_mask & !available_mask != 0 {
+            return Err(CaptureError::new(
+                "invalid simulated logic analyzer channel selection",
+            ));
+        }
+        self.enabled_channel_mask = enabled_channel_mask;
+        Ok(self)
     }
 }
 
@@ -81,22 +119,33 @@ impl CaptureSource for SimulatedLogicAnalyzer {
     }
 
     fn run(self: Box<Self>, context: CaptureContext) -> Result<(), CaptureError> {
-        let batch_period =
-            Duration::from_secs_f64(self.batch_size as f64 / self.sample_rate_hz as f64);
         context.synchronize_start()?;
         let mut deadline = Instant::now();
         let mut sample_index = 0_u64;
         let mut sequence = 0_u64;
 
         while !context.is_cancelled() {
+            let remaining = self
+                .sample_limit
+                .map(|limit| limit.saturating_sub(sample_index));
+            if remaining == Some(0) {
+                break;
+            }
+            let batch_size = remaining.map_or(self.batch_size, |remaining| {
+                usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(self.batch_size)
+            });
             let captured_at = context.elapsed();
-            let mut samples = Vec::with_capacity(self.batch_size);
-            for _ in 0..self.batch_size {
+            let mut samples = Vec::with_capacity(batch_size);
+            for _ in 0..batch_size {
                 let mut sample = 0_u32;
                 for channel in 0..self.channel_count {
                     let half_period =
                         (self.sample_rate_hz / (2_000 * (u64::from(channel) + 1))).max(1);
-                    if (sample_index / half_period) % 2 == 1 {
+                    if self.enabled_channel_mask & (1 << channel) != 0
+                        && (sample_index / half_period) % 2 == 1
+                    {
                         sample |= 1 << channel;
                     }
                 }
@@ -114,7 +163,7 @@ impl CaptureSource for SimulatedLogicAnalyzer {
                 }),
             )?;
             sequence += 1;
-            deadline += batch_period;
+            deadline += Duration::from_secs_f64(batch_size as f64 / self.sample_rate_hz as f64);
             context.wait_until(deadline);
         }
         Ok(())
