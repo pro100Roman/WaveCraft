@@ -89,6 +89,7 @@ const LOGIC_MARKER_NAME_MAX_CHARS: usize = 32;
 const CHANNEL_NAME_MAX_CHARS: usize = 32;
 const LOGIC_CHANNEL_NAME_MAX_CHARS: usize = 8;
 const MAX_SESSION_TABS: usize = 10;
+const SESSION_NAME_MAX_CHARS: usize = 48;
 const DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY: u8 = 128;
 const LOGIC_MARKER_EDGE_SNAP_DISTANCE: f32 = 8.0;
 const CAPTURE_FILE_BUTTON_WIDTH: f32 = 82.0;
@@ -320,7 +321,76 @@ fn main() -> eframe::Result<()> {
 
 struct DeviceEntry {
     device: DiscoveredDevice,
-    selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeviceRole {
+    LogicAnalyzer,
+    Oscilloscope,
+}
+
+impl DeviceRole {
+    fn matches(self, device: &DiscoveredDevice) -> bool {
+        if device.link_status() == LinkStatus::Unsupported
+            || !device.profile.model.supports_capture()
+        {
+            return false;
+        }
+        match self {
+            Self::LogicAnalyzer => device.profile.model.is_logic_analyzer(),
+            Self::Oscilloscope => device.profile.model == DeviceModel::DsCopeU3P100,
+        }
+    }
+
+    fn empty_label(self) -> &'static str {
+        match self {
+            Self::LogicAnalyzer => "No DSLogic device available",
+            Self::Oscilloscope => "No DSCope device available",
+        }
+    }
+}
+
+fn selected_device_for_role<'a>(
+    devices: &'a [DeviceEntry],
+    selected_id: Option<&str>,
+    role: DeviceRole,
+) -> Option<&'a DiscoveredDevice> {
+    let selected_id = selected_id?;
+    devices
+        .iter()
+        .map(|entry| &entry.device)
+        .find(|device| role.matches(device) && device.location.stable_id() == selected_id)
+}
+
+fn first_device_id_for_role(devices: &[DeviceEntry], role: DeviceRole) -> Option<String> {
+    devices
+        .iter()
+        .map(|entry| &entry.device)
+        .find(|device| role.matches(device))
+        .map(|device| device.location.stable_id())
+}
+
+fn capture_devices_for_target(
+    devices: &[DeviceEntry],
+    selected_logic_device_id: Option<&str>,
+    selected_scope_device_id: Option<&str>,
+    target: CaptureTarget,
+) -> Result<Vec<DiscoveredDevice>, String> {
+    let logic = || {
+        selected_device_for_role(devices, selected_logic_device_id, DeviceRole::LogicAnalyzer)
+            .cloned()
+            .ok_or_else(|| "Select a connected DSLogic instrument in Capture Setup".to_owned())
+    };
+    let scope = || {
+        selected_device_for_role(devices, selected_scope_device_id, DeviceRole::Oscilloscope)
+            .cloned()
+            .ok_or_else(|| "Select a connected DSCope U3P100 in Capture Setup".to_owned())
+    };
+    match target {
+        CaptureTarget::LogicAnalyzer => Ok(vec![logic()?]),
+        CaptureTarget::Oscilloscope => Ok(vec![scope()?]),
+        CaptureTarget::Combined => Ok(vec![logic()?, scope()?]),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1324,14 +1394,6 @@ impl CaptureTarget {
         }
     }
 
-    fn includes_model(self, model: DeviceModel) -> bool {
-        match self {
-            Self::LogicAnalyzer => model.is_logic_analyzer(),
-            Self::Oscilloscope => model.is_oscilloscope(),
-            Self::Combined => true,
-        }
-    }
-
     fn is_available(self, has_logic_analyzer: bool, has_oscilloscope: bool) -> bool {
         match self {
             Self::LogicAnalyzer => has_logic_analyzer,
@@ -2114,6 +2176,27 @@ fn apply_time_per_division(
     viewport.start = viewport.clamp_start(center_sample_fraction - new_span * 0.5);
 }
 
+fn resolve_scope_timebase(
+    selected_timebase: Option<f64>,
+    displayed_timebase: Option<f64>,
+    requested_timebase: Option<f64>,
+    viewport_span: f32,
+    auto_sample_rate: bool,
+) -> Option<f64> {
+    requested_timebase.or_else(|| {
+        if auto_sample_rate
+            && viewport_span >= 1.0 - f32::EPSILON
+            && selected_timebase
+                .zip(displayed_timebase)
+                .is_some_and(|(selected, displayed)| selected > displayed * (1.0 + 1.0e-9))
+        {
+            selected_timebase
+        } else {
+            displayed_timebase
+        }
+    })
+}
+
 fn adjacent_timebase(current_seconds: f64, zoom_in: bool) -> Option<f64> {
     const COMPARISON_EPSILON: f64 = 1.0e-6;
     if zoom_in {
@@ -2352,6 +2435,7 @@ struct CompletedCapture {
 }
 
 struct SessionTab<T, S> {
+    name: String,
     capture: Option<T>,
     settings: S,
 }
@@ -2359,16 +2443,34 @@ struct SessionTab<T, S> {
 struct SessionTabs<T, S> {
     tabs: Vec<SessionTab<T, S>>,
     active: usize,
+    next_default_number: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionTabAction {
+    Select(usize),
+    Add,
+    Close(usize),
+    BeginRename(usize),
+}
+
+struct SessionNameEditor {
+    target: CaptureTarget,
+    index: usize,
+    draft: String,
+    request_focus: bool,
 }
 
 impl<T, S> SessionTabs<T, S> {
     fn new(settings: S) -> Self {
         Self {
             tabs: vec![SessionTab {
+                name: "Session 1".to_owned(),
                 capture: None,
                 settings,
             }],
             active: 0,
+            next_default_number: 2,
         }
     }
 
@@ -2378,6 +2480,14 @@ impl<T, S> SessionTabs<T, S> {
 
     fn active_index(&self) -> usize {
         self.active
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.tabs.iter().map(|tab| tab.name.clone()).collect()
+    }
+
+    fn name(&self, index: usize) -> Option<&str> {
+        self.tabs.get(index).map(|tab| tab.name.as_str())
     }
 
     fn active_capture(&self) -> Option<&T> {
@@ -2409,14 +2519,29 @@ impl<T, S> SessionTabs<T, S> {
     }
 
     fn add(&mut self, settings: S) -> bool {
-        if self.tabs.len() >= MAX_SESSION_TABS {
+        if self.len() >= MAX_SESSION_TABS {
             return false;
         }
+        let name = format!("Session {}", self.next_default_number);
+        self.next_default_number += 1;
         self.tabs.push(SessionTab {
+            name,
             capture: None,
             settings,
         });
         self.active = self.tabs.len() - 1;
+        true
+    }
+
+    fn rename(&mut self, index: usize, name: &str) -> bool {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return false;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        tab.name = name.chars().take(SESSION_NAME_MAX_CHARS).collect();
         true
     }
 
@@ -2428,13 +2553,28 @@ impl<T, S> SessionTabs<T, S> {
         true
     }
 
+    fn close(&mut self, index: usize) -> bool {
+        if self.len() <= 1 || index >= self.len() {
+            return false;
+        }
+        self.tabs.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        true
+    }
+
     fn reset(&mut self, settings: S) {
         self.tabs.clear();
         self.tabs.push(SessionTab {
+            name: "Session 1".to_owned(),
             capture: None,
             settings,
         });
         self.active = 0;
+        self.next_default_number = 2;
     }
 
     fn any(&self, predicate: impl Fn(&T) -> bool) -> bool {
@@ -2477,6 +2617,7 @@ struct LoadedRecording {
 
 #[derive(Clone)]
 struct LogicSessionSettings {
+    device_id: Option<String>,
     capture: LogicCaptureSettings,
     acquisition_mode: AcquisitionMode,
     repetitive_interval_seconds: f32,
@@ -2493,6 +2634,7 @@ struct LogicSessionSettings {
 impl Default for LogicSessionSettings {
     fn default() -> Self {
         Self {
+            device_id: None,
             capture: LogicCaptureSettings::default(),
             acquisition_mode: AcquisitionMode::Single,
             repetitive_interval_seconds: 1.0,
@@ -2510,6 +2652,7 @@ impl Default for LogicSessionSettings {
 
 #[derive(Clone)]
 struct ScopeSessionSettings {
+    device_id: Option<String>,
     capture: ScopeCaptureSettings,
     auto_sample_rate: bool,
     smart_timing_enabled: bool,
@@ -2528,6 +2671,7 @@ struct ScopeSessionSettings {
 impl Default for ScopeSessionSettings {
     fn default() -> Self {
         Self {
+            device_id: None,
             capture: ScopeCaptureSettings::default(),
             auto_sample_rate: true,
             smart_timing_enabled: false,
@@ -2566,7 +2710,7 @@ enum WorkerSuccess {
         scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
         scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
     },
-    ScopeConfigured(usize),
+    ScopeConfigured,
     ScopeAutoCalibrated(DsCopeCalibrationValues),
     ScopeAutoCalibrationSaved,
     ScopeCalibrationLoaded(DsCopeCalibrationValues),
@@ -2595,6 +2739,8 @@ struct WaveCraftApp {
     repetitive_interval_seconds: f32,
     scheduled_repetitive_capture: Option<ScheduledRepetitiveCapture>,
     devices: Vec<DeviceEntry>,
+    selected_logic_device_id: Option<String>,
+    selected_scope_device_id: Option<String>,
     active_capture_settings_tab: CaptureSettingsTab,
     logic_settings: LogicCaptureSettings,
     scope_settings: ScopeCaptureSettings,
@@ -2635,6 +2781,7 @@ struct WaveCraftApp {
     capture: Option<ActiveCapture>,
     logic_sessions: SessionTabs<CompletedCapture, LogicSessionSettings>,
     scope_sessions: SessionTabs<CompletedCapture, ScopeSessionSettings>,
+    session_name_editor: Option<SessionNameEditor>,
     combined_capture: Option<CompletedCapture>,
     combined_settings: CombinedSessionSettings,
     status: String,
@@ -2663,6 +2810,8 @@ impl WaveCraftApp {
             repetitive_interval_seconds: 1.0,
             scheduled_repetitive_capture: None,
             devices: Vec::new(),
+            selected_logic_device_id: None,
+            selected_scope_device_id: None,
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
             logic_settings: LogicCaptureSettings::default(),
             scope_settings: ScopeCaptureSettings::default(),
@@ -2703,6 +2852,7 @@ impl WaveCraftApp {
             capture: None,
             logic_sessions: SessionTabs::new(LogicSessionSettings::default()),
             scope_sessions: SessionTabs::new(ScopeSessionSettings::default()),
+            session_name_editor: None,
             combined_capture: None,
             combined_settings: CombinedSessionSettings {
                 logic_ratio: 0.55,
@@ -2843,6 +2993,33 @@ impl WaveCraftApp {
         });
     }
 
+    fn reconcile_device_selections(&mut self) {
+        if self.selected_logic_device_id.is_none() {
+            self.selected_logic_device_id =
+                first_device_id_for_role(&self.devices, DeviceRole::LogicAnalyzer);
+        }
+        if self.selected_scope_device_id.is_none() {
+            self.selected_scope_device_id =
+                first_device_id_for_role(&self.devices, DeviceRole::Oscilloscope);
+        }
+    }
+
+    fn selected_logic_device(&self) -> Option<&DiscoveredDevice> {
+        selected_device_for_role(
+            &self.devices,
+            self.selected_logic_device_id.as_deref(),
+            DeviceRole::LogicAnalyzer,
+        )
+    }
+
+    fn selected_scope_device_ref(&self) -> Option<&DiscoveredDevice> {
+        selected_device_for_role(
+            &self.devices,
+            self.selected_scope_device_id.as_deref(),
+            DeviceRole::Oscilloscope,
+        )
+    }
+
     fn begin_capture(&mut self, mode: AcquisitionMode, target: CaptureTarget) {
         if self.pending.is_some() || self.capture.is_some() {
             return;
@@ -2859,37 +3036,21 @@ impl WaveCraftApp {
                 Some("Complete-capture recording is available in Single mode only".to_owned());
             return;
         }
-        let has_logic_analyzer = self
-            .devices
-            .iter()
-            .any(|entry| entry.selected && entry.device.profile.model.is_logic_analyzer());
-        let has_oscilloscope = self
-            .devices
-            .iter()
-            .any(|entry| entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100);
-        if !target.is_available(has_logic_analyzer, has_oscilloscope) {
-            self.capture_run_requested = false;
-            self.requested_capture_target = None;
-            self.record_capture = false;
-            self.last_error = Some(match target {
-                CaptureTarget::LogicAnalyzer => {
-                    "Select at least one Logic Analyzer instrument".to_owned()
-                }
-                CaptureTarget::Oscilloscope => {
-                    "Select at least one Oscilloscope instrument".to_owned()
-                }
-                CaptureTarget::Combined => {
-                    "Select at least one Logic Analyzer and one Oscilloscope instrument".to_owned()
-                }
-            });
-            return;
-        }
-        let devices = self
-            .devices
-            .iter()
-            .filter(|entry| entry.selected && target.includes_model(entry.device.profile.model))
-            .map(|entry| entry.device.clone())
-            .collect::<Vec<_>>();
+        let devices = match capture_devices_for_target(
+            &self.devices,
+            self.selected_logic_device_id.as_deref(),
+            self.selected_scope_device_id.as_deref(),
+            target,
+        ) {
+            Ok(devices) => devices,
+            Err(error) => {
+                self.capture_run_requested = false;
+                self.requested_capture_target = None;
+                self.record_capture = false;
+                self.last_error = Some(error);
+                return;
+            }
+        };
         if self.record_capture && self.recording_path.trim().is_empty() {
             self.capture_run_requested = false;
             self.requested_capture_target = None;
@@ -2992,18 +3153,10 @@ impl WaveCraftApp {
             return;
         }
         self.scope_configuration_due = None;
-        let devices = self
-            .devices
-            .iter()
-            .filter(|entry| {
-                entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100
-            })
-            .map(|entry| entry.device.clone())
-            .collect::<Vec<_>>();
-        if devices.is_empty() {
+        let Some(device) = self.selected_scope_device_ref().cloned() else {
             self.status = "DSCope settings will be applied when capture starts".to_owned();
             return;
-        }
+        };
         let scope_config = match self.scope_settings.capture_config() {
             Ok(config) => config,
             Err(error) => {
@@ -3012,48 +3165,38 @@ impl WaveCraftApp {
             }
         };
         let resource_directory = PathBuf::from(self.resource_directory.trim());
-        let device_count = devices.len();
         let (sender, receiver) = mpsc::channel();
         self.pending = Some(receiver);
-        self.status = format!("Applying DSCope configuration to {device_count} instrument(s)…");
+        self.status = format!(
+            "Applying DSCope configuration to {}…",
+            device.location.stable_id()
+        );
         self.last_error = None;
         thread::spawn(move || {
             let result = (|| {
-                for device in devices {
-                    let bitstream_path =
-                        resource_directory.join(device.profile.fpga_bitstream_name);
-                    prepare_device(&device, &bitstream_path).map_err(|error| error.to_string())?;
-                    apply_dscope_configuration(&device, scope_config)
-                        .map_err(|error| error.to_string())?;
-                }
-                Ok(WorkerSuccess::ScopeConfigured(device_count))
+                let bitstream_path = resource_directory.join(device.profile.fpga_bitstream_name);
+                prepare_device(&device, &bitstream_path).map_err(|error| error.to_string())?;
+                apply_dscope_configuration(&device, scope_config)
+                    .map_err(|error| error.to_string())?;
+                Ok(WorkerSuccess::ScopeConfigured)
             })();
             let _ = sender.send(result);
         });
     }
 
-    fn selected_scope_device(&mut self) -> Option<DiscoveredDevice> {
-        let devices = self
-            .devices
-            .iter()
-            .filter(|entry| {
-                entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100
-            })
-            .map(|entry| entry.device.clone())
-            .collect::<Vec<_>>();
-        if devices.len() != 1 {
-            self.last_error =
-                Some("Select exactly one connected DSCope U3P100 for calibration".to_owned());
-            return None;
+    fn selected_scope_device_for_operation(&mut self) -> Option<DiscoveredDevice> {
+        let device = self.selected_scope_device_ref().cloned();
+        if device.is_none() {
+            self.last_error = Some("Select a connected DSCope U3P100 in Capture Setup".to_owned());
         }
-        devices.into_iter().next()
+        device
     }
 
     fn begin_auto_calibration(&mut self) {
         if self.is_busy() {
             return;
         }
-        let Some(device) = self.selected_scope_device() else {
+        let Some(device) = self.selected_scope_device_for_operation() else {
             return;
         };
         let scope_config = match self.scope_settings.capture_config() {
@@ -3100,7 +3243,7 @@ impl WaveCraftApp {
         if self.is_busy() {
             return;
         }
-        let Some(device) = self.selected_scope_device() else {
+        let Some(device) = self.selected_scope_device_for_operation() else {
             return;
         };
         let scope_config = match self.scope_settings.capture_config() {
@@ -3135,7 +3278,7 @@ impl WaveCraftApp {
         if self.is_busy() {
             return;
         }
-        let Some(device) = self.selected_scope_device() else {
+        let Some(device) = self.selected_scope_device_for_operation() else {
             return;
         };
         let resource_directory = PathBuf::from(self.resource_directory.trim());
@@ -3177,7 +3320,7 @@ impl WaveCraftApp {
         if self.is_busy() {
             return;
         }
-        let Some(device) = self.selected_scope_device() else {
+        let Some(device) = self.selected_scope_device_for_operation() else {
             return;
         };
         let scope_config = match self.scope_settings.capture_config() {
@@ -3282,24 +3425,11 @@ impl WaveCraftApp {
         match result {
             Ok(WorkerSuccess::Devices(devices)) => {
                 self.usb_speed_warning = usb_speed_warning(&devices);
-                let selected = self
-                    .devices
-                    .iter()
-                    .filter(|entry| entry.selected)
-                    .map(|entry| entry.device.location.stable_id())
-                    .collect::<HashSet<_>>();
                 self.devices = devices
                     .into_iter()
-                    .map(|device| {
-                        let stable_id = device.location.stable_id();
-                        let selected = if selected.is_empty() {
-                            device.link_status() != LinkStatus::Unsupported
-                        } else {
-                            selected.contains(&stable_id)
-                        };
-                        DeviceEntry { device, selected }
-                    })
+                    .map(|device| DeviceEntry { device })
                     .collect();
+                self.reconcile_device_selections();
                 self.status = if self.devices.is_empty() {
                     "No supported instruments detected".to_owned()
                 } else {
@@ -3583,9 +3713,8 @@ impl WaveCraftApp {
                 self.status = format!("Exported Saleae capture to {}", path.display());
                 self.last_error = None;
             }
-            Ok(WorkerSuccess::ScopeConfigured(device_count)) => {
-                self.status =
-                    format!("Applied DSCope configuration to {device_count} instrument(s)");
+            Ok(WorkerSuccess::ScopeConfigured) => {
+                self.status = "Applied DSCope configuration to the selected instrument".to_owned();
             }
             Ok(WorkerSuccess::ScopeAutoCalibrated(values)) => {
                 self.calibration_active = false;
@@ -3940,6 +4069,7 @@ impl WaveCraftApp {
 
     fn current_logic_session_settings(&self) -> LogicSessionSettings {
         LogicSessionSettings {
+            device_id: self.selected_logic_device_id.clone(),
             capture: self.logic_settings,
             acquisition_mode: self.logic_acquisition_mode,
             repetitive_interval_seconds: self.repetitive_interval_seconds,
@@ -3955,6 +4085,7 @@ impl WaveCraftApp {
     }
 
     fn apply_logic_session_settings(&mut self, settings: LogicSessionSettings) {
+        self.selected_logic_device_id = settings.device_id;
         self.logic_settings = settings.capture;
         self.logic_acquisition_mode = settings.acquisition_mode;
         self.repetitive_interval_seconds = settings.repetitive_interval_seconds;
@@ -3975,6 +4106,7 @@ impl WaveCraftApp {
 
     fn current_scope_session_settings(&self) -> ScopeSessionSettings {
         ScopeSessionSettings {
+            device_id: self.selected_scope_device_id.clone(),
             capture: self.scope_settings,
             auto_sample_rate: self.scope_auto_sample_rate,
             smart_timing_enabled: self.scope_smart_timing_enabled,
@@ -3992,6 +4124,7 @@ impl WaveCraftApp {
     }
 
     fn apply_scope_session_settings(&mut self, settings: ScopeSessionSettings) {
+        self.selected_scope_device_id = settings.device_id;
         self.scope_settings = settings.capture;
         self.scope_auto_sample_rate = settings.auto_sample_rate;
         self.scope_smart_timing_enabled = settings.smart_timing_enabled;
@@ -4062,6 +4195,7 @@ impl WaveCraftApp {
         let scope_settings = self.current_scope_session_settings();
         self.logic_sessions.reset(logic_settings);
         self.scope_sessions.reset(scope_settings);
+        self.session_name_editor = None;
         self.combined_capture = None;
     }
 
@@ -4138,7 +4272,15 @@ impl WaveCraftApp {
             .devices
             .iter()
             .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100);
-        capture_settings_tabs(has_logic_analyzer, has_oscilloscope)
+        match self.active_waveform_tab {
+            Some(WaveformTab::LogicAnalyzer) => capture_settings_tabs(has_logic_analyzer, false),
+            Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
+                capture_settings_tabs(false, has_oscilloscope)
+            }
+            Some(WaveformTab::Combined) | None => {
+                capture_settings_tabs(has_logic_analyzer, has_oscilloscope)
+            }
+        }
     }
 
     fn reconcile_capture_settings_tab(&mut self) {
@@ -6398,11 +6540,7 @@ fn paint_calibration_progress_modal(
     action
 }
 
-fn paint_instrument_settings(
-    ui: &mut egui::Ui,
-    devices: &mut [DeviceEntry],
-    selection_enabled: bool,
-) {
+fn paint_instrument_settings(ui: &mut egui::Ui, devices: &[DeviceEntry]) {
     if devices.is_empty() {
         ui.label(RichText::new("No supported devices").color(TEXT_MUTED));
         return;
@@ -6415,13 +6553,7 @@ fn paint_instrument_settings(
             .rounding(egui::Rounding::same(6.0))
             .inner_margin(egui::Margin::same(10.0))
             .show(ui, |ui| {
-                ui.add_enabled(
-                    selection_enabled,
-                    egui::Checkbox::new(
-                        &mut entry.selected,
-                        RichText::new(entry.device.profile.display_name).strong(),
-                    ),
-                );
+                ui.label(RichText::new(entry.device.profile.display_name).strong());
                 ui.small(RichText::new(entry.device.location.stable_id()).color(TEXT_MUTED));
                 let (link_text, link_color) = match entry.device.link_status() {
                     LinkStatus::Optimal => (
@@ -6447,6 +6579,114 @@ fn paint_instrument_settings(
                 );
             });
     }
+}
+
+fn selected_device_text(
+    devices: &[DeviceEntry],
+    selected_id: Option<&str>,
+    role: DeviceRole,
+) -> String {
+    match selected_id {
+        Some(id) => selected_device_for_role(devices, Some(id), role)
+            .map(|device| format!("{} · {id}", device.profile.display_name))
+            .unwrap_or_else(|| format!("Unavailable · {id}")),
+        None => role.empty_label().to_owned(),
+    }
+}
+
+fn paint_device_selector(
+    ui: &mut egui::Ui,
+    id_salt: &'static str,
+    label: &str,
+    devices: &[DeviceEntry],
+    selected_id: &mut Option<String>,
+    role: DeviceRole,
+    enabled: bool,
+) -> bool {
+    let choices = devices
+        .iter()
+        .map(|entry| &entry.device)
+        .filter(|device| role.matches(device))
+        .map(|device| {
+            let id = device.location.stable_id();
+            (
+                id.clone(),
+                format!("{} · {id}", device.profile.display_name),
+            )
+        })
+        .collect::<Vec<_>>();
+    let before = selected_id.clone();
+    ui.label(RichText::new(label).small().color(TEXT_MUTED));
+    ui.add_enabled_ui(enabled && !choices.is_empty(), |ui| {
+        egui::ComboBox::from_id_salt(id_salt)
+            .width(ui.available_width())
+            .selected_text(selected_device_text(devices, selected_id.as_deref(), role))
+            .show_ui(ui, |ui| {
+                for (id, text) in choices {
+                    ui.selectable_value(selected_id, Some(id), text);
+                }
+            });
+    });
+    before != *selected_id
+}
+
+fn paint_capture_device_selectors(
+    ui: &mut egui::Ui,
+    active_tab: Option<WaveformTab>,
+    devices: &[DeviceEntry],
+    selected_logic_device_id: &mut Option<String>,
+    selected_scope_device_id: &mut Option<String>,
+    enabled: bool,
+) -> (bool, bool) {
+    let mut logic_changed = false;
+    let mut scope_changed = false;
+    match active_tab {
+        Some(WaveformTab::LogicAnalyzer) => {
+            logic_changed = paint_device_selector(
+                ui,
+                "logic_device_selector",
+                "Device",
+                devices,
+                selected_logic_device_id,
+                DeviceRole::LogicAnalyzer,
+                enabled,
+            );
+        }
+        Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
+            scope_changed = paint_device_selector(
+                ui,
+                "scope_device_selector",
+                "Device",
+                devices,
+                selected_scope_device_id,
+                DeviceRole::Oscilloscope,
+                enabled,
+            );
+        }
+        Some(WaveformTab::Combined) => {
+            logic_changed = paint_device_selector(
+                ui,
+                "combined_logic_device_selector",
+                "Logic analyzer",
+                devices,
+                selected_logic_device_id,
+                DeviceRole::LogicAnalyzer,
+                enabled,
+            );
+            ui.add_space(4.0);
+            scope_changed = paint_device_selector(
+                ui,
+                "combined_scope_device_selector",
+                "Oscilloscope",
+                devices,
+                selected_scope_device_id,
+                DeviceRole::Oscilloscope,
+                enabled,
+            );
+        }
+        None => {}
+    }
+    (logic_changed, scope_changed)
 }
 
 fn usb_speed_warning(devices: &[DiscoveredDevice]) -> Option<UsbSpeedWarning> {
@@ -6514,6 +6754,7 @@ impl eframe::App for WaveCraftApp {
         self.poll_worker();
         self.reconcile_capture_settings_tab();
         self.reconcile_waveform_tab();
+        self.reconcile_device_selections();
         self.poll_capture();
         self.poll_repetitive_capture();
         self.finish_pending_snapshot(context);
@@ -6526,18 +6767,14 @@ impl eframe::App for WaveCraftApp {
         let mut start_request = None;
         let mut stop_clicked = false;
         let mut calibration_action = None;
+        let mut logic_device_selection_changed = false;
+        let mut scope_device_selection_changed = false;
         let capture_settings_enabled = !self.is_busy();
         let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
-        let selected_logic_device = self
-            .devices
-            .iter()
-            .any(|entry| entry.selected && entry.device.profile.model.is_logic_analyzer());
+        let selected_logic_device = self.selected_logic_device().is_some();
         let logic_settings_speed = self
-            .devices
-            .iter()
-            .filter(|entry| entry.selected && entry.device.profile.model.is_logic_analyzer())
-            .map(|entry| entry.device.speed)
-            .min()
+            .selected_logic_device()
+            .map(|device| device.speed)
             .or_else(|| {
                 self.devices
                     .iter()
@@ -6546,10 +6783,7 @@ impl eframe::App for WaveCraftApp {
                     .min()
             })
             .unwrap_or(UsbSpeedClass::HighSpeed);
-        let selected_scope_device = self
-            .devices
-            .iter()
-            .any(|entry| entry.selected && entry.device.profile.model == DeviceModel::DsCopeU3P100);
+        let selected_scope_device = self.selected_scope_device_ref().is_some();
         let control_target_available = control_target.is_some_and(|target| {
             target.is_available(selected_logic_device, selected_scope_device)
         });
@@ -6781,6 +7015,19 @@ impl eframe::App for WaveCraftApp {
                         ui.set_max_width(content_width);
                         ui.label(RichText::new("CAPTURE SETUP").strong().color(TEXT_MUTED));
                         ui.add_space(8.0);
+                        let (logic_changed, scope_changed) = paint_capture_device_selectors(
+                            ui,
+                            self.active_waveform_tab,
+                            &self.devices,
+                            &mut self.selected_logic_device_id,
+                            &mut self.selected_scope_device_id,
+                            capture_settings_enabled && self.manual_calibration.is_none(),
+                        );
+                        logic_device_selection_changed |= logic_changed;
+                        scope_device_selection_changed |= scope_changed;
+                        if self.active_waveform_tab.is_some() {
+                            ui.add_space(12.0);
+                        }
                         if available_capture_settings_tabs.len() > 1 {
                             ui.horizontal(|ui| {
                                 for tab in &available_capture_settings_tabs {
@@ -6918,18 +7165,22 @@ impl eframe::App for WaveCraftApp {
         let session_tab_state = match self.active_waveform_tab {
             Some(WaveformTab::LogicAnalyzer) => Some((
                 CaptureTarget::LogicAnalyzer,
-                self.logic_sessions.len(),
+                self.logic_sessions.names(),
                 self.logic_sessions.active_index(),
             )),
             Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => Some((
                 CaptureTarget::Oscilloscope,
-                self.scope_sessions.len(),
+                self.scope_sessions.names(),
                 self.scope_sessions.active_index(),
             )),
             Some(WaveformTab::Combined) | None => None,
         };
         let mut session_tab_action = None;
-        if let Some((target, tab_count, active_tab)) = session_tab_state {
+        let mut session_name_commit = false;
+        let mut session_name_cancel = false;
+        if let Some((target, tab_names, active_tab)) = session_tab_state {
+            let tab_count = tab_names.len();
+            let sessions_enabled = !self.is_busy();
             egui::TopBottomPanel::bottom("session_tabs")
                 .frame(
                     egui::Frame::none()
@@ -6943,85 +7194,245 @@ impl eframe::App for WaveCraftApp {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("SESSION").strong().color(TEXT_MUTED));
                                 ui.separator();
-                                for index in 0..tab_count {
-                                    if ui
-                                        .add_enabled(
-                                            !self.is_busy(),
-                                            egui::SelectableLabel::new(
-                                                active_tab == index,
-                                                format!("Session {}", index + 1),
-                                            ),
-                                        )
-                                        .on_hover_text(if self.is_busy() {
-                                            "Stop the active acquisition before changing sessions"
+                                for (index, name) in tab_names.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        let editing = self
+                                            .session_name_editor
+                                            .as_ref()
+                                            .is_some_and(|editor| {
+                                                editor.target == target && editor.index == index
+                                            });
+                                        if editing {
+                                            if let Some(editor) = self.session_name_editor.as_mut() {
+                                                let response = ui.add_enabled(
+                                                    sessions_enabled,
+                                                    egui::TextEdit::singleline(&mut editor.draft)
+                                                        .char_limit(SESSION_NAME_MAX_CHARS)
+                                                        .desired_width(140.0),
+                                                );
+                                                if editor.request_focus {
+                                                    response.request_focus();
+                                                    editor.request_focus = false;
+                                                }
+                                                let escape_pressed = ui.input(|input| {
+                                                    input.key_pressed(egui::Key::Escape)
+                                                });
+                                                let enter_pressed = ui.input(|input| {
+                                                    input.key_pressed(egui::Key::Enter)
+                                                });
+                                                if escape_pressed {
+                                                    session_name_cancel = true;
+                                                } else if enter_pressed || response.lost_focus() {
+                                                    session_name_commit = true;
+                                                }
+                                            }
                                         } else {
-                                            "Show this session's captured waveform"
-                                        })
-                                        .clicked()
-                                    {
-                                        session_tab_action = Some((target, Some(index)));
-                                    }
+                                            let response = ui
+                                                .add_enabled(
+                                                    sessions_enabled,
+                                                    egui::SelectableLabel::new(
+                                                        active_tab == index,
+                                                        name,
+                                                    ),
+                                                )
+                                                .on_hover_text(if sessions_enabled {
+                                                    "Show this session · double-click to rename"
+                                                } else {
+                                                    "Stop the active acquisition before changing sessions"
+                                                });
+                                            if response.double_clicked() {
+                                                session_tab_action = Some((
+                                                    target,
+                                                    SessionTabAction::BeginRename(index),
+                                                ));
+                                            } else if response.clicked() {
+                                                session_tab_action = Some((
+                                                    target,
+                                                    SessionTabAction::Select(index),
+                                                ));
+                                            }
+                                        }
+                                        let close_enabled = sessions_enabled && tab_count > 1;
+                                        if ui
+                                            .add_enabled(
+                                                close_enabled,
+                                                egui::Button::new("×").small().frame(false),
+                                            )
+                                            .on_hover_text(if !sessions_enabled {
+                                                "Stop the active acquisition before closing a session"
+                                            } else if tab_count <= 1 {
+                                                "At least one session must remain open"
+                                            } else {
+                                                "Close and permanently discard this session"
+                                            })
+                                            .clicked()
+                                        {
+                                            session_tab_action =
+                                                Some((target, SessionTabAction::Close(index)));
+                                        }
+                                    });
                                 }
-                                let add_enabled = !self.is_busy() && tab_count < MAX_SESSION_TABS;
+                                let add_enabled = sessions_enabled && tab_count < MAX_SESSION_TABS;
                                 if ui
                                     .add_enabled(add_enabled, egui::Button::new("+").small())
                                     .on_hover_text(if tab_count >= MAX_SESSION_TABS {
                                         "The 10-session limit has been reached"
-                                    } else if self.is_busy() {
+                                    } else if !sessions_enabled {
                                         "Stop the active acquisition before adding a session"
                                     } else {
                                         "Add a new empty session"
                                     })
                                     .clicked()
                                 {
-                                    session_tab_action = Some((target, None));
+                                    session_tab_action = Some((target, SessionTabAction::Add));
                                 }
                             });
                         });
                 });
         }
-        if let Some((target, selected)) = session_tab_action {
+        if session_name_cancel {
+            self.session_name_editor = None;
+        } else if session_name_commit {
+            if let Some(editor) = self.session_name_editor.take() {
+                let renamed = match editor.target {
+                    CaptureTarget::LogicAnalyzer => {
+                        self.logic_sessions.rename(editor.index, &editor.draft)
+                    }
+                    CaptureTarget::Oscilloscope => {
+                        self.scope_sessions.rename(editor.index, &editor.draft)
+                    }
+                    CaptureTarget::Combined => false,
+                };
+                if renamed {
+                    self.status = "Session renamed".to_owned();
+                    self.last_error = None;
+                }
+            }
+        }
+        if let Some((target, action)) = session_tab_action {
+            let action_session_name = match action {
+                SessionTabAction::Close(index) => match target {
+                    CaptureTarget::LogicAnalyzer => self.logic_sessions.name(index),
+                    CaptureTarget::Oscilloscope => self.scope_sessions.name(index),
+                    CaptureTarget::Combined => None,
+                }
+                .map(str::to_owned),
+                _ => None,
+            };
+            if !matches!(action, SessionTabAction::BeginRename(_)) {
+                self.session_name_editor = None;
+            }
             let changed = match target {
                 CaptureTarget::LogicAnalyzer => {
                     self.save_active_logic_session_settings();
-                    if let Some(index) = selected {
-                        if self.logic_sessions.select(index) {
-                            let settings = self.logic_sessions.active_settings().clone();
-                            self.apply_logic_session_settings(settings);
-                            true
-                        } else {
-                            false
+                    match action {
+                        SessionTabAction::Select(index) => {
+                            if !self.logic_sessions.select(index) {
+                                false
+                            } else {
+                                let settings = self.logic_sessions.active_settings().clone();
+                                self.apply_logic_session_settings(settings);
+                                true
+                            }
                         }
-                    } else {
-                        let settings = self.current_logic_session_settings();
-                        self.logic_sessions.add(settings)
+                        SessionTabAction::Add => {
+                            let settings = self.current_logic_session_settings();
+                            self.logic_sessions.add(settings)
+                        }
+                        SessionTabAction::Close(index) => {
+                            if !self.logic_sessions.close(index) {
+                                false
+                            } else {
+                                let settings = self.logic_sessions.active_settings().clone();
+                                self.apply_logic_session_settings(settings);
+                                true
+                            }
+                        }
+                        SessionTabAction::BeginRename(index) => {
+                            if let Some(name) = self.logic_sessions.name(index).map(str::to_owned) {
+                                self.session_name_editor = Some(SessionNameEditor {
+                                    target,
+                                    index,
+                                    draft: name,
+                                    request_focus: true,
+                                });
+                                true
+                            } else {
+                                false
+                            }
+                        }
                     }
                 }
                 CaptureTarget::Oscilloscope => {
                     self.save_active_scope_session_settings();
-                    if let Some(index) = selected {
-                        if self.scope_sessions.select(index) {
-                            let settings = self.scope_sessions.active_settings().clone();
-                            self.apply_scope_session_settings(settings);
-                            true
-                        } else {
-                            false
+                    match action {
+                        SessionTabAction::Select(index) => {
+                            if !self.scope_sessions.select(index) {
+                                false
+                            } else {
+                                let settings = self.scope_sessions.active_settings().clone();
+                                self.apply_scope_session_settings(settings);
+                                true
+                            }
                         }
-                    } else {
-                        let settings = self.current_scope_session_settings();
-                        self.scope_sessions.add(settings)
+                        SessionTabAction::Add => {
+                            let settings = self.current_scope_session_settings();
+                            self.scope_sessions.add(settings)
+                        }
+                        SessionTabAction::Close(index) => {
+                            if !self.scope_sessions.close(index) {
+                                false
+                            } else {
+                                let settings = self.scope_sessions.active_settings().clone();
+                                self.apply_scope_session_settings(settings);
+                                true
+                            }
+                        }
+                        SessionTabAction::BeginRename(index) => {
+                            if let Some(name) = self.scope_sessions.name(index).map(str::to_owned) {
+                                self.session_name_editor = Some(SessionNameEditor {
+                                    target,
+                                    index,
+                                    draft: name,
+                                    request_focus: true,
+                                });
+                                true
+                            } else {
+                                false
+                            }
+                        }
                     }
                 }
                 CaptureTarget::Combined => unreachable!("combined view has no session tabs"),
             };
-            if changed && selected.is_none() {
-                let active_index = match target {
-                    CaptureTarget::LogicAnalyzer => self.logic_sessions.active_index(),
-                    CaptureTarget::Oscilloscope => self.scope_sessions.active_index(),
-                    CaptureTarget::Combined => unreachable!("combined view has no session tabs"),
-                };
-                self.status = format!("Added {} session {}", target.label(), active_index + 1);
-                self.last_error = None;
+            if changed {
+                match action {
+                    SessionTabAction::Add => {
+                        let active_name = match target {
+                            CaptureTarget::LogicAnalyzer => {
+                                self.logic_sessions.name(self.logic_sessions.active_index())
+                            }
+                            CaptureTarget::Oscilloscope => {
+                                self.scope_sessions.name(self.scope_sessions.active_index())
+                            }
+                            CaptureTarget::Combined => {
+                                unreachable!("combined view has no session tabs")
+                            }
+                        }
+                        .unwrap_or("session");
+                        self.status = format!("Added {} {active_name}", target.label());
+                        self.last_error = None;
+                    }
+                    SessionTabAction::Close(_) => {
+                        self.status = format!(
+                            "Closed {} {}; its data was discarded",
+                            target.label(),
+                            action_session_name.as_deref().unwrap_or("session")
+                        );
+                        self.last_error = None;
+                    }
+                    SessionTabAction::Select(_) | SessionTabAction::BeginRename(_) => {}
+                }
             }
         }
 
@@ -7144,6 +7555,7 @@ impl eframe::App for WaveCraftApp {
                                     true,
                                     ScopeWaveformOptions {
                                         settings: scope_settings,
+                                        auto_sample_rate: self.scope_auto_sample_rate,
                                         smart_timing_enabled: self.scope_smart_timing_enabled,
                                         function_settings: self.scope_function_settings,
                                         channel_names: &self.scope_channel_names,
@@ -7225,6 +7637,7 @@ impl eframe::App for WaveCraftApp {
                             },
                             ScopeWaveformOptions {
                                 settings: scope_settings,
+                                auto_sample_rate: self.scope_auto_sample_rate,
                                 smart_timing_enabled: self.scope_smart_timing_enabled,
                                 function_settings: self.scope_function_settings,
                                 channel_names: &self.scope_channel_names,
@@ -7336,7 +7749,7 @@ impl eframe::App for WaveCraftApp {
                         });
                     });
                     ui.add_space(6.0);
-                    paint_instrument_settings(ui, &mut self.devices, !settings_locked);
+                    paint_instrument_settings(ui, &self.devices);
 
                     if settings_locked {
                         ui.add_space(8.0);
@@ -7581,6 +7994,19 @@ impl eframe::App for WaveCraftApp {
         }
         if let Some(values) = save_manual_values {
             self.request_save_manual_calibration(values);
+        }
+        if logic_device_selection_changed || scope_device_selection_changed {
+            if let Some(active) = self.active_waveform_tab {
+                self.save_waveform_view_settings(active);
+            }
+            self.last_error = None;
+            self.status = "Capture device selection updated".to_owned();
+        }
+        if scope_device_selection_changed
+            && self.selected_scope_device_ref().is_some()
+            && !self.is_busy()
+        {
+            self.scope_configuration_due = Some(Instant::now() + SCOPE_CONFIGURATION_DEBOUNCE);
         }
         let manual_calibration_range_after_ui =
             self.manual_calibration.as_ref().map(|editor| editor.range);
@@ -8512,6 +8938,7 @@ const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;
 
 struct ScopeWaveformOptions<'a> {
     settings: ScopeCaptureSettings,
+    auto_sample_rate: bool,
     smart_timing_enabled: bool,
     function_settings: ScopeFunctionSettings,
     channel_names: &'a [String; 2],
@@ -8986,6 +9413,7 @@ struct WaveformViewportOptions {
     reset_on_double_click: bool,
     primary_pan_enabled: bool,
     zoom_anchor: WaveformZoomAnchor,
+    timebase_basis: Option<f64>,
 }
 
 fn update_waveform_viewport(
@@ -8996,9 +9424,10 @@ fn update_waveform_viewport(
     sample_count: usize,
     sample_rate_hz: u64,
     options: WaveformViewportOptions,
-) -> (bool, bool, Option<WaveformPlotClick>) {
+) -> (bool, bool, Option<WaveformPlotClick>, Option<f64>) {
     let mut panned = false;
     let mut timebase_changed = false;
+    let mut requested_timebase = None;
     let response = ui.interact(
         rect,
         ui.make_persistent_id(id_salt),
@@ -9046,6 +9475,10 @@ fn update_waveform_viewport(
     if response.hovered() {
         let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
         if scroll_delta != 0.0 {
+            requested_timebase = options
+                .timebase_basis
+                .or_else(|| viewport.time_per_division(sample_count, sample_rate_hz))
+                .and_then(|current| adjacent_timebase(current, scroll_delta > 0.0));
             let pointer_fraction = response
                 .hover_pos()
                 .map(|pointer| (pointer.x - rect.left()) / rect.width().max(1.0))
@@ -9071,7 +9504,7 @@ fn update_waveform_viewport(
             ui.ctx().request_repaint();
         }
     }
-    (panned, timebase_changed, click)
+    (panned, timebase_changed, click, requested_timebase)
 }
 
 fn paint_waveform_status(
@@ -10181,6 +10614,7 @@ fn paint_logic(
             reset_on_double_click: true,
             primary_pan_enabled: !marker_settings.adding,
             zoom_anchor: WaveformZoomAnchor::Pointer,
+            timebase_basis: None,
         },
     );
     update_logic_marker_gesture(
@@ -12616,6 +13050,7 @@ fn paint_scope_time_domain(
 ) {
     let ScopeWaveformOptions {
         mut settings,
+        auto_sample_rate,
         smart_timing_enabled,
         function_settings,
         channel_names,
@@ -12691,22 +13126,24 @@ fn paint_scope_time_domain(
     ) {
         viewport.align_trigger_to_screen(trigger_sample_fraction, trigger_screen_fraction);
     }
-    let (viewport_panned, viewport_timebase_changed, waveform_click) = update_waveform_viewport(
-        ui,
-        plot,
-        "scope_waveform_zoom",
-        viewport,
-        display_sample_count,
-        display_sample_rate_hz,
-        WaveformViewportOptions {
-            reset_on_double_click: false,
-            primary_pan_enabled: true,
-            zoom_anchor: WaveformZoomAnchor::Sample {
-                domain_fraction: trigger_sample_fraction,
-                screen_fraction: trigger_screen_fraction,
+    let (viewport_panned, viewport_timebase_changed, waveform_click, requested_timebase) =
+        update_waveform_viewport(
+            ui,
+            plot,
+            "scope_waveform_zoom",
+            viewport,
+            display_sample_count,
+            display_sample_rate_hz,
+            WaveformViewportOptions {
+                reset_on_double_click: false,
+                primary_pan_enabled: true,
+                zoom_anchor: WaveformZoomAnchor::Sample {
+                    domain_fraction: trigger_sample_fraction,
+                    screen_fraction: trigger_screen_fraction,
+                },
+                timebase_basis: *time_per_division_seconds,
             },
-        },
-    );
+        );
     if let Some(click) = waveform_click {
         match click {
             WaveformPlotClick::Primary {
@@ -12722,12 +13159,19 @@ fn paint_scope_time_domain(
             WaveformPlotClick::Secondary => quick_time_measurement.clear(),
         }
     }
-    *timebase_changed |= viewport_timebase_changed;
+    *timebase_changed |= viewport_timebase_changed || requested_timebase.is_some();
     if viewport_panned && !waveforms.scope_rolling {
         finish_scope_viewport_pan(trigger_sample_fraction, viewport, trigger_settings);
     }
-    *time_per_division_seconds =
+    let displayed_timebase =
         viewport.time_per_division(display_sample_count, display_sample_rate_hz);
+    *time_per_division_seconds = resolve_scope_timebase(
+        *time_per_division_seconds,
+        displayed_timebase,
+        requested_timebase,
+        viewport.span,
+        auto_sample_rate,
+    );
     for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
         channel.vertical_offset = vertical_offset;
     }
@@ -13055,6 +13499,168 @@ mod tests {
         assert!(!sessions.add(()));
         assert_eq!(sessions.active_index(), MAX_SESSION_TABS - 1);
         assert!(!sessions.select(MAX_SESSION_TABS));
+        assert_eq!(sessions.name(0), Some("Session 1"));
+        assert_eq!(sessions.name(MAX_SESSION_TABS - 1), Some("Session 10"));
+    }
+
+    #[test]
+    fn closing_sessions_discards_the_tab_and_keeps_active_session_valid() {
+        let mut sessions = SessionTabs::new(10_u64);
+        sessions.replace_active("first capture");
+        assert!(sessions.add(20));
+        sessions.replace_active("second capture");
+        assert!(sessions.add(30));
+        sessions.replace_active("third capture");
+
+        assert!(sessions.close(0));
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.names(), ["Session 2", "Session 3"]);
+        assert_eq!(sessions.active_index(), 1);
+        assert_eq!(*sessions.active_settings(), 30);
+        assert_eq!(sessions.active_capture(), Some(&"third capture"));
+
+        assert!(sessions.close(1));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions.active_index(), 0);
+        assert_eq!(*sessions.active_settings(), 20);
+        assert_eq!(sessions.active_capture(), Some(&"second capture"));
+        assert!(!sessions.close(0));
+        assert!(!sessions.close(1));
+
+        assert!(sessions.add(40));
+        assert_eq!(sessions.names(), ["Session 2", "Session 4"]);
+    }
+
+    #[test]
+    fn closing_active_middle_session_selects_the_following_session() {
+        let mut sessions = SessionTabs::<(), _>::new("first");
+        assert!(sessions.add("second"));
+        assert!(sessions.add("third"));
+        assert!(sessions.select(1));
+
+        assert!(sessions.close(1));
+
+        assert_eq!(sessions.active_index(), 1);
+        assert_eq!(*sessions.active_settings(), "third");
+    }
+
+    #[test]
+    fn renamed_session_name_persists_across_selection_and_closing_other_tabs() {
+        let mut sessions = SessionTabs::<(), _>::new("first");
+        assert!(sessions.add("second"));
+        assert!(sessions.add("third"));
+        assert!(sessions.rename(1, "  SPI boot  "));
+        assert!(!sessions.rename(1, "   "));
+
+        assert!(sessions.select(0));
+        assert!(sessions.select(1));
+        assert_eq!(sessions.name(1), Some("SPI boot"));
+
+        assert!(sessions.close(0));
+        assert_eq!(sessions.names(), ["SPI boot", "Session 3"]);
+        assert_eq!(sessions.name(0), Some("SPI boot"));
+    }
+
+    #[test]
+    fn session_tabs_preserve_selected_device_ids() {
+        let first = LogicSessionSettings {
+            device_id: Some("usb-logic-a".to_owned()),
+            ..LogicSessionSettings::default()
+        };
+        let mut sessions = SessionTabs::<(), _>::new(first);
+        let second = LogicSessionSettings {
+            device_id: Some("usb-logic-b".to_owned()),
+            ..LogicSessionSettings::default()
+        };
+
+        assert!(sessions.add(second));
+        assert_eq!(
+            sessions.active_settings().device_id.as_deref(),
+            Some("usb-logic-b")
+        );
+        assert!(sessions.select(0));
+        assert_eq!(
+            sessions.active_settings().device_id.as_deref(),
+            Some("usb-logic-a")
+        );
+    }
+
+    #[test]
+    fn combined_session_settings_preserve_both_device_ids() {
+        let settings = CombinedSessionSettings {
+            logic: LogicSessionSettings {
+                device_id: Some("usb-logic".to_owned()),
+                ..LogicSessionSettings::default()
+            },
+            scope: ScopeSessionSettings {
+                device_id: Some("usb-scope".to_owned()),
+                ..ScopeSessionSettings::default()
+            },
+            ..CombinedSessionSettings::default()
+        };
+        let restored = settings.clone();
+
+        assert_eq!(restored.logic.device_id.as_deref(), Some("usb-logic"));
+        assert_eq!(restored.scope.device_id.as_deref(), Some("usb-scope"));
+    }
+
+    #[test]
+    fn identical_devices_are_selected_by_connection_id() {
+        let entry = |profile, platform_path: &str| DeviceEntry {
+            device: DiscoveredDevice {
+                profile,
+                location: wavecraft_usb::DeviceLocation {
+                    platform_path: platform_path.to_owned(),
+                },
+                speed: UsbSpeedClass::HighSpeed,
+            },
+        };
+        let devices = vec![
+            entry(&wavecraft_usb::DSCOPE_U3P100, "usb:1-2.1"),
+            entry(&wavecraft_usb::DSCOPE_U3P100, "usb:1-2.2"),
+            entry(&wavecraft_usb::DSLOGIC_U3PRO16, "usb:1-3"),
+        ];
+        let selected_scope_id = devices[1].device.location.stable_id();
+        let selected_logic_id = devices[2].device.location.stable_id();
+        let selected_scope =
+            selected_device_for_role(&devices, Some(&selected_scope_id), DeviceRole::Oscilloscope)
+                .expect("the exact scope connection should resolve");
+
+        assert_eq!(
+            selected_scope.location.platform_path,
+            devices[1].device.location.platform_path
+        );
+        assert_eq!(
+            first_device_id_for_role(&devices, DeviceRole::Oscilloscope),
+            Some(devices[0].device.location.stable_id())
+        );
+        assert!(selected_device_for_role(
+            &devices,
+            Some(&selected_scope_id),
+            DeviceRole::LogicAnalyzer
+        )
+        .is_none());
+
+        let scope_capture = capture_devices_for_target(
+            &devices,
+            Some(&selected_logic_id),
+            Some(&selected_scope_id),
+            CaptureTarget::Oscilloscope,
+        )
+        .unwrap();
+        assert_eq!(scope_capture.len(), 1);
+        assert_eq!(scope_capture[0].location.stable_id(), selected_scope_id);
+
+        let combined_capture = capture_devices_for_target(
+            &devices,
+            Some(&selected_logic_id),
+            Some(&selected_scope_id),
+            CaptureTarget::Combined,
+        )
+        .unwrap();
+        assert_eq!(combined_capture.len(), 2);
+        assert_eq!(combined_capture[0].location.stable_id(), selected_logic_id);
+        assert_eq!(combined_capture[1].location.stable_id(), selected_scope_id);
     }
 
     #[test]
@@ -14158,14 +14764,6 @@ mod tests {
             Some(CaptureSettingsTab::DsCope)
         );
         assert_eq!(WaveformTab::Combined.capture_settings_tab(), None);
-
-        assert!(CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsLogicU3Pro16));
-        assert!(CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsLogicU2Pro16));
-        assert!(!CaptureTarget::LogicAnalyzer.includes_model(DeviceModel::DsCopeU3P100));
-        assert!(CaptureTarget::Oscilloscope.includes_model(DeviceModel::DsCopeU3P100));
-        assert!(!CaptureTarget::Oscilloscope.includes_model(DeviceModel::DsLogicU3Pro16));
-        assert!(CaptureTarget::Combined.includes_model(DeviceModel::DsLogicU3Pro16));
-        assert!(CaptureTarget::Combined.includes_model(DeviceModel::DsCopeU3P100));
     }
 
     #[test]
@@ -14897,6 +15495,47 @@ mod tests {
         assert!(
             (viewport.time_per_division(250_000, 1_000_000).unwrap() - 0.025).abs() < f64::EPSILON,
             "fit-to-capture should replace a wider persisted timebase"
+        );
+    }
+
+    #[test]
+    fn scope_auto_timebase_preserves_zoom_out_request_beyond_current_capture() {
+        let displayed_timebase = 2.0e-3;
+        let requested_timebase = adjacent_timebase(displayed_timebase, false).unwrap();
+        assert_eq!(requested_timebase, 5.0e-3);
+
+        let selected = resolve_scope_timebase(
+            Some(displayed_timebase),
+            Some(displayed_timebase),
+            Some(requested_timebase),
+            1.0,
+            true,
+        );
+        assert_eq!(selected, Some(requested_timebase));
+        assert_eq!(
+            resolve_scope_timebase(selected, Some(displayed_timebase), None, 1.0, true),
+            Some(requested_timebase),
+            "the request must survive while the old capture is still displayed"
+        );
+        assert_eq!(
+            resolve_scope_timebase(selected, Some(displayed_timebase), None, 1.0, false),
+            Some(displayed_timebase),
+            "manual sample rate remains limited by the captured buffer"
+        );
+
+        let settings = ScopeCaptureSettings::default();
+        let adjusted_rate = settings.sample_rate_for_timebase(requested_timebase);
+        assert_eq!(adjusted_rate, 20_000_000);
+        let mut viewport = WaveformViewport::default();
+        apply_time_per_division(
+            &mut viewport,
+            settings.sample_count as usize,
+            adjusted_rate,
+            requested_timebase,
+        );
+        assert_eq!(
+            viewport.time_per_division(settings.sample_count as usize, adjusted_rate),
+            Some(requested_timebase)
         );
     }
 

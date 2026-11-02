@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::time::{Duration, Instant};
+use wavecraft_automation::{AutomationManager, DeviceBackend, DeviceSelector};
 use wavecraft_core::{CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSource, DeviceId};
 use wavecraft_recording::{
     export_saleae_recording, import_saleae_recording, CompletionStatus, RecordingReader,
@@ -16,7 +17,7 @@ use wavecraft_usb::{
     LinkStatus,
 };
 
-const USAGE: &str = "usage: wavecraft-cli [list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
+const USAGE: &str = "usage: wavecraft-cli [devices list [--format json] | devices probe --id <connection-id> [--format json] | list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
 
 type FileRecorder = RecordingWriter<BufWriter<File>>;
 
@@ -31,6 +32,31 @@ struct DeviceStats {
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     match arguments.as_slice() {
+        [group, command] if group == "devices" && command == "list" => {
+            return automation_list_devices(false);
+        }
+        [group, command, format, value]
+            if group == "devices"
+                && command == "list"
+                && format == "--format"
+                && value == "json" =>
+        {
+            return automation_list_devices(true);
+        }
+        [group, command, id_flag, id]
+            if group == "devices" && command == "probe" && id_flag == "--id" =>
+        {
+            return automation_probe_device(id, false);
+        }
+        [group, command, id_flag, id, format, value]
+            if group == "devices"
+                && command == "probe"
+                && id_flag == "--id"
+                && format == "--format"
+                && value == "json" =>
+        {
+            return automation_probe_device(id, true);
+        }
         [command] if command == "list" => return list_devices(),
         [command] if command == "probe" => return probe_devices(),
         [command, path] if command == "inspect" => return inspect_recording(Path::new(path)),
@@ -96,6 +122,81 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     run_simulation(run_seconds, None)
+}
+
+fn automation_list_devices(json: bool) -> Result<(), Box<dyn Error>> {
+    let listing = match AutomationManager::new().device_list() {
+        Ok(listing) => listing,
+        Err(error) => return report_automation_error(error, json),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&listing)?);
+        return Ok(());
+    }
+
+    for device in listing.devices {
+        let location = device
+            .physical_location
+            .as_deref()
+            .unwrap_or("deterministic simulator");
+        println!(
+            "{}: {} ({}, {}) at {}; {:?}, {:?}",
+            device.connection_id,
+            device.display_name,
+            device.kind,
+            device.backend,
+            location,
+            device.ownership,
+            device.preparation
+        );
+        if let Some(warning) = device.link.warning {
+            eprintln!("warning: {warning}");
+        }
+    }
+    Ok(())
+}
+
+fn automation_probe_device(device_id: &str, json: bool) -> Result<(), Box<dyn Error>> {
+    let manager = AutomationManager::new();
+    let handle = match manager.open_device(DeviceSelector::connection_id(device_id)) {
+        Ok(handle) => handle,
+        Err(error) => return report_automation_error(error, json),
+    };
+    let probe = match handle.probe() {
+        Ok(probe) => probe,
+        Err(error) => return report_automation_error(error, json),
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&probe)?);
+    } else if probe.device.backend == DeviceBackend::Simulator {
+        println!(
+            "{}: {} is ready (simulator, {} channels)",
+            probe.device.connection_id,
+            probe.device.display_name,
+            probe.device.capabilities.channel_count
+        );
+    } else {
+        println!(
+            "{}: {} firmware {}, hardware status 0x{:02x}, {:?}",
+            probe.device.connection_id,
+            probe.device.display_name,
+            probe.firmware_version.as_deref().unwrap_or("unknown"),
+            probe.hardware_status_raw.unwrap_or_default(),
+            probe.preparation
+        );
+    }
+    Ok(())
+}
+
+fn report_automation_error(
+    error: wavecraft_automation::AutomationError,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&error)?);
+    }
+    Err(Box::new(error))
 }
 
 fn import_saleae(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {

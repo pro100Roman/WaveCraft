@@ -2980,9 +2980,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wavecraft-automation"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wavecraft-core",
+ "wavecraft-sim",
+ "wavecraft-usb",
+]
+
+[[package]]
 name = "wavecraft-cli"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
+ "wavecraft-automation",
  "wavecraft-core",
  "wavecraft-recording",
  "wavecraft-sim",

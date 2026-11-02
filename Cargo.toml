@@ -2,6 +2,7 @@
 members = [
     "apps/wavecraft-cli",
     "apps/wavecraft-gui",
+    "crates/wavecraft-automation",
     "crates/wavecraft-core",
     "crates/wavecraft-recording",
     "crates/wavecraft-sim",
