@@ -303,7 +303,10 @@ The protocol-analyzer catalog configures decoder stacks, channel mappings, and
 display formats. I²C selections show separate address/direction, data-byte, and
 ACK/NACK cells; SPI selections show MOSI/MISO bytes. The dedicated rows remain
 aligned with their source samples, and unsupported catalog entries report their
-status instead of silently producing no output.
+status instead of silently producing no output. The hideable, resizable
+**Decoded Data** panel groups I²C bytes into read/write transactions, lists SPI
+transfers, and renders decoded UART bytes as human-readable text when ASCII is
+selected. Clicking a decoded operation focuses its range in the waveform.
 
 Enable **Record complete capture** and enter a `.dsv` path before starting to
 write the full session to disk. The GUI uses the same streaming recorder as the

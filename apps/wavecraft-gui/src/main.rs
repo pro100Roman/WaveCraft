@@ -12,7 +12,7 @@ use measurements::{
 use protocol_analyzer::{
     decode_protocol_samples, matching_protocols, protocol_by_id, protocol_channels, protocol_stack,
     ProtocolAnalyzerInstance, ProtocolAnalyzerSettings, ProtocolDataFormat, ProtocolDecodeOutcome,
-    PROTOCOLS,
+    ProtocolDecodedEvent, ProtocolDecodedKind, PROTOCOLS,
 };
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -1845,7 +1845,12 @@ impl ProtocolDecodeCache {
                 analyzers
                     .iter()
                     .map(|analyzer| {
-                        decode_protocol_samples(analyzer, &samples, waveforms.logic_sample_offset)
+                        decode_protocol_samples(
+                            analyzer,
+                            &samples,
+                            waveforms.logic_sample_offset,
+                            waveforms.logic_rate_hz,
+                        )
                     })
                     .collect()
             };
@@ -1853,6 +1858,273 @@ impl ProtocolDecodeCache {
         }
         &self.outcomes
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecodedPanelEntry {
+    start_sample: u64,
+    end_sample: u64,
+    title: String,
+    detail: String,
+    warning: bool,
+}
+
+struct I2cPanelTransaction {
+    start_sample: u64,
+    end_sample: u64,
+    address: u8,
+    read: bool,
+    data: Vec<u8>,
+    acknowledgements: Vec<bool>,
+}
+
+impl I2cPanelTransaction {
+    fn entry(self) -> DecodedPanelEntry {
+        let operation = if self.read { "READ" } else { "WRITE" };
+        let data = if self.data.is_empty() {
+            "No data bytes".to_owned()
+        } else {
+            format!(
+                "Data: {}",
+                self.data
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        let acknowledgement = self
+            .acknowledgements
+            .iter()
+            .map(|acknowledged| if *acknowledged { "ACK" } else { "NACK" })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        DecodedPanelEntry {
+            start_sample: self.start_sample,
+            end_sample: self.end_sample,
+            title: format!("I²C {operation} · address 0x{:02X}", self.address),
+            detail: if acknowledgement.is_empty() {
+                data
+            } else {
+                format!("{data}\nResponses: {acknowledgement}")
+            },
+            warning: self
+                .acknowledgements
+                .iter()
+                .any(|acknowledged| !acknowledged),
+        }
+    }
+}
+
+fn decoded_panel_entries(events: &[ProtocolDecodedEvent]) -> Vec<DecodedPanelEntry> {
+    let mut entries = Vec::new();
+    let mut i2c_transaction: Option<I2cPanelTransaction> = None;
+    for event in events {
+        match event.kind {
+            ProtocolDecodedKind::I2cAddress { address, read } => {
+                if let Some(transaction) = i2c_transaction.take() {
+                    entries.push(transaction.entry());
+                }
+                i2c_transaction = Some(I2cPanelTransaction {
+                    start_sample: event.start_sample,
+                    end_sample: event.end_sample,
+                    address,
+                    read,
+                    data: Vec::new(),
+                    acknowledgements: Vec::new(),
+                });
+            }
+            ProtocolDecodedKind::Data { value } => {
+                if let Some(transaction) = &mut i2c_transaction {
+                    transaction.end_sample = event.end_sample;
+                    transaction.data.push(value);
+                } else {
+                    entries.push(DecodedPanelEntry {
+                        start_sample: event.start_sample,
+                        end_sample: event.end_sample,
+                        title: event.text.clone(),
+                        detail: event.detail.clone(),
+                        warning: event.warning,
+                    });
+                }
+            }
+            ProtocolDecodedKind::Acknowledge { acknowledged } => {
+                if let Some(transaction) = &mut i2c_transaction {
+                    transaction.end_sample = event.end_sample;
+                    transaction.acknowledgements.push(acknowledged);
+                }
+            }
+            ProtocolDecodedKind::Spi { .. } | ProtocolDecodedKind::Uart { .. } => {
+                if let Some(transaction) = i2c_transaction.take() {
+                    entries.push(transaction.entry());
+                }
+                entries.push(DecodedPanelEntry {
+                    start_sample: event.start_sample,
+                    end_sample: event.end_sample,
+                    title: event.text.clone(),
+                    detail: event.detail.clone(),
+                    warning: event.warning,
+                });
+            }
+        }
+    }
+    if let Some(transaction) = i2c_transaction {
+        entries.push(transaction.entry());
+    }
+    entries
+}
+
+fn uart_ascii_text(events: &[ProtocolDecodedEvent]) -> Option<String> {
+    let bytes = events
+        .iter()
+        .filter_map(|event| match event.kind {
+            ProtocolDecodedKind::Uart { value } => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    (!bytes.is_empty()).then(|| {
+        bytes
+            .into_iter()
+            .map(|byte| match byte {
+                b'\n' => "\n".to_owned(),
+                b'\r' => "\r".to_owned(),
+                b'\t' => "\t".to_owned(),
+                byte if byte.is_ascii_graphic() || byte == b' ' => char::from(byte).to_string(),
+                byte => format!("\\x{byte:02X}"),
+            })
+            .collect::<String>()
+    })
+}
+
+fn focus_logic_sample_range(
+    viewport: &mut WaveformViewport,
+    sample_offset: u64,
+    sample_count: usize,
+    start_sample: u64,
+    end_sample: u64,
+) {
+    if sample_count == 0 {
+        return;
+    }
+    let local_start = start_sample.saturating_sub(sample_offset) as f64;
+    let local_end = end_sample.saturating_sub(sample_offset) as f64;
+    let center = ((local_start + local_end) * 0.5 / sample_count as f64).clamp(0.0, 1.0);
+    let event_span = ((local_end - local_start).max(1.0) / sample_count as f64) as f32;
+    viewport.span = (event_span * 4.0).clamp(1.0 / sample_count as f32, 1.0);
+    viewport.start = viewport.clamp_start(center as f32 - viewport.span * 0.5);
+    viewport.anchor_locked = true;
+}
+
+fn paint_decoded_data_panel(
+    ui: &mut egui::Ui,
+    analyzers: &[ProtocolAnalyzerInstance],
+    outcomes: &[ProtocolDecodeOutcome],
+    sample_offset: u64,
+    sample_rate_hz: u64,
+) -> Option<(u64, u64)> {
+    let mut selected_range = None;
+    if analyzers.is_empty() {
+        ui.label(RichText::new("No protocol analyzer configured").color(TEXT_MUTED));
+        ui.add_space(4.0);
+        ui.small("Add an analyzer in Capture Setup to decode transactions.");
+        return None;
+    }
+    for (analyzer_index, (analyzer, outcome)) in analyzers.iter().zip(outcomes).enumerate() {
+        if analyzer_index != 0 {
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+        }
+        let name = protocol_by_id(analyzer.protocol_id)
+            .map(|protocol| protocol.name)
+            .unwrap_or(analyzer.protocol_id);
+        ui.label(
+            RichText::new(name)
+                .strong()
+                .color(logic_marker_color(analyzer_index)),
+        );
+        match outcome {
+            ProtocolDecodeOutcome::Unavailable(message) => {
+                ui.add_space(4.0);
+                ui.label(RichText::new(message).color(TEXT_MUTED));
+            }
+            ProtocolDecodeOutcome::Events(events) => {
+                if analyzer.data_format == ProtocolDataFormat::Ascii {
+                    if let Some(text) = uart_ascii_text(events) {
+                        ui.add_space(5.0);
+                        ui.label(RichText::new("TEXT").small().strong().color(TEXT_MUTED));
+                        egui::Frame::none()
+                            .fill(BACKGROUND)
+                            .rounding(egui::Rounding::same(5.0))
+                            .inner_margin(egui::Margin::same(8.0))
+                            .show(ui, |ui| {
+                                ui.add(egui::Label::new(RichText::new(text).monospace()).wrap());
+                            });
+                    }
+                }
+                let entries = decoded_panel_entries(events);
+                if entries.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("No decoded operations").color(TEXT_MUTED));
+                    continue;
+                }
+                ui.add_space(6.0);
+                for (entry_index, entry) in entries.iter().enumerate() {
+                    let time = if sample_rate_hz == 0 {
+                        String::new()
+                    } else {
+                        format_duration(Duration::from_secs_f64(
+                            entry.start_sample.saturating_sub(sample_offset) as f64
+                                / sample_rate_hz as f64,
+                        ))
+                    };
+                    let color = if entry.warning {
+                        Color32::LIGHT_RED
+                    } else {
+                        Color32::WHITE
+                    };
+                    let card = egui::Frame::none()
+                        .fill(BACKGROUND)
+                        .rounding(egui::Rounding::same(5.0))
+                        .inner_margin(egui::Margin::same(8.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&entry.title).strong().color(color));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(&time)
+                                                .small()
+                                                .monospace()
+                                                .color(TEXT_MUTED),
+                                        );
+                                    },
+                                );
+                            });
+                            ui.label(RichText::new(&entry.detail).small().monospace());
+                        });
+                    let response = ui.interact(
+                        card.response.rect,
+                        ui.make_persistent_id((
+                            "decoded_panel_entry",
+                            analyzer.instance_id,
+                            entry_index,
+                        )),
+                        Sense::click(),
+                    );
+                    if response
+                        .on_hover_text("Click to focus this operation in the waveform")
+                        .clicked()
+                    {
+                        selected_range = Some((entry.start_sample, entry.end_sample));
+                    }
+                    ui.add_space(5.0);
+                }
+            }
+        }
+    }
+    selected_range
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2845,6 +3117,7 @@ struct WaveCraftApp {
     logic_marker_settings: LogicMarkerSettings,
     protocol_analyzer: ProtocolAnalyzerSettings,
     protocol_decode_cache: ProtocolDecodeCache,
+    decoded_data_panel_open: bool,
     scope_channel_colors: [Color32; 2],
     logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
     scope_channel_names: [String; 2],
@@ -2917,6 +3190,7 @@ impl WaveCraftApp {
             logic_marker_settings: LogicMarkerSettings::default(),
             protocol_analyzer: ProtocolAnalyzerSettings::default(),
             protocol_decode_cache: ProtocolDecodeCache::default(),
+            decoded_data_panel_open: true,
             scope_channel_colors: SCOPE_COLORS,
             logic_channel_names: empty_logic_channel_names(),
             scope_channel_names: empty_scope_channel_names(),
@@ -6995,6 +7269,19 @@ impl eframe::App for WaveCraftApp {
                     {
                         snapshot_clicked = true;
                     }
+                    if self.active_waveform_tab == Some(WaveformTab::LogicAnalyzer) {
+                        ui.separator();
+                        if ui
+                            .selectable_label(
+                                self.decoded_data_panel_open,
+                                "Decoded Data",
+                            )
+                            .on_hover_text("Show or hide decoded protocol transactions")
+                            .clicked()
+                        {
+                            self.decoded_data_panel_open = !self.decoded_data_panel_open;
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let logic_only = control_target == Some(CaptureTarget::LogicAnalyzer);
                         let acquisition_active = self.capture_run_requested
@@ -7200,6 +7487,99 @@ impl eframe::App for WaveCraftApp {
             && self.logic_settings.operation_mode != DsLogicOperationMode::Stream
         {
             self.logic_acquisition_mode = AcquisitionMode::Single;
+        }
+
+        if self.active_waveform_tab == Some(WaveformTab::LogicAnalyzer) {
+            if self.decoded_data_panel_open {
+                let analyzers = self.protocol_analyzer.analyzers.clone();
+                let mut decode_cache = std::mem::take(&mut self.protocol_decode_cache);
+                let empty_waveforms = WaveformStore::default();
+                let waveforms = self
+                    .capture
+                    .as_ref()
+                    .filter(|active| !active.preserve_display_until_complete && active.has_logic)
+                    .map(|active| &active.waveforms)
+                    .or_else(|| {
+                        self.displayed_completed_capture()
+                            .filter(|capture| capture.has_logic)
+                            .map(|capture| &capture.waveforms)
+                    })
+                    .unwrap_or(&empty_waveforms);
+                let outcomes = decode_cache.outcomes(waveforms, &analyzers).to_vec();
+                let sample_offset = waveforms.logic_sample_offset;
+                let sample_count = waveforms.logic_sample_count;
+                let sample_rate_hz = waveforms.logic_rate_hz;
+                self.protocol_decode_cache = decode_cache;
+                let mut collapse_panel = false;
+                let mut selected_range = None;
+                egui::SidePanel::right("decoded_data_panel")
+                    .resizable(true)
+                    .default_width(360.0)
+                    .width_range(280.0..=560.0)
+                    .frame(
+                        egui::Frame::none()
+                            .fill(PANEL)
+                            .inner_margin(egui::Margin::same(12.0)),
+                    )
+                    .show(context, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("DECODED DATA").strong().color(TEXT_MUTED));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    collapse_panel = ui
+                                        .small_button(">>")
+                                        .on_hover_text("Collapse decoded data")
+                                        .clicked();
+                                },
+                            );
+                        });
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                selected_range = paint_decoded_data_panel(
+                                    ui,
+                                    &analyzers,
+                                    &outcomes,
+                                    sample_offset,
+                                    sample_rate_hz,
+                                );
+                            });
+                    });
+                if collapse_panel {
+                    self.decoded_data_panel_open = false;
+                }
+                if let Some((start_sample, end_sample)) = selected_range {
+                    focus_logic_sample_range(
+                        &mut self.logic_viewport,
+                        sample_offset,
+                        sample_count,
+                        start_sample,
+                        end_sample,
+                    );
+                }
+            } else {
+                let mut expand_panel = false;
+                egui::SidePanel::right("decoded_data_panel_collapsed")
+                    .resizable(false)
+                    .exact_width(34.0)
+                    .frame(
+                        egui::Frame::none()
+                            .fill(PANEL)
+                            .inner_margin(egui::Margin::same(4.0)),
+                    )
+                    .show(context, |ui| {
+                        expand_panel = ui
+                            .add_sized([ui.available_width(), 24.0], egui::Button::new("<<"))
+                            .on_hover_text("Expand decoded data")
+                            .clicked();
+                    });
+                if expand_panel {
+                    self.decoded_data_panel_open = true;
+                }
+            }
         }
 
         if scope_tools_panel_is_visible(self.active_waveform_tab) {
@@ -14047,6 +14427,81 @@ mod tests {
         assert_eq!(lanes.len(), 1);
         assert!(lanes[0].top() > layout.levels[4].1);
         assert!(lanes[0].bottom() < layout.levels[5].0);
+    }
+
+    #[test]
+    fn decoded_panel_groups_i2c_bytes_into_one_transaction() {
+        let event = |kind, text: &str, start_sample, end_sample, warning| ProtocolDecodedEvent {
+            start_sample,
+            end_sample,
+            text: text.to_owned(),
+            detail: text.to_owned(),
+            warning,
+            kind,
+        };
+        let events = vec![
+            event(
+                ProtocolDecodedKind::I2cAddress {
+                    address: 0x50,
+                    read: false,
+                },
+                "ADDR 50 W",
+                10,
+                20,
+                false,
+            ),
+            event(
+                ProtocolDecodedKind::Acknowledge { acknowledged: true },
+                "ACK",
+                20,
+                22,
+                false,
+            ),
+            event(
+                ProtocolDecodedKind::Data { value: 0x12 },
+                "12",
+                23,
+                31,
+                false,
+            ),
+            event(
+                ProtocolDecodedKind::Acknowledge {
+                    acknowledged: false,
+                },
+                "NACK",
+                31,
+                33,
+                true,
+            ),
+        ];
+
+        let entries = decoded_panel_entries(&events);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "I²C WRITE · address 0x50");
+        assert!(entries[0].detail.contains("Data: 12"));
+        assert!(entries[0].detail.contains("ACK · NACK"));
+        assert!(entries[0].warning);
+        assert_eq!((entries[0].start_sample, entries[0].end_sample), (10, 33));
+    }
+
+    #[test]
+    fn decoded_panel_renders_uart_ascii_as_readable_text() {
+        let events = b"Hello\r\n"
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, value)| ProtocolDecodedEvent {
+                start_sample: index as u64 * 10,
+                end_sample: index as u64 * 10 + 9,
+                text: char::from(value).to_string(),
+                detail: String::new(),
+                warning: false,
+                kind: ProtocolDecodedKind::Uart { value },
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(uart_ascii_text(&events).as_deref(), Some("Hello\r\n"));
     }
 
     #[test]
