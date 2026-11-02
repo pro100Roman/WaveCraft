@@ -171,6 +171,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download release packages
         uses: actions/download-artifact@v4
         with:
@@ -178,9 +182,40 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Generate release notes from commit messages
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          previous_tag="$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null || true)"
+          if [[ -n "$previous_tag" ]]; then
+            commit_range="${previous_tag}..${RELEASE_TAG}"
+          else
+            commit_range="$RELEASE_TAG"
+          fi
+
+          {
+            if [[ -n "$previous_tag" ]]; then
+              printf '## Changes since `%s`\n\n' "$previous_tag"
+            else
+              printf '## Changes\n\n'
+            fi
+
+            while IFS=$'\t' read -r commit subject; do
+              printf -- '- %s ([`%s`](https://github.com/%s/commit/%s))\n' \
+                "$subject" "${commit:0:7}" "$REPOSITORY" "$commit"
+            done < <(git log --no-merges --format='%H%x09%s' "$commit_range")
+
+            if [[ -n "$previous_tag" ]]; then
+              printf '\n**Full changelog:** https://github.com/%s/compare/%s...%s\n' \
+                "$REPOSITORY" "$previous_tag" "$RELEASE_TAG"
+            fi
+          } > release-notes.md
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body_path: release-notes.md
           fail_on_unmatched_files: true
-          generate_release_notes: true
