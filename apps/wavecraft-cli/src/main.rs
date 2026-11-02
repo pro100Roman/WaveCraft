@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use wavecraft_automation::{
     AutomationEvent, AutomationEventKind, AutomationManager, CaptureConfiguration, DeviceBackend,
-    DeviceSelector,
+    DeviceSelector, InstrumentKind as AutomationInstrumentKind,
 };
 use wavecraft_core::{CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureSource, DeviceId};
 use wavecraft_recording::{
@@ -154,12 +154,20 @@ fn automation_capture_run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Ok(device) => device,
         Err(error) => return report_capture_error(error, arguments.ndjson_events),
     };
-    let mut configuration = CaptureConfiguration::finite_logic(
-        arguments.sample_rate_hz,
-        arguments.sample_count,
-        arguments.channels,
-        &arguments.output,
-    );
+    let mut configuration = match device.descriptor().kind {
+        AutomationInstrumentKind::LogicAnalyzer => CaptureConfiguration::finite_logic(
+            arguments.sample_rate_hz,
+            arguments.sample_count,
+            arguments.channels,
+            &arguments.output,
+        ),
+        AutomationInstrumentKind::Oscilloscope => CaptureConfiguration::finite_scope(
+            arguments.sample_rate_hz,
+            arguments.sample_count,
+            arguments.channels,
+            &arguments.output,
+        ),
+    };
     if let Some(timeout_ms) = arguments.timeout_ms {
         configuration = configuration.with_timeout(Duration::from_millis(timeout_ms));
     }

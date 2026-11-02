@@ -175,6 +175,7 @@ pub struct SimulatedOscilloscope {
     sample_rate_hz: u64,
     channel_count: usize,
     batch_size: usize,
+    sample_limit: Option<u64>,
 }
 
 impl SimulatedOscilloscope {
@@ -198,7 +199,19 @@ impl SimulatedOscilloscope {
             sample_rate_hz,
             channel_count,
             batch_size,
+            sample_limit: None,
         })
+    }
+
+    /// Stop after emitting exactly `sample_count` samples per channel.
+    pub fn with_sample_limit(mut self, sample_count: u64) -> Result<Self, CaptureError> {
+        if sample_count == 0 {
+            return Err(CaptureError::new(
+                "simulated capture sample count must be greater than zero",
+            ));
+        }
+        self.sample_limit = Some(sample_count);
+        Ok(self)
     }
 }
 
@@ -216,11 +229,18 @@ impl CaptureSource for SimulatedOscilloscope {
         let mut sequence = 0_u64;
 
         while !context.is_cancelled() {
+            let remaining = self
+                .sample_limit
+                .map_or(self.batch_size as u64, |limit| limit - sample_index);
+            if remaining == 0 {
+                break;
+            }
+            let batch_size = remaining.min(self.batch_size as u64) as usize;
             let captured_at = context.elapsed();
             let mut channels = (0..self.channel_count)
-                .map(|_| Vec::with_capacity(self.batch_size))
+                .map(|_| Vec::with_capacity(batch_size))
                 .collect::<Vec<_>>();
-            for offset in 0..self.batch_size {
+            for offset in 0..batch_size {
                 let time = (sample_index + offset as u64) as f32 / self.sample_rate_hz as f32;
                 for (channel_index, channel) in channels.iter_mut().enumerate() {
                     let frequency = 1_000.0 + 500.0 * channel_index as f32;
@@ -228,7 +248,7 @@ impl CaptureSource for SimulatedOscilloscope {
                     channel.push((TAU * frequency * time + phase).sin());
                 }
             }
-            sample_index += self.batch_size as u64;
+            sample_index += batch_size as u64;
 
             context.emit(
                 sequence,
@@ -240,7 +260,11 @@ impl CaptureSource for SimulatedOscilloscope {
                 }),
             )?;
             sequence += 1;
-            deadline += batch_period;
+            deadline += if batch_size == self.batch_size {
+                batch_period
+            } else {
+                Duration::from_secs_f64(batch_size as f64 / self.sample_rate_hz as f64)
+            };
             context.wait_until(deadline);
         }
         Ok(())

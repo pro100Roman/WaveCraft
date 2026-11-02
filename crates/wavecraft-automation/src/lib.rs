@@ -21,11 +21,20 @@ use wavecraft_core::{
     DeviceId, InstrumentKind as CoreInstrumentKind,
 };
 use wavecraft_recording::{CompletionStatus, RecordingWriter};
-use wavecraft_sim::{SimulatedDeviceProfile, SimulatedLogicAnalyzer, SIMULATED_DEVICE_PROFILES};
+use wavecraft_sim::{
+    SimulatedDeviceProfile, SimulatedLogicAnalyzer, SimulatedOscilloscope,
+    SIMULATED_DEVICE_PROFILES,
+};
 use wavecraft_usb::{
     discover_supported_devices, prepare_device, probe_device, DeviceModel, DiscoveredDevice,
-    DsLogicCaptureConfig, DsLogicCaptureSource, DsLogicOperationMode, LinkStatus, UsbSpeedClass,
-    DSCOPE_SAMPLE_RATES_HZ, DSLOGIC_SAMPLE_ALIGNMENT, DSLOGIC_SAMPLE_RATES_HZ,
+    DsCopeBandwidthLimit as UsbScopeBandwidthLimit, DsCopeCaptureConfig, DsCopeCaptureSource,
+    DsCopeChannelConfig, DsCopeCoupling as UsbScopeCoupling, DsCopeOperationMode,
+    DsCopeTriggerConfig, DsCopeTriggerSlope as UsbScopeTriggerSlope,
+    DsCopeTriggerSource as UsbScopeTriggerSource, DsLogicCaptureConfig, DsLogicCaptureSource,
+    DsLogicOperationMode, LinkStatus, UsbSpeedClass, DSCOPE_SAMPLE_RATES_HZ,
+    DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
+    DSCOPE_TRIGGER_POSITION_CENTER_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER,
+    DSLOGIC_SAMPLE_ALIGNMENT, DSLOGIC_SAMPLE_RATES_HZ,
 };
 
 pub const DEVICE_LIST_SCHEMA: &str = "wavecraft.devices/v1";
@@ -293,8 +302,138 @@ pub enum CaptureMode {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ScopeCoupling {
+    Dc,
+    Ac,
+}
+
+impl Display for ScopeCoupling {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dc => formatter.write_str("dc"),
+            Self::Ac => formatter.write_str("ac"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeBandwidthLimit {
+    Full,
+    Mhz20,
+}
+
+impl Display for ScopeBandwidthLimit {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => formatter.write_str("full"),
+            Self::Mhz20 => formatter.write_str("20_mhz"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeTriggerSource {
+    Auto,
+    ChannelZero,
+    ChannelOne,
+    ChannelZeroAndOne,
+    ChannelZeroOrOne,
+}
+
+impl Display for ScopeTriggerSource {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => formatter.write_str("auto"),
+            Self::ChannelZero => formatter.write_str("channel_zero"),
+            Self::ChannelOne => formatter.write_str("channel_one"),
+            Self::ChannelZeroAndOne => formatter.write_str("channel_zero_and_one"),
+            Self::ChannelZeroOrOne => formatter.write_str("channel_zero_or_one"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeTriggerSlope {
+    Rising,
+    Falling,
+}
+
+impl Display for ScopeTriggerSlope {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rising => formatter.write_str("rising"),
+            Self::Falling => formatter.write_str("falling"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScopeChannelConfiguration {
+    pub volts_per_div_mv: u16,
+    pub coupling: ScopeCoupling,
+    pub probe_attenuation: u8,
+    pub vertical_offset: u16,
+}
+
+impl Default for ScopeChannelConfiguration {
+    fn default() -> Self {
+        Self {
+            volts_per_div_mv: 1_000,
+            coupling: ScopeCoupling::Dc,
+            probe_attenuation: 1,
+            vertical_offset: DSCOPE_VERTICAL_OFFSET_CENTER,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScopeCaptureConfiguration {
+    pub channel_settings: [ScopeChannelConfiguration; 2],
+    pub bandwidth_limit: ScopeBandwidthLimit,
+}
+
+impl Default for ScopeCaptureConfiguration {
+    fn default() -> Self {
+        Self {
+            channel_settings: [ScopeChannelConfiguration::default(); 2],
+            bandwidth_limit: ScopeBandwidthLimit::Full,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScopeTriggerConfiguration {
+    pub position_percent: u8,
+    pub source: ScopeTriggerSource,
+    pub auto_channel: u8,
+    pub slope: ScopeTriggerSlope,
+    pub holdoff_ns: u64,
+    pub noise_sensitivity: u8,
+    pub levels: [u8; 2],
+}
+
+impl Default for ScopeTriggerConfiguration {
+    fn default() -> Self {
+        Self {
+            position_percent: DSCOPE_TRIGGER_POSITION_CENTER_PERCENT,
+            source: ScopeTriggerSource::Auto,
+            auto_channel: 0,
+            slope: ScopeTriggerSlope::Rising,
+            holdoff_ns: 0,
+            noise_sensitivity: DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX / 2 + 1,
+            levels: [DSCOPE_TRIGGER_LEVEL_CENTER; 2],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CaptureTrigger {
     None,
+    Scope(ScopeTriggerConfiguration),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -305,6 +444,8 @@ pub struct CaptureConfiguration {
     pub sample_count: u64,
     pub channels: Vec<u8>,
     pub trigger: CaptureTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeCaptureConfiguration>,
     pub timeout_ms: u64,
     pub output_path: PathBuf,
 }
@@ -323,6 +464,30 @@ impl CaptureConfiguration {
             sample_count,
             channels,
             trigger: CaptureTrigger::None,
+            scope: None,
+            timeout_ms: 30_000,
+            output_path: output_path.into(),
+        }
+    }
+
+    pub fn finite_scope(
+        sample_rate_hz: u64,
+        sample_count: u64,
+        channels: Vec<u8>,
+        output_path: impl Into<PathBuf>,
+    ) -> Self {
+        let auto_channel = channels.first().copied().unwrap_or(0);
+        Self {
+            schema: CAPTURE_CONFIGURATION_SCHEMA.to_owned(),
+            mode: CaptureMode::Finite,
+            sample_rate_hz,
+            sample_count,
+            channels,
+            trigger: CaptureTrigger::Scope(ScopeTriggerConfiguration {
+                auto_channel,
+                ..ScopeTriggerConfiguration::default()
+            }),
+            scope: Some(ScopeCaptureConfiguration::default()),
             timeout_ms: 30_000,
             output_path: output_path.into(),
         }
@@ -930,12 +1095,18 @@ impl DeviceHandle {
 
         let mut effective_configuration = requested_configuration.clone();
         effective_configuration.channels.sort_unstable();
-        match self.descriptor.backend {
-            DeviceBackend::Simulator => {
+        match (self.descriptor.kind, self.descriptor.backend) {
+            (InstrumentKind::LogicAnalyzer, DeviceBackend::Simulator) => {
                 self.start_simulated_logic_capture(requested_configuration, effective_configuration)
             }
-            DeviceBackend::Usb => {
+            (InstrumentKind::LogicAnalyzer, DeviceBackend::Usb) => {
                 self.start_usb_logic_capture(requested_configuration, effective_configuration)
+            }
+            (InstrumentKind::Oscilloscope, DeviceBackend::Simulator) => {
+                self.start_simulated_scope_capture(requested_configuration, effective_configuration)
+            }
+            (InstrumentKind::Oscilloscope, DeviceBackend::Usb) => {
+                self.start_usb_scope_capture(requested_configuration, effective_configuration)
             }
         }
     }
@@ -957,6 +1128,35 @@ impl DeviceHandle {
         )
         .and_then(|source| source.with_sample_limit(effective_configuration.sample_count))
         .and_then(|source| source.with_enabled_channel_mask(enabled_channel_mask))
+        .map_err(|error| {
+            AutomationError::new(
+                AutomationErrorCode::UnsupportedConfiguration,
+                error.to_string(),
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id)
+        })?;
+
+        self.start_capture_with_factory(
+            requested_configuration,
+            effective_configuration,
+            Box::new(move || Ok(Box::new(source))),
+        )
+    }
+
+    fn start_simulated_scope_capture(
+        &self,
+        requested_configuration: CaptureConfiguration,
+        effective_configuration: CaptureConfiguration,
+    ) -> Result<CaptureHandle, AutomationError> {
+        let source = SimulatedOscilloscope::new(
+            &self.descriptor.connection_id,
+            effective_configuration.sample_rate_hz,
+            effective_configuration.channels.len(),
+            SIMULATOR_BATCH_SIZE,
+        )
+        .and_then(|source| source.with_sample_limit(effective_configuration.sample_count))
         .map_err(|error| {
             AutomationError::new(
                 AutomationErrorCode::UnsupportedConfiguration,
@@ -1056,6 +1256,74 @@ impl DeviceHandle {
         )
     }
 
+    fn start_usb_scope_capture(
+        &self,
+        requested_configuration: CaptureConfiguration,
+        effective_configuration: CaptureConfiguration,
+    ) -> Result<CaptureHandle, AutomationError> {
+        let usb_device = self.current_usb_device("capture.start")?;
+        if usb_device.profile.model != DeviceModel::DsCopeU3P100 {
+            return Err(AutomationError::new(
+                AutomationErrorCode::UnsupportedConfiguration,
+                format!(
+                    "{} is not a supported DSCope capture device",
+                    usb_device.profile.display_name
+                ),
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id));
+        }
+        let resource_directory = self.resource_directory.as_ref().ok_or_else(|| {
+            AutomationError::new(
+                AutomationErrorCode::PreparationFailed,
+                "USB capture requires an FPGA resource directory",
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id)
+        })?;
+        let bitstream_path = resource_directory.join(usb_device.profile.fpga_bitstream_name);
+        if !bitstream_path.is_file() {
+            return Err(AutomationError::new(
+                AutomationErrorCode::PreparationFailed,
+                format!("FPGA bitstream {} is missing", bitstream_path.display()),
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id));
+        }
+
+        let config =
+            dscope_capture_config(&self.descriptor.connection_id, &effective_configuration)?;
+        let source = DsCopeCaptureSource::new(usb_device.clone(), config).map_err(|error| {
+            AutomationError::new(
+                AutomationErrorCode::UnsupportedConfiguration,
+                error.to_string(),
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id)
+        })?;
+        let device_id = self.descriptor.connection_id.clone();
+        self.start_capture_with_factory(
+            requested_configuration,
+            effective_configuration,
+            Box::new(move || {
+                prepare_device(&usb_device, &bitstream_path).map_err(|error| {
+                    AutomationError::new(
+                        AutomationErrorCode::PreparationFailed,
+                        format!("failed to prepare {device_id}: {error}"),
+                        "capture.prepare",
+                        true,
+                    )
+                    .for_device(&device_id)
+                })?;
+                Ok(Box::new(source))
+            }),
+        )
+    }
+
     fn current_usb_device(
         &self,
         operation: &'static str,
@@ -1105,7 +1373,10 @@ impl DeviceHandle {
         let core_descriptor = DeviceDescriptor {
             id: DeviceId::new(&self.descriptor.connection_id),
             name: self.descriptor.display_name.clone(),
-            kind: CoreInstrumentKind::LogicAnalyzer,
+            kind: match self.descriptor.kind {
+                InstrumentKind::LogicAnalyzer => CoreInstrumentKind::LogicAnalyzer,
+                InstrumentKind::Oscilloscope => CoreInstrumentKind::Oscilloscope,
+            },
         };
         let metadata = capture_metadata(
             &self.descriptor,
@@ -1143,7 +1414,7 @@ impl DeviceHandle {
             .name(format!("wavecraft-{capture_id}"))
             .spawn(move || {
                 let _lease = worker_lease;
-                let result = run_logic_capture(
+                let result = run_capture(
                     worker_capture_id,
                     worker_device,
                     requested_configuration,
@@ -1344,7 +1615,7 @@ type CaptureSourceFactory =
     Box<dyn FnOnce() -> Result<Box<dyn CaptureSource>, AutomationError> + Send + 'static>;
 
 #[allow(clippy::too_many_arguments)]
-fn run_logic_capture(
+fn run_capture(
     capture_id: CaptureId,
     device: AutomationDevice,
     requested_configuration: CaptureConfiguration,
@@ -1560,6 +1831,95 @@ fn dslogic_capture_config(
         })
 }
 
+fn dscope_capture_config(
+    device_id: &str,
+    configuration: &CaptureConfiguration,
+) -> Result<DsCopeCaptureConfig, AutomationError> {
+    let unsupported = |error: wavecraft_core::CaptureError| {
+        AutomationError::new(
+            AutomationErrorCode::UnsupportedConfiguration,
+            error.to_string(),
+            "capture.start",
+            false,
+        )
+        .for_device(device_id)
+    };
+    let scope = configuration.scope.ok_or_else(|| {
+        AutomationError::new(
+            AutomationErrorCode::UnsupportedConfiguration,
+            "oscilloscope capture requires scope configuration",
+            "capture.start",
+            false,
+        )
+        .for_device(device_id)
+    })?;
+    let enabled_channels = configuration
+        .channels
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut channels = [DsCopeChannelConfig::default(); 2];
+    for (index, (destination, source)) in
+        channels.iter_mut().zip(scope.channel_settings).enumerate()
+    {
+        *destination = DsCopeChannelConfig::new(
+            source.volts_per_div_mv,
+            match source.coupling {
+                ScopeCoupling::Dc => UsbScopeCoupling::Dc,
+                ScopeCoupling::Ac => UsbScopeCoupling::Ac,
+            },
+            source.probe_attenuation,
+        )
+        .and_then(|channel| channel.with_vertical_offset(source.vertical_offset))
+        .map(|channel| channel.with_enabled(enabled_channels.contains(&(index as u8))))
+        .map_err(unsupported)?;
+    }
+    let CaptureTrigger::Scope(trigger) = configuration.trigger else {
+        return Err(AutomationError::new(
+            AutomationErrorCode::UnsupportedConfiguration,
+            "oscilloscope capture requires scope trigger configuration",
+            "capture.start",
+            false,
+        )
+        .for_device(device_id));
+    };
+    let trigger = DsCopeTriggerConfig::new(
+        match trigger.source {
+            ScopeTriggerSource::Auto => UsbScopeTriggerSource::Auto,
+            ScopeTriggerSource::ChannelZero => UsbScopeTriggerSource::ChannelZero,
+            ScopeTriggerSource::ChannelOne => UsbScopeTriggerSource::ChannelOne,
+            ScopeTriggerSource::ChannelZeroAndOne => UsbScopeTriggerSource::ChannelZeroAndOne,
+            ScopeTriggerSource::ChannelZeroOrOne => UsbScopeTriggerSource::ChannelZeroOrOne,
+        },
+        match trigger.slope {
+            ScopeTriggerSlope::Rising => UsbScopeTriggerSlope::Rising,
+            ScopeTriggerSlope::Falling => UsbScopeTriggerSlope::Falling,
+        },
+    )
+    .with_position_percent(trigger.position_percent)
+    .and_then(|value| value.with_auto_channel(trigger.auto_channel))
+    .and_then(|value| value.with_holdoff_ns(trigger.holdoff_ns))
+    .and_then(|value| value.with_noise_sensitivity(trigger.noise_sensitivity))
+    .and_then(|value| value.with_levels(trigger.levels))
+    .map_err(unsupported)?;
+    DsCopeCaptureConfig::with_channel_configs(
+        configuration.sample_rate_hz,
+        configuration.sample_count,
+        channels,
+    )
+    .and_then(|config| config.with_trigger_config(trigger))
+    .map(|config| {
+        config.with_options(
+            DsCopeOperationMode::Normal,
+            match scope.bandwidth_limit {
+                ScopeBandwidthLimit::Full => UsbScopeBandwidthLimit::Full,
+                ScopeBandwidthLimit::Mhz20 => UsbScopeBandwidthLimit::Mhz20,
+            },
+        )
+    })
+    .map_err(unsupported)
+}
+
 fn validate_capture_configuration(
     device: &AutomationDevice,
     configuration: &CaptureConfiguration,
@@ -1579,11 +1939,6 @@ fn validate_capture_configuration(
             configuration.schema
         )));
     }
-    if device.kind != InstrumentKind::LogicAnalyzer {
-        return Err(unsupported(
-            "finite logic capture requires a logic analyzer".to_owned(),
-        ));
-    }
     if !device.capabilities.supports_capture {
         return Err(unsupported(
             "selected device does not support capture".to_owned(),
@@ -1594,10 +1949,24 @@ fn validate_capture_configuration(
             "only finite capture mode is currently supported".to_owned(),
         ));
     }
-    if configuration.trigger != CaptureTrigger::None {
-        return Err(unsupported(
-            "only untriggered capture is currently supported".to_owned(),
-        ));
+    match device.kind {
+        InstrumentKind::LogicAnalyzer => {
+            if configuration.trigger != CaptureTrigger::None || configuration.scope.is_some() {
+                return Err(unsupported(
+                    "logic capture requires an untriggered logic configuration".to_owned(),
+                ));
+            }
+        }
+        InstrumentKind::Oscilloscope => {
+            if !matches!(configuration.trigger, CaptureTrigger::Scope(_))
+                || configuration.scope.is_none()
+            {
+                return Err(unsupported(
+                    "oscilloscope capture requires scope frontend and trigger configuration"
+                        .to_owned(),
+                ));
+            }
+        }
     }
     if !device
         .capabilities
@@ -1622,7 +1991,7 @@ fn validate_capture_configuration(
     }
     if configuration.channels.is_empty() {
         return Err(unsupported(
-            "at least one logic channel must be enabled".to_owned(),
+            "at least one channel must be enabled".to_owned(),
         ));
     }
     let unique_channels = configuration
@@ -1632,7 +2001,7 @@ fn validate_capture_configuration(
         .collect::<HashSet<_>>();
     if unique_channels.len() != configuration.channels.len() {
         return Err(unsupported(
-            "enabled logic channels must not contain duplicates".to_owned(),
+            "enabled channels must not contain duplicates".to_owned(),
         ));
     }
     if let Some(channel) = configuration
@@ -1641,7 +2010,7 @@ fn validate_capture_configuration(
         .find(|channel| **channel >= device.capabilities.channel_count)
     {
         return Err(unsupported(format!(
-            "logic channel {channel} is outside the device range 0..{}",
+            "channel {channel} is outside the device range 0..{}",
             device.capabilities.channel_count.saturating_sub(1)
         )));
     }
@@ -1707,6 +2076,62 @@ fn capture_metadata(
             .collect::<Vec<_>>()
             .join(","),
     );
+    if let Some(scope) = effective.scope {
+        metadata.insert(
+            "scope.bandwidth_limit".to_owned(),
+            scope.bandwidth_limit.to_string(),
+        );
+        for (index, channel) in scope.channel_settings.into_iter().enumerate() {
+            metadata.insert(
+                format!("scope.channel_{index}.volts_per_div_mv"),
+                channel.volts_per_div_mv.to_string(),
+            );
+            metadata.insert(
+                format!("scope.channel_{index}.coupling"),
+                channel.coupling.to_string(),
+            );
+            metadata.insert(
+                format!("scope.channel_{index}.probe_attenuation"),
+                channel.probe_attenuation.to_string(),
+            );
+            metadata.insert(
+                format!("scope.channel_{index}.vertical_offset"),
+                channel.vertical_offset.to_string(),
+            );
+        }
+    }
+    if let CaptureTrigger::Scope(trigger) = effective.trigger {
+        metadata.insert(
+            "scope.trigger.position_percent".to_owned(),
+            trigger.position_percent.to_string(),
+        );
+        metadata.insert(
+            "scope.trigger.source".to_owned(),
+            trigger.source.to_string(),
+        );
+        metadata.insert(
+            "scope.trigger.auto_channel".to_owned(),
+            trigger.auto_channel.to_string(),
+        );
+        metadata.insert("scope.trigger.slope".to_owned(), trigger.slope.to_string());
+        metadata.insert(
+            "scope.trigger.holdoff_ns".to_owned(),
+            trigger.holdoff_ns.to_string(),
+        );
+        metadata.insert(
+            "scope.trigger.noise_sensitivity".to_owned(),
+            trigger.noise_sensitivity.to_string(),
+        );
+        metadata.insert(
+            "scope.trigger.levels".to_owned(),
+            trigger
+                .levels
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
     metadata
 }
 
@@ -1902,6 +2327,16 @@ mod tests {
 
     fn usb_logic_configuration(path: &Path, sample_count: u64) -> CaptureConfiguration {
         CaptureConfiguration::finite_logic(1_000_000, sample_count, vec![2, 0], path)
+            .with_timeout(Duration::from_secs(2))
+    }
+
+    fn scope_configuration(path: &Path, sample_count: u64) -> CaptureConfiguration {
+        CaptureConfiguration::finite_scope(50_000, sample_count, vec![1], path)
+            .with_timeout(Duration::from_secs(2))
+    }
+
+    fn usb_scope_configuration(path: &Path, sample_count: u64) -> CaptureConfiguration {
+        CaptureConfiguration::finite_scope(1_000_000, sample_count, vec![1, 0], path)
             .with_timeout(Duration::from_secs(2))
     }
 
@@ -2145,6 +2580,44 @@ mod tests {
     }
 
     #[test]
+    fn dscope_configuration_maps_frontend_trigger_and_sorted_channels() {
+        let mut configuration = usb_scope_configuration(Path::new("unused.dsv"), 100_000);
+        let mut scope = configuration.scope.expect("scope settings should exist");
+        scope.channel_settings[1] = ScopeChannelConfiguration {
+            volts_per_div_mv: 200,
+            coupling: ScopeCoupling::Ac,
+            probe_attenuation: 10,
+            vertical_offset: 144,
+        };
+        scope.bandwidth_limit = ScopeBandwidthLimit::Mhz20;
+        configuration.scope = Some(scope);
+        configuration.trigger = CaptureTrigger::Scope(ScopeTriggerConfiguration {
+            position_percent: 25,
+            source: ScopeTriggerSource::ChannelOne,
+            auto_channel: 1,
+            slope: ScopeTriggerSlope::Falling,
+            holdoff_ns: 2_000,
+            noise_sensitivity: 5,
+            levels: [120, 140],
+        });
+        configuration.channels.sort_unstable();
+
+        let config = dscope_capture_config("usb:test", &configuration)
+            .expect("DSCope configuration should be valid");
+
+        assert_eq!(configuration.channels, [0, 1]);
+        assert_eq!(config.sample_count(), 100_000);
+        assert_eq!(config.enabled_channel_count(), 2);
+        assert_eq!(config.channels()[1].volts_per_div_mv(), 200);
+        assert_eq!(config.channels()[1].coupling(), UsbScopeCoupling::Ac);
+        assert_eq!(config.channels()[1].probe_attenuation(), 10);
+        assert_eq!(config.channels()[1].vertical_offset(), 144);
+        assert_eq!(config.trigger().source(), UsbScopeTriggerSource::ChannelOne);
+        assert_eq!(config.trigger().slope(), UsbScopeTriggerSlope::Falling);
+        assert_eq!(config.bandwidth_limit(), UsbScopeBandwidthLimit::Mhz20);
+    }
+
+    #[test]
     fn simulated_probe_uses_the_same_handle_contract() {
         let manager = AutomationManager::from_usb_discovery(
             || Ok(Vec::new()),
@@ -2263,6 +2736,43 @@ mod tests {
                 recorded_samples += frame.payload.sample_count() as u64;
                 if let wavecraft_core::CaptureBatch::Logic(batch) = frame.payload {
                     assert!(batch.samples.iter().all(|sample| sample & !0b101 == 0));
+                }
+            }
+        }
+        assert_eq!(recorded_samples, 4_097);
+    }
+
+    #[test]
+    fn finite_simulated_scope_capture_uses_the_shared_contract() {
+        let path = TestRecordingPath::new("scope-complete");
+        let manager = simulator_manager();
+        let device = manager
+            .open_device(DeviceSelector::connection_id("sim:scope-0"))
+            .expect("scope simulator should open");
+        let completed = device
+            .start_capture(scope_configuration(path.as_path(), 4_097))
+            .expect("scope capture should start")
+            .wait()
+            .expect("scope capture should complete");
+
+        assert_eq!(completed.summary.status, CaptureStatus::Completed);
+        assert_eq!(completed.summary.captured_samples, 4_097);
+        assert_eq!(completed.summary.frame_count, 2);
+        assert!(completed.summary.effective_configuration.scope.is_some());
+        assert_eq!(
+            recording_completion(path.as_path()),
+            CompletionStatus::Complete
+        );
+
+        let file = File::open(path.as_path()).expect("recording should exist");
+        let mut reader =
+            RecordingReader::new(BufReader::new(file)).expect("recording header should be valid");
+        let mut recorded_samples = 0_u64;
+        while let Some(event) = reader.read_event().expect("recording should be readable") {
+            if let CoreCaptureEvent::Frame(frame) = event {
+                recorded_samples += frame.payload.sample_count() as u64;
+                if let wavecraft_core::CaptureBatch::Scope(batch) = frame.payload {
+                    assert_eq!(batch.channels.len(), 1);
                 }
             }
         }

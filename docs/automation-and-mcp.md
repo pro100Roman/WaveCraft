@@ -30,8 +30,9 @@ a complete capture configuration.
 
 ### Current implementation
 
-The first device-service milestone and finite logic capture for simulated and
-selected DSLogic devices are implemented in `crates/wavecraft-automation`.
+The first device-service milestone and finite capture for simulated, selected
+DSLogic, and selected DSCope U3P100 devices are implemented in
+`crates/wavecraft-automation`.
 `AutomationManager` discovers USB instruments and deterministic simulators,
 returns schema-versioned descriptions, resolves selectors to exactly one
 connection, and acquires a process-wide exclusive lease before returning
@@ -40,19 +41,22 @@ disconnect-after-selection, and release their lease when explicitly closed or
 dropped. A running capture retains that lease independently of the original
 device handle.
 
-`DeviceHandle::start_capture` accepts complete finite logic-capture
-configuration for `sim:logic-0` and supported DSLogic USB devices. It validates
-sample rate, sample count, channels, timeout, trigger mode, and a
-non-overwriting output path before starting. USB managers receive an FPGA
-resource directory; the worker prepares the exact selected DSLogic device
-during the `preparing` state, maps the generic configuration to finite stream
-capture, and reports the hardware's 1,024-sample alignment through requested
-and effective configurations. `CaptureHandle` exposes status, bounded
-schema-versioned progress events, cancellation, and wait. Capture frames are
-written incrementally to a `.dsv`; successful, cancelled, timed-out, and
-failed operations select the appropriate recording footer and return
-structured results or errors. A simulator-only manager path avoids
-initializing libusb in CI.
+`DeviceHandle::start_capture` accepts complete finite configurations for both
+instrument kinds. Logic requests cover `sim:logic-0` and supported DSLogic USB
+devices. Scope requests cover `sim:scope-0` and DSCope U3P100, including both
+channel frontends, coupling, probe attenuation, vertical offsets, bandwidth,
+and hardware trigger settings. It validates sample rate, sample count,
+channels, timeout, instrument-specific settings, and a non-overwriting output
+path before starting. USB managers receive an FPGA resource directory; the
+worker prepares the exact selected instrument during the `preparing` state and
+maps the request to its hardware driver. DSLogic reports its 1,024-sample
+alignment through requested and effective configurations. `CaptureHandle`
+exposes status, bounded schema-versioned progress events, cancellation, and
+wait. Capture frames are written incrementally to a `.dsv`; successful,
+cancelled, timed-out, and failed operations select the appropriate recording
+footer and return structured results or errors. Scope frontend and trigger
+settings are preserved in recording metadata. A simulator-only manager path
+avoids initializing libusb in CI.
 
 The initial end-to-end CLI surface is:
 
@@ -63,16 +67,20 @@ wavecraft-cli devices probe --id <usb-connection-id> --format json
 wavecraft-cli capture run --device sim:logic-0 --sample-rate 100000 \
   --samples 10000 --channels 0,1,2,3 --output capture.dsv \
   --events ndjson
-wavecraft-cli capture run --device <usb-connection-id> \
+wavecraft-cli capture run --device <dslogic-connection-id> \
   --resource-directory resources/fpga --sample-rate 1000000 \
   --samples 65536 --channels 0,1,2,3 --output capture.dsv \
+  --events ndjson
+wavecraft-cli capture run --device <dscope-connection-id> \
+  --resource-directory resources/fpga --sample-rate 1000000 \
+  --samples 100000 --channels 0,1 --output scope.dsv \
   --events ndjson
 ```
 
 USB persistent identities remain absent when the current non-opening discovery
-path cannot read a serial number. Extending the same selected-device capture
-contract with oscilloscope-specific configuration for DSCope U3P100 is the next
-hardware milestone.
+path cannot read a serial number. Coordinating one explicitly selected DSLogic
+and one explicitly selected DSCope in a combined capture is the next hardware
+milestone.
 
 ## Goals
 
@@ -788,9 +796,8 @@ sources and recorded fixtures.
 Implementation status: steps 1 through 9 are complete. Step 10 covers the
 successful, cancelled, timed-out, injected-source-failure, bounded-event,
 lease-retention, exact-sample, and non-overwriting simulator paths. Explicit
-mid-stream recording failure injection remains. The DSLogic portion of step 11
-is complete and has a separate opt-in physical hardware test; DSCope support
-remains.
+mid-stream recording failure injection remains. Step 11 is complete for
+DSLogic and DSCope U3P100, with separate opt-in physical tests for both.
 
 The first milestone is deterministic discovery, exact selection, and exclusive
 ownership of one simulated or USB device, with structured results for no match,
@@ -798,6 +805,7 @@ ambiguous match, and busy state. The second milestone is direct control of one
 explicitly selected simulated logic analyzer: a CLI command supplies the
 complete capture configuration, emits versioned NDJSON, supports cancellation
 and timeout, writes a valid `.dsv`, and returns a structured result. The same
-operation now also runs against one explicitly selected DSLogic USB instrument.
-The next extension adds DSCope configuration and capture before scenarios and
-MCP reuse the proven device-and-capture lifecycle.
+operation now also runs against explicitly selected DSLogic and DSCope USB
+instruments. The next extension coordinates both selected instruments in one
+combined capture before scenarios and MCP reuse the proven device-and-capture
+lifecycle.
