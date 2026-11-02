@@ -1881,33 +1881,41 @@ struct I2cPanelTransaction {
 impl I2cPanelTransaction {
     fn entry(self) -> DecodedPanelEntry {
         let operation = if self.read { "READ" } else { "WRITE" };
-        let data = if self.data.is_empty() {
-            "No data bytes".to_owned()
+        let response = |index| {
+            self.acknowledgements
+                .get(index)
+                .map_or(
+                    "no response",
+                    |acknowledged| {
+                        if *acknowledged {
+                            "ACK"
+                        } else {
+                            "NACK"
+                        }
+                    },
+                )
+        };
+        let mut details = vec![format!(
+            "Address 0x{:02X} ({}) → {}",
+            self.address,
+            if self.read { "R" } else { "W" },
+            response(0)
+        )];
+        if self.data.is_empty() {
+            details.push("No data bytes".to_owned());
         } else {
-            format!(
-                "Data: {}",
+            details.extend(
                 self.data
                     .iter()
-                    .map(|byte| format!("{byte:02X}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        };
-        let acknowledgement = self
-            .acknowledgements
-            .iter()
-            .map(|acknowledged| if *acknowledged { "ACK" } else { "NACK" })
-            .collect::<Vec<_>>()
-            .join(" · ");
+                    .enumerate()
+                    .map(|(index, byte)| format!("Data 0x{byte:02X} → {}", response(index + 1))),
+            );
+        }
         DecodedPanelEntry {
             start_sample: self.start_sample,
             end_sample: self.end_sample,
             title: format!("I²C {operation} · address 0x{:02X}", self.address),
-            detail: if acknowledgement.is_empty() {
-                data
-            } else {
-                format!("{data}\nResponses: {acknowledgement}")
-            },
+            detail: details.join("\n"),
             warning: self
                 .acknowledgements
                 .iter()
@@ -14479,8 +14487,8 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "I²C WRITE · address 0x50");
-        assert!(entries[0].detail.contains("Data: 12"));
-        assert!(entries[0].detail.contains("ACK · NACK"));
+        assert!(entries[0].detail.contains("Address 0x50 (W) → ACK"));
+        assert!(entries[0].detail.contains("Data 0x12 → NACK"));
         assert!(entries[0].warning);
         assert_eq!((entries[0].start_sample, entries[0].end_sample), (10, 33));
     }
