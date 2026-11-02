@@ -270,9 +270,11 @@ captured. Each input range uses a rotary-style encoder that supports vertical
 mouse dragging, the mouse wheel, and arrow keys. Double-clicking a scope encoder
 opens its channel color picker; the selected color is shared by the encoder,
 trace, offset reference, readout, and trigger indication. Logic Analyzer and
-Oscilloscope tabs are created only for connected devices; the Combined tab
-appears when both models are present, and Refresh rebuilds the available tab
-set. Each waveform expands with the main window; Combined provides a draggable
+Oscilloscope tabs are available for connected devices or matching data from an
+opened capture file. Capture Setup remains available for offline analysis even
+when no instrument is connected. The Combined tab appears when both signal
+types are available, and Refresh rebuilds the available tab set. Each waveform
+expands with the main window; Combined provides a draggable
 horizontal divider for adjusting the DSLogic/DSCope height ratio. Finite
 waveform storage is bounded at two million samples and rendering is decimated
 to the plot width; this display limit does not truncate data written to a

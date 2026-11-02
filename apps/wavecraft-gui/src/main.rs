@@ -1378,6 +1378,26 @@ fn capture_settings_tabs(
     tabs
 }
 
+fn capture_settings_tabs_for_view(
+    active_waveform_tab: Option<WaveformTab>,
+    has_logic_device: bool,
+    has_scope_device: bool,
+    has_logic_capture: bool,
+    has_scope_capture: bool,
+) -> Vec<CaptureSettingsTab> {
+    let logic_available = has_logic_device || has_logic_capture;
+    let scope_available = has_scope_device || has_scope_capture;
+    match active_waveform_tab {
+        Some(WaveformTab::LogicAnalyzer) => capture_settings_tabs(logic_available, false),
+        Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
+            capture_settings_tabs(false, scope_available)
+        }
+        Some(WaveformTab::Combined) | None => {
+            capture_settings_tabs(logic_available, scope_available)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CaptureTarget {
     LogicAnalyzer,
@@ -4264,23 +4284,39 @@ impl WaveCraftApp {
     }
 
     fn available_capture_settings_tabs(&self) -> Vec<CaptureSettingsTab> {
-        let has_logic_analyzer = self
+        let has_logic_device = self
             .devices
             .iter()
             .any(|entry| entry.device.profile.model.is_logic_analyzer());
-        let has_oscilloscope = self
+        let has_scope_device = self
             .devices
             .iter()
             .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100);
-        match self.active_waveform_tab {
-            Some(WaveformTab::LogicAnalyzer) => capture_settings_tabs(has_logic_analyzer, false),
-            Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
-                capture_settings_tabs(false, has_oscilloscope)
-            }
-            Some(WaveformTab::Combined) | None => {
-                capture_settings_tabs(has_logic_analyzer, has_oscilloscope)
-            }
-        }
+        let has_logic_capture = self
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.has_logic)
+            || self.logic_sessions.any(|capture| capture.has_logic)
+            || self
+                .combined_capture
+                .as_ref()
+                .is_some_and(|capture| capture.has_logic);
+        let has_scope_capture = self
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.has_scope)
+            || self.scope_sessions.any(|capture| capture.has_scope)
+            || self
+                .combined_capture
+                .as_ref()
+                .is_some_and(|capture| capture.has_scope);
+        capture_settings_tabs_for_view(
+            self.active_waveform_tab,
+            has_logic_device,
+            has_scope_device,
+            has_logic_capture,
+            has_scope_capture,
+        )
     }
 
     fn reconcile_capture_settings_tab(&mut self) {
@@ -14973,7 +15009,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_setup_tabs_require_their_connected_devices() {
+    fn capture_setup_tabs_follow_connected_devices() {
         assert!(capture_settings_tabs(false, false).is_empty());
         assert_eq!(
             capture_settings_tabs(true, false),
@@ -14994,6 +15030,34 @@ mod tests {
                 .map(CaptureSettingsTab::label)
                 .collect::<Vec<_>>(),
             ["DSLogic", "DSCope"]
+        );
+    }
+
+    #[test]
+    fn capture_setup_stays_available_for_offline_capture_analysis() {
+        assert_eq!(
+            capture_settings_tabs_for_view(
+                Some(WaveformTab::LogicAnalyzer),
+                false,
+                false,
+                true,
+                false,
+            ),
+            vec![CaptureSettingsTab::DsLogic]
+        );
+        assert_eq!(
+            capture_settings_tabs_for_view(
+                Some(WaveformTab::Oscilloscope),
+                false,
+                false,
+                false,
+                true,
+            ),
+            vec![CaptureSettingsTab::DsCope]
+        );
+        assert_eq!(
+            capture_settings_tabs_for_view(Some(WaveformTab::Combined), false, false, true, true,),
+            vec![CaptureSettingsTab::DsLogic, CaptureSettingsTab::DsCope]
         );
     }
 
