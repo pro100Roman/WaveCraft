@@ -11053,6 +11053,7 @@ fn paint_logic_timing_hint(
     if plot.width() < 120.0 || plot.height() < 80.0 {
         return;
     }
+    let painter = painter.with_clip_rect(plot);
     let channel = measurement.channel;
 
     if let Some(timing) = measurement.cycle {
@@ -12200,6 +12201,7 @@ fn paint_scope_timing_hint(
         sample_rate_hz,
         color,
     } = options;
+    let painter = painter.with_clip_rect(plot);
     let Some(duration) = measurement.duration(sample_rate_hz) else {
         return;
     };
@@ -15918,6 +15920,59 @@ mod tests {
         assert_eq!(low_pulse.edge_end_sample, 50);
         assert_eq!(low_pulse.cycle, Some(cycle));
         assert_eq!(logic_smart_timing_measurement(&waveforms, 0, 0), None);
+    }
+
+    #[test]
+    fn logic_smart_timing_paint_is_clipped_to_the_waveform_plot() {
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let plot = Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(500.0, 400.0));
+        let waveforms = WaveformStore {
+            logic_channels: 1,
+            logic_rate_hz: 1_000_000,
+            logic_sample_count: 101,
+            ..WaveformStore::default()
+        };
+        let measurement = LogicSmartTimingMeasurement {
+            channel: 0,
+            edge_start_sample: 10,
+            edge_end_sample: 90,
+            cycle: Some(LogicTimingMeasurement {
+                channel: 0,
+                period_start_sample: 10,
+                period_end_sample: 90,
+                period_samples: 80,
+                high_samples: 40,
+            }),
+        };
+
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..egui::RawInput::default()
+            },
+            |context| {
+                let painter = context.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("smart_timing_clip_test"),
+                ));
+                paint_logic_timing_hint(
+                    &painter,
+                    plot,
+                    &waveforms,
+                    WaveformViewport {
+                        start: 0.4,
+                        span: 0.2,
+                        anchor_locked: false,
+                    },
+                    measurement,
+                    ACCENT,
+                );
+            },
+        );
+
+        assert!(!output.shapes.is_empty());
+        assert!(output.shapes.iter().all(|shape| shape.clip_rect == plot));
     }
 
     #[test]
