@@ -1420,6 +1420,19 @@ mod tests {
         "/../../docs/examples/motor-controller.wavecraft-protocol.yaml"
     ));
 
+    fn normalized_example() -> String {
+        EXAMPLE.replace("\r\n", "\n")
+    }
+
+    fn replace_once(source: &str, pattern: &str, replacement: &str) -> String {
+        assert_eq!(
+            source.matches(pattern).count(),
+            1,
+            "test fixture should contain exactly one occurrence of {pattern:?}"
+        );
+        source.replacen(pattern, replacement, 1)
+    }
+
     #[test]
     fn loads_documented_uart_schema() {
         let schema = load_protocol_schema(EXAMPLE).unwrap();
@@ -1431,8 +1444,21 @@ mod tests {
     }
 
     #[test]
+    fn loads_documented_uart_schema_with_crlf() {
+        let source = normalized_example().replace('\n', "\r\n");
+        let schema = load_protocol_schema(&source).unwrap();
+
+        assert_eq!(schema.protocol.id, "example.motor-controller");
+        assert_eq!(schema.input.transport, TransportKind::Uart);
+    }
+
+    #[test]
     fn rejects_unknown_fields_with_a_path() {
-        let source = EXAMPLE.replace("  version: 1", "  version: 1\n  typo: true");
+        let source = replace_once(
+            &normalized_example(),
+            "  version: 1",
+            "  version: 1\n  typo: true",
+        );
         let error = load_protocol_schema(&source).unwrap_err();
         assert_eq!(error.path(), "protocol.typo");
         assert_eq!(error.message(), "unknown field");
@@ -1440,25 +1466,26 @@ mod tests {
 
     #[test]
     fn rejects_stream_that_transport_does_not_provide() {
-        let source = EXAMPLE.replace("  stream: data", "  stream: mosi");
+        let source = replace_once(&normalized_example(), "  stream: data", "  stream: mosi");
         let error = load_protocol_schema(&source).unwrap_err();
         assert_eq!(error.path(), "input.stream");
     }
 
     #[test]
     fn rejects_unbounded_gap_framing() {
-        let source = EXAMPLE
-            .replace(
-                "  strategy: length_field\n  sync: [0xAA, 0x55]\n  length:\n    offset: 2\n    width: 1\n    endian: little\n    adjustment: 4\n  max_frame_bytes: 256\n  resync: next_sync",
-                "  strategy: gap\n  minimum_us: 500",
-            );
+        let source = replace_once(
+            &normalized_example(),
+            "  strategy: length_field\n  sync: [0xAA, 0x55]\n  length:\n    offset: 2\n    width: 1\n    endian: little\n    adjustment: 4\n  max_frame_bytes: 256\n  resync: next_sync",
+            "  strategy: gap\n  minimum_us: 500",
+        );
         let error = load_protocol_schema(&source).unwrap_err();
         assert_eq!(error.path(), "framing.max_frame_bytes");
     }
 
     #[test]
     fn rejects_duplicate_message_matches() {
-        let source = EXAMPLE.replace(
+        let source = replace_once(
+            &normalized_example(),
             "    summary: \"Motor {motor}: {speed_rpm}\"",
             "    summary: \"Motor {motor}: {speed_rpm}\"\n  - id: duplicate\n    name: Duplicate\n    match:\n      - offset: 3\n        value: 0x10\n    fields:\n      - name: value\n        type: u8",
         );
@@ -1468,18 +1495,20 @@ mod tests {
 
     #[test]
     fn rejects_summary_that_references_unknown_field() {
-        let source = EXAMPLE.replace("{speed_rpm}", "{missing}");
+        let source = replace_once(&normalized_example(), "{speed_rpm}", "{missing}");
         let error = load_protocol_schema(&source).unwrap_err();
         assert_eq!(error.path(), "messages[0].summary");
     }
 
     #[test]
     fn rejects_yaml_aliases_before_they_are_expanded() {
-        let source = EXAMPLE.replace(
+        let source = replace_once(
+            &normalized_example(),
             "      - name: sync\n        type: bytes",
             "      - &shared\n        name: sync\n        type: bytes",
         );
-        let source = source.replace(
+        let source = replace_once(
+            &source,
             "      - name: payload_length\n        type: u8",
             "      - *shared",
         );
