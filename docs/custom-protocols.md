@@ -5,8 +5,9 @@ generic packet model, incremental byte-stream framing, and fixed-layout field
 decoder exist in `wavecraft-decode`. First-party UART, SPI, and I2C sample
 decoding also lives in that crate, with the GUI adapting its transport results
 to the existing presentation model. The initial GUI integration can load and
-validate a YAML schema, create its UART, SPI, or I2C analyzer, map channels,
-and render generic decoded messages in the waveform and decoded-data panel.
+validate a YAML schema, attach it to a configured UART, SPI, or I2C analyzer,
+map channels, and render generic decoded messages in the waveform and
+decoded-data panel.
 It currently decodes only when the GUI retains every raw sample. Moving decode
 to an independent capture-stream consumer and adding project persistence remain
 to be implemented.
@@ -495,11 +496,11 @@ Logic channels 1-4
         `-- Custom flash commands       [flash]
 ```
 
-The initial **Load custom YAML…** action selects and validates a YAML file,
-creates the matching UART, SPI, or I2C analyzer, and opens its channel mapping
-dialog. The dialog displays the source path and decoder chain. A later stack
-editor may allow selecting an existing compatible transport analyzer instead
-of creating one automatically.
+Each configured analyzer card provides **Load YAML**, which selects and
+validates a YAML file before attaching it to that UART, SPI, or I2C transport.
+An incompatible transport is rejected without changing the analyzer. **Clear**
+removes only the attached YAML layer, while **×** removes the entire analyzer.
+The settings dialog displays the source path and decoder chain.
 
 Before committing, the dialog previews bounded results from the current raw
 capture or recording. It shows schema errors separately from data diagnostics.

@@ -51,6 +51,7 @@ use wavecraft_usb::{
 
 const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
+const BUILD_VERSION_LABEL: &str = concat!("Version: ", env!("WAVECRAFT_BUILD_VERSION"));
 const LOGIC_CHANNEL_COUNT: usize = 16;
 // Keep the complete largest hardware capture in memory. Rendering is already
 // decimated to the plot width, so retaining the samples does not increase the
@@ -281,7 +282,7 @@ fn choose_recording_to_open() -> Option<PathBuf> {
 
 fn choose_custom_protocol_to_open() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("Load custom protocol")
+        .set_title("Load YAML protocol")
         .add_filter("WaveCraft protocol", &["yaml", "yml"])
         .pick_file()
 }
@@ -6433,32 +6434,6 @@ fn paint_protocol_analyzer_settings(
                 if ui.button(add_label).clicked() {
                     settings.picker_open = !settings.picker_open;
                 }
-                if ui.button("Load custom YAML…").clicked() {
-                    if let Some(path) = choose_custom_protocol_to_open() {
-                        match std::fs::read_to_string(&path) {
-                            Ok(source) => {
-                                if let Err(error) =
-                                    settings.begin_add_custom_yaml(path.clone(), source)
-                                {
-                                    settings.custom_load_error =
-                                        Some(format!("Failed to load {}: {error}", path.display()));
-                                }
-                            }
-                            Err(error) => {
-                                settings.custom_load_error =
-                                    Some(format!("Failed to read {}: {error}", path.display()));
-                            }
-                        }
-                    }
-                }
-                if !settings.analyzers.is_empty()
-                    && ui
-                        .small_button("Clear")
-                        .on_hover_text("Remove all protocol analyzers")
-                        .clicked()
-                {
-                    settings.clear();
-                }
             });
 
             if let Some(error) = &settings.custom_load_error {
@@ -6513,6 +6488,8 @@ fn paint_protocol_analyzer_settings(
 
             let mut remove = None;
             let mut edit = None;
+            let mut load_yaml = None;
+            let mut clear_yaml = None;
             for (analyzer_index, analyzer) in settings.analyzers.iter().enumerate() {
                 let channels = analyzer_channels(analyzer);
                 let assigned_channels = analyzer
@@ -6540,45 +6517,57 @@ fn paint_protocol_analyzer_settings(
                     .rounding(egui::Rounding::same(4.0))
                     .inner_margin(egui::Margin::same(6.0))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
+                        ui.vertical(|ui| {
+                            ui.small(RichText::new(analyzer_long_name(analyzer)).color(TEXT_MUTED));
+                            ui.label(RichText::new(analyzer_name(analyzer)).strong());
+                            ui.small(
+                                RichText::new(format!(
+                                    "{} · {assigned_channels}/{} inputs",
+                                    analyzer.data_format.label(),
+                                    channels.len()
+                                ))
+                                .color(TEXT_MUTED),
+                            );
+                            if missing_required {
                                 ui.small(
-                                    RichText::new(analyzer_long_name(analyzer)).color(TEXT_MUTED),
+                                    RichText::new("Assign every required input")
+                                        .color(Color32::LIGHT_RED),
                                 );
-                                ui.label(RichText::new(analyzer_name(analyzer)).strong());
+                            } else if disabled_mapping {
                                 ui.small(
-                                    RichText::new(format!(
-                                        "{} · {assigned_channels}/{} inputs",
-                                        analyzer.data_format.label(),
-                                        channels.len()
-                                    ))
-                                    .color(TEXT_MUTED),
+                                    RichText::new(
+                                        "One or more mapped capture channels are disabled",
+                                    )
+                                    .color(Color32::YELLOW),
                                 );
-                                if missing_required {
-                                    ui.small(
-                                        RichText::new("Assign every required input")
-                                            .color(Color32::LIGHT_RED),
-                                    );
-                                } else if disabled_mapping {
-                                    ui.small(
-                                        RichText::new(
-                                            "One or more mapped capture channels are disabled",
-                                        )
-                                        .color(Color32::YELLOW),
-                                    );
+                            }
+                            ui.add_space(3.0);
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Edit…").clicked() {
+                                    edit = Some(analyzer_index);
+                                }
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text("Remove analyzer")
+                                    .clicked()
+                                {
+                                    remove = Some(analyzer_index);
+                                }
+                                ui.separator();
+                                if ui.small_button("Load YAML").clicked() {
+                                    load_yaml = Some(analyzer_index);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        analyzer.custom_protocol.is_some(),
+                                        egui::Button::new("Clear").small(),
+                                    )
+                                    .on_hover_text("Clear the attached YAML protocol")
+                                    .clicked()
+                                {
+                                    clear_yaml = Some(analyzer_index);
                                 }
                             });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.small_button("×").on_hover_text("Remove").clicked() {
-                                        remove = Some(analyzer_index);
-                                    }
-                                    if ui.small_button("Edit…").clicked() {
-                                        edit = Some(analyzer_index);
-                                    }
-                                },
-                            );
                         })
                         .response
                         .on_hover_text(format!(
@@ -6591,6 +6580,26 @@ fn paint_protocol_analyzer_settings(
                 settings.analyzers.remove(index);
             } else if let Some(index) = edit {
                 settings.begin_edit(index);
+            } else if let Some(index) = load_yaml {
+                settings.custom_load_error = None;
+                if let Some(path) = choose_custom_protocol_to_open() {
+                    match std::fs::read_to_string(&path) {
+                        Ok(source) => {
+                            if let Err(error) =
+                                settings.begin_attach_custom_yaml(index, path.clone(), source)
+                            {
+                                settings.custom_load_error =
+                                    Some(format!("Failed to load {}: {error}", path.display()));
+                            }
+                        }
+                        Err(error) => {
+                            settings.custom_load_error =
+                                Some(format!("Failed to read {}: {error}", path.display()));
+                        }
+                    }
+                }
+            } else if let Some(index) = clear_yaml {
+                settings.clear_custom_protocol(index);
             }
         });
 }
@@ -7589,6 +7598,15 @@ impl eframe::App for WaveCraftApp {
                         ui.separator();
                         ui.label(RichText::new(error).color(Color32::LIGHT_RED));
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(BUILD_VERSION_LABEL)
+                                .small()
+                                .monospace()
+                                .color(TEXT_MUTED),
+                        )
+                        .on_hover_text("Build version");
+                    });
                 });
             });
 

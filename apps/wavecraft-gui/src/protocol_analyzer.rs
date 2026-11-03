@@ -170,20 +170,27 @@ impl ProtocolAnalyzerSettings {
         true
     }
 
-    pub fn begin_add_custom_yaml(
+    pub fn begin_attach_custom_yaml(
         &mut self,
+        analyzer_index: usize,
         source_path: PathBuf,
         source: String,
     ) -> Result<(), String> {
         let schema = load_protocol_schema(&source).map_err(|error| error.to_string())?;
-        let protocol_id = match schema.input.transport {
-            TransportKind::Uart => "1:uart",
-            TransportKind::Spi => "1:spi",
-            TransportKind::I2c => "1:i2c",
-        };
         let mut analyzer = self
-            .new_analyzer(protocol_id)
-            .ok_or_else(|| format!("base decoder {protocol_id:?} is unavailable"))?;
+            .analyzers
+            .get(analyzer_index)
+            .cloned()
+            .ok_or_else(|| "selected analyzer is no longer available".to_owned())?;
+        let selected_transport = analyzer_transport(&analyzer)
+            .ok_or_else(|| "selected analyzer does not use UART, SPI, or I²C".to_owned())?;
+        if schema.input.transport != selected_transport {
+            return Err(format!(
+                "YAML expects {}, but the selected analyzer uses {}",
+                transport_name(schema.input.transport),
+                transport_name(selected_transport)
+            ));
+        }
         analyzer.custom_protocol = Some(CustomProtocolAnalyzer {
             source_path,
             source,
@@ -191,11 +198,22 @@ impl ProtocolAnalyzerSettings {
         });
         self.editor = Some(ProtocolAnalyzerEditor {
             analyzer,
-            target_index: None,
+            target_index: Some(analyzer_index),
         });
         self.picker_open = false;
         self.custom_load_error = None;
         Ok(())
+    }
+
+    pub fn clear_custom_protocol(&mut self, analyzer_index: usize) -> bool {
+        let Some(analyzer) = self.analyzers.get_mut(analyzer_index) else {
+            return false;
+        };
+        let cleared = analyzer.custom_protocol.take().is_some();
+        if cleared {
+            self.custom_load_error = None;
+        }
+        cleared
     }
 
     pub fn begin_edit(&mut self, index: usize) -> bool {
@@ -223,14 +241,28 @@ impl ProtocolAnalyzerSettings {
     pub fn cancel_editor(&mut self) {
         self.editor = None;
     }
-
-    pub fn clear(&mut self) {
-        self.analyzers.clear();
-    }
 }
 
 pub fn protocol_by_id(id: &str) -> Option<&'static ProtocolDefinition> {
     PROTOCOLS.iter().find(|protocol| protocol.id == id)
+}
+
+fn analyzer_transport(analyzer: &ProtocolAnalyzerInstance) -> Option<TransportKind> {
+    let base_id = protocol_stack(analyzer.protocol_id)?.first()?.id;
+    match base_id {
+        "0:uart" | "1:uart" => Some(TransportKind::Uart),
+        "0:spi" | "1:spi" => Some(TransportKind::Spi),
+        "0:i2c" | "1:i2c" => Some(TransportKind::I2c),
+        _ => None,
+    }
+}
+
+fn transport_name(transport: TransportKind) -> &'static str {
+    match transport {
+        TransportKind::Uart => "UART",
+        TransportKind::Spi => "SPI",
+        TransportKind::I2c => "I²C",
+    }
 }
 
 pub fn analyzer_name(analyzer: &ProtocolAnalyzerInstance) -> &str {
@@ -1956,8 +1988,12 @@ mod tests {
         let source =
             include_str!("../../../docs/examples/motor-controller.wavecraft-protocol.yaml");
         let mut settings = ProtocolAnalyzerSettings::default();
+        assert!(settings.begin_add("1:uart"));
+        let editor = settings.editor.clone().unwrap();
+        settings.save_editor(editor);
         settings
-            .begin_add_custom_yaml(
+            .begin_attach_custom_yaml(
+                0,
                 PathBuf::from("motor-controller.wavecraft-protocol.yaml"),
                 source.to_owned(),
             )
@@ -1984,5 +2020,30 @@ mod tests {
         assert!(!events[0].warning);
         assert_eq!(events[0].kind, ProtocolDecodedKind::Custom);
         assert!(events[0].start_sample >= 500);
+
+        assert!(settings.clear_custom_protocol(0));
+        assert_eq!(analyzer_name(&settings.analyzers[0]), "1:UART");
+        assert!(!settings.clear_custom_protocol(0));
+    }
+
+    #[test]
+    fn custom_yaml_must_match_the_selected_transport() {
+        let source =
+            include_str!("../../../docs/examples/motor-controller.wavecraft-protocol.yaml");
+        let mut settings = ProtocolAnalyzerSettings::default();
+        assert!(settings.begin_add("1:i2c"));
+        let editor = settings.editor.clone().unwrap();
+        settings.save_editor(editor);
+
+        let error = settings
+            .begin_attach_custom_yaml(0, PathBuf::from("motor.yaml"), source.to_owned())
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "YAML expects UART, but the selected analyzer uses I²C"
+        );
+        assert!(settings.editor.is_none());
+        assert!(settings.analyzers[0].custom_protocol.is_none());
     }
 }

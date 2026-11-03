@@ -26,7 +26,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        if: github.ref_type == 'tag'
+        with:
+          python-version: "3.12"
+
       - uses: dtolnay/rust-toolchain@1.79.0
+
+      - name: Set application version from release tag
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python scripts/set_release_version.py "$RELEASE_TAG"
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
       - name: Install Linux window-system dependencies
         run: >-
@@ -60,9 +73,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        if: github.ref_type == 'tag'
+        with:
+          python-version: "3.12"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - name: Set application version from release tag
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          python scripts/set_release_version.py "$RELEASE_TAG"
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
       - name: Install universal macOS targets
         if: runner.os == 'macOS'
