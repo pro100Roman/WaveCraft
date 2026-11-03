@@ -2100,6 +2100,7 @@ fn paint_decoded_data_panel(
                 }
                 ui.add_space(6.0);
                 for (entry_index, entry) in entries.iter().enumerate() {
+                    let card_width = ui.available_width();
                     let time = protocol_event_elapsed(entry.start_sample, sample_rate_hz)
                         .map(format_duration)
                         .unwrap_or_default();
@@ -2113,21 +2114,25 @@ fn paint_decoded_data_panel(
                         .rounding(egui::Rounding::same(5.0))
                         .inner_margin(egui::Margin::same(8.0))
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(&entry.title).strong().color(color));
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(&time)
-                                                .small()
-                                                .monospace()
-                                                .color(TEXT_MUTED),
-                                        );
-                                    },
+                            let content_width = (card_width - 16.0).max(0.0);
+                            ui.set_width(content_width);
+                            ui.set_max_width(content_width);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                                ui.label(
+                                    RichText::new(&time).small().monospace().color(TEXT_MUTED),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&entry.title).strong().color(color),
+                                    )
+                                    .wrap()
+                                    .halign(egui::Align::Min),
                                 );
                             });
-                            ui.label(RichText::new(&entry.detail).small().monospace());
+                            ui.add(
+                                egui::Label::new(RichText::new(&entry.detail).small().monospace())
+                                    .wrap(),
+                            );
                         });
                     let response = ui.interact(
                         card.response.rect,
@@ -5853,142 +5858,6 @@ fn paint_capture_settings(
                         "Show edge width, rising-edge period, frequency, and duty cycle for the digital waveform under the mouse",
                     );
                     ui.add_space(8.0);
-                    let capture_summary = format!(
-                        "Capture · {} @ {}",
-                        logic_capture_duration_label(*logic_settings),
-                        format_sample_rate(logic_settings.sample_rate_hz)
-                    );
-                    egui::CollapsingHeader::new(RichText::new(capture_summary).strong())
-                        .id_salt("dslogic_capture_section")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.set_max_width(ui.available_width());
-                            egui::Grid::new("dslogic_capture_menu")
-                                .num_columns(2)
-                                .max_col_width(126.0)
-                                .spacing([8.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label("Mode");
-                                    ui.add_enabled_ui(availability.capture, |ui| {
-                                        let loop_available = logic_settings.operation_mode
-                                            == DsLogicOperationMode::Stream;
-                                        egui::ComboBox::from_id_salt("logic_acquisition_mode")
-                                            .width(100.0)
-                                            .selected_text(logic_acquisition_mode.logic_label())
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    logic_acquisition_mode,
-                                                    AcquisitionMode::Single,
-                                                    "Single",
-                                                );
-                                                ui.selectable_value(
-                                                    logic_acquisition_mode,
-                                                    AcquisitionMode::Repetitive,
-                                                    "Repetitive",
-                                                );
-                                                ui.add_enabled_ui(loop_available, |ui| {
-                                                    ui.selectable_value(
-                                                        logic_acquisition_mode,
-                                                        AcquisitionMode::Loop,
-                                                        "Loop",
-                                                    )
-                                                    .on_disabled_hover_text(
-                                                        "Loop requires DSLogic Stream mode",
-                                                    );
-                                                });
-                                            });
-                                    });
-                                    ui.end_row();
-
-                                    ui.label("Duration");
-                                    ui.add_enabled_ui(availability.capture, |ui| {
-                                        egui::ComboBox::from_id_salt("logic_capture_duration")
-                                            .width(100.0)
-                                            .selected_text(logic_capture_duration_label(
-                                                *logic_settings,
-                                            ))
-                                            .show_ui(ui, |ui| {
-                                                for (duration_seconds, sample_count) in
-                                                    logic_capture_duration_options(*logic_settings)
-                                                {
-                                                    ui.selectable_value(
-                                                        &mut logic_settings.sample_count,
-                                                        sample_count,
-                                                        format_duration(Duration::from_secs_f64(
-                                                            duration_seconds,
-                                                        )),
-                                                    );
-                                                }
-                                            });
-                                    });
-                                    ui.end_row();
-
-                                    ui.label("Sample rate");
-                                    ui.add_enabled_ui(
-                                        availability.capture
-                                            && logic_settings.operation_mode
-                                                != DsLogicOperationMode::InternalTest,
-                                        |ui| {
-                                            let previous_rate = logic_settings.sample_rate_hz;
-                                            egui::ComboBox::from_id_salt("logic_sample_rate")
-                                                .width(100.0)
-                                                .selected_text(format_sample_rate(
-                                                    logic_settings.sample_rate_hz,
-                                                ))
-                                                .show_ui(ui, |ui| {
-                                                    for rate in DSLOGIC_SAMPLE_RATES_HZ
-                                                        .iter()
-                                                        .copied()
-                                                        .filter(|rate| {
-                                                            *rate <= maximum_sample_rate_hz
-                                                        })
-                                                    {
-                                                        ui.selectable_value(
-                                                            &mut logic_settings.sample_rate_hz,
-                                                            rate,
-                                                            format_sample_rate(rate),
-                                                        );
-                                                    }
-                                                });
-                                            if logic_settings.sample_rate_hz != previous_rate {
-                                                let selected_rate = logic_settings.sample_rate_hz;
-                                                logic_settings.sample_rate_hz = previous_rate;
-                                                set_logic_sample_rate_preserving_duration(
-                                                    logic_settings,
-                                                    selected_rate,
-                                                );
-                                            }
-                                        },
-                                    );
-                                    ui.end_row();
-
-                                    if *logic_acquisition_mode == AcquisitionMode::Repetitive {
-                                        ui.label("Repeat interval");
-                                        if logic_settings.operation_mode
-                                            == DsLogicOperationMode::Stream
-                                        {
-                                            ui.label(RichText::new("0.1 s").color(TEXT_MUTED))
-                                                .on_hover_text(
-                                                    "Stream-mode Repetitive uses the original fixed 0.1 s interval",
-                                                );
-                                        } else {
-                                            ui.add_enabled(
-                                                availability.capture,
-                                                egui::DragValue::new(
-                                                    repetitive_interval_seconds,
-                                                )
-                                                .range(0.1..=10.0)
-                                                .speed(0.1)
-                                                .fixed_decimals(1)
-                                                .suffix(" s"),
-                                            )
-                                            .on_hover_text("Delay between complete captures");
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                    ui.add_space(8.0);
                     egui::CollapsingHeader::new(RichText::new("Options").strong())
                         .default_open(false)
                         .show(ui, |ui| {
@@ -6130,6 +5999,142 @@ fn paint_capture_settings(
                             });
                         });
                     ui.add_space(8.0);
+                    let capture_summary = format!(
+                        "Capture · {} @ {}",
+                        logic_capture_duration_label(*logic_settings),
+                        format_sample_rate(logic_settings.sample_rate_hz)
+                    );
+                    egui::CollapsingHeader::new(RichText::new(capture_summary).strong())
+                        .id_salt("dslogic_capture_section")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.set_max_width(ui.available_width());
+                            egui::Grid::new("dslogic_capture_menu")
+                                .num_columns(2)
+                                .max_col_width(126.0)
+                                .spacing([8.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Mode");
+                                    ui.add_enabled_ui(availability.capture, |ui| {
+                                        let loop_available = logic_settings.operation_mode
+                                            == DsLogicOperationMode::Stream;
+                                        egui::ComboBox::from_id_salt("logic_acquisition_mode")
+                                            .width(100.0)
+                                            .selected_text(logic_acquisition_mode.logic_label())
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    logic_acquisition_mode,
+                                                    AcquisitionMode::Single,
+                                                    "Single",
+                                                );
+                                                ui.selectable_value(
+                                                    logic_acquisition_mode,
+                                                    AcquisitionMode::Repetitive,
+                                                    "Repetitive",
+                                                );
+                                                ui.add_enabled_ui(loop_available, |ui| {
+                                                    ui.selectable_value(
+                                                        logic_acquisition_mode,
+                                                        AcquisitionMode::Loop,
+                                                        "Loop",
+                                                    )
+                                                    .on_disabled_hover_text(
+                                                        "Loop requires DSLogic Stream mode",
+                                                    );
+                                                });
+                                            });
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Duration");
+                                    ui.add_enabled_ui(availability.capture, |ui| {
+                                        egui::ComboBox::from_id_salt("logic_capture_duration")
+                                            .width(100.0)
+                                            .selected_text(logic_capture_duration_label(
+                                                *logic_settings,
+                                            ))
+                                            .show_ui(ui, |ui| {
+                                                for (duration_seconds, sample_count) in
+                                                    logic_capture_duration_options(*logic_settings)
+                                                {
+                                                    ui.selectable_value(
+                                                        &mut logic_settings.sample_count,
+                                                        sample_count,
+                                                        format_duration(Duration::from_secs_f64(
+                                                            duration_seconds,
+                                                        )),
+                                                    );
+                                                }
+                                            });
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Sample rate");
+                                    ui.add_enabled_ui(
+                                        availability.capture
+                                            && logic_settings.operation_mode
+                                                != DsLogicOperationMode::InternalTest,
+                                        |ui| {
+                                            let previous_rate = logic_settings.sample_rate_hz;
+                                            egui::ComboBox::from_id_salt("logic_sample_rate")
+                                                .width(100.0)
+                                                .selected_text(format_sample_rate(
+                                                    logic_settings.sample_rate_hz,
+                                                ))
+                                                .show_ui(ui, |ui| {
+                                                    for rate in DSLOGIC_SAMPLE_RATES_HZ
+                                                        .iter()
+                                                        .copied()
+                                                        .filter(|rate| {
+                                                            *rate <= maximum_sample_rate_hz
+                                                        })
+                                                    {
+                                                        ui.selectable_value(
+                                                            &mut logic_settings.sample_rate_hz,
+                                                            rate,
+                                                            format_sample_rate(rate),
+                                                        );
+                                                    }
+                                                });
+                                            if logic_settings.sample_rate_hz != previous_rate {
+                                                let selected_rate = logic_settings.sample_rate_hz;
+                                                logic_settings.sample_rate_hz = previous_rate;
+                                                set_logic_sample_rate_preserving_duration(
+                                                    logic_settings,
+                                                    selected_rate,
+                                                );
+                                            }
+                                        },
+                                    );
+                                    ui.end_row();
+
+                                    if *logic_acquisition_mode == AcquisitionMode::Repetitive {
+                                        ui.label("Repeat interval");
+                                        if logic_settings.operation_mode
+                                            == DsLogicOperationMode::Stream
+                                        {
+                                            ui.label(RichText::new("0.1 s").color(TEXT_MUTED))
+                                                .on_hover_text(
+                                                    "Stream-mode Repetitive uses the original fixed 0.1 s interval",
+                                                );
+                                        } else {
+                                            ui.add_enabled(
+                                                availability.capture,
+                                                egui::DragValue::new(
+                                                    repetitive_interval_seconds,
+                                                )
+                                                .range(0.1..=10.0)
+                                                .speed(0.1)
+                                                .fixed_decimals(1)
+                                                .suffix(" s"),
+                                            )
+                                            .on_hover_text("Delay between complete captures");
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    ui.add_space(8.0);
                     egui::CollapsingHeader::new(
                         RichText::new(format!(
                             "Channels ({enabled_channel_count}/{LOGIC_CHANNEL_COUNT} enabled)"
@@ -6137,7 +6142,7 @@ fn paint_capture_settings(
                         .strong(),
                     )
                     .id_salt("dslogic_channels_section")
-                    .default_open(false)
+                    .default_open(true)
                     .show(ui, |ui| {
                             let channel_controls_enabled = availability.capture
                                 && logic_settings.operation_mode
