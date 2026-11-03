@@ -2,12 +2,15 @@
 
 Status: implementation in progress. The strict YAML loader, schema validator,
 generic packet model, incremental byte-stream framing, and fixed-layout field
-decoder exist in `wavecraft-decode`. First-party UART, SPI, and I2C sample
-decoding also lives in that crate, with the GUI adapting its transport results
-to the existing presentation model. The initial GUI integration can load and
-validate a YAML schema, attach it to a configured UART, SPI, or I2C analyzer,
-map channels, and render generic decoded messages in the waveform and
-decoded-data panel.
+decoder exist in `wavecraft-decode`. Stateful UART, SPI, and I2C decoders retain
+transport state across arbitrary sample chunks, reject discontinuities until
+explicitly reset, and report incomplete state when finished. A persistent
+custom-protocol runtime likewise retains framing state across timed-byte
+batches. The GUI still uses the stateless compatibility functions to adapt
+transport results to its existing presentation model. It can load and validate
+a YAML schema, attach it to a configured UART, SPI, or I2C analyzer, map
+channels, and render generic decoded messages in the waveform and decoded-data
+panel.
 It currently decodes only when the GUI retains every raw sample. Moving decode
 to an independent capture-stream consumer and adding project persistence remain
 to be implemented.
@@ -76,6 +79,60 @@ decoding consumes the ordered logic batches alongside recording. Offline
 decoding consumes ordered frames from the recording reader. It must not use the
 GUI's bounded or downsampled waveform display buffer, because that buffer may
 no longer contain every raw sample.
+
+## Continuous and Loop capture
+
+The current GUI can decode in DSLogic Loop mode, but only within the retained
+rolling waveform window. Loop requires DSLogic Stream mode and configures the
+display store with a raw-sample stride of one. Its capacity is the selected
+logic sample count capped at 2,000,000 samples. Therefore ordinary UART, SPI,
+or I2C transactions and their custom YAML messages decode when the complete
+transport frame and protocol packet lie inside that window.
+
+This is not yet full continuous decoding. `ProtocolDecodeCache` currently
+reconstructs the raw words from the display store and reruns each stateless
+transport decoder and YAML parser whenever the waveform revision changes. As
+the rolling window advances:
+
+- decoded events disappear when their source samples are evicted;
+- a transaction or packet whose beginning crossed the left boundary may be
+  lost or reported as incomplete;
+- a packet at the right boundary appears only after the remaining bytes enter
+  the window;
+- transport and framing state is not retained independently of the window; and
+- repeatedly decoding the complete window can become expensive at high sample
+  rates or with several analyzers.
+
+When native recording is enabled, `.dsv` still receives every raw capture
+batch emitted during Loop mode. The current GUI recording loader nevertheless
+builds another bounded `WaveformStore`, so reopening the file does not yet run
+the decoder over its complete frame stream.
+
+The target path separates decoding from display retention:
+
+```text
+CaptureFrame
+    |-- native .dsv recorder
+    |-- bounded waveform display buffer
+    `-- persistent analyzer runtime
+            |-- incremental UART / SPI / I2C decoder
+            `-- persistent custom-protocol framer and field parser
+                    `-- bounded decoded-event history
+```
+
+Each configured analyzer instance owns an incremental runtime. It consumes
+every ordered raw logic batch before display downsampling or eviction, retains
+partial symbols, transport transactions, and framed bytes across chunk
+boundaries, and emits events with absolute sample ranges. A normal capture stop
+flushes incomplete state with an explicit diagnostic. A source discontinuity,
+new acquisition, channel remap, sample-rate change, or analyzer configuration
+change resets the affected stages rather than joining unrelated samples.
+
+Decoded-event retention is bounded separately from raw waveform retention.
+Older UI events may be discarded without changing recorder or decoder input.
+Offline decoding streams every `CaptureFrame` from `.dsv` through the same
+runtime, so live and offline results are identical for the same recording,
+analyzer settings, schema snapshot, and decoder versions.
 
 ## Crate boundaries
 
@@ -561,6 +618,13 @@ keyed by all of those inputs.
 Transport decoder tests cover bytes and boundaries that span capture chunks,
 cancellation, end-of-input, malformed symbols, and absolute sample ordering.
 
+Continuous-capture tests feed the same raw stream with different batch sizes,
+advance the display ring past old samples, and require identical still-retained
+events without restarting decoder state. They also cover packets spanning
+capture batches, explicit discontinuity resets, final incomplete-frame flush,
+bounded decoded-event eviction, and equality between live Loop decoding and a
+complete `.dsv` offline pass.
+
 YAML tests cover:
 
 - valid examples for UART, SPI, and I2C;
@@ -586,11 +650,14 @@ live and after a `.dsv` round trip and require identical results.
    messages, and incremental decoder traits.
 3. Move UART, SPI, and I2C semantics out of the GUI while retaining current UI
    behavior through adapters.
-4. Add YAML DTOs, strict validation, immutable execution plans, and bounded
+4. Move decoder execution from `ProtocolDecodeCache` to persistent analyzer
+   runtimes that consume live and recorded `CaptureFrame` streams, including
+   Loop-mode boundary, reset, flush, and bounded-history behavior.
+5. Add YAML DTOs, strict validation, immutable execution plans, and bounded
    framing and field parsing.
-5. Replace GUI-specific decoded kinds with generic message and field rendering.
-6. Add versioned project loading/saving, recording-ID checks, and embedded YAML
+6. Replace GUI-specific decoded kinds with generic message and field rendering.
+7. Add versioned project loading/saving, recording-ID checks, and embedded YAML
    schema snapshots.
-7. Add CLI validation and offline decode commands using the same services.
-8. Add request/response correlation, multi-stream SPI parsing, or Kaitai Struct
+8. Add CLI validation and offline decode commands using the same services.
+9. Add request/response correlation, multi-stream SPI parsing, or Kaitai Struct
    only after version 1 behavior and resource limits are proven.

@@ -54,9 +54,12 @@ timed packet bytes. Only then may a custom YAML schema assign application-level
 meaning to fields. YAML schemas do not implement filters, carrier recovery,
 symbol timing, or bit slicing.
 
-Live and offline decoding use the same incremental engine. Decoders subscribe
-to ordered capture data independently of the GUI's bounded display buffers, so
-waveform downsampling cannot change protocol results.
+The target live and offline paths use the same incremental engine. Decoders
+subscribe to ordered capture data independently of the GUI's bounded display
+buffers, so waveform downsampling cannot change protocol results. The current
+GUI still re-decodes only its retained raw display window; its exact Loop-mode
+behavior and migration plan are documented under
+[Continuous and Loop capture](custom-protocols.md#continuous-and-loop-capture).
 
 First-party SPI and I2C decoders will implement the same decoder contract as
 third-party extensions. External plugins use a versioned, out-of-process

@@ -1,4 +1,4 @@
-use crate::{ByteStatus, SampleRange, TimedByte};
+use crate::{ByteStatus, DecodeDiagnostic, SampleRange, Severity, TimedByte};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -40,6 +40,155 @@ pub struct I2cConfig {
     pub data_channel: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct I2cDecoder {
+    config: I2cConfig,
+    previous_sample: Option<u32>,
+    next_sample_offset: Option<u64>,
+    active: bool,
+    transaction_start: Option<u64>,
+    byte: u8,
+    bit_count: u8,
+    byte_start: u64,
+    byte_end: u64,
+    acknowledge_start: u64,
+    byte_index: usize,
+}
+
+impl I2cDecoder {
+    pub fn new(config: I2cConfig) -> Result<Self, TransportDecodeError> {
+        validate_channel(config.clock_channel, "I2C clock")?;
+        validate_channel(config.data_channel, "I2C data")?;
+        if config.clock_channel == config.data_channel {
+            return Err(TransportDecodeError::new(
+                "I2C clock and data must use different channels",
+            ));
+        }
+        Ok(Self {
+            config,
+            previous_sample: None,
+            next_sample_offset: None,
+            active: false,
+            transaction_start: None,
+            byte: 0,
+            bit_count: 0,
+            byte_start: 0,
+            byte_end: 0,
+            acknowledge_start: 0,
+            byte_index: 0,
+        })
+    }
+
+    pub fn push_samples(
+        &mut self,
+        samples: &[u32],
+        sample_offset: u64,
+    ) -> Result<Vec<I2cEvent>, TransportDecodeError> {
+        validate_contiguous_chunk(self.next_sample_offset, sample_offset, samples.len())?;
+        let mut events = Vec::new();
+        for (local_index, sample) in samples.iter().copied().enumerate() {
+            let sample_index = sample_offset + local_index as u64;
+            let Some(previous_sample) = self.previous_sample else {
+                self.previous_sample = Some(sample);
+                continue;
+            };
+            let previous_clock = channel_is_high(previous_sample, self.config.clock_channel);
+            let previous_data = channel_is_high(previous_sample, self.config.data_channel);
+            let clock = channel_is_high(sample, self.config.clock_channel);
+            let data = channel_is_high(sample, self.config.data_channel);
+            let start = previous_data && !data && clock;
+            let stop = !previous_data && data && clock;
+
+            if start {
+                events.push(I2cEvent::Start {
+                    sample: sample_index,
+                });
+                self.active = true;
+                self.transaction_start = Some(sample_index);
+                self.byte = 0;
+                self.bit_count = 0;
+                self.byte_index = 0;
+            } else if stop {
+                events.push(I2cEvent::Stop {
+                    sample: sample_index,
+                });
+                self.active = false;
+                self.transaction_start = None;
+                self.byte = 0;
+                self.bit_count = 0;
+            } else if self.active && !previous_clock && clock {
+                if self.bit_count == 0 {
+                    self.byte_start = sample_index;
+                }
+                if self.bit_count < 8 {
+                    self.byte = (self.byte << 1) | u8::from(data);
+                    self.bit_count += 1;
+                    if self.bit_count == 8 {
+                        self.byte_end = sample_index.saturating_add(1);
+                        self.acknowledge_start = sample_index;
+                    }
+                } else {
+                    let acknowledged = !data;
+                    events.push(I2cEvent::Byte {
+                        byte: TimedByte {
+                            value: self.byte,
+                            range: SampleRange {
+                                start: self.byte_start,
+                                end: self.byte_end,
+                            },
+                            status: ByteStatus::default(),
+                        },
+                        index: self.byte_index,
+                    });
+                    events.push(I2cEvent::Acknowledge {
+                        range: SampleRange {
+                            start: self.acknowledge_start,
+                            end: sample_index.saturating_add(1),
+                        },
+                        acknowledged,
+                        byte_index: self.byte_index,
+                        byte_value: self.byte,
+                    });
+                    self.byte = 0;
+                    self.bit_count = 0;
+                    self.byte_index += 1;
+                }
+            } else if self.active && previous_clock && !clock && self.bit_count == 8 {
+                self.acknowledge_start = sample_index;
+            }
+
+            self.previous_sample = Some(sample);
+        }
+        self.next_sample_offset = chunk_end(sample_offset, samples.len())?;
+        Ok(events)
+    }
+
+    pub fn finish(&mut self) -> Vec<DecodeDiagnostic> {
+        let diagnostics = if self.active {
+            vec![incomplete_transport_diagnostic(
+                "transport.i2c.incomplete",
+                "I2C transaction ended before STOP",
+                self.transaction_start,
+                self.next_sample_offset,
+            )]
+        } else {
+            Vec::new()
+        };
+        self.reset();
+        diagnostics
+    }
+
+    pub fn reset(&mut self) {
+        self.previous_sample = None;
+        self.next_sample_offset = None;
+        self.active = false;
+        self.transaction_start = None;
+        self.byte = 0;
+        self.bit_count = 0;
+        self.byte_index = 0;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum I2cEvent {
     Start {
@@ -68,6 +217,156 @@ pub struct SpiConfig {
     pub chip_select_channel: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SpiDecoder {
+    config: SpiConfig,
+    previous_sample: Option<u32>,
+    next_sample_offset: Option<u64>,
+    previous_selected: bool,
+    transaction_index: usize,
+    next_transaction_index: usize,
+    transaction_start: Option<u64>,
+    miso: u8,
+    mosi: u8,
+    bit_count: u8,
+    byte_start: u64,
+}
+
+impl SpiDecoder {
+    pub fn new(config: SpiConfig) -> Result<Self, TransportDecodeError> {
+        validate_channel(config.clock_channel, "SPI clock")?;
+        validate_optional_channel(config.miso_channel, "SPI MISO")?;
+        validate_optional_channel(config.mosi_channel, "SPI MOSI")?;
+        validate_optional_channel(config.chip_select_channel, "SPI chip select")?;
+        if config.miso_channel.is_none() && config.mosi_channel.is_none() {
+            return Err(TransportDecodeError::new(
+                "SPI requires a MISO or MOSI channel",
+            ));
+        }
+        validate_distinct_channels(
+            config.clock_channel,
+            [
+                config.miso_channel,
+                config.mosi_channel,
+                config.chip_select_channel,
+            ],
+            "SPI",
+        )?;
+        Ok(Self {
+            config,
+            previous_sample: None,
+            next_sample_offset: None,
+            previous_selected: false,
+            transaction_index: 0,
+            next_transaction_index: 0,
+            transaction_start: None,
+            miso: 0,
+            mosi: 0,
+            bit_count: 0,
+            byte_start: 0,
+        })
+    }
+
+    pub fn push_samples(
+        &mut self,
+        samples: &[u32],
+        sample_offset: u64,
+    ) -> Result<Vec<SpiTransfer>, TransportDecodeError> {
+        validate_contiguous_chunk(self.next_sample_offset, sample_offset, samples.len())?;
+        let mut transfers = Vec::new();
+        for (local_index, sample) in samples.iter().copied().enumerate() {
+            let sample_index = sample_offset + local_index as u64;
+            let selected = self
+                .config
+                .chip_select_channel
+                .map(|channel| !channel_is_high(sample, channel))
+                .unwrap_or(true);
+            let Some(previous_sample) = self.previous_sample else {
+                self.previous_selected = selected;
+                self.next_transaction_index = usize::from(selected);
+                self.transaction_start = selected.then_some(sample_index);
+                self.previous_sample = Some(sample);
+                continue;
+            };
+            let previous_clock = channel_is_high(previous_sample, self.config.clock_channel);
+            let clock = channel_is_high(sample, self.config.clock_channel);
+            if selected && !self.previous_selected {
+                self.transaction_index = self.next_transaction_index;
+                self.next_transaction_index = self.next_transaction_index.saturating_add(1);
+                self.transaction_start = Some(sample_index);
+            }
+            if !selected {
+                self.bit_count = 0;
+                self.miso = 0;
+                self.mosi = 0;
+                self.transaction_start = None;
+            } else if !previous_clock && clock {
+                if self.bit_count == 0 {
+                    self.byte_start = sample_index;
+                }
+                if let Some(channel) = self.config.miso_channel {
+                    self.miso = (self.miso << 1) | u8::from(channel_is_high(sample, channel));
+                }
+                if let Some(channel) = self.config.mosi_channel {
+                    self.mosi = (self.mosi << 1) | u8::from(channel_is_high(sample, channel));
+                }
+                self.bit_count += 1;
+                if self.bit_count == 8 {
+                    transfers.push(SpiTransfer {
+                        transaction_index: self.transaction_index,
+                        range: SampleRange {
+                            start: self.byte_start,
+                            end: sample_index.saturating_add(1),
+                        },
+                        mosi: self.config.mosi_channel.map(|_| self.mosi),
+                        miso: self.config.miso_channel.map(|_| self.miso),
+                    });
+                    self.bit_count = 0;
+                    self.miso = 0;
+                    self.mosi = 0;
+                }
+            }
+            self.previous_sample = Some(sample);
+            self.previous_selected = selected;
+        }
+        self.next_sample_offset = chunk_end(sample_offset, samples.len())?;
+        Ok(transfers)
+    }
+
+    pub fn finish(&mut self) -> Vec<DecodeDiagnostic> {
+        let mut diagnostics = Vec::new();
+        if self.bit_count > 0 {
+            diagnostics.push(incomplete_transport_diagnostic(
+                "transport.spi.incomplete_byte",
+                "SPI stream ended in the middle of a byte",
+                Some(self.byte_start),
+                self.next_sample_offset,
+            ));
+        } else if self.config.chip_select_channel.is_some() && self.previous_selected {
+            diagnostics.push(incomplete_transport_diagnostic(
+                "transport.spi.incomplete_transaction",
+                "SPI transaction ended while chip select was still asserted",
+                self.transaction_start,
+                self.next_sample_offset,
+            ));
+        }
+        self.reset();
+        diagnostics
+    }
+
+    pub fn reset(&mut self) {
+        self.previous_sample = None;
+        self.next_sample_offset = None;
+        self.previous_selected = false;
+        self.transaction_index = 0;
+        self.next_transaction_index = 0;
+        self.transaction_start = None;
+        self.miso = 0;
+        self.mosi = 0;
+        self.bit_count = 0;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpiTransfer {
     pub transaction_index: usize,
@@ -87,99 +386,265 @@ pub struct UartDecode {
     pub bytes: Vec<TimedByte>,
 }
 
+const UART_PROBE_SAMPLE_LIMIT: usize = 1_000_000;
+
+#[derive(Clone, Debug)]
+pub struct UartDecoder {
+    config: UartConfig,
+    sample_rate_hz: u64,
+    next_sample_offset: Option<u64>,
+    probe_offset: Option<u64>,
+    probe: Vec<u32>,
+    fixed: Option<FixedUartDecoder>,
+}
+
+impl UartDecoder {
+    pub fn new(config: UartConfig, sample_rate_hz: u64) -> Result<Self, TransportDecodeError> {
+        validate_channel(config.data_channel, "UART data")?;
+        if sample_rate_hz == 0 {
+            return Err(TransportDecodeError::new(
+                "UART sample rate must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            config,
+            sample_rate_hz,
+            next_sample_offset: None,
+            probe_offset: None,
+            probe: Vec::new(),
+            fixed: None,
+        })
+    }
+
+    pub fn baud_rate(&self) -> Option<u64> {
+        self.fixed.as_ref().map(|decoder| decoder.baud_rate)
+    }
+
+    pub fn push_samples(
+        &mut self,
+        samples: &[u32],
+        sample_offset: u64,
+    ) -> Result<UartDecode, TransportDecodeError> {
+        validate_contiguous_chunk(self.next_sample_offset, sample_offset, samples.len())?;
+        self.next_sample_offset = chunk_end(sample_offset, samples.len())?;
+        if let Some(decoder) = &mut self.fixed {
+            return Ok(UartDecode {
+                baud_rate: decoder.baud_rate,
+                bytes: decoder.push_samples(samples, sample_offset),
+            });
+        }
+        if samples.is_empty() {
+            return Ok(UartDecode {
+                baud_rate: 0,
+                bytes: Vec::new(),
+            });
+        }
+        self.probe_offset.get_or_insert(sample_offset);
+        if self.probe.len().saturating_add(samples.len()) > UART_PROBE_SAMPLE_LIMIT {
+            return Err(TransportDecodeError::new(format!(
+                "UART baud rate was not detected within {UART_PROBE_SAMPLE_LIMIT} samples"
+            )));
+        }
+        self.probe.extend_from_slice(samples);
+        let Ok(candidate) = decode_uart_samples(
+            self.config,
+            &self.probe,
+            self.probe_offset.unwrap_or(sample_offset),
+            self.sample_rate_hz,
+        ) else {
+            return Ok(UartDecode {
+                baud_rate: 0,
+                bytes: Vec::new(),
+            });
+        };
+        if candidate.bytes.len() < 2 {
+            return Ok(UartDecode {
+                baud_rate: 0,
+                bytes: Vec::new(),
+            });
+        }
+        let probe_offset = self.probe_offset.unwrap_or(sample_offset);
+        let mut decoder =
+            FixedUartDecoder::new(self.config, candidate.baud_rate, self.sample_rate_hz);
+        let bytes = decoder.push_samples(&self.probe, probe_offset);
+        self.probe.clear();
+        self.probe_offset = None;
+        self.fixed = Some(decoder);
+        Ok(UartDecode {
+            baud_rate: candidate.baud_rate,
+            bytes,
+        })
+    }
+
+    pub fn finish(&mut self) -> Result<(UartDecode, Vec<DecodeDiagnostic>), TransportDecodeError> {
+        if let Some(mut decoder) = self.fixed.take() {
+            let baud_rate = decoder.baud_rate;
+            let (bytes, diagnostics) = decoder.finish(self.next_sample_offset);
+            self.reset();
+            return Ok((UartDecode { baud_rate, bytes }, diagnostics));
+        }
+        let decoded = if self.probe.is_empty() {
+            UartDecode {
+                baud_rate: 0,
+                bytes: Vec::new(),
+            }
+        } else {
+            decode_uart_samples(
+                self.config,
+                &self.probe,
+                self.probe_offset.unwrap_or(0),
+                self.sample_rate_hz,
+            )?
+        };
+        self.reset();
+        Ok((decoded, Vec::new()))
+    }
+
+    pub fn reset(&mut self) {
+        self.next_sample_offset = None;
+        self.probe_offset = None;
+        self.probe.clear();
+        self.fixed = None;
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FixedUartDecoder {
+    config: UartConfig,
+    baud_rate: u64,
+    samples_per_bit: f64,
+    previous_high: Option<bool>,
+    pending: Option<PendingUartFrame>,
+}
+
+impl FixedUartDecoder {
+    fn new(config: UartConfig, baud_rate: u64, sample_rate_hz: u64) -> Self {
+        Self {
+            config,
+            baud_rate,
+            samples_per_bit: sample_rate_hz as f64 / baud_rate as f64,
+            previous_high: None,
+            pending: None,
+        }
+    }
+
+    fn push_samples(&mut self, samples: &[u32], sample_offset: u64) -> Vec<TimedByte> {
+        let mut bytes = Vec::new();
+        for (local_index, sample) in samples.iter().copied().enumerate() {
+            let sample_index = sample_offset + local_index as u64;
+            let high = channel_is_high(sample, self.config.data_channel);
+            let falling = self.previous_high == Some(true) && !high;
+            if let Some(pending) = &mut self.pending {
+                pending.observe(sample_index, high, self.samples_per_bit);
+                if sample_index >= pending.end_sample(self.samples_per_bit) {
+                    let pending = self.pending.take().expect("pending UART frame exists");
+                    if let Some(byte) = pending.complete(self.samples_per_bit) {
+                        bytes.push(byte);
+                    }
+                }
+            }
+            if self.pending.is_none() && falling {
+                self.pending = Some(PendingUartFrame::new(sample_index));
+            }
+            self.previous_high = Some(high);
+        }
+        bytes
+    }
+
+    fn finish(&mut self, stream_end: Option<u64>) -> (Vec<TimedByte>, Vec<DecodeDiagnostic>) {
+        let Some(pending) = self.pending.take() else {
+            return (Vec::new(), Vec::new());
+        };
+        let expected_end = pending.end_sample(self.samples_per_bit);
+        let actual_end = stream_end.unwrap_or(expected_end).min(expected_end);
+        if let Some(byte) = pending.clone().complete_at(actual_end) {
+            return (vec![byte], Vec::new());
+        }
+        (
+            Vec::new(),
+            vec![incomplete_transport_diagnostic(
+                "transport.uart.incomplete_frame",
+                "UART stream ended in the middle of an 8-N-1 frame",
+                Some(pending.start),
+                stream_end,
+            )],
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingUartFrame {
+    start: u64,
+    start_high: Option<bool>,
+    data_high: [Option<bool>; 8],
+    stop_high: Option<bool>,
+}
+
+impl PendingUartFrame {
+    fn new(start: u64) -> Self {
+        Self {
+            start,
+            start_high: None,
+            data_high: [None; 8],
+            stop_high: None,
+        }
+    }
+
+    fn observe(&mut self, sample: u64, high: bool, samples_per_bit: f64) {
+        if sample == self.sample_at(0.5, samples_per_bit) {
+            self.start_high = Some(high);
+        }
+        for bit in 0..8 {
+            if sample == self.sample_at(1.5 + bit as f64, samples_per_bit) {
+                self.data_high[bit] = Some(high);
+            }
+        }
+        if sample == self.sample_at(9.5, samples_per_bit) {
+            self.stop_high = Some(high);
+        }
+    }
+
+    fn sample_at(&self, bit_position: f64, samples_per_bit: f64) -> u64 {
+        self.start
+            .saturating_add((bit_position * samples_per_bit).round() as u64)
+    }
+
+    fn end_sample(&self, samples_per_bit: f64) -> u64 {
+        self.sample_at(10.0, samples_per_bit)
+    }
+
+    fn complete(self, samples_per_bit: f64) -> Option<TimedByte> {
+        let end = self.end_sample(samples_per_bit);
+        self.complete_at(end)
+    }
+
+    fn complete_at(self, end: u64) -> Option<TimedByte> {
+        if self.start_high != Some(false) || self.stop_high != Some(true) {
+            return None;
+        }
+        let mut value = 0_u8;
+        for (bit, high) in self.data_high.into_iter().enumerate() {
+            if high? {
+                value |= 1 << bit;
+            }
+        }
+        Some(TimedByte {
+            value,
+            range: SampleRange {
+                start: self.start,
+                end: (end > self.start).then_some(end)?,
+            },
+            status: ByteStatus::default(),
+        })
+    }
+}
+
 pub fn decode_i2c_samples(
     config: I2cConfig,
     samples: &[u32],
     sample_offset: u64,
 ) -> Result<Vec<I2cEvent>, TransportDecodeError> {
-    validate_channel(config.clock_channel, "I2C clock")?;
-    validate_channel(config.data_channel, "I2C data")?;
-    if config.clock_channel == config.data_channel {
-        return Err(TransportDecodeError::new(
-            "I2C clock and data must use different channels",
-        ));
-    }
-    let Some(&first) = samples.first() else {
-        return Ok(Vec::new());
-    };
-    let mut events = Vec::new();
-    let mut previous_clock = channel_is_high(first, config.clock_channel);
-    let mut previous_data = channel_is_high(first, config.data_channel);
-    let mut active = false;
-    let mut byte = 0_u8;
-    let mut bit_count = 0_u8;
-    let mut byte_start = sample_offset;
-    let mut byte_end = sample_offset;
-    let mut acknowledge_start = sample_offset;
-    let mut byte_index = 0_usize;
-
-    for (local_index, sample) in samples.iter().copied().enumerate().skip(1) {
-        let sample_index = sample_offset.saturating_add(local_index as u64);
-        let clock = channel_is_high(sample, config.clock_channel);
-        let data = channel_is_high(sample, config.data_channel);
-        let start = previous_data && !data && clock;
-        let stop = !previous_data && data && clock;
-
-        if start {
-            events.push(I2cEvent::Start {
-                sample: sample_index,
-            });
-            active = true;
-            byte = 0;
-            bit_count = 0;
-            byte_index = 0;
-        } else if stop {
-            events.push(I2cEvent::Stop {
-                sample: sample_index,
-            });
-            active = false;
-            byte = 0;
-            bit_count = 0;
-        } else if active && !previous_clock && clock {
-            if bit_count == 0 {
-                byte_start = sample_index;
-            }
-            if bit_count < 8 {
-                byte = (byte << 1) | u8::from(data);
-                bit_count += 1;
-                if bit_count == 8 {
-                    byte_end = sample_index.saturating_add(1);
-                    acknowledge_start = sample_index;
-                }
-            } else {
-                let acknowledged = !data;
-                events.push(I2cEvent::Byte {
-                    byte: TimedByte {
-                        value: byte,
-                        range: SampleRange {
-                            start: byte_start,
-                            end: byte_end,
-                        },
-                        status: ByteStatus::default(),
-                    },
-                    index: byte_index,
-                });
-                events.push(I2cEvent::Acknowledge {
-                    range: SampleRange {
-                        start: acknowledge_start,
-                        end: sample_index.saturating_add(1),
-                    },
-                    acknowledged,
-                    byte_index,
-                    byte_value: byte,
-                });
-                byte = 0;
-                bit_count = 0;
-                byte_index += 1;
-            }
-        } else if active && previous_clock && !clock && bit_count == 8 {
-            acknowledge_start = sample_index;
-        }
-
-        previous_clock = clock;
-        previous_data = data;
-    }
-    Ok(events)
+    I2cDecoder::new(config)?.push_samples(samples, sample_offset)
 }
 
 pub fn decode_spi_samples(
@@ -187,85 +652,7 @@ pub fn decode_spi_samples(
     samples: &[u32],
     sample_offset: u64,
 ) -> Result<Vec<SpiTransfer>, TransportDecodeError> {
-    validate_channel(config.clock_channel, "SPI clock")?;
-    validate_optional_channel(config.miso_channel, "SPI MISO")?;
-    validate_optional_channel(config.mosi_channel, "SPI MOSI")?;
-    validate_optional_channel(config.chip_select_channel, "SPI chip select")?;
-    if config.miso_channel.is_none() && config.mosi_channel.is_none() {
-        return Err(TransportDecodeError::new(
-            "SPI requires a MISO or MOSI channel",
-        ));
-    }
-    validate_distinct_channels(
-        config.clock_channel,
-        [
-            config.miso_channel,
-            config.mosi_channel,
-            config.chip_select_channel,
-        ],
-        "SPI",
-    )?;
-    let Some(&first) = samples.first() else {
-        return Ok(Vec::new());
-    };
-    let mut transfers = Vec::new();
-    let mut previous_clock = channel_is_high(first, config.clock_channel);
-    let mut miso = 0_u8;
-    let mut mosi = 0_u8;
-    let mut bit_count = 0_u8;
-    let mut byte_start = sample_offset;
-    let mut previous_selected = config
-        .chip_select_channel
-        .map(|channel| !channel_is_high(first, channel))
-        .unwrap_or(true);
-    let mut transaction_index = 0_usize;
-    let mut next_transaction_index = usize::from(previous_selected);
-
-    for (local_index, sample) in samples.iter().copied().enumerate().skip(1) {
-        let sample_index = sample_offset.saturating_add(local_index as u64);
-        let clock = channel_is_high(sample, config.clock_channel);
-        let selected = config
-            .chip_select_channel
-            .map(|channel| !channel_is_high(sample, channel))
-            .unwrap_or(true);
-        if selected && !previous_selected {
-            transaction_index = next_transaction_index;
-            next_transaction_index = next_transaction_index.saturating_add(1);
-        }
-        if !selected {
-            bit_count = 0;
-            miso = 0;
-            mosi = 0;
-        } else if !previous_clock && clock {
-            if bit_count == 0 {
-                byte_start = sample_index;
-            }
-            if let Some(channel) = config.miso_channel {
-                miso = (miso << 1) | u8::from(channel_is_high(sample, channel));
-            }
-            if let Some(channel) = config.mosi_channel {
-                mosi = (mosi << 1) | u8::from(channel_is_high(sample, channel));
-            }
-            bit_count += 1;
-            if bit_count == 8 {
-                transfers.push(SpiTransfer {
-                    transaction_index,
-                    range: SampleRange {
-                        start: byte_start,
-                        end: sample_index.saturating_add(1),
-                    },
-                    mosi: config.mosi_channel.map(|_| mosi),
-                    miso: config.miso_channel.map(|_| miso),
-                });
-                bit_count = 0;
-                miso = 0;
-                mosi = 0;
-            }
-        }
-        previous_clock = clock;
-        previous_selected = selected;
-    }
-    Ok(transfers)
+    SpiDecoder::new(config)?.push_samples(samples, sample_offset)
 }
 
 pub fn decode_uart_samples(
@@ -404,6 +791,48 @@ struct UartCandidate {
 
 fn channel_is_high(sample: u32, channel: usize) -> bool {
     sample & (1_u32 << channel) != 0
+}
+
+fn chunk_end(sample_offset: u64, sample_count: usize) -> Result<Option<u64>, TransportDecodeError> {
+    let sample_count = u64::try_from(sample_count)
+        .map_err(|_| TransportDecodeError::new("logic sample count does not fit in u64"))?;
+    sample_offset
+        .checked_add(sample_count)
+        .map(Some)
+        .ok_or_else(|| TransportDecodeError::new("logic sample range overflows u64"))
+}
+
+fn validate_contiguous_chunk(
+    expected_offset: Option<u64>,
+    sample_offset: u64,
+    sample_count: usize,
+) -> Result<(), TransportDecodeError> {
+    let _ = chunk_end(sample_offset, sample_count)?;
+    if let Some(expected_offset) = expected_offset {
+        if sample_offset != expected_offset {
+            return Err(TransportDecodeError::new(format!(
+                "non-contiguous logic chunk starts at sample {sample_offset}; expected {expected_offset}; reset the decoder after a discontinuity"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn incomplete_transport_diagnostic(
+    code: &str,
+    message: &str,
+    start: Option<u64>,
+    end: Option<u64>,
+) -> DecodeDiagnostic {
+    let range = start
+        .zip(end)
+        .and_then(|(start, end)| (start < end).then_some(SampleRange { start, end }));
+    DecodeDiagnostic {
+        code: code.to_owned(),
+        message: message.to_owned(),
+        severity: Severity::Warning,
+        range,
+    }
 }
 
 fn validate_channel(channel: usize, name: &str) -> Result<(), TransportDecodeError> {
@@ -632,5 +1061,135 @@ mod tests {
         )
         .is_err());
         assert!(decode_uart_samples(UartConfig { data_channel: 32 }, &[0; 10], 0, 1).is_err());
+    }
+
+    #[test]
+    fn i2c_incremental_decode_is_independent_of_chunk_boundaries() {
+        let samples = i2c_transaction(&[(0xA0, true), (0x5A, false)]);
+        let expected = decode_i2c_samples(
+            I2cConfig {
+                clock_channel: 0,
+                data_channel: 1,
+            },
+            &samples,
+            100,
+        )
+        .unwrap();
+        let mut decoder = I2cDecoder::new(I2cConfig {
+            clock_channel: 0,
+            data_channel: 1,
+        })
+        .unwrap();
+        let mut actual = Vec::new();
+        for (offset, chunk) in samples.chunks(7).enumerate() {
+            actual.extend(
+                decoder
+                    .push_samples(chunk, 100 + (offset * 7) as u64)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(actual, expected);
+        assert!(decoder.finish().is_empty());
+    }
+
+    #[test]
+    fn spi_incremental_decode_is_independent_of_chunk_boundaries() {
+        let mut samples = vec![
+            logic_word(false, false, true),
+            logic_word(false, false, false),
+        ];
+        for bit in (0..8).rev() {
+            let mosi = 0xA5 & (1 << bit) != 0;
+            let miso = 0x3C & (1 << bit) != 0;
+            let low = u32::from(miso) << 1 | u32::from(mosi) << 2;
+            samples.extend([low, low | 1, low]);
+        }
+        samples.push(logic_word(false, false, true));
+        let config = SpiConfig {
+            clock_channel: 0,
+            miso_channel: Some(1),
+            mosi_channel: Some(2),
+            chip_select_channel: Some(3),
+        };
+        let expected = decode_spi_samples(config, &samples, 50).unwrap();
+        let mut decoder = SpiDecoder::new(config).unwrap();
+        let mut actual = Vec::new();
+        for (offset, chunk) in samples.chunks(5).enumerate() {
+            actual.extend(
+                decoder
+                    .push_samples(chunk, 50 + (offset * 5) as u64)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(actual, expected);
+        assert!(decoder.finish().is_empty());
+    }
+
+    #[test]
+    fn uart_incremental_decode_is_independent_of_chunk_boundaries() {
+        let samples = uart_8n1(b"Hi!", 10);
+        let expected =
+            decode_uart_samples(UartConfig { data_channel: 0 }, &samples, 500, 1_152_000).unwrap();
+        let mut decoder = UartDecoder::new(UartConfig { data_channel: 0 }, 1_152_000).unwrap();
+        let mut actual = Vec::new();
+        let mut baud_rate = 0;
+        for (offset, chunk) in samples.chunks(7).enumerate() {
+            let output = decoder
+                .push_samples(chunk, 500 + (offset * 7) as u64)
+                .unwrap();
+            baud_rate = baud_rate.max(output.baud_rate);
+            actual.extend(output.bytes);
+        }
+        let (tail, diagnostics) = decoder.finish().unwrap();
+        baud_rate = baud_rate.max(tail.baud_rate);
+        actual.extend(tail.bytes);
+        assert_eq!(baud_rate, expected.baud_rate);
+        assert_eq!(actual, expected.bytes);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn incremental_decoder_requires_an_explicit_reset_after_discontinuity() {
+        let mut decoder = I2cDecoder::new(I2cConfig {
+            clock_channel: 0,
+            data_channel: 1,
+        })
+        .unwrap();
+        decoder.push_samples(&[3, 3], 10).unwrap();
+        let error = decoder.push_samples(&[3], 20).unwrap_err();
+        assert!(error.message().contains("reset the decoder"));
+        decoder.reset();
+        assert!(decoder.push_samples(&[3], 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn finish_reports_an_incomplete_transport_symbol() {
+        let samples = i2c_transaction(&[(0xA0, true)]);
+        let mut decoder = I2cDecoder::new(I2cConfig {
+            clock_channel: 0,
+            data_channel: 1,
+        })
+        .unwrap();
+        decoder
+            .push_samples(&samples[..samples.len() - 2], 0)
+            .unwrap();
+        let diagnostics = decoder.finish();
+        assert_eq!(diagnostics[0].code, "transport.i2c.incomplete");
+    }
+
+    #[test]
+    fn finish_reports_an_asserted_spi_transaction() {
+        let mut decoder = SpiDecoder::new(SpiConfig {
+            clock_channel: 0,
+            miso_channel: None,
+            mosi_channel: Some(1),
+            chip_select_channel: Some(3),
+        })
+        .unwrap();
+        decoder
+            .push_samples(&[logic_word(false, false, false)], 20)
+            .unwrap();
+        let diagnostics = decoder.finish();
+        assert_eq!(diagnostics[0].code, "transport.spi.incomplete_transaction");
     }
 }
