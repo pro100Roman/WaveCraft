@@ -1847,6 +1847,7 @@ struct LogicSampleBucket {
     first: u32,
     last: u32,
     activity: u32,
+    multiple_transitions: u32,
     sample_count: u32,
 }
 
@@ -1856,6 +1857,7 @@ impl LogicSampleBucket {
             first: sample,
             last: sample,
             activity: 0,
+            multiple_transitions: 0,
             sample_count: 1,
         }
     }
@@ -1868,13 +1870,13 @@ impl LogicSampleBucket {
     }
 
     fn push_samples(&mut self, samples: &[u32]) {
-        self.activity |= samples
-            .iter()
-            .fold(0_u32, |activity, sample| activity | (self.first ^ sample));
-        if let Some(last) = samples.last() {
-            self.last = *last;
-            self.sample_count += samples.len() as u32;
+        for sample in samples {
+            let transitions = self.last ^ sample;
+            self.multiple_transitions |= self.activity & transitions;
+            self.activity |= self.first ^ sample;
+            self.last = *sample;
         }
+        self.sample_count += samples.len() as u32;
     }
 }
 
@@ -11432,21 +11434,43 @@ fn exact_logic_bucket_state(bucket: LogicSampleBucket, mask: u32) -> Option<bool
     (bucket.activity & mask == 0).then_some(bucket.first & mask != 0)
 }
 
+fn logic_transition_within_bucket(
+    waveforms: &WaveformStore,
+    mask: u32,
+    bucket_index: usize,
+) -> Option<LogicTransition> {
+    let bucket = waveforms.logic_samples[bucket_index];
+    if bucket.activity & mask == 0 || bucket.multiple_transitions & mask != 0 {
+        return None;
+    }
+    let bucket_start = (bucket_index as u64).saturating_mul(waveforms.logic_sample_stride as u64);
+    Some(LogicTransition {
+        sample: waveforms
+            .logic_sample_offset
+            .saturating_add(bucket_start)
+            .saturating_add(u64::from(bucket.sample_count) / 2),
+        new_state_high: bucket.last & mask != 0,
+    })
+}
+
 fn logic_transition_before_bucket(
     waveforms: &WaveformStore,
     mask: u32,
     before_bucket: usize,
 ) -> Option<LogicTransition> {
     for right_index in (1..=before_bucket).rev() {
-        let left_state = exact_logic_bucket_state(waveforms.logic_samples[right_index - 1], mask)?;
-        let right_state = exact_logic_bucket_state(waveforms.logic_samples[right_index], mask)?;
-        if left_state != right_state {
+        let left = waveforms.logic_samples[right_index - 1];
+        let right = waveforms.logic_samples[right_index];
+        if (left.last ^ right.first) & mask != 0 {
             return Some(LogicTransition {
                 sample: waveforms.logic_sample_offset.saturating_add(
                     (right_index as u64).saturating_mul(waveforms.logic_sample_stride as u64),
                 ),
-                new_state_high: right_state,
+                new_state_high: right.first & mask != 0,
             });
+        }
+        if left.activity & mask != 0 {
+            return logic_transition_within_bucket(waveforms, mask, right_index - 1);
         }
     }
     None
@@ -11458,15 +11482,18 @@ fn logic_transition_after_bucket(
     after_bucket: usize,
 ) -> Option<LogicTransition> {
     for right_index in after_bucket.saturating_add(1)..waveforms.logic_samples.len() {
-        let left_state = exact_logic_bucket_state(waveforms.logic_samples[right_index - 1], mask)?;
-        let right_state = exact_logic_bucket_state(waveforms.logic_samples[right_index], mask)?;
-        if left_state != right_state {
+        let left = waveforms.logic_samples[right_index - 1];
+        let right = waveforms.logic_samples[right_index];
+        if (left.last ^ right.first) & mask != 0 {
             return Some(LogicTransition {
                 sample: waveforms.logic_sample_offset.saturating_add(
                     (right_index as u64).saturating_mul(waveforms.logic_sample_stride as u64),
                 ),
-                new_state_high: right_state,
+                new_state_high: right.first & mask != 0,
             });
+        }
+        if right.activity & mask != 0 {
+            return logic_transition_within_bucket(waveforms, mask, right_index);
         }
     }
     None
@@ -16931,6 +16958,39 @@ mod tests {
     }
 
     #[test]
+    fn logic_smart_timing_handles_edges_inside_downsampled_buckets() {
+        let mut waveforms = WaveformStore {
+            logic_channels: 1,
+            logic_rate_hz: 1_000_000,
+            logic_sample_stride: 4,
+            ..WaveformStore::default()
+        };
+        let samples = (0..37)
+            .map(|index| u32::from(matches!(index, 5..13 | 21..29)))
+            .collect::<Vec<_>>();
+        waveforms.ingest_logic_samples(&samples);
+
+        let high_pulse = logic_smart_timing_measurement(&waveforms, 0, 9).unwrap();
+        assert_eq!(high_pulse.edge_start_sample, 6);
+        assert_eq!(high_pulse.edge_end_sample, 14);
+        assert_eq!(
+            high_pulse.cycle,
+            Some(LogicTimingMeasurement {
+                channel: 0,
+                period_start_sample: 6,
+                period_end_sample: 22,
+                period_samples: 16,
+                high_samples: 8,
+            })
+        );
+
+        let low_pulse = logic_smart_timing_measurement(&waveforms, 0, 17).unwrap();
+        assert_eq!(low_pulse.edge_start_sample, 14);
+        assert_eq!(low_pulse.edge_end_sample, 22);
+        assert_eq!(low_pulse.cycle, high_pulse.cycle);
+    }
+
+    #[test]
     fn logic_smart_timing_paint_is_clipped_to_the_waveform_plot() {
         let context = egui::Context::default();
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
@@ -16995,6 +17055,23 @@ mod tests {
         };
 
         assert_eq!(logic_smart_timing_measurement(&waveforms, 0, 1), None);
+
+        let mut waveforms = WaveformStore {
+            logic_channels: 1,
+            logic_rate_hz: 1_000_000,
+            logic_sample_stride: 4,
+            ..WaveformStore::default()
+        };
+        waveforms.ingest_logic_samples(&[
+            0, 0, 0, 0, // stable low
+            0, 1, 0, 1, // three transitions cannot be located after compaction
+            1, 1, 1, 1, // stable high under the pointer
+            1, 0, 0, 0, // falling edge
+            0, 0, 0, 0,
+        ]);
+
+        assert_ne!(waveforms.logic_samples[1].multiple_transitions & 1, 0);
+        assert_eq!(logic_smart_timing_measurement(&waveforms, 0, 9), None);
     }
 
     #[test]
