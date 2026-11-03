@@ -6426,20 +6426,22 @@ fn paint_capture_settings(
                                                     .on_hover_text(
                                                         "All channel conditions match at one sample",
                                                     );
-                                                    ui.add_enabled_ui(
-                                                        logic_settings.operation_mode
-                                                            == DsLogicOperationMode::Buffer,
-                                                        |ui| {
-                                                            ui.selectable_value(
-                                                                &mut logic_settings.trigger_mode,
-                                                                LogicTriggerMode::Smart,
-                                                                "Smart",
-                                                            )
-                                                            .on_hover_text(
-                                                                "Match two or more channel-condition stages in order",
-                                                            );
-                                                        },
-                                                    );
+                                                    if ui
+                                                        .selectable_value(
+                                                            &mut logic_settings.trigger_mode,
+                                                            LogicTriggerMode::Smart,
+                                                            "Smart",
+                                                        )
+                                                        .on_hover_text(
+                                                            "Match two or more channel-condition stages in order; selects buffered capture",
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        set_logic_operation_mode_preserving_duration(
+                                                            logic_settings,
+                                                            DsLogicOperationMode::Buffer,
+                                                        );
+                                                    }
                                                 });
                                         });
                                         ui.end_row();
