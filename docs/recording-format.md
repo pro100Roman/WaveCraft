@@ -47,6 +47,17 @@ counts before allocation, and verify the footer's event count.
 The native file is the source of truth. Future CSV, VCD, or decoder exports may
 represent only compatible subsets, but must not modify the original recording.
 
+## Planned RF/IQ extension
+
+Format version 1 has frame payloads only for logic and scope samples. The
+planned HackRF/SDR support introduces a version 2 IQ payload while retaining
+read compatibility with version 1 and never rewriting legacy recordings on
+open. IQ batches preserve their signed complex bytes, sample rate, center
+frequency, absolute source-sample position, and discontinuities. Spectrum,
+waterfall, demodulated bits, and decoded packets remain reproducible derived
+data rather than authoritative recording content. The complete design is in
+[RF/SDR capture and signal-decoding architecture](rf-sdr-architecture.md).
+
 ## Saleae Logic 2 interoperability
 
 The recording crate can import and export the ZIP-based `.sal` container used

@@ -287,6 +287,12 @@ stream supplied by that transport. The GUI connects the custom analyzer to a
 specific transport-analyzer instance; a schema never names physical logic
 channels.
 
+RF modulation is intentionally not represented as a pretend UART/SPI/I2C
+transport. The planned FSK/GFSK pipeline first converts IQ into timed bits and
+framed packet bytes. A future protocol-schema version accepts that generic
+packet-byte capability as input while preserving version 1 behavior. See
+[RF/SDR capture and signal-decoding architecture](rf-sdr-architecture.md).
+
 Multiple custom analyzers may consume the same transport instance. Removing a
 transport analyzer with dependants requires confirmation and identifies the
 custom analyzers that would become unavailable.

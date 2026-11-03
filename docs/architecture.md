@@ -22,6 +22,13 @@ threads, while the UI polls typed capture events without blocking the window
 loop. It keeps bounded display buffers and paints digital and scope traces
 without introducing UI dependencies into the core or hardware crates.
 
+The planned HackRF integration adds a third, generic radio-receiver instrument
+and raw IQ capture path. HackRF remains the backend name; the user-facing view
+and core data model are device-independent so another SDR can reuse them. IQ
+streaming, bounded DSP, spectrum and waterfall rendering, native recording,
+and the FSK/GFSK decoding stack are specified in
+[RF/SDR capture and signal-decoding architecture](rf-sdr-architecture.md).
+
 ## Protocol decoding and plugins
 
 Protocol decoding is a consumer of capture data, never a hardware-driver
@@ -39,6 +46,13 @@ meaning. Custom schemas never consume hardware samples or access physical
 channels directly. The versioned YAML format, generic event model, separate
 project file, recording identity rules, and implementation sequence are
 specified in [Custom protocol decoding architecture](custom-protocols.md).
+
+Radio modulation decoding follows the same layering rule. An RF channelizer
+and FSK/GFSK demodulator consume IQ samples and emit timed soft bits; line-code,
+whitening, synchronization, and packet-framing stages turn those bits into
+timed packet bytes. Only then may a custom YAML schema assign application-level
+meaning to fields. YAML schemas do not implement filters, carrier recovery,
+symbol timing, or bit slicing.
 
 Live and offline decoding use the same incremental engine. Decoders subscribe
 to ordered capture data independently of the GUI's bounded display buffers, so
