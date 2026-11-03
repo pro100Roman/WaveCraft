@@ -3062,6 +3062,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wavecraft-sdr"
+version = "0.1.0"
+dependencies = [
+ "wavecraft-core",
+]
+
+[[package]]
 name = "wavecraft-sim"
 version = "0.1.0"
 dependencies = [

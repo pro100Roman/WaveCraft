@@ -6,6 +6,7 @@ members = [
     "crates/wavecraft-core",
     "crates/wavecraft-decode",
     "crates/wavecraft-recording",
+    "crates/wavecraft-sdr",
     "crates/wavecraft-sim",
     "crates/wavecraft-usb",
 ]
