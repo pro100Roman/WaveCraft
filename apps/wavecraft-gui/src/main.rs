@@ -41,14 +41,14 @@ use wavecraft_usb::{
     DsCopeOperationMode, DsCopeRuntimeCalibrationControl, DsCopeRuntimeTriggerControl,
     DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig,
     DsLogicCaptureSource, DsLogicInputFilter, DsLogicOperationMode, DsLogicSimpleTrigger,
-    DsLogicStopOption, DsLogicTriggerCondition, DsLogicTriggerConfig, LinkStatus, UsbSpeedClass,
-    DSCOPE_FRAME_SEQUENCE_STRIDE, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
-    DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX,
-    DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
-    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
-    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN,
-    DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_ALIGNMENT, DSLOGIC_SAMPLE_RATES_HZ,
-    REQUIRED_RESOURCE_FILES,
+    DsLogicSmartTrigger, DsLogicStopOption, DsLogicTriggerCondition, DsLogicTriggerConfig,
+    DsLogicTriggerStage, LinkStatus, UsbSpeedClass, DSCOPE_FRAME_SEQUENCE_STRIDE,
+    DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ, DSCOPE_TRIGGER_HOLDOFF_MAX_NS,
+    DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
+    DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
+    DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
+    DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_ALIGNMENT,
+    DSLOGIC_SAMPLE_RATES_HZ, DSLOGIC_TRIGGER_STAGE_COUNT, REQUIRED_RESOURCE_FILES,
 };
 
 const SAMPLE_RATE_HZ: u64 = 1_000_000;
@@ -1039,6 +1039,12 @@ struct ScopeCaptureSettings {
     bandwidth_limit: DsCopeBandwidthLimit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogicTriggerMode {
+    Simple,
+    Smart,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LogicCaptureSettings {
     sample_rate_hz: u64,
@@ -1053,13 +1059,21 @@ struct LogicCaptureSettings {
     external_clock: bool,
     falling_clock_edge: bool,
     trigger_enabled: bool,
+    trigger_mode: LogicTriggerMode,
     trigger_conditions: [Option<DsLogicTriggerCondition>; LOGIC_CHANNEL_COUNT],
+    smart_trigger_stage_count: u8,
+    smart_trigger_conditions:
+        [[Option<DsLogicTriggerCondition>; LOGIC_CHANNEL_COUNT]; DSLOGIC_TRIGGER_STAGE_COUNT],
 }
 
 impl Default for LogicCaptureSettings {
     fn default() -> Self {
         let mut trigger_conditions = [None; LOGIC_CHANNEL_COUNT];
         trigger_conditions[0] = Some(DsLogicTriggerCondition::RisingEdge);
+        let mut smart_trigger_conditions =
+            [[None; LOGIC_CHANNEL_COUNT]; DSLOGIC_TRIGGER_STAGE_COUNT];
+        smart_trigger_conditions[0][0] = Some(DsLogicTriggerCondition::RisingEdge);
+        smart_trigger_conditions[1][0] = Some(DsLogicTriggerCondition::FallingEdge);
         Self {
             sample_rate_hz: SAMPLE_RATE_HZ,
             sample_count: SAMPLE_COUNT,
@@ -1073,7 +1087,10 @@ impl Default for LogicCaptureSettings {
             external_clock: false,
             falling_clock_edge: false,
             trigger_enabled: false,
+            trigger_mode: LogicTriggerMode::Simple,
             trigger_conditions,
+            smart_trigger_stage_count: 2,
+            smart_trigger_conditions,
         }
     }
 }
@@ -1120,33 +1137,37 @@ impl LogicCaptureSettings {
             if internal_test {
                 return Err("Logic triggering is unavailable in internal-test mode".to_owned());
             }
-            let mut configured_conditions = self
-                .trigger_conditions
-                .iter()
-                .copied()
-                .enumerate()
-                .filter_map(|(channel, condition)| condition.map(|condition| (channel, condition)));
-            let (first_channel, first_condition) = configured_conditions
-                .next()
-                .ok_or_else(|| "Configure at least one logic trigger condition".to_owned())?;
-            let mut trigger = DsLogicSimpleTrigger::new(first_channel as u8, first_condition)
-                .map_err(|error| error.to_string())?;
-            for (channel, condition) in configured_conditions {
-                trigger = trigger
-                    .with_channel_condition(channel as u8, condition)
-                    .map_err(|error| error.to_string())?;
-            }
-            if let Some(channel) =
-                self.trigger_conditions
-                    .iter()
-                    .enumerate()
-                    .find_map(|(channel, condition)| {
-                        (condition.is_some() && !self.enabled_channels[channel]).then_some(channel)
-                    })
-            {
-                return Err(format!("Logic trigger channel {channel} must be enabled"));
-            }
-            Ok(config.with_trigger(Some(DsLogicTriggerConfig::Simple(trigger))))
+            let trigger = match self.trigger_mode {
+                LogicTriggerMode::Simple => DsLogicTriggerConfig::Simple(simple_logic_trigger(
+                    self.trigger_conditions,
+                    self.enabled_channels,
+                )?),
+                LogicTriggerMode::Smart => {
+                    if self.operation_mode != DsLogicOperationMode::Buffer {
+                        return Err(
+                            "Smart logic triggering requires buffered capture mode".to_owned()
+                        );
+                    }
+                    let stage_count = usize::from(self.smart_trigger_stage_count)
+                        .clamp(2, DSLOGIC_TRIGGER_STAGE_COUNT);
+                    let mut trigger = DsLogicSmartTrigger::new(logic_trigger_stage(
+                        self.smart_trigger_conditions[0],
+                        self.enabled_channels,
+                        0,
+                    )?);
+                    for stage_index in 1..stage_count {
+                        trigger = trigger
+                            .with_stage(logic_trigger_stage(
+                                self.smart_trigger_conditions[stage_index],
+                                self.enabled_channels,
+                                stage_index,
+                            )?)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    DsLogicTriggerConfig::Smart(trigger)
+                }
+            };
+            Ok(config.with_trigger(Some(trigger)))
         })
     }
 
@@ -1169,6 +1190,74 @@ impl LogicCaptureSettings {
             .with_operation_mode(self.operation_mode)
             .maximum_sample_count()
     }
+}
+
+fn configured_logic_trigger_conditions(
+    conditions: [Option<DsLogicTriggerCondition>; LOGIC_CHANNEL_COUNT],
+    enabled_channels: [bool; LOGIC_CHANNEL_COUNT],
+    stage_index: Option<usize>,
+) -> Result<Vec<(usize, DsLogicTriggerCondition)>, String> {
+    let configured = conditions
+        .into_iter()
+        .enumerate()
+        .filter_map(|(channel, condition)| condition.map(|condition| (channel, condition)))
+        .collect::<Vec<_>>();
+    if configured.is_empty() {
+        return Err(match stage_index {
+            Some(stage) => format!(
+                "Configure at least one condition in smart trigger stage {}",
+                stage + 1
+            ),
+            None => "Configure at least one logic trigger condition".to_owned(),
+        });
+    }
+    if let Some((channel, _)) = configured
+        .iter()
+        .find(|(channel, _)| !enabled_channels[*channel])
+    {
+        return Err(format!("Logic trigger channel {channel} must be enabled"));
+    }
+    Ok(configured)
+}
+
+fn simple_logic_trigger(
+    conditions: [Option<DsLogicTriggerCondition>; LOGIC_CHANNEL_COUNT],
+    enabled_channels: [bool; LOGIC_CHANNEL_COUNT],
+) -> Result<DsLogicSimpleTrigger, String> {
+    let mut configured =
+        configured_logic_trigger_conditions(conditions, enabled_channels, None)?.into_iter();
+    let (first_channel, first_condition) = configured
+        .next()
+        .expect("configured trigger conditions are non-empty");
+    let mut trigger = DsLogicSimpleTrigger::new(first_channel as u8, first_condition)
+        .map_err(|error| error.to_string())?;
+    for (channel, condition) in configured {
+        trigger = trigger
+            .with_channel_condition(channel as u8, condition)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(trigger)
+}
+
+fn logic_trigger_stage(
+    conditions: [Option<DsLogicTriggerCondition>; LOGIC_CHANNEL_COUNT],
+    enabled_channels: [bool; LOGIC_CHANNEL_COUNT],
+    stage_index: usize,
+) -> Result<DsLogicTriggerStage, String> {
+    let mut configured =
+        configured_logic_trigger_conditions(conditions, enabled_channels, Some(stage_index))?
+            .into_iter();
+    let (first_channel, first_condition) = configured
+        .next()
+        .expect("configured trigger stage is non-empty");
+    let mut stage = DsLogicTriggerStage::new(first_channel as u8, first_condition)
+        .map_err(|error| error.to_string())?;
+    for (channel, condition) in configured {
+        stage = stage
+            .with_channel_condition(channel as u8, condition)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(stage)
 }
 
 fn logic_trigger_condition_label(condition: DsLogicTriggerCondition) -> &'static str {
@@ -3178,7 +3267,7 @@ enum WorkerSuccess {
         mode: AcquisitionMode,
         target: CaptureTarget,
         retain_protocol_history: bool,
-        logic_config: DsLogicCaptureConfig,
+        logic_config: Box<DsLogicCaptureConfig>,
         scope_config: DsCopeCaptureConfig,
         scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
         scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
@@ -3623,7 +3712,7 @@ impl WaveCraftApp {
                 mode,
                 target,
                 retain_protocol_history,
-                logic_config,
+                logic_config: Box::new(logic_config),
                 scope_config,
                 scope_trigger_controls: started.scope_trigger_controls,
                 scope_calibration_controls: started.scope_calibration_controls,
@@ -3932,6 +4021,7 @@ impl WaveCraftApp {
                 scope_trigger_controls,
                 scope_calibration_controls,
             }) => {
+                let logic_config = *logic_config;
                 if !self.capture_run_requested {
                     self.requested_capture_target = None;
                     match session.stop() {
@@ -5840,28 +5930,29 @@ struct ScopeVisualizationSettingsEditor<'a> {
     scope_channel_names: &'a mut [String; 2],
 }
 
-fn paint_logic_trigger_conditions(ui: &mut egui::Ui, settings: &mut LogicCaptureSettings) {
+fn paint_logic_trigger_conditions(
+    ui: &mut egui::Ui,
+    enabled_channels: [bool; LOGIC_CHANNEL_COUNT],
+    conditions: &mut [Option<DsLogicTriggerCondition>; LOGIC_CHANNEL_COUNT],
+    id_source: impl std::hash::Hash,
+) {
     ui.vertical(|ui| {
         ui.small(RichText::new("All selected conditions must match together").color(TEXT_MUTED));
         for channel in 0..LOGIC_CHANNEL_COUNT {
-            if !settings.enabled_channels[channel] {
+            if !enabled_channels[channel] {
                 continue;
             }
             ui.horizontal(|ui| {
                 ui.monospace(format!("CH {channel}"));
-                egui::ComboBox::from_id_salt(("logic_trigger_condition", channel))
+                egui::ComboBox::from_id_salt((&id_source, channel))
                     .width(92.0)
                     .selected_text(
-                        settings.trigger_conditions[channel]
+                        conditions[channel]
                             .map(logic_trigger_condition_label)
                             .unwrap_or("Don't care"),
                     )
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut settings.trigger_conditions[channel],
-                            None,
-                            "Don't care",
-                        );
+                        ui.selectable_value(&mut conditions[channel], None, "Don't care");
                         for condition in [
                             DsLogicTriggerCondition::RisingEdge,
                             DsLogicTriggerCondition::FallingEdge,
@@ -5870,7 +5961,7 @@ fn paint_logic_trigger_conditions(ui: &mut egui::Ui, settings: &mut LogicCapture
                             DsLogicTriggerCondition::Low,
                         ] {
                             ui.selectable_value(
-                                &mut settings.trigger_conditions[channel],
+                                &mut conditions[channel],
                                 Some(condition),
                                 logic_trigger_condition_label(condition),
                             );
@@ -5878,7 +5969,7 @@ fn paint_logic_trigger_conditions(ui: &mut egui::Ui, settings: &mut LogicCapture
                     });
             });
         }
-        if !settings.trigger_conditions.iter().any(Option::is_some) {
+        if !conditions.iter().any(Option::is_some) {
             ui.small(RichText::new("Choose at least one condition").color(Color32::LIGHT_RED));
         }
     });
@@ -5943,16 +6034,22 @@ fn paint_capture_settings(
                     if *logic_acquisition_mode == AcquisitionMode::Loop {
                         logic_settings.trigger_enabled = false;
                     }
+                    if logic_settings.operation_mode != DsLogicOperationMode::Buffer
+                        && logic_settings.trigger_mode == LogicTriggerMode::Smart
+                    {
+                        logic_settings.trigger_mode = LogicTriggerMode::Simple;
+                    }
                     for channel in 0..LOGIC_CHANNEL_COUNT {
                         if !logic_settings.enabled_channels[channel] {
                             logic_settings.trigger_conditions[channel] = None;
+                            for stage in &mut logic_settings.smart_trigger_conditions {
+                                stage[channel] = None;
+                            }
                         }
                     }
                     if logic_settings.trigger_enabled
-                        && !logic_settings
-                            .trigger_conditions
-                            .iter()
-                            .any(Option::is_some)
+                        && logic_settings.trigger_mode == LogicTriggerMode::Simple
+                        && !logic_settings.trigger_conditions.iter().any(Option::is_some)
                     {
                         if let Some(channel) = logic_settings
                             .enabled_channels
@@ -5961,6 +6058,31 @@ fn paint_capture_settings(
                         {
                             logic_settings.trigger_conditions[channel] =
                                 Some(DsLogicTriggerCondition::RisingEdge);
+                        }
+                    }
+                    if logic_settings.trigger_enabled
+                        && logic_settings.trigger_mode == LogicTriggerMode::Smart
+                    {
+                        let default_channel = logic_settings
+                            .enabled_channels
+                            .iter()
+                            .position(|enabled| *enabled);
+                        for stage_index in
+                            0..usize::from(logic_settings.smart_trigger_stage_count)
+                        {
+                            if !logic_settings.smart_trigger_conditions[stage_index]
+                                .iter()
+                                .any(Option::is_some)
+                            {
+                                if let Some(channel) = default_channel {
+                                    logic_settings.smart_trigger_conditions[stage_index][channel] =
+                                        Some(if stage_index % 2 == 0 {
+                                            DsLogicTriggerCondition::RisingEdge
+                                        } else {
+                                            DsLogicTriggerCondition::FallingEdge
+                                        });
+                                }
+                            }
                         }
                     }
                     let maximum_sample_rate_hz =
@@ -6265,10 +6387,11 @@ fn paint_capture_settings(
                                         ),
                                     )
                                     .on_hover_text(
-                                        "Arm the analyzer and wait until every configured channel condition matches at the same sample",
+                                        "Arm the analyzer and wait for the configured hardware trigger",
                                     );
                                     if trigger_response.changed()
                                         && logic_settings.trigger_enabled
+                                        && logic_settings.trigger_mode == LogicTriggerMode::Simple
                                         && !logic_settings
                                             .trigger_conditions
                                             .iter()
@@ -6286,11 +6409,104 @@ fn paint_capture_settings(
                                     ui.end_row();
 
                                     if logic_settings.trigger_enabled {
-                                        ui.label("Conditions");
+                                        ui.label("Trigger mode");
                                         ui.add_enabled_ui(availability.capture, |ui| {
-                                            paint_logic_trigger_conditions(ui, logic_settings);
+                                            egui::ComboBox::from_id_salt("logic_trigger_mode")
+                                                .width(92.0)
+                                                .selected_text(match logic_settings.trigger_mode {
+                                                    LogicTriggerMode::Simple => "Simple",
+                                                    LogicTriggerMode::Smart => "Smart",
+                                                })
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(
+                                                        &mut logic_settings.trigger_mode,
+                                                        LogicTriggerMode::Simple,
+                                                        "Simple",
+                                                    )
+                                                    .on_hover_text(
+                                                        "All channel conditions match at one sample",
+                                                    );
+                                                    ui.add_enabled_ui(
+                                                        logic_settings.operation_mode
+                                                            == DsLogicOperationMode::Buffer,
+                                                        |ui| {
+                                                            ui.selectable_value(
+                                                                &mut logic_settings.trigger_mode,
+                                                                LogicTriggerMode::Smart,
+                                                                "Smart",
+                                                            )
+                                                            .on_hover_text(
+                                                                "Match two or more channel-condition stages in order",
+                                                            );
+                                                        },
+                                                    );
+                                                });
                                         });
                                         ui.end_row();
+
+                                        match logic_settings.trigger_mode {
+                                            LogicTriggerMode::Simple => {
+                                                ui.label("Conditions");
+                                                ui.add_enabled_ui(availability.capture, |ui| {
+                                                    paint_logic_trigger_conditions(
+                                                        ui,
+                                                        logic_settings.enabled_channels,
+                                                        &mut logic_settings.trigger_conditions,
+                                                        "logic_simple_trigger",
+                                                    );
+                                                });
+                                                ui.end_row();
+                                            }
+                                            LogicTriggerMode::Smart => {
+                                                ui.label("Smart stages");
+                                                ui.add_enabled_ui(availability.capture, |ui| {
+                                                    ui.vertical(|ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label("Stages");
+                                                            ui.add(
+                                                                egui::DragValue::new(
+                                                                    &mut logic_settings
+                                                                        .smart_trigger_stage_count,
+                                                                )
+                                                                .range(
+                                                                    2..=DSLOGIC_TRIGGER_STAGE_COUNT
+                                                                        as u8,
+                                                                ),
+                                                            );
+                                                        });
+                                                        ui.small(
+                                                            RichText::new(
+                                                                "Each stage matches its channels together; stages match in order",
+                                                            )
+                                                            .color(TEXT_MUTED),
+                                                        );
+                                                        for stage_index in 0..usize::from(
+                                                            logic_settings.smart_trigger_stage_count,
+                                                        ) {
+                                                            egui::CollapsingHeader::new(format!(
+                                                                "Stage {}",
+                                                                stage_index + 1
+                                                            ))
+                                                            .default_open(stage_index < 2)
+                                                            .show(ui, |ui| {
+                                                                paint_logic_trigger_conditions(
+                                                                    ui,
+                                                                    logic_settings.enabled_channels,
+                                                                    &mut logic_settings
+                                                                        .smart_trigger_conditions
+                                                                        [stage_index],
+                                                                    (
+                                                                        "logic_smart_trigger",
+                                                                        stage_index,
+                                                                    ),
+                                                                );
+                                                            });
+                                                        }
+                                                    });
+                                                });
+                                                ui.end_row();
+                                            }
+                                        }
                                     }
 
                                     if *logic_acquisition_mode == AcquisitionMode::Repetitive {
@@ -9150,28 +9366,51 @@ fn start_gui_recording(
         "logic.trigger.enabled".to_owned(),
         logic_config.trigger().is_some().to_string(),
     );
-    if let Some(DsLogicTriggerConfig::Simple(trigger)) = logic_config.trigger() {
-        metadata.insert("logic.trigger.mode".to_owned(), "simple".to_owned());
-        let mut first_condition = None;
-        for (channel, condition) in trigger.conditions().into_iter().enumerate() {
-            let Some(condition) = condition else {
-                continue;
-            };
-            first_condition.get_or_insert((channel, condition));
-            metadata.insert(
-                format!("logic.trigger.ch{channel}.condition"),
-                logic_trigger_condition_key(condition).to_owned(),
-            );
+    match logic_config.trigger() {
+        Some(DsLogicTriggerConfig::Simple(trigger)) => {
+            metadata.insert("logic.trigger.mode".to_owned(), "simple".to_owned());
+            let mut first_condition = None;
+            for (channel, condition) in trigger.conditions().into_iter().enumerate() {
+                let Some(condition) = condition else {
+                    continue;
+                };
+                first_condition.get_or_insert((channel, condition));
+                metadata.insert(
+                    format!("logic.trigger.ch{channel}.condition"),
+                    logic_trigger_condition_key(condition).to_owned(),
+                );
+            }
+            if let Some((channel, condition)) = first_condition {
+                // Keep the original one-channel keys readable by recordings made
+                // while simple triggers supported only one condition.
+                metadata.insert("logic.trigger.channel".to_owned(), channel.to_string());
+                metadata.insert(
+                    "logic.trigger.condition".to_owned(),
+                    logic_trigger_condition_key(condition).to_owned(),
+                );
+            }
         }
-        if let Some((channel, condition)) = first_condition {
-            // Keep the original one-channel keys readable by recordings made
-            // while simple triggers supported only one condition.
-            metadata.insert("logic.trigger.channel".to_owned(), channel.to_string());
+        Some(DsLogicTriggerConfig::Smart(trigger)) => {
+            metadata.insert("logic.trigger.mode".to_owned(), "smart".to_owned());
             metadata.insert(
-                "logic.trigger.condition".to_owned(),
-                logic_trigger_condition_key(condition).to_owned(),
+                "logic.trigger.stage_count".to_owned(),
+                trigger.stage_count().to_string(),
             );
+            for (stage_index, stage) in trigger.stages().into_iter().enumerate() {
+                let Some(stage) = stage else {
+                    continue;
+                };
+                for (channel, condition) in stage.conditions().into_iter().enumerate() {
+                    if let Some(condition) = condition {
+                        metadata.insert(
+                            format!("logic.trigger.stage{stage_index}.ch{channel}.condition"),
+                            logic_trigger_condition_key(condition).to_owned(),
+                        );
+                    }
+                }
+            }
         }
+        None => {}
     }
     for (channel, enabled) in logic_config.enabled_channels().into_iter().enumerate() {
         metadata.insert(format!("logic.ch{channel}.enabled"), enabled.to_string());
@@ -9368,38 +9607,76 @@ fn logic_settings_from_recording_metadata(
         settings.falling_clock_edge = falling_clock_edge;
     }
     if recording_metadata_value::<bool>(metadata, "logic.trigger.enabled") == Some(true) {
-        let mut trigger_conditions = [None; LOGIC_CHANNEL_COUNT];
-        if let (Some(channel), Some(condition)) = (
-            recording_metadata_value::<u8>(metadata, "logic.trigger.channel"),
-            metadata
-                .get("logic.trigger.condition")
-                .and_then(|value| parse_logic_trigger_condition(value)),
-        ) {
-            if let Some(destination) = trigger_conditions.get_mut(usize::from(channel)) {
-                *destination = Some(condition);
-            }
-        }
-        for (channel, destination) in trigger_conditions.iter_mut().enumerate() {
-            if let Some(condition) = metadata
-                .get(&format!("logic.trigger.ch{channel}.condition"))
-                .and_then(|value| parse_logic_trigger_condition(value))
-            {
-                *destination = Some(condition);
-            }
-        }
-        let conditions_are_valid = trigger_conditions
-            .iter()
-            .enumerate()
-            .any(|(channel, condition)| condition.is_some() && settings.enabled_channels[channel])
-            && trigger_conditions
-                .iter()
-                .enumerate()
-                .all(|(channel, condition)| {
-                    condition.is_none() || settings.enabled_channels[channel]
+        if metadata.get("logic.trigger.mode").map(String::as_str) == Some("smart") {
+            let stage_count = recording_metadata_value::<u8>(metadata, "logic.trigger.stage_count")
+                .map(|count| usize::from(count).clamp(2, DSLOGIC_TRIGGER_STAGE_COUNT));
+            if let Some(stage_count) = stage_count {
+                let mut stages = [[None; LOGIC_CHANNEL_COUNT]; DSLOGIC_TRIGGER_STAGE_COUNT];
+                for (stage_index, stage) in stages.iter_mut().enumerate().take(stage_count) {
+                    for (channel, destination) in stage.iter_mut().enumerate() {
+                        if let Some(condition) = metadata
+                            .get(&format!(
+                                "logic.trigger.stage{stage_index}.ch{channel}.condition"
+                            ))
+                            .and_then(|value| parse_logic_trigger_condition(value))
+                        {
+                            *destination = Some(condition);
+                        }
+                    }
+                }
+                let stages_are_valid = stages[..stage_count].iter().all(|stage| {
+                    stage.iter().enumerate().any(|(channel, condition)| {
+                        condition.is_some() && settings.enabled_channels[channel]
+                    }) && stage.iter().enumerate().all(|(channel, condition)| {
+                        condition.is_none() || settings.enabled_channels[channel]
+                    })
                 });
-        if conditions_are_valid && settings.operation_mode != DsLogicOperationMode::InternalTest {
-            settings.trigger_conditions = trigger_conditions;
-            settings.trigger_enabled = true;
+                if stages_are_valid && settings.operation_mode == DsLogicOperationMode::Buffer {
+                    settings.trigger_mode = LogicTriggerMode::Smart;
+                    settings.smart_trigger_stage_count = stage_count as u8;
+                    settings.smart_trigger_conditions = stages;
+                    settings.trigger_enabled = true;
+                }
+            }
+        } else {
+            let mut trigger_conditions = [None; LOGIC_CHANNEL_COUNT];
+            if let (Some(channel), Some(condition)) = (
+                recording_metadata_value::<u8>(metadata, "logic.trigger.channel"),
+                metadata
+                    .get("logic.trigger.condition")
+                    .and_then(|value| parse_logic_trigger_condition(value)),
+            ) {
+                if let Some(destination) = trigger_conditions.get_mut(usize::from(channel)) {
+                    *destination = Some(condition);
+                }
+            }
+            for (channel, destination) in trigger_conditions.iter_mut().enumerate() {
+                if let Some(condition) = metadata
+                    .get(&format!("logic.trigger.ch{channel}.condition"))
+                    .and_then(|value| parse_logic_trigger_condition(value))
+                {
+                    *destination = Some(condition);
+                }
+            }
+            let conditions_are_valid =
+                trigger_conditions
+                    .iter()
+                    .enumerate()
+                    .any(|(channel, condition)| {
+                        condition.is_some() && settings.enabled_channels[channel]
+                    })
+                    && trigger_conditions
+                        .iter()
+                        .enumerate()
+                        .all(|(channel, condition)| {
+                            condition.is_none() || settings.enabled_channels[channel]
+                        });
+            if conditions_are_valid && settings.operation_mode != DsLogicOperationMode::InternalTest
+            {
+                settings.trigger_mode = LogicTriggerMode::Simple;
+                settings.trigger_conditions = trigger_conditions;
+                settings.trigger_enabled = true;
+            }
         }
     }
     settings
@@ -15260,6 +15537,7 @@ mod tests {
             falling_clock_edge: true,
             trigger_enabled: true,
             trigger_conditions,
+            ..LogicCaptureSettings::default()
         };
 
         let config = settings
@@ -15284,6 +15562,80 @@ mod tests {
                     .with_channel_condition(3, DsLogicTriggerCondition::FallingEdge)
                     .unwrap()
             ))
+        );
+    }
+
+    #[test]
+    fn smart_logic_settings_build_ordered_hardware_stages() {
+        let mut settings = LogicCaptureSettings {
+            operation_mode: DsLogicOperationMode::Buffer,
+            trigger_enabled: true,
+            trigger_mode: LogicTriggerMode::Smart,
+            smart_trigger_stage_count: 2,
+            ..LogicCaptureSettings::default()
+        };
+        settings.smart_trigger_conditions =
+            [[None; LOGIC_CHANNEL_COUNT]; DSLOGIC_TRIGGER_STAGE_COUNT];
+        settings.smart_trigger_conditions[0][0] = Some(DsLogicTriggerCondition::RisingEdge);
+        settings.smart_trigger_conditions[0][1] = Some(DsLogicTriggerCondition::High);
+        settings.smart_trigger_conditions[1][2] = Some(DsLogicTriggerCondition::FallingEdge);
+
+        let config = settings
+            .capture_config()
+            .expect("smart trigger settings should be valid");
+
+        let first_stage = DsLogicTriggerStage::new(0, DsLogicTriggerCondition::RisingEdge)
+            .unwrap()
+            .with_channel_condition(1, DsLogicTriggerCondition::High)
+            .unwrap();
+        let second_stage =
+            DsLogicTriggerStage::new(2, DsLogicTriggerCondition::FallingEdge).unwrap();
+        assert_eq!(
+            config.trigger(),
+            Some(DsLogicTriggerConfig::Smart(
+                DsLogicSmartTrigger::new(first_stage)
+                    .with_stage(second_stage)
+                    .unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn recording_metadata_restores_smart_trigger_stages() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("logic.operation_mode".to_owned(), "buffer".to_owned());
+        metadata.insert("logic.trigger.enabled".to_owned(), "true".to_owned());
+        metadata.insert("logic.trigger.mode".to_owned(), "smart".to_owned());
+        metadata.insert("logic.trigger.stage_count".to_owned(), "2".to_owned());
+        metadata.insert(
+            "logic.trigger.stage0.ch0.condition".to_owned(),
+            "rising_edge".to_owned(),
+        );
+        metadata.insert(
+            "logic.trigger.stage0.ch1.condition".to_owned(),
+            "high".to_owned(),
+        );
+        metadata.insert(
+            "logic.trigger.stage1.ch2.condition".to_owned(),
+            "falling_edge".to_owned(),
+        );
+
+        let settings = logic_settings_from_recording_metadata(&metadata);
+
+        assert!(settings.trigger_enabled);
+        assert_eq!(settings.trigger_mode, LogicTriggerMode::Smart);
+        assert_eq!(settings.smart_trigger_stage_count, 2);
+        assert_eq!(
+            settings.smart_trigger_conditions[0][0],
+            Some(DsLogicTriggerCondition::RisingEdge)
+        );
+        assert_eq!(
+            settings.smart_trigger_conditions[0][1],
+            Some(DsLogicTriggerCondition::High)
+        );
+        assert_eq!(
+            settings.smart_trigger_conditions[1][2],
+            Some(DsLogicTriggerCondition::FallingEdge)
         );
     }
 

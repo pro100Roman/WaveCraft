@@ -51,7 +51,7 @@ const LOOP_MODE_BIT: u16 = 7;
 const SLOW_ACQUISITION_BIT: u16 = 10;
 const STREAM_MODE_BIT: u16 = 12;
 const INTERNAL_TEST_BIT: u16 = 15;
-const TRIGGER_STAGE_COUNT: usize = 16;
+pub const DSLOGIC_TRIGGER_STAGE_COUNT: usize = 16;
 
 pub const DSLOGIC_SAMPLE_RATES_HZ: &[u64] = &[
     1_000_000,
@@ -105,6 +105,141 @@ pub struct DsLogicSimpleTrigger {
     conditions: [Option<DsLogicTriggerCondition>; CHANNEL_COUNT as usize],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DsLogicTriggerStage {
+    conditions: [Option<DsLogicTriggerCondition>; CHANNEL_COUNT as usize],
+}
+
+impl DsLogicTriggerStage {
+    pub fn new(channel: u8, condition: DsLogicTriggerCondition) -> Result<Self, CaptureError> {
+        Self {
+            conditions: [None; CHANNEL_COUNT as usize],
+        }
+        .with_channel_condition(channel, condition)
+    }
+
+    pub fn with_channel_condition(
+        mut self,
+        channel: u8,
+        condition: DsLogicTriggerCondition,
+    ) -> Result<Self, CaptureError> {
+        let Some(destination) = self.conditions.get_mut(usize::from(channel)) else {
+            return Err(CaptureError::new(format!(
+                "DSLogic trigger channel must be between 0 and {}; got {channel}",
+                CHANNEL_COUNT - 1
+            )));
+        };
+        *destination = Some(condition);
+        Ok(self)
+    }
+
+    pub fn conditions(self) -> [Option<DsLogicTriggerCondition>; CHANNEL_COUNT as usize] {
+        self.conditions
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PackedTriggerStage {
+    mask: u32,
+    value: u32,
+    edge: u32,
+}
+
+impl PackedTriggerStage {
+    fn from_stage(stage: DsLogicTriggerStage) -> Self {
+        let mut packed = Self {
+            mask: u32::MAX,
+            ..Self::default()
+        };
+        for (channel, condition) in stage.conditions.into_iter().enumerate() {
+            let Some(condition) = condition else {
+                continue;
+            };
+            let bit = 1_u32 << channel;
+            match condition {
+                DsLogicTriggerCondition::Low => packed.mask &= !bit,
+                DsLogicTriggerCondition::High => {
+                    packed.mask &= !bit;
+                    packed.value |= bit;
+                }
+                DsLogicTriggerCondition::RisingEdge => {
+                    packed.mask &= !bit;
+                    packed.value |= bit;
+                    packed.edge |= bit;
+                }
+                DsLogicTriggerCondition::FallingEdge => {
+                    packed.mask &= !bit;
+                    packed.edge |= bit;
+                }
+                DsLogicTriggerCondition::EitherEdge => packed.edge |= bit,
+            }
+        }
+        packed
+    }
+
+    fn conditions(self) -> [Option<DsLogicTriggerCondition>; CHANNEL_COUNT as usize] {
+        std::array::from_fn(|channel| {
+            let bit = 1_u32 << channel;
+            match (
+                self.mask & bit != 0,
+                self.value & bit != 0,
+                self.edge & bit != 0,
+            ) {
+                (true, false, false) => None,
+                (false, false, false) => Some(DsLogicTriggerCondition::Low),
+                (false, true, false) => Some(DsLogicTriggerCondition::High),
+                (false, true, true) => Some(DsLogicTriggerCondition::RisingEdge),
+                (false, false, true) => Some(DsLogicTriggerCondition::FallingEdge),
+                (true, false, true) => Some(DsLogicTriggerCondition::EitherEdge),
+                _ => None,
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DsLogicSmartTrigger {
+    stages: [PackedTriggerStage; DSLOGIC_TRIGGER_STAGE_COUNT],
+    stage_count: u8,
+}
+
+impl DsLogicSmartTrigger {
+    /// Create an ordered hardware trigger. Every condition in a stage must
+    /// match at the same sample; stages must then match in sequence.
+    pub fn new(first_stage: DsLogicTriggerStage) -> Self {
+        let mut stages = [PackedTriggerStage::default(); DSLOGIC_TRIGGER_STAGE_COUNT];
+        stages[0] = PackedTriggerStage::from_stage(first_stage);
+        Self {
+            stages,
+            stage_count: 1,
+        }
+    }
+
+    pub fn with_stage(mut self, stage: DsLogicTriggerStage) -> Result<Self, CaptureError> {
+        let stage_index = usize::from(self.stage_count);
+        let Some(destination) = self.stages.get_mut(stage_index) else {
+            return Err(CaptureError::new(format!(
+                "DSLogic smart trigger supports at most {DSLOGIC_TRIGGER_STAGE_COUNT} stages"
+            )));
+        };
+        *destination = PackedTriggerStage::from_stage(stage);
+        self.stage_count += 1;
+        Ok(self)
+    }
+
+    pub fn stages(self) -> [Option<DsLogicTriggerStage>; DSLOGIC_TRIGGER_STAGE_COUNT] {
+        std::array::from_fn(|index| {
+            (index < usize::from(self.stage_count)).then(|| DsLogicTriggerStage {
+                conditions: self.stages[index].conditions(),
+            })
+        })
+    }
+
+    pub fn stage_count(self) -> u8 {
+        self.stage_count
+    }
+}
+
 impl DsLogicSimpleTrigger {
     /// Create a simple hardware trigger. Additional channel conditions can be
     /// added with [`Self::with_channel_condition`]; all configured conditions
@@ -143,11 +278,32 @@ impl DsLogicSimpleTrigger {
     }
 }
 
-/// Hardware trigger mode. Future two-pattern or staged triggers can be added
-/// as separate variants without changing capture configuration users.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DsLogicTriggerConfig {
     Simple(DsLogicSimpleTrigger),
+    Smart(DsLogicSmartTrigger),
+}
+
+impl DsLogicTriggerConfig {
+    fn condition_sets(
+        self,
+    ) -> [[Option<DsLogicTriggerCondition>; CHANNEL_COUNT as usize]; DSLOGIC_TRIGGER_STAGE_COUNT]
+    {
+        let mut condition_sets = [[None; CHANNEL_COUNT as usize]; DSLOGIC_TRIGGER_STAGE_COUNT];
+        match self {
+            Self::Simple(trigger) => condition_sets[0] = trigger.conditions,
+            Self::Smart(trigger) => {
+                for (destination, stage) in condition_sets
+                    .iter_mut()
+                    .zip(trigger.stages)
+                    .take(usize::from(trigger.stage_count))
+                {
+                    *destination = stage.conditions();
+                }
+            }
+        }
+        condition_sets
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -459,21 +615,30 @@ impl DsLogicCaptureConfig {
                 "DSLogic hardware triggering is not supported in internal-test mode",
             ));
         }
-        if let Some(DsLogicTriggerConfig::Simple(trigger)) = self.trigger {
-            for (channel, condition) in trigger.conditions.iter().enumerate() {
-                if condition.is_none() {
-                    continue;
-                }
-                if channel >= usize::from(channel_count) {
-                    return Err(CaptureError::new(format!(
-                        "{} exposes {channel_count} logic channels; trigger channel {channel} is unavailable",
-                        profile.display_name
-                    )));
-                }
-                if !self.enabled_channels[channel] {
-                    return Err(CaptureError::new(format!(
-                        "DSLogic trigger channel {channel} must be enabled"
-                    )));
+        if matches!(self.trigger, Some(DsLogicTriggerConfig::Smart(_)))
+            && self.operation_mode != DsLogicOperationMode::Buffer
+        {
+            return Err(CaptureError::new(
+                "DSLogic smart triggering requires buffer operation mode",
+            ));
+        }
+        if let Some(trigger) = self.trigger {
+            for conditions in trigger.condition_sets() {
+                for (channel, condition) in conditions.iter().enumerate() {
+                    if condition.is_none() {
+                        continue;
+                    }
+                    if channel >= usize::from(channel_count) {
+                        return Err(CaptureError::new(format!(
+                            "{} exposes {channel_count} logic channels; trigger channel {channel} is unavailable",
+                            profile.display_name
+                        )));
+                    }
+                    if !self.enabled_channels[channel] {
+                        return Err(CaptureError::new(format!(
+                            "DSLogic trigger channel {channel} must be enabled"
+                        )));
+                    }
                 }
             }
         }
@@ -582,7 +747,10 @@ impl DsLogicCaptureConfig {
         push_u16(&mut bytes, ATOMIC_SAMPLES as u16);
         push_u16(&mut bytes, 0);
         push_u16(&mut bytes, 0x0701);
-        push_u16(&mut bytes, u16::from(self.enabled_channel_count()) << 8);
+        push_u16(
+            &mut bytes,
+            (u16::from(self.enabled_channel_count()) << 8) | u16::from(self.trigger_last_stage()),
+        );
         push_u16(&mut bytes, 0x0802);
         push_u16(&mut bytes, armed_samples as u16);
         push_u16(&mut bytes, (armed_samples >> 16) as u16);
@@ -593,15 +761,15 @@ impl DsLogicCaptureConfig {
         push_u16(&mut bytes, 0);
         push_u16(&mut bytes, 0x40a0);
         let trigger = self.trigger_words(0);
-        push_trigger_stages_u16(&mut bytes, trigger.mask, u16::MAX);
-        push_trigger_stages_u16(&mut bytes, u16::MAX, u16::MAX);
-        push_trigger_stages_u16(&mut bytes, trigger.value, 0);
-        push_trigger_stages_u16(&mut bytes, 0, 0);
-        push_trigger_stages_u16(&mut bytes, trigger.edge, 0);
-        push_trigger_stages_u16(&mut bytes, 0, 0);
-        push_trigger_stages_u16(&mut bytes, 2, 2);
-        push_trigger_stages_u16(&mut bytes, 2, 2);
-        for _ in 0..TRIGGER_STAGE_COUNT {
+        push_trigger_stages_u16(&mut bytes, trigger.map(|words| words.mask));
+        push_trigger_stages_u16(&mut bytes, [u16::MAX; DSLOGIC_TRIGGER_STAGE_COUNT]);
+        push_trigger_stages_u16(&mut bytes, trigger.map(|words| words.value));
+        push_trigger_stages_u16(&mut bytes, [0; DSLOGIC_TRIGGER_STAGE_COUNT]);
+        push_trigger_stages_u16(&mut bytes, trigger.map(|words| words.edge));
+        push_trigger_stages_u16(&mut bytes, [0; DSLOGIC_TRIGGER_STAGE_COUNT]);
+        push_trigger_stages_u16(&mut bytes, [2; DSLOGIC_TRIGGER_STAGE_COUNT]);
+        push_trigger_stages_u16(&mut bytes, [2; DSLOGIC_TRIGGER_STAGE_COUNT]);
+        for _ in 0..DSLOGIC_TRIGGER_STAGE_COUNT {
             push_u32(&mut bytes, 0);
         }
         push_u32(&mut bytes, 0xfa5a_fa5a);
@@ -619,27 +787,46 @@ impl DsLogicCaptureConfig {
         push_u32(&mut bytes, 0xf5a5_f5a5);
         push_u16(&mut bytes, 0x6060);
         let trigger = self.trigger_words(16);
-        push_trigger_stages_u16(&mut bytes, trigger.mask, u16::MAX);
-        push_trigger_stages_u16(&mut bytes, u16::MAX, u16::MAX);
-        push_trigger_stages_u16(&mut bytes, trigger.value, 0);
-        push_trigger_stages_u16(&mut bytes, 0, 0);
-        push_trigger_stages_u16(&mut bytes, trigger.edge, 0);
-        push_trigger_stages_u16(&mut bytes, 0, 0);
+        push_trigger_stages_u16(&mut bytes, trigger.map(|words| words.mask));
+        push_trigger_stages_u16(&mut bytes, [u16::MAX; DSLOGIC_TRIGGER_STAGE_COUNT]);
+        push_trigger_stages_u16(&mut bytes, trigger.map(|words| words.value));
+        push_trigger_stages_u16(&mut bytes, [0; DSLOGIC_TRIGGER_STAGE_COUNT]);
+        push_trigger_stages_u16(&mut bytes, trigger.map(|words| words.edge));
+        push_trigger_stages_u16(&mut bytes, [0; DSLOGIC_TRIGGER_STAGE_COUNT]);
         push_u16(&mut bytes, u16::MAX);
         push_u32(&mut bytes, 0xfa5a_fa5a);
         debug_assert_eq!(bytes.len(), EXTENDED_SETTINGS_BYTES);
         Some(bytes)
     }
 
-    fn trigger_words(self, first_channel: u8) -> TriggerWords {
-        let Some(DsLogicTriggerConfig::Simple(trigger)) = self.trigger else {
-            return TriggerWords::default();
+    fn trigger_last_stage(self) -> u8 {
+        match self.trigger {
+            Some(DsLogicTriggerConfig::Smart(trigger)) => trigger.stage_count.saturating_sub(1),
+            _ => 0,
+        }
+    }
+
+    fn trigger_words(self, first_channel: u8) -> [TriggerWords; DSLOGIC_TRIGGER_STAGE_COUNT] {
+        let mut stages = [TriggerWords::default(); DSLOGIC_TRIGGER_STAGE_COUNT];
+        let Some(trigger) = self.trigger else {
+            return stages;
         };
+        for (stage_index, conditions) in trigger.condition_sets().into_iter().enumerate() {
+            stages[stage_index] = self.trigger_stage_words(conditions, first_channel);
+        }
+        stages
+    }
+
+    fn trigger_stage_words(
+        self,
+        conditions: [Option<DsLogicTriggerCondition>; CHANNEL_COUNT as usize],
+        first_channel: u8,
+    ) -> TriggerWords {
         let mut mask = u16::MAX;
         let mut value = 0;
         let mut edge = 0;
         for channel in first_channel..first_channel + 16 {
-            let Some(condition) = trigger.conditions[usize::from(channel)] else {
+            let Some(condition) = conditions[usize::from(channel)] else {
                 continue;
             };
             let bit = 1_u16 << (channel - first_channel);
@@ -712,10 +899,9 @@ impl Default for TriggerWords {
     }
 }
 
-fn push_trigger_stages_u16(bytes: &mut Vec<u8>, first: u16, remaining: u16) {
-    push_u16(bytes, first);
-    for _ in 1..TRIGGER_STAGE_COUNT {
-        push_u16(bytes, remaining);
+fn push_trigger_stages_u16(bytes: &mut Vec<u8>, stages: [u16; DSLOGIC_TRIGGER_STAGE_COUNT]) {
+    for stage in stages {
+        push_u16(bytes, stage);
     }
 }
 
@@ -1899,6 +2085,47 @@ mod tests {
         assert_eq!(read_u16(&settings, 48), u16::MAX ^ 0b111);
         assert_eq!(read_u16(&settings, 112), 0b011);
         assert_eq!(read_u16(&settings, 176), 0b001);
+    }
+
+    #[test]
+    fn encodes_ordered_smart_trigger_stages() {
+        let first_stage = DsLogicTriggerStage::new(0, DsLogicTriggerCondition::RisingEdge)
+            .unwrap()
+            .with_channel_condition(1, DsLogicTriggerCondition::High)
+            .unwrap();
+        let second_stage =
+            DsLogicTriggerStage::new(2, DsLogicTriggerCondition::FallingEdge).unwrap();
+        let trigger = DsLogicSmartTrigger::new(first_stage)
+            .with_stage(second_stage)
+            .unwrap();
+        let settings = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .unwrap()
+            .with_trigger(Some(DsLogicTriggerConfig::Smart(trigger)))
+            .encode_settings();
+
+        assert_eq!(trigger.stage_count(), 2);
+        assert_eq!(read_u16(&settings, 28), 0x1001);
+        assert_eq!(read_u16(&settings, 48), u16::MAX ^ 0b11);
+        assert_eq!(read_u16(&settings, 50), u16::MAX ^ 0b100);
+        assert_eq!(read_u16(&settings, 112), 0b11);
+        assert_eq!(read_u16(&settings, 114), 0);
+        assert_eq!(read_u16(&settings, 176), 0b01);
+        assert_eq!(read_u16(&settings, 178), 0b100);
+    }
+
+    #[test]
+    fn smart_trigger_requires_buffer_mode() {
+        let trigger = DsLogicSmartTrigger::new(
+            DsLogicTriggerStage::new(0, DsLogicTriggerCondition::High).unwrap(),
+        );
+        let config = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .unwrap()
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_trigger(Some(DsLogicTriggerConfig::Smart(trigger)));
+
+        assert!(config
+            .validate_for_speed(UsbSpeedClass::SuperSpeed)
+            .is_err());
     }
 
     #[test]

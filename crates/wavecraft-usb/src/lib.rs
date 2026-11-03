@@ -29,9 +29,10 @@ pub use dscope::{
 };
 pub use dslogic::{
     DsLogicCaptureConfig, DsLogicCaptureSource, DsLogicInputFilter, DsLogicOperationMode,
-    DsLogicSimpleTrigger, DsLogicStopOption, DsLogicTriggerCondition, DsLogicTriggerConfig,
-    DSLOGIC_MAX_BUFFER_SAMPLE_COUNT, DSLOGIC_MAX_SAMPLE_COUNT, DSLOGIC_MAX_STREAM_SAMPLE_COUNT,
-    DSLOGIC_SAMPLE_ALIGNMENT, DSLOGIC_SAMPLE_RATES_HZ,
+    DsLogicSimpleTrigger, DsLogicSmartTrigger, DsLogicStopOption, DsLogicTriggerCondition,
+    DsLogicTriggerConfig, DsLogicTriggerStage, DSLOGIC_MAX_BUFFER_SAMPLE_COUNT,
+    DSLOGIC_MAX_SAMPLE_COUNT, DSLOGIC_MAX_STREAM_SAMPLE_COUNT, DSLOGIC_SAMPLE_ALIGNMENT,
+    DSLOGIC_SAMPLE_RATES_HZ, DSLOGIC_TRIGGER_STAGE_COUNT,
 };
 pub use prepare::{load_device_fpga, prepare_device, FpgaLoad, PreparedDevice};
 pub use probe::{probe_device, DeviceProbe, UsbEndpointInfo};
