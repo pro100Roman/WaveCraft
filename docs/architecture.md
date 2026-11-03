@@ -28,6 +28,9 @@ and core data model are device-independent so another SDR can reuse them. IQ
 streaming, bounded DSP, spectrum and waterfall rendering, native recording,
 and the FSK/GFSK decoding stack are specified in
 [RF/SDR capture and signal-decoding architecture](rf-sdr-architecture.md).
+The GUI module boundaries and reserved provider seams for HackRF One, LimeSDR,
+and AntSDR are specified in
+[GUI modularization and multi-SDR integration plan](gui-modularization.md).
 
 ## Protocol decoding and plugins
 
