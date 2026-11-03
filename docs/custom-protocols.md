@@ -201,6 +201,15 @@ save the analyzer, and use **Load YAML** on its card to select the YAML file.
 The decoded-data panel shows three messages with speeds of 1200, 2000, and
 750 rpm.
 
+The [`BNO08x SH-2 I2C example`](examples/bno08x-sh2-i2c.wavecraft-protocol.yaml)
+decodes the SHTP header, Product ID and feature-control messages, plus common
+accelerometer, gyroscope, magnetometer, gravity, and rotation-vector reports.
+Add an I2C analyzer, map SCL and SDA, save it, then load the example YAML from
+the analyzer card. The current schema version decodes the first SH-2 sensor
+report in each I2C transaction and displays sensor values as raw fixed-point
+integers annotated with their Q point. It does not yet reassemble SHTP
+continuations or iterate over multiple reports in one cargo.
+
 ```yaml
 schema: wavecraft.protocol/v1
 

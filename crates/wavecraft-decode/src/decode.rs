@@ -644,6 +644,10 @@ messages:
           expected_field: checksum
     summary: "Motor {motor}: {speed_rpm}"
 "#;
+    const SH2_I2C_SCHEMA: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/examples/bno08x-sh2-i2c.wavecraft-protocol.yaml"
+    ));
 
     fn bytes(values: &[u8]) -> Vec<TimedByte> {
         values
@@ -734,6 +738,32 @@ messages:
             .unwrap()
             .unwrap();
         assert_eq!(message.summary, "Motor 2: 2000 rpm");
+    }
+
+    #[test]
+    fn decodes_documented_sh2_accelerometer_report() {
+        let decoder = CustomProtocolDecoder::new(load_protocol_schema(SH2_I2C_SCHEMA).unwrap());
+        let packet = TransportPacket {
+            transport: TransportKind::I2c,
+            streams: BTreeMap::from([(
+                "data".to_owned(),
+                bytes(&[
+                    0x13, 0x00, 0x03, 0x07, 0xFB, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x05,
+                    0x00, 0x01, 0x00, 0xFF, 0x00, 0x02,
+                ]),
+            )]),
+            attributes: BTreeMap::new(),
+            completeness: PacketCompleteness::Complete,
+        };
+
+        let message = decoder.decode_packet(&packet).unwrap().unwrap();
+
+        assert_eq!(message.message_id, "accelerometer");
+        assert_eq!(
+            message.summary,
+            "Accel · X 256 raw Q8 m/s^2 · Y -256 raw Q8 m/s^2 · Z 512 raw Q8 m/s^2"
+        );
+        assert_eq!(message.severity, Severity::Info);
     }
 
     #[test]

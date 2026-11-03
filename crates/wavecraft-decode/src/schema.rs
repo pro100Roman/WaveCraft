@@ -1419,6 +1419,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/examples/motor-controller.wavecraft-protocol.yaml"
     ));
+    const SH2_I2C_EXAMPLE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/examples/bno08x-sh2-i2c.wavecraft-protocol.yaml"
+    ));
 
     fn normalized_example() -> String {
         EXAMPLE.replace("\r\n", "\n")
@@ -1441,6 +1445,21 @@ mod tests {
         assert_eq!(schema.messages[0].fields.len(), 7);
         assert_eq!(schema.messages[0].checksums.len(), 1);
         assert_eq!(schema.framing.max_frame_bytes(), 256);
+    }
+
+    #[test]
+    fn loads_documented_sh2_i2c_schema() {
+        let schema = load_protocol_schema(SH2_I2C_EXAMPLE).unwrap();
+
+        assert_eq!(schema.protocol.id, "ceva.bno08x.sh2-i2c");
+        assert_eq!(schema.input.transport, TransportKind::I2c);
+        assert_eq!(schema.messages.len(), 13);
+        assert!(matches!(
+            schema.framing,
+            FramingSchema::TransportTransaction {
+                max_frame_bytes: 32_767
+            }
+        ));
     }
 
     #[test]

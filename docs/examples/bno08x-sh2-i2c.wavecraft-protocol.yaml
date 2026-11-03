@@ -1,0 +1,707 @@
+# SH-2 over SHTP for the CEVA/Hillcrest BNO08x family, captured over I2C.
+# Reference: SH-2 Reference Manual 1000-3625 and BNO080 Datasheet 1000-3927.
+#
+# WaveCraft protocol/v1 limitations:
+# - one decoded message is emitted per I2C transaction, so only the first SH-2
+#   sensor report following a Base Timestamp (0xFB) is decoded;
+# - SHTP continuations and I2C reads split across several transactions are not
+#   reassembled;
+# - fixed-point values are displayed as raw signed integers with their Q point.
+
+schema: wavecraft.protocol/v1
+
+protocol:
+  id: ceva.bno08x.sh2-i2c
+  name: BNO08x SH-2
+  version: 1
+  description: Common SH-2 control and sensor reports inside SHTP over I2C
+
+input:
+  transport: i2c
+  stream: data
+
+framing:
+  strategy: transport_transaction
+  max_frame_bytes: 32767
+
+messages:
+  - id: product_id_request
+    name: Product ID request
+    match:
+      - offset: 4
+        value: 0xF9
+    fields:
+      - name: packet_length
+        type: u16le
+        bits:
+          continuation: 15
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          0: shtp_command
+          1: executable
+          2: sh2_control
+          3: input_normal
+          4: input_wakeup
+          5: gyro_rotation_vector
+      - name: shtp_sequence
+        type: u8
+      - name: report_id
+        type: u8
+        expect: 0xF9
+        hidden: true
+      - name: reserved
+        type: u8
+        expect: 0
+        hidden: true
+    summary: "Product ID request · seq {shtp_sequence}"
+
+  - id: product_id_response
+    name: Product ID response
+    match:
+      - offset: 4
+        value: 0xF8
+    fields:
+      - name: packet_length
+        type: u16le
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          0: shtp_command
+          1: executable
+          2: sh2_control
+          3: input_normal
+          4: input_wakeup
+          5: gyro_rotation_vector
+      - name: shtp_sequence
+        type: u8
+      - name: report_id
+        type: u8
+        expect: 0xF8
+        hidden: true
+      - name: reset_cause
+        type: u8
+        enum:
+          0: not_applicable
+          1: power_on_reset
+          2: internal_system_reset
+          3: watchdog_timeout
+          4: external_reset
+          5: other
+      - name: version_major
+        type: u8
+      - name: version_minor
+        type: u8
+      - name: part_number
+        type: u32le
+      - name: build_number
+        type: u32le
+      - name: version_patch
+        type: u16le
+      - name: reserved
+        type: u16le
+        expect: 0
+        hidden: true
+    summary: "Product {part_number} · v{version_major}"
+
+  - id: get_feature_request
+    name: Get Feature request
+    match:
+      - offset: 4
+        value: 0xFE
+    fields:
+      - name: packet_length
+        type: u16le
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          0: shtp_command
+          1: executable
+          2: sh2_control
+          3: input_normal
+          4: input_wakeup
+          5: gyro_rotation_vector
+      - name: shtp_sequence
+        type: u8
+      - name: report_id
+        type: u8
+        expect: 0xFE
+        hidden: true
+      - name: feature_report
+        type: u8
+        enum:
+          0x01: accelerometer
+          0x02: gyroscope_calibrated
+          0x03: magnetic_field_calibrated
+          0x04: linear_acceleration
+          0x05: rotation_vector
+          0x06: gravity
+          0x07: gyroscope_uncalibrated
+          0x08: game_rotation_vector
+          0x09: geomagnetic_rotation_vector
+          0x0A: pressure
+          0x0B: ambient_light
+          0x0C: humidity
+          0x0D: proximity
+          0x0E: temperature
+          0x0F: magnetic_field_uncalibrated
+          0x10: tap_detector
+          0x11: step_counter
+          0x12: significant_motion
+          0x13: stability_classifier
+          0x14: raw_accelerometer
+          0x15: raw_gyroscope
+          0x16: raw_magnetometer
+          0x18: step_detector
+          0x28: arvr_stabilized_rotation_vector
+          0x29: arvr_stabilized_game_rotation_vector
+          0x2A: gyro_integrated_rotation_vector
+    summary: "Get feature {feature_report}"
+
+  - id: set_feature_command
+    name: Set Feature command
+    match:
+      - offset: 4
+        value: 0xFD
+    fields:
+      - name: packet_length
+        type: u16le
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          0: shtp_command
+          1: executable
+          2: sh2_control
+          3: input_normal
+          4: input_wakeup
+          5: gyro_rotation_vector
+      - name: shtp_sequence
+        type: u8
+      - name: report_id
+        type: u8
+        expect: 0xFD
+        hidden: true
+      - name: feature_report
+        type: u8
+        enum:
+          0x01: accelerometer
+          0x02: gyroscope_calibrated
+          0x03: magnetic_field_calibrated
+          0x04: linear_acceleration
+          0x05: rotation_vector
+          0x06: gravity
+          0x07: gyroscope_uncalibrated
+          0x08: game_rotation_vector
+          0x09: geomagnetic_rotation_vector
+          0x0A: pressure
+          0x0B: ambient_light
+          0x0C: humidity
+          0x0D: proximity
+          0x0E: temperature
+          0x0F: magnetic_field_uncalibrated
+          0x10: tap_detector
+          0x11: step_counter
+          0x12: significant_motion
+          0x13: stability_classifier
+          0x14: raw_accelerometer
+          0x15: raw_gyroscope
+          0x16: raw_magnetometer
+          0x18: step_detector
+          0x28: arvr_stabilized_rotation_vector
+          0x29: arvr_stabilized_game_rotation_vector
+          0x2A: gyro_integrated_rotation_vector
+      - name: feature_flags
+        type: u8
+        bits:
+          change_sensitivity_enabled: 0
+          change_sensitivity_relative: 1
+          wake_up_enabled: 2
+          always_on_enabled: 3
+      - name: change_sensitivity
+        type: s16le
+      - name: report_interval
+        type: u32le
+        display:
+          unit: us
+      - name: batch_interval
+        type: u32le
+        display:
+          unit: us
+      - name: sensor_specific
+        type: u32le
+    summary: "Set {feature_report} · {report_interval}"
+
+  - id: get_feature_response
+    name: Get Feature response
+    match:
+      - offset: 4
+        value: 0xFC
+    fields:
+      - name: packet_length
+        type: u16le
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          0: shtp_command
+          1: executable
+          2: sh2_control
+          3: input_normal
+          4: input_wakeup
+          5: gyro_rotation_vector
+      - name: shtp_sequence
+        type: u8
+      - name: report_id
+        type: u8
+        expect: 0xFC
+        hidden: true
+      - name: feature_report
+        type: u8
+        enum:
+          0x01: accelerometer
+          0x02: gyroscope_calibrated
+          0x03: magnetic_field_calibrated
+          0x04: linear_acceleration
+          0x05: rotation_vector
+          0x06: gravity
+          0x07: gyroscope_uncalibrated
+          0x08: game_rotation_vector
+          0x09: geomagnetic_rotation_vector
+          0x0A: pressure
+          0x0B: ambient_light
+          0x0C: humidity
+          0x0D: proximity
+          0x0E: temperature
+          0x0F: magnetic_field_uncalibrated
+          0x10: tap_detector
+          0x11: step_counter
+          0x12: significant_motion
+          0x13: stability_classifier
+          0x14: raw_accelerometer
+          0x15: raw_gyroscope
+          0x16: raw_magnetometer
+          0x18: step_detector
+          0x28: arvr_stabilized_rotation_vector
+          0x29: arvr_stabilized_game_rotation_vector
+          0x2A: gyro_integrated_rotation_vector
+      - name: feature_flags
+        type: u8
+        bits:
+          change_sensitivity_enabled: 0
+          change_sensitivity_relative: 1
+          wake_up_enabled: 2
+          always_on_enabled: 3
+      - name: change_sensitivity
+        type: s16le
+      - name: report_interval
+        type: u32le
+        display:
+          unit: us
+      - name: batch_interval
+        type: u32le
+        display:
+          unit: us
+      - name: sensor_specific
+        type: u32le
+    summary: "Feature {feature_report} · {report_interval}"
+
+  - id: accelerometer
+    name: Accelerometer
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x01
+    fields:
+      - name: packet_length
+        type: u16le
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: x100 us
+      - name: sensor_report
+        type: u8
+        expect: 0x01
+        hidden: true
+      - name: sensor_sequence
+        type: u8
+      - name: status_and_delay_msb
+        type: u8
+      - name: delay_lsb
+        type: u8
+        display:
+          unit: x100 us
+      - name: x
+        type: s16le
+        display:
+          unit: raw Q8 m/s^2
+      - name: y
+        type: s16le
+        display:
+          unit: raw Q8 m/s^2
+      - name: z
+        type: s16le
+        display:
+          unit: raw Q8 m/s^2
+    summary: "Accel · X {x} · Y {y} · Z {z}"
+
+  - id: gyroscope_calibrated
+    name: Gyroscope calibrated
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x02
+    fields:
+      - name: packet_length
+        type: u16le
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: x100 us
+      - name: sensor_report
+        type: u8
+        expect: 0x02
+        hidden: true
+      - name: sensor_sequence
+        type: u8
+      - name: status_and_delay_msb
+        type: u8
+      - name: delay_lsb
+        type: u8
+        display:
+          unit: x100 us
+      - name: x
+        type: s16le
+        display:
+          unit: raw Q9 rad/s
+      - name: y
+        type: s16le
+        display:
+          unit: raw Q9 rad/s
+      - name: z
+        type: s16le
+        display:
+          unit: raw Q9 rad/s
+    summary: "Gyro · X {x} · Y {y} · Z {z}"
+
+  - id: magnetic_field_calibrated
+    name: Magnetic field calibrated
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x03
+    fields:
+      - name: packet_length
+        type: u16le
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: x100 us
+      - name: sensor_report
+        type: u8
+        expect: 0x03
+        hidden: true
+      - name: sensor_sequence
+        type: u8
+      - name: status_and_delay_msb
+        type: u8
+      - name: delay_lsb
+        type: u8
+        display:
+          unit: x100 us
+      - name: x
+        type: s16le
+        display:
+          unit: raw Q4 uT
+      - name: y
+        type: s16le
+        display:
+          unit: raw Q4 uT
+      - name: z
+        type: s16le
+        display:
+          unit: raw Q4 uT
+    summary: "Mag · X {x} · Y {y} · Z {z}"
+
+  - id: linear_acceleration
+    name: Linear acceleration
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x04
+    fields:
+      - name: packet_length
+        type: u16le
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: x100 us
+      - name: sensor_report
+        type: u8
+        expect: 0x04
+        hidden: true
+      - name: sensor_sequence
+        type: u8
+      - name: status_and_delay_msb
+        type: u8
+      - name: delay_lsb
+        type: u8
+        display:
+          unit: x100 us
+      - name: x
+        type: s16le
+        display:
+          unit: raw Q8 m/s^2
+      - name: y
+        type: s16le
+        display:
+          unit: raw Q8 m/s^2
+      - name: z
+        type: s16le
+        display:
+          unit: raw Q8 m/s^2
+    summary: "Linear accel · X {x} · Y {y} · Z {z}"
+
+  - id: gravity
+    name: Gravity
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x06
+    fields:
+      - name: packet_length
+        type: u16le
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: x100 us
+      - name: sensor_report
+        type: u8
+        expect: 0x06
+        hidden: true
+      - name: sensor_sequence
+        type: u8
+      - name: status_and_delay_msb
+        type: u8
+      - name: delay_lsb
+        type: u8
+        display:
+          unit: x100 us
+      - name: x
+        type: s16le
+        display:
+          unit: raw Q8 m/s^2
+      - name: y
+        type: s16le
+        display:
+          unit: raw Q8 m/s^2
+      - name: z
+        type: s16le
+        display:
+          unit: raw Q8 m/s^2
+    summary: "Gravity · X {x} · Y {y} · Z {z}"
+
+  - id: rotation_vector
+    name: Rotation vector
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x05
+    fields:
+      - name: packet_length
+        type: u16le
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: x100 us
+      - name: sensor_report
+        type: u8
+        expect: 0x05
+        hidden: true
+      - name: sensor_sequence
+        type: u8
+      - name: status_and_delay_msb
+        type: u8
+      - name: delay_lsb
+        type: u8
+        display:
+          unit: x100 us
+      - name: i
+        type: s16le
+        display:
+          unit: raw Q14
+      - name: j
+        type: s16le
+        display:
+          unit: raw Q14
+      - name: k
+        type: s16le
+        display:
+          unit: raw Q14
+      - name: real
+        type: s16le
+        display:
+          unit: raw Q14
+      - name: accuracy
+        type: u16le
+        display:
+          unit: raw Q12 rad
+    summary: "Rotation · i {i} · j {j} · k {k} · real {real}"
+
+  - id: game_rotation_vector
+    name: Game rotation vector
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x08
+    fields:
+      - name: packet_length
+        type: u16le
+        hidden: true
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: x100 us
+      - name: sensor_report
+        type: u8
+        expect: 0x08
+        hidden: true
+      - name: sensor_sequence
+        type: u8
+      - name: status_and_delay_msb
+        type: u8
+      - name: delay_lsb
+        type: u8
+        display:
+          unit: x100 us
+      - name: i
+        type: s16le
+        display:
+          unit: raw Q14
+      - name: j
+        type: s16le
+        display:
+          unit: raw Q14
+      - name: k
+        type: s16le
+        display:
+          unit: raw Q14
+      - name: real
+        type: s16le
+        display:
+          unit: raw Q14
+    summary: "Game rotation · i {i} · j {j} · k {k} · real {real}"
+
+  - id: shtp_packet
+    name: SHTP packet
+    default: true
+    fields:
+      - name: packet_length
+        type: u16le
+        bits:
+          continuation: 15
+      - name: channel
+        type: u8
+        enum:
+          0: shtp_command
+          1: executable
+          2: sh2_control
+          3: input_normal
+          4: input_wakeup
+          5: gyro_rotation_vector
+      - name: shtp_sequence
+        type: u8
+    summary: "SHTP {channel} · seq {shtp_sequence} · {packet_length} bytes"
