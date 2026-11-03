@@ -1,0 +1,63 @@
+schema: wavecraft.protocol/v1
+
+protocol:
+  id: example.motor-controller
+  name: Motor Controller
+  version: 1
+  description: Example controller protocol over UART
+
+input:
+  transport: uart
+  stream: data
+
+framing:
+  strategy: length_field
+  sync: [0xAA, 0x55]
+  length:
+    offset: 2
+    width: 1
+    endian: little
+    adjustment: 4
+  max_frame_bytes: 256
+  resync: next_sync
+
+messages:
+  - id: set_speed
+    name: Set speed
+    match:
+      - offset: 3
+        value: 0x10
+    fields:
+      - name: sync
+        type: bytes
+        size: 2
+        expect: [0xAA, 0x55]
+        hidden: true
+      - name: payload_length
+        type: u8
+      - name: opcode
+        type: u8
+        enum:
+          0x10: set_speed
+          0x11: get_status
+      - name: motor
+        type: u8
+      - name: speed_rpm
+        type: u16le
+        display:
+          unit: rpm
+      - name: flags
+        type: u8
+        bits:
+          enabled: 0
+          reverse: 1
+          brake: 2
+      - name: checksum
+        type: u8
+    validate:
+      - checksum:
+          algorithm: crc8_smbus
+          from: 2
+          through_field: flags
+          expected_field: checksum
+    summary: "Motor {motor}: {speed_rpm} rpm"

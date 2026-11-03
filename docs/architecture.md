@@ -31,6 +31,19 @@ range, summary, and structured fields. The sample range is authoritative so
 the GUI, recorder, CLI, and automation API can all place the same decoded event
 on the capture timeline.
 
+Custom protocols form a high-level layer above first-party UART, SPI, and I2C
+transport decoders. The transport layer emits timed bytes, transaction
+boundaries, directions, acknowledgements, and errors. A bounded declarative
+YAML schema then frames those bytes and gives their fields protocol-specific
+meaning. Custom schemas never consume hardware samples or access physical
+channels directly. The versioned YAML format, generic event model, separate
+project file, recording identity rules, and implementation sequence are
+specified in [Custom protocol decoding architecture](custom-protocols.md).
+
+Live and offline decoding use the same incremental engine. Decoders subscribe
+to ordered capture data independently of the GUI's bounded display buffers, so
+waveform downsampling cannot change protocol results.
+
 First-party SPI and I2C decoders will implement the same decoder contract as
 third-party extensions. External plugins use a versioned, out-of-process
 protocol rather than Rust dynamic libraries. This avoids an unstable Rust ABI,
