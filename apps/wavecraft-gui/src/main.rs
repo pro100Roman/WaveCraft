@@ -2301,7 +2301,8 @@ fn paint_decoded_data_panel(
                         if ui
                             .add_enabled(
                                 !entries.is_empty(),
-                                egui::Button::new(if all_open { "− All" } else { "+ All" }).small(),
+                                toolbar_action_button(if all_open { "⊟" } else { "⊞" }, ACCENT)
+                                    .small(),
                             )
                             .on_hover_text(if all_open {
                                 "Collapse all messages for this analyzer"
@@ -8654,7 +8655,9 @@ impl eframe::App for WaveCraftApp {
                                                             if ui
                                                                 .add_sized(
                                                                     [26.0, 24.0],
-                                                                    egui::Button::new("▶"),
+                                                                    toolbar_action_button(
+                                                                        "▶", ACCENT,
+                                                                    ),
                                                                 )
                                                                 .on_hover_text(
                                                                     "Collapse decoded data",
@@ -8708,7 +8711,10 @@ impl eframe::App for WaveCraftApp {
                                                     (available_size.y - 8.0).max(0.0),
                                                 );
                                                 if ui
-                                                    .add_sized([26.0, 24.0], egui::Button::new("◀"))
+                                                    .add_sized(
+                                                        [26.0, 24.0],
+                                                        toolbar_action_button("◀", ACCENT),
+                                                    )
                                                     .on_hover_text("Expand decoded data")
                                                     .clicked()
                                                 {
