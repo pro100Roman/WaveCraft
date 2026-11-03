@@ -1,4 +1,8 @@
 use std::collections::HashSet;
+use wavecraft_decode::{
+    decode_i2c_samples, decode_spi_samples, decode_uart_samples, I2cConfig, I2cEvent, SpiConfig,
+    UartConfig,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolDefinition {
@@ -418,10 +422,6 @@ fn mapped_channel(analyzer: &ProtocolAnalyzerInstance, index: usize) -> Option<u
     analyzer.channel_mappings.get(index).copied().flatten()
 }
 
-fn channel_is_high(sample: u32, channel: usize) -> bool {
-    channel < u32::BITS as usize && sample & (1_u32 << channel) != 0
-}
-
 fn format_protocol_byte(value: u8, format: ProtocolDataFormat) -> String {
     match format {
         ProtocolDataFormat::Hexadecimal => format!("{value:02X}"),
@@ -444,89 +444,65 @@ fn decode_i2c(
     else {
         return ProtocolDecodeOutcome::Unavailable("Map both SCL and SDA channels".to_owned());
     };
-    let Some(&first) = samples.first() else {
-        return ProtocolDecodeOutcome::Events(Vec::new());
+    let transport_events = match decode_i2c_samples(
+        I2cConfig {
+            clock_channel,
+            data_channel,
+        },
+        samples,
+        sample_offset,
+    ) {
+        Ok(events) => events,
+        Err(error) => return ProtocolDecodeOutcome::Unavailable(error.to_string()),
     };
-    let mut events = Vec::new();
-    let mut previous_clock = channel_is_high(first, clock_channel);
-    let mut previous_data = channel_is_high(first, data_channel);
-    let mut active = false;
-    let mut byte = 0_u8;
-    let mut bit_count = 0_u8;
-    let mut byte_start = sample_offset;
-    let mut byte_end = sample_offset;
-    let mut acknowledge_start = sample_offset;
-    let mut byte_index = 0_usize;
-
-    for (local_index, sample) in samples.iter().copied().enumerate().skip(1) {
-        let sample_index = sample_offset.saturating_add(local_index as u64);
-        let clock = channel_is_high(sample, clock_channel);
-        let data = channel_is_high(sample, data_channel);
-        let start = previous_data && !data && clock;
-        let stop = !previous_data && data && clock;
-
-        if start {
-            active = true;
-            byte = 0;
-            bit_count = 0;
-            byte_index = 0;
-        } else if stop {
-            active = false;
-            byte = 0;
-            bit_count = 0;
-        } else if active && !previous_clock && clock {
-            if bit_count == 0 {
-                byte_start = sample_index;
-            }
-            if bit_count < 8 {
-                byte = (byte << 1) | u8::from(data);
-                bit_count += 1;
-                if bit_count == 8 {
-                    byte_end = sample_index;
-                    acknowledge_start = sample_index;
-                }
-            } else {
-                let acknowledged = !data;
-                let (text, detail) = if byte_index == 0 {
-                    let address = byte >> 1;
-                    let direction = if byte & 1 == 0 { "W" } else { "R" };
-                    (
-                        format!(
-                            "ADDR {} {direction}",
-                            format_protocol_byte(address, analyzer.data_format)
-                        ),
-                        format!(
-                            "I²C address 0x{address:02X} ({address}) · {} · raw byte 0x{byte:02X}",
-                            if byte & 1 == 0 { "write" } else { "read" }
-                        ),
-                    )
-                } else {
-                    (
-                        format_protocol_byte(byte, analyzer.data_format),
-                        format!("I²C data 0x{byte:02X} ({byte})"),
-                    )
-                };
-                events.push(ProtocolDecodedEvent {
-                    start_sample: byte_start,
-                    end_sample: byte_end,
-                    text,
-                    detail,
-                    warning: false,
-                    kind: if byte_index == 0 {
-                        ProtocolDecodedKind::I2cAddress {
-                            address: byte >> 1,
-                            read: byte & 1 != 0,
-                        }
+    ProtocolDecodeOutcome::Events(
+        transport_events
+            .into_iter()
+            .filter_map(|event| match event {
+                I2cEvent::Byte { byte, index } => {
+                    let (text, detail, kind) = if index == 0 {
+                        let address = byte.value >> 1;
+                        let read = byte.value & 1 != 0;
+                        let direction = if read { "R" } else { "W" };
+                        (
+                            format!(
+                                "ADDR {} {direction}",
+                                format_protocol_byte(address, analyzer.data_format)
+                            ),
+                            format!(
+                                "I²C address 0x{address:02X} ({address}) · {} · raw byte 0x{:02X}",
+                                if read { "read" } else { "write" },
+                                byte.value
+                            ),
+                            ProtocolDecodedKind::I2cAddress { address, read },
+                        )
                     } else {
-                        ProtocolDecodedKind::Data { value: byte }
-                    },
-                });
-                events.push(ProtocolDecodedEvent {
-                    start_sample: acknowledge_start,
-                    end_sample: sample_index,
+                        (
+                            format_protocol_byte(byte.value, analyzer.data_format),
+                            format!("I²C data 0x{:02X} ({})", byte.value, byte.value),
+                            ProtocolDecodedKind::Data { value: byte.value },
+                        )
+                    };
+                    Some(ProtocolDecodedEvent {
+                        start_sample: byte.range.start,
+                        end_sample: byte.range.end,
+                        text,
+                        detail,
+                        warning: false,
+                        kind,
+                    })
+                }
+                I2cEvent::Acknowledge {
+                    range,
+                    acknowledged,
+                    byte_index,
+                    byte_value,
+                } => Some(ProtocolDecodedEvent {
+                    start_sample: range.start,
+                    end_sample: range.end,
                     text: if acknowledged { "ACK" } else { "NACK" }.to_owned(),
                     detail: format!(
-                        "I²C {} for {} byte 0x{byte:02X}",
+                        "I²C {} for {} byte 0x{byte_value:02X}",
                         if acknowledged {
                             "acknowledge"
                         } else {
@@ -536,19 +512,11 @@ fn decode_i2c(
                     ),
                     warning: !acknowledged,
                     kind: ProtocolDecodedKind::Acknowledge { acknowledged },
-                });
-                byte = 0;
-                bit_count = 0;
-                byte_index += 1;
-            }
-        } else if active && previous_clock && !clock && bit_count == 8 {
-            acknowledge_start = sample_index;
-        }
-
-        previous_clock = clock;
-        previous_data = data;
-    }
-    ProtocolDecodeOutcome::Events(events)
+                }),
+                I2cEvent::Start { .. } | I2cEvent::Stop { .. } => None,
+            })
+            .collect(),
+    )
 }
 
 fn decode_spi(
@@ -565,79 +533,57 @@ fn decode_spi(
     if miso_channel.is_none() && mosi_channel.is_none() {
         return ProtocolDecodeOutcome::Unavailable("Map MISO or MOSI".to_owned());
     }
-    let Some(&first) = samples.first() else {
-        return ProtocolDecodeOutcome::Events(Vec::new());
+    let transfers = match decode_spi_samples(
+        SpiConfig {
+            clock_channel,
+            miso_channel,
+            mosi_channel,
+            chip_select_channel,
+        },
+        samples,
+        sample_offset,
+    ) {
+        Ok(transfers) => transfers,
+        Err(error) => return ProtocolDecodeOutcome::Unavailable(error.to_string()),
     };
-    let mut events = Vec::new();
-    let mut previous_clock = channel_is_high(first, clock_channel);
-    let mut miso = 0_u8;
-    let mut mosi = 0_u8;
-    let mut bit_count = 0_u8;
-    let mut byte_start = sample_offset;
-
-    for (local_index, sample) in samples.iter().copied().enumerate().skip(1) {
-        let sample_index = sample_offset.saturating_add(local_index as u64);
-        let clock = channel_is_high(sample, clock_channel);
-        let selected = chip_select_channel
-            .map(|channel| !channel_is_high(sample, channel))
-            .unwrap_or(true);
-        if !selected {
-            bit_count = 0;
-            miso = 0;
-            mosi = 0;
-        } else if !previous_clock && clock {
-            if bit_count == 0 {
-                byte_start = sample_index;
-            }
-            if let Some(channel) = miso_channel {
-                miso = (miso << 1) | u8::from(channel_is_high(sample, channel));
-            }
-            if let Some(channel) = mosi_channel {
-                mosi = (mosi << 1) | u8::from(channel_is_high(sample, channel));
-            }
-            bit_count += 1;
-            if bit_count == 8 {
-                let text = match (mosi_channel, miso_channel) {
-                    (Some(_), Some(_)) => format!(
+    ProtocolDecodeOutcome::Events(
+        transfers
+            .into_iter()
+            .map(|transfer| {
+                let text = match (transfer.mosi, transfer.miso) {
+                    (Some(mosi), Some(miso)) => format!(
                         "MOSI {} · MISO {}",
                         format_protocol_byte(mosi, analyzer.data_format),
                         format_protocol_byte(miso, analyzer.data_format)
                     ),
-                    (Some(_), None) => format_protocol_byte(mosi, analyzer.data_format),
-                    (None, Some(_)) => format_protocol_byte(miso, analyzer.data_format),
-                    (None, None) => unreachable!("SPI requires at least one data channel"),
+                    (Some(mosi), None) => format_protocol_byte(mosi, analyzer.data_format),
+                    (None, Some(miso)) => format_protocol_byte(miso, analyzer.data_format),
+                    (None, None) => unreachable!("SPI configuration requires a data channel"),
                 };
-                events.push(ProtocolDecodedEvent {
-                    start_sample: byte_start,
-                    end_sample: sample_index,
-                    detail: format!("SPI byte · MOSI 0x{mosi:02X} · MISO 0x{miso:02X}"),
+                ProtocolDecodedEvent {
+                    start_sample: transfer.range.start,
+                    end_sample: transfer.range.end,
+                    detail: format!(
+                        "SPI byte · MOSI {} · MISO {}",
+                        transfer.mosi.map_or_else(
+                            || "not mapped".to_owned(),
+                            |value| format!("0x{value:02X}")
+                        ),
+                        transfer.miso.map_or_else(
+                            || "not mapped".to_owned(),
+                            |value| format!("0x{value:02X}")
+                        )
+                    ),
                     text,
                     warning: false,
                     kind: ProtocolDecodedKind::Spi {
-                        mosi: mosi_channel.map(|_| mosi),
-                        miso: miso_channel.map(|_| miso),
+                        mosi: transfer.mosi,
+                        miso: transfer.miso,
                     },
-                });
-                bit_count = 0;
-                miso = 0;
-                mosi = 0;
-            }
-        }
-        previous_clock = clock;
-    }
-    ProtocolDecodeOutcome::Events(events)
-}
-
-const UART_BAUD_RATES: [u64; 16] = [
-    300, 600, 1_200, 2_400, 4_800, 9_600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800,
-    921_600, 1_000_000, 2_000_000, 3_000_000,
-];
-
-struct UartCandidate {
-    timing_error: f64,
-    samples_per_bit: f64,
-    baud_rate: u64,
-    frames: Vec<(usize, usize, u8)>,
+                }
+            })
+            .collect(),
+    )
 }
 
 fn decode_uart(
@@ -649,110 +595,32 @@ fn decode_uart(
     let Some(channel) = mapped_channel(analyzer, 0) else {
         return ProtocolDecodeOutcome::Unavailable("Map the RX/TX channel".to_owned());
     };
-    if samples.len() < 10 || sample_rate_hz == 0 {
-        return ProtocolDecodeOutcome::Events(Vec::new());
-    }
-    let falling_edges = samples
-        .windows(2)
-        .enumerate()
-        .filter_map(|(index, pair)| {
-            (channel_is_high(pair[0], channel) && !channel_is_high(pair[1], channel))
-                .then_some(index + 1)
-        })
-        .collect::<Vec<_>>();
-    let transition_runs = samples
-        .windows(2)
-        .enumerate()
-        .filter_map(|(index, pair)| {
-            (channel_is_high(pair[0], channel) != channel_is_high(pair[1], channel))
-                .then_some(index + 1)
-        })
-        .collect::<Vec<_>>()
-        .windows(2)
-        .map(|pair| pair[1] - pair[0])
-        .filter(|run| *run > 1)
-        .collect::<Vec<_>>();
-    let mut best: Option<UartCandidate> = None;
-    for baud_rate in UART_BAUD_RATES {
-        let samples_per_bit = sample_rate_hz as f64 / baud_rate as f64;
-        if samples_per_bit < 2.0 {
-            continue;
-        }
-        let mut frames = Vec::new();
-        let mut next_available = 0_usize;
-        for &start in &falling_edges {
-            if start < next_available {
-                continue;
-            }
-            let sample_at = |bit_position: f64| {
-                start.saturating_add((bit_position * samples_per_bit).round() as usize)
-            };
-            let stop_sample = sample_at(9.5);
-            if stop_sample >= samples.len() {
-                continue;
-            }
-            let start_is_low = !channel_is_high(samples[sample_at(0.5)], channel);
-            let stop_is_high = channel_is_high(samples[stop_sample], channel);
-            if !start_is_low || !stop_is_high {
-                continue;
-            }
-            let mut value = 0_u8;
-            for bit in 0..8 {
-                if channel_is_high(samples[sample_at(1.5 + bit as f64)], channel) {
-                    value |= 1 << bit;
-                }
-            }
-            let end = sample_at(10.0).min(samples.len() - 1);
-            frames.push((start, end, value));
-            next_available = end;
-        }
-        if frames.is_empty() {
-            continue;
-        }
-        let timing_error = if transition_runs.is_empty() {
-            0.0
-        } else {
-            transition_runs
-                .iter()
-                .map(|run| {
-                    let bit_count = *run as f64 / samples_per_bit;
-                    (bit_count - bit_count.round()).abs()
-                })
-                .sum::<f64>()
-                / transition_runs.len() as f64
-        };
-        let replace = best.as_ref().map_or(true, |best| {
-            timing_error < best.timing_error - 0.02
-                || ((timing_error - best.timing_error).abs() <= 0.02
-                    && (samples_per_bit > best.samples_per_bit + 0.5
-                        || ((samples_per_bit - best.samples_per_bit).abs() <= 0.5
-                            && frames.len() > best.frames.len())))
-        });
-        if replace {
-            best = Some(UartCandidate {
-                timing_error,
-                samples_per_bit,
-                baud_rate,
-                frames,
-            });
-        }
-    }
-    let Some(best) = best else {
-        return ProtocolDecodeOutcome::Unavailable(
-            "No valid 8-N-1 UART frames found at a standard baud rate".to_owned(),
-        );
+    let decoded = match decode_uart_samples(
+        UartConfig {
+            data_channel: channel,
+        },
+        samples,
+        sample_offset,
+        sample_rate_hz,
+    ) {
+        Ok(decoded) => decoded,
+        Err(error) => return ProtocolDecodeOutcome::Unavailable(error.to_string()),
     };
-    let baud_rate = best.baud_rate;
+    let baud_rate = decoded.baud_rate;
     ProtocolDecodeOutcome::Events(
-        best.frames
+        decoded
+            .bytes
             .into_iter()
-            .map(|(start, end, value)| ProtocolDecodedEvent {
-                start_sample: sample_offset.saturating_add(start as u64),
-                end_sample: sample_offset.saturating_add(end as u64),
-                text: format_protocol_byte(value, analyzer.data_format),
-                detail: format!("UART 8-N-1 · {baud_rate} baud · 0x{value:02X} ({value})"),
+            .map(|byte| ProtocolDecodedEvent {
+                start_sample: byte.range.start,
+                end_sample: byte.range.end,
+                text: format_protocol_byte(byte.value, analyzer.data_format),
+                detail: format!(
+                    "UART 8-N-1 · {baud_rate} baud · 0x{:02X} ({})",
+                    byte.value, byte.value
+                ),
                 warning: false,
-                kind: ProtocolDecodedKind::Uart { value },
+                kind: ProtocolDecodedKind::Uart { value: byte.value },
             })
             .collect(),
     )

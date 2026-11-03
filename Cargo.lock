@@ -3046,6 +3046,7 @@ dependencies = [
  "image",
  "rfd",
  "wavecraft-core",
+ "wavecraft-decode",
  "wavecraft-recording",
  "wavecraft-usb",
 ]

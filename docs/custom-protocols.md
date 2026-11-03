@@ -2,9 +2,10 @@
 
 Status: implementation in progress. The strict YAML loader, schema validator,
 generic packet model, incremental byte-stream framing, and fixed-layout field
-decoder exist in `wavecraft-decode`. Transport-decoder migration, project
-persistence, and GUI integration remain to be implemented; the current GUI
-still owns its first-party UART, SPI, and I2C decoding code.
+decoder exist in `wavecraft-decode`. First-party UART, SPI, and I2C sample
+decoding also lives in that crate, with the GUI adapting its transport results
+to the existing presentation model. Project persistence and custom-protocol
+GUI integration remain to be implemented.
 
 WaveCraft custom protocols describe the meaning of bytes that a first-party
 transport decoder has already recovered from logic samples. Version 1 uses a
@@ -81,10 +82,10 @@ The implementation adds a UI-independent `wavecraft-decode` crate with:
 - bounded framing and field parsing; and
 - deterministic tests that operate without hardware or a windowing backend.
 
-The existing first-party decoders move out of
-`apps/wavecraft-gui/src/protocol_analyzer.rs` incrementally. During migration,
-the GUI may adapt the new generic events to its current presentation, but the
-final GUI must not define decoder semantics.
+The first-party sample decoders live in `wavecraft-decode`; the GUI adapts their
+transport results to its current presentation model. Formatting remains a GUI
+concern, while sampling edges, bytes, acknowledgements, baud detection, and
+sample ranges are defined and tested outside the application.
 
 A later `wavecraft-project` crate may own project-file serialization when both
 the GUI and CLI need to create or modify projects. Initially the versioned
