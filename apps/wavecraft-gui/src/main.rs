@@ -10,9 +10,10 @@ use measurements::{
     SCOPE_MEASUREMENT_KINDS,
 };
 use protocol_analyzer::{
-    decode_protocol_samples, matching_protocols, protocol_by_id, protocol_channels, protocol_stack,
-    ProtocolAnalyzerInstance, ProtocolAnalyzerSettings, ProtocolDataFormat, ProtocolDecodeOutcome,
-    ProtocolDecodedEvent, ProtocolDecodedKind, PROTOCOLS,
+    analyzer_channels, analyzer_decoder_chain, analyzer_long_name, analyzer_name,
+    decode_protocol_samples, matching_protocols, protocol_stack, ProtocolAnalyzerInstance,
+    ProtocolAnalyzerSettings, ProtocolDataFormat, ProtocolDecodeOutcome, ProtocolDecodedEvent,
+    ProtocolDecodedKind, PROTOCOLS,
 };
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -275,6 +276,13 @@ fn choose_recording_to_open() -> Option<PathBuf> {
         .add_filter("Supported captures", &["dsv", "sal"])
         .add_filter("WaveCraft capture", &["dsv"])
         .add_filter("Saleae Logic 2 capture", &["sal"])
+        .pick_file()
+}
+
+fn choose_custom_protocol_to_open() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Load custom protocol")
+        .add_filter("WaveCraft protocol", &["yaml", "yml"])
         .pick_file()
 }
 
@@ -1962,7 +1970,9 @@ fn decoded_panel_entries(events: &[ProtocolDecodedEvent]) -> Vec<DecodedPanelEnt
                     transaction.acknowledgements.push(acknowledged);
                 }
             }
-            ProtocolDecodedKind::Spi { .. } | ProtocolDecodedKind::Uart { .. } => {
+            ProtocolDecodedKind::Spi { .. }
+            | ProtocolDecodedKind::Uart { .. }
+            | ProtocolDecodedKind::Custom => {
                 if let Some(transaction) = i2c_transaction.take() {
                     entries.push(transaction.entry());
                 }
@@ -1987,7 +1997,11 @@ fn uart_ascii_text(events: &[ProtocolDecodedEvent]) -> Option<String> {
         .iter()
         .filter_map(|event| match event.kind {
             ProtocolDecodedKind::Uart { value } => Some(value),
-            _ => None,
+            ProtocolDecodedKind::I2cAddress { .. }
+            | ProtocolDecodedKind::Data { .. }
+            | ProtocolDecodedKind::Acknowledge { .. }
+            | ProtocolDecodedKind::Spi { .. }
+            | ProtocolDecodedKind::Custom => None,
         })
         .collect::<Vec<_>>();
     (!bytes.is_empty()).then(|| {
@@ -2043,9 +2057,7 @@ fn paint_decoded_data_panel(
             ui.separator();
             ui.add_space(6.0);
         }
-        let name = protocol_by_id(analyzer.protocol_id)
-            .map(|protocol| protocol.name)
-            .unwrap_or(analyzer.protocol_id);
+        let name = analyzer_name(analyzer);
         ui.label(
             RichText::new(name)
                 .strong()
@@ -6421,6 +6433,24 @@ fn paint_protocol_analyzer_settings(
                 if ui.button(add_label).clicked() {
                     settings.picker_open = !settings.picker_open;
                 }
+                if ui.button("Load custom YAML…").clicked() {
+                    if let Some(path) = choose_custom_protocol_to_open() {
+                        match std::fs::read_to_string(&path) {
+                            Ok(source) => {
+                                if let Err(error) =
+                                    settings.begin_add_custom_yaml(path.clone(), source)
+                                {
+                                    settings.custom_load_error =
+                                        Some(format!("Failed to load {}: {error}", path.display()));
+                                }
+                            }
+                            Err(error) => {
+                                settings.custom_load_error =
+                                    Some(format!("Failed to read {}: {error}", path.display()));
+                            }
+                        }
+                    }
+                }
                 if !settings.analyzers.is_empty()
                     && ui
                         .small_button("Clear")
@@ -6430,6 +6460,11 @@ fn paint_protocol_analyzer_settings(
                     settings.clear();
                 }
             });
+
+            if let Some(error) = &settings.custom_load_error {
+                ui.add_space(4.0);
+                ui.label(RichText::new(error).color(Color32::LIGHT_RED));
+            }
 
             if settings.picker_open {
                 ui.add_space(5.0);
@@ -6479,12 +6514,7 @@ fn paint_protocol_analyzer_settings(
             let mut remove = None;
             let mut edit = None;
             for (analyzer_index, analyzer) in settings.analyzers.iter().enumerate() {
-                let definition = protocol_by_id(analyzer.protocol_id)
-                    .expect("configured protocol should remain in the catalog");
-                let stack =
-                    protocol_stack(analyzer.protocol_id).unwrap_or_else(|| vec![definition]);
-                let base = stack[0];
-                let channels = protocol_channels(base.id);
+                let channels = analyzer_channels(analyzer);
                 let assigned_channels = analyzer
                     .channel_mappings
                     .iter()
@@ -6512,8 +6542,10 @@ fn paint_protocol_analyzer_settings(
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.small(RichText::new(definition.long_name).color(TEXT_MUTED));
-                                ui.label(RichText::new(definition.name).strong());
+                                ui.small(
+                                    RichText::new(analyzer_long_name(analyzer)).color(TEXT_MUTED),
+                                );
+                                ui.label(RichText::new(analyzer_name(analyzer)).strong());
                                 ui.small(
                                     RichText::new(format!(
                                         "{} · {assigned_channels}/{} inputs",
@@ -6551,11 +6583,7 @@ fn paint_protocol_analyzer_settings(
                         .response
                         .on_hover_text(format!(
                             "Decoder chain: {}",
-                            stack
-                                .iter()
-                                .map(|decoder| decoder.name)
-                                .collect::<Vec<_>>()
-                                .join(" → ")
+                            analyzer_decoder_chain(analyzer).join(" → ")
                         ));
                     });
             }
@@ -6576,10 +6604,7 @@ fn paint_protocol_analyzer_modal(
     let Some(mut editor) = settings.editor.clone() else {
         return;
     };
-    let definition = protocol_by_id(editor.analyzer.protocol_id)
-        .expect("configured protocol should remain in the catalog");
-    let stack = protocol_stack(editor.analyzer.protocol_id).unwrap_or_else(|| vec![definition]);
-    let channels = protocol_channels(stack[0].id);
+    let channels = analyzer_channels(&editor.analyzer);
     editor
         .analyzer
         .channel_mappings
@@ -6613,19 +6638,23 @@ fn paint_protocol_analyzer_modal(
         .default_width(440.0)
         .min_width(380.0)
         .show(context, |ui| {
-            ui.label(RichText::new(definition.name).strong().color(ACCENT));
-            ui.label(RichText::new(definition.long_name).color(TEXT_MUTED));
-            if stack.len() > 1 {
+            ui.label(
+                RichText::new(analyzer_name(&editor.analyzer))
+                    .strong()
+                    .color(ACCENT),
+            );
+            ui.label(RichText::new(analyzer_long_name(&editor.analyzer)).color(TEXT_MUTED));
+            if let Some(custom) = &editor.analyzer.custom_protocol {
                 ui.small(
-                    RichText::new(format!(
-                        "Decoder chain: {}",
-                        stack
-                            .iter()
-                            .map(|decoder| decoder.name)
-                            .collect::<Vec<_>>()
-                            .join(" → ")
-                    ))
-                    .color(TEXT_MUTED),
+                    RichText::new(format!("Schema: {}", custom.source_path.display()))
+                        .color(TEXT_MUTED),
+                );
+            }
+            let decoder_chain = analyzer_decoder_chain(&editor.analyzer);
+            if decoder_chain.len() > 1 {
+                ui.small(
+                    RichText::new(format!("Decoder chain: {}", decoder_chain.join(" → ")))
+                        .color(TEXT_MUTED),
                 );
             }
             ui.add_space(10.0);
@@ -11351,9 +11380,7 @@ fn paint_logic_protocol_lanes(
             [label_rect.right_top(), label_rect.right_bottom()],
             Stroke::new(1.0_f32, color.gamma_multiply(0.65)),
         );
-        let label = protocol_by_id(analyzer.protocol_id)
-            .map(|protocol| protocol.name)
-            .unwrap_or(analyzer.protocol_id);
+        let label = analyzer_name(analyzer);
         painter.text(
             label_rect.left_center() + Vec2::new(6.0, 0.0),
             egui::Align2::LEFT_CENTER,
@@ -14495,6 +14522,7 @@ mod tests {
             protocol_id: "1:i2c",
             channel_mappings: vec![Some(0), Some(5)],
             data_format: ProtocolDataFormat::Hexadecimal,
+            custom_protocol: None,
         };
         let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_000.0, 800.0));
         let maximum_heights = LogicCaptureSettings::default().maximum_heights;

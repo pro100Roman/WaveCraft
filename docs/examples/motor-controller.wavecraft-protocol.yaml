@@ -60,4 +60,4 @@ messages:
           from: 2
           through_field: flags
           expected_field: checksum
-    summary: "Motor {motor}: {speed_rpm} rpm"
+    summary: "Motor {motor}: {speed_rpm}"

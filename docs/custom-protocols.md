@@ -4,8 +4,12 @@ Status: implementation in progress. The strict YAML loader, schema validator,
 generic packet model, incremental byte-stream framing, and fixed-layout field
 decoder exist in `wavecraft-decode`. First-party UART, SPI, and I2C sample
 decoding also lives in that crate, with the GUI adapting its transport results
-to the existing presentation model. Project persistence and custom-protocol
-GUI integration remain to be implemented.
+to the existing presentation model. The initial GUI integration can load and
+validate a YAML schema, create its UART, SPI, or I2C analyzer, map channels,
+and render generic decoded messages in the waveform and decoded-data panel.
+It currently decodes only when the GUI retains every raw sample. Moving decode
+to an independent capture-stream consumer and adding project persistence remain
+to be implemented.
 
 WaveCraft custom protocols describe the meaning of bytes that a first-party
 transport decoder has already recovered from logic samples. Version 1 uses a
@@ -247,7 +251,7 @@ messages:
           from: 2
           through_field: flags
           expected_field: checksum
-    summary: "Motor {motor}: {speed_rpm} rpm"
+    summary: "Motor {motor}: {speed_rpm}"
 ```
 
 Unknown root or structural fields are errors in version 1. This catches typos
@@ -491,10 +495,11 @@ Logic channels 1-4
         `-- Custom flash commands       [flash]
 ```
 
-**Add custom protocol** selects a YAML file, validates it, and filters eligible
-transport analyzer instances by `input.transport` and stream availability. If
-no compatible transport exists, the wizard offers to create one before adding
-the custom analyzer.
+The initial **Load custom YAML…** action selects and validates a YAML file,
+creates the matching UART, SPI, or I2C analyzer, and opens its channel mapping
+dialog. The dialog displays the source path and decoder chain. A later stack
+editor may allow selecting an existing compatible transport analyzer instead
+of creating one automatically.
 
 Before committing, the dialog previews bounded results from the current raw
 capture or recording. It shows schema errors separately from data diagnostics.

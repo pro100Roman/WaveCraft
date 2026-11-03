@@ -1459,8 +1459,8 @@ mod tests {
     #[test]
     fn rejects_duplicate_message_matches() {
         let source = EXAMPLE.replace(
-            "    summary: \"Motor {motor}: {speed_rpm} rpm\"",
-            "    summary: \"Motor {motor}: {speed_rpm} rpm\"\n  - id: duplicate\n    name: Duplicate\n    match:\n      - offset: 3\n        value: 0x10\n    fields:\n      - name: value\n        type: u8",
+            "    summary: \"Motor {motor}: {speed_rpm}\"",
+            "    summary: \"Motor {motor}: {speed_rpm}\"\n  - id: duplicate\n    name: Duplicate\n    match:\n      - offset: 3\n        value: 0x10\n    fields:\n      - name: value\n        type: u8",
         );
         let error = load_protocol_schema(&source).unwrap_err();
         assert_eq!(error.path(), "messages[1].match");

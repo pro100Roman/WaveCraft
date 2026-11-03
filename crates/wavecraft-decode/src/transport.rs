@@ -70,6 +70,7 @@ pub struct SpiConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpiTransfer {
+    pub transaction_index: usize,
     pub range: SampleRange,
     pub mosi: Option<u8>,
     pub miso: Option<u8>,
@@ -213,6 +214,12 @@ pub fn decode_spi_samples(
     let mut mosi = 0_u8;
     let mut bit_count = 0_u8;
     let mut byte_start = sample_offset;
+    let mut previous_selected = config
+        .chip_select_channel
+        .map(|channel| !channel_is_high(first, channel))
+        .unwrap_or(true);
+    let mut transaction_index = 0_usize;
+    let mut next_transaction_index = usize::from(previous_selected);
 
     for (local_index, sample) in samples.iter().copied().enumerate().skip(1) {
         let sample_index = sample_offset.saturating_add(local_index as u64);
@@ -221,6 +228,10 @@ pub fn decode_spi_samples(
             .chip_select_channel
             .map(|channel| !channel_is_high(sample, channel))
             .unwrap_or(true);
+        if selected && !previous_selected {
+            transaction_index = next_transaction_index;
+            next_transaction_index = next_transaction_index.saturating_add(1);
+        }
         if !selected {
             bit_count = 0;
             miso = 0;
@@ -238,6 +249,7 @@ pub fn decode_spi_samples(
             bit_count += 1;
             if bit_count == 8 {
                 transfers.push(SpiTransfer {
+                    transaction_index,
                     range: SampleRange {
                         start: byte_start,
                         end: sample_index.saturating_add(1),
@@ -251,6 +263,7 @@ pub fn decode_spi_samples(
             }
         }
         previous_clock = clock;
+        previous_selected = selected;
     }
     Ok(transfers)
 }
@@ -539,7 +552,40 @@ mod tests {
         assert_eq!(transfers.len(), 1);
         assert_eq!(transfers[0].mosi, Some(0xA5));
         assert_eq!(transfers[0].miso, Some(0x3C));
+        assert_eq!(transfers[0].transaction_index, 0);
         assert!(transfers[0].range.start >= 50);
+    }
+
+    #[test]
+    fn spi_assigns_a_new_transaction_index_after_chip_select() {
+        let mut samples = vec![logic_word(false, false, true)];
+        for value in [0x12_u8, 0x34] {
+            samples.push(logic_word(false, false, false));
+            for bit in (0..8).rev() {
+                let data = value & (1 << bit) != 0;
+                let low = logic_word(false, data, false);
+                samples.extend([low, low | 1, low]);
+            }
+            samples.push(logic_word(false, false, true));
+        }
+
+        let transfers = decode_spi_samples(
+            SpiConfig {
+                clock_channel: 0,
+                miso_channel: None,
+                mosi_channel: Some(1),
+                chip_select_channel: Some(3),
+            },
+            &samples,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(transfers.len(), 2);
+        assert_eq!(transfers[0].mosi, Some(0x12));
+        assert_eq!(transfers[0].transaction_index, 0);
+        assert_eq!(transfers[1].mosi, Some(0x34));
+        assert_eq!(transfers[1].transaction_index, 1);
     }
 
     #[test]
