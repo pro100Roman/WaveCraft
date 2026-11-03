@@ -90,7 +90,7 @@ pub enum DsLogicInputFilter {
     OneSampleClock,
 }
 
-/// Match performed by the DSLogic FPGA for a simple, single-channel trigger.
+/// Per-channel match performed by the DSLogic FPGA.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DsLogicTriggerCondition {
     Low,
@@ -102,32 +102,49 @@ pub enum DsLogicTriggerCondition {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DsLogicSimpleTrigger {
-    channel: u8,
-    condition: DsLogicTriggerCondition,
+    conditions: [Option<DsLogicTriggerCondition>; CHANNEL_COUNT as usize],
 }
 
 impl DsLogicSimpleTrigger {
+    /// Create a simple hardware trigger. Additional channel conditions can be
+    /// added with [`Self::with_channel_condition`]; all configured conditions
+    /// must match at the same sample, matching the original DSView behavior.
     pub fn new(channel: u8, condition: DsLogicTriggerCondition) -> Result<Self, CaptureError> {
-        if channel >= CHANNEL_COUNT {
+        Self {
+            conditions: [None; CHANNEL_COUNT as usize],
+        }
+        .with_channel_condition(channel, condition)
+    }
+
+    pub fn with_channel_condition(
+        mut self,
+        channel: u8,
+        condition: DsLogicTriggerCondition,
+    ) -> Result<Self, CaptureError> {
+        let Some(destination) = self.conditions.get_mut(usize::from(channel)) else {
             return Err(CaptureError::new(format!(
                 "DSLogic trigger channel must be between 0 and {}; got {channel}",
                 CHANNEL_COUNT - 1
             )));
-        }
-        Ok(Self { channel, condition })
+        };
+        *destination = Some(condition);
+        Ok(self)
     }
 
-    pub fn channel(self) -> u8 {
-        self.channel
+    pub fn conditions(self) -> [Option<DsLogicTriggerCondition>; CHANNEL_COUNT as usize] {
+        self.conditions
     }
 
-    pub fn condition(self) -> DsLogicTriggerCondition {
-        self.condition
+    pub fn condition_count(self) -> u8 {
+        self.conditions
+            .iter()
+            .filter(|condition| condition.is_some())
+            .count() as u8
     }
 }
 
-/// Hardware trigger mode. A future multi-channel trigger can be added as a
-/// separate variant without changing capture configuration users.
+/// Hardware trigger mode. Future two-pattern or staged triggers can be added
+/// as separate variants without changing capture configuration users.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DsLogicTriggerConfig {
     Simple(DsLogicSimpleTrigger),
@@ -443,17 +460,21 @@ impl DsLogicCaptureConfig {
             ));
         }
         if let Some(DsLogicTriggerConfig::Simple(trigger)) = self.trigger {
-            if trigger.channel >= channel_count {
-                return Err(CaptureError::new(format!(
-                    "{} exposes {channel_count} logic channels; trigger channel {} is unavailable",
-                    profile.display_name, trigger.channel
-                )));
-            }
-            if !self.enabled_channels[usize::from(trigger.channel)] {
-                return Err(CaptureError::new(format!(
-                    "DSLogic trigger channel {} must be enabled",
-                    trigger.channel
-                )));
+            for (channel, condition) in trigger.conditions.iter().enumerate() {
+                if condition.is_none() {
+                    continue;
+                }
+                if channel >= usize::from(channel_count) {
+                    return Err(CaptureError::new(format!(
+                        "{} exposes {channel_count} logic channels; trigger channel {channel} is unavailable",
+                        profile.display_name
+                    )));
+                }
+                if !self.enabled_channels[channel] {
+                    return Err(CaptureError::new(format!(
+                        "DSLogic trigger channel {channel} must be enabled"
+                    )));
+                }
             }
         }
         let maximum = self.maximum_sample_rate_hz_for_model(model, speed);
@@ -614,18 +635,32 @@ impl DsLogicCaptureConfig {
         let Some(DsLogicTriggerConfig::Simple(trigger)) = self.trigger else {
             return TriggerWords::default();
         };
-        if !(first_channel..first_channel + 16).contains(&trigger.channel) {
-            return TriggerWords::default();
+        let mut mask = u16::MAX;
+        let mut value = 0;
+        let mut edge = 0;
+        for channel in first_channel..first_channel + 16 {
+            let Some(condition) = trigger.conditions[usize::from(channel)] else {
+                continue;
+            };
+            let bit = 1_u16 << (channel - first_channel);
+            match condition {
+                DsLogicTriggerCondition::Low => mask &= !bit,
+                DsLogicTriggerCondition::High => {
+                    mask &= !bit;
+                    value |= bit;
+                }
+                DsLogicTriggerCondition::RisingEdge => {
+                    mask &= !bit;
+                    value |= bit;
+                    edge |= bit;
+                }
+                DsLogicTriggerCondition::FallingEdge => {
+                    mask &= !bit;
+                    edge |= bit;
+                }
+                DsLogicTriggerCondition::EitherEdge => edge |= bit,
+            }
         }
-
-        let bit = 1_u16 << (trigger.channel - first_channel);
-        let (value, edge, mask) = match trigger.condition {
-            DsLogicTriggerCondition::Low => (0, 0, !bit),
-            DsLogicTriggerCondition::High => (bit, 0, !bit),
-            DsLogicTriggerCondition::RisingEdge => (bit, bit, !bit),
-            DsLogicTriggerCondition::FallingEdge => (0, bit, !bit),
-            DsLogicTriggerCondition::EitherEdge => (0, bit, u16::MAX),
-        };
         TriggerWords {
             mask: self.replicate_high_rate_trigger_word(mask),
             value: self.replicate_high_rate_trigger_word(value),
@@ -1845,6 +1880,25 @@ mod tests {
         assert_eq!(read_u16(&settings, 208), 0);
         assert_eq!(read_u16(&settings, 240), 2);
         assert_eq!(read_u16(&settings, 50), u16::MAX);
+    }
+
+    #[test]
+    fn combines_simple_channel_conditions_at_one_sample() {
+        let trigger = DsLogicSimpleTrigger::new(0, DsLogicTriggerCondition::RisingEdge)
+            .unwrap()
+            .with_channel_condition(1, DsLogicTriggerCondition::High)
+            .unwrap()
+            .with_channel_condition(2, DsLogicTriggerCondition::Low)
+            .unwrap();
+        let settings = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .unwrap()
+            .with_trigger(Some(DsLogicTriggerConfig::Simple(trigger)))
+            .encode_settings();
+
+        assert_eq!(trigger.condition_count(), 3);
+        assert_eq!(read_u16(&settings, 48), u16::MAX ^ 0b111);
+        assert_eq!(read_u16(&settings, 112), 0b011);
+        assert_eq!(read_u16(&settings, 176), 0b001);
     }
 
     #[test]
