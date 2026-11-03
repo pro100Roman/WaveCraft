@@ -222,8 +222,8 @@ messages:
       - name: feature_flags
         type: u8
         bits:
-          change_sensitivity_enabled: 0
-          change_sensitivity_relative: 1
+          change_sensitivity_relative: 0
+          change_sensitivity_enabled: 1
           wake_up_enabled: 2
           always_on_enabled: 3
       - name: change_sensitivity
@@ -297,8 +297,8 @@ messages:
       - name: feature_flags
         type: u8
         bits:
-          change_sensitivity_enabled: 0
-          change_sensitivity_relative: 1
+          change_sensitivity_relative: 0
+          change_sensitivity_enabled: 1
           wake_up_enabled: 2
           always_on_enabled: 3
       - name: change_sensitivity
@@ -377,6 +377,72 @@ messages:
           fixed_point_q: 8
     summary: "Accelerometer (includes gravity) · X {acceleration_x} · Y {acceleration_y} · Z {acceleration_z} · accuracy {accuracy}"
 
+  - id: raw_accelerometer
+    name: Raw accelerometer
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x14
+    fields:
+      - name: packet_length
+        type: u16le
+        mask: 0x7FFF
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: 100 us ticks before host interrupt
+      - name: report_type
+        type: u8
+        expect: 0x14
+        enum:
+          0x14: raw physical accelerometer ADC readings
+      - name: sensor_sequence
+        type: u8
+      - name: accuracy
+        type: u8
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
+        type: u8
+        display:
+          unit: 100 us ticks
+      - name: raw_acceleration_x
+        type: s16le
+        display:
+          unit: ADC counts
+      - name: raw_acceleration_y
+        type: s16le
+        display:
+          unit: ADC counts
+      - name: raw_acceleration_z
+        type: s16le
+        display:
+          unit: ADC counts
+      - name: reserved
+        type: u16le
+        hidden: true
+      - name: sensor_timestamp
+        type: u32le
+        display:
+          unit: us
+    summary: "Raw accelerometer (sensor-dependent ADC readings) · X {raw_acceleration_x} · Y {raw_acceleration_y} · Z {raw_acceleration_z} · sensor timestamp {sensor_timestamp} · accuracy {accuracy}"
+
   - id: gyroscope_calibrated
     name: Gyroscope calibrated
     match:
@@ -439,6 +505,148 @@ messages:
           fixed_point_q: 9
     summary: "Calibrated gyroscope (angular velocity) · X {angular_velocity_x} · Y {angular_velocity_y} · Z {angular_velocity_z} · accuracy {accuracy}"
 
+  - id: raw_gyroscope
+    name: Raw gyroscope
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x15
+    fields:
+      - name: packet_length
+        type: u16le
+        mask: 0x7FFF
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: 100 us ticks before host interrupt
+      - name: report_type
+        type: u8
+        expect: 0x15
+        enum:
+          0x15: raw physical gyroscope ADC readings
+      - name: sensor_sequence
+        type: u8
+      - name: accuracy
+        type: u8
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
+        type: u8
+        display:
+          unit: 100 us ticks
+      - name: raw_angular_velocity_x
+        type: s16le
+        display:
+          unit: ADC counts
+      - name: raw_angular_velocity_y
+        type: s16le
+        display:
+          unit: ADC counts
+      - name: raw_angular_velocity_z
+        type: s16le
+        display:
+          unit: ADC counts
+      - name: gyroscope_temperature_raw
+        type: u16le
+      - name: sensor_timestamp
+        type: u32le
+        display:
+          unit: us
+    summary: "Raw gyroscope (sensor-dependent ADC readings) · X {raw_angular_velocity_x} · Y {raw_angular_velocity_y} · Z {raw_angular_velocity_z} · temperature raw {gyroscope_temperature_raw} · sensor timestamp {sensor_timestamp} · accuracy {accuracy}"
+
+  - id: gyroscope_uncalibrated
+    name: Gyroscope uncalibrated
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x07
+    fields:
+      - name: packet_length
+        type: u16le
+        mask: 0x7FFF
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: 100 us ticks before host interrupt
+      - name: report_type
+        type: u8
+        expect: 0x07
+        enum:
+          0x07: uncalibrated angular velocity and drift estimate
+      - name: sensor_sequence
+        type: u8
+      - name: accuracy
+        type: u8
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
+        type: u8
+        display:
+          unit: 100 us ticks
+      - name: angular_velocity_x
+        type: s16le
+        display:
+          unit: rad/s
+          fixed_point_q: 9
+      - name: angular_velocity_y
+        type: s16le
+        display:
+          unit: rad/s
+          fixed_point_q: 9
+      - name: angular_velocity_z
+        type: s16le
+        display:
+          unit: rad/s
+          fixed_point_q: 9
+      - name: drift_bias_x
+        type: s16le
+        display:
+          unit: rad/s
+          fixed_point_q: 9
+      - name: drift_bias_y
+        type: s16le
+        display:
+          unit: rad/s
+          fixed_point_q: 9
+      - name: drift_bias_z
+        type: s16le
+        display:
+          unit: rad/s
+          fixed_point_q: 9
+    summary: "Uncalibrated gyroscope (angular velocity + drift estimate) · X {angular_velocity_x} · Y {angular_velocity_y} · Z {angular_velocity_z} · bias X {drift_bias_x} · Y {drift_bias_y} · Z {drift_bias_z} · accuracy {accuracy}"
+
   - id: magnetic_field_calibrated
     name: Magnetic field calibrated
     match:
@@ -500,6 +708,149 @@ messages:
           unit: µT
           fixed_point_q: 4
     summary: "Calibrated magnetometer (magnetic field) · X {magnetic_field_x} · Y {magnetic_field_y} · Z {magnetic_field_z} · accuracy {accuracy}"
+
+  - id: raw_magnetometer
+    name: Raw magnetometer
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x16
+    fields:
+      - name: packet_length
+        type: u16le
+        mask: 0x7FFF
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: 100 us ticks before host interrupt
+      - name: report_type
+        type: u8
+        expect: 0x16
+        enum:
+          0x16: raw physical magnetometer ADC readings
+      - name: sensor_sequence
+        type: u8
+      - name: accuracy
+        type: u8
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
+        type: u8
+        display:
+          unit: 100 us ticks
+      - name: raw_magnetic_field_x
+        type: s16le
+        display:
+          unit: ADC counts
+      - name: raw_magnetic_field_y
+        type: s16le
+        display:
+          unit: ADC counts
+      - name: raw_magnetic_field_z
+        type: s16le
+        display:
+          unit: ADC counts
+      - name: reserved
+        type: u16le
+        hidden: true
+      - name: sensor_timestamp
+        type: u32le
+        display:
+          unit: us
+    summary: "Raw magnetometer (sensor-dependent ADC readings) · X {raw_magnetic_field_x} · Y {raw_magnetic_field_y} · Z {raw_magnetic_field_z} · sensor timestamp {sensor_timestamp} · accuracy {accuracy}"
+
+  - id: magnetic_field_uncalibrated
+    name: Magnetic field uncalibrated
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x0F
+    fields:
+      - name: packet_length
+        type: u16le
+        mask: 0x7FFF
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: 100 us ticks before host interrupt
+      - name: report_type
+        type: u8
+        expect: 0x0F
+        enum:
+          0x0F: soft-iron-corrected magnetic field and hard-iron bias
+      - name: sensor_sequence
+        type: u8
+      - name: accuracy
+        type: u8
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
+        type: u8
+        display:
+          unit: 100 us ticks
+      - name: magnetic_field_x
+        type: s16le
+        display:
+          unit: µT
+          fixed_point_q: 4
+      - name: magnetic_field_y
+        type: s16le
+        display:
+          unit: µT
+          fixed_point_q: 4
+      - name: magnetic_field_z
+        type: s16le
+        display:
+          unit: µT
+          fixed_point_q: 4
+      - name: hard_iron_bias_x
+        type: s16le
+        display:
+          unit: µT
+          fixed_point_q: 4
+      - name: hard_iron_bias_y
+        type: s16le
+        display:
+          unit: µT
+          fixed_point_q: 4
+      - name: hard_iron_bias_z
+        type: s16le
+        display:
+          unit: µT
+          fixed_point_q: 4
+    summary: "Uncalibrated magnetic field (soft-iron corrected + hard-iron bias) · X {magnetic_field_x} · Y {magnetic_field_y} · Z {magnetic_field_z} · bias X {hard_iron_bias_x} · Y {hard_iron_bias_y} · Z {hard_iron_bias_z} · accuracy {accuracy}"
 
   - id: linear_acceleration
     name: Linear acceleration
@@ -755,6 +1106,254 @@ messages:
         display:
           fixed_point_q: 14
     summary: "Game rotation vector (orientation quaternion) · i {quaternion_i} · j {quaternion_j} · k {quaternion_k} · real {quaternion_real} · sensor accuracy {accuracy}"
+
+  - id: geomagnetic_rotation_vector
+    name: Geomagnetic rotation vector
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x09
+    fields:
+      - name: packet_length
+        type: u16le
+        mask: 0x7FFF
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: 100 us ticks before host interrupt
+      - name: report_type
+        type: u8
+        expect: 0x09
+        enum:
+          0x09: geomagnetic orientation rotation vector (quaternion)
+      - name: sensor_sequence
+        type: u8
+      - name: accuracy
+        type: u8
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
+        type: u8
+        display:
+          unit: 100 us ticks
+      - name: quaternion_i
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_j
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_k
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_real
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: heading_accuracy
+        type: u16le
+        display:
+          unit: rad
+          fixed_point_q: 12
+    summary: "Geomagnetic rotation vector (orientation from accelerometer + magnetometer) · i {quaternion_i} · j {quaternion_j} · k {quaternion_k} · real {quaternion_real} · heading accuracy {heading_accuracy} · sensor accuracy {accuracy}"
+
+  - id: arvr_stabilized_rotation_vector
+    name: AR/VR-stabilized rotation vector
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x28
+    fields:
+      - name: packet_length
+        type: u16le
+        mask: 0x7FFF
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: 100 us ticks before host interrupt
+      - name: report_type
+        type: u8
+        expect: 0x28
+        enum:
+          0x28: AR/VR-stabilized orientation rotation vector (quaternion)
+      - name: sensor_sequence
+        type: u8
+      - name: accuracy
+        type: u8
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
+        type: u8
+        display:
+          unit: 100 us ticks
+      - name: quaternion_i
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_j
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_k
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_real
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: heading_accuracy
+        type: u16le
+        display:
+          unit: rad
+          fixed_point_q: 12
+    summary: "AR/VR-stabilized rotation vector (motion-corrected orientation) · i {quaternion_i} · j {quaternion_j} · k {quaternion_k} · real {quaternion_real} · heading accuracy {heading_accuracy} · sensor accuracy {accuracy}"
+
+  - id: arvr_stabilized_game_rotation_vector
+    name: AR/VR-stabilized game rotation vector
+    match:
+      - offset: 4
+        value: 0xFB
+      - offset: 9
+        value: 0x29
+    fields:
+      - name: packet_length
+        type: u16le
+        mask: 0x7FFF
+      - name: channel
+        type: u8
+        enum:
+          3: input_normal
+          4: input_wakeup
+      - name: shtp_sequence
+        type: u8
+      - name: base_timestamp_report
+        type: u8
+        expect: 0xFB
+        hidden: true
+      - name: base_delta
+        type: s32le
+        display:
+          unit: 100 us ticks before host interrupt
+      - name: report_type
+        type: u8
+        expect: 0x29
+        enum:
+          0x29: AR/VR-stabilized game orientation rotation vector (quaternion)
+      - name: sensor_sequence
+        type: u8
+      - name: accuracy
+        type: u8
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
+        type: u8
+        display:
+          unit: 100 us ticks
+      - name: quaternion_i
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_j
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_k
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_real
+        type: s16le
+        display:
+          fixed_point_q: 14
+    summary: "AR/VR-stabilized game rotation vector (motion-corrected orientation without magnetic north) · i {quaternion_i} · j {quaternion_j} · k {quaternion_k} · real {quaternion_real} · sensor accuracy {accuracy}"
+
+  - id: gyro_integrated_rotation_vector
+    name: Gyro-integrated rotation vector
+    match:
+      - offset: 2
+        value: 5
+    fields:
+      - name: packet_length
+        type: u16le
+        mask: 0x7FFF
+      - name: channel
+        type: u8
+        expect: 5
+        enum:
+          5: gyro_rotation_vector
+      - name: shtp_sequence
+        type: u8
+      - name: quaternion_i
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_j
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_k
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_real
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: angular_velocity_x
+        type: s16le
+        display:
+          unit: rad/s
+          fixed_point_q: 10
+      - name: angular_velocity_y
+        type: s16le
+        display:
+          unit: rad/s
+          fixed_point_q: 10
+      - name: angular_velocity_z
+        type: s16le
+        display:
+          unit: rad/s
+          fixed_point_q: 10
+    summary: "Gyro-integrated rotation vector (high-rate orientation + angular velocity) · i {quaternion_i} · j {quaternion_j} · k {quaternion_k} · real {quaternion_real} · gyro X {angular_velocity_x} · Y {angular_velocity_y} · Z {angular_velocity_z}"
 
   - id: shtp_packet
     name: SHTP packet

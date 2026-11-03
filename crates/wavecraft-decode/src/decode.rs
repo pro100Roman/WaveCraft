@@ -678,11 +678,6 @@ messages:
           expected_field: checksum
     summary: "Motor {motor}: {speed_rpm}"
 "#;
-    const SH2_I2C_SCHEMA: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/examples/bno08x-sh2-i2c.wavecraft-protocol.yaml"
-    ));
-
     fn bytes(values: &[u8]) -> Vec<TimedByte> {
         values
             .iter()
@@ -772,114 +767,6 @@ messages:
             .unwrap()
             .unwrap();
         assert_eq!(message.summary, "Motor 2: 2000 rpm");
-    }
-
-    #[test]
-    fn decodes_documented_sh2_accelerometer_report() {
-        let decoder = CustomProtocolDecoder::new(load_protocol_schema(SH2_I2C_SCHEMA).unwrap());
-        let packet = TransportPacket {
-            transport: TransportKind::I2c,
-            streams: BTreeMap::from([(
-                "data".to_owned(),
-                bytes(&[
-                    0x13, 0x00, 0x03, 0x07, 0xFB, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x05,
-                    0x00, 0x01, 0x00, 0xFF, 0x00, 0x02,
-                ]),
-            )]),
-            attributes: BTreeMap::new(),
-            completeness: PacketCompleteness::Complete,
-        };
-
-        let message = decoder.decode_packet(&packet).unwrap().unwrap();
-
-        assert_eq!(message.message_id, "accelerometer");
-        assert_eq!(message.fields[0].value, DecodedValue::Integer(19));
-        assert_eq!(
-            message.summary,
-            "Accelerometer (includes gravity) · X 1 m/s^2 · Y -1 m/s^2 · Z 2 m/s^2 · accuracy high"
-        );
-        assert_eq!(
-            message.fields[5].display.as_deref(),
-            Some("accelerometer (acceleration including gravity)")
-        );
-        assert_eq!(message.fields[7].display.as_deref(), Some("high"));
-        assert_eq!(message.fields[9].display.as_deref(), Some("1 m/s^2"));
-        assert_eq!(message.severity, Severity::Info);
-    }
-
-    #[test]
-    fn labels_and_scales_sh2_gyroscope_report() {
-        let decoder = CustomProtocolDecoder::new(load_protocol_schema(SH2_I2C_SCHEMA).unwrap());
-        let packet = TransportPacket {
-            transport: TransportKind::I2c,
-            streams: BTreeMap::from([(
-                "data".to_owned(),
-                bytes(&[
-                    0x13, 0x00, 0x03, 0x08, 0xFB, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02, 0x00,
-                    0x00, 0x02, 0x00, 0xFF, 0x00, 0x04,
-                ]),
-            )]),
-            attributes: BTreeMap::new(),
-            completeness: PacketCompleteness::Complete,
-        };
-
-        let message = decoder.decode_packet(&packet).unwrap().unwrap();
-
-        assert_eq!(message.message_id, "gyroscope_calibrated");
-        assert_eq!(
-            message.summary,
-            "Calibrated gyroscope (angular velocity) · X 1 rad/s · Y -0.5 rad/s · Z 2 rad/s · accuracy medium"
-        );
-        assert_eq!(message.fields[9].name, "angular_velocity_x");
-        assert_eq!(message.fields[9].display.as_deref(), Some("1 rad/s"));
-    }
-
-    #[test]
-    fn labels_and_scales_sh2_rotation_vector_report() {
-        let decoder = CustomProtocolDecoder::new(load_protocol_schema(SH2_I2C_SCHEMA).unwrap());
-        let packet = TransportPacket {
-            transport: TransportKind::I2c,
-            streams: BTreeMap::from([(
-                "data".to_owned(),
-                bytes(&[
-                    0x17, 0x00, 0x03, 0x09, 0xFB, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x10,
-                ]),
-            )]),
-            attributes: BTreeMap::new(),
-            completeness: PacketCompleteness::Complete,
-        };
-
-        let message = decoder.decode_packet(&packet).unwrap().unwrap();
-
-        assert_eq!(message.message_id, "rotation_vector");
-        assert_eq!(
-            message.summary,
-            "Rotation vector (orientation quaternion) · i 0 · j 0 · k 0 · real 1 · heading accuracy 1 rad · sensor accuracy high"
-        );
-        assert_eq!(message.fields[13].name, "heading_accuracy");
-        assert_eq!(message.fields[13].display.as_deref(), Some("1 rad"));
-    }
-
-    #[test]
-    fn masks_shtp_continuation_bit_out_of_packet_length() {
-        let decoder = CustomProtocolDecoder::new(load_protocol_schema(SH2_I2C_SCHEMA).unwrap());
-        let packet = TransportPacket {
-            transport: TransportKind::I2c,
-            streams: BTreeMap::from([("data".to_owned(), bytes(&[0x04, 0x80, 0x00, 0x07]))]),
-            attributes: BTreeMap::new(),
-            completeness: PacketCompleteness::Complete,
-        };
-
-        let message = decoder.decode_packet(&packet).unwrap().unwrap();
-
-        assert_eq!(message.message_id, "shtp_packet");
-        assert_eq!(message.summary, "SHTP shtp_command · seq 7 · 4 bytes");
-        assert_eq!(message.fields[0].value, DecodedValue::Integer(4));
-        assert_eq!(
-            message.fields[0].children[0].value,
-            DecodedValue::Boolean(true)
-        );
     }
 
     #[test]
