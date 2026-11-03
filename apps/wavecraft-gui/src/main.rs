@@ -7783,19 +7783,6 @@ impl eframe::App for WaveCraftApp {
                     {
                         snapshot_clicked = true;
                     }
-                    if self.active_waveform_tab == Some(WaveformTab::LogicAnalyzer) {
-                        ui.separator();
-                        if ui
-                            .selectable_label(
-                                self.decoded_data_panel_open,
-                                "Decoded Data",
-                            )
-                            .on_hover_text("Show or hide decoded protocol transactions")
-                            .clicked()
-                        {
-                            self.decoded_data_panel_open = !self.decoded_data_panel_open;
-                        }
-                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let logic_only = control_target == Some(CaptureTarget::LogicAnalyzer);
                         let acquisition_active = self.capture_run_requested
@@ -8106,8 +8093,6 @@ impl eframe::App for WaveCraftApp {
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("SESSION").strong().color(TEXT_MUTED));
-                                ui.separator();
                                 for (index, name) in tab_names.iter().enumerate() {
                                     ui.horizontal(|ui| {
                                         let editing = self
