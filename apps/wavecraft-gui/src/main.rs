@@ -11,9 +11,10 @@ use measurements::{
 };
 use protocol_analyzer::{
     analyzer_channels, analyzer_decoder_chain, analyzer_long_name, analyzer_name,
-    decode_protocol_samples, matching_protocols, protocol_stack, ProtocolAnalyzerInstance,
-    ProtocolAnalyzerSettings, ProtocolCaptureDecoder, ProtocolDataFormat, ProtocolDecodeOutcome,
-    ProtocolDecodeSnapshot, ProtocolDecodedEvent, ProtocolDecodedKind, PROTOCOLS,
+    analyzer_transport_name, decode_protocol_samples, decode_transport_samples, matching_protocols,
+    protocol_stack, ProtocolAnalyzerInstance, ProtocolAnalyzerSettings, ProtocolCaptureDecoder,
+    ProtocolDataFormat, ProtocolDecodeOutcome, ProtocolDecodeSnapshot, ProtocolDecodedEvent,
+    ProtocolDecodedKind, PROTOCOLS,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -1976,6 +1977,7 @@ struct ProtocolDecodeCacheKey {
 struct ProtocolDecodeCache {
     key: Option<ProtocolDecodeCacheKey>,
     outcomes: Vec<ProtocolDecodeOutcome>,
+    waveform_outcomes: Vec<ProtocolDecodeOutcome>,
 }
 
 impl ProtocolDecodeCache {
@@ -1988,6 +1990,24 @@ impl ProtocolDecodeCache {
         if let Some(streamed) = streamed.filter(|decoder| decoder.matches_analyzers(analyzers)) {
             return streamed.outcomes();
         }
+        self.refresh(waveforms, analyzers);
+        &self.outcomes
+    }
+
+    fn waveform_outcomes<'a>(
+        &'a mut self,
+        waveforms: &WaveformStore,
+        analyzers: &[ProtocolAnalyzerInstance],
+        streamed: Option<&'a ProtocolDecodeSnapshot>,
+    ) -> &'a [ProtocolDecodeOutcome] {
+        if let Some(streamed) = streamed.filter(|decoder| decoder.matches_analyzers(analyzers)) {
+            return streamed.waveform_outcomes();
+        }
+        self.refresh(waveforms, analyzers);
+        &self.waveform_outcomes
+    }
+
+    fn refresh(&mut self, waveforms: &WaveformStore, analyzers: &[ProtocolAnalyzerInstance]) {
         let key = ProtocolDecodeCacheKey {
             waveform_revision: waveforms.logic_revision,
             sample_offset: waveforms.logic_sample_offset,
@@ -1995,27 +2015,28 @@ impl ProtocolDecodeCache {
             analyzers: analyzers.to_vec(),
         };
         if self.key.as_ref() != Some(&key) {
-            self.outcomes = if waveforms.logic_sample_stride != 1
+            if waveforms.logic_sample_stride != 1
                 || waveforms
                     .logic_samples
                     .iter()
                     .any(|bucket| bucket.sample_count != 1)
             {
-                analyzers
+                self.outcomes = analyzers
                     .iter()
                     .map(|_| {
                         ProtocolDecodeOutcome::Unavailable(
                             "Raw samples are unavailable for this display capture".to_owned(),
                         )
                     })
-                    .collect()
+                    .collect();
+                self.waveform_outcomes = self.outcomes.clone();
             } else {
                 let samples = waveforms
                     .logic_samples
                     .iter()
                     .map(|bucket| bucket.first)
                     .collect::<Vec<_>>();
-                analyzers
+                self.outcomes = analyzers
                     .iter()
                     .map(|analyzer| {
                         decode_protocol_samples(
@@ -2025,11 +2046,21 @@ impl ProtocolDecodeCache {
                             waveforms.logic_rate_hz,
                         )
                     })
-                    .collect()
-            };
+                    .collect();
+                self.waveform_outcomes = analyzers
+                    .iter()
+                    .map(|analyzer| {
+                        decode_transport_samples(
+                            analyzer,
+                            &samples,
+                            waveforms.logic_sample_offset,
+                            waveforms.logic_rate_hz,
+                        )
+                    })
+                    .collect();
+            }
             self.key = Some(key);
         }
-        &self.outcomes
     }
 }
 
@@ -2213,6 +2244,7 @@ fn paint_decoded_data_panel(
     analyzers: &[ProtocolAnalyzerInstance],
     outcomes: &[ProtocolDecodeOutcome],
     sample_rate_hz: u64,
+    open_all: Option<bool>,
 ) -> Option<(u64, u64)> {
     let mut selected_range = None;
     if analyzers.is_empty() {
@@ -2268,7 +2300,12 @@ fn paint_decoded_data_panel(
                         entry.end_sample,
                         entry.title.as_str(),
                     ));
-                    let mut open = ui.data(|data| data.get_temp::<bool>(entry_id).unwrap_or(false));
+                    let mut open = open_all.unwrap_or_else(|| {
+                        ui.data(|data| data.get_temp::<bool>(entry_id).unwrap_or(false))
+                    });
+                    if open_all.is_some() {
+                        ui.data_mut(|data| data.insert_temp(entry_id, open));
+                    }
                     let time = protocol_event_elapsed(entry.start_sample, sample_rate_hz)
                         .map(format_duration)
                         .unwrap_or_default();
@@ -8379,6 +8416,7 @@ impl eframe::App for WaveCraftApp {
             });
         let mut decoded_data_panel_open = self.decoded_data_panel_open;
         let mut decoded_data_panel_width = self.decoded_data_panel_width;
+        let mut decoded_messages_open_request = None;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -8590,6 +8628,26 @@ impl eframe::App for WaveCraftApp {
                                                             {
                                                                 decoded_data_panel_open = false;
                                                             }
+                                                            if ui
+                                                                .small_button("+ All")
+                                                                .on_hover_text(
+                                                                    "Expand all decoded messages",
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                decoded_messages_open_request =
+                                                                    Some(true);
+                                                            }
+                                                            if ui
+                                                                .small_button("− All")
+                                                                .on_hover_text(
+                                                                    "Collapse all decoded messages",
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                decoded_messages_open_request =
+                                                                    Some(false);
+                                                            }
                                                         },
                                                     );
                                                 });
@@ -8604,6 +8662,7 @@ impl eframe::App for WaveCraftApp {
                                                                 .analyzers,
                                                             decoded_outcomes.as_ref(),
                                                             sample_rate_hz,
+                                                            decoded_messages_open_request,
                                                         );
                                                     });
                                             });
@@ -11953,7 +12012,7 @@ fn paint_logic_protocol_lanes(
     {
         streamed.waveform_outcomes()
     } else {
-        cache.outcomes(waveforms, &settings.analyzers, None)
+        cache.waveform_outcomes(waveforms, &settings.analyzers, None)
     };
     for (lane_index, ((lane, analyzer), outcome)) in lanes
         .iter()
@@ -11963,7 +12022,7 @@ fn paint_logic_protocol_lanes(
     {
         let color = logic_marker_color(lane_index);
         let painter = ui.painter().with_clip_rect(*lane);
-        let label = analyzer_name(analyzer);
+        let label = analyzer_transport_name(analyzer);
         let label_galley = painter.layout_no_wrap(
             label.to_owned(),
             FontId::monospace(LOGIC_PROTOCOL_LABEL_FONT_SIZE),

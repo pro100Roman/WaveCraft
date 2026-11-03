@@ -418,14 +418,14 @@ impl ProtocolCaptureDecoder {
                 .as_mut()
                 .map(|runtime| runtime.push_samples(samples, sample_offset, sample_rate_hz));
             match result {
-                Some(Ok(events)) => {
+                Some(Ok(batch)) => {
                     append_streamed_events(
                         &mut Arc::make_mut(&mut self.outcomes)[index],
-                        events.clone(),
+                        batch.panel_events,
                     );
                     append_streamed_events(
                         &mut Arc::make_mut(&mut self.waveform_outcomes)[index],
-                        events,
+                        batch.waveform_events,
                     );
                 }
                 Some(Err(error)) => {
@@ -452,14 +452,14 @@ impl ProtocolCaptureDecoder {
                 .as_mut()
                 .map(|runtime| runtime.finish(sample_rate_hz, fallback));
             match result {
-                Some(Ok(events)) => {
+                Some(Ok(batch)) => {
                     append_streamed_events(
                         &mut Arc::make_mut(&mut self.outcomes)[index],
-                        events.clone(),
+                        batch.panel_events,
                     );
                     append_streamed_events(
                         &mut Arc::make_mut(&mut self.waveform_outcomes)[index],
-                        events,
+                        batch.waveform_events,
                     );
                 }
                 Some(Err(error)) => {
@@ -551,6 +551,11 @@ enum IncrementalAnalyzerRuntime {
     Uart(IncrementalUartRuntime),
 }
 
+struct AnalyzerDecodeBatch {
+    panel_events: Vec<ProtocolDecodedEvent>,
+    waveform_events: Vec<ProtocolDecodedEvent>,
+}
+
 impl IncrementalAnalyzerRuntime {
     fn new(analyzer: ProtocolAnalyzerInstance, sample_rate_hz: u64) -> Result<Self, String> {
         match analyzer_transport(&analyzer) {
@@ -633,7 +638,7 @@ impl IncrementalAnalyzerRuntime {
         samples: &[u32],
         sample_offset: u64,
         sample_rate_hz: u64,
-    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+    ) -> Result<AnalyzerDecodeBatch, String> {
         match self {
             Self::I2c(runtime) => runtime.push_samples(samples, sample_offset, sample_rate_hz),
             Self::Spi(runtime) => runtime.push_samples(samples, sample_offset, sample_rate_hz),
@@ -645,7 +650,7 @@ impl IncrementalAnalyzerRuntime {
         &mut self,
         sample_rate_hz: u64,
         fallback: (u64, u64),
-    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+    ) -> Result<AnalyzerDecodeBatch, String> {
         match self {
             Self::I2c(runtime) => runtime.finish(fallback),
             Self::Spi(runtime) => runtime.finish(fallback),
@@ -666,31 +671,40 @@ impl IncrementalI2cRuntime {
         samples: &[u32],
         sample_offset: u64,
         sample_rate_hz: u64,
-    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+    ) -> Result<AnalyzerDecodeBatch, String> {
         let events = self
             .decoder
             .push_samples(samples, sample_offset)
             .map_err(|error| error.to_string())?;
-        if let Some(custom) = &mut self.custom {
+        let waveform_events = i2c_events_to_decoded(&self.analyzer, events.iter().copied());
+        let panel_events = if let Some(custom) = &mut self.custom {
             custom.push_events(
                 &events,
                 sample_rate_hz,
                 sample_fallback_range(sample_offset, samples.len()),
-            )
+            )?
         } else {
-            Ok(i2c_events_to_decoded(&self.analyzer, events))
-        }
+            waveform_events.clone()
+        };
+        Ok(AnalyzerDecodeBatch {
+            panel_events,
+            waveform_events,
+        })
     }
 
-    fn finish(&mut self, fallback: (u64, u64)) -> Result<Vec<ProtocolDecodedEvent>, String> {
+    fn finish(&mut self, fallback: (u64, u64)) -> Result<AnalyzerDecodeBatch, String> {
         let diagnostics = self.decoder.finish();
-        let mut events = if let Some(custom) = &mut self.custom {
+        let waveform_events = diagnostics_to_events(diagnostics, fallback);
+        let mut panel_events = if let Some(custom) = &mut self.custom {
             custom.finish(fallback)?
         } else {
             Vec::new()
         };
-        events.extend(diagnostics_to_events(diagnostics, fallback));
-        Ok(events)
+        panel_events.extend(waveform_events.iter().cloned());
+        Ok(AnalyzerDecodeBatch {
+            panel_events,
+            waveform_events,
+        })
     }
 }
 
@@ -816,48 +830,55 @@ impl IncrementalSpiRuntime {
         samples: &[u32],
         sample_offset: u64,
         sample_rate_hz: u64,
-    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+    ) -> Result<AnalyzerDecodeBatch, String> {
         let transfers = self
             .decoder
             .push_samples(samples, sample_offset)
             .map_err(|error| error.to_string())?;
         let completed = self.decoder.take_completed_transactions();
         let fallback = sample_fallback_range(sample_offset, samples.len());
-        if let Some(custom) = &mut self.custom {
-            custom.push_transfers(transfers, completed, sample_rate_hz, fallback)
+        let mut waveform_events =
+            spi_transfers_to_decoded(&self.analyzer, transfers.iter().copied());
+        waveform_events.extend(
+            completed
+                .iter()
+                .filter(|transaction| transaction.completeness == PacketCompleteness::Incomplete)
+                .map(|transaction| ProtocolDecodedEvent {
+                    start_sample: fallback.0,
+                    end_sample: fallback.1,
+                    text: "Incomplete SPI".to_owned(),
+                    detail: format!(
+                        "SPI transaction {} ended in the middle of a byte",
+                        transaction.transaction_index
+                    ),
+                    warning: true,
+                    kind: ProtocolDecodedKind::Custom,
+                }),
+        );
+        let panel_events = if let Some(custom) = &mut self.custom {
+            custom.push_transfers(transfers, completed, sample_rate_hz, fallback)?
         } else {
-            let mut events = spi_transfers_to_decoded(&self.analyzer, transfers);
-            events.extend(
-                completed
-                    .into_iter()
-                    .filter(|transaction| {
-                        transaction.completeness == PacketCompleteness::Incomplete
-                    })
-                    .map(|transaction| ProtocolDecodedEvent {
-                        start_sample: fallback.0,
-                        end_sample: fallback.1,
-                        text: "Incomplete SPI".to_owned(),
-                        detail: format!(
-                            "SPI transaction {} ended in the middle of a byte",
-                            transaction.transaction_index
-                        ),
-                        warning: true,
-                        kind: ProtocolDecodedKind::Custom,
-                    }),
-            );
-            Ok(events)
-        }
+            waveform_events.clone()
+        };
+        Ok(AnalyzerDecodeBatch {
+            panel_events,
+            waveform_events,
+        })
     }
 
-    fn finish(&mut self, fallback: (u64, u64)) -> Result<Vec<ProtocolDecodedEvent>, String> {
+    fn finish(&mut self, fallback: (u64, u64)) -> Result<AnalyzerDecodeBatch, String> {
         let diagnostics = self.decoder.finish();
-        let mut events = if let Some(custom) = &mut self.custom {
+        let waveform_events = diagnostics_to_events(diagnostics, fallback);
+        let mut panel_events = if let Some(custom) = &mut self.custom {
             custom.finish(fallback)
         } else {
             Vec::new()
         };
-        events.extend(diagnostics_to_events(diagnostics, fallback));
-        Ok(events)
+        panel_events.extend(waveform_events.iter().cloned());
+        Ok(AnalyzerDecodeBatch {
+            panel_events,
+            waveform_events,
+        })
     }
 }
 
@@ -1002,7 +1023,7 @@ impl IncrementalUartRuntime {
         samples: &[u32],
         sample_offset: u64,
         sample_rate_hz: u64,
-    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+    ) -> Result<AnalyzerDecodeBatch, String> {
         let decoded = self
             .decoder
             .push_samples(samples, sample_offset)
@@ -1018,14 +1039,18 @@ impl IncrementalUartRuntime {
         &mut self,
         sample_rate_hz: u64,
         fallback: (u64, u64),
-    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+    ) -> Result<AnalyzerDecodeBatch, String> {
         let (decoded, diagnostics) = self.decoder.finish().map_err(|error| error.to_string())?;
-        let mut events = self.decode_uart_output(decoded, sample_rate_hz, fallback)?;
+        let mut batch = self.decode_uart_output(decoded, sample_rate_hz, fallback)?;
         if let Some(custom) = &mut self.custom {
-            events.extend(protocol_output_events(custom.finish(), fallback));
+            batch
+                .panel_events
+                .extend(protocol_output_events(custom.finish(), fallback));
         }
-        events.extend(diagnostics_to_events(diagnostics, fallback));
-        Ok(events)
+        let diagnostics = diagnostics_to_events(diagnostics, fallback);
+        batch.panel_events.extend(diagnostics.iter().cloned());
+        batch.waveform_events.extend(diagnostics);
+        Ok(batch)
     }
 
     fn decode_uart_output(
@@ -1033,15 +1058,20 @@ impl IncrementalUartRuntime {
         decoded: UartDecode,
         sample_rate_hz: u64,
         fallback: (u64, u64),
-    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
-        if let Some(custom) = &mut self.custom {
+    ) -> Result<AnalyzerDecodeBatch, String> {
+        let waveform_events = uart_bytes_to_decoded(&self.analyzer, decoded.clone());
+        let panel_events = if let Some(custom) = &mut self.custom {
             custom
                 .push_bytes(&decoded.bytes, sample_rate_hz)
                 .map(|output| protocol_output_events(output, fallback))
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?
         } else {
-            Ok(uart_bytes_to_decoded(&self.analyzer, decoded))
-        }
+            waveform_events.clone()
+        };
+        Ok(AnalyzerDecodeBatch {
+            panel_events,
+            waveform_events,
+        })
     }
 }
 
@@ -1110,6 +1140,12 @@ pub fn analyzer_name(analyzer: &ProtocolAnalyzerInstance) -> &str {
         .map(|custom| custom.schema.protocol.name.as_str())
         .or_else(|| protocol_by_id(analyzer.protocol_id).map(|protocol| protocol.name))
         .unwrap_or(analyzer.protocol_id)
+}
+
+pub fn analyzer_transport_name(analyzer: &ProtocolAnalyzerInstance) -> &str {
+    analyzer_transport(analyzer)
+        .map(transport_name)
+        .unwrap_or_else(|| analyzer_name(analyzer))
 }
 
 pub fn analyzer_long_name(analyzer: &ProtocolAnalyzerInstance) -> &str {
@@ -1384,6 +1420,22 @@ pub fn decode_protocol_samples(
                 character.is_ascii_digit() || character == ':'
             })
         )),
+    }
+}
+
+pub fn decode_transport_samples(
+    analyzer: &ProtocolAnalyzerInstance,
+    samples: &[u32],
+    sample_offset: u64,
+    sample_rate_hz: u64,
+) -> ProtocolDecodeOutcome {
+    match analyzer_transport(analyzer) {
+        Some(TransportKind::I2c) => decode_i2c(analyzer, samples, sample_offset),
+        Some(TransportKind::Spi) => decode_spi(analyzer, samples, sample_offset),
+        Some(TransportKind::Uart) => decode_uart(analyzer, samples, sample_offset, sample_rate_hz),
+        None => ProtocolDecodeOutcome::Unavailable(
+            "Transport decoding is not implemented for this analyzer".to_owned(),
+        ),
     }
 }
 
@@ -2964,6 +3016,16 @@ messages:
         };
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].text, "SPI 165");
+        assert_eq!(events[0].kind, ProtocolDecodedKind::Custom);
+        let snapshot = streaming.snapshot();
+        let ProtocolDecodeOutcome::Events(waveform_events) = &snapshot.waveform_outcomes()[0]
+        else {
+            panic!("raw SPI transfers should remain available to the waveform");
+        };
+        assert!(waveform_events
+            .iter()
+            .any(|event| matches!(event.kind, ProtocolDecodedKind::Spi { .. })));
+        assert!(waveform_events.iter().all(|event| event.text != "SPI 165"));
     }
 
     #[test]
@@ -3059,23 +3121,32 @@ messages:
 
         let mut frame = vec![0xaa, 0x55, 0x05, 0x10, 0x02, 0xd0, 0x07, 0x03];
         frame.push(crc8_smbus(&frame[2..]));
-        let outcome = decode_protocol_samples(
-            &settings.analyzers[0],
-            &uart_8n1(&frame, 10),
-            500,
-            1_152_000,
-        );
+        let samples = uart_8n1(&frame, 10);
+        let outcome = decode_protocol_samples(&settings.analyzers[0], &samples, 500, 1_152_000);
         let ProtocolDecodeOutcome::Events(events) = outcome else {
             panic!("custom UART protocol should be decoded");
         };
 
         assert_eq!(analyzer_name(&settings.analyzers[0]), "Motor Controller");
+        assert_eq!(analyzer_transport_name(&settings.analyzers[0]), "UART");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].text, "Motor 2: 2000 rpm");
         assert!(events[0].detail.contains("speed_rpm=2000 rpm"));
         assert!(!events[0].warning);
         assert_eq!(events[0].kind, ProtocolDecodedKind::Custom);
         assert!(events[0].start_sample >= 500);
+
+        let transport = decode_transport_samples(&settings.analyzers[0], &samples, 500, 1_152_000);
+        let ProtocolDecodeOutcome::Events(transport_events) = transport else {
+            panic!("UART transport bytes should be decoded");
+        };
+        assert_eq!(transport_events.len(), frame.len());
+        assert!(transport_events
+            .iter()
+            .all(|event| matches!(event.kind, ProtocolDecodedKind::Uart { .. })));
+        assert!(transport_events
+            .iter()
+            .all(|event| event.text != "Motor 2: 2000 rpm"));
 
         assert!(settings.clear_custom_protocol(0));
         assert_eq!(analyzer_name(&settings.analyzers[0]), "1:UART");
