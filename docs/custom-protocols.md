@@ -347,6 +347,9 @@ Version 1 supports these bounded strategies:
 
 - `transport_transaction` uses an SPI chip-select transaction or an I2C
   START-to-STOP transaction;
+- `segmented_transport_transaction` reassembles a length-delimited cargo split
+  across consecutive SPI or I2C transactions, using YAML-declared header,
+  continuation, channel, and sequence fields;
 - `gap` ends a UART frame after a configured minimum idle duration;
 - `delimiter` ends a frame at a configured byte sequence;
 - `fixed_length` consumes an exact number of bytes; and

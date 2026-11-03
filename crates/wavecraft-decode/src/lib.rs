@@ -17,7 +17,8 @@ pub use schema::{
     load_protocol_schema, BitDefinition, ByteMatch, ChecksumAlgorithm, ChecksumValidation,
     DisplayOptions, Endian, ExpectedValue, FieldKind, FieldSchema, FramingSchema, InputSchema,
     IntegerType, LengthField, MessageSchema, ProtocolMetadata, ProtocolSchema, ResyncStrategy,
-    SchemaError, StringEncoding, TransportKind, PROTOCOL_SCHEMA_VERSION,
+    SchemaError, SegmentedTransactionSchema, StringEncoding, TransportKind,
+    PROTOCOL_SCHEMA_VERSION,
 };
 pub use transport::{
     decode_i2c_samples, decode_spi_samples, decode_uart_samples, I2cConfig, I2cDecoder, I2cEvent,

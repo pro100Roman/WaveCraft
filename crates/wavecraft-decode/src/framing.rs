@@ -23,9 +23,13 @@ pub struct ByteStreamFramer {
 
 impl ByteStreamFramer {
     pub fn new(framing: FramingSchema) -> Result<Self, DecodeError> {
-        if matches!(framing, FramingSchema::TransportTransaction { .. }) {
+        if matches!(
+            framing,
+            FramingSchema::TransportTransaction { .. }
+                | FramingSchema::SegmentedTransportTransaction { .. }
+        ) {
             return Err(DecodeError::new(
-                "transport_transaction framing consumes complete transport packets",
+                "transport transaction framing consumes complete transport packets",
             ));
         }
         Ok(Self {
@@ -65,7 +69,10 @@ impl ByteStreamFramer {
             FramingSchema::Gap {
                 max_frame_bytes, ..
             } => Ok(self.enforce_gap_limit(max_frame_bytes)),
-            FramingSchema::TransportTransaction { .. } => unreachable!("rejected by constructor"),
+            FramingSchema::TransportTransaction { .. }
+            | FramingSchema::SegmentedTransportTransaction { .. } => {
+                unreachable!("rejected by constructor")
+            }
         }
     }
 

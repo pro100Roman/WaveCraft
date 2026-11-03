@@ -1,7 +1,7 @@
 use crate::{
-    ByteStreamFramer, CustomProtocolDecoder, DecodeDiagnostic, DecodeError, DecodedMessage,
-    FramedBytes, FramingOutput, FramingSchema, ProtocolSchema, SampleRange, Severity, TimedByte,
-    TransportPacket,
+    ByteStreamFramer, CustomProtocolDecoder, DecodeDiagnostic, DecodeError, DecodedMessage, Endian,
+    FramedBytes, FramingOutput, FramingSchema, ProtocolSchema, SampleRange,
+    SegmentedTransactionSchema, Severity, TimedByte, TransportPacket,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -16,11 +16,24 @@ pub struct CustomProtocolRuntime {
     decoder: CustomProtocolDecoder,
     framer: Option<ByteStreamFramer>,
     previous_byte_end: Option<u64>,
+    pending_segment: Option<PendingSegmentedPacket>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSegmentedPacket {
+    packet: TransportPacket,
+    expected_bytes: usize,
+    channel: u8,
+    next_sequence: u8,
 }
 
 impl CustomProtocolRuntime {
     pub fn new(schema: ProtocolSchema) -> Result<Self, DecodeError> {
-        let framer = if matches!(schema.framing, FramingSchema::TransportTransaction { .. }) {
+        let framer = if matches!(
+            schema.framing,
+            FramingSchema::TransportTransaction { .. }
+                | FramingSchema::SegmentedTransportTransaction { .. }
+        ) {
             None
         } else {
             Some(ByteStreamFramer::new(schema.framing.clone())?)
@@ -30,6 +43,7 @@ impl CustomProtocolRuntime {
             schema,
             framer,
             previous_byte_end: None,
+            pending_segment: None,
         })
     }
 
@@ -97,6 +111,13 @@ impl CustomProtocolRuntime {
             };
         }
         if self.framer.is_none() {
+            if let FramingSchema::SegmentedTransportTransaction {
+                max_frame_bytes,
+                segmentation,
+            } = self.schema.framing.clone()
+            {
+                return self.push_segmented_packet(packet, max_frame_bytes, &segmentation);
+            }
             let mut output = ProtocolRuntimeOutput::default();
             self.decode_packet(
                 packet,
@@ -130,6 +151,27 @@ impl CustomProtocolRuntime {
     }
 
     pub fn finish(&mut self) -> ProtocolRuntimeOutput {
+        if let Some(pending) = self.pending_segment.take() {
+            self.previous_byte_end = None;
+            let bytes = pending
+                .packet
+                .streams
+                .get(&self.schema.input.stream)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            return ProtocolRuntimeOutput {
+                messages: Vec::new(),
+                diagnostics: vec![warning_diagnostic(
+                    "protocol.incomplete_segmented_packet",
+                    format!(
+                        "transport stream ended after {} of {} reassembled bytes",
+                        bytes.len(),
+                        pending.expected_bytes
+                    ),
+                    timed_bytes_range(bytes),
+                )],
+            };
+        }
         let Some(frame) = self.framer.as_mut().and_then(ByteStreamFramer::finish) else {
             self.previous_byte_end = None;
             return ProtocolRuntimeOutput::default();
@@ -144,6 +186,7 @@ impl CustomProtocolRuntime {
         self.framer = if matches!(
             self.schema.framing,
             FramingSchema::TransportTransaction { .. }
+                | FramingSchema::SegmentedTransportTransaction { .. }
         ) {
             None
         } else {
@@ -153,6 +196,198 @@ impl CustomProtocolRuntime {
             )
         };
         self.previous_byte_end = None;
+        self.pending_segment = None;
+    }
+
+    fn push_segmented_packet(
+        &mut self,
+        packet: &TransportPacket,
+        max_frame_bytes: usize,
+        segmentation: &SegmentedTransactionSchema,
+    ) -> ProtocolRuntimeOutput {
+        let Some(bytes) = packet.streams.get(&self.schema.input.stream) else {
+            return ProtocolRuntimeOutput {
+                messages: Vec::new(),
+                diagnostics: vec![runtime_diagnostic(
+                    "protocol.missing_stream",
+                    format!(
+                        "transport packet does not contain stream {:?}",
+                        self.schema.input.stream
+                    ),
+                    None,
+                )],
+            };
+        };
+        if bytes.len() < segmentation.header_bytes {
+            let mut output = ProtocolRuntimeOutput::default();
+            self.decode_packet(packet, &mut output, true);
+            return output;
+        }
+
+        let declared_bytes = decode_segmented_length(bytes, segmentation);
+        let is_continuation = bytes[segmentation.continuation.offset].value
+            & segmentation.continuation.mask
+            == segmentation.continuation.value;
+        if declared_bytes < segmentation.header_bytes || declared_bytes > max_frame_bytes {
+            let mut output = ProtocolRuntimeOutput {
+                messages: Vec::new(),
+                diagnostics: vec![runtime_diagnostic(
+                    "protocol.invalid_segmented_length",
+                    format!(
+                        "segmented transaction length {declared_bytes} is outside {}..={max_frame_bytes}",
+                        segmentation.header_bytes
+                    ),
+                    timed_bytes_range(bytes),
+                )],
+            };
+            self.decode_packet(packet, &mut output, false);
+            return output;
+        }
+
+        let channel = bytes[segmentation.channel_offset].value;
+        let sequence = bytes[segmentation.sequence_offset].value;
+        if is_continuation {
+            return self.continue_segmented_packet(
+                packet,
+                declared_bytes,
+                channel,
+                sequence,
+                segmentation,
+            );
+        }
+
+        let mut output = ProtocolRuntimeOutput::default();
+        if let Some(abandoned) = self.pending_segment.take() {
+            let abandoned_bytes = abandoned
+                .packet
+                .streams
+                .get(&self.schema.input.stream)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            output.diagnostics.push(warning_diagnostic(
+                "protocol.segmented_packet_abandoned",
+                "a new transaction started before the previous segmented packet was complete",
+                timed_bytes_range(abandoned_bytes),
+            ));
+        }
+
+        let transferred_bytes = bytes.len().min(declared_bytes);
+        let mut first_packet = packet.clone();
+        first_packet
+            .streams
+            .get_mut(&self.schema.input.stream)
+            .expect("input stream was checked")
+            .truncate(transferred_bytes);
+        if transferred_bytes == declared_bytes {
+            self.decode_packet(
+                &first_packet,
+                &mut output,
+                packet.completeness == crate::PacketCompleteness::Incomplete,
+            );
+        } else {
+            self.pending_segment = Some(PendingSegmentedPacket {
+                packet: first_packet,
+                expected_bytes: declared_bytes,
+                channel,
+                next_sequence: sequence.wrapping_add(1),
+            });
+        }
+        output
+    }
+
+    fn continue_segmented_packet(
+        &mut self,
+        packet: &TransportPacket,
+        declared_bytes: usize,
+        channel: u8,
+        sequence: u8,
+        segmentation: &SegmentedTransactionSchema,
+    ) -> ProtocolRuntimeOutput {
+        let Some(mut pending) = self.pending_segment.take() else {
+            let mut output = ProtocolRuntimeOutput {
+                messages: Vec::new(),
+                diagnostics: vec![warning_diagnostic(
+                    "protocol.orphan_segment_continuation",
+                    "continuation transaction has no preceding packet to reassemble",
+                    packet
+                        .streams
+                        .get(&self.schema.input.stream)
+                        .and_then(|bytes| timed_bytes_range(bytes)),
+                )],
+            };
+            self.decode_packet(packet, &mut output, false);
+            return output;
+        };
+
+        let accumulated = pending
+            .packet
+            .streams
+            .get(&self.schema.input.stream)
+            .map(Vec::len)
+            .unwrap_or_default();
+        let expected_remaining = pending
+            .expected_bytes
+            .saturating_sub(accumulated)
+            .saturating_add(segmentation.header_bytes);
+        if channel != pending.channel
+            || sequence != pending.next_sequence
+            || declared_bytes != expected_remaining
+        {
+            let mut output = ProtocolRuntimeOutput {
+                messages: Vec::new(),
+                diagnostics: vec![warning_diagnostic(
+                    "protocol.segment_continuation_mismatch",
+                    format!(
+                        "continuation does not match pending packet (expected channel {}, sequence {}, remaining length {}; got channel {channel}, sequence {sequence}, length {declared_bytes})",
+                        pending.channel, pending.next_sequence, expected_remaining
+                    ),
+                    packet
+                        .streams
+                        .get(&self.schema.input.stream)
+                        .and_then(|bytes| timed_bytes_range(bytes)),
+                )],
+            };
+            self.decode_packet(packet, &mut output, false);
+            return output;
+        }
+
+        let continuation_bytes = packet
+            .streams
+            .get(&self.schema.input.stream)
+            .expect("input stream was checked");
+        let payload_end = continuation_bytes.len().min(declared_bytes);
+        pending
+            .packet
+            .streams
+            .get_mut(&self.schema.input.stream)
+            .expect("pending input stream exists")
+            .extend_from_slice(&continuation_bytes[segmentation.header_bytes..payload_end]);
+        pending.next_sequence = sequence.wrapping_add(1);
+
+        let accumulated = pending
+            .packet
+            .streams
+            .get(&self.schema.input.stream)
+            .map(Vec::len)
+            .unwrap_or_default();
+        if accumulated < pending.expected_bytes {
+            self.pending_segment = Some(pending);
+            return ProtocolRuntimeOutput::default();
+        }
+
+        pending
+            .packet
+            .streams
+            .get_mut(&self.schema.input.stream)
+            .expect("pending input stream exists")
+            .truncate(pending.expected_bytes);
+        let mut output = ProtocolRuntimeOutput::default();
+        self.decode_packet(
+            &pending.packet,
+            &mut output,
+            packet.completeness == crate::PacketCompleteness::Incomplete,
+        );
+        output
     }
 
     fn decode_framing_output(
@@ -282,6 +517,22 @@ fn timed_bytes_range(bytes: &[TimedByte]) -> Option<SampleRange> {
     })
 }
 
+fn decode_segmented_length(bytes: &[TimedByte], schema: &SegmentedTransactionSchema) -> usize {
+    let length_bytes = &bytes[schema.length_offset..schema.length_offset + schema.length_width];
+    let encoded = match schema.length_endian {
+        Endian::Little => length_bytes
+            .iter()
+            .enumerate()
+            .fold(0_u64, |value, (index, byte)| {
+                value | (u64::from(byte.value) << (index * 8))
+            }),
+        Endian::Big => length_bytes
+            .iter()
+            .fold(0_u64, |value, byte| (value << 8) | u64::from(byte.value)),
+    };
+    usize::try_from(encoded & schema.length_mask).unwrap_or(usize::MAX)
+}
+
 fn runtime_diagnostic(
     code: &str,
     message: impl Into<String>,
@@ -291,6 +542,19 @@ fn runtime_diagnostic(
         code: code.to_owned(),
         message: message.into(),
         severity: Severity::Error,
+        range,
+    }
+}
+
+fn warning_diagnostic(
+    code: &str,
+    message: impl Into<String>,
+    range: Option<SampleRange>,
+) -> DecodeDiagnostic {
+    DecodeDiagnostic {
+        code: code.to_owned(),
+        message: message.into(),
+        severity: Severity::Warning,
         range,
     }
 }

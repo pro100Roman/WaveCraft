@@ -3,9 +3,10 @@
 #
 # WaveCraft protocol/v1 limitations:
 # - one decoded message is emitted per I2C transaction, so only the first SH-2
-#   sensor report following a Base Timestamp (0xFB) is decoded;
-# - SHTP continuations and I2C reads split across several transactions are not
-#   reassembled;
+#   sensor report following a Base Timestamp (0xFB) or Timestamp Rebase (0xFA)
+#   is decoded;
+# - SHTP cargo split across several I2C transactions is reassembled before
+#   SH-2 message selection;
 # - fixed-point sensor values are converted to physical units while the decoder
 #   retains the original signed integer value.
 
@@ -22,13 +23,28 @@ input:
   stream: data
 
 framing:
-  strategy: transport_transaction
+  strategy: segmented_transport_transaction
+  header_bytes: 4
+  length:
+    offset: 0
+    width: 2
+    endian: little
+    mask: 0x7FFF
+  continuation:
+    offset: 1
+    mask: 0x80
+    value: 0x80
+  channel_offset: 2
+  sequence_offset: 3
   max_frame_bytes: 32767
 
 messages:
   - id: product_id_request
     name: Product ID request
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
         value: 0xF9
     fields:
@@ -62,6 +78,9 @@ messages:
   - id: product_id_response
     name: Product ID response
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
         value: 0xF8
     fields:
@@ -112,6 +131,9 @@ messages:
   - id: get_feature_request
     name: Get Feature request
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
         value: 0xFE
     fields:
@@ -168,6 +190,9 @@ messages:
   - id: set_feature_command
     name: Set Feature command
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
         value: 0xFD
     fields:
@@ -243,6 +268,9 @@ messages:
   - id: get_feature_response
     name: Get Feature response
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
         value: 0xFC
     fields:
@@ -318,8 +346,12 @@ messages:
   - id: accelerometer
     name: Accelerometer
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x01
     fields:
@@ -333,14 +365,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x01
@@ -380,8 +414,12 @@ messages:
   - id: raw_accelerometer
     name: Raw accelerometer
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x14
     fields:
@@ -395,14 +433,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x14
@@ -446,8 +486,12 @@ messages:
   - id: gyroscope_calibrated
     name: Gyroscope calibrated
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x02
     fields:
@@ -461,14 +505,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x02
@@ -508,8 +554,12 @@ messages:
   - id: raw_gyroscope
     name: Raw gyroscope
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x15
     fields:
@@ -523,14 +573,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x15
@@ -573,8 +625,12 @@ messages:
   - id: gyroscope_uncalibrated
     name: Gyroscope uncalibrated
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x07
     fields:
@@ -588,14 +644,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x07
@@ -650,8 +708,12 @@ messages:
   - id: magnetic_field_calibrated
     name: Magnetic field calibrated
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x03
     fields:
@@ -665,14 +727,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x03
@@ -712,8 +776,12 @@ messages:
   - id: raw_magnetometer
     name: Raw magnetometer
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x16
     fields:
@@ -727,14 +795,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x16
@@ -778,8 +848,12 @@ messages:
   - id: magnetic_field_uncalibrated
     name: Magnetic field uncalibrated
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x0F
     fields:
@@ -793,14 +867,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x0F
@@ -855,8 +931,12 @@ messages:
   - id: linear_acceleration
     name: Linear acceleration
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x04
     fields:
@@ -870,14 +950,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x04
@@ -917,8 +999,12 @@ messages:
   - id: gravity
     name: Gravity
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x06
     fields:
@@ -932,14 +1018,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x06
@@ -979,8 +1067,12 @@ messages:
   - id: rotation_vector
     name: Rotation vector
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x05
     fields:
@@ -994,14 +1086,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x05
@@ -1047,8 +1141,12 @@ messages:
   - id: game_rotation_vector
     name: Game rotation vector
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x08
     fields:
@@ -1062,14 +1160,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x08
@@ -1110,8 +1210,12 @@ messages:
   - id: geomagnetic_rotation_vector
     name: Geomagnetic rotation vector
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x09
     fields:
@@ -1125,14 +1229,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x09
@@ -1178,8 +1284,12 @@ messages:
   - id: arvr_stabilized_rotation_vector
     name: AR/VR-stabilized rotation vector
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x28
     fields:
@@ -1193,14 +1303,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x28
@@ -1246,8 +1358,12 @@ messages:
   - id: arvr_stabilized_game_rotation_vector
     name: AR/VR-stabilized game rotation vector
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 4
-        value: 0xFB
+        mask: 0xFE
+        value: 0xFA
       - offset: 9
         value: 0x29
     fields:
@@ -1261,14 +1377,16 @@ messages:
           4: input_wakeup
       - name: shtp_sequence
         type: u8
-      - name: base_timestamp_report
+      - name: timestamp_reference
         type: u8
-        expect: 0xFB
+        enum:
+          0xFA: timestamp rebase
+          0xFB: base timestamp
         hidden: true
-      - name: base_delta
+      - name: timestamp_delta
         type: s32le
         display:
-          unit: 100 us ticks before host interrupt
+          unit: signed 100 us ticks
       - name: report_type
         type: u8
         expect: 0x29
@@ -1309,6 +1427,9 @@ messages:
   - id: gyro_integrated_rotation_vector
     name: Gyro-integrated rotation vector
     match:
+      - offset: 1
+        mask: 0x80
+        value: 0
       - offset: 2
         value: 5
     fields:

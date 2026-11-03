@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use wavecraft_decode::{
-    load_protocol_schema, ByteStatus, CustomProtocolDecoder, DecodedValue, FramingSchema,
-    PacketCompleteness, SampleRange, Severity, TimedByte, TransportKind, TransportPacket,
+    load_protocol_schema, ByteStatus, CustomProtocolDecoder, CustomProtocolRuntime, DecodedValue,
+    FramingSchema, PacketCompleteness, SampleRange, Severity, TimedByte, TransportKind,
+    TransportPacket,
 };
 
 const SH2_I2C_SCHEMA: &str = include_str!(concat!(
@@ -11,14 +12,18 @@ const SH2_I2C_SCHEMA: &str = include_str!(concat!(
 ));
 
 fn bytes(values: &[u8]) -> Vec<TimedByte> {
+    bytes_at(values, 0)
+}
+
+fn bytes_at(values: &[u8], first_sample: u64) -> Vec<TimedByte> {
     values
         .iter()
         .enumerate()
         .map(|(index, value)| TimedByte {
             value: *value,
             range: SampleRange {
-                start: (index * 10) as u64,
-                end: (index * 10 + 8) as u64,
+                start: first_sample + (index * 10) as u64,
+                end: first_sample + (index * 10 + 8) as u64,
             },
             status: ByteStatus::default(),
         })
@@ -290,7 +295,7 @@ fn labels_and_scales_sh2_geomagnetic_rotation_vector_report() {
         streams: BTreeMap::from([(
             "data".to_owned(),
             bytes(&[
-                0x17, 0x00, 0x03, 0x6B, 0xFB, 0x00, 0x00, 0x00, 0x00, 0x09, 0x01, 0x03, 0x00, 0x00,
+                0x17, 0x00, 0x03, 0x49, 0xFA, 0x00, 0x00, 0x00, 0x00, 0x09, 0x01, 0x03, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x10,
             ]),
         )]),
@@ -301,6 +306,10 @@ fn labels_and_scales_sh2_geomagnetic_rotation_vector_report() {
     let message = decoder.decode_packet(&packet).unwrap().unwrap();
 
     assert_eq!(message.message_id, "geomagnetic_rotation_vector");
+    assert_eq!(
+        message.fields[3].display.as_deref(),
+        Some("timestamp rebase")
+    );
     assert_eq!(
         message.summary,
         "Geomagnetic rotation vector (orientation from accelerometer + magnetometer) · i 0 · j 0 · k 0 · real 1 · heading accuracy 1 rad · sensor accuracy high"
@@ -355,7 +364,13 @@ fn masks_shtp_continuation_bit_out_of_packet_length() {
     let decoder = CustomProtocolDecoder::new(load_protocol_schema(SH2_I2C_SCHEMA).unwrap());
     let packet = TransportPacket {
         transport: TransportKind::I2c,
-        streams: BTreeMap::from([("data".to_owned(), bytes(&[0x04, 0x80, 0x00, 0x07]))]),
+        streams: BTreeMap::from([(
+            "data".to_owned(),
+            bytes(&[
+                0x19, 0x80, 0x03, 0x07, 0xFB, 0x00, 0x00, 0x00, 0x00, 0x15, 0x07, 0x03, 0x00, 0x34,
+                0x12, 0xFE, 0xFF, 0x00, 0x80, 0x00, 0x00, 0x40, 0xE2, 0x01, 0x00,
+            ]),
+        )]),
         attributes: BTreeMap::new(),
         completeness: PacketCompleteness::Complete,
     };
@@ -363,11 +378,51 @@ fn masks_shtp_continuation_bit_out_of_packet_length() {
     let message = decoder.decode_packet(&packet).unwrap().unwrap();
 
     assert_eq!(message.message_id, "shtp_packet");
-    assert_eq!(message.summary, "SHTP shtp_command · seq 7 · 4 bytes");
-    assert_eq!(message.fields[0].value, DecodedValue::Integer(4));
+    assert_eq!(message.summary, "SHTP input_normal · seq 7 · 25 bytes");
+    assert_eq!(message.fields[0].value, DecodedValue::Integer(25));
     assert_eq!(
         message.fields[0].children[0].value,
         DecodedValue::Boolean(true)
+    );
+}
+
+#[test]
+fn reassembles_shtp_header_read_and_continuation_before_sh2_decode() {
+    let schema = load_protocol_schema(SH2_I2C_SCHEMA).unwrap();
+    let mut runtime = CustomProtocolRuntime::new(schema).unwrap();
+    let header_read = TransportPacket::single_stream(
+        TransportKind::I2c,
+        "data",
+        bytes_at(&[0x17, 0x00, 0x03, 0x48], 0),
+        PacketCompleteness::Complete,
+    );
+    let continuation = TransportPacket::single_stream(
+        TransportKind::I2c,
+        "data",
+        bytes_at(
+            &[
+                0x17, 0x80, 0x03, 0x49, 0xFA, 0x00, 0x00, 0x00, 0x00, 0x09, 0x01, 0x03, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x10,
+            ],
+            100,
+        ),
+        PacketCompleteness::Complete,
+    );
+
+    let first = runtime.push_packet(&header_read, 10_000_000);
+    assert!(first.messages.is_empty());
+    assert!(first.diagnostics.is_empty());
+
+    let completed = runtime.push_packet(&continuation, 10_000_000);
+    assert!(completed.diagnostics.is_empty());
+    assert_eq!(completed.messages.len(), 1);
+    assert_eq!(
+        completed.messages[0].message_id,
+        "geomagnetic_rotation_vector"
+    );
+    assert_eq!(
+        completed.messages[0].summary,
+        "Geomagnetic rotation vector (orientation from accelerometer + magnetometer) · i 0 · j 0 · k 0 · real 1 · heading accuracy 1 rad · sensor accuracy high"
     );
 }
 
@@ -380,8 +435,9 @@ fn loads_documented_sh2_i2c_schema() {
     assert_eq!(schema.messages.len(), 22);
     assert!(matches!(
         schema.framing,
-        FramingSchema::TransportTransaction {
-            max_frame_bytes: 32_767
+        FramingSchema::SegmentedTransportTransaction {
+            max_frame_bytes: 32_767,
+            ..
         }
     ));
     assert!(schema.messages.iter().all(|message| {

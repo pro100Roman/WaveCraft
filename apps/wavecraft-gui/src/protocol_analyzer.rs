@@ -704,8 +704,7 @@ struct I2cProtocolRuntime {
 
 impl I2cProtocolRuntime {
     fn new(schema: ProtocolSchema) -> Result<Self, String> {
-        let transaction_framing =
-            matches!(schema.framing, FramingSchema::TransportTransaction { .. });
+        let transaction_framing = schema.framing.uses_transport_transactions();
         Ok(Self {
             runtime: CustomProtocolRuntime::new(schema).map_err(|error| error.to_string())?,
             transaction_framing,
@@ -876,8 +875,7 @@ struct SpiProtocolRuntime {
 
 impl SpiProtocolRuntime {
     fn new(schema: ProtocolSchema) -> Result<Self, String> {
-        let transaction_framing =
-            matches!(schema.framing, FramingSchema::TransportTransaction { .. });
+        let transaction_framing = schema.framing.uses_transport_transactions();
         Ok(Self {
             runtime: CustomProtocolRuntime::new(schema).map_err(|error| error.to_string())?,
             transaction_framing,
@@ -1515,10 +1513,7 @@ fn decode_custom_spi(
         sample_offset,
     )
     .map_err(|error| error.to_string())?;
-    if matches!(
-        decoder.schema().framing,
-        FramingSchema::TransportTransaction { .. }
-    ) {
+    if decoder.schema().framing.uses_transport_transactions() {
         let mut transactions = BTreeMap::<usize, Vec<TimedByte>>::new();
         for transfer in transfers {
             let value = match decoder.schema().input.stream.as_str() {
@@ -1537,7 +1532,7 @@ fn decode_custom_spi(
                     });
             }
         }
-        decode_custom_transactions(decoder, transactions.into_values())
+        decode_custom_transactions(decoder.schema(), transactions.into_values())
     } else {
         let bytes = transfers
             .into_iter()
@@ -1612,11 +1607,8 @@ fn decode_custom_i2c(
     if active && (!bytes.is_empty() || !attributes.is_empty()) {
         transactions.push((bytes, attributes));
     }
-    if matches!(
-        decoder.schema().framing,
-        FramingSchema::TransportTransaction { .. }
-    ) {
-        let mut messages = Vec::new();
+    if decoder.schema().framing.uses_transport_transactions() {
+        let mut packets = Vec::new();
         for (bytes, attributes) in transactions {
             if bytes.is_empty() {
                 continue;
@@ -1628,14 +1620,9 @@ fn decode_custom_i2c(
                 PacketCompleteness::Complete,
             );
             packet.attributes = attributes;
-            if let Some(message) = decoder
-                .decode_packet(&packet)
-                .map_err(|error| error.to_string())?
-            {
-                messages.push(message);
-            }
+            packets.push(packet);
         }
-        Ok(messages)
+        decode_custom_packets(decoder.schema(), packets)
     } else {
         let bytes = transactions
             .into_iter()
@@ -1646,27 +1633,42 @@ fn decode_custom_i2c(
 }
 
 fn decode_custom_transactions(
-    decoder: &CustomProtocolDecoder,
+    schema: &ProtocolSchema,
     transactions: impl IntoIterator<Item = Vec<TimedByte>>,
 ) -> Result<Vec<DecodedMessage>, String> {
+    let packets = transactions
+        .into_iter()
+        .filter(|bytes| !bytes.is_empty())
+        .map(|bytes| {
+            TransportPacket::single_stream(
+                schema.input.transport,
+                schema.input.stream.clone(),
+                bytes,
+                PacketCompleteness::Complete,
+            )
+        });
+    decode_custom_packets(schema, packets)
+}
+
+fn decode_custom_packets(
+    schema: &ProtocolSchema,
+    packets: impl IntoIterator<Item = TransportPacket>,
+) -> Result<Vec<DecodedMessage>, String> {
+    let mut runtime =
+        CustomProtocolRuntime::new(schema.clone()).map_err(|error| error.to_string())?;
     let mut messages = Vec::new();
-    for bytes in transactions {
-        if bytes.is_empty() {
-            continue;
-        }
-        let packet = TransportPacket::single_stream(
-            decoder.schema().input.transport,
-            decoder.schema().input.stream.clone(),
-            bytes,
-            PacketCompleteness::Complete,
-        );
-        if let Some(message) = decoder
-            .decode_packet(&packet)
-            .map_err(|error| error.to_string())?
+    for packet in packets {
+        let output = runtime.push_packet(&packet, 0);
+        if let Some(diagnostic) = output
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.severity == Severity::Error)
         {
-            messages.push(message);
+            return Err(diagnostic.message.clone());
         }
+        messages.extend(output.messages);
     }
+    messages.extend(runtime.finish().messages);
     Ok(messages)
 }
 

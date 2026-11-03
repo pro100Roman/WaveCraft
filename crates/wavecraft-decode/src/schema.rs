@@ -72,9 +72,25 @@ pub struct LengthField {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SegmentedTransactionSchema {
+    pub header_bytes: usize,
+    pub length_offset: usize,
+    pub length_width: usize,
+    pub length_endian: Endian,
+    pub length_mask: u64,
+    pub continuation: ByteMatch,
+    pub channel_offset: usize,
+    pub sequence_offset: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FramingSchema {
     TransportTransaction {
         max_frame_bytes: usize,
+    },
+    SegmentedTransportTransaction {
+        max_frame_bytes: usize,
+        segmentation: SegmentedTransactionSchema,
     },
     Gap {
         minimum_us: u64,
@@ -97,9 +113,19 @@ pub enum FramingSchema {
 }
 
 impl FramingSchema {
+    pub fn uses_transport_transactions(&self) -> bool {
+        matches!(
+            self,
+            Self::TransportTransaction { .. } | Self::SegmentedTransportTransaction { .. }
+        )
+    }
+
     pub fn max_frame_bytes(&self) -> usize {
         match self {
             Self::TransportTransaction { max_frame_bytes }
+            | Self::SegmentedTransportTransaction {
+                max_frame_bytes, ..
+            }
             | Self::Gap {
                 max_frame_bytes, ..
             }
@@ -461,6 +487,77 @@ fn parse_framing(value: &Yaml, transport: TransportKind) -> Result<FramingSchema
             let max_frame_bytes = optional_frame_limit(map, MAX_FRAME_BYTES)?;
             Ok(FramingSchema::TransportTransaction { max_frame_bytes })
         }
+        "segmented_transport_transaction" => {
+            ensure_only_keys(
+                map,
+                &[
+                    "strategy",
+                    "header_bytes",
+                    "length",
+                    "continuation",
+                    "channel_offset",
+                    "sequence_offset",
+                    "max_frame_bytes",
+                ],
+                path,
+            )?;
+            if transport == TransportKind::Uart {
+                return Err(SchemaError::at(
+                    "framing.strategy",
+                    "segmented_transport_transaction is only valid for SPI or I2C",
+                ));
+            }
+            let max_frame_bytes = optional_frame_limit(map, MAX_FRAME_BYTES)?;
+            let header_bytes = required_usize(map, "header_bytes", "framing.header_bytes")?;
+            if header_bytes == 0 || header_bytes > max_frame_bytes {
+                return Err(SchemaError::at(
+                    "framing.header_bytes",
+                    "header size must be within 1..=max_frame_bytes",
+                ));
+            }
+            let (length_offset, length_width, length_endian, length_mask) =
+                parse_segmented_length(required(map, "length", "framing.length")?)?;
+            if length_offset
+                .checked_add(length_width)
+                .map_or(true, |end| end > header_bytes)
+            {
+                return Err(SchemaError::at(
+                    "framing.length",
+                    "length field must fit within the transaction header",
+                ));
+            }
+            let continuation = parse_segmented_continuation(
+                required(map, "continuation", "framing.continuation")?,
+                header_bytes,
+            )?;
+            let channel_offset = required_usize(map, "channel_offset", "framing.channel_offset")?;
+            let sequence_offset =
+                required_usize(map, "sequence_offset", "framing.sequence_offset")?;
+            for (field, offset) in [
+                ("framing.channel_offset", channel_offset),
+                ("framing.sequence_offset", sequence_offset),
+            ] {
+                if offset >= header_bytes {
+                    return Err(SchemaError::at(
+                        field,
+                        "offset must lie within the transaction header",
+                    ));
+                }
+            }
+            Ok(FramingSchema::SegmentedTransportTransaction {
+                max_frame_bytes,
+                segmentation: SegmentedTransactionSchema {
+                    header_bytes,
+                    length_offset,
+                    length_width,
+                    length_endian,
+                    length_mask,
+                    continuation,
+                    channel_offset,
+                    sequence_offset,
+                },
+            })
+        }
         "gap" => {
             ensure_only_keys(map, &["strategy", "minimum_us", "max_frame_bytes"], path)?;
             if transport != TransportKind::Uart {
@@ -580,6 +677,73 @@ fn parse_framing(value: &Yaml, transport: TransportKind) -> Result<FramingSchema
             format!("unsupported framing strategy {strategy:?}"),
         )),
     }
+}
+
+fn parse_segmented_length(value: &Yaml) -> Result<(usize, usize, Endian, u64), SchemaError> {
+    let path = "framing.length";
+    let map = as_map(value, path)?;
+    ensure_only_keys(map, &["offset", "width", "endian", "mask"], path)?;
+    let offset = required_usize(map, "offset", "framing.length.offset")?;
+    let width = required_usize(map, "width", "framing.length.width")?;
+    if !matches!(width, 1 | 2 | 4) {
+        return Err(SchemaError::at(
+            "framing.length.width",
+            "length width must be 1, 2, or 4 bytes",
+        ));
+    }
+    let endian = match optional_string(map, "endian", "framing.length.endian")?.as_deref() {
+        None | Some("little") => Endian::Little,
+        Some("big") => Endian::Big,
+        Some(other) => {
+            return Err(SchemaError::at(
+                "framing.length.endian",
+                format!("unsupported byte order {other:?}"),
+            ));
+        }
+    };
+    let full_mask = match width {
+        1 => u64::from(u8::MAX),
+        2 => u64::from(u16::MAX),
+        4 => u64::from(u32::MAX),
+        _ => unreachable!(),
+    };
+    let mask = optional_u64(map, "mask", "framing.length.mask")?.unwrap_or(full_mask);
+    if mask == 0 || mask & !full_mask != 0 {
+        return Err(SchemaError::at(
+            "framing.length.mask",
+            "length mask must select at least one bit within the configured width",
+        ));
+    }
+    Ok((offset, width, endian, mask))
+}
+
+fn parse_segmented_continuation(
+    value: &Yaml,
+    header_bytes: usize,
+) -> Result<ByteMatch, SchemaError> {
+    let path = "framing.continuation";
+    let map = as_map(value, path)?;
+    ensure_only_keys(map, &["offset", "value", "mask"], path)?;
+    let offset = required_usize(map, "offset", "framing.continuation.offset")?;
+    if offset >= header_bytes {
+        return Err(SchemaError::at(
+            "framing.continuation.offset",
+            "continuation flag must lie within the transaction header",
+        ));
+    }
+    let mask = optional_u8(map, "mask", "framing.continuation.mask")?.unwrap_or(u8::MAX);
+    let value = required_u8(map, "value", "framing.continuation.value")?;
+    if mask == 0 || value & !mask != 0 {
+        return Err(SchemaError::at(
+            "framing.continuation",
+            "continuation value must use only bits selected by its non-zero mask",
+        ));
+    }
+    Ok(ByteMatch {
+        offset,
+        value,
+        mask,
+    })
 }
 
 fn parse_length_field(value: &Yaml) -> Result<LengthField, SchemaError> {
@@ -1376,6 +1540,12 @@ fn optional_bool(map: &Hash, key: &str, path: &str) -> Result<Option<bool>, Sche
 
 fn required_u64(map: &Hash, key: &str, path: &str) -> Result<u64, SchemaError> {
     parse_u64(required(map, key, path)?, path)
+}
+
+fn optional_u64(map: &Hash, key: &str, path: &str) -> Result<Option<u64>, SchemaError> {
+    get(map, key)
+        .map(|value| parse_u64(value, path))
+        .transpose()
 }
 
 fn required_usize(map: &Hash, key: &str, path: &str) -> Result<usize, SchemaError> {
