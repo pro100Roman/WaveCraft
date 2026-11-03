@@ -98,6 +98,7 @@ const SESSION_NAME_MAX_CHARS: usize = 48;
 const DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY: u8 = 128;
 const LOGIC_MARKER_EDGE_SNAP_DISTANCE: f32 = 8.0;
 const CAPTURE_FILE_BUTTON_WIDTH: f32 = 82.0;
+const DECODED_PANEL_ACTION_BUTTON_SIZE: [f32; 2] = [26.0, 24.0];
 static SCOPE_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
 static LOGIC_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
 
@@ -2253,6 +2254,101 @@ fn decoded_panel_entry_id(
     ))
 }
 
+fn paint_decoded_analyzer_messages(
+    ui: &mut egui::Ui,
+    analyzer: &ProtocolAnalyzerInstance,
+    events: &[ProtocolDecodedEvent],
+    entries: &[DecodedPanelEntry],
+    open_all: Option<bool>,
+    sample_rate_hz: u64,
+) -> Option<(u64, u64)> {
+    let mut selected_range = None;
+    if analyzer.data_format == ProtocolDataFormat::Ascii {
+        if let Some(text) = uart_ascii_text(events) {
+            ui.add_space(5.0);
+            ui.label(RichText::new("TEXT").small().strong().color(TEXT_MUTED));
+            egui::Frame::none()
+                .fill(BACKGROUND)
+                .rounding(egui::Rounding::same(5.0))
+                .inner_margin(egui::Margin::same(8.0))
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(RichText::new(text).monospace()).wrap());
+                });
+        }
+    }
+    if entries.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new("No decoded operations").color(TEXT_MUTED));
+        return None;
+    }
+    ui.add_space(6.0);
+    for entry in entries {
+        let card_width = ui.available_width();
+        let entry_id = decoded_panel_entry_id(ui, analyzer, entry);
+        let mut open = open_all
+            .unwrap_or_else(|| ui.data(|data| data.get_temp::<bool>(entry_id).unwrap_or(false)));
+        if open_all.is_some() {
+            ui.data_mut(|data| data.insert_temp(entry_id, open));
+        }
+        let time = protocol_event_elapsed(entry.start_sample, sample_rate_hz)
+            .map(format_duration)
+            .unwrap_or_default();
+        let color = if entry.warning {
+            Color32::LIGHT_RED
+        } else {
+            Color32::WHITE
+        };
+        let card = egui::Frame::none()
+            .fill(BACKGROUND)
+            .rounding(egui::Rounding::same(5.0))
+            .inner_margin(egui::Margin::same(8.0))
+            .show(ui, |ui| {
+                let content_width = (card_width - 16.0).max(0.0);
+                ui.set_width(content_width);
+                ui.set_max_width(content_width);
+                let header = ui.horizontal(|ui| {
+                    ui.label(RichText::new(if open { "▼" } else { "▶" }).color(TEXT_MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        ui.label(RichText::new(&time).small().monospace().color(TEXT_MUTED));
+                        ui.add(
+                            egui::Label::new(RichText::new(&entry.title).strong().color(color))
+                                .wrap()
+                                .halign(egui::Align::Min),
+                        );
+                    });
+                });
+                let header_response = ui
+                    .interact(
+                        header.response.rect,
+                        entry_id.with("header"),
+                        Sense::click(),
+                    )
+                    .on_hover_text("Expand or collapse message data");
+                if header_response.clicked() {
+                    open = !open;
+                    ui.data_mut(|data| data.insert_temp(entry_id, open));
+                }
+                if open {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(&entry.detail).small().monospace())
+                            .wrap()
+                            .sense(Sense::click()),
+                    )
+                    .on_hover_text("Click to focus this message in the waveform")
+                    .clicked()
+                } else {
+                    false
+                }
+            });
+        if card.inner {
+            selected_range = Some((entry.start_sample, entry.end_sample));
+        }
+        ui.add_space(5.0);
+    }
+    selected_range
+}
+
 fn paint_decoded_data_panel(
     ui: &mut egui::Ui,
     analyzers: &[ProtocolAnalyzerInstance],
@@ -2291,127 +2387,57 @@ fn paint_decoded_data_panel(
                         ui.data(|data| data.get_temp::<bool>(entry_id).unwrap_or(false))
                     });
                 let mut open_all = None;
-                ui.horizontal(|ui| {
+                let remaining_analyzers = analyzers.len() - analyzer_index;
+                let remaining_separator_height =
+                    17.0 * remaining_analyzers.saturating_sub(1) as f32;
+                let analyzer_height = ((ui.available_height() - remaining_separator_height)
+                    / remaining_analyzers as f32)
+                    .max(DECODED_PANEL_ACTION_BUTTON_SIZE[1] + 32.0);
+                let header = ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(name)
                             .strong()
                             .color(logic_marker_color(analyzer_index)),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                !entries.is_empty(),
-                                toolbar_action_button(if all_open { "⊟" } else { "⊞" }, ACCENT)
-                                    .small(),
-                            )
+                        let response = ui
+                            .add_enabled_ui(!entries.is_empty(), |ui| {
+                                ui.add_sized(
+                                    DECODED_PANEL_ACTION_BUTTON_SIZE,
+                                    toolbar_action_button(if all_open { "⊟" } else { "⊞" }, ACCENT),
+                                )
+                            })
+                            .inner
                             .on_hover_text(if all_open {
                                 "Collapse all messages for this analyzer"
                             } else {
                                 "Expand all messages for this analyzer"
-                            })
-                            .clicked()
-                        {
+                            });
+                        if response.clicked() {
                             open_all = Some(!all_open);
                         }
                     });
                 });
-                if analyzer.data_format == ProtocolDataFormat::Ascii {
-                    if let Some(text) = uart_ascii_text(events) {
-                        ui.add_space(5.0);
-                        ui.label(RichText::new("TEXT").small().strong().color(TEXT_MUTED));
-                        egui::Frame::none()
-                            .fill(BACKGROUND)
-                            .rounding(egui::Rounding::same(5.0))
-                            .inner_margin(egui::Margin::same(8.0))
-                            .show(ui, |ui| {
-                                ui.add(egui::Label::new(RichText::new(text).monospace()).wrap());
-                            });
-                    }
-                }
-                if entries.is_empty() {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("No decoded operations").color(TEXT_MUTED));
-                    continue;
-                }
-                ui.add_space(6.0);
-                for entry in &entries {
-                    let card_width = ui.available_width();
-                    let entry_id = decoded_panel_entry_id(ui, analyzer, entry);
-                    let mut open = open_all.unwrap_or_else(|| {
-                        ui.data(|data| data.get_temp::<bool>(entry_id).unwrap_or(false))
-                    });
-                    if open_all.is_some() {
-                        ui.data_mut(|data| data.insert_temp(entry_id, open));
-                    }
-                    let time = protocol_event_elapsed(entry.start_sample, sample_rate_hz)
-                        .map(format_duration)
-                        .unwrap_or_default();
-                    let color = if entry.warning {
-                        Color32::LIGHT_RED
-                    } else {
-                        Color32::WHITE
-                    };
-                    let card = egui::Frame::none()
-                        .fill(BACKGROUND)
-                        .rounding(egui::Rounding::same(5.0))
-                        .inner_margin(egui::Margin::same(8.0))
-                        .show(ui, |ui| {
-                            let content_width = (card_width - 16.0).max(0.0);
-                            ui.set_width(content_width);
-                            ui.set_max_width(content_width);
-                            let header = ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(if open { "▼" } else { "▶" }).color(TEXT_MUTED),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::TOP),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(&time)
-                                                .small()
-                                                .monospace()
-                                                .color(TEXT_MUTED),
-                                        );
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&entry.title).strong().color(color),
-                                            )
-                                            .wrap()
-                                            .halign(egui::Align::Min),
-                                        );
-                                    },
-                                );
-                            });
-                            let header_response = ui
-                                .interact(
-                                    header.response.rect,
-                                    entry_id.with("header"),
-                                    Sense::click(),
-                                )
-                                .on_hover_text("Expand or collapse message data");
-                            if header_response.clicked() {
-                                open = !open;
-                                ui.data_mut(|data| data.insert_temp(entry_id, open));
-                            }
-                            if open {
-                                ui.add_space(4.0);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&entry.detail).small().monospace(),
-                                    )
-                                    .wrap()
-                                    .sense(Sense::click()),
-                                )
-                                .on_hover_text("Click to focus this message in the waveform")
-                                .clicked()
-                            } else {
-                                false
-                            }
-                        });
-                    if card.inner {
-                        selected_range = Some((entry.start_sample, entry.end_sample));
-                    }
-                    ui.add_space(5.0);
+                let message_area_height =
+                    (analyzer_height - header.response.rect.height()).max(24.0);
+                let clicked_range = egui::ScrollArea::vertical()
+                    .id_salt(("decoded_analyzer_messages", analyzer.instance_id))
+                    .max_height(message_area_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        paint_decoded_analyzer_messages(
+                            ui,
+                            analyzer,
+                            events,
+                            &entries,
+                            open_all,
+                            sample_rate_hz,
+                        )
+                    })
+                    .inner;
+                if clicked_range.is_some() {
+                    selected_range = clicked_range;
                 }
             }
         }
@@ -8654,7 +8680,7 @@ impl eframe::App for WaveCraftApp {
                                                         |ui| {
                                                             if ui
                                                                 .add_sized(
-                                                                    [26.0, 24.0],
+                                                                    DECODED_PANEL_ACTION_BUTTON_SIZE,
                                                                     toolbar_action_button(
                                                                         "▶", ACCENT,
                                                                     ),
@@ -8670,18 +8696,13 @@ impl eframe::App for WaveCraftApp {
                                                     );
                                                 });
                                                 ui.add_space(8.0);
-                                                egui::ScrollArea::vertical()
-                                                    .auto_shrink([false, false])
-                                                    .show(ui, |ui| {
-                                                        ui.set_width(ui.available_width());
-                                                        selected_range = paint_decoded_data_panel(
-                                                            ui,
-                                                            &protocol_analyzer_for_waveform
-                                                                .analyzers,
-                                                            decoded_outcomes.as_ref(),
-                                                            sample_rate_hz,
-                                                        );
-                                                    });
+                                                ui.set_width(ui.available_width());
+                                                selected_range = paint_decoded_data_panel(
+                                                    ui,
+                                                    &protocol_analyzer_for_waveform.analyzers,
+                                                    decoded_outcomes.as_ref(),
+                                                    sample_rate_hz,
+                                                );
                                             });
                                     },
                                 );
@@ -8712,7 +8733,7 @@ impl eframe::App for WaveCraftApp {
                                                 );
                                                 if ui
                                                     .add_sized(
-                                                        [26.0, 24.0],
+                                                        DECODED_PANEL_ACTION_BUTTON_SIZE,
                                                         toolbar_action_button("◀", ACCENT),
                                                     )
                                                     .on_hover_text("Expand decoded data")
