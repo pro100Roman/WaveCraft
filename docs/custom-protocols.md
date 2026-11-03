@@ -6,14 +6,13 @@ decoder exist in `wavecraft-decode`. Stateful UART, SPI, and I2C decoders retain
 transport state across arbitrary sample chunks, reject discontinuities until
 explicitly reset, and report incomplete state when finished. A persistent
 custom-protocol runtime likewise retains framing state across timed-byte
-batches. The GUI still uses the stateless compatibility functions to adapt
-transport results to its existing presentation model. It can load and validate
-a YAML schema, attach it to a configured UART, SPI, or I2C analyzer, map
-channels, and render generic decoded messages in the waveform and decoded-data
-panel.
-It currently decodes only when the GUI retains every raw sample. Moving decode
-to an independent capture-stream consumer and adding project persistence remain
-to be implemented.
+batches. The GUI owns one persistent runtime per configured analyzer during
+live capture and while opening native or Saleae recordings. It consumes every
+logic batch before display retention, bounds decoded history independently,
+and renders the results in the waveform and decoded-data panel. The stateless
+display-window path remains as a compatibility fallback when an analyzer is
+added only after a capture has completed. Project persistence remains to be
+implemented.
 
 WaveCraft custom protocols describe the meaning of bytes that a first-party
 transport decoder has already recovered from logic samples. Version 1 uses a
@@ -82,33 +81,7 @@ no longer contain every raw sample.
 
 ## Continuous and Loop capture
 
-The current GUI can decode in DSLogic Loop mode, but only within the retained
-rolling waveform window. Loop requires DSLogic Stream mode and configures the
-display store with a raw-sample stride of one. Its capacity is the selected
-logic sample count capped at 2,000,000 samples. Therefore ordinary UART, SPI,
-or I2C transactions and their custom YAML messages decode when the complete
-transport frame and protocol packet lie inside that window.
-
-This is not yet full continuous decoding. `ProtocolDecodeCache` currently
-reconstructs the raw words from the display store and reruns each stateless
-transport decoder and YAML parser whenever the waveform revision changes. As
-the rolling window advances:
-
-- decoded events disappear when their source samples are evicted;
-- a transaction or packet whose beginning crossed the left boundary may be
-  lost or reported as incomplete;
-- a packet at the right boundary appears only after the remaining bytes enter
-  the window;
-- transport and framing state is not retained independently of the window; and
-- repeatedly decoding the complete window can become expensive at high sample
-  rates or with several analyzers.
-
-When native recording is enabled, `.dsv` still receives every raw capture
-batch emitted during Loop mode. The current GUI recording loader nevertheless
-builds another bounded `WaveformStore`, so reopening the file does not yet run
-the decoder over its complete frame stream.
-
-The target path separates decoding from display retention:
+The GUI separates decoding from display retention:
 
 ```text
 CaptureFrame
@@ -124,15 +97,27 @@ Each configured analyzer instance owns an incremental runtime. It consumes
 every ordered raw logic batch before display downsampling or eviction, retains
 partial symbols, transport transactions, and framed bytes across chunk
 boundaries, and emits events with absolute sample ranges. A normal capture stop
-flushes incomplete state with an explicit diagnostic. A source discontinuity,
+flushes incomplete state with an explicit diagnostic. Decoded timestamps are
+derived from those absolute ranges, so rolling-display eviction does not reset
+their time origin. A source discontinuity,
 new acquisition, channel remap, sample-rate change, or analyzer configuration
 change resets the affected stages rather than joining unrelated samples.
 
 Decoded-event retention is bounded separately from raw waveform retention.
-Older UI events may be discarded without changing recorder or decoder input.
-Offline decoding streams every `CaptureFrame` from `.dsv` through the same
-runtime, so live and offline results are identical for the same recording,
-analyzer settings, schema snapshot, and decoder versions.
+The GUI currently keeps the newest 10,000 events per analyzer; older UI events
+may be discarded without changing recorder or decoder input. Loop-mode decode
+therefore continues across the rolling waveform's left boundary. Native `.dsv`
+loading streams every `CaptureFrame` through the same runtime, and Saleae
+loading streams its complete digital sample set before building the display
+store.
+
+Analyzer configuration is captured when acquisition or recording loading
+starts. Adding or changing an analyzer only after a capture has completed uses
+the stateless `ProtocolDecodeCache` compatibility path over the retained raw
+display window. Reopening the recording with that analyzer configured runs the
+complete offline stream. Project persistence will remove the need for this
+manual ordering by restoring analyzer settings and schema snapshots before the
+recording pass begins.
 
 ## Crate boundaries
 
@@ -652,7 +637,8 @@ live and after a `.dsv` round trip and require identical results.
    behavior through adapters.
 4. Move decoder execution from `ProtocolDecodeCache` to persistent analyzer
    runtimes that consume live and recorded `CaptureFrame` streams, including
-   Loop-mode boundary, reset, flush, and bounded-history behavior.
+   Loop-mode boundary, reset, flush, and bounded-history behavior. Implemented;
+   `ProtocolDecodeCache` remains only as the post-capture compatibility path.
 5. Add YAML DTOs, strict validation, immutable execution plans, and bounded
    framing and field parsing.
 6. Replace GUI-specific decoded kinds with generic message and field rendering.

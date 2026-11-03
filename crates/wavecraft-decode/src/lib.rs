@@ -21,5 +21,6 @@ pub use schema::{
 };
 pub use transport::{
     decode_i2c_samples, decode_spi_samples, decode_uart_samples, I2cConfig, I2cDecoder, I2cEvent,
-    SpiConfig, SpiDecoder, SpiTransfer, TransportDecodeError, UartConfig, UartDecode, UartDecoder,
+    SpiConfig, SpiDecoder, SpiTransactionEnd, SpiTransfer, TransportDecodeError, UartConfig,
+    UartDecode, UartDecoder,
 };

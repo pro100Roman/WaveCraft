@@ -54,11 +54,11 @@ timed packet bytes. Only then may a custom YAML schema assign application-level
 meaning to fields. YAML schemas do not implement filters, carrier recovery,
 symbol timing, or bit slicing.
 
-The target live and offline paths use the same incremental engine. Decoders
-subscribe to ordered capture data independently of the GUI's bounded display
-buffers, so waveform downsampling cannot change protocol results. The current
-GUI still re-decodes only its retained raw display window; its exact Loop-mode
-behavior and migration plan are documented under
+Live capture and recording loading use the same incremental engine. Decoders
+consume ordered capture data independently of the GUI's bounded display
+buffers, so waveform downsampling does not change protocol results. A
+display-window compatibility path remains for analyzers configured only after
+a capture has completed; its behavior is documented under
 [Continuous and Loop capture](custom-protocols.md#continuous-and-loop-capture).
 
 First-party SPI and I2C decoders will implement the same decoder contract as
@@ -145,8 +145,11 @@ security-enabled U2Pro16/PGL12 models, completes the EEPROM-backed FPGA
 challenge before declaring an instrument ready for acquisition.
 
 Bulk-IN acquisition uses queued asynchronous libusb transfers so reads are
-already pending when an instrument starts. The shared DSLogic driver implements
-the legacy and U2/U3 profile matrix, including packed FPGA settings,
+already pending when an instrument starts. Continuous paths replenish every
+completed queue slot before decoding or publishing data: DSLogic keeps four
+SuperSpeed or five HighSpeed payload reads in flight, while DSCope keeps ten
+complete frame reads queued. The shared DSLogic driver implements the legacy
+and U2/U3 profile matrix, including packed FPGA settings,
 arm/start/stop commands, trigger-header validation, and conversion of
 channel-major 64-sample bitmaps into `LogicBatch` sample words. It selects the
 profile's clock generator, threshold conversion, USB header size, memory/rate

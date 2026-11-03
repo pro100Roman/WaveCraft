@@ -2318,13 +2318,12 @@ fn read_continuous_capture_inner(
             trigger_header = Some(header);
         }
 
-        while payload_reads
-            .front()
-            .is_some_and(QueuedBulkRead::is_complete)
+        let mut completed_payloads = Vec::with_capacity(CONTINUOUS_QUEUED_FRAMES);
+        while trigger_header.is_some()
+            && payload_reads
+                .front()
+                .is_some_and(QueuedBulkRead::is_complete)
         {
-            let Some(current_trigger_header) = trigger_header.as_ref() else {
-                break;
-            };
             let completed = payload_reads
                 .pop_front()
                 .expect("the completed continuous scope payload read is present");
@@ -2337,7 +2336,10 @@ fn read_continuous_capture_inner(
                     .queue_bulk_read(payload_bytes)
                     .map_err(capture_error)?,
             );
+            completed_payloads.push(payload);
+        }
 
+        for payload in completed_payloads {
             let footer = &payload[payload_bytes - MEASUREMENT_FOOTER_BYTES..];
             if !ScopeMeasurement::is_ready(footer, *config) {
                 continue;
@@ -2350,7 +2352,10 @@ fn read_continuous_capture_inner(
             let capture_origin = context.elapsed().saturating_sub(frame_duration);
             decode_capture(
                 RawScopeCapture {
-                    trigger_header: current_trigger_header.clone(),
+                    trigger_header: trigger_header
+                        .as_ref()
+                        .expect("continuous payloads require a trigger header")
+                        .clone(),
                     payload,
                     capture_origin,
                 },

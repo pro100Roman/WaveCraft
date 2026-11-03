@@ -1,4 +1,4 @@
-use crate::{ByteStatus, DecodeDiagnostic, SampleRange, Severity, TimedByte};
+use crate::{ByteStatus, DecodeDiagnostic, PacketCompleteness, SampleRange, Severity, TimedByte};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -226,6 +226,7 @@ pub struct SpiDecoder {
     transaction_index: usize,
     next_transaction_index: usize,
     transaction_start: Option<u64>,
+    completed_transactions: Vec<SpiTransactionEnd>,
     miso: u8,
     mosi: u8,
     bit_count: u8,
@@ -260,6 +261,7 @@ impl SpiDecoder {
             transaction_index: 0,
             next_transaction_index: 0,
             transaction_start: None,
+            completed_transactions: Vec::new(),
             miso: 0,
             mosi: 0,
             bit_count: 0,
@@ -290,6 +292,16 @@ impl SpiDecoder {
             };
             let previous_clock = channel_is_high(previous_sample, self.config.clock_channel);
             let clock = channel_is_high(sample, self.config.clock_channel);
+            if !selected && self.previous_selected {
+                self.completed_transactions.push(SpiTransactionEnd {
+                    transaction_index: self.transaction_index,
+                    completeness: if self.bit_count == 0 {
+                        PacketCompleteness::Complete
+                    } else {
+                        PacketCompleteness::Incomplete
+                    },
+                });
+            }
             if selected && !self.previous_selected {
                 self.transaction_index = self.next_transaction_index;
                 self.next_transaction_index = self.next_transaction_index.saturating_add(1);
@@ -333,6 +345,10 @@ impl SpiDecoder {
         Ok(transfers)
     }
 
+    pub fn take_completed_transactions(&mut self) -> Vec<SpiTransactionEnd> {
+        std::mem::take(&mut self.completed_transactions)
+    }
+
     pub fn finish(&mut self) -> Vec<DecodeDiagnostic> {
         let mut diagnostics = Vec::new();
         if self.bit_count > 0 {
@@ -361,6 +377,7 @@ impl SpiDecoder {
         self.transaction_index = 0;
         self.next_transaction_index = 0;
         self.transaction_start = None;
+        self.completed_transactions.clear();
         self.miso = 0;
         self.mosi = 0;
         self.bit_count = 0;
@@ -373,6 +390,12 @@ pub struct SpiTransfer {
     pub range: SampleRange,
     pub mosi: Option<u8>,
     pub miso: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpiTransactionEnd {
+    pub transaction_index: usize,
+    pub completeness: PacketCompleteness,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1114,14 +1137,23 @@ mod tests {
         let expected = decode_spi_samples(config, &samples, 50).unwrap();
         let mut decoder = SpiDecoder::new(config).unwrap();
         let mut actual = Vec::new();
+        let mut completed_transactions = Vec::new();
         for (offset, chunk) in samples.chunks(5).enumerate() {
             actual.extend(
                 decoder
                     .push_samples(chunk, 50 + (offset * 5) as u64)
                     .unwrap(),
             );
+            completed_transactions.extend(decoder.take_completed_transactions());
         }
         assert_eq!(actual, expected);
+        assert_eq!(
+            completed_transactions,
+            [SpiTransactionEnd {
+                transaction_index: 0,
+                completeness: PacketCompleteness::Complete,
+            }]
+        );
         assert!(decoder.finish().is_empty());
     }
 

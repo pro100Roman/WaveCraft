@@ -30,7 +30,6 @@ const SUPER_SPEED_TRANSFER_MILLISECONDS: u64 = 10;
 const SUPER_SPEED_QUEUED_TRANSFERS: usize = 4;
 const HIGH_SPEED_TRANSFER_MILLISECONDS: u64 = 20;
 const HIGH_SPEED_QUEUED_TRANSFERS: usize = 5;
-const LOOP_TRANSFER_MILLISECONDS: u64 = 20;
 pub const DSLOGIC_MAX_BUFFER_SAMPLE_COUNT: u64 = 134_217_728;
 // Match the original 64-bit application's software capture depth. Stream-mode
 // data is consumed in batches, so it is not constrained by the FPGA buffer.
@@ -608,7 +607,16 @@ fn run_capture(
         session
             .arm_capture_extended(&settings, extended_settings.as_deref())
             .map_err(capture_error)?;
-        if config.operation_mode == DsLogicOperationMode::Stream && !config.loop_mode {
+        if config.operation_mode == DsLogicOperationMode::Stream {
+            if config.loop_mode {
+                return read_loop_stream_capture(
+                    session,
+                    config,
+                    speed,
+                    model.logic_trigger_header_bytes(),
+                    context,
+                );
+            }
             return read_stream_capture(
                 session,
                 config,
@@ -671,6 +679,129 @@ fn read_stream_capture(
     );
     let cleanup_result = cancel_pending_stream_reads(session, &mut header_read, &mut payload_reads);
     combine_results(capture_result, cleanup_result, "cancel queued stream reads")
+}
+
+fn read_loop_stream_capture(
+    session: &UsbDeviceSession,
+    config: DsLogicCaptureConfig,
+    speed: UsbSpeedClass,
+    trigger_header_bytes: usize,
+    context: &CaptureContext,
+) -> Result<(), CaptureError> {
+    let mut header_read = None;
+    let mut payload_reads = VecDeque::new();
+    let capture_result = read_loop_stream_capture_inner(
+        session,
+        config,
+        speed,
+        trigger_header_bytes,
+        context,
+        &mut header_read,
+        &mut payload_reads,
+    );
+    let cleanup_result = cancel_pending_stream_reads(session, &mut header_read, &mut payload_reads);
+    combine_results(
+        capture_result,
+        cleanup_result,
+        "cancel queued loop-stream reads",
+    )
+}
+
+fn read_loop_stream_capture_inner(
+    session: &UsbDeviceSession,
+    config: DsLogicCaptureConfig,
+    speed: UsbSpeedClass,
+    trigger_header_bytes: usize,
+    context: &CaptureContext,
+    header_read: &mut Option<QueuedBulkRead>,
+    payload_reads: &mut VecDeque<PendingStreamRead>,
+) -> Result<(), CaptureError> {
+    let (transfer_bytes, queued_transfer_count) = stream_transfer_plan(speed, config);
+    *header_read = Some(
+        session
+            .queue_bulk_read(trigger_header_bytes)
+            .map_err(capture_error)?,
+    );
+    while payload_reads.len() < queued_transfer_count {
+        payload_reads.push_back(queue_stream_payload_read(session, transfer_bytes, config)?);
+    }
+
+    context.synchronize_start()?;
+    let capture_origin = context.elapsed();
+    session.start_capture().map_err(capture_error)?;
+
+    let mut header_complete = false;
+    let mut sample_offset = 0_u64;
+    let mut sequence = 0_u64;
+    loop {
+        if context.is_cancelled() {
+            return Ok(());
+        }
+
+        if header_read
+            .as_ref()
+            .is_some_and(QueuedBulkRead::is_complete)
+        {
+            let completed = header_read
+                .take()
+                .expect("the completed loop-stream header read is present");
+            let header = match completed.finish().map_err(capture_error)? {
+                QueuedBulkReadOutcome::Data(data) => data,
+                QueuedBulkReadOutcome::Cancelled => {
+                    return Err(CaptureError::new(
+                        "DSLogic loop-stream trigger-header transfer was unexpectedly cancelled",
+                    ));
+                }
+            };
+            TriggerPosition::decode(&header, trigger_header_bytes)?;
+            header_complete = true;
+        }
+
+        let mut completed_payloads = Vec::with_capacity(queued_transfer_count);
+        while header_complete
+            && payload_reads
+                .front()
+                .is_some_and(|pending| pending.transfer.is_complete())
+        {
+            let pending = payload_reads
+                .pop_front()
+                .expect("the completed loop-stream payload read is present");
+            let payload = match pending.transfer.finish().map_err(capture_error)? {
+                QueuedBulkReadOutcome::Data(data) => data,
+                QueuedBulkReadOutcome::Cancelled => {
+                    return Err(CaptureError::new(
+                        "DSLogic loop-stream payload transfer was unexpectedly cancelled",
+                    ));
+                }
+            };
+            if payload.is_empty() {
+                return Err(CaptureError::new(
+                    "the DSLogic loop-stream endpoint returned an empty transfer",
+                ));
+            }
+
+            // Keep the host-side queue full before decoding or publishing the
+            // completed payload. Those operations can block long enough for a
+            // continuously streaming device to overflow if no read is pending.
+            payload_reads.push_back(queue_stream_payload_read(session, transfer_bytes, config)?);
+            completed_payloads.push(payload);
+        }
+
+        for payload in completed_payloads {
+            emit_wire_batch(
+                &payload,
+                config,
+                capture_origin,
+                context,
+                &mut sequence,
+                &mut sample_offset,
+            )?;
+        }
+
+        session
+            .handle_usb_events(Duration::from_millis(5))
+            .map_err(capture_error)?;
+    }
 }
 
 fn read_stream_capture_inner(
@@ -906,11 +1037,7 @@ fn read_capture(
             prequeued.payload.len()
         )));
     }
-    let read_buffer_bytes = if config.loop_mode {
-        loop_transfer_bytes(config)
-    } else {
-        aligned_transfer_bytes(CAPTURE_READ_BYTES, config)
-    };
+    let read_buffer_bytes = aligned_transfer_bytes(CAPTURE_READ_BYTES, config);
     let mut wire_buffer = vec![0_u8; read_buffer_bytes];
     let mut sample_offset = 0_u64;
     let mut sequence = 0_u64;
@@ -924,18 +1051,6 @@ fn read_capture(
             &mut sample_offset,
         )?;
     }
-    if config.loop_mode {
-        return read_loop_capture(
-            session,
-            config,
-            context,
-            &mut wire_buffer,
-            prequeued.capture_origin,
-            &mut sequence,
-            &mut sample_offset,
-        );
-    }
-
     let mut bytes_remaining = total_bytes - prequeued.payload.len();
     let conservative_transfer_time = Duration::from_secs_f64(total_bytes as f64 / 10_000_000.0);
     let payload_deadline = Instant::now() + conservative_transfer_time + PAYLOAD_TRANSFER_GRACE;
@@ -967,14 +1082,6 @@ fn read_capture(
     Ok(())
 }
 
-fn loop_transfer_bytes(config: DsLogicCaptureConfig) -> usize {
-    let bytes_per_second =
-        config.sample_rate_hz as u128 * u128::from(config.enabled_channel_count()) / 8;
-    let target = (bytes_per_second * u128::from(LOOP_TRANSFER_MILLISECONDS) / 1_000)
-        .min(PREQUEUED_DATA_BYTES as u128) as usize;
-    aligned_transfer_bytes(target, config)
-}
-
 fn aligned_transfer_bytes(target: usize, config: DsLogicCaptureConfig) -> usize {
     let cross_block_bytes = config.enabled_channel_count() as usize * BYTES_PER_CHANNEL_BLOCK;
     let alignment = least_common_multiple(cross_block_bytes, USB_TRANSFER_ALIGNMENT);
@@ -990,31 +1097,6 @@ fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
         (left, right) = (right, left % right);
     }
     left
-}
-
-#[allow(clippy::too_many_arguments)]
-fn read_loop_capture(
-    session: &UsbDeviceSession,
-    config: DsLogicCaptureConfig,
-    context: &CaptureContext,
-    wire_buffer: &mut [u8],
-    capture_origin: Duration,
-    sequence: &mut u64,
-    sample_offset: &mut u64,
-) -> Result<(), CaptureError> {
-    loop {
-        if !read_exact_until_cancelled(session, wire_buffer, context)? {
-            return Ok(());
-        }
-        emit_wire_batch(
-            wire_buffer,
-            config,
-            capture_origin,
-            context,
-            sequence,
-            sample_offset,
-        )?;
-    }
 }
 
 fn captured_sample_count(
@@ -1209,31 +1291,6 @@ fn read_exact_cancellable(
         }
     }
     Ok(ReadOutcome::Complete)
-}
-
-fn read_exact_until_cancelled(
-    session: &UsbDeviceSession,
-    mut buffer: &mut [u8],
-    context: &CaptureContext,
-) -> Result<bool, CaptureError> {
-    while !buffer.is_empty() {
-        match session
-            .read_bulk_cancellable(buffer, || context.is_cancelled())
-            .map_err(capture_error)?
-        {
-            BulkReadOutcome::Data(0) => {
-                return Err(CaptureError::new(
-                    "the DSLogic bulk endpoint returned an empty loop transfer",
-                ));
-            }
-            BulkReadOutcome::Data(bytes_read) => {
-                let (_, remaining) = buffer.split_at_mut(bytes_read);
-                buffer = remaining;
-            }
-            BulkReadOutcome::Cancelled => return Ok(false),
-        }
-    }
-    Ok(true)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1686,25 +1743,23 @@ mod tests {
     }
 
     #[test]
-    fn loop_transfer_size_targets_frequent_aligned_updates() {
-        let mut one_channel = [false; CHANNEL_COUNT as usize];
-        one_channel[0] = true;
-        let slow = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+    fn loop_stream_plan_keeps_multiple_aligned_reads_in_flight() {
+        let mut two_channels = [false; CHANNEL_COUNT as usize];
+        two_channels[..2].fill(true);
+        let config = DsLogicCaptureConfig::new(100_000_000, 1_000_000)
             .expect("configuration should be valid")
             .with_operation_mode(DsLogicOperationMode::Stream)
             .with_loop_mode(true)
-            .with_enabled_channels(one_channel)
+            .with_enabled_channels(two_channels)
             .expect("channel selection should be valid");
-        assert_eq!(loop_transfer_bytes(slow), 3_072);
+        let (transfer_bytes, transfer_count) =
+            stream_transfer_plan(UsbSpeedClass::HighSpeed, config);
 
-        let fast = DsLogicCaptureConfig::new(125_000_000, 1_000_000)
-            .expect("configuration should be valid")
-            .with_operation_mode(DsLogicOperationMode::Stream)
-            .with_loop_mode(true);
-        assert_eq!(loop_transfer_bytes(fast), PREQUEUED_DATA_BYTES);
+        assert_eq!(transfer_bytes, 500_736);
+        assert_eq!(transfer_count, 5);
+        assert_eq!(transfer_bytes % USB_TRANSFER_ALIGNMENT, 0);
         assert_eq!(
-            loop_transfer_bytes(fast)
-                % (fast.enabled_channel_count() as usize * BYTES_PER_CHANNEL_BLOCK),
+            transfer_bytes % (config.enabled_channel_count() as usize * BYTES_PER_CHANNEL_BLOCK),
             0
         );
     }

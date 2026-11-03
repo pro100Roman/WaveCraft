@@ -12,9 +12,10 @@ use measurements::{
 use protocol_analyzer::{
     analyzer_channels, analyzer_decoder_chain, analyzer_long_name, analyzer_name,
     decode_protocol_samples, matching_protocols, protocol_stack, ProtocolAnalyzerInstance,
-    ProtocolAnalyzerSettings, ProtocolDataFormat, ProtocolDecodeOutcome, ProtocolDecodedEvent,
-    ProtocolDecodedKind, PROTOCOLS,
+    ProtocolAnalyzerSettings, ProtocolCaptureDecoder, ProtocolDataFormat, ProtocolDecodeOutcome,
+    ProtocolDecodeSnapshot, ProtocolDecodedEvent, ProtocolDecodedKind, PROTOCOLS,
 };
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek};
@@ -1823,7 +1824,11 @@ impl ProtocolDecodeCache {
         &'a mut self,
         waveforms: &WaveformStore,
         analyzers: &[ProtocolAnalyzerInstance],
+        streamed: Option<&'a ProtocolDecodeSnapshot>,
     ) -> &'a [ProtocolDecodeOutcome] {
+        if let Some(streamed) = streamed.filter(|decoder| decoder.matches_analyzers(analyzers)) {
+            return streamed.outcomes();
+        }
         let key = ProtocolDecodeCacheKey {
             waveform_revision: waveforms.logic_revision,
             sample_offset: waveforms.logic_sample_offset,
@@ -2038,11 +2043,15 @@ fn focus_logic_sample_range(
     viewport.anchor_locked = true;
 }
 
+fn protocol_event_elapsed(start_sample: u64, sample_rate_hz: u64) -> Option<Duration> {
+    (sample_rate_hz != 0)
+        .then(|| Duration::from_secs_f64(start_sample as f64 / sample_rate_hz as f64))
+}
+
 fn paint_decoded_data_panel(
     ui: &mut egui::Ui,
     analyzers: &[ProtocolAnalyzerInstance],
     outcomes: &[ProtocolDecodeOutcome],
-    sample_offset: u64,
     sample_rate_hz: u64,
 ) -> Option<(u64, u64)> {
     let mut selected_range = None;
@@ -2091,14 +2100,9 @@ fn paint_decoded_data_panel(
                 }
                 ui.add_space(6.0);
                 for (entry_index, entry) in entries.iter().enumerate() {
-                    let time = if sample_rate_hz == 0 {
-                        String::new()
-                    } else {
-                        format_duration(Duration::from_secs_f64(
-                            entry.start_sample.saturating_sub(sample_offset) as f64
-                                / sample_rate_hz as f64,
-                        ))
-                    };
+                    let time = protocol_event_elapsed(entry.start_sample, sample_rate_hz)
+                        .map(format_duration)
+                        .unwrap_or_default();
                     let color = if entry.warning {
                         Color32::LIGHT_RED
                     } else {
@@ -2795,6 +2799,7 @@ struct ActiveCapture {
     scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
     stopped: HashSet<DeviceId>,
     waveforms: WaveformStore,
+    protocol_decode: ProtocolCaptureDecoder,
     recorder: Option<FileRecorder>,
     recording_path: Option<PathBuf>,
     has_logic: bool,
@@ -2809,6 +2814,7 @@ struct ScheduledRepetitiveCapture {
 
 struct CompletedCapture {
     waveforms: WaveformStore,
+    protocol_decode: ProtocolCaptureDecoder,
     has_logic: bool,
     has_scope: bool,
 }
@@ -3311,12 +3317,14 @@ impl WaveCraftApp {
         self.scope_configuration_due = None;
         self.status = format!("Opening capture {}…", path.display());
         self.last_error = None;
+        let protocol_analyzers = self.protocol_analyzer.analyzers.clone();
         thread::spawn(move || {
-            let result =
-                load_gui_recording(&path).map(|recording| WorkerSuccess::RecordingLoaded {
+            let result = load_gui_recording(&path, &protocol_analyzers).map(|recording| {
+                WorkerSuccess::RecordingLoaded {
                     path,
                     recording: Box::new(recording),
-                });
+                }
+            });
             let _ = sender.send(result);
         });
     }
@@ -3770,11 +3778,13 @@ impl WaveCraftApp {
         }
         let has_logic = active.has_logic;
         let has_scope = active.has_scope;
+        active.protocol_decode.finish();
         if !active.preserve_display_until_complete {
             self.set_completed_capture_for_target(
                 active.target,
                 CompletedCapture {
                     waveforms: active.waveforms,
+                    protocol_decode: active.protocol_decode,
                     has_logic,
                     has_scope,
                 },
@@ -3961,13 +3971,21 @@ impl WaveCraftApp {
                 let preserve_display_until_complete = preserve_display_until_complete
                     && self.completed_capture_for_target(target).is_some()
                     && !continue_roll;
-                let mut waveforms = if continue_roll || continue_logic_loop {
+                let continued_capture = if continue_roll || continue_logic_loop {
                     self.take_completed_capture_for_target(target)
-                        .map(|capture| capture.waveforms)
-                        .unwrap_or_default()
                 } else {
-                    WaveformStore::default()
+                    None
                 };
+                let (mut waveforms, mut protocol_decode) = continued_capture.map_or_else(
+                    || {
+                        (
+                            WaveformStore::default(),
+                            ProtocolCaptureDecoder::new(&self.protocol_analyzer.analyzers),
+                        )
+                    },
+                    |capture| (capture.waveforms, capture.protocol_decode),
+                );
+                protocol_decode.reconfigure(&self.protocol_analyzer.analyzers);
                 if !continue_logic_loop {
                     waveforms.configure_logic_capture(
                         logic_config.sample_count(),
@@ -3986,6 +4004,7 @@ impl WaveCraftApp {
                     scope_calibration_controls,
                     stopped: HashSet::new(),
                     waveforms,
+                    protocol_decode,
                     recorder,
                     recording_path: recording_path.clone(),
                     has_logic,
@@ -4214,7 +4233,9 @@ impl WaveCraftApp {
 
     fn poll_capture(&mut self) {
         let mut finish_status = None::<(Result<String, String>, CompletionStatus)>;
+        let protocol_analyzers = self.protocol_analyzer.analyzers.clone();
         if let Some(active) = self.capture.as_mut() {
+            active.protocol_decode.reconfigure(&protocol_analyzers);
             loop {
                 match active.session.try_recv() {
                     Ok(event) => {
@@ -4230,6 +4251,14 @@ impl WaveCraftApp {
                         }
                         match event {
                             CaptureEvent::Frame(frame) => {
+                                if let CaptureBatch::Logic(logic) = &frame.payload {
+                                    active.protocol_decode.ingest_logic_frame(
+                                        frame.device_id.as_str(),
+                                        frame.sequence,
+                                        &logic.samples,
+                                        logic.sample_rate_hz,
+                                    );
+                                }
                                 let enabled_scope_channels = active
                                     .scope_config
                                     .channels()
@@ -4297,6 +4326,7 @@ impl WaveCraftApp {
                 };
                 let recording_result =
                     finish_gui_recording(&mut active.recorder, recording_completion);
+                active.protocol_decode.finish();
                 let mut error = result.as_ref().err().cloned();
                 if let Err(stop_error) = stop_result {
                     append_error(&mut error, format!("failed to stop capture: {stop_error}"));
@@ -4317,6 +4347,7 @@ impl WaveCraftApp {
                         target,
                         CompletedCapture {
                             waveforms: active.waveforms,
+                            protocol_decode: active.protocol_decode,
                             has_logic,
                             has_scope,
                         },
@@ -7887,6 +7918,17 @@ impl eframe::App for WaveCraftApp {
         let mut snapshot_plot_rect = None;
         let protocol_analyzer_for_waveform = self.protocol_analyzer.clone();
         let mut protocol_decode_cache = std::mem::take(&mut self.protocol_decode_cache);
+        let streamed_protocol_decode = self
+            .capture
+            .as_ref()
+            .filter(|active| !active.preserve_display_until_complete)
+            .map(|active| active.protocol_decode.snapshot())
+            .or_else(|| {
+                (!self.calibration_active)
+                    .then(|| self.displayed_completed_capture())
+                    .flatten()
+                    .map(|capture| capture.protocol_decode.snapshot())
+            });
         let mut decoded_data_panel_open = self.decoded_data_panel_open;
         let mut decoded_data_panel_width = self.decoded_data_panel_width;
         egui::CentralPanel::default()
@@ -7965,9 +8007,26 @@ impl eframe::App for WaveCraftApp {
                     .unwrap_or(self.scope_settings);
                 match self.active_waveform_tab {
                     Some(WaveformTab::LogicAnalyzer) => {
-                        let decoded_outcomes = protocol_decode_cache
-                            .outcomes(waveforms, &protocol_analyzer_for_waveform.analyzers)
-                            .to_vec();
+                        let decoded_outcomes = streamed_protocol_decode
+                            .as_ref()
+                            .filter(|snapshot| {
+                                snapshot
+                                    .matches_analyzers(&protocol_analyzer_for_waveform.analyzers)
+                            })
+                            .map_or_else(
+                                || {
+                                    Cow::Owned(
+                                        protocol_decode_cache
+                                            .outcomes(
+                                                waveforms,
+                                                &protocol_analyzer_for_waveform.analyzers,
+                                                None,
+                                            )
+                                            .to_vec(),
+                                    )
+                                },
+                                |snapshot| Cow::Borrowed(snapshot.outcomes()),
+                            );
                         let sample_offset = waveforms.logic_sample_offset;
                         let sample_count = waveforms.logic_sample_count;
                         let sample_rate_hz = waveforms.logic_rate_hz;
@@ -7999,6 +8058,7 @@ impl eframe::App for WaveCraftApp {
                                             enabled_channels: &mut logic_enabled_channels,
                                             protocol_analyzer: &protocol_analyzer_for_waveform,
                                             protocol_decode_cache: &mut protocol_decode_cache,
+                                            protocol_stream: streamed_protocol_decode.as_ref(),
                                             time_axis: None,
                                         },
                                         &mut logic_viewport,
@@ -8091,8 +8151,7 @@ impl eframe::App for WaveCraftApp {
                                                             ui,
                                                             &protocol_analyzer_for_waveform
                                                                 .analyzers,
-                                                            &decoded_outcomes,
-                                                            sample_offset,
+                                                            decoded_outcomes.as_ref(),
                                                             sample_rate_hz,
                                                         );
                                                     });
@@ -8239,6 +8298,7 @@ impl eframe::App for WaveCraftApp {
                                 enabled_channels: &mut logic_enabled_channels,
                                 protocol_analyzer: &protocol_analyzer_for_waveform,
                                 protocol_decode_cache: &mut protocol_decode_cache,
+                                protocol_stream: streamed_protocol_decode.as_ref(),
                                 time_axis: None,
                             },
                             CombinedWaveformViewports {
@@ -9177,7 +9237,15 @@ fn scope_settings_from_recording_metadata(
     settings
 }
 
+#[cfg(test)]
 fn read_gui_recording(input: impl Read) -> Result<LoadedRecording, String> {
+    read_gui_recording_with_analyzers(input, &[])
+}
+
+fn read_gui_recording_with_analyzers(
+    input: impl Read,
+    analyzers: &[ProtocolAnalyzerInstance],
+) -> Result<LoadedRecording, String> {
     let mut reader = RecordingReader::new(input).map_err(|error| error.to_string())?;
     let header = reader.header().clone();
     let has_scope_channel_metadata = (0..2).any(|index| {
@@ -9202,11 +9270,21 @@ fn read_gui_recording(input: impl Read) -> Result<LoadedRecording, String> {
     if header.metadata.contains_key("logic.sample_count") {
         waveforms.configure_logic_capture(logic_settings.sample_count, false);
     }
+    let mut protocol_decode = ProtocolCaptureDecoder::new(analyzers);
     while let Some(event) = reader.read_event().map_err(|error| error.to_string())? {
         if let CaptureEvent::Frame(frame) = event {
+            if let CaptureBatch::Logic(logic) = &frame.payload {
+                protocol_decode.ingest_logic_frame(
+                    frame.device_id.as_str(),
+                    frame.sequence,
+                    &logic.samples,
+                    logic.sample_rate_hz,
+                );
+            }
             waveforms.ingest_frame(&frame, enabled_scope_channels);
         }
     }
+    protocol_decode.finish();
     let completion = reader
         .completion_status()
         .ok_or_else(|| "recording has no completion status".to_owned())?;
@@ -9238,6 +9316,7 @@ fn read_gui_recording(input: impl Read) -> Result<LoadedRecording, String> {
     Ok(LoadedRecording {
         capture: CompletedCapture {
             waveforms,
+            protocol_decode,
             has_logic,
             has_scope,
         },
@@ -9249,7 +9328,10 @@ fn read_gui_recording(input: impl Read) -> Result<LoadedRecording, String> {
     })
 }
 
-fn load_gui_recording(path: &Path) -> Result<LoadedRecording, String> {
+fn load_gui_recording(
+    path: &Path,
+    analyzers: &[ProtocolAnalyzerInstance],
+) -> Result<LoadedRecording, String> {
     let file = File::open(path)
         .map_err(|error| format!("failed to open recording {}: {error}", path.display()))?;
     let is_saleae = path
@@ -9257,14 +9339,22 @@ fn load_gui_recording(path: &Path) -> Result<LoadedRecording, String> {
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("sal"));
     let result = if is_saleae {
-        read_gui_saleae(BufReader::new(file))
+        read_gui_saleae_with_analyzers(BufReader::new(file), analyzers)
     } else {
-        read_gui_recording(BufReader::new(file))
+        read_gui_recording_with_analyzers(BufReader::new(file), analyzers)
     };
     result.map_err(|error| format!("failed to read recording {}: {error}", path.display()))
 }
 
+#[cfg(test)]
 fn read_gui_saleae(input: impl Read + Seek) -> Result<LoadedRecording, String> {
+    read_gui_saleae_with_analyzers(input, &[])
+}
+
+fn read_gui_saleae_with_analyzers(
+    input: impl Read + Seek,
+    analyzers: &[ProtocolAnalyzerInstance],
+) -> Result<LoadedRecording, String> {
     let saleae = read_saleae(input).map_err(|error| error.to_string())?;
     let has_logic = saleae.digital.is_some();
     let has_scope = !saleae.analog.is_empty();
@@ -9278,6 +9368,7 @@ fn read_gui_saleae(input: impl Read + Seek) -> Result<LoadedRecording, String> {
     };
     let mut logic_names = empty_logic_channel_names();
     let mut waveforms = WaveformStore::default();
+    let mut protocol_decode = ProtocolCaptureDecoder::new(analyzers);
     if let Some(digital) = &saleae.digital {
         for channel in &digital.channels {
             let index = usize::from(channel.index);
@@ -9294,6 +9385,7 @@ fn read_gui_saleae(input: impl Read + Seek) -> Result<LoadedRecording, String> {
             logic_settings.sample_rate_hz = digital.sample_rate_hz;
         }
         waveforms.configure_logic_capture(digital.samples.len() as u64, false);
+        protocol_decode.ingest_logic(&digital.samples, digital.sample_rate_hz);
         waveforms.ingest(
             &CaptureBatch::Logic(wavecraft_core::LogicBatch {
                 sample_rate_hz: digital.sample_rate_hz,
@@ -9309,6 +9401,7 @@ fn read_gui_saleae(input: impl Read + Seek) -> Result<LoadedRecording, String> {
         );
         waveforms.logic_captured_at = Some(Duration::ZERO);
     }
+    protocol_decode.finish();
 
     let mut scope_settings = ScopeCaptureSettings::default();
     for channel in &mut scope_settings.channels {
@@ -9358,6 +9451,7 @@ fn read_gui_saleae(input: impl Read + Seek) -> Result<LoadedRecording, String> {
     Ok(LoadedRecording {
         capture: CompletedCapture {
             waveforms,
+            protocol_decode,
             has_logic,
             has_scope,
         },
@@ -9613,6 +9707,7 @@ struct LogicWaveformOptions<'a> {
     enabled_channels: &'a mut [bool; LOGIC_CHANNEL_COUNT],
     protocol_analyzer: &'a ProtocolAnalyzerSettings,
     protocol_decode_cache: &'a mut ProtocolDecodeCache,
+    protocol_stream: Option<&'a ProtocolDecodeSnapshot>,
     time_axis: Option<WaveformTimeAxis>,
 }
 
@@ -11275,11 +11370,12 @@ fn paint_logic_protocol_lanes(
     viewport: WaveformViewport,
     settings: &ProtocolAnalyzerSettings,
     cache: &mut ProtocolDecodeCache,
+    streamed: Option<&ProtocolDecodeSnapshot>,
 ) {
     if lanes.is_empty() {
         return;
     }
-    let outcomes = cache.outcomes(waveforms, &settings.analyzers);
+    let outcomes = cache.outcomes(waveforms, &settings.analyzers, streamed);
     for (lane_index, ((lane, analyzer), outcome)) in lanes
         .iter()
         .zip(&settings.analyzers)
@@ -11428,6 +11524,7 @@ fn paint_logic(
         enabled_channels,
         protocol_analyzer,
         protocol_decode_cache,
+        protocol_stream,
         time_axis,
     } = options;
     paint_plot_background(ui, rect);
@@ -11640,6 +11737,7 @@ fn paint_logic(
         *viewport,
         protocol_analyzer,
         protocol_decode_cache,
+        protocol_stream,
     );
     paint_logic_markers(ui, plot, waveforms, *viewport, marker_settings);
     let smart_timing = smart_timing_enabled
@@ -14333,10 +14431,6 @@ mod tests {
     #[test]
     fn motor_controller_example_recording_opens_and_decodes() {
         let recording = include_bytes!("../../../docs/examples/motor-controller-uart.dsv");
-        let loaded = read_gui_recording(Cursor::new(recording.as_slice())).unwrap();
-        assert_eq!(loaded.completion, CompletionStatus::Complete);
-        assert_eq!(loaded.logic_channel_names[0], "UART RX");
-
         let schema =
             include_str!("../../../docs/examples/motor-controller.wavecraft-protocol.yaml");
         let mut analyzers = ProtocolAnalyzerSettings::default();
@@ -14353,10 +14447,21 @@ mod tests {
         let editor = analyzers.editor.clone().unwrap();
         analyzers.save_editor(editor);
 
+        let loaded = read_gui_recording_with_analyzers(
+            Cursor::new(recording.as_slice()),
+            &analyzers.analyzers,
+        )
+        .unwrap();
+        assert_eq!(loaded.completion, CompletionStatus::Complete);
+        assert_eq!(loaded.logic_channel_names[0], "UART RX");
+
         let mut cache = ProtocolDecodeCache::default();
-        let ProtocolDecodeOutcome::Events(events) =
-            &cache.outcomes(&loaded.capture.waveforms, &analyzers.analyzers)[0]
-        else {
+        let snapshot = loaded.capture.protocol_decode.snapshot();
+        let ProtocolDecodeOutcome::Events(events) = &cache.outcomes(
+            &loaded.capture.waveforms,
+            &analyzers.analyzers,
+            Some(&snapshot),
+        )[0] else {
             panic!("example recording should decode");
         };
         assert_eq!(
@@ -14365,6 +14470,54 @@ mod tests {
                 .map(|event| event.text.as_str())
                 .collect::<Vec<_>>(),
             ["Motor 1: 1200 rpm", "Motor 2: 2000 rpm", "Motor 3: 750 rpm"]
+        );
+    }
+
+    #[test]
+    fn streamed_protocol_history_survives_waveform_ring_eviction() {
+        let analyzer = ProtocolAnalyzerInstance {
+            instance_id: 7,
+            protocol_id: "1:uart",
+            channel_mappings: vec![Some(0)],
+            data_format: ProtocolDataFormat::Ascii,
+            custom_protocol: None,
+        };
+        let samples_per_bit = 10;
+        let mut samples = vec![1_u32; samples_per_bit * 2];
+        for byte in b"Hi" {
+            samples.extend(std::iter::repeat(0).take(samples_per_bit));
+            for bit in 0..8 {
+                let level = u32::from(byte & (1 << bit) != 0);
+                samples.extend(std::iter::repeat(level).take(samples_per_bit));
+            }
+            samples.extend(std::iter::repeat(1).take(samples_per_bit * 2));
+        }
+
+        let mut decoder = ProtocolCaptureDecoder::new(std::slice::from_ref(&analyzer));
+        for (sequence, chunk) in samples.chunks(7).enumerate() {
+            decoder.ingest_logic_frame("logic", sequence as u64, chunk, 1_152_000);
+        }
+        decoder.finish();
+
+        let mut waveforms = WaveformStore::default();
+        waveforms.configure_logic_capture(1, true);
+        waveforms.ingest_logic_samples(&samples);
+        assert!(waveforms.logic_sample_offset > 0);
+        assert_eq!(waveforms.logic_sample_count, 1);
+
+        let mut cache = ProtocolDecodeCache::default();
+        let snapshot = decoder.snapshot();
+        let ProtocolDecodeOutcome::Events(events) =
+            &cache.outcomes(&waveforms, std::slice::from_ref(&analyzer), Some(&snapshot))[0]
+        else {
+            panic!("streamed UART history should remain available");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.text.as_str())
+                .collect::<Vec<_>>(),
+            ["'H'", "'i'"]
         );
     }
 
@@ -14665,6 +14818,25 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(uart_ascii_text(&events).as_deref(), Some("Hello\r\n"));
+    }
+
+    #[test]
+    fn decoded_panel_timestamp_does_not_reset_when_the_waveform_buffer_moves() {
+        let event_start_sample = 2_000_000;
+        let waveform_sample_offset = 1_500_000;
+        let sample_rate_hz = 1_000_000;
+
+        let elapsed = protocol_event_elapsed(event_start_sample, sample_rate_hz)
+            .expect("a nonzero sample rate should produce a timestamp");
+
+        assert_eq!(elapsed, Duration::from_secs(2));
+        assert_ne!(
+            elapsed,
+            Duration::from_secs_f64(
+                event_start_sample.saturating_sub(waveform_sample_offset) as f64
+                    / sample_rate_hz as f64,
+            )
+        );
     }
 
     #[test]

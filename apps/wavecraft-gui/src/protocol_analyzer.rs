@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use wavecraft_decode::{
     decode_i2c_samples, decode_spi_samples, decode_uart_samples, load_protocol_schema,
-    ByteStreamFramer, CustomProtocolDecoder, DecodedField, DecodedMessage, DecodedValue,
-    FramedBytes, FramingSchema, I2cConfig, I2cEvent, PacketCompleteness, ProtocolSchema, Severity,
-    SpiConfig, TimedByte, TransportKind, TransportPacket, TransportValue, UartConfig,
+    ByteStreamFramer, CustomProtocolDecoder, CustomProtocolRuntime, DecodeDiagnostic, DecodedField,
+    DecodedMessage, DecodedValue, FramedBytes, FramingSchema, I2cConfig, I2cDecoder, I2cEvent,
+    PacketCompleteness, ProtocolRuntimeOutput, ProtocolSchema, Severity, SpiConfig, SpiDecoder,
+    SpiTransactionEnd, SpiTransfer, TimedByte, TransportKind, TransportPacket, TransportValue,
+    UartConfig, UartDecode, UartDecoder,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,6 +244,773 @@ impl ProtocolAnalyzerSettings {
     pub fn cancel_editor(&mut self) {
         self.editor = None;
     }
+}
+
+const MAX_STREAMED_EVENTS_PER_ANALYZER: usize = 10_000;
+
+pub struct ProtocolCaptureDecoder {
+    analyzers: Vec<ProtocolAnalyzerInstance>,
+    runtimes: Vec<Option<IncrementalAnalyzerRuntime>>,
+    outcomes: Arc<Vec<ProtocolDecodeOutcome>>,
+    next_sample_offset: u64,
+    sample_rate_hz: Option<u64>,
+    source_id: Option<String>,
+    next_sequence: Option<u64>,
+    preserve_history_on_rebuild: bool,
+    finished: bool,
+}
+
+#[derive(Clone)]
+pub struct ProtocolDecodeSnapshot {
+    analyzers: Vec<ProtocolAnalyzerInstance>,
+    outcomes: Arc<Vec<ProtocolDecodeOutcome>>,
+}
+
+impl ProtocolDecodeSnapshot {
+    pub fn matches_analyzers(&self, analyzers: &[ProtocolAnalyzerInstance]) -> bool {
+        self.analyzers == analyzers
+    }
+
+    pub fn outcomes(&self) -> &[ProtocolDecodeOutcome] {
+        &self.outcomes
+    }
+}
+
+impl ProtocolCaptureDecoder {
+    pub fn new(analyzers: &[ProtocolAnalyzerInstance]) -> Self {
+        Self {
+            analyzers: analyzers.to_vec(),
+            runtimes: Vec::new(),
+            outcomes: Arc::new(
+                analyzers
+                    .iter()
+                    .map(|_| ProtocolDecodeOutcome::Events(Vec::new()))
+                    .collect(),
+            ),
+            next_sample_offset: 0,
+            sample_rate_hz: None,
+            source_id: None,
+            next_sequence: None,
+            preserve_history_on_rebuild: false,
+            finished: false,
+        }
+    }
+
+    pub fn matches_analyzers(&self, analyzers: &[ProtocolAnalyzerInstance]) -> bool {
+        self.analyzers == analyzers
+    }
+
+    #[cfg(test)]
+    pub fn outcomes(&self) -> &[ProtocolDecodeOutcome] {
+        &self.outcomes
+    }
+
+    pub fn snapshot(&self) -> ProtocolDecodeSnapshot {
+        ProtocolDecodeSnapshot {
+            analyzers: self.analyzers.clone(),
+            outcomes: Arc::clone(&self.outcomes),
+        }
+    }
+
+    pub fn reconfigure(&mut self, analyzers: &[ProtocolAnalyzerInstance]) {
+        if self.matches_analyzers(analyzers) {
+            return;
+        }
+        self.analyzers = analyzers.to_vec();
+        self.runtimes.clear();
+        self.outcomes = Arc::new(
+            analyzers
+                .iter()
+                .map(|_| ProtocolDecodeOutcome::Events(Vec::new()))
+                .collect(),
+        );
+        self.finished = false;
+        self.preserve_history_on_rebuild = false;
+        if let Some(sample_rate_hz) = self.sample_rate_hz {
+            self.build_runtimes(sample_rate_hz, false);
+        }
+    }
+
+    pub fn ingest_logic_frame(
+        &mut self,
+        source_id: &str,
+        sequence: u64,
+        samples: &[u32],
+        sample_rate_hz: u64,
+    ) {
+        let discontinuity = self
+            .source_id
+            .as_deref()
+            .is_some_and(|previous| previous != source_id)
+            || self
+                .next_sequence
+                .is_some_and(|expected| sequence != expected);
+        if discontinuity {
+            self.runtimes.clear();
+            self.finished = false;
+            self.preserve_history_on_rebuild = true;
+        }
+        self.source_id = Some(source_id.to_owned());
+        self.next_sequence = Some(sequence.saturating_add(1));
+        self.ingest_logic(samples, sample_rate_hz);
+    }
+
+    pub fn ingest_logic(&mut self, samples: &[u32], sample_rate_hz: u64) {
+        if self.finished {
+            self.runtimes.clear();
+            self.finished = false;
+            self.preserve_history_on_rebuild = true;
+        }
+        if self.sample_rate_hz != Some(sample_rate_hz) {
+            self.sample_rate_hz = Some(sample_rate_hz);
+            self.outcomes = Arc::new(
+                self.analyzers
+                    .iter()
+                    .map(|_| ProtocolDecodeOutcome::Events(Vec::new()))
+                    .collect(),
+            );
+            self.build_runtimes(sample_rate_hz, false);
+        } else if self.runtimes.len() != self.analyzers.len() {
+            self.build_runtimes(sample_rate_hz, self.preserve_history_on_rebuild);
+        }
+        self.preserve_history_on_rebuild = false;
+
+        let sample_offset = self.next_sample_offset;
+        let fallback = sample_fallback_range(sample_offset, samples.len());
+        for index in 0..self.runtimes.len() {
+            let result = self.runtimes[index]
+                .as_mut()
+                .map(|runtime| runtime.push_samples(samples, sample_offset, sample_rate_hz));
+            match result {
+                Some(Ok(events)) => {
+                    append_streamed_events(&mut Arc::make_mut(&mut self.outcomes)[index], events)
+                }
+                Some(Err(error)) => {
+                    Arc::make_mut(&mut self.outcomes)[index] =
+                        ProtocolDecodeOutcome::Unavailable(error);
+                    self.runtimes[index] = None;
+                }
+                None => {}
+            }
+        }
+        self.next_sample_offset = fallback.1;
+    }
+
+    pub fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        let fallback = sample_fallback_range(self.next_sample_offset, 0);
+        let sample_rate_hz = self.sample_rate_hz.unwrap_or(0);
+        for index in 0..self.runtimes.len() {
+            let result = self.runtimes[index]
+                .as_mut()
+                .map(|runtime| runtime.finish(sample_rate_hz, fallback));
+            match result {
+                Some(Ok(events)) => {
+                    append_streamed_events(&mut Arc::make_mut(&mut self.outcomes)[index], events)
+                }
+                Some(Err(error)) => {
+                    Arc::make_mut(&mut self.outcomes)[index] =
+                        ProtocolDecodeOutcome::Unavailable(error);
+                    self.runtimes[index] = None;
+                }
+                None => {}
+            }
+        }
+        self.finished = true;
+    }
+
+    fn build_runtimes(&mut self, sample_rate_hz: u64, preserve_history: bool) {
+        let mut previous_outcomes = std::mem::take(Arc::make_mut(&mut self.outcomes)).into_iter();
+        let mut runtimes = Vec::with_capacity(self.analyzers.len());
+        let mut outcomes = Vec::with_capacity(self.analyzers.len());
+        for analyzer in &self.analyzers {
+            let previous_outcome = previous_outcomes.next();
+            match IncrementalAnalyzerRuntime::new(analyzer.clone(), sample_rate_hz) {
+                Ok(runtime) => {
+                    runtimes.push(Some(runtime));
+                    outcomes.push(if preserve_history {
+                        match previous_outcome {
+                            Some(ProtocolDecodeOutcome::Events(events)) => {
+                                ProtocolDecodeOutcome::Events(events)
+                            }
+                            _ => ProtocolDecodeOutcome::Events(Vec::new()),
+                        }
+                    } else {
+                        ProtocolDecodeOutcome::Events(Vec::new())
+                    });
+                }
+                Err(error) => {
+                    runtimes.push(None);
+                    outcomes.push(ProtocolDecodeOutcome::Unavailable(error));
+                }
+            }
+        }
+        self.runtimes = runtimes;
+        self.outcomes = Arc::new(outcomes);
+    }
+}
+
+fn append_streamed_events(
+    outcome: &mut ProtocolDecodeOutcome,
+    mut events: Vec<ProtocolDecodedEvent>,
+) {
+    let ProtocolDecodeOutcome::Events(history) = outcome else {
+        return;
+    };
+    history.append(&mut events);
+    let excess = history
+        .len()
+        .saturating_sub(MAX_STREAMED_EVENTS_PER_ANALYZER);
+    history.drain(..excess);
+}
+
+fn sample_fallback_range(sample_offset: u64, sample_count: usize) -> (u64, u64) {
+    let end = sample_offset.saturating_add(sample_count as u64);
+    if sample_offset < end {
+        (sample_offset, end)
+    } else {
+        (sample_offset.saturating_sub(1), sample_offset.max(1))
+    }
+}
+
+enum IncrementalAnalyzerRuntime {
+    I2c(IncrementalI2cRuntime),
+    Spi(IncrementalSpiRuntime),
+    Uart(IncrementalUartRuntime),
+}
+
+impl IncrementalAnalyzerRuntime {
+    fn new(analyzer: ProtocolAnalyzerInstance, sample_rate_hz: u64) -> Result<Self, String> {
+        match analyzer_transport(&analyzer) {
+            Some(TransportKind::I2c) => {
+                let (Some(clock_channel), Some(data_channel)) =
+                    (mapped_channel(&analyzer, 0), mapped_channel(&analyzer, 1))
+                else {
+                    return Err("Map both SCL and SDA channels".to_owned());
+                };
+                let decoder = I2cDecoder::new(I2cConfig {
+                    clock_channel,
+                    data_channel,
+                })
+                .map_err(|error| error.to_string())?;
+                let custom = analyzer
+                    .custom_protocol
+                    .as_ref()
+                    .map(|custom| I2cProtocolRuntime::new(custom.schema.clone()))
+                    .transpose()?;
+                Ok(Self::I2c(IncrementalI2cRuntime {
+                    analyzer,
+                    decoder,
+                    custom,
+                }))
+            }
+            Some(TransportKind::Spi) => {
+                let Some(clock_channel) = mapped_channel(&analyzer, 0) else {
+                    return Err("Map the CLK channel".to_owned());
+                };
+                let config = SpiConfig {
+                    clock_channel,
+                    miso_channel: mapped_channel(&analyzer, 1),
+                    mosi_channel: mapped_channel(&analyzer, 2),
+                    chip_select_channel: mapped_channel(&analyzer, 3),
+                };
+                if config.miso_channel.is_none() && config.mosi_channel.is_none() {
+                    return Err("Map MISO or MOSI".to_owned());
+                }
+                let decoder = SpiDecoder::new(config).map_err(|error| error.to_string())?;
+                let custom = analyzer
+                    .custom_protocol
+                    .as_ref()
+                    .map(|custom| SpiProtocolRuntime::new(custom.schema.clone()))
+                    .transpose()?;
+                Ok(Self::Spi(IncrementalSpiRuntime {
+                    analyzer,
+                    decoder,
+                    custom,
+                }))
+            }
+            Some(TransportKind::Uart) => {
+                let Some(data_channel) = mapped_channel(&analyzer, 0) else {
+                    return Err("Map the RX/TX channel".to_owned());
+                };
+                let decoder = UartDecoder::new(UartConfig { data_channel }, sample_rate_hz)
+                    .map_err(|error| error.to_string())?;
+                let custom = analyzer
+                    .custom_protocol
+                    .as_ref()
+                    .map(|custom| {
+                        CustomProtocolRuntime::new(custom.schema.clone())
+                            .map_err(|error| error.to_string())
+                    })
+                    .transpose()?;
+                Ok(Self::Uart(IncrementalUartRuntime {
+                    analyzer,
+                    decoder,
+                    custom,
+                }))
+            }
+            None => Err(format!(
+                "{} streaming decoding is not implemented yet",
+                analyzer_name(&analyzer)
+            )),
+        }
+    }
+
+    fn push_samples(
+        &mut self,
+        samples: &[u32],
+        sample_offset: u64,
+        sample_rate_hz: u64,
+    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        match self {
+            Self::I2c(runtime) => runtime.push_samples(samples, sample_offset, sample_rate_hz),
+            Self::Spi(runtime) => runtime.push_samples(samples, sample_offset, sample_rate_hz),
+            Self::Uart(runtime) => runtime.push_samples(samples, sample_offset, sample_rate_hz),
+        }
+    }
+
+    fn finish(
+        &mut self,
+        sample_rate_hz: u64,
+        fallback: (u64, u64),
+    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        match self {
+            Self::I2c(runtime) => runtime.finish(fallback),
+            Self::Spi(runtime) => runtime.finish(fallback),
+            Self::Uart(runtime) => runtime.finish(sample_rate_hz, fallback),
+        }
+    }
+}
+
+struct IncrementalI2cRuntime {
+    analyzer: ProtocolAnalyzerInstance,
+    decoder: I2cDecoder,
+    custom: Option<I2cProtocolRuntime>,
+}
+
+impl IncrementalI2cRuntime {
+    fn push_samples(
+        &mut self,
+        samples: &[u32],
+        sample_offset: u64,
+        sample_rate_hz: u64,
+    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        let events = self
+            .decoder
+            .push_samples(samples, sample_offset)
+            .map_err(|error| error.to_string())?;
+        if let Some(custom) = &mut self.custom {
+            custom.push_events(
+                &events,
+                sample_rate_hz,
+                sample_fallback_range(sample_offset, samples.len()),
+            )
+        } else {
+            Ok(i2c_events_to_decoded(&self.analyzer, events))
+        }
+    }
+
+    fn finish(&mut self, fallback: (u64, u64)) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        let diagnostics = self.decoder.finish();
+        let mut events = if let Some(custom) = &mut self.custom {
+            custom.finish(fallback)?
+        } else {
+            Vec::new()
+        };
+        events.extend(diagnostics_to_events(diagnostics, fallback));
+        Ok(events)
+    }
+}
+
+struct I2cProtocolRuntime {
+    runtime: CustomProtocolRuntime,
+    transaction_framing: bool,
+    active: bool,
+    bytes: Vec<TimedByte>,
+    attributes: BTreeMap<String, TransportValue>,
+}
+
+impl I2cProtocolRuntime {
+    fn new(schema: ProtocolSchema) -> Result<Self, String> {
+        let transaction_framing =
+            matches!(schema.framing, FramingSchema::TransportTransaction { .. });
+        Ok(Self {
+            runtime: CustomProtocolRuntime::new(schema).map_err(|error| error.to_string())?,
+            transaction_framing,
+            active: false,
+            bytes: Vec::new(),
+            attributes: BTreeMap::new(),
+        })
+    }
+
+    fn push_events(
+        &mut self,
+        events: &[I2cEvent],
+        sample_rate_hz: u64,
+        fallback: (u64, u64),
+    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        if !self.transaction_framing {
+            let bytes = events
+                .iter()
+                .filter_map(|event| match event {
+                    I2cEvent::Byte { byte, index } if *index > 0 => Some(*byte),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            return self
+                .runtime
+                .push_bytes(&bytes, sample_rate_hz)
+                .map(|output| protocol_output_events(output, fallback))
+                .map_err(|error| error.to_string());
+        }
+
+        let mut decoded = Vec::new();
+        for event in events {
+            match *event {
+                I2cEvent::Start { .. } => {
+                    if self.active {
+                        decoded.extend(self.flush_transaction(
+                            PacketCompleteness::Complete,
+                            sample_rate_hz,
+                            fallback,
+                        ));
+                    }
+                    self.active = true;
+                }
+                I2cEvent::Byte { byte, index: 0 } => {
+                    self.attributes.insert(
+                        "address".to_owned(),
+                        TransportValue::Integer(i64::from(byte.value >> 1)),
+                    );
+                    self.attributes.insert(
+                        "read".to_owned(),
+                        TransportValue::Boolean(byte.value & 1 != 0),
+                    );
+                }
+                I2cEvent::Byte { byte, .. } if self.active => self.bytes.push(byte),
+                I2cEvent::Stop { .. } if self.active => {
+                    decoded.extend(self.flush_transaction(
+                        PacketCompleteness::Complete,
+                        sample_rate_hz,
+                        fallback,
+                    ));
+                    self.active = false;
+                }
+                I2cEvent::Acknowledge { .. } | I2cEvent::Byte { .. } | I2cEvent::Stop { .. } => {}
+            }
+        }
+        Ok(decoded)
+    }
+
+    fn finish(&mut self, fallback: (u64, u64)) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        let mut events = Vec::new();
+        if self.transaction_framing && self.active {
+            events.extend(self.flush_transaction(PacketCompleteness::Incomplete, 0, fallback));
+            self.active = false;
+        }
+        events.extend(protocol_output_events(self.runtime.finish(), fallback));
+        Ok(events)
+    }
+
+    fn flush_transaction(
+        &mut self,
+        completeness: PacketCompleteness,
+        sample_rate_hz: u64,
+        fallback: (u64, u64),
+    ) -> Vec<ProtocolDecodedEvent> {
+        if self.bytes.is_empty() {
+            self.attributes.clear();
+            return Vec::new();
+        }
+        let mut packet = TransportPacket::single_stream(
+            TransportKind::I2c,
+            "data",
+            std::mem::take(&mut self.bytes),
+            completeness,
+        );
+        packet.attributes = std::mem::take(&mut self.attributes);
+        protocol_output_events(self.runtime.push_packet(&packet, sample_rate_hz), fallback)
+    }
+}
+
+struct IncrementalSpiRuntime {
+    analyzer: ProtocolAnalyzerInstance,
+    decoder: SpiDecoder,
+    custom: Option<SpiProtocolRuntime>,
+}
+
+impl IncrementalSpiRuntime {
+    fn push_samples(
+        &mut self,
+        samples: &[u32],
+        sample_offset: u64,
+        sample_rate_hz: u64,
+    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        let transfers = self
+            .decoder
+            .push_samples(samples, sample_offset)
+            .map_err(|error| error.to_string())?;
+        let completed = self.decoder.take_completed_transactions();
+        let fallback = sample_fallback_range(sample_offset, samples.len());
+        if let Some(custom) = &mut self.custom {
+            custom.push_transfers(transfers, completed, sample_rate_hz, fallback)
+        } else {
+            let mut events = spi_transfers_to_decoded(&self.analyzer, transfers);
+            events.extend(
+                completed
+                    .into_iter()
+                    .filter(|transaction| {
+                        transaction.completeness == PacketCompleteness::Incomplete
+                    })
+                    .map(|transaction| ProtocolDecodedEvent {
+                        start_sample: fallback.0,
+                        end_sample: fallback.1,
+                        text: "Incomplete SPI".to_owned(),
+                        detail: format!(
+                            "SPI transaction {} ended in the middle of a byte",
+                            transaction.transaction_index
+                        ),
+                        warning: true,
+                        kind: ProtocolDecodedKind::Custom,
+                    }),
+            );
+            Ok(events)
+        }
+    }
+
+    fn finish(&mut self, fallback: (u64, u64)) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        let diagnostics = self.decoder.finish();
+        let mut events = if let Some(custom) = &mut self.custom {
+            custom.finish(fallback)
+        } else {
+            Vec::new()
+        };
+        events.extend(diagnostics_to_events(diagnostics, fallback));
+        Ok(events)
+    }
+}
+
+#[derive(Default)]
+struct SpiTransactionStreams {
+    mosi: Vec<TimedByte>,
+    miso: Vec<TimedByte>,
+}
+
+struct SpiProtocolRuntime {
+    runtime: CustomProtocolRuntime,
+    transaction_framing: bool,
+    transactions: BTreeMap<usize, SpiTransactionStreams>,
+}
+
+impl SpiProtocolRuntime {
+    fn new(schema: ProtocolSchema) -> Result<Self, String> {
+        let transaction_framing =
+            matches!(schema.framing, FramingSchema::TransportTransaction { .. });
+        Ok(Self {
+            runtime: CustomProtocolRuntime::new(schema).map_err(|error| error.to_string())?,
+            transaction_framing,
+            transactions: BTreeMap::new(),
+        })
+    }
+
+    fn push_transfers(
+        &mut self,
+        transfers: Vec<SpiTransfer>,
+        completed: Vec<SpiTransactionEnd>,
+        sample_rate_hz: u64,
+        fallback: (u64, u64),
+    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        if !self.transaction_framing {
+            let stream = self.runtime.schema().input.stream.as_str();
+            let bytes = transfers
+                .into_iter()
+                .filter_map(|transfer| {
+                    let value = match stream {
+                        "mosi" => transfer.mosi,
+                        "miso" => transfer.miso,
+                        _ => None,
+                    }?;
+                    Some(TimedByte {
+                        value,
+                        range: transfer.range,
+                        status: Default::default(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            return self
+                .runtime
+                .push_bytes(&bytes, sample_rate_hz)
+                .map(|output| protocol_output_events(output, fallback))
+                .map_err(|error| error.to_string());
+        }
+
+        for transfer in transfers {
+            let streams = self
+                .transactions
+                .entry(transfer.transaction_index)
+                .or_default();
+            if let Some(value) = transfer.mosi {
+                streams.mosi.push(TimedByte {
+                    value,
+                    range: transfer.range,
+                    status: Default::default(),
+                });
+            }
+            if let Some(value) = transfer.miso {
+                streams.miso.push(TimedByte {
+                    value,
+                    range: transfer.range,
+                    status: Default::default(),
+                });
+            }
+        }
+        let mut events = Vec::new();
+        for transaction in completed {
+            events.extend(self.flush_transaction(
+                transaction.transaction_index,
+                transaction.completeness,
+                sample_rate_hz,
+                fallback,
+            ));
+        }
+        Ok(events)
+    }
+
+    fn finish(&mut self, fallback: (u64, u64)) -> Vec<ProtocolDecodedEvent> {
+        let mut events = Vec::new();
+        let pending = self.transactions.keys().copied().collect::<Vec<_>>();
+        for transaction_index in pending {
+            events.extend(self.flush_transaction(
+                transaction_index,
+                PacketCompleteness::Incomplete,
+                0,
+                fallback,
+            ));
+        }
+        events.extend(protocol_output_events(self.runtime.finish(), fallback));
+        events
+    }
+
+    fn flush_transaction(
+        &mut self,
+        transaction_index: usize,
+        completeness: PacketCompleteness,
+        sample_rate_hz: u64,
+        fallback: (u64, u64),
+    ) -> Vec<ProtocolDecodedEvent> {
+        let Some(streams) = self.transactions.remove(&transaction_index) else {
+            return Vec::new();
+        };
+        let mut packet = TransportPacket {
+            transport: TransportKind::Spi,
+            streams: BTreeMap::new(),
+            attributes: BTreeMap::new(),
+            completeness,
+        };
+        if !streams.mosi.is_empty() {
+            packet.streams.insert("mosi".to_owned(), streams.mosi);
+        }
+        if !streams.miso.is_empty() {
+            packet.streams.insert("miso".to_owned(), streams.miso);
+        }
+        if packet.streams.is_empty() {
+            return Vec::new();
+        }
+        protocol_output_events(self.runtime.push_packet(&packet, sample_rate_hz), fallback)
+    }
+}
+
+struct IncrementalUartRuntime {
+    analyzer: ProtocolAnalyzerInstance,
+    decoder: UartDecoder,
+    custom: Option<CustomProtocolRuntime>,
+}
+
+impl IncrementalUartRuntime {
+    fn push_samples(
+        &mut self,
+        samples: &[u32],
+        sample_offset: u64,
+        sample_rate_hz: u64,
+    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        let decoded = self
+            .decoder
+            .push_samples(samples, sample_offset)
+            .map_err(|error| error.to_string())?;
+        self.decode_uart_output(
+            decoded,
+            sample_rate_hz,
+            sample_fallback_range(sample_offset, samples.len()),
+        )
+    }
+
+    fn finish(
+        &mut self,
+        sample_rate_hz: u64,
+        fallback: (u64, u64),
+    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        let (decoded, diagnostics) = self.decoder.finish().map_err(|error| error.to_string())?;
+        let mut events = self.decode_uart_output(decoded, sample_rate_hz, fallback)?;
+        if let Some(custom) = &mut self.custom {
+            events.extend(protocol_output_events(custom.finish(), fallback));
+        }
+        events.extend(diagnostics_to_events(diagnostics, fallback));
+        Ok(events)
+    }
+
+    fn decode_uart_output(
+        &mut self,
+        decoded: UartDecode,
+        sample_rate_hz: u64,
+        fallback: (u64, u64),
+    ) -> Result<Vec<ProtocolDecodedEvent>, String> {
+        if let Some(custom) = &mut self.custom {
+            custom
+                .push_bytes(&decoded.bytes, sample_rate_hz)
+                .map(|output| protocol_output_events(output, fallback))
+                .map_err(|error| error.to_string())
+        } else {
+            Ok(uart_bytes_to_decoded(&self.analyzer, decoded))
+        }
+    }
+}
+
+fn protocol_output_events(
+    output: ProtocolRuntimeOutput,
+    fallback: (u64, u64),
+) -> Vec<ProtocolDecodedEvent> {
+    let mut events = output
+        .messages
+        .into_iter()
+        .map(custom_message_event)
+        .collect::<Vec<_>>();
+    events.extend(diagnostics_to_events(output.diagnostics, fallback));
+    events
+}
+
+fn diagnostics_to_events(
+    diagnostics: impl IntoIterator<Item = DecodeDiagnostic>,
+    fallback: (u64, u64),
+) -> Vec<ProtocolDecodedEvent> {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            let range = diagnostic
+                .range
+                .map(|range| (range.start, range.end))
+                .unwrap_or(fallback);
+            ProtocolDecodedEvent {
+                start_sample: range.0,
+                end_sample: range.1,
+                text: "Decode warning".to_owned(),
+                detail: format!("{} · {}", diagnostic.code, diagnostic.message),
+                warning: diagnostic.severity >= Severity::Warning,
+                kind: ProtocolDecodedKind::Custom,
+            }
+        })
+        .collect()
 }
 
 pub fn protocol_by_id(id: &str) -> Option<&'static ProtocolDefinition> {
@@ -888,68 +1658,73 @@ fn decode_i2c(
         Ok(events) => events,
         Err(error) => return ProtocolDecodeOutcome::Unavailable(error.to_string()),
     };
-    ProtocolDecodeOutcome::Events(
-        transport_events
-            .into_iter()
-            .filter_map(|event| match event {
-                I2cEvent::Byte { byte, index } => {
-                    let (text, detail, kind) = if index == 0 {
-                        let address = byte.value >> 1;
-                        let read = byte.value & 1 != 0;
-                        let direction = if read { "R" } else { "W" };
-                        (
-                            format!(
-                                "ADDR {} {direction}",
-                                format_protocol_byte(address, analyzer.data_format)
-                            ),
-                            format!(
-                                "I²C address 0x{address:02X} ({address}) · {} · raw byte 0x{:02X}",
-                                if read { "read" } else { "write" },
-                                byte.value
-                            ),
-                            ProtocolDecodedKind::I2cAddress { address, read },
-                        )
+    ProtocolDecodeOutcome::Events(i2c_events_to_decoded(analyzer, transport_events))
+}
+
+fn i2c_events_to_decoded(
+    analyzer: &ProtocolAnalyzerInstance,
+    events: impl IntoIterator<Item = I2cEvent>,
+) -> Vec<ProtocolDecodedEvent> {
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            I2cEvent::Byte { byte, index } => {
+                let (text, detail, kind) = if index == 0 {
+                    let address = byte.value >> 1;
+                    let read = byte.value & 1 != 0;
+                    let direction = if read { "R" } else { "W" };
+                    (
+                        format!(
+                            "ADDR {} {direction}",
+                            format_protocol_byte(address, analyzer.data_format)
+                        ),
+                        format!(
+                            "I²C address 0x{address:02X} ({address}) · {} · raw byte 0x{:02X}",
+                            if read { "read" } else { "write" },
+                            byte.value
+                        ),
+                        ProtocolDecodedKind::I2cAddress { address, read },
+                    )
+                } else {
+                    (
+                        format_protocol_byte(byte.value, analyzer.data_format),
+                        format!("I²C data 0x{:02X} ({})", byte.value, byte.value),
+                        ProtocolDecodedKind::Data { value: byte.value },
+                    )
+                };
+                Some(ProtocolDecodedEvent {
+                    start_sample: byte.range.start,
+                    end_sample: byte.range.end,
+                    text,
+                    detail,
+                    warning: false,
+                    kind,
+                })
+            }
+            I2cEvent::Acknowledge {
+                range,
+                acknowledged,
+                byte_index,
+                byte_value,
+            } => Some(ProtocolDecodedEvent {
+                start_sample: range.start,
+                end_sample: range.end,
+                text: if acknowledged { "ACK" } else { "NACK" }.to_owned(),
+                detail: format!(
+                    "I²C {} for {} byte 0x{byte_value:02X}",
+                    if acknowledged {
+                        "acknowledge"
                     } else {
-                        (
-                            format_protocol_byte(byte.value, analyzer.data_format),
-                            format!("I²C data 0x{:02X} ({})", byte.value, byte.value),
-                            ProtocolDecodedKind::Data { value: byte.value },
-                        )
-                    };
-                    Some(ProtocolDecodedEvent {
-                        start_sample: byte.range.start,
-                        end_sample: byte.range.end,
-                        text,
-                        detail,
-                        warning: false,
-                        kind,
-                    })
-                }
-                I2cEvent::Acknowledge {
-                    range,
-                    acknowledged,
-                    byte_index,
-                    byte_value,
-                } => Some(ProtocolDecodedEvent {
-                    start_sample: range.start,
-                    end_sample: range.end,
-                    text: if acknowledged { "ACK" } else { "NACK" }.to_owned(),
-                    detail: format!(
-                        "I²C {} for {} byte 0x{byte_value:02X}",
-                        if acknowledged {
-                            "acknowledge"
-                        } else {
-                            "not acknowledged"
-                        },
-                        if byte_index == 0 { "address" } else { "data" }
-                    ),
-                    warning: !acknowledged,
-                    kind: ProtocolDecodedKind::Acknowledge { acknowledged },
-                }),
-                I2cEvent::Start { .. } | I2cEvent::Stop { .. } => None,
-            })
-            .collect(),
-    )
+                        "not acknowledged"
+                    },
+                    if byte_index == 0 { "address" } else { "data" }
+                ),
+                warning: !acknowledged,
+                kind: ProtocolDecodedKind::Acknowledge { acknowledged },
+            }),
+            I2cEvent::Start { .. } | I2cEvent::Stop { .. } => None,
+        })
+        .collect()
 }
 
 fn decode_spi(
@@ -979,44 +1754,47 @@ fn decode_spi(
         Ok(transfers) => transfers,
         Err(error) => return ProtocolDecodeOutcome::Unavailable(error.to_string()),
     };
-    ProtocolDecodeOutcome::Events(
-        transfers
-            .into_iter()
-            .map(|transfer| {
-                let text = match (transfer.mosi, transfer.miso) {
-                    (Some(mosi), Some(miso)) => format!(
-                        "MOSI {} · MISO {}",
-                        format_protocol_byte(mosi, analyzer.data_format),
-                        format_protocol_byte(miso, analyzer.data_format)
-                    ),
-                    (Some(mosi), None) => format_protocol_byte(mosi, analyzer.data_format),
-                    (None, Some(miso)) => format_protocol_byte(miso, analyzer.data_format),
-                    (None, None) => unreachable!("SPI configuration requires a data channel"),
-                };
-                ProtocolDecodedEvent {
-                    start_sample: transfer.range.start,
-                    end_sample: transfer.range.end,
-                    detail: format!(
-                        "SPI byte · MOSI {} · MISO {}",
-                        transfer.mosi.map_or_else(
-                            || "not mapped".to_owned(),
-                            |value| format!("0x{value:02X}")
-                        ),
-                        transfer.miso.map_or_else(
-                            || "not mapped".to_owned(),
-                            |value| format!("0x{value:02X}")
-                        )
-                    ),
-                    text,
-                    warning: false,
-                    kind: ProtocolDecodedKind::Spi {
-                        mosi: transfer.mosi,
-                        miso: transfer.miso,
-                    },
-                }
-            })
-            .collect(),
-    )
+    ProtocolDecodeOutcome::Events(spi_transfers_to_decoded(analyzer, transfers))
+}
+
+fn spi_transfers_to_decoded(
+    analyzer: &ProtocolAnalyzerInstance,
+    transfers: impl IntoIterator<Item = SpiTransfer>,
+) -> Vec<ProtocolDecodedEvent> {
+    transfers
+        .into_iter()
+        .map(|transfer| {
+            let text = match (transfer.mosi, transfer.miso) {
+                (Some(mosi), Some(miso)) => format!(
+                    "MOSI {} · MISO {}",
+                    format_protocol_byte(mosi, analyzer.data_format),
+                    format_protocol_byte(miso, analyzer.data_format)
+                ),
+                (Some(mosi), None) => format_protocol_byte(mosi, analyzer.data_format),
+                (None, Some(miso)) => format_protocol_byte(miso, analyzer.data_format),
+                (None, None) => unreachable!("SPI configuration requires a data channel"),
+            };
+            ProtocolDecodedEvent {
+                start_sample: transfer.range.start,
+                end_sample: transfer.range.end,
+                detail: format!(
+                    "SPI byte · MOSI {} · MISO {}",
+                    transfer
+                        .mosi
+                        .map_or_else(|| "not mapped".to_owned(), |value| format!("0x{value:02X}")),
+                    transfer
+                        .miso
+                        .map_or_else(|| "not mapped".to_owned(), |value| format!("0x{value:02X}"))
+                ),
+                text,
+                warning: false,
+                kind: ProtocolDecodedKind::Spi {
+                    mosi: transfer.mosi,
+                    miso: transfer.miso,
+                },
+            }
+        })
+        .collect()
 }
 
 fn decode_uart(
@@ -1039,24 +1817,29 @@ fn decode_uart(
         Ok(decoded) => decoded,
         Err(error) => return ProtocolDecodeOutcome::Unavailable(error.to_string()),
     };
+    ProtocolDecodeOutcome::Events(uart_bytes_to_decoded(analyzer, decoded))
+}
+
+fn uart_bytes_to_decoded(
+    analyzer: &ProtocolAnalyzerInstance,
+    decoded: UartDecode,
+) -> Vec<ProtocolDecodedEvent> {
     let baud_rate = decoded.baud_rate;
-    ProtocolDecodeOutcome::Events(
-        decoded
-            .bytes
-            .into_iter()
-            .map(|byte| ProtocolDecodedEvent {
-                start_sample: byte.range.start,
-                end_sample: byte.range.end,
-                text: format_protocol_byte(byte.value, analyzer.data_format),
-                detail: format!(
-                    "UART 8-N-1 · {baud_rate} baud · 0x{:02X} ({})",
-                    byte.value, byte.value
-                ),
-                warning: false,
-                kind: ProtocolDecodedKind::Uart { value: byte.value },
-            })
-            .collect(),
-    )
+    decoded
+        .bytes
+        .into_iter()
+        .map(|byte| ProtocolDecodedEvent {
+            start_sample: byte.range.start,
+            end_sample: byte.range.end,
+            text: format_protocol_byte(byte.value, analyzer.data_format),
+            detail: format!(
+                "UART 8-N-1 · {baud_rate} baud · 0x{:02X} ({})",
+                byte.value, byte.value
+            ),
+            warning: false,
+            kind: ProtocolDecodedKind::Uart { value: byte.value },
+        })
+        .collect()
 }
 
 const GPIB_CHANNELS: [ProtocolChannel; 16] = [
@@ -1981,6 +2764,161 @@ mod tests {
             events[0].kind,
             ProtocolDecodedKind::Uart { value: b'H' }
         ));
+    }
+
+    #[test]
+    fn streaming_uart_matches_whole_buffer_decode_across_chunks() {
+        let mut uart = analyzer("1:uart", vec![Some(0)]);
+        uart.data_format = ProtocolDataFormat::Ascii;
+        let samples = uart_8n1(b"Hi!", 10);
+        let expected = decode_protocol_samples(&uart, &samples, 0, 1_152_000);
+        let mut streaming = ProtocolCaptureDecoder::new(std::slice::from_ref(&uart));
+        for (sequence, chunk) in samples.chunks(7).enumerate() {
+            streaming.ingest_logic_frame("logic", sequence as u64, chunk, 1_152_000);
+        }
+        streaming.finish();
+        assert_eq!(streaming.outcomes(), std::slice::from_ref(&expected));
+    }
+
+    #[test]
+    fn streaming_i2c_matches_whole_buffer_decode_across_chunks() {
+        let i2c = analyzer("1:i2c", vec![Some(0), Some(1)]);
+        let samples = i2c_transaction(&[(0xa0, true), (0x5a, true)]);
+        let expected = decode_protocol_samples(&i2c, &samples, 0, 1_000_000);
+        let mut streaming = ProtocolCaptureDecoder::new(std::slice::from_ref(&i2c));
+        for (sequence, chunk) in samples.chunks(5).enumerate() {
+            streaming.ingest_logic_frame("logic", sequence as u64, chunk, 1_000_000);
+        }
+        streaming.finish();
+        assert_eq!(streaming.outcomes(), std::slice::from_ref(&expected));
+    }
+
+    #[test]
+    fn streaming_spi_flushes_custom_protocol_on_chip_select_boundary() {
+        let schema = load_protocol_schema(
+            r#"
+schema: wavecraft.protocol/v1
+protocol:
+  id: example.spi-byte
+  name: SPI byte
+  version: 1
+input:
+  transport: spi
+  stream: mosi
+framing:
+  strategy: transport_transaction
+  max_frame_bytes: 16
+messages:
+  - id: value
+    name: Value
+    default: true
+    fields:
+      - name: value
+        type: u8
+    summary: "SPI {value}"
+"#,
+        )
+        .unwrap();
+        let mut spi = analyzer("1:spi", vec![Some(0), Some(1), Some(2), Some(3)]);
+        spi.custom_protocol = Some(CustomProtocolAnalyzer {
+            source_path: PathBuf::from("spi-byte.yaml"),
+            source: String::new(),
+            schema,
+        });
+        let mut samples = vec![
+            logic_word(false, false, true),
+            logic_word(false, false, false),
+        ];
+        for bit in (0..8).rev() {
+            let data = 0xa5 & (1 << bit) != 0;
+            let low = logic_word(false, data, false);
+            samples.extend([low, low | 1, low]);
+        }
+        samples.push(logic_word(false, false, true));
+
+        let mut streaming = ProtocolCaptureDecoder::new(&[spi]);
+        for (sequence, chunk) in samples.chunks(4).enumerate() {
+            streaming.ingest_logic_frame("logic", sequence as u64, chunk, 1_000_000);
+        }
+        streaming.finish();
+        let ProtocolDecodeOutcome::Events(events) = &streaming.outcomes()[0] else {
+            panic!("custom SPI protocol should stream");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].text, "SPI 165");
+    }
+
+    #[test]
+    fn streaming_custom_uart_preserves_protocol_frame_across_chunks() {
+        let source =
+            include_str!("../../../docs/examples/motor-controller.wavecraft-protocol.yaml");
+        let schema = load_protocol_schema(source).unwrap();
+        let mut uart = analyzer("1:uart", vec![Some(0)]);
+        uart.custom_protocol = Some(CustomProtocolAnalyzer {
+            source_path: PathBuf::from("motor-controller.wavecraft-protocol.yaml"),
+            source: source.to_owned(),
+            schema,
+        });
+        let mut frame = vec![0xaa, 0x55, 0x05, 0x10, 0x02, 0xd0, 0x07, 0x03];
+        frame.push(crc8_smbus(&frame[2..]));
+        let samples = uart_8n1(&frame, 10);
+        let mut streaming = ProtocolCaptureDecoder::new(&[uart]);
+        for (sequence, chunk) in samples.chunks(23).enumerate() {
+            streaming.ingest_logic_frame("logic", sequence as u64, chunk, 1_152_000);
+        }
+        streaming.finish();
+
+        let ProtocolDecodeOutcome::Events(events) = &streaming.outcomes()[0] else {
+            panic!("custom UART protocol should stream");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].text, "Motor 2: 2000 rpm");
+    }
+
+    #[test]
+    fn source_discontinuity_resets_partial_transport_state() {
+        let uart = analyzer("1:uart", vec![Some(0)]);
+        let partial = uart_8n1(b"X", 10);
+        let complete = uart_8n1(b"OK", 10);
+        let mut streaming = ProtocolCaptureDecoder::new(&[uart]);
+        streaming.ingest_logic_frame("logic", 0, &partial[..40], 1_152_000);
+        streaming.ingest_logic_frame("logic", 2, &complete, 1_152_000);
+        streaming.finish();
+
+        let ProtocolDecodeOutcome::Events(events) = &streaming.outcomes()[0] else {
+            panic!("UART should remain available after reset");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event.kind {
+                    ProtocolDecodedKind::Uart { value } => Some(value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            b"OK"
+        );
+    }
+
+    #[test]
+    fn streamed_event_history_is_bounded_independently() {
+        let mut outcome = ProtocolDecodeOutcome::Events(Vec::new());
+        let events = (0..=MAX_STREAMED_EVENTS_PER_ANALYZER)
+            .map(|sample| ProtocolDecodedEvent {
+                start_sample: sample as u64,
+                end_sample: sample as u64 + 1,
+                text: sample.to_string(),
+                detail: String::new(),
+                warning: false,
+                kind: ProtocolDecodedKind::Data { value: 0 },
+            })
+            .collect();
+        append_streamed_events(&mut outcome, events);
+        let ProtocolDecodeOutcome::Events(events) = outcome else {
+            unreachable!();
+        };
+        assert_eq!(events.len(), MAX_STREAMED_EVENTS_PER_ANALYZER);
+        assert_eq!(events[0].start_sample, 1);
     }
 
     #[test]

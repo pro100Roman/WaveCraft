@@ -98,7 +98,11 @@ impl CustomProtocolRuntime {
         }
         if self.framer.is_none() {
             let mut output = ProtocolRuntimeOutput::default();
-            self.decode_packet(packet, &mut output, false);
+            self.decode_packet(
+                packet,
+                &mut output,
+                packet.completeness == crate::PacketCompleteness::Incomplete,
+            );
             return output;
         }
         let Some(bytes) = packet.streams.get(&self.schema.input.stream) else {
@@ -224,8 +228,27 @@ impl CustomProtocolRuntime {
             .get(&self.schema.input.stream)
             .and_then(|bytes| timed_bytes_range(bytes));
         match self.decoder.decode_packet(packet) {
-            Ok(Some(message)) => output.messages.push(message),
-            Ok(None) => {}
+            Ok(Some(message)) => {
+                output.messages.push(message);
+                if finishing {
+                    output.diagnostics.push(DecodeDiagnostic {
+                        code: "protocol.incomplete_packet".to_owned(),
+                        message: "transport stream ended before the packet boundary".to_owned(),
+                        severity: Severity::Warning,
+                        range,
+                    });
+                }
+            }
+            Ok(None) => {
+                if finishing {
+                    output.diagnostics.push(DecodeDiagnostic {
+                        code: "protocol.incomplete_packet".to_owned(),
+                        message: "transport stream ended before the packet boundary".to_owned(),
+                        severity: Severity::Warning,
+                        range,
+                    });
+                }
+            }
             Err(error) => {
                 let mut diagnostic = runtime_diagnostic(
                     if finishing {
@@ -324,6 +347,27 @@ messages:
         type: u8
     summary: "{value}"
 "#;
+    const TRANSACTION_SCHEMA: &str = r#"
+schema: wavecraft.protocol/v1
+protocol:
+  id: example.transaction
+  name: Transaction
+  version: 1
+input:
+  transport: i2c
+  stream: data
+framing:
+  strategy: transport_transaction
+  max_frame_bytes: 16
+messages:
+  - id: value
+    name: Value
+    default: true
+    fields:
+      - name: value
+        type: u8
+    summary: "{value}"
+"#;
 
     fn timed(values: &[u8], first_sample: u64) -> Vec<TimedByte> {
         values
@@ -398,5 +442,20 @@ messages:
         let tail = runtime.finish();
         assert_eq!(tail.messages[0].summary, "2");
         assert_eq!(tail.diagnostics[0].code, "protocol.incomplete_frame");
+    }
+
+    #[test]
+    fn incomplete_transport_packet_keeps_message_and_reports_diagnostic() {
+        let schema = load_protocol_schema(TRANSACTION_SCHEMA).unwrap();
+        let mut runtime = CustomProtocolRuntime::new(schema).unwrap();
+        let packet = TransportPacket::single_stream(
+            crate::TransportKind::I2c,
+            "data",
+            timed(&[7], 20),
+            crate::PacketCompleteness::Incomplete,
+        );
+        let output = runtime.push_packet(&packet, 1_000_000);
+        assert_eq!(output.messages[0].summary, "7");
+        assert_eq!(output.diagnostics[0].code, "protocol.incomplete_packet");
     }
 }
