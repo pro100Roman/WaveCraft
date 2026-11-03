@@ -41,6 +41,7 @@ const CAPTURE_COMPLETION_GRACE: Duration = Duration::from_secs(5);
 const PAYLOAD_TRANSFER_GRACE: Duration = Duration::from_secs(5);
 
 const CLOCK_TYPE_BIT: u16 = 1;
+const TRIGGER_ENABLE_BIT: u16 = 0;
 const CLOCK_EDGE_BIT: u16 = 2;
 const RLE_MODE_BIT: u16 = 3;
 const HALF_MODE_BIT: u16 = 5;
@@ -50,6 +51,7 @@ const LOOP_MODE_BIT: u16 = 7;
 const SLOW_ACQUISITION_BIT: u16 = 10;
 const STREAM_MODE_BIT: u16 = 12;
 const INTERNAL_TEST_BIT: u16 = 15;
+const TRIGGER_STAGE_COUNT: usize = 16;
 
 pub const DSLOGIC_SAMPLE_RATES_HZ: &[u64] = &[
     1_000_000,
@@ -88,6 +90,49 @@ pub enum DsLogicInputFilter {
     OneSampleClock,
 }
 
+/// Match performed by the DSLogic FPGA for a simple, single-channel trigger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DsLogicTriggerCondition {
+    Low,
+    High,
+    RisingEdge,
+    FallingEdge,
+    EitherEdge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DsLogicSimpleTrigger {
+    channel: u8,
+    condition: DsLogicTriggerCondition,
+}
+
+impl DsLogicSimpleTrigger {
+    pub fn new(channel: u8, condition: DsLogicTriggerCondition) -> Result<Self, CaptureError> {
+        if channel >= CHANNEL_COUNT {
+            return Err(CaptureError::new(format!(
+                "DSLogic trigger channel must be between 0 and {}; got {channel}",
+                CHANNEL_COUNT - 1
+            )));
+        }
+        Ok(Self { channel, condition })
+    }
+
+    pub fn channel(self) -> u8 {
+        self.channel
+    }
+
+    pub fn condition(self) -> DsLogicTriggerCondition {
+        self.condition
+    }
+}
+
+/// Hardware trigger mode. A future multi-channel trigger can be added as a
+/// separate variant without changing capture configuration users.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DsLogicTriggerConfig {
+    Simple(DsLogicSimpleTrigger),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DsLogicCaptureConfig {
     sample_rate_hz: u64,
@@ -100,6 +145,7 @@ pub struct DsLogicCaptureConfig {
     rle_enabled: bool,
     external_clock: bool,
     falling_clock_edge: bool,
+    trigger: Option<DsLogicTriggerConfig>,
     enabled_channels: [bool; CHANNEL_COUNT as usize],
     device_model: DeviceModel,
     device_channel_count: u8,
@@ -130,6 +176,7 @@ impl DsLogicCaptureConfig {
             rle_enabled: false,
             external_clock: false,
             falling_clock_edge: false,
+            trigger: None,
             enabled_channels,
             device_model: DeviceModel::DsLogicU3Pro16,
             device_channel_count: LEGACY_CHANNEL_COUNT as u8,
@@ -178,6 +225,11 @@ impl DsLogicCaptureConfig {
 
     pub fn with_falling_clock_edge(mut self, enabled: bool) -> Self {
         self.falling_clock_edge = enabled;
+        self
+    }
+
+    pub fn with_trigger(mut self, trigger: Option<DsLogicTriggerConfig>) -> Self {
+        self.trigger = trigger;
         self
     }
 
@@ -245,6 +297,10 @@ impl DsLogicCaptureConfig {
 
     pub fn falling_clock_edge(self) -> bool {
         self.falling_clock_edge
+    }
+
+    pub fn trigger(self) -> Option<DsLogicTriggerConfig> {
+        self.trigger
     }
 
     pub fn enabled_channels(self) -> [bool; LEGACY_CHANNEL_COUNT] {
@@ -376,6 +432,30 @@ impl DsLogicCaptureConfig {
                 "DSLogic loop mode requires stream operation mode",
             ));
         }
+        if self.loop_mode && self.trigger.is_some() {
+            return Err(CaptureError::new(
+                "DSLogic hardware triggering is not supported in loop mode",
+            ));
+        }
+        if self.operation_mode == DsLogicOperationMode::InternalTest && self.trigger.is_some() {
+            return Err(CaptureError::new(
+                "DSLogic hardware triggering is not supported in internal-test mode",
+            ));
+        }
+        if let Some(DsLogicTriggerConfig::Simple(trigger)) = self.trigger {
+            if trigger.channel >= channel_count {
+                return Err(CaptureError::new(format!(
+                    "{} exposes {channel_count} logic channels; trigger channel {} is unavailable",
+                    profile.display_name, trigger.channel
+                )));
+            }
+            if !self.enabled_channels[usize::from(trigger.channel)] {
+                return Err(CaptureError::new(format!(
+                    "DSLogic trigger channel {} must be enabled",
+                    trigger.channel
+                )));
+            }
+        }
         let maximum = self.maximum_sample_rate_hz_for_model(model, speed);
         if self.sample_rate_hz > maximum {
             return Err(CaptureError::new(format!(
@@ -430,6 +510,7 @@ impl DsLogicCaptureConfig {
         let bytes_per_millisecond =
             self.sample_rate_hz as u128 * u128::from(self.enabled_channel_count()) / 8 / 1_000;
         let mode = operation_mode
+            | (u16::from(self.trigger.is_some()) << TRIGGER_ENABLE_BIT)
             | (u16::from(self.external_clock) << CLOCK_TYPE_BIT)
             | (u16::from(self.falling_clock_edge) << CLOCK_EDGE_BIT)
             | (u16::from(self.rle_enabled) << RLE_MODE_BIT)
@@ -490,23 +571,16 @@ impl DsLogicCaptureConfig {
         push_u16(&mut bytes, 0x0c01);
         push_u16(&mut bytes, 0);
         push_u16(&mut bytes, 0x40a0);
-
-        for _ in 0..2 {
-            for _ in 0..16 {
-                push_u16(&mut bytes, u16::MAX);
-            }
-        }
-        for _ in 0..4 {
-            for _ in 0..16 {
-                push_u16(&mut bytes, 0);
-            }
-        }
-        for _ in 0..2 {
-            for _ in 0..16 {
-                push_u16(&mut bytes, 2);
-            }
-        }
-        for _ in 0..16 {
+        let trigger = self.trigger_words(0);
+        push_trigger_stages_u16(&mut bytes, trigger.mask, u16::MAX);
+        push_trigger_stages_u16(&mut bytes, u16::MAX, u16::MAX);
+        push_trigger_stages_u16(&mut bytes, trigger.value, 0);
+        push_trigger_stages_u16(&mut bytes, 0, 0);
+        push_trigger_stages_u16(&mut bytes, trigger.edge, 0);
+        push_trigger_stages_u16(&mut bytes, 0, 0);
+        push_trigger_stages_u16(&mut bytes, 2, 2);
+        push_trigger_stages_u16(&mut bytes, 2, 2);
+        for _ in 0..TRIGGER_STAGE_COUNT {
             push_u32(&mut bytes, 0);
         }
         push_u32(&mut bytes, 0xfa5a_fa5a);
@@ -523,20 +597,90 @@ impl DsLogicCaptureConfig {
         let mut bytes = Vec::with_capacity(EXTENDED_SETTINGS_BYTES);
         push_u32(&mut bytes, 0xf5a5_f5a5);
         push_u16(&mut bytes, 0x6060);
-        for _ in 0..2 {
-            for _ in 0..16 {
-                push_u16(&mut bytes, u16::MAX);
-            }
-        }
-        for _ in 0..4 {
-            for _ in 0..16 {
-                push_u16(&mut bytes, 0);
-            }
-        }
+        let trigger = self.trigger_words(16);
+        push_trigger_stages_u16(&mut bytes, trigger.mask, u16::MAX);
+        push_trigger_stages_u16(&mut bytes, u16::MAX, u16::MAX);
+        push_trigger_stages_u16(&mut bytes, trigger.value, 0);
+        push_trigger_stages_u16(&mut bytes, 0, 0);
+        push_trigger_stages_u16(&mut bytes, trigger.edge, 0);
+        push_trigger_stages_u16(&mut bytes, 0, 0);
         push_u16(&mut bytes, u16::MAX);
         push_u32(&mut bytes, 0xfa5a_fa5a);
         debug_assert_eq!(bytes.len(), EXTENDED_SETTINGS_BYTES);
         Some(bytes)
+    }
+
+    fn trigger_words(self, first_channel: u8) -> TriggerWords {
+        let Some(DsLogicTriggerConfig::Simple(trigger)) = self.trigger else {
+            return TriggerWords::default();
+        };
+        if !(first_channel..first_channel + 16).contains(&trigger.channel) {
+            return TriggerWords::default();
+        }
+
+        let bit = 1_u16 << (trigger.channel - first_channel);
+        let (value, edge, mask) = match trigger.condition {
+            DsLogicTriggerCondition::Low => (0, 0, !bit),
+            DsLogicTriggerCondition::High => (bit, 0, !bit),
+            DsLogicTriggerCondition::RisingEdge => (bit, bit, !bit),
+            DsLogicTriggerCondition::FallingEdge => (0, bit, !bit),
+            DsLogicTriggerCondition::EitherEdge => (0, bit, u16::MAX),
+        };
+        TriggerWords {
+            mask: self.replicate_high_rate_trigger_word(mask),
+            value: self.replicate_high_rate_trigger_word(value),
+            edge: self.replicate_high_rate_trigger_word(edge),
+        }
+    }
+
+    fn replicate_high_rate_trigger_word(self, value: u16) -> u16 {
+        let quarter_mode = self.sample_rate_hz
+            == if self.device_model.logic_hardware_sample_rate_hz() == 500_000_000 {
+                1_000_000_000
+            } else {
+                400_000_000
+            };
+        let half_mode = self.sample_rate_hz
+            == if self.device_model.logic_hardware_sample_rate_hz() == 500_000_000 {
+                500_000_000
+            } else {
+                200_000_000
+            };
+        if !self.device_model.logic_uses_adf4360() && quarter_mode {
+            let low = value & 0x000f;
+            low | (low << 4) | (low << 8) | (low << 12)
+        } else if (!self.device_model.logic_uses_adf4360() && half_mode)
+            || (self.device_model.logic_uses_adf4360() && quarter_mode)
+        {
+            let low = value & 0x00ff;
+            low | (low << 8)
+        } else {
+            value
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TriggerWords {
+    mask: u16,
+    value: u16,
+    edge: u16,
+}
+
+impl Default for TriggerWords {
+    fn default() -> Self {
+        Self {
+            mask: u16::MAX,
+            value: 0,
+            edge: 0,
+        }
+    }
+}
+
+fn push_trigger_stages_u16(bytes: &mut Vec<u8>, first: u16, remaining: u16) {
+    push_u16(bytes, first);
+    for _ in 1..TRIGGER_STAGE_COUNT {
+        push_u16(bytes, remaining);
     }
 }
 
@@ -838,7 +982,12 @@ fn read_stream_capture_inner(
 
     let capture_time =
         Duration::from_secs_f64(config.sample_count as f64 / config.sample_rate_hz as f64);
-    let deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
+    // An armed hardware trigger may legitimately wait indefinitely. Callers
+    // retain cancellation/timeout control through CaptureContext.
+    let deadline = config
+        .trigger
+        .is_none()
+        .then(|| Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE);
     let mut header = None;
     let mut received_bytes = 0_usize;
     let mut sample_offset = 0_u64;
@@ -848,7 +997,7 @@ fn read_stream_capture_inner(
         if context.is_cancelled() {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(capture_timeout_error(session, "stream capture transfers"));
         }
 
@@ -1136,7 +1285,12 @@ fn read_prequeued_capture(
     let mut payload = vec![0_u8; expected_payload_bytes.min(prequeued_data_bytes)];
     let capture_time =
         Duration::from_secs_f64(config.sample_count as f64 / config.sample_rate_hz as f64);
-    let deadline = Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE;
+    // Before a hardware trigger occurs there is no meaningful capture
+    // completion deadline. Keep servicing USB so cancellation stays prompt.
+    let deadline = config
+        .trigger
+        .is_none()
+        .then(|| Instant::now() + capture_time + CAPTURE_COMPLETION_GRACE);
     let mut header_read = session
         .queue_bulk_read(header.len())
         .map_err(capture_error)?;
@@ -1186,7 +1340,10 @@ fn read_prequeued_capture(
                     session.force_capture_stop().map_err(capture_error)?;
                 }
             }
-        } else if !cancelled && timeout_error.is_none() && Instant::now() >= deadline {
+        } else if !cancelled
+            && timeout_error.is_none()
+            && deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
             timeout_error = Some(capture_timeout_error(session, "queued capture transfers"));
             let _ = session.force_capture_ready();
             header_read.cancel().map_err(capture_error)?;
@@ -1499,17 +1656,19 @@ mod tests {
             .expect("channel selection should be valid");
         config.device_model = DeviceModel::DsLogicU3Pro32;
         config.device_channel_count = 32;
+        config = config.with_trigger(Some(DsLogicTriggerConfig::Simple(
+            DsLogicSimpleTrigger::new(31, DsLogicTriggerCondition::High).unwrap(),
+        )));
 
         let settings = config.encode_settings();
         assert_eq!(read_u16(&settings, 38), 0);
         assert_eq!(read_u16(&settings, 40), 1 << 15);
-        assert_eq!(
-            config
-                .encode_extended_settings()
-                .expect("U3Pro32 needs extended settings")
-                .len(),
-            EXTENDED_SETTINGS_BYTES
-        );
+        let extended = config
+            .encode_extended_settings()
+            .expect("U3Pro32 needs extended settings");
+        assert_eq!(extended.len(), EXTENDED_SETTINGS_BYTES);
+        assert_eq!(read_u16(&extended, 6), 0x7fff);
+        assert_eq!(read_u16(&extended, 70), 0x8000);
 
         let samples = decode_cross_samples(&1_u64.to_le_bytes(), channels)
             .expect("upper-channel data should decode");
@@ -1662,6 +1821,86 @@ mod tests {
         assert_eq!(read_u16(&settings, 48), u16::MAX);
         assert_eq!(read_u16(&settings, 304), 0);
         assert_eq!(read_u32(&settings, 368), 0xfa5a_fa5a);
+    }
+
+    #[test]
+    fn encodes_simple_rising_edge_trigger_in_fpga_settings() {
+        let trigger = DsLogicSimpleTrigger::new(3, DsLogicTriggerCondition::RisingEdge)
+            .expect("trigger should be valid");
+        let config = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .expect("configuration should be valid")
+            .with_trigger(Some(DsLogicTriggerConfig::Simple(trigger)));
+        let settings = config.encode_settings();
+
+        assert_eq!(
+            config.trigger(),
+            Some(DsLogicTriggerConfig::Simple(trigger))
+        );
+        assert_eq!(read_u16(&settings, 6), 1 << TRIGGER_ENABLE_BIT);
+        assert_eq!(read_u16(&settings, 48), u16::MAX ^ (1 << 3));
+        assert_eq!(read_u16(&settings, 80), u16::MAX);
+        assert_eq!(read_u16(&settings, 112), 1 << 3);
+        assert_eq!(read_u16(&settings, 144), 0);
+        assert_eq!(read_u16(&settings, 176), 1 << 3);
+        assert_eq!(read_u16(&settings, 208), 0);
+        assert_eq!(read_u16(&settings, 240), 2);
+        assert_eq!(read_u16(&settings, 50), u16::MAX);
+    }
+
+    #[test]
+    fn encodes_all_simple_trigger_conditions() {
+        let cases = [
+            (DsLogicTriggerCondition::Low, u16::MAX ^ 1, 0, 0),
+            (DsLogicTriggerCondition::High, u16::MAX ^ 1, 1, 0),
+            (DsLogicTriggerCondition::RisingEdge, u16::MAX ^ 1, 1, 1),
+            (DsLogicTriggerCondition::FallingEdge, u16::MAX ^ 1, 0, 1),
+            (DsLogicTriggerCondition::EitherEdge, u16::MAX, 0, 1),
+        ];
+
+        for (condition, mask, value, edge) in cases {
+            let trigger = DsLogicSimpleTrigger::new(0, condition).unwrap();
+            let settings = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+                .unwrap()
+                .with_trigger(Some(DsLogicTriggerConfig::Simple(trigger)))
+                .encode_settings();
+            assert_eq!(read_u16(&settings, 48), mask, "{condition:?}");
+            assert_eq!(read_u16(&settings, 112), value, "{condition:?}");
+            assert_eq!(read_u16(&settings, 176), edge, "{condition:?}");
+        }
+    }
+
+    #[test]
+    fn replicates_trigger_bits_for_gigasample_capture() {
+        let mut enabled_channels = [false; CHANNEL_COUNT as usize];
+        enabled_channels[3] = true;
+        let trigger = DsLogicSimpleTrigger::new(3, DsLogicTriggerCondition::RisingEdge).unwrap();
+        let settings = DsLogicCaptureConfig::new(1_000_000_000, 1_000_000)
+            .unwrap()
+            .with_enabled_channels(enabled_channels)
+            .unwrap()
+            .with_trigger(Some(DsLogicTriggerConfig::Simple(trigger)))
+            .encode_settings();
+
+        assert_eq!(read_u16(&settings, 48), 0xf7f7);
+        assert_eq!(read_u16(&settings, 112), 0x0808);
+        assert_eq!(read_u16(&settings, 176), 0x0808);
+    }
+
+    #[test]
+    fn validates_simple_trigger_channel() {
+        assert!(DsLogicSimpleTrigger::new(32, DsLogicTriggerCondition::High).is_err());
+
+        let mut enabled_channels = [false; CHANNEL_COUNT as usize];
+        enabled_channels[0] = true;
+        let trigger = DsLogicSimpleTrigger::new(1, DsLogicTriggerCondition::High).unwrap();
+        let config = DsLogicCaptureConfig::new(1_000_000, 1_000_000)
+            .unwrap()
+            .with_enabled_channels(enabled_channels)
+            .unwrap()
+            .with_trigger(Some(DsLogicTriggerConfig::Simple(trigger)));
+        assert!(config
+            .validate_for_speed(UsbSpeedClass::SuperSpeed)
+            .is_err());
     }
 
     #[test]

@@ -40,8 +40,9 @@ use wavecraft_usb::{
     DsCopeCaptureConfig, DsCopeCaptureSource, DsCopeChannelConfig, DsCopeCoupling,
     DsCopeOperationMode, DsCopeRuntimeCalibrationControl, DsCopeRuntimeTriggerControl,
     DsCopeTriggerConfig, DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig,
-    DsLogicCaptureSource, DsLogicInputFilter, DsLogicOperationMode, DsLogicStopOption, LinkStatus,
-    UsbSpeedClass, DSCOPE_FRAME_SEQUENCE_STRIDE, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
+    DsLogicCaptureSource, DsLogicInputFilter, DsLogicOperationMode, DsLogicSimpleTrigger,
+    DsLogicStopOption, DsLogicTriggerCondition, DsLogicTriggerConfig, LinkStatus, UsbSpeedClass,
+    DSCOPE_FRAME_SEQUENCE_STRIDE, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
     DSCOPE_TRIGGER_HOLDOFF_MAX_NS, DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX,
     DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX,
     DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
@@ -1051,6 +1052,9 @@ struct LogicCaptureSettings {
     rle_enabled: bool,
     external_clock: bool,
     falling_clock_edge: bool,
+    trigger_enabled: bool,
+    trigger_channel: u8,
+    trigger_condition: DsLogicTriggerCondition,
 }
 
 impl Default for LogicCaptureSettings {
@@ -1067,6 +1071,9 @@ impl Default for LogicCaptureSettings {
             rle_enabled: false,
             external_clock: false,
             falling_clock_edge: false,
+            trigger_enabled: false,
+            trigger_channel: 0,
+            trigger_condition: DsLogicTriggerCondition::RisingEdge,
         }
     }
 }
@@ -1100,13 +1107,33 @@ impl LogicCaptureSettings {
                 .with_falling_clock_edge(self.falling_clock_edge)
         })
         .and_then(|config| {
-            config
+            let config = config
                 .with_enabled_channels(if internal_test {
                     [true; LOGIC_CHANNEL_COUNT]
                 } else {
                     self.enabled_channels
                 })
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            if !self.trigger_enabled {
+                return Ok(config);
+            }
+            if internal_test {
+                return Err("Logic triggering is unavailable in internal-test mode".to_owned());
+            }
+            if !self
+                .enabled_channels
+                .get(usize::from(self.trigger_channel))
+                .copied()
+                .unwrap_or(false)
+            {
+                return Err(format!(
+                    "Logic trigger channel {} must be enabled",
+                    self.trigger_channel
+                ));
+            }
+            let trigger = DsLogicSimpleTrigger::new(self.trigger_channel, self.trigger_condition)
+                .map_err(|error| error.to_string())?;
+            Ok(config.with_trigger(Some(DsLogicTriggerConfig::Simple(trigger))))
         })
     }
 
@@ -3965,6 +3992,7 @@ impl WaveCraftApp {
                     .iter()
                     .any(|device| device.kind == InstrumentKind::Oscilloscope);
                 let has_scope_trigger = !scope_trigger_controls.is_empty();
+                let has_logic_trigger = has_logic && logic_config.trigger().is_some();
                 let rolling =
                     uses_rolling_scope_buffer(mode, has_scope, scope_config.trigger().source());
                 let scope_capacity = if rolling {
@@ -4039,6 +4067,10 @@ impl WaveCraftApp {
                     has_scope,
                 });
                 self.status = match (mode, recording_path) {
+                    (AcquisitionMode::Single, Some(path)) if has_logic_trigger => format!(
+                        "Single · waiting for logic trigger; recording to {}",
+                        path.display()
+                    ),
                     (AcquisitionMode::Single, Some(path)) => {
                         format!(
                             "{} Single acquisition from {count} instrument(s) to {}",
@@ -4047,7 +4079,9 @@ impl WaveCraftApp {
                         )
                     }
                     (AcquisitionMode::Single, None) => {
-                        if has_scope_trigger
+                        if has_logic_trigger {
+                            "Single · waiting for logic trigger".to_owned()
+                        } else if has_scope_trigger
                             && scope_config.trigger().source() != DsCopeTriggerSource::Auto
                         {
                             "Single · waiting for trigger".to_owned()
@@ -5812,10 +5846,28 @@ fn paint_capture_settings(
                 CaptureSettingsTab::DsLogic => {
                     if logic_settings.operation_mode == DsLogicOperationMode::InternalTest {
                         logic_settings.enabled_channels = [true; LOGIC_CHANNEL_COUNT];
+                        logic_settings.trigger_enabled = false;
                         set_logic_sample_rate_preserving_duration(
                             logic_settings,
                             100_000_000,
                         );
+                    }
+                    if *logic_acquisition_mode == AcquisitionMode::Loop {
+                        logic_settings.trigger_enabled = false;
+                    }
+                    if !logic_settings
+                        .enabled_channels
+                        .get(usize::from(logic_settings.trigger_channel))
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        if let Some(channel) = logic_settings
+                            .enabled_channels
+                            .iter()
+                            .position(|enabled| *enabled)
+                        {
+                            logic_settings.trigger_channel = channel as u8;
+                        }
                     }
                     let maximum_sample_rate_hz =
                         logic_settings.maximum_sample_rate_hz(logic_speed);
@@ -6107,6 +6159,98 @@ fn paint_capture_settings(
                                         },
                                     );
                                     ui.end_row();
+
+                                    ui.label("Hardware trigger");
+                                    ui.add_enabled(
+                                        availability.capture
+                                            && logic_settings.operation_mode
+                                                != DsLogicOperationMode::InternalTest
+                                            && *logic_acquisition_mode != AcquisitionMode::Loop,
+                                        egui::Checkbox::without_text(
+                                            &mut logic_settings.trigger_enabled,
+                                        ),
+                                    )
+                                    .on_hover_text(
+                                        "Arm the analyzer and wait for the selected channel condition before capturing",
+                                    );
+                                    ui.end_row();
+
+                                    if logic_settings.trigger_enabled {
+                                        ui.label("Trigger channel");
+                                        ui.add_enabled_ui(availability.capture, |ui| {
+                                            egui::ComboBox::from_id_salt(
+                                                "logic_trigger_channel",
+                                            )
+                                            .width(100.0)
+                                            .selected_text(format!(
+                                                "CH {}",
+                                                logic_settings.trigger_channel
+                                            ))
+                                            .show_ui(ui, |ui| {
+                                                for channel in logic_settings
+                                                    .enabled_channels
+                                                    .iter()
+                                                    .copied()
+                                                    .enumerate()
+                                                    .filter_map(|(channel, enabled)| {
+                                                        enabled.then_some(channel)
+                                                    })
+                                                {
+                                                    ui.selectable_value(
+                                                        &mut logic_settings.trigger_channel,
+                                                        channel as u8,
+                                                        format!("CH {channel}"),
+                                                    );
+                                                }
+                                            });
+                                        });
+                                        ui.end_row();
+
+                                        ui.label("Trigger condition");
+                                        ui.add_enabled_ui(availability.capture, |ui| {
+                                            egui::ComboBox::from_id_salt(
+                                                "logic_trigger_condition",
+                                            )
+                                            .width(100.0)
+                                            .selected_text(match logic_settings.trigger_condition {
+                                                DsLogicTriggerCondition::Low => "Low",
+                                                DsLogicTriggerCondition::High => "High",
+                                                DsLogicTriggerCondition::RisingEdge => "Rising edge",
+                                                DsLogicTriggerCondition::FallingEdge => {
+                                                    "Falling edge"
+                                                }
+                                                DsLogicTriggerCondition::EitherEdge => "Either edge",
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut logic_settings.trigger_condition,
+                                                    DsLogicTriggerCondition::RisingEdge,
+                                                    "Rising edge",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut logic_settings.trigger_condition,
+                                                    DsLogicTriggerCondition::FallingEdge,
+                                                    "Falling edge",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut logic_settings.trigger_condition,
+                                                    DsLogicTriggerCondition::EitherEdge,
+                                                    "Either edge",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut logic_settings.trigger_condition,
+                                                    DsLogicTriggerCondition::High,
+                                                    "High",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut logic_settings.trigger_condition,
+                                                    DsLogicTriggerCondition::Low,
+                                                    "Low",
+                                                );
+                                            });
+                                        });
+                                        ui.end_row();
+                                    }
 
                                     if *logic_acquisition_mode == AcquisitionMode::Repetitive {
                                         ui.label("Repeat interval");
@@ -8961,6 +9105,28 @@ fn start_gui_recording(
         "logic.falling_clock_edge".to_owned(),
         logic_config.falling_clock_edge().to_string(),
     );
+    metadata.insert(
+        "logic.trigger.enabled".to_owned(),
+        logic_config.trigger().is_some().to_string(),
+    );
+    if let Some(DsLogicTriggerConfig::Simple(trigger)) = logic_config.trigger() {
+        metadata.insert("logic.trigger.mode".to_owned(), "simple".to_owned());
+        metadata.insert(
+            "logic.trigger.channel".to_owned(),
+            trigger.channel().to_string(),
+        );
+        metadata.insert(
+            "logic.trigger.condition".to_owned(),
+            match trigger.condition() {
+                DsLogicTriggerCondition::Low => "low",
+                DsLogicTriggerCondition::High => "high",
+                DsLogicTriggerCondition::RisingEdge => "rising_edge",
+                DsLogicTriggerCondition::FallingEdge => "falling_edge",
+                DsLogicTriggerCondition::EitherEdge => "either_edge",
+            }
+            .to_owned(),
+        );
+    }
     for (channel, enabled) in logic_config.enabled_channels().into_iter().enumerate() {
         metadata.insert(format!("logic.ch{channel}.enabled"), enabled.to_string());
         metadata.insert(
@@ -9154,6 +9320,31 @@ fn logic_settings_from_recording_metadata(
     if let Some(falling_clock_edge) = recording_metadata_value(metadata, "logic.falling_clock_edge")
     {
         settings.falling_clock_edge = falling_clock_edge;
+    }
+    if let Some(trigger_channel) = recording_metadata_value::<u8>(metadata, "logic.trigger.channel")
+    {
+        if usize::from(trigger_channel) < LOGIC_CHANNEL_COUNT {
+            settings.trigger_channel = trigger_channel;
+        }
+    }
+    if let Some(condition) = metadata.get("logic.trigger.condition") {
+        settings.trigger_condition = match condition.as_str() {
+            "low" => DsLogicTriggerCondition::Low,
+            "high" => DsLogicTriggerCondition::High,
+            "falling_edge" => DsLogicTriggerCondition::FallingEdge,
+            "either_edge" => DsLogicTriggerCondition::EitherEdge,
+            _ => DsLogicTriggerCondition::RisingEdge,
+        };
+    }
+    if recording_metadata_value::<bool>(metadata, "logic.trigger.enabled") == Some(true)
+        && settings
+            .enabled_channels
+            .get(usize::from(settings.trigger_channel))
+            .copied()
+            .unwrap_or(false)
+        && settings.operation_mode != DsLogicOperationMode::InternalTest
+    {
+        settings.trigger_enabled = true;
     }
     settings
 }
@@ -15012,6 +15203,9 @@ mod tests {
             rle_enabled: true,
             external_clock: true,
             falling_clock_edge: true,
+            trigger_enabled: true,
+            trigger_channel: 3,
+            trigger_condition: DsLogicTriggerCondition::FallingEdge,
         };
 
         let config = settings
@@ -15028,6 +15222,12 @@ mod tests {
         assert!(config.rle_enabled());
         assert!(config.external_clock());
         assert!(config.falling_clock_edge());
+        assert_eq!(
+            config.trigger(),
+            Some(DsLogicTriggerConfig::Simple(
+                DsLogicSimpleTrigger::new(3, DsLogicTriggerCondition::FallingEdge).unwrap()
+            ))
+        );
     }
 
     #[test]
@@ -15094,6 +15294,13 @@ mod tests {
         metadata.insert("logic.rle_enabled".to_owned(), "true".to_owned());
         metadata.insert("logic.external_clock".to_owned(), "true".to_owned());
         metadata.insert("logic.falling_clock_edge".to_owned(), "true".to_owned());
+        metadata.insert("logic.trigger.enabled".to_owned(), "true".to_owned());
+        metadata.insert("logic.trigger.mode".to_owned(), "simple".to_owned());
+        metadata.insert("logic.trigger.channel".to_owned(), "9".to_owned());
+        metadata.insert(
+            "logic.trigger.condition".to_owned(),
+            "falling_edge".to_owned(),
+        );
         metadata.insert("logic.ch0.name".to_owned(), "Clock".to_owned());
         metadata.insert("logic.ch1.name".to_owned(), "  Data  ".to_owned());
         metadata.insert("scope.ch0.name".to_owned(), "Input".to_owned());
@@ -15184,6 +15391,12 @@ mod tests {
         assert!(logic_settings.rle_enabled);
         assert!(logic_settings.external_clock);
         assert!(logic_settings.falling_clock_edge);
+        assert!(logic_settings.trigger_enabled);
+        assert_eq!(logic_settings.trigger_channel, 9);
+        assert_eq!(
+            logic_settings.trigger_condition,
+            DsLogicTriggerCondition::FallingEdge
+        );
         assert_eq!(loaded.logic_channel_names[0], "Clock");
         assert_eq!(loaded.logic_channel_names[1], "Data");
         assert_eq!(loaded.scope_channel_names, ["Input", "Reference"]);
