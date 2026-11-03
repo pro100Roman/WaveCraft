@@ -2239,12 +2239,25 @@ fn protocol_event_elapsed(start_sample: u64, sample_rate_hz: u64) -> Option<Dura
         .then(|| Duration::from_secs_f64(start_sample as f64 / sample_rate_hz as f64))
 }
 
+fn decoded_panel_entry_id(
+    ui: &egui::Ui,
+    analyzer: &ProtocolAnalyzerInstance,
+    entry: &DecodedPanelEntry,
+) -> egui::Id {
+    ui.make_persistent_id((
+        "decoded_panel_entry",
+        analyzer.instance_id,
+        entry.start_sample,
+        entry.end_sample,
+        entry.title.as_str(),
+    ))
+}
+
 fn paint_decoded_data_panel(
     ui: &mut egui::Ui,
     analyzers: &[ProtocolAnalyzerInstance],
     outcomes: &[ProtocolDecodeOutcome],
     sample_rate_hz: u64,
-    open_all: Option<bool>,
 ) -> Option<(u64, u64)> {
     let mut selected_range = None;
     if analyzers.is_empty() {
@@ -2260,17 +2273,47 @@ fn paint_decoded_data_panel(
             ui.add_space(6.0);
         }
         let name = analyzer_name(analyzer);
-        ui.label(
-            RichText::new(name)
-                .strong()
-                .color(logic_marker_color(analyzer_index)),
-        );
         match outcome {
             ProtocolDecodeOutcome::Unavailable(message) => {
+                ui.label(
+                    RichText::new(name)
+                        .strong()
+                        .color(logic_marker_color(analyzer_index)),
+                );
                 ui.add_space(4.0);
                 ui.label(RichText::new(message).color(TEXT_MUTED));
             }
             ProtocolDecodeOutcome::Events(events) => {
+                let entries = decoded_panel_entries(events);
+                let all_open = !entries.is_empty()
+                    && entries.iter().all(|entry| {
+                        let entry_id = decoded_panel_entry_id(ui, analyzer, entry);
+                        ui.data(|data| data.get_temp::<bool>(entry_id).unwrap_or(false))
+                    });
+                let mut open_all = None;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(name)
+                            .strong()
+                            .color(logic_marker_color(analyzer_index)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                !entries.is_empty(),
+                                egui::Button::new(if all_open { "− All" } else { "+ All" }).small(),
+                            )
+                            .on_hover_text(if all_open {
+                                "Collapse all messages for this analyzer"
+                            } else {
+                                "Expand all messages for this analyzer"
+                            })
+                            .clicked()
+                        {
+                            open_all = Some(!all_open);
+                        }
+                    });
+                });
                 if analyzer.data_format == ProtocolDataFormat::Ascii {
                     if let Some(text) = uart_ascii_text(events) {
                         ui.add_space(5.0);
@@ -2284,7 +2327,6 @@ fn paint_decoded_data_panel(
                             });
                     }
                 }
-                let entries = decoded_panel_entries(events);
                 if entries.is_empty() {
                     ui.add_space(4.0);
                     ui.label(RichText::new("No decoded operations").color(TEXT_MUTED));
@@ -2293,13 +2335,7 @@ fn paint_decoded_data_panel(
                 ui.add_space(6.0);
                 for entry in &entries {
                     let card_width = ui.available_width();
-                    let entry_id = ui.make_persistent_id((
-                        "decoded_panel_entry",
-                        analyzer.instance_id,
-                        entry.start_sample,
-                        entry.end_sample,
-                        entry.title.as_str(),
-                    ));
+                    let entry_id = decoded_panel_entry_id(ui, analyzer, entry);
                     let mut open = open_all.unwrap_or_else(|| {
                         ui.data(|data| data.get_temp::<bool>(entry_id).unwrap_or(false))
                     });
@@ -8416,7 +8452,6 @@ impl eframe::App for WaveCraftApp {
             });
         let mut decoded_data_panel_open = self.decoded_data_panel_open;
         let mut decoded_data_panel_width = self.decoded_data_panel_width;
-        let mut decoded_messages_open_request = None;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -8628,26 +8663,6 @@ impl eframe::App for WaveCraftApp {
                                                             {
                                                                 decoded_data_panel_open = false;
                                                             }
-                                                            if ui
-                                                                .small_button("+ All")
-                                                                .on_hover_text(
-                                                                    "Expand all decoded messages",
-                                                                )
-                                                                .clicked()
-                                                            {
-                                                                decoded_messages_open_request =
-                                                                    Some(true);
-                                                            }
-                                                            if ui
-                                                                .small_button("− All")
-                                                                .on_hover_text(
-                                                                    "Collapse all decoded messages",
-                                                                )
-                                                                .clicked()
-                                                            {
-                                                                decoded_messages_open_request =
-                                                                    Some(false);
-                                                            }
                                                         },
                                                     );
                                                 });
@@ -8662,7 +8677,6 @@ impl eframe::App for WaveCraftApp {
                                                                 .analyzers,
                                                             decoded_outcomes.as_ref(),
                                                             sample_rate_hz,
-                                                            decoded_messages_open_request,
                                                         );
                                                     });
                                             });
