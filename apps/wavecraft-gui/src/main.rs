@@ -6426,20 +6426,25 @@ fn paint_capture_settings(
                                                     .on_hover_text(
                                                         "All channel conditions match at one sample",
                                                     );
-                                                    if ui
-                                                        .selectable_value(
-                                                            &mut logic_settings.trigger_mode,
-                                                            LogicTriggerMode::Smart,
-                                                            "Smart",
-                                                        )
-                                                        .on_hover_text(
-                                                            "Match two or more channel-condition stages in order; selects buffered capture",
-                                                        )
-                                                        .changed()
-                                                    {
-                                                        set_logic_operation_mode_preserving_duration(
-                                                            logic_settings,
-                                                            DsLogicOperationMode::Buffer,
+                                                    let smart_available =
+                                                        logic_settings.operation_mode
+                                                            == DsLogicOperationMode::Buffer;
+                                                    let smart_option = ui.add_enabled_ui(
+                                                        smart_available,
+                                                        |ui| {
+                                                            ui.selectable_value(
+                                                                &mut logic_settings.trigger_mode,
+                                                                LogicTriggerMode::Smart,
+                                                                "Smart",
+                                                            )
+                                                            .on_hover_text(
+                                                                "Match two or more channel-condition stages in order",
+                                                            );
+                                                        },
+                                                    );
+                                                    if !smart_available {
+                                                        smart_option.response.on_hover_text(
+                                                            "Smart trigger requires Buffer mode. Select Buffer under Capture mode to enable it.",
                                                         );
                                                     }
                                                 });
