@@ -20,7 +20,8 @@ pub fn classify_build_version(state: &BuildVersionState) -> String {
         "origin main".to_owned()
     } else {
         format!(
-            "dirty · {}",
+            "dirty · {} · {}",
+            state.branch.as_deref().unwrap_or("detached"),
             state.short_hash.as_deref().unwrap_or("unknown")
         )
     }
@@ -70,14 +71,30 @@ mod tests {
     fn changes_or_another_branch_include_the_commit_hash() {
         let mut changed = clean_main();
         changed.clean = false;
-        assert_eq!(classify_build_version(&changed), "dirty · 01234567");
+        assert_eq!(classify_build_version(&changed), "dirty · main · 01234567");
 
         let mut branch = clean_main();
         branch.branch = Some("feature/version-label".to_owned());
-        assert_eq!(classify_build_version(&branch), "dirty · 01234567");
+        assert_eq!(
+            classify_build_version(&branch),
+            "dirty · feature/version-label · 01234567"
+        );
 
         let mut ahead = clean_main();
         ahead.head = Some("fedcba9876543210".to_owned());
-        assert_eq!(classify_build_version(&ahead), "dirty · 01234567");
+        assert_eq!(classify_build_version(&ahead), "dirty · main · 01234567");
+    }
+
+    #[test]
+    fn detached_dirty_build_has_an_explicit_branch_placeholder() {
+        let state = BuildVersionState {
+            short_hash: Some("01234567".to_owned()),
+            ..BuildVersionState::default()
+        };
+
+        assert_eq!(
+            classify_build_version(&state),
+            "dirty · detached · 01234567"
+        );
     }
 }

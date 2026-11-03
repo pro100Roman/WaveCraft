@@ -9,6 +9,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_ACTIONS");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
+    println!("cargo:rerun-if-env-changed=GITHUB_HEAD_REF");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
     println!("cargo:rerun-if-changed=../../.git/packed-refs");
@@ -49,11 +50,13 @@ fn repository_version(repository: &Path) -> String {
     let github_main = env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true")
         && env::var("GITHUB_REF_TYPE").ok().as_deref() == Some("branch")
         && env::var("GITHUB_REF_NAME").ok().as_deref() == Some("main");
+    let branch =
+        git(repository, &["symbolic-ref", "--quiet", "--short", "HEAD"]).or_else(ci_branch_name);
     classify_build_version(&BuildVersionState {
         ci_tag: ci_tag(),
         head: git(repository, &["rev-parse", "HEAD"]),
         short_hash: git(repository, &["rev-parse", "--short=8", "HEAD"]),
-        branch: git(repository, &["symbolic-ref", "--quiet", "--short", "HEAD"]),
+        branch,
         origin_main: git(
             repository,
             &["rev-parse", "--verify", "refs/remotes/origin/main"],
@@ -65,6 +68,17 @@ fn repository_version(repository: &Path) -> String {
         .is_some_and(|status| status.is_empty()),
         github_main,
     })
+}
+
+fn ci_branch_name() -> Option<String> {
+    env::var("GITHUB_HEAD_REF")
+        .ok()
+        .filter(|branch| !branch.trim().is_empty())
+        .or_else(|| {
+            (env::var("GITHUB_REF_TYPE").ok().as_deref() == Some("branch"))
+                .then(|| env::var("GITHUB_REF_NAME").ok())
+                .flatten()
+        })
 }
 
 fn git(repository: &Path, arguments: &[&str]) -> Option<String> {
