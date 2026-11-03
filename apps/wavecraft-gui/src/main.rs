@@ -8551,7 +8551,10 @@ impl eframe::App for WaveCraftApp {
                                                         ),
                                                         |ui| {
                                                             if ui
-                                                                .small_button(">>")
+                                                                .add_sized(
+                                                                    [26.0, 24.0],
+                                                                    egui::Button::new("▶"),
+                                                                )
                                                                 .on_hover_text(
                                                                     "Collapse decoded data",
                                                                 )
@@ -8604,10 +8607,7 @@ impl eframe::App for WaveCraftApp {
                                                     (available_size.y - 8.0).max(0.0),
                                                 );
                                                 if ui
-                                                    .add_sized(
-                                                        [ui.available_width(), 24.0],
-                                                        egui::Button::new("<<"),
-                                                    )
+                                                    .add_sized([26.0, 24.0], egui::Button::new("◀"))
                                                     .on_hover_text("Expand decoded data")
                                                     .clicked()
                                                 {
