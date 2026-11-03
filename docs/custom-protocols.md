@@ -247,12 +247,19 @@ The [`BNO08x SH-2 I2C example`](examples/bno08x-sh2-i2c.wavecraft-protocol.yaml)
 decodes the SHTP header, Product ID and feature-control messages, plus common
 accelerometer, gyroscope, magnetometer, gravity, and rotation-vector reports.
 Add an I2C analyzer, map SCL and SDA, save it, then load the example YAML from
-the analyzer card. The current schema version decodes the first SH-2 sensor
-report in each I2C transaction and converts raw fixed-point sensor integers
+the analyzer card. Segmented SHTP cargoes are reassembled across consecutive
+I2C transactions. The current schema version decodes the first SH-2 sensor
+report in each reassembled cargo and converts raw fixed-point sensor integers
 from their documented Q point into physical units. Its
 summaries distinguish acceleration (including or excluding gravity), angular
 velocity, magnetic field, gravity, and orientation quaternions. It does not yet
-reassemble SHTP continuations or iterate over multiple reports in one cargo.
+iterate over multiple reports in one cargo.
+
+Known issue: a capture with only raw accelerometer (`0x14`) and raw
+magnetometer (`0x16`) enabled can currently be decoded as raw gyroscope
+(`0x15`). Raw-vector report selection and offsets require further investigation;
+the reported raw sensor type should not be considered reliable until this is
+fixed.
 
 ```yaml
 schema: wavecraft.protocol/v1

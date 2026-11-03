@@ -2,13 +2,19 @@
 # Reference: SH-2 Reference Manual 1000-3625 and BNO080 Datasheet 1000-3927.
 #
 # WaveCraft protocol/v1 limitations:
-# - one decoded message is emitted per I2C transaction, so only the first SH-2
-#   sensor report following a Base Timestamp (0xFB) or Timestamp Rebase (0xFA)
-#   is decoded;
+# - one decoded message is emitted per reassembled SHTP cargo, so only the
+#   first SH-2 sensor report following a Base Timestamp (0xFB) or Timestamp
+#   Rebase (0xFA) is decoded;
 # - SHTP cargo split across several I2C transactions is reassembled before
 #   SH-2 message selection;
 # - fixed-point sensor values are converted to physical units while the decoder
 #   retains the original signed integer value.
+#
+# Known issue:
+# - captures with only raw accelerometer (0x14) and raw magnetometer (0x16)
+#   enabled can currently be classified as raw gyroscope (0x15). Raw-vector
+#   report selection and offsets still need to be investigated and fixed; do
+#   not rely on the reported raw sensor type until that work is complete.
 
 schema: wavecraft.protocol/v1
 
