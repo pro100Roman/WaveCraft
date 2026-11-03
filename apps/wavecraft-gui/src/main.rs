@@ -2,6 +2,7 @@
 
 mod measurements;
 mod protocol_analyzer;
+mod sessions;
 mod snapshot;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
@@ -16,6 +17,7 @@ use protocol_analyzer::{
     ProtocolDataFormat, ProtocolDecodeOutcome, ProtocolDecodeSnapshot, ProtocolDecodedEvent,
     ProtocolDecodedKind, PROTOCOLS,
 };
+use sessions::{SessionTabs, MAX_SESSION_TABS, SESSION_NAME_MAX_CHARS};
 use snapshot::{crop_snapshot_image, save_snapshot_image, PendingSnapshot};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -94,8 +96,6 @@ const LOGIC_MARKER_LIMIT: usize = 20;
 const LOGIC_MARKER_NAME_MAX_CHARS: usize = 32;
 const CHANNEL_NAME_MAX_CHARS: usize = 32;
 const LOGIC_CHANNEL_NAME_MAX_CHARS: usize = 8;
-const MAX_SESSION_TABS: usize = 10;
-const SESSION_NAME_MAX_CHARS: usize = 48;
 const DEFAULT_LOGIC_CHANNEL_MARKER_OPACITY: u8 = 128;
 const LOGIC_MARKER_EDGE_SNAP_DISTANCE: f32 = 8.0;
 const CAPTURE_FILE_BUTTON_WIDTH: f32 = 82.0;
@@ -3039,18 +3039,6 @@ struct CompletedCapture {
     has_scope: bool,
 }
 
-struct SessionTab<T, S> {
-    name: String,
-    capture: Option<T>,
-    settings: S,
-}
-
-struct SessionTabs<T, S> {
-    tabs: Vec<SessionTab<T, S>>,
-    active: usize,
-    next_default_number: usize,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionTabAction {
     Select(usize),
@@ -3064,130 +3052,6 @@ struct SessionNameEditor {
     index: usize,
     draft: String,
     request_focus: bool,
-}
-
-impl<T, S> SessionTabs<T, S> {
-    fn new(settings: S) -> Self {
-        Self {
-            tabs: vec![SessionTab {
-                name: "Session 1".to_owned(),
-                capture: None,
-                settings,
-            }],
-            active: 0,
-            next_default_number: 2,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.tabs.len()
-    }
-
-    fn active_index(&self) -> usize {
-        self.active
-    }
-
-    fn names(&self) -> Vec<String> {
-        self.tabs.iter().map(|tab| tab.name.clone()).collect()
-    }
-
-    fn name(&self, index: usize) -> Option<&str> {
-        self.tabs.get(index).map(|tab| tab.name.as_str())
-    }
-
-    fn active_capture(&self) -> Option<&T> {
-        self.tabs
-            .get(self.active)
-            .and_then(|tab| tab.capture.as_ref())
-    }
-
-    fn active_settings(&self) -> &S {
-        &self.tabs[self.active].settings
-    }
-
-    fn replace_active_settings(&mut self, settings: S) {
-        self.tabs[self.active].settings = settings;
-    }
-
-    fn replace_active(&mut self, value: T) {
-        self.tabs[self.active].capture = Some(value);
-    }
-
-    fn clear_active(&mut self) {
-        self.tabs[self.active].capture = None;
-    }
-
-    fn take_active(&mut self) -> Option<T> {
-        self.tabs
-            .get_mut(self.active)
-            .and_then(|tab| tab.capture.take())
-    }
-
-    fn add(&mut self, settings: S) -> bool {
-        if self.len() >= MAX_SESSION_TABS {
-            return false;
-        }
-        let name = format!("Session {}", self.next_default_number);
-        self.next_default_number += 1;
-        self.tabs.push(SessionTab {
-            name,
-            capture: None,
-            settings,
-        });
-        self.active = self.tabs.len() - 1;
-        true
-    }
-
-    fn rename(&mut self, index: usize, name: &str) -> bool {
-        let Some(tab) = self.tabs.get_mut(index) else {
-            return false;
-        };
-        let name = name.trim();
-        if name.is_empty() {
-            return false;
-        }
-        tab.name = name.chars().take(SESSION_NAME_MAX_CHARS).collect();
-        true
-    }
-
-    fn select(&mut self, index: usize) -> bool {
-        if index >= self.tabs.len() {
-            return false;
-        }
-        self.active = index;
-        true
-    }
-
-    fn close(&mut self, index: usize) -> bool {
-        if self.len() <= 1 || index >= self.len() {
-            return false;
-        }
-        self.tabs.remove(index);
-        if index < self.active {
-            self.active -= 1;
-        } else if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        }
-        true
-    }
-
-    fn reset(&mut self, settings: S) {
-        self.tabs.clear();
-        self.tabs.push(SessionTab {
-            name: "Session 1".to_owned(),
-            capture: None,
-            settings,
-        });
-        self.active = 0;
-        self.next_default_number = 2;
-    }
-
-    fn any(&self, predicate: impl Fn(&T) -> bool) -> bool {
-        self.tabs
-            .iter()
-            .filter_map(|tab| tab.capture.as_ref())
-            .any(predicate)
-    }
 }
 
 struct CalibrationDisplay {
@@ -15133,101 +14997,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["'H'", "'i'"]
         );
-    }
-
-    #[test]
-    fn session_tabs_preserve_each_tabs_capture_and_settings() {
-        let mut sessions = SessionTabs::new(10_u64);
-        sessions.replace_active("first capture");
-        sessions.replace_active_settings(11);
-
-        assert!(sessions.add(20));
-        assert_eq!(sessions.active_index(), 1);
-        assert_eq!(sessions.active_capture(), None);
-        assert_eq!(*sessions.active_settings(), 20);
-        sessions.replace_active("second capture");
-        sessions.replace_active_settings(21);
-
-        assert!(sessions.select(0));
-        assert_eq!(sessions.active_capture(), Some(&"first capture"));
-        assert_eq!(*sessions.active_settings(), 11);
-        assert!(sessions.select(1));
-        assert_eq!(sessions.active_capture(), Some(&"second capture"));
-        assert_eq!(*sessions.active_settings(), 21);
-    }
-
-    #[test]
-    fn session_tabs_are_limited_to_ten() {
-        let mut sessions = SessionTabs::<(), ()>::new(());
-
-        for _ in 1..MAX_SESSION_TABS {
-            assert!(sessions.add(()));
-        }
-
-        assert_eq!(sessions.len(), MAX_SESSION_TABS);
-        assert!(!sessions.add(()));
-        assert_eq!(sessions.active_index(), MAX_SESSION_TABS - 1);
-        assert!(!sessions.select(MAX_SESSION_TABS));
-        assert_eq!(sessions.name(0), Some("Session 1"));
-        assert_eq!(sessions.name(MAX_SESSION_TABS - 1), Some("Session 10"));
-    }
-
-    #[test]
-    fn closing_sessions_discards_the_tab_and_keeps_active_session_valid() {
-        let mut sessions = SessionTabs::new(10_u64);
-        sessions.replace_active("first capture");
-        assert!(sessions.add(20));
-        sessions.replace_active("second capture");
-        assert!(sessions.add(30));
-        sessions.replace_active("third capture");
-
-        assert!(sessions.close(0));
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions.names(), ["Session 2", "Session 3"]);
-        assert_eq!(sessions.active_index(), 1);
-        assert_eq!(*sessions.active_settings(), 30);
-        assert_eq!(sessions.active_capture(), Some(&"third capture"));
-
-        assert!(sessions.close(1));
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions.active_index(), 0);
-        assert_eq!(*sessions.active_settings(), 20);
-        assert_eq!(sessions.active_capture(), Some(&"second capture"));
-        assert!(!sessions.close(0));
-        assert!(!sessions.close(1));
-
-        assert!(sessions.add(40));
-        assert_eq!(sessions.names(), ["Session 2", "Session 4"]);
-    }
-
-    #[test]
-    fn closing_active_middle_session_selects_the_following_session() {
-        let mut sessions = SessionTabs::<(), _>::new("first");
-        assert!(sessions.add("second"));
-        assert!(sessions.add("third"));
-        assert!(sessions.select(1));
-
-        assert!(sessions.close(1));
-
-        assert_eq!(sessions.active_index(), 1);
-        assert_eq!(*sessions.active_settings(), "third");
-    }
-
-    #[test]
-    fn renamed_session_name_persists_across_selection_and_closing_other_tabs() {
-        let mut sessions = SessionTabs::<(), _>::new("first");
-        assert!(sessions.add("second"));
-        assert!(sessions.add("third"));
-        assert!(sessions.rename(1, "  SPI boot  "));
-        assert!(!sessions.rename(1, "   "));
-
-        assert!(sessions.select(0));
-        assert!(sessions.select(1));
-        assert_eq!(sessions.name(1), Some("SPI boot"));
-
-        assert!(sessions.close(0));
-        assert_eq!(sessions.names(), ["SPI boot", "Session 3"]);
-        assert_eq!(sessions.name(0), Some("SPI boot"));
     }
 
     #[test]
