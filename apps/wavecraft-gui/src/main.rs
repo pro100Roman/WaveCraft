@@ -11398,7 +11398,13 @@ fn paint_logic_protocol_lanes(
     if lanes.is_empty() {
         return;
     }
-    let outcomes = cache.outcomes(waveforms, &settings.analyzers, streamed);
+    let outcomes = if let Some(streamed) =
+        streamed.filter(|snapshot| snapshot.matches_analyzers(&settings.analyzers))
+    {
+        streamed.waveform_outcomes()
+    } else {
+        cache.outcomes(waveforms, &settings.analyzers, None)
+    };
     for (lane_index, ((lane, analyzer), outcome)) in lanes
         .iter()
         .zip(&settings.analyzers)

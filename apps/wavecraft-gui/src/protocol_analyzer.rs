@@ -252,6 +252,7 @@ pub struct ProtocolCaptureDecoder {
     analyzers: Vec<ProtocolAnalyzerInstance>,
     runtimes: Vec<Option<IncrementalAnalyzerRuntime>>,
     outcomes: Arc<Vec<ProtocolDecodeOutcome>>,
+    waveform_outcomes: Arc<Vec<ProtocolDecodeOutcome>>,
     next_sample_offset: u64,
     sample_rate_hz: Option<u64>,
     source_id: Option<String>,
@@ -264,6 +265,7 @@ pub struct ProtocolCaptureDecoder {
 pub struct ProtocolDecodeSnapshot {
     analyzers: Vec<ProtocolAnalyzerInstance>,
     outcomes: Arc<Vec<ProtocolDecodeOutcome>>,
+    waveform_outcomes: Arc<Vec<ProtocolDecodeOutcome>>,
 }
 
 impl ProtocolDecodeSnapshot {
@@ -274,6 +276,10 @@ impl ProtocolDecodeSnapshot {
     pub fn outcomes(&self) -> &[ProtocolDecodeOutcome] {
         &self.outcomes
     }
+
+    pub fn waveform_outcomes(&self) -> &[ProtocolDecodeOutcome] {
+        &self.waveform_outcomes
+    }
 }
 
 impl ProtocolCaptureDecoder {
@@ -282,6 +288,12 @@ impl ProtocolCaptureDecoder {
             analyzers: analyzers.to_vec(),
             runtimes: Vec::new(),
             outcomes: Arc::new(
+                analyzers
+                    .iter()
+                    .map(|_| ProtocolDecodeOutcome::Events(Vec::new()))
+                    .collect(),
+            ),
+            waveform_outcomes: Arc::new(
                 analyzers
                     .iter()
                     .map(|_| ProtocolDecodeOutcome::Events(Vec::new()))
@@ -309,6 +321,7 @@ impl ProtocolCaptureDecoder {
         ProtocolDecodeSnapshot {
             analyzers: self.analyzers.clone(),
             outcomes: Arc::clone(&self.outcomes),
+            waveform_outcomes: Arc::clone(&self.waveform_outcomes),
         }
     }
 
@@ -327,6 +340,12 @@ impl ProtocolCaptureDecoder {
         self.analyzers = analyzers.to_vec();
         self.runtimes.clear();
         self.outcomes = Arc::new(
+            analyzers
+                .iter()
+                .map(|_| ProtocolDecodeOutcome::Events(Vec::new()))
+                .collect(),
+        );
+        self.waveform_outcomes = Arc::new(
             analyzers
                 .iter()
                 .map(|_| ProtocolDecodeOutcome::Events(Vec::new()))
@@ -379,6 +398,12 @@ impl ProtocolCaptureDecoder {
                         .map(|_| ProtocolDecodeOutcome::Events(Vec::new()))
                         .collect(),
                 );
+                self.waveform_outcomes = Arc::new(
+                    self.analyzers
+                        .iter()
+                        .map(|_| ProtocolDecodeOutcome::Events(Vec::new()))
+                        .collect(),
+                );
             }
             self.build_runtimes(sample_rate_hz, preserve_history);
         } else if self.runtimes.len() != self.analyzers.len() {
@@ -394,10 +419,19 @@ impl ProtocolCaptureDecoder {
                 .map(|runtime| runtime.push_samples(samples, sample_offset, sample_rate_hz));
             match result {
                 Some(Ok(events)) => {
-                    append_streamed_events(&mut Arc::make_mut(&mut self.outcomes)[index], events)
+                    append_streamed_events(
+                        &mut Arc::make_mut(&mut self.outcomes)[index],
+                        events.clone(),
+                    );
+                    append_streamed_events(
+                        &mut Arc::make_mut(&mut self.waveform_outcomes)[index],
+                        events,
+                    );
                 }
                 Some(Err(error)) => {
                     Arc::make_mut(&mut self.outcomes)[index] =
+                        ProtocolDecodeOutcome::Unavailable(error.clone());
+                    Arc::make_mut(&mut self.waveform_outcomes)[index] =
                         ProtocolDecodeOutcome::Unavailable(error);
                     self.runtimes[index] = None;
                 }
@@ -419,10 +453,19 @@ impl ProtocolCaptureDecoder {
                 .map(|runtime| runtime.finish(sample_rate_hz, fallback));
             match result {
                 Some(Ok(events)) => {
-                    append_streamed_events(&mut Arc::make_mut(&mut self.outcomes)[index], events)
+                    append_streamed_events(
+                        &mut Arc::make_mut(&mut self.outcomes)[index],
+                        events.clone(),
+                    );
+                    append_streamed_events(
+                        &mut Arc::make_mut(&mut self.waveform_outcomes)[index],
+                        events,
+                    );
                 }
                 Some(Err(error)) => {
                     Arc::make_mut(&mut self.outcomes)[index] =
+                        ProtocolDecodeOutcome::Unavailable(error.clone());
+                    Arc::make_mut(&mut self.waveform_outcomes)[index] =
                         ProtocolDecodeOutcome::Unavailable(error);
                     self.runtimes[index] = None;
                 }
@@ -434,10 +477,14 @@ impl ProtocolCaptureDecoder {
 
     fn build_runtimes(&mut self, sample_rate_hz: u64, preserve_history: bool) {
         let mut previous_outcomes = std::mem::take(Arc::make_mut(&mut self.outcomes)).into_iter();
+        let mut previous_waveform_outcomes =
+            std::mem::take(Arc::make_mut(&mut self.waveform_outcomes)).into_iter();
         let mut runtimes = Vec::with_capacity(self.analyzers.len());
         let mut outcomes = Vec::with_capacity(self.analyzers.len());
+        let mut waveform_outcomes = Vec::with_capacity(self.analyzers.len());
         for analyzer in &self.analyzers {
             let previous_outcome = previous_outcomes.next();
+            let previous_waveform_outcome = previous_waveform_outcomes.next();
             match IncrementalAnalyzerRuntime::new(analyzer.clone(), sample_rate_hz) {
                 Ok(runtime) => {
                     runtimes.push(Some(runtime));
@@ -451,15 +498,27 @@ impl ProtocolCaptureDecoder {
                     } else {
                         ProtocolDecodeOutcome::Events(Vec::new())
                     });
+                    waveform_outcomes.push(if preserve_history {
+                        match previous_waveform_outcome {
+                            Some(ProtocolDecodeOutcome::Events(events)) => {
+                                ProtocolDecodeOutcome::Events(events)
+                            }
+                            _ => ProtocolDecodeOutcome::Events(Vec::new()),
+                        }
+                    } else {
+                        ProtocolDecodeOutcome::Events(Vec::new())
+                    });
                 }
                 Err(error) => {
                     runtimes.push(None);
-                    outcomes.push(ProtocolDecodeOutcome::Unavailable(error));
+                    outcomes.push(ProtocolDecodeOutcome::Unavailable(error.clone()));
+                    waveform_outcomes.push(ProtocolDecodeOutcome::Unavailable(error));
                 }
             }
         }
         self.runtimes = runtimes;
         self.outcomes = Arc::new(outcomes);
+        self.waveform_outcomes = Arc::new(waveform_outcomes);
     }
 }
 
@@ -2792,31 +2851,48 @@ mod tests {
     }
 
     #[test]
-    fn repetitive_capture_retains_prior_decoded_history() {
-        let mut uart = analyzer("1:uart", vec![Some(0)]);
-        uart.data_format = ProtocolDataFormat::Ascii;
+    fn repetitive_capture_retains_panel_history_but_not_waveform_events() {
+        let i2c = analyzer("1:i2c", vec![Some(0), Some(1)]);
 
-        let mut first = ProtocolCaptureDecoder::new(std::slice::from_ref(&uart));
-        first.ingest_logic(&uart_8n1(b"A", 10), 1_152_000);
+        let mut first = ProtocolCaptureDecoder::new(std::slice::from_ref(&i2c));
+        first.ingest_logic(&i2c_transaction(&[(0xA0, true), (0x11, true)]), 1_000_000);
         first.finish();
 
-        let mut second = ProtocolCaptureDecoder::new(std::slice::from_ref(&uart));
+        let mut second = ProtocolCaptureDecoder::new(std::slice::from_ref(&i2c));
         second.retain_history_from(&first.snapshot());
-        second.ingest_logic(&uart_8n1(b"B", 10), 1_152_000);
+        second.ingest_logic(&i2c_transaction(&[(0xA0, true), (0x22, false)]), 1_000_000);
         second.finish();
 
         let ProtocolDecodeOutcome::Events(events) = &second.outcomes()[0] else {
-            panic!("UART should remain available across repetitive captures");
+            panic!("I²C should remain available across repetitive captures");
         };
         assert_eq!(
             events
                 .iter()
                 .filter_map(|event| match event.kind {
-                    ProtocolDecodedKind::Uart { value } => Some(value),
+                    ProtocolDecodedKind::Data { value } => Some(value),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            b"AB"
+            [0x11, 0x22]
+        );
+        let snapshot = second.snapshot();
+        let ProtocolDecodeOutcome::Events(events) = &snapshot.waveform_outcomes()[0] else {
+            panic!("current I²C capture should remain available to the waveform");
+        };
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [
+                ProtocolDecodedKind::I2cAddress {
+                    address: 0x50,
+                    read: false,
+                },
+                ProtocolDecodedKind::Acknowledge { acknowledged: true },
+                ProtocolDecodedKind::Data { value: 0x22 },
+                ProtocolDecodedKind::Acknowledge {
+                    acknowledged: false,
+                },
+            ]
         );
     }
 
