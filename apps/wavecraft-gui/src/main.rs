@@ -2259,8 +2259,16 @@ fn paint_decoded_data_panel(
                     continue;
                 }
                 ui.add_space(6.0);
-                for (entry_index, entry) in entries.iter().enumerate() {
+                for entry in &entries {
                     let card_width = ui.available_width();
+                    let entry_id = ui.make_persistent_id((
+                        "decoded_panel_entry",
+                        analyzer.instance_id,
+                        entry.start_sample,
+                        entry.end_sample,
+                        entry.title.as_str(),
+                    ));
+                    let mut open = ui.data(|data| data.get_temp::<bool>(entry_id).unwrap_or(false));
                     let time = protocol_event_elapsed(entry.start_sample, sample_rate_hz)
                         .map(format_duration)
                         .unwrap_or_default();
@@ -2277,36 +2285,56 @@ fn paint_decoded_data_panel(
                             let content_width = (card_width - 16.0).max(0.0);
                             ui.set_width(content_width);
                             ui.set_max_width(content_width);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                            let header = ui.horizontal(|ui| {
                                 ui.label(
-                                    RichText::new(&time).small().monospace().color(TEXT_MUTED),
+                                    RichText::new(if open { "▼" } else { "▶" }).color(TEXT_MUTED),
                                 );
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&entry.title).strong().color(color),
-                                    )
-                                    .wrap()
-                                    .halign(egui::Align::Min),
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::TOP),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(&time)
+                                                .small()
+                                                .monospace()
+                                                .color(TEXT_MUTED),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&entry.title).strong().color(color),
+                                            )
+                                            .wrap()
+                                            .halign(egui::Align::Min),
+                                        );
+                                    },
                                 );
                             });
-                            ui.add(
-                                egui::Label::new(RichText::new(&entry.detail).small().monospace())
-                                    .wrap(),
-                            );
+                            let header_response = ui
+                                .interact(
+                                    header.response.rect,
+                                    entry_id.with("header"),
+                                    Sense::click(),
+                                )
+                                .on_hover_text("Expand or collapse message data");
+                            if header_response.clicked() {
+                                open = !open;
+                                ui.data_mut(|data| data.insert_temp(entry_id, open));
+                            }
+                            if open {
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&entry.detail).small().monospace(),
+                                    )
+                                    .wrap()
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text("Click to focus this message in the waveform")
+                                .clicked()
+                            } else {
+                                false
+                            }
                         });
-                    let response = ui.interact(
-                        card.response.rect,
-                        ui.make_persistent_id((
-                            "decoded_panel_entry",
-                            analyzer.instance_id,
-                            entry_index,
-                        )),
-                        Sense::click(),
-                    );
-                    if response
-                        .on_hover_text("Click to focus this operation in the waveform")
-                        .clicked()
-                    {
+                    if card.inner {
                         selected_range = Some((entry.start_sample, entry.end_sample));
                     }
                     ui.add_space(5.0);
