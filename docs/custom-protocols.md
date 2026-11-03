@@ -188,6 +188,18 @@ field is required and controls compatibility:
 
 The complete copyable example is
 [`examples/motor-controller.wavecraft-protocol.yaml`](examples/motor-controller.wavecraft-protocol.yaml).
+Its matching UART capture is
+[`examples/motor-controller-uart.dsv`](examples/motor-controller-uart.dsv).
+Regenerate the recording deterministically from the workspace root with:
+
+```sh
+cargo run -p wavecraft-recording --example generate_motor_controller_dsv
+```
+
+To try it in the GUI, open the `.dsv`, add `1:UART`, map `RX/TX` to `D0`,
+save the analyzer, and use **Load YAML** on its card to select the YAML file.
+The decoded-data panel shows three messages with speeds of 1200, 2000, and
+750 rpm.
 
 ```yaml
 schema: wavecraft.protocol/v1

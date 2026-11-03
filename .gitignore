@@ -3,6 +3,7 @@
 *.swp
 *.swo
 *.dsv
+!docs/examples/*.dsv
 *.sal
 __pycache__/
 *.py[cod]

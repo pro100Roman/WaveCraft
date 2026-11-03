@@ -14329,6 +14329,44 @@ mod tests {
     use wavecraft_core::{LogicBatch, ScopeBatch};
 
     #[test]
+    fn motor_controller_example_recording_opens_and_decodes() {
+        let recording = include_bytes!("../../../docs/examples/motor-controller-uart.dsv");
+        let loaded = read_gui_recording(Cursor::new(recording.as_slice())).unwrap();
+        assert_eq!(loaded.completion, CompletionStatus::Complete);
+        assert_eq!(loaded.logic_channel_names[0], "UART RX");
+
+        let schema =
+            include_str!("../../../docs/examples/motor-controller.wavecraft-protocol.yaml");
+        let mut analyzers = ProtocolAnalyzerSettings::default();
+        assert!(analyzers.begin_add("1:uart"));
+        let editor = analyzers.editor.clone().unwrap();
+        analyzers.save_editor(editor);
+        analyzers
+            .begin_attach_custom_yaml(
+                0,
+                PathBuf::from("motor-controller.wavecraft-protocol.yaml"),
+                schema.to_owned(),
+            )
+            .unwrap();
+        let editor = analyzers.editor.clone().unwrap();
+        analyzers.save_editor(editor);
+
+        let mut cache = ProtocolDecodeCache::default();
+        let ProtocolDecodeOutcome::Events(events) =
+            &cache.outcomes(&loaded.capture.waveforms, &analyzers.analyzers)[0]
+        else {
+            panic!("example recording should decode");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Motor 1: 1200 rpm", "Motor 2: 2000 rpm", "Motor 3: 750 rpm"]
+        );
+    }
+
+    #[test]
     fn session_tabs_preserve_each_tabs_capture_and_settings() {
         let mut sessions = SessionTabs::new(10_u64);
         sessions.replace_active("first capture");
