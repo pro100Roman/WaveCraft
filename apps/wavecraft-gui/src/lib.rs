@@ -4,6 +4,7 @@ mod protocol_analyzer;
 mod recording;
 mod sessions;
 mod snapshot;
+mod theme;
 
 use devices::{
     capture_devices_for_target, first_device_id_for_role, selected_device_for_role,
@@ -37,6 +38,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
+use theme::{
+    configure_style, toolbar_action_button, ACCENT, BACKGROUND, GRID, MATH_COLOR, PANEL,
+    SCOPE_COLORS, TEXT_MUTED,
+};
 use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
@@ -81,23 +86,12 @@ const SCOPE_VERTICAL_DIVISIONS: usize = 8;
 const SCOPE_ADC_VERTICAL_DIVISIONS: f32 = 10.0;
 const SCOPE_DOWNSAMPLE_MIN_SAMPLES_PER_PIXEL: usize = 4;
 const SCOPE_CONFIGURATION_DEBOUNCE: Duration = Duration::from_millis(350);
-const TOOLTIP_DELAY_SECONDS: f32 = 0.1;
 const DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS: f64 = 1.0e-3;
 const TIMEBASE_STEPS_SECONDS: [f64; 30] = [
     2.0e-9, 5.0e-9, 10.0e-9, 20.0e-9, 50.0e-9, 100.0e-9, 200.0e-9, 500.0e-9, 1.0e-6, 2.0e-6,
     5.0e-6, 10.0e-6, 20.0e-6, 50.0e-6, 100.0e-6, 200.0e-6, 500.0e-6, 1.0e-3, 2.0e-3, 5.0e-3,
     10.0e-3, 20.0e-3, 50.0e-3, 100.0e-3, 200.0e-3, 500.0e-3, 1.0, 2.0, 5.0, 10.0,
 ];
-const BACKGROUND: Color32 = Color32::from_rgb(12, 17, 25);
-const PANEL: Color32 = Color32::from_rgb(20, 27, 38);
-const GRID: Color32 = Color32::from_rgb(43, 55, 72);
-const TEXT_MUTED: Color32 = Color32::from_rgb(145, 160, 180);
-const ACCENT: Color32 = Color32::from_rgb(70, 210, 185);
-const SCOPE_COLORS: [Color32; 2] = [
-    Color32::from_rgb(255, 204, 74),
-    Color32::from_rgb(99, 179, 255),
-];
-const MATH_COLOR: Color32 = Color32::from_rgb(213, 126, 255);
 const FFT_LENGTHS: [usize; 5] = [1_024, 2_048, 4_096, 8_192, 16_384];
 const SCOPE_MARKER_LIMIT: usize = 10;
 const LOGIC_MARKER_LIMIT: usize = 20;
@@ -110,12 +104,6 @@ const CAPTURE_FILE_BUTTON_WIDTH: f32 = 82.0;
 const DECODED_PANEL_ACTION_BUTTON_SIZE: [f32; 2] = [26.0, 20.0];
 static SCOPE_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
 static LOGIC_WAVEFORM_REVISION: AtomicU64 = AtomicU64::new(1);
-
-fn toolbar_action_button(label: &str, color: Color32) -> egui::Button<'static> {
-    egui::Button::new(label.to_owned())
-        .fill(color.gamma_multiply(0.24))
-        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.85)))
-}
 
 fn empty_logic_channel_names() -> [String; LOGIC_CHANNEL_COUNT] {
     std::array::from_fn(|_| String::new())
@@ -9915,20 +9903,6 @@ fn start_capture(
         scope_trigger_controls,
         scope_calibration_controls,
     })
-}
-
-fn configure_style(context: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = PANEL;
-    visuals.window_fill = PANEL;
-    visuals.extreme_bg_color = BACKGROUND;
-    visuals.selection.bg_fill = ACCENT.gamma_multiply(0.45);
-    visuals.widgets.active.bg_fill = ACCENT.gamma_multiply(0.6);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 61, 77);
-    context.set_visuals(visuals);
-    context.style_mut(|style| {
-        style.interaction.tooltip_delay = TOOLTIP_DELAY_SECONDS;
-    });
 }
 
 const WAVEFORM_CARD_CHROME_HEIGHT: f32 = 58.0;
