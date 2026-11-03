@@ -4,11 +4,12 @@ use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 use wavecraft_core::{
     CaptureBatch, CaptureContext, CaptureError, CaptureSource, DeviceDescriptor, DeviceId,
-    InstrumentKind, LogicBatch, ScopeBatch,
+    InstrumentKind, Iq8, IqBatch, LogicBatch, ScopeBatch,
 };
 
 pub const SIMULATED_LOGIC_ANALYZER_ID: &str = "sim:logic-0";
 pub const SIMULATED_OSCILLOSCOPE_ID: &str = "sim:scope-0";
+pub const SIMULATED_RADIO_RECEIVER_ID: &str = "sim:radio-0";
 
 /// Static discovery information for one deterministic simulated instrument.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,6 +24,7 @@ pub struct SimulatedDeviceProfile {
 
 const SIMULATED_LOGIC_SAMPLE_RATES_HZ: &[u64] = &[100_000, 1_000_000, 10_000_000];
 const SIMULATED_SCOPE_SAMPLE_RATES_HZ: &[u64] = &[50_000, 500_000, 5_000_000];
+const SIMULATED_RADIO_SAMPLE_RATES_HZ: &[u64] = &[1_000_000, 2_000_000, 10_000_000];
 
 pub const SIMULATED_DEVICE_PROFILES: &[SimulatedDeviceProfile] = &[
     SimulatedDeviceProfile {
@@ -40,6 +42,14 @@ pub const SIMULATED_DEVICE_PROFILES: &[SimulatedDeviceProfile] = &[
         kind: InstrumentKind::Oscilloscope,
         channel_count: 2,
         sample_rates_hz: SIMULATED_SCOPE_SAMPLE_RATES_HZ,
+    },
+    SimulatedDeviceProfile {
+        connection_id: SIMULATED_RADIO_RECEIVER_ID,
+        display_name: "Simulated Radio Receiver",
+        model: "simulated_radio_receiver",
+        kind: InstrumentKind::RadioReceiver,
+        channel_count: 1,
+        sample_rates_hz: SIMULATED_RADIO_SAMPLE_RATES_HZ,
     },
 ];
 
@@ -268,5 +278,184 @@ impl CaptureSource for SimulatedOscilloscope {
             context.wait_until(deadline);
         }
         Ok(())
+    }
+}
+
+/// Deterministic complex tone source for RF display, recording, and DSP tests.
+pub struct SimulatedRadioReceiver {
+    descriptor: DeviceDescriptor,
+    sample_rate_hz: u64,
+    center_frequency_hz: u64,
+    tone_offset_hz: i64,
+    amplitude: i8,
+    batch_size: usize,
+    sample_limit: Option<u64>,
+}
+
+impl SimulatedRadioReceiver {
+    pub fn new(
+        id: impl Into<String>,
+        sample_rate_hz: u64,
+        center_frequency_hz: u64,
+        tone_offset_hz: i64,
+        batch_size: usize,
+    ) -> Result<Self, CaptureError> {
+        if sample_rate_hz == 0 || batch_size == 0 {
+            return Err(CaptureError::new(
+                "invalid simulated radio receiver configuration",
+            ));
+        }
+        if tone_offset_hz.unsigned_abs().saturating_mul(2) >= sample_rate_hz {
+            return Err(CaptureError::new(
+                "simulated radio tone must remain inside the Nyquist range",
+            ));
+        }
+        Ok(Self {
+            descriptor: DeviceDescriptor {
+                id: DeviceId::new(id),
+                name: "Simulated Radio Receiver".to_owned(),
+                kind: InstrumentKind::RadioReceiver,
+            },
+            sample_rate_hz,
+            center_frequency_hz,
+            tone_offset_hz,
+            amplitude: 100,
+            batch_size,
+            sample_limit: None,
+        })
+    }
+
+    pub fn with_amplitude(mut self, amplitude: i8) -> Result<Self, CaptureError> {
+        if amplitude <= 0 {
+            return Err(CaptureError::new(
+                "simulated radio amplitude must be positive",
+            ));
+        }
+        self.amplitude = amplitude;
+        Ok(self)
+    }
+
+    pub fn with_sample_limit(mut self, sample_count: u64) -> Result<Self, CaptureError> {
+        if sample_count == 0 {
+            return Err(CaptureError::new(
+                "simulated capture sample count must be greater than zero",
+            ));
+        }
+        self.sample_limit = Some(sample_count);
+        Ok(self)
+    }
+}
+
+impl CaptureSource for SimulatedRadioReceiver {
+    fn descriptor(&self) -> DeviceDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn run(self: Box<Self>, context: CaptureContext) -> Result<(), CaptureError> {
+        context.synchronize_start()?;
+        let mut deadline = Instant::now();
+        let mut sample_index = 0_u64;
+        let mut sequence = 0_u64;
+
+        while !context.is_cancelled() {
+            let remaining = self
+                .sample_limit
+                .map_or(self.batch_size as u64, |limit| limit - sample_index);
+            if remaining == 0 {
+                break;
+            }
+            let batch_size = remaining.min(self.batch_size as u64) as usize;
+            let captured_at = context.elapsed();
+            let mut samples = Vec::with_capacity(batch_size);
+            for offset in 0..batch_size {
+                let index = sample_index + offset as u64;
+                let phase = std::f64::consts::TAU * self.tone_offset_hz as f64 * index as f64
+                    / self.sample_rate_hz as f64;
+                let amplitude = f64::from(self.amplitude);
+                samples.push(Iq8 {
+                    i: (amplitude * phase.cos()).round() as i8,
+                    q: (amplitude * phase.sin()).round() as i8,
+                });
+            }
+
+            context.emit(
+                sequence,
+                captured_at,
+                CaptureBatch::Iq(IqBatch {
+                    sample_rate_hz: self.sample_rate_hz,
+                    center_frequency_hz: self.center_frequency_hz,
+                    first_sample_index: sample_index,
+                    discontinuity: false,
+                    samples,
+                }),
+            )?;
+            sample_index += batch_size as u64;
+            sequence += 1;
+            deadline += Duration::from_secs_f64(batch_size as f64 / self.sample_rate_hz as f64);
+            context.wait_until(deadline);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wavecraft_core::{CaptureCoordinator, CaptureEvent};
+
+    #[test]
+    fn radio_tone_is_deterministic_across_batch_boundaries() {
+        let source = SimulatedRadioReceiver::new("radio", 1_000, 100_000_000, 250, 3)
+            .unwrap()
+            .with_sample_limit(8)
+            .unwrap();
+        let session = CaptureCoordinator::start(vec![Box::new(source)]).unwrap();
+        let mut batches = Vec::new();
+        loop {
+            match session.recv_timeout(Duration::from_secs(1)).unwrap() {
+                CaptureEvent::Frame(frame) => {
+                    let CaptureBatch::Iq(batch) = frame.payload else {
+                        panic!("simulated radio should emit IQ");
+                    };
+                    batches.push(batch);
+                }
+                CaptureEvent::SourceStopped { .. } => break,
+                CaptureEvent::SourceFailed { error, .. } => {
+                    panic!("simulated radio failed: {error}")
+                }
+            }
+        }
+        session.stop().unwrap();
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.first_sample_index)
+                .collect::<Vec<_>>(),
+            [0, 3, 6]
+        );
+        assert!(batches.iter().all(|batch| !batch.discontinuity));
+        assert_eq!(
+            batches
+                .into_iter()
+                .flat_map(|batch| batch.samples)
+                .collect::<Vec<_>>(),
+            [
+                Iq8 { i: 100, q: 0 },
+                Iq8 { i: 0, q: 100 },
+                Iq8 { i: -100, q: 0 },
+                Iq8 { i: 0, q: -100 },
+                Iq8 { i: 100, q: 0 },
+                Iq8 { i: 0, q: 100 },
+                Iq8 { i: -100, q: 0 },
+                Iq8 { i: 0, q: -100 },
+            ]
+        );
+    }
+
+    #[test]
+    fn radio_rejects_a_tone_at_or_beyond_nyquist() {
+        assert!(SimulatedRadioReceiver::new("radio", 1_000, 100_000_000, 500, 16).is_err());
+        assert!(SimulatedRadioReceiver::new("radio", 1_000, 100_000_000, -500, 16).is_err());
     }
 }

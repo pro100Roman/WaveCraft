@@ -2379,7 +2379,7 @@ mod tests {
     }
 
     #[test]
-    fn default_manager_lists_both_simulator_kinds() {
+    fn default_manager_lists_all_simulator_kinds() {
         let manager = AutomationManager::from_usb_discovery(
             || Ok(Vec::new()),
             SIMULATED_DEVICE_PROFILES.to_vec(),
@@ -2387,7 +2387,7 @@ mod tests {
         let listing = manager.device_list().expect("listing should succeed");
 
         assert_eq!(listing.schema, DEVICE_LIST_SCHEMA);
-        assert_eq!(listing.devices.len(), 2);
+        assert_eq!(listing.devices.len(), 3);
         assert!(listing
             .devices
             .iter()
@@ -2396,6 +2396,10 @@ mod tests {
             .devices
             .iter()
             .any(|device| device.kind == InstrumentKind::Oscilloscope));
+        assert!(listing
+            .devices
+            .iter()
+            .any(|device| device.kind == InstrumentKind::RadioReceiver));
     }
 
     #[test]
