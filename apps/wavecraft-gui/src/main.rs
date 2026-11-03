@@ -11555,7 +11555,9 @@ fn paint_logic_timing_hint(
 }
 
 const LOGIC_PROTOCOL_LANE_HEIGHT: f32 = 30.0;
-const LOGIC_PROTOCOL_LABEL_WIDTH: f32 = 82.0;
+const LOGIC_PROTOCOL_LABEL_HORIZONTAL_PADDING: f32 = 6.0;
+const LOGIC_PROTOCOL_LABEL_FONT_SIZE: f32 = 9.0;
+const LOGIC_PROTOCOL_VALUE_FONT_SIZE: f32 = 13.0;
 
 fn protocol_data_channel(analyzer: &ProtocolAnalyzerInstance) -> usize {
     let base_id = protocol_stack(analyzer.protocol_id)
@@ -11665,6 +11667,14 @@ fn paint_logic_protocol_lanes(
     {
         let color = logic_marker_color(lane_index);
         let painter = ui.painter().with_clip_rect(*lane);
+        let label = analyzer_name(analyzer);
+        let label_galley = painter.layout_no_wrap(
+            label.to_owned(),
+            FontId::monospace(LOGIC_PROTOCOL_LABEL_FONT_SIZE),
+            color,
+        );
+        let label_width = (label_galley.size().x + LOGIC_PROTOCOL_LABEL_HORIZONTAL_PADDING * 2.0)
+            .min(lane.width());
         painter.rect_filled(*lane, 0.0, PANEL.gamma_multiply(0.72));
         painter.line_segment(
             [lane.left_top(), lane.right_top()],
@@ -11709,15 +11719,14 @@ fn paint_logic_protocol_lanes(
                     };
                     painter.rect_filled(event_rect, 3.0, event_color.gamma_multiply(0.22));
                     painter.rect_stroke(event_rect, 3.0, Stroke::new(0.8_f32, event_color));
-                    let estimated_text_width = event.text.chars().count() as f32 * 6.5 + 8.0;
-                    if event_rect.width() >= estimated_text_width {
-                        painter.text(
-                            event_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            &event.text,
-                            FontId::monospace(9.0),
-                            Color32::WHITE,
-                        );
+                    let value_galley = painter.layout_no_wrap(
+                        event.text.clone(),
+                        FontId::monospace(LOGIC_PROTOCOL_VALUE_FONT_SIZE),
+                        Color32::WHITE,
+                    );
+                    if event_rect.width() >= value_galley.size().x + 8.0 {
+                        let text_origin = event_rect.center() - value_galley.size() * 0.5;
+                        painter.galley(text_origin, value_galley, Color32::WHITE);
                     }
                     ui.interact(
                         event_rect.expand(2.0),
@@ -11735,10 +11744,7 @@ fn paint_logic_protocol_lanes(
                 }
                 if events.is_empty() {
                     painter.text(
-                        Pos2::new(
-                            lane.left() + LOGIC_PROTOCOL_LABEL_WIDTH + 8.0,
-                            lane.center().y,
-                        ),
+                        Pos2::new(lane.left() + label_width + 8.0, lane.center().y),
                         egui::Align2::LEFT_CENTER,
                         if waveforms.logic_sample_count == 0 {
                             "Waiting for logic samples"
@@ -11752,10 +11758,7 @@ fn paint_logic_protocol_lanes(
             }
             ProtocolDecodeOutcome::Unavailable(message) => {
                 painter.text(
-                    Pos2::new(
-                        lane.left() + LOGIC_PROTOCOL_LABEL_WIDTH + 8.0,
-                        lane.center().y,
-                    ),
+                    Pos2::new(lane.left() + label_width + 8.0, lane.center().y),
                     egui::Align2::LEFT_CENTER,
                     message,
                     FontId::monospace(9.0),
@@ -11766,24 +11769,17 @@ fn paint_logic_protocol_lanes(
 
         let label_rect = Rect::from_min_max(
             lane.min,
-            Pos2::new(
-                (lane.left() + LOGIC_PROTOCOL_LABEL_WIDTH).min(lane.right()),
-                lane.bottom(),
-            ),
+            Pos2::new((lane.left() + label_width).min(lane.right()), lane.bottom()),
         );
-        painter.rect_filled(label_rect, 0.0, PANEL);
         painter.line_segment(
             [label_rect.right_top(), label_rect.right_bottom()],
             Stroke::new(1.0_f32, color.gamma_multiply(0.65)),
         );
-        let label = analyzer_name(analyzer);
-        painter.text(
-            label_rect.left_center() + Vec2::new(6.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            label,
-            FontId::monospace(9.0),
-            color,
+        let label_origin = Pos2::new(
+            label_rect.left() + LOGIC_PROTOCOL_LABEL_HORIZONTAL_PADDING,
+            label_rect.center().y - label_galley.size().y * 0.5,
         );
+        painter.galley(label_origin, label_galley, color);
     }
 }
 
