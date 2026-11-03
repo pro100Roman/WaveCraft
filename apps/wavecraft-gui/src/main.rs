@@ -3101,6 +3101,7 @@ enum WorkerSuccess {
         session: CaptureSession,
         mode: AcquisitionMode,
         target: CaptureTarget,
+        retain_protocol_history: bool,
         logic_config: DsLogicCaptureConfig,
         scope_config: DsCopeCaptureConfig,
         scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
@@ -3506,6 +3507,8 @@ impl WaveCraftApp {
         }
         let calibration_values = self.manual_calibration.as_ref().map(|editor| editor.values);
 
+        let retain_protocol_history =
+            mode == AcquisitionMode::Repetitive && self.capture_run_requested;
         let continuing_loop = mode == AcquisitionMode::Loop && self.capture_run_requested;
         self.capture_run_requested = true;
         self.requested_capture_target = Some(target);
@@ -3543,6 +3546,7 @@ impl WaveCraftApp {
                 session: started.session,
                 mode,
                 target,
+                retain_protocol_history,
                 logic_config,
                 scope_config,
                 scope_trigger_controls: started.scope_trigger_controls,
@@ -3846,6 +3850,7 @@ impl WaveCraftApp {
                 session,
                 mode,
                 target,
+                retain_protocol_history,
                 logic_config,
                 mut scope_config,
                 scope_trigger_controls,
@@ -3985,6 +3990,10 @@ impl WaveCraftApp {
                 let preserve_display_until_complete = preserve_display_until_complete
                     && self.completed_capture_for_target(target).is_some()
                     && !continue_roll;
+                let prior_protocol_history = retain_protocol_history
+                    .then(|| self.completed_capture_for_target(target))
+                    .flatten()
+                    .map(|capture| capture.protocol_decode.snapshot());
                 let continued_capture = if continue_roll || continue_logic_loop {
                     self.take_completed_capture_for_target(target)
                 } else {
@@ -3999,6 +4008,9 @@ impl WaveCraftApp {
                     },
                     |capture| (capture.waveforms, capture.protocol_decode),
                 );
+                if let Some(snapshot) = &prior_protocol_history {
+                    protocol_decode.retain_history_from(snapshot);
+                }
                 protocol_decode.reconfigure(&self.protocol_analyzer.analyzers);
                 if !continue_logic_loop {
                     waveforms.configure_logic_capture(logic_config.sample_count());

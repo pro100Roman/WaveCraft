@@ -312,6 +312,14 @@ impl ProtocolCaptureDecoder {
         }
     }
 
+    pub fn retain_history_from(&mut self, snapshot: &ProtocolDecodeSnapshot) {
+        if !snapshot.matches_analyzers(&self.analyzers) {
+            return;
+        }
+        self.outcomes = Arc::clone(&snapshot.outcomes);
+        self.preserve_history_on_rebuild = true;
+    }
+
     pub fn reconfigure(&mut self, analyzers: &[ProtocolAnalyzerInstance]) {
         if self.matches_analyzers(analyzers) {
             return;
@@ -363,13 +371,16 @@ impl ProtocolCaptureDecoder {
         }
         if self.sample_rate_hz != Some(sample_rate_hz) {
             self.sample_rate_hz = Some(sample_rate_hz);
-            self.outcomes = Arc::new(
-                self.analyzers
-                    .iter()
-                    .map(|_| ProtocolDecodeOutcome::Events(Vec::new()))
-                    .collect(),
-            );
-            self.build_runtimes(sample_rate_hz, false);
+            let preserve_history = self.preserve_history_on_rebuild;
+            if !preserve_history {
+                self.outcomes = Arc::new(
+                    self.analyzers
+                        .iter()
+                        .map(|_| ProtocolDecodeOutcome::Events(Vec::new()))
+                        .collect(),
+                );
+            }
+            self.build_runtimes(sample_rate_hz, preserve_history);
         } else if self.runtimes.len() != self.analyzers.len() {
             self.build_runtimes(sample_rate_hz, self.preserve_history_on_rebuild);
         }
@@ -2778,6 +2789,35 @@ mod tests {
         }
         streaming.finish();
         assert_eq!(streaming.outcomes(), std::slice::from_ref(&expected));
+    }
+
+    #[test]
+    fn repetitive_capture_retains_prior_decoded_history() {
+        let mut uart = analyzer("1:uart", vec![Some(0)]);
+        uart.data_format = ProtocolDataFormat::Ascii;
+
+        let mut first = ProtocolCaptureDecoder::new(std::slice::from_ref(&uart));
+        first.ingest_logic(&uart_8n1(b"A", 10), 1_152_000);
+        first.finish();
+
+        let mut second = ProtocolCaptureDecoder::new(std::slice::from_ref(&uart));
+        second.retain_history_from(&first.snapshot());
+        second.ingest_logic(&uart_8n1(b"B", 10), 1_152_000);
+        second.finish();
+
+        let ProtocolDecodeOutcome::Events(events) = &second.outcomes()[0] else {
+            panic!("UART should remain available across repetitive captures");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event.kind {
+                    ProtocolDecodedKind::Uart { value } => Some(value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            b"AB"
+        );
     }
 
     #[test]
