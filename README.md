@@ -282,10 +282,11 @@ opened capture file. Capture Setup remains available for offline analysis even
 when no instrument is connected. The Combined tab appears when both signal
 types are available, and Refresh rebuilds the available tab set. Each waveform
 expands with the main window; Combined provides a draggable
-horizontal divider for adjusting the DSLogic/DSCope height ratio. Finite
-waveform storage is bounded at two million samples and rendering is decimated
-to the plot width; this display limit does not truncate data written to a
-capture file. DSLogic labels D0–D15 remain visible before
+horizontal divider for adjusting the DSLogic/DSCope height ratio. Logic
+waveform storage is bounded at two million activity-preserving buckets whose
+stride covers the configured finite or Loop duration, and rendering is further
+decimated to the plot width; this display limit does not truncate data written
+to a capture file or sent to protocol decoders. DSLogic labels D0–D15 remain visible before
 capture, use distinct waveform colors, and open a per-channel color picker when
 clicked. Every logic lane includes a persistent dotted `0`-level reference.
 Scroll over either waveform to zoom its time axis around the pointer, or drag

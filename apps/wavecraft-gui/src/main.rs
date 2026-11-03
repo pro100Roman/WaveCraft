@@ -54,10 +54,9 @@ const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
 const BUILD_VERSION_LABEL: &str = concat!("Version: ", env!("WAVECRAFT_BUILD_VERSION"));
 const LOGIC_CHANNEL_COUNT: usize = 16;
-// Keep the complete largest hardware capture in memory. Rendering is already
-// decimated to the plot width, so retaining the samples does not increase the
-// number of painted points. This also keeps the hardware trigger region in the
-// waveform instead of displaying only the final tail of a capture.
+// Bound logic display storage by activity-preserving buckets. The bucket stride
+// expands to cover the configured finite or Loop duration without limiting the
+// decoder, recorder, or zoom-out domain to this in-memory bucket count.
 const MAX_WAVEFORM_SAMPLES: usize = 2_000_000;
 // Continuous Auto acquisition uses a software ring large enough for the
 // selected OSC span. Bound its total sample storage across enabled channels.
@@ -1995,6 +1994,7 @@ fn decoded_panel_entries(events: &[ProtocolDecodedEvent]) -> Vec<DecodedPanelEnt
     if let Some(transaction) = i2c_transaction {
         entries.push(transaction.entry());
     }
+    entries.reverse();
     entries
 }
 
@@ -2595,6 +2595,17 @@ fn adjacent_timebase(current_seconds: f64, zoom_in: bool) -> Option<f64> {
 }
 
 impl WaveformStore {
+    fn logic_capture_layout(expected_sample_count: u64) -> (usize, usize) {
+        let expected_sample_count = usize::try_from(expected_sample_count).unwrap_or(usize::MAX);
+        let stride = expected_sample_count
+            .div_ceil(MAX_WAVEFORM_SAMPLES)
+            .clamp(1, u32::MAX as usize);
+        let capacity = expected_sample_count
+            .div_ceil(stride)
+            .clamp(1, MAX_WAVEFORM_SAMPLES);
+        (capacity, stride)
+    }
+
     fn logic_time_range(&self) -> Option<CaptureTimeRange> {
         let captured_at = self.logic_captured_at?.as_secs_f64();
         if self.logic_rate_hz == 0 || self.logic_sample_count == 0 {
@@ -2641,21 +2652,21 @@ impl WaveformStore {
         })
     }
 
-    fn configure_logic_capture(&mut self, expected_sample_count: u64, rolling: bool) {
-        let expected_sample_count = usize::try_from(expected_sample_count).unwrap_or(usize::MAX);
-        self.logic_capacity = expected_sample_count.clamp(1, MAX_WAVEFORM_SAMPLES);
-        self.logic_sample_stride = if rolling {
-            1
-        } else {
-            expected_sample_count / self.logic_capacity
-                + usize::from(expected_sample_count % self.logic_capacity != 0)
-        }
-        .clamp(1, u32::MAX as usize);
+    fn configure_logic_capture(&mut self, expected_sample_count: u64) {
+        (self.logic_capacity, self.logic_sample_stride) =
+            Self::logic_capture_layout(expected_sample_count);
         self.logic_samples.clear();
         self.logic_revision = LOGIC_WAVEFORM_REVISION.fetch_add(1, Ordering::Relaxed);
         self.logic_captured_at = None;
         self.logic_sample_offset = 0;
         self.logic_sample_count = 0;
+    }
+
+    fn can_continue_logic_loop(&self, config: DsLogicCaptureConfig) -> bool {
+        let (capacity, stride) = Self::logic_capture_layout(config.sample_count());
+        self.logic_rate_hz == config.sample_rate_hz()
+            && self.logic_capacity == capacity
+            && self.logic_sample_stride == stride
     }
 
     fn ingest_logic_samples(&mut self, samples: &[u32]) {
@@ -3965,7 +3976,10 @@ impl WaveCraftApp {
                 let continue_logic_loop = mode == AcquisitionMode::Loop
                     && self
                         .completed_capture_for_target(target)
-                        .is_some_and(|capture| capture.has_logic);
+                        .is_some_and(|capture| {
+                            capture.has_logic
+                                && capture.waveforms.can_continue_logic_loop(logic_config)
+                        });
                 let preserve_display_until_complete =
                     mode == AcquisitionMode::Run || mode == AcquisitionMode::Repetitive;
                 let preserve_display_until_complete = preserve_display_until_complete
@@ -3987,10 +4001,7 @@ impl WaveCraftApp {
                 );
                 protocol_decode.reconfigure(&self.protocol_analyzer.analyzers);
                 if !continue_logic_loop {
-                    waveforms.configure_logic_capture(
-                        logic_config.sample_count(),
-                        mode == AcquisitionMode::Loop,
-                    );
+                    waveforms.configure_logic_capture(logic_config.sample_count());
                 }
                 waveforms.scope_capacity = scope_capacity;
                 waveforms.scope_rolling = rolling;
@@ -9268,7 +9279,7 @@ fn read_gui_recording_with_analyzers(
         ..WaveformStore::default()
     };
     if header.metadata.contains_key("logic.sample_count") {
-        waveforms.configure_logic_capture(logic_settings.sample_count, false);
+        waveforms.configure_logic_capture(logic_settings.sample_count);
     }
     let mut protocol_decode = ProtocolCaptureDecoder::new(analyzers);
     while let Some(event) = reader.read_event().map_err(|error| error.to_string())? {
@@ -9384,7 +9395,7 @@ fn read_gui_saleae_with_analyzers(
         if DSLOGIC_SAMPLE_RATES_HZ.contains(&digital.sample_rate_hz) {
             logic_settings.sample_rate_hz = digital.sample_rate_hz;
         }
-        waveforms.configure_logic_capture(digital.samples.len() as u64, false);
+        waveforms.configure_logic_capture(digital.samples.len() as u64);
         protocol_decode.ingest_logic(&digital.samples, digital.sample_rate_hz);
         waveforms.ingest(
             &CaptureBatch::Logic(wavecraft_core::LogicBatch {
@@ -14500,7 +14511,7 @@ mod tests {
         decoder.finish();
 
         let mut waveforms = WaveformStore::default();
-        waveforms.configure_logic_capture(1, true);
+        waveforms.configure_logic_capture(1);
         waveforms.ingest_logic_samples(&samples);
         assert!(waveforms.logic_sample_offset > 0);
         assert_eq!(waveforms.logic_sample_count, 1);
@@ -14799,6 +14810,24 @@ mod tests {
         assert!(entries[0].detail.contains("Data 0x12 → NACK"));
         assert!(entries[0].warning);
         assert_eq!((entries[0].start_sample, entries[0].end_sample), (10, 33));
+    }
+
+    #[test]
+    fn decoded_panel_lists_newest_operations_first() {
+        let event = |value, start_sample| ProtocolDecodedEvent {
+            start_sample,
+            end_sample: start_sample + 9,
+            text: format!("{value:02X}"),
+            detail: String::new(),
+            warning: false,
+            kind: ProtocolDecodedKind::Uart { value },
+        };
+
+        let entries = decoded_panel_entries(&[event(0x11, 10), event(0x22, 30)]);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].start_sample, 30);
+        assert_eq!(entries[1].start_sample, 10);
     }
 
     #[test]
@@ -15447,7 +15476,7 @@ mod tests {
     #[test]
     fn waveform_store_preserves_a_one_second_logic_domain_with_bounded_buckets() {
         let mut store = WaveformStore::default();
-        store.configure_logic_capture(1_000_000_000, false);
+        store.configure_logic_capture(1_000_000_000);
 
         assert_eq!(store.logic_capacity, MAX_WAVEFORM_SAMPLES);
         assert_eq!(store.logic_sample_stride, 500);
@@ -15468,6 +15497,45 @@ mod tests {
         assert_eq!(store.logic_samples[0].sample_count, 500);
         assert_eq!(store.logic_samples[0].activity & 1, 1);
         assert_eq!(store.logic_sample_offset, 0);
+    }
+
+    #[test]
+    fn loop_waveform_capacity_covers_the_configured_two_second_span() {
+        let sample_rate_hz = 10_000_000_u64;
+        let expected_sample_count = aligned_logic_sample_count(2.0, sample_rate_hz, u64::MAX)
+            .expect("two seconds should fit the stream capture depth");
+        let mut store = WaveformStore::default();
+
+        store.configure_logic_capture(expected_sample_count);
+
+        let represented_samples = store.logic_capacity * store.logic_sample_stride;
+        assert!(store.logic_capacity <= MAX_WAVEFORM_SAMPLES);
+        assert_eq!(store.logic_sample_stride, 11);
+        assert!(represented_samples >= expected_sample_count as usize);
+        assert!(represented_samples - (expected_sample_count as usize) < store.logic_sample_stride);
+    }
+
+    #[test]
+    fn loop_restart_reuses_only_a_compatible_waveform_window() {
+        let sample_rate_hz = 10_000_000_u64;
+        let two_second_count = aligned_logic_sample_count(2.0, sample_rate_hz, u64::MAX).unwrap();
+        let one_second_count = aligned_logic_sample_count(1.0, sample_rate_hz, u64::MAX).unwrap();
+        let two_second_config = DsLogicCaptureConfig::new(sample_rate_hz, two_second_count)
+            .unwrap()
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_loop_mode(true);
+        let one_second_config = DsLogicCaptureConfig::new(sample_rate_hz, one_second_count)
+            .unwrap()
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_loop_mode(true);
+        let mut store = WaveformStore {
+            logic_rate_hz: sample_rate_hz,
+            ..WaveformStore::default()
+        };
+        store.configure_logic_capture(two_second_count);
+
+        assert!(store.can_continue_logic_loop(two_second_config));
+        assert!(!store.can_continue_logic_loop(one_second_config));
     }
 
     #[test]
@@ -16015,7 +16083,7 @@ mod tests {
             logic_rate_hz: 1_000_000,
             ..WaveformStore::default()
         };
-        waveforms.configure_logic_capture(101, false);
+        waveforms.configure_logic_capture(101);
         let samples = (0..101)
             .map(|index| match index {
                 0..20 => 0,
@@ -16065,7 +16133,7 @@ mod tests {
             logic_rate_hz: 1_000_000,
             ..WaveformStore::default()
         };
-        waveforms.configure_logic_capture(101, false);
+        waveforms.configure_logic_capture(101);
         let samples = (0..101)
             .map(|index| u32::from(matches!(index, 10..30 | 50..70 | 90..=100)))
             .collect::<Vec<_>>();
