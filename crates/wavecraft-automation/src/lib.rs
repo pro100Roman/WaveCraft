@@ -56,6 +56,7 @@ const USB_DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub enum InstrumentKind {
     LogicAnalyzer,
     Oscilloscope,
+    RadioReceiver,
 }
 
 impl Display for InstrumentKind {
@@ -63,6 +64,7 @@ impl Display for InstrumentKind {
         match self {
             Self::LogicAnalyzer => formatter.write_str("logic_analyzer"),
             Self::Oscilloscope => formatter.write_str("oscilloscope"),
+            Self::RadioReceiver => formatter.write_str("radio_receiver"),
         }
     }
 }
@@ -72,6 +74,7 @@ impl From<CoreInstrumentKind> for InstrumentKind {
         match value {
             CoreInstrumentKind::LogicAnalyzer => Self::LogicAnalyzer,
             CoreInstrumentKind::Oscilloscope => Self::Oscilloscope,
+            CoreInstrumentKind::RadioReceiver => Self::RadioReceiver,
         }
     }
 }
@@ -1108,6 +1111,13 @@ impl DeviceHandle {
             (InstrumentKind::Oscilloscope, DeviceBackend::Usb) => {
                 self.start_usb_scope_capture(requested_configuration, effective_configuration)
             }
+            (InstrumentKind::RadioReceiver, _) => Err(AutomationError::new(
+                AutomationErrorCode::UnsupportedConfiguration,
+                "radio receiver automation capture is not implemented",
+                "capture.start",
+                false,
+            )
+            .for_device(&self.descriptor.connection_id)),
         }
     }
 
@@ -1376,6 +1386,7 @@ impl DeviceHandle {
             kind: match self.descriptor.kind {
                 InstrumentKind::LogicAnalyzer => CoreInstrumentKind::LogicAnalyzer,
                 InstrumentKind::Oscilloscope => CoreInstrumentKind::Oscilloscope,
+                InstrumentKind::RadioReceiver => CoreInstrumentKind::RadioReceiver,
             },
         };
         let metadata = capture_metadata(
@@ -1966,6 +1977,11 @@ fn validate_capture_configuration(
                         .to_owned(),
                 ));
             }
+        }
+        InstrumentKind::RadioReceiver => {
+            return Err(unsupported(
+                "radio receiver capture configuration is not implemented".to_owned(),
+            ));
         }
     }
     if !device

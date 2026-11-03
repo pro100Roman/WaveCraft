@@ -5,6 +5,6 @@ mod session;
 
 pub use model::{
     CaptureBatch, CaptureError, CaptureEvent, CaptureFrame, CaptureSource, DeviceDescriptor,
-    DeviceId, InstrumentKind, LogicBatch, ScopeBatch,
+    DeviceId, InstrumentKind, Iq8, IqBatch, LogicBatch, ScopeBatch,
 };
 pub use session::{CaptureContext, CaptureCoordinator, CaptureSession};

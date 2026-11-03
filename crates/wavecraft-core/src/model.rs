@@ -27,6 +27,7 @@ impl Display for DeviceId {
 pub enum InstrumentKind {
     LogicAnalyzer,
     Oscilloscope,
+    RadioReceiver,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,10 +58,28 @@ pub struct ScopeBatch {
     pub channels: Vec<Vec<f32>>,
 }
 
+/// One native signed 8-bit complex sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Iq8 {
+    pub i: i8,
+    pub q: i8,
+}
+
+/// One ordered batch of raw complex radio samples.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IqBatch {
+    pub sample_rate_hz: u64,
+    pub center_frequency_hz: u64,
+    pub first_sample_index: u64,
+    pub discontinuity: bool,
+    pub samples: Vec<Iq8>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum CaptureBatch {
     Logic(LogicBatch),
     Scope(ScopeBatch),
+    Iq(IqBatch),
 }
 
 impl CaptureBatch {
@@ -68,6 +87,7 @@ impl CaptureBatch {
         match self {
             Self::Logic(batch) => batch.samples.len(),
             Self::Scope(batch) => batch.channels.first().map_or(0, Vec::len),
+            Self::Iq(batch) => batch.samples.len(),
         }
     }
 }

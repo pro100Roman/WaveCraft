@@ -167,6 +167,9 @@ fn automation_capture_run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             arguments.channels,
             &arguments.output,
         ),
+        AutomationInstrumentKind::RadioReceiver => {
+            return Err("radio receiver capture is not implemented by this command".into())
+        }
     };
     if let Some(timeout_ms) = arguments.timeout_ms {
         configuration = configuration.with_timeout(Duration::from_millis(timeout_ms));

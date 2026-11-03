@@ -1,15 +1,16 @@
 # WaveCraft recording format
 
 WaveCraft's native `.dsv` format is a lossless, little-endian stream of bounded
-records. Format version 1 preserves capture events exactly and can be written
-without retaining the complete capture in memory.
+records. Format version 2 preserves logic, scope, and raw IQ capture events and
+can be written without retaining the complete capture in memory. Readers
+continue to accept version 1 logic/scope recordings unchanged.
 
 ## File header
 
 | Field | Size | Value |
 | --- | ---: | --- |
 | Magic | 8 bytes | legacy `DSVIEW`, `0x1a`, newline |
-| Format version | `u16` | `1` |
+| Format version | `u16` | `2` (`1` remains readable) |
 | Flags | `u16` | `0` |
 
 The header is immediately followed by one session-metadata record.
@@ -21,15 +22,17 @@ Every record has a 16-byte header followed by its payload:
 | Field | Size | Description |
 | --- | ---: | --- |
 | Kind | `u8` | Session, frame, source failure, source stopped, or footer |
-| Flags/reserved | 3 bytes | Zero in version 1 |
+| Flags/reserved | 3 bytes | Zero in versions 1 and 2 |
 | Payload length | `u64` | Bounded to 256 MiB |
 | Payload CRC-32 | `u32` | CRC of payload bytes |
 
 Strings are UTF-8 with a `u32` byte length. Counts and sample values use their
 explicit fixed-width little-endian representation. Logic data stores one `u32`
 sample word per sampling instant. Scope data stores IEEE-754 `f32` values in
-channel-major order. Frame timestamps contain separate `u64` seconds and `u32`
-nanoseconds on the capture coordinator's shared monotonic timeline.
+channel-major order. IQ data stores signed complex `i8` pairs together with the
+sample rate, center frequency, absolute first-sample index, and discontinuity
+flag. Frame timestamps contain separate `u64` seconds and `u32` nanoseconds on
+the capture coordinator's shared monotonic timeline.
 
 ## Session and completion
 
@@ -47,15 +50,15 @@ counts before allocation, and verify the footer's event count.
 The native file is the source of truth. Future CSV, VCD, or decoder exports may
 represent only compatible subsets, but must not modify the original recording.
 
-## Planned RF/IQ extension
+## RF/IQ payload
 
-Format version 1 has frame payloads only for logic and scope samples. The
-planned HackRF/SDR support introduces a version 2 IQ payload while retaining
-read compatibility with version 1 and never rewriting legacy recordings on
-open. IQ batches preserve their signed complex bytes, sample rate, center
-frequency, absolute source-sample position, and discontinuities. Spectrum,
-waterfall, demodulated bits, and decoded packets remain reproducible derived
-data rather than authoritative recording content. The complete design is in
+Format version 1 has frame payloads only for logic and scope samples. Version 2
+adds the IQ payload while retaining read compatibility with version 1 and never
+rewriting legacy recordings on open. IQ batches preserve their signed complex
+bytes, sample rate, center frequency, absolute source-sample position, and
+discontinuities. Spectrum, waterfall, demodulated bits, and decoded packets
+remain reproducible derived data rather than authoritative recording content.
+The complete design is in
 [RF/SDR capture and signal-decoding architecture](rf-sdr-architecture.md).
 
 ## Saleae Logic 2 interoperability

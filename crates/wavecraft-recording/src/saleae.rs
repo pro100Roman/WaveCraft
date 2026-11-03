@@ -1212,6 +1212,11 @@ pub fn export_saleae_recording<R: Read, W: Write + Seek>(
                     destination.extend(source);
                 }
             }
+            CaptureBatch::Iq(_) => {
+                return Err(SaleaeConversionError::invalid(
+                    "Saleae export does not support RF IQ samples",
+                ));
+            }
         }
     }
     let digital = if digital_samples.is_empty() {

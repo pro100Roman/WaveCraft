@@ -16,7 +16,7 @@ use std::io::{self, Read, Write};
 use std::time::Duration;
 use wavecraft_core::{
     CaptureBatch, CaptureError, CaptureEvent, CaptureFrame, DeviceDescriptor, DeviceId,
-    InstrumentKind, LogicBatch, ScopeBatch,
+    InstrumentKind, Iq8, IqBatch, LogicBatch, ScopeBatch,
 };
 
 const FILE_MAGIC: [u8; 8] = *b"DSVIEW\x1a\n";
@@ -33,7 +33,8 @@ const MAX_DEVICES: usize = 1_024;
 const MAX_METADATA_ENTRIES: usize = 4_096;
 const MAX_SCOPE_CHANNELS: usize = 256;
 
-pub const FORMAT_VERSION: u16 = 1;
+const MIN_READABLE_FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordingHeader {
@@ -179,9 +180,9 @@ impl<R: Read> RecordingReader<R> {
             ));
         }
         let version = u16::from_le_bytes([file_header[8], file_header[9]]);
-        if version != FORMAT_VERSION {
+        if !(MIN_READABLE_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(RecordingError::invalid(format!(
-                "format version {version} is unsupported; expected {FORMAT_VERSION}"
+                "format version {version} is unsupported; expected {MIN_READABLE_FORMAT_VERSION} through {FORMAT_VERSION}"
             )));
         }
         if file_header[10..12] != [0, 0] {
@@ -495,6 +496,19 @@ fn encode_frame(frame: &CaptureFrame) -> Result<Vec<u8>, RecordingError> {
                 }
             }
         }
+        CaptureBatch::Iq(batch) => {
+            payload.push(3);
+            push_u64(&mut payload, batch.sample_rate_hz);
+            push_u64(&mut payload, batch.center_frequency_hz);
+            push_u64(&mut payload, batch.first_sample_index);
+            payload.push(u8::from(batch.discontinuity));
+            push_length_u64(&mut payload, batch.samples.len(), "IQ sample")?;
+            ensure_sample_bytes(batch.samples.len(), 2)?;
+            for sample in &batch.samples {
+                payload.push(sample.i as u8);
+                payload.push(sample.q as u8);
+            }
+        }
     }
     if payload.len() > MAX_RECORD_BYTES {
         return Err(RecordingError::invalid(
@@ -563,6 +577,36 @@ fn decode_frame(payload: &[u8]) -> Result<CaptureFrame, RecordingError> {
                 channels,
             })
         }
+        3 => {
+            let sample_rate_hz = reader.read_u64()?;
+            let center_frequency_hz = reader.read_u64()?;
+            let first_sample_index = reader.read_u64()?;
+            let discontinuity = match reader.read_u8()? {
+                0 => false,
+                1 => true,
+                value => {
+                    return Err(RecordingError::invalid(format!(
+                        "IQ discontinuity flag {value} is invalid"
+                    )))
+                }
+            };
+            let sample_count = reader.read_length("IQ sample")?;
+            reader.require_values(sample_count, 2, "IQ samples")?;
+            let mut samples = Vec::with_capacity(sample_count);
+            for _ in 0..sample_count {
+                samples.push(Iq8 {
+                    i: reader.read_u8()? as i8,
+                    q: reader.read_u8()? as i8,
+                });
+            }
+            CaptureBatch::Iq(IqBatch {
+                sample_rate_hz,
+                center_frequency_hz,
+                first_sample_index,
+                discontinuity,
+                samples,
+            })
+        }
         _ => {
             return Err(RecordingError::invalid(format!(
                 "unknown capture payload kind {payload_kind}"
@@ -590,6 +634,7 @@ fn encode_instrument_kind(kind: InstrumentKind) -> u8 {
     match kind {
         InstrumentKind::LogicAnalyzer => 1,
         InstrumentKind::Oscilloscope => 2,
+        InstrumentKind::RadioReceiver => 3,
     }
 }
 
@@ -597,6 +642,7 @@ fn decode_instrument_kind(value: u8) -> Result<InstrumentKind, RecordingError> {
     match value {
         1 => Ok(InstrumentKind::LogicAnalyzer),
         2 => Ok(InstrumentKind::Oscilloscope),
+        3 => Ok(InstrumentKind::RadioReceiver),
         _ => Err(RecordingError::invalid(format!(
             "unknown instrument kind {value}"
         ))),
@@ -787,6 +833,21 @@ mod tests {
         })
     }
 
+    fn iq_event() -> CaptureEvent {
+        CaptureEvent::Frame(CaptureFrame {
+            device_id: DeviceId::new("radio-1"),
+            sequence: 9,
+            captured_at: Duration::new(2, 901),
+            payload: CaptureBatch::Iq(IqBatch {
+                sample_rate_hz: 20_000_000,
+                center_frequency_hz: 433_920_000,
+                first_sample_index: 65_536,
+                discontinuity: true,
+                samples: vec![Iq8 { i: -128, q: 127 }, Iq8 { i: -3, q: 4 }],
+            }),
+        })
+    }
+
     #[test]
     fn round_trips_complete_logic_and_scope_capture() {
         let descriptors = descriptors();
@@ -818,6 +879,46 @@ mod tests {
         }
         assert_eq!(decoded, events);
         assert_eq!(reader.completion_status(), Some(CompletionStatus::Complete));
+    }
+
+    #[test]
+    fn version_two_round_trips_radio_iq_capture() {
+        let descriptors = vec![DeviceDescriptor {
+            id: DeviceId::new("radio-1"),
+            name: "Radio".to_owned(),
+            kind: InstrumentKind::RadioReceiver,
+        }];
+        let event = iq_event();
+        let mut bytes = Vec::new();
+        {
+            let mut writer =
+                RecordingWriter::new(&mut bytes, &descriptors, BTreeMap::new()).unwrap();
+            writer.write_event(&event).unwrap();
+            writer.finish(CompletionStatus::Complete).unwrap();
+        }
+
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), FORMAT_VERSION);
+        let mut reader = RecordingReader::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.header().devices, descriptors);
+        assert_eq!(reader.read_event().unwrap(), Some(event));
+        assert_eq!(reader.read_event().unwrap(), None);
+    }
+
+    #[test]
+    fn version_one_logic_recordings_remain_readable() {
+        let event = logic_event();
+        let mut bytes = Vec::new();
+        {
+            let mut writer =
+                RecordingWriter::new(&mut bytes, &descriptors(), BTreeMap::new()).unwrap();
+            writer.write_event(&event).unwrap();
+            writer.finish(CompletionStatus::Complete).unwrap();
+        }
+        bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
+
+        let mut reader = RecordingReader::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.read_event().unwrap(), Some(event));
+        assert_eq!(reader.read_event().unwrap(), None);
     }
 
     #[test]

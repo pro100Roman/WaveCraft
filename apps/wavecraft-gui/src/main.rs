@@ -2793,6 +2793,7 @@ impl WaveformStore {
             CaptureBatch::Scope(_) => {
                 self.scope_captured_at.get_or_insert(frame.captured_at);
             }
+            CaptureBatch::Iq(_) => {}
         }
         self.ingest(&frame.payload, scope_channels);
     }
@@ -2847,6 +2848,7 @@ impl WaveformStore {
                     self.scope_capture_boundaries.pop_front();
                 }
             }
+            CaptureBatch::Iq(_) => {}
         }
     }
 }

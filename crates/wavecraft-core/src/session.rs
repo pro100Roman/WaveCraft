@@ -282,7 +282,7 @@ impl Drop for CaptureSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DeviceDescriptor, InstrumentKind, LogicBatch, ScopeBatch};
+    use crate::{DeviceDescriptor, InstrumentKind, Iq8, IqBatch, LogicBatch, ScopeBatch};
 
     struct OneFrameSource {
         descriptor: DeviceDescriptor,
@@ -306,6 +306,13 @@ mod tests {
                     sample_rate_hz: 1_000,
                     trigger_sample_index: None,
                     channels: vec![vec![0.0, 1.0]],
+                }),
+                InstrumentKind::RadioReceiver => CaptureBatch::Iq(IqBatch {
+                    sample_rate_hz: 1_000,
+                    center_frequency_hz: 100_000_000,
+                    first_sample_index: 0,
+                    discontinuity: false,
+                    samples: vec![Iq8 { i: 0, q: 0 }, Iq8 { i: 1, q: -1 }],
                 }),
             };
             context.synchronize_start()?;
