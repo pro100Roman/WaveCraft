@@ -1,6 +1,6 @@
 use crate::{
     ByteStreamFramer, CustomProtocolDecoder, DecodeDiagnostic, DecodeError, DecodedMessage, Endian,
-    FramedBytes, FramingOutput, FramingSchema, ProtocolSchema, SampleRange,
+    FramedBytes, FramingOutput, FramingSchema, ProtocolSchema, RecordStreamSchema, SampleRange,
     SegmentedTransactionSchema, Severity, TimedByte, TransportPacket,
 };
 
@@ -453,6 +453,109 @@ impl CustomProtocolRuntime {
     }
 
     fn decode_packet(
+        &self,
+        packet: &TransportPacket,
+        output: &mut ProtocolRuntimeOutput,
+        finishing: bool,
+    ) {
+        if let FramingSchema::SegmentedTransportTransaction { segmentation, .. } =
+            &self.schema.framing
+        {
+            if let Some(records) = &segmentation.records {
+                let is_record_stream = packet
+                    .streams
+                    .get(&self.schema.input.stream)
+                    .and_then(|bytes| bytes.get(segmentation.channel_offset))
+                    .is_some_and(|channel| records.channels.contains(&channel.value));
+                if is_record_stream {
+                    self.decode_record_stream(packet, output, finishing, segmentation, records);
+                    return;
+                }
+            }
+        }
+        self.decode_single_packet(packet, output, finishing);
+    }
+
+    fn decode_record_stream(
+        &self,
+        packet: &TransportPacket,
+        output: &mut ProtocolRuntimeOutput,
+        finishing: bool,
+        segmentation: &SegmentedTransactionSchema,
+        records: &RecordStreamSchema,
+    ) {
+        let bytes = packet
+            .streams
+            .get(&self.schema.input.stream)
+            .expect("record-stream input was checked");
+        let mut cursor = segmentation.header_bytes;
+        let mut prefix: Option<&[TimedByte]> = None;
+
+        while cursor < bytes.len() {
+            let record_id = bytes[cursor].value;
+            if record_id & records.prefix.mask == records.prefix.value & records.prefix.mask {
+                let end = cursor.saturating_add(records.prefix_bytes);
+                if end > bytes.len() {
+                    output.diagnostics.push(warning_diagnostic(
+                        "protocol.incomplete_record_prefix",
+                        format!(
+                            "record prefix 0x{record_id:02X} has {} of {} bytes",
+                            bytes.len() - cursor,
+                            records.prefix_bytes
+                        ),
+                        timed_bytes_range(&bytes[cursor..]),
+                    ));
+                    return;
+                }
+                prefix = Some(&bytes[cursor..end]);
+                cursor = end;
+                continue;
+            }
+
+            let Some(record_bytes) = records.record_lengths.get(&record_id).copied() else {
+                output.diagnostics.push(warning_diagnostic(
+                    "protocol.unknown_record",
+                    format!("record stream contains unknown record identifier 0x{record_id:02X}"),
+                    Some(bytes[cursor].range),
+                ));
+                return;
+            };
+            let end = cursor.saturating_add(record_bytes);
+            if end > bytes.len() {
+                output.diagnostics.push(warning_diagnostic(
+                    "protocol.incomplete_record",
+                    format!(
+                        "record 0x{record_id:02X} has {} of {record_bytes} bytes",
+                        bytes.len() - cursor
+                    ),
+                    timed_bytes_range(&bytes[cursor..]),
+                ));
+                return;
+            }
+            let Some(prefix) = prefix else {
+                output.diagnostics.push(warning_diagnostic(
+                    "protocol.missing_record_prefix",
+                    format!("record 0x{record_id:02X} appeared before a record-stream prefix"),
+                    Some(bytes[cursor].range),
+                ));
+                return;
+            };
+
+            let mut framed =
+                Vec::with_capacity(segmentation.header_bytes + records.prefix_bytes + record_bytes);
+            framed.extend_from_slice(&bytes[..segmentation.header_bytes]);
+            framed.extend_from_slice(prefix);
+            framed.extend_from_slice(&bytes[cursor..end]);
+            let mut record_packet = packet.clone();
+            record_packet
+                .streams
+                .insert(self.schema.input.stream.clone(), framed);
+            self.decode_single_packet(&record_packet, output, finishing);
+            cursor = end;
+        }
+    }
+
+    fn decode_single_packet(
         &self,
         packet: &TransportPacket,
         output: &mut ProtocolRuntimeOutput,

@@ -1,20 +1,13 @@
 # SH-2 over SHTP for the CEVA/Hillcrest BNO08x family, captured over I2C.
 # Reference: SH-2 Reference Manual 1000-3625 and BNO080 Datasheet 1000-3927.
 #
-# WaveCraft protocol/v1 limitations:
-# - one decoded message is emitted per reassembled SHTP cargo, so only the
-#   first SH-2 sensor report following a Base Timestamp (0xFB) or Timestamp
-#   Rebase (0xFA) is decoded;
+# WaveCraft protocol/v1 behavior:
+# - supported SH-2 sensor reports are decoded individually when several reports
+#   share one reassembled SHTP cargo;
 # - SHTP cargo split across several I2C transactions is reassembled before
 #   SH-2 message selection;
 # - fixed-point sensor values are converted to physical units while the decoder
 #   retains the original signed integer value.
-#
-# Known issue:
-# - captures with only raw accelerometer (0x14) and raw magnetometer (0x16)
-#   enabled can currently be classified as raw gyroscope (0x15). Raw-vector
-#   report selection and offsets still need to be investigated and fixed; do
-#   not rely on the reported raw sensor type until that work is complete.
 
 schema: wavecraft.protocol/v1
 
@@ -42,6 +35,28 @@ framing:
     value: 0x80
   channel_offset: 2
   sequence_offset: 3
+  records:
+    channels: [3, 4]
+    prefix:
+      value: 0xFA
+      mask: 0xFE
+      bytes: 5
+    lengths:
+      0x01: 10
+      0x02: 10
+      0x03: 10
+      0x04: 10
+      0x05: 14
+      0x06: 10
+      0x07: 16
+      0x08: 12
+      0x09: 14
+      0x0F: 16
+      0x14: 16
+      0x15: 16
+      0x16: 16
+      0x28: 14
+      0x29: 12
   max_frame_bytes: 32767
 
 messages:

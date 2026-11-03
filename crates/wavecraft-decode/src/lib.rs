@@ -16,8 +16,8 @@ pub use runtime::{CustomProtocolRuntime, ProtocolRuntimeOutput};
 pub use schema::{
     load_protocol_schema, BitDefinition, ByteMatch, ChecksumAlgorithm, ChecksumValidation,
     DisplayOptions, Endian, ExpectedValue, FieldKind, FieldSchema, FramingSchema, InputSchema,
-    IntegerType, LengthField, MessageSchema, ProtocolMetadata, ProtocolSchema, ResyncStrategy,
-    SchemaError, SegmentedTransactionSchema, StringEncoding, TransportKind,
+    IntegerType, LengthField, MessageSchema, ProtocolMetadata, ProtocolSchema, RecordStreamSchema,
+    ResyncStrategy, SchemaError, SegmentedTransactionSchema, StringEncoding, TransportKind,
     PROTOCOL_SCHEMA_VERSION,
 };
 pub use transport::{

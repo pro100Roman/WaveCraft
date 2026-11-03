@@ -248,18 +248,14 @@ decodes the SHTP header, Product ID and feature-control messages, plus common
 accelerometer, gyroscope, magnetometer, gravity, and rotation-vector reports.
 Add an I2C analyzer, map SCL and SDA, save it, then load the example YAML from
 the analyzer card. Segmented SHTP cargoes are reassembled across consecutive
-I2C transactions. The current schema version decodes the first SH-2 sensor
-report in each reassembled cargo and converts raw fixed-point sensor integers
-from their documented Q point into physical units. Its
+I2C transactions. The current schema version decodes each supported SH-2
+sensor report in a reassembled cargo and converts raw fixed-point sensor
+integers from their documented Q point into physical units. Its
 summaries distinguish acceleration (including or excluding gravity), angular
-velocity, magnetic field, gravity, and orientation quaternions. It does not yet
-iterate over multiple reports in one cargo.
-
-Known issue: a capture with only raw accelerometer (`0x14`) and raw
-magnetometer (`0x16`) enabled can currently be decoded as raw gyroscope
-(`0x15`). Raw-vector report selection and offsets require further investigation;
-the reported raw sensor type should not be considered reliable until this is
-fixed.
+velocity, magnetic field, gravity, and orientation quaternions. Raw
+accelerometer (`0x14`), raw gyroscope (`0x15`), and raw magnetometer (`0x16`)
+records are selected independently by their on-wire report identifiers,
+including when several records share one cargo.
 
 ```yaml
 schema: wavecraft.protocol/v1
@@ -356,7 +352,9 @@ Version 1 supports these bounded strategies:
   START-to-STOP transaction;
 - `segmented_transport_transaction` reassembles a length-delimited cargo split
   across consecutive SPI or I2C transactions, using YAML-declared header,
-  continuation, channel, and sequence fields;
+  continuation, channel, and sequence fields. Its optional `records` section
+  can split selected channels into bounded, identifier-to-length records while
+  carrying the most recent matched prefix into each decoded message;
 - `gap` ends a UART frame after a configured minimum idle duration;
 - `delimiter` ends a frame at a configured byte sequence;
 - `fixed_length` consumes an exact number of bytes; and

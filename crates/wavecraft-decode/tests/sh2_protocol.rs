@@ -201,6 +201,36 @@ fn decodes_all_sh2_raw_physical_vectors() {
 }
 
 #[test]
+fn decodes_raw_accelerometer_and_magnetometer_without_inventing_gyroscope() {
+    let schema = load_protocol_schema(SH2_I2C_SCHEMA).unwrap();
+    let mut runtime = CustomProtocolRuntime::new(schema).unwrap();
+    let packet = TransportPacket::single_stream(
+        TransportKind::I2c,
+        "data",
+        bytes(&[
+            0x29, 0x00, 0x03, 0x6B, // SHTP header: 41 bytes
+            0xFB, 0x00, 0x00, 0x00, 0x00, // Base timestamp
+            0x14, 0x01, 0x03, 0x00, 0x34, 0x12, 0xFE, 0xFF, 0x00, 0x80, 0x00, 0x00, 0x40, 0xE2,
+            0x01, 0x00, // Raw accelerometer
+            0x16, 0x02, 0x03, 0x00, 0x78, 0x56, 0xFC, 0xFF, 0x00, 0x40, 0x00, 0x00, 0x44, 0xE2,
+            0x01, 0x00, // Raw magnetometer
+        ]),
+        PacketCompleteness::Complete,
+    );
+
+    let output = runtime.push_packet(&packet, 10_000_000);
+
+    assert!(output.diagnostics.is_empty());
+    assert_eq!(output.messages.len(), 2);
+    assert_eq!(output.messages[0].message_id, "raw_accelerometer");
+    assert_eq!(output.messages[1].message_id, "raw_magnetometer");
+    assert!(output
+        .messages
+        .iter()
+        .all(|message| message.message_id != "raw_gyroscope"));
+}
+
+#[test]
 fn decodes_all_sh2_uncalibrated_vectors_with_bias() {
     let decoder = CustomProtocolDecoder::new(load_protocol_schema(SH2_I2C_SCHEMA).unwrap());
 
@@ -433,13 +463,22 @@ fn loads_documented_sh2_i2c_schema() {
     assert_eq!(schema.protocol.id, "ceva.bno08x.sh2-i2c");
     assert_eq!(schema.input.transport, TransportKind::I2c);
     assert_eq!(schema.messages.len(), 22);
-    assert!(matches!(
-        schema.framing,
-        FramingSchema::SegmentedTransportTransaction {
-            max_frame_bytes: 32_767,
-            ..
-        }
-    ));
+    let FramingSchema::SegmentedTransportTransaction {
+        max_frame_bytes,
+        segmentation,
+    } = &schema.framing
+    else {
+        panic!("SH-2 schema should use segmented transport framing");
+    };
+    assert_eq!(*max_frame_bytes, 32_767);
+    let records = segmentation
+        .records
+        .as_ref()
+        .expect("SH-2 sensor channels should decode record streams");
+    assert_eq!(records.channels.iter().copied().collect::<Vec<_>>(), [3, 4]);
+    assert_eq!(records.record_lengths.get(&0x14), Some(&16));
+    assert_eq!(records.record_lengths.get(&0x15), Some(&16));
+    assert_eq!(records.record_lengths.get(&0x16), Some(&16));
     assert!(schema.messages.iter().all(|message| {
         message
             .fields

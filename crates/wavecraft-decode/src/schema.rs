@@ -81,6 +81,15 @@ pub struct SegmentedTransactionSchema {
     pub continuation: ByteMatch,
     pub channel_offset: usize,
     pub sequence_offset: usize,
+    pub records: Option<RecordStreamSchema>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordStreamSchema {
+    pub channels: BTreeSet<u8>,
+    pub prefix: ByteMatch,
+    pub prefix_bytes: usize,
+    pub record_lengths: BTreeMap<u8, usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -497,6 +506,7 @@ fn parse_framing(value: &Yaml, transport: TransportKind) -> Result<FramingSchema
                     "continuation",
                     "channel_offset",
                     "sequence_offset",
+                    "records",
                     "max_frame_bytes",
                 ],
                 path,
@@ -544,6 +554,10 @@ fn parse_framing(value: &Yaml, transport: TransportKind) -> Result<FramingSchema
                     ));
                 }
             }
+            let records = match get(map, "records") {
+                Some(value) => Some(parse_record_stream(value, header_bytes, max_frame_bytes)?),
+                None => None,
+            };
             Ok(FramingSchema::SegmentedTransportTransaction {
                 max_frame_bytes,
                 segmentation: SegmentedTransactionSchema {
@@ -555,6 +569,7 @@ fn parse_framing(value: &Yaml, transport: TransportKind) -> Result<FramingSchema
                     continuation,
                     channel_offset,
                     sequence_offset,
+                    records,
                 },
             })
         }
@@ -677,6 +692,112 @@ fn parse_framing(value: &Yaml, transport: TransportKind) -> Result<FramingSchema
             format!("unsupported framing strategy {strategy:?}"),
         )),
     }
+}
+
+fn parse_record_stream(
+    value: &Yaml,
+    header_bytes: usize,
+    max_frame_bytes: usize,
+) -> Result<RecordStreamSchema, SchemaError> {
+    let path = "framing.records";
+    let map = as_map(value, path)?;
+    ensure_only_keys(map, &["channels", "prefix", "lengths"], path)?;
+
+    let channel_values = as_array(
+        required(map, "channels", "framing.records.channels")?,
+        "framing.records.channels",
+    )?;
+    if channel_values.is_empty() {
+        return Err(SchemaError::at(
+            "framing.records.channels",
+            "at least one record-stream channel is required",
+        ));
+    }
+    let mut channels = BTreeSet::new();
+    for (index, value) in channel_values.iter().enumerate() {
+        let item_path = format!("framing.records.channels[{index}]");
+        let channel = u8::try_from(parse_u64(value, &item_path)?)
+            .map_err(|_| SchemaError::at(&item_path, "channel does not fit in one byte"))?;
+        if !channels.insert(channel) {
+            return Err(SchemaError::at(
+                item_path,
+                "duplicate record-stream channel",
+            ));
+        }
+    }
+
+    let prefix_path = "framing.records.prefix";
+    let prefix_map = as_map(required(map, "prefix", prefix_path)?, prefix_path)?;
+    ensure_only_keys(prefix_map, &["value", "mask", "bytes"], prefix_path)?;
+    let prefix_mask =
+        optional_u8(prefix_map, "mask", "framing.records.prefix.mask")?.unwrap_or(u8::MAX);
+    let prefix_value = required_u8(prefix_map, "value", "framing.records.prefix.value")?;
+    if prefix_mask == 0 || prefix_value & !prefix_mask != 0 {
+        return Err(SchemaError::at(
+            prefix_path,
+            "prefix value must use only bits selected by its non-zero mask",
+        ));
+    }
+    let prefix_bytes = required_usize(prefix_map, "bytes", "framing.records.prefix.bytes")?;
+    if prefix_bytes == 0
+        || header_bytes
+            .checked_add(prefix_bytes)
+            .map_or(true, |bytes| bytes > max_frame_bytes)
+    {
+        return Err(SchemaError::at(
+            "framing.records.prefix.bytes",
+            "prefix size must fit within max_frame_bytes after the transaction header",
+        ));
+    }
+
+    let lengths_path = "framing.records.lengths";
+    let lengths_map = as_map(required(map, "lengths", lengths_path)?, lengths_path)?;
+    if lengths_map.is_empty() {
+        return Err(SchemaError::at(
+            lengths_path,
+            "at least one record length is required",
+        ));
+    }
+    let mut record_lengths = BTreeMap::new();
+    for (key, value) in lengths_map {
+        let id = u8::try_from(parse_u64(key, lengths_path)?).map_err(|_| {
+            SchemaError::at(lengths_path, "record identifier does not fit in one byte")
+        })?;
+        let length = usize::try_from(parse_u64(value, lengths_path)?).map_err(|_| {
+            SchemaError::at(lengths_path, "record length does not fit this platform")
+        })?;
+        if length == 0
+            || header_bytes
+                .checked_add(prefix_bytes)
+                .and_then(|bytes| bytes.checked_add(length))
+                .map_or(true, |bytes| bytes > max_frame_bytes)
+        {
+            return Err(SchemaError::at(
+                lengths_path,
+                "record length must fit within max_frame_bytes with the header and prefix",
+            ));
+        }
+        if id & prefix_mask == prefix_value & prefix_mask {
+            return Err(SchemaError::at(
+                lengths_path,
+                "record identifier overlaps the configured prefix match",
+            ));
+        }
+        if record_lengths.insert(id, length).is_some() {
+            return Err(SchemaError::at(lengths_path, "duplicate record identifier"));
+        }
+    }
+
+    Ok(RecordStreamSchema {
+        channels,
+        prefix: ByteMatch {
+            offset: 0,
+            value: prefix_value,
+            mask: prefix_mask,
+        },
+        prefix_bytes,
+        record_lengths,
+    })
 }
 
 fn parse_segmented_length(value: &Yaml) -> Result<(usize, usize, Endian, u64), SchemaError> {
