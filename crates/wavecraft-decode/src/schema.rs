@@ -176,6 +176,13 @@ impl IntegerType {
             Self::S32Le | Self::S32Be => (i32::MIN as i64..=i32::MAX as i64).contains(&value),
         }
     }
+
+    const fn is_unsigned(self) -> bool {
+        matches!(
+            self,
+            Self::U8 | Self::U16Le | Self::U16Be | Self::U32Le | Self::U32Be
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,6 +233,7 @@ pub struct DisplayOptions {
 pub struct FieldSchema {
     pub name: String,
     pub kind: FieldKind,
+    pub mask: Option<i64>,
     pub expected: Option<ExpectedValue>,
     pub enum_values: BTreeMap<i64, String>,
     pub bits: BTreeMap<String, BitDefinition>,
@@ -798,7 +806,8 @@ fn parse_field(value: &Yaml, path: &str) -> Result<FieldSchema, SchemaError> {
     ensure_only_keys(
         map,
         &[
-            "name", "type", "size", "encoding", "expect", "enum", "bits", "hidden", "display",
+            "name", "type", "size", "encoding", "mask", "expect", "enum", "bits", "hidden",
+            "display",
         ],
         path,
     )?;
@@ -851,6 +860,32 @@ fn parse_field(value: &Yaml, path: &str) -> Result<FieldSchema, SchemaError> {
         }
     };
 
+    let mask = match get(map, "mask") {
+        Some(value) => {
+            let FieldKind::Integer(integer) = kind else {
+                return Err(SchemaError::at(
+                    format!("{path}.mask"),
+                    "mask is only valid on integer fields",
+                ));
+            };
+            if !integer.is_unsigned() {
+                return Err(SchemaError::at(
+                    format!("{path}.mask"),
+                    "mask is only valid on unsigned integer fields",
+                ));
+            }
+            let value = parse_i64(value, &format!("{path}.mask"))?;
+            if !integer.contains(value) {
+                return Err(SchemaError::at(
+                    format!("{path}.mask"),
+                    "mask does not fit field type",
+                ));
+            }
+            Some(value)
+        }
+        None => None,
+    };
+
     let expected = match get(map, "expect") {
         Some(value) => Some(parse_expected(value, &kind, &format!("{path}.expect"))?),
         None => None,
@@ -877,6 +912,7 @@ fn parse_field(value: &Yaml, path: &str) -> Result<FieldSchema, SchemaError> {
     Ok(FieldSchema {
         name,
         kind,
+        mask,
         expected,
         enum_values,
         bits,
@@ -1460,6 +1496,37 @@ mod tests {
                 max_frame_bytes: 32_767
             }
         ));
+        assert!(schema.messages.iter().all(|message| {
+            message
+                .fields
+                .iter()
+                .find(|field| field.name == "packet_length")
+                .is_some_and(|field| field.mask == Some(0x7FFF))
+        }));
+    }
+
+    #[test]
+    fn rejects_masks_that_do_not_fit_unsigned_integer_fields() {
+        let source = replace_once(
+            &normalized_example(),
+            "        type: u16le\n        display:",
+            "        type: u16le\n        mask: 0x1_FFFF\n        display:",
+        );
+        let error = load_protocol_schema(&source).unwrap_err();
+        assert_eq!(error.path(), "messages[0].fields[4].mask");
+        assert_eq!(error.message(), "mask does not fit field type");
+
+        let source = replace_once(
+            &normalized_example(),
+            "        type: u16le\n        display:",
+            "        type: s16le\n        mask: 0x7FFF\n        display:",
+        );
+        let error = load_protocol_schema(&source).unwrap_err();
+        assert_eq!(error.path(), "messages[0].fields[4].mask");
+        assert_eq!(
+            error.message(),
+            "mask is only valid on unsigned integer fields"
+        );
     }
 
     #[test]

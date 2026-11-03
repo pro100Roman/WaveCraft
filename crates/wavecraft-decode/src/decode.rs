@@ -293,7 +293,7 @@ fn decode_message(
         let source = &bytes[start..end];
         let range = SampleRange::covering(source[0].range, source[source.len() - 1].range)?;
         let raw = source.iter().map(|byte| byte.value).collect::<Vec<_>>();
-        let (value, mut field_diagnostics) = decode_value(&field_schema.kind, &raw, range)?;
+        let (raw_value, mut field_diagnostics) = decode_value(&field_schema.kind, &raw, range)?;
         diagnostics.append(&mut field_diagnostics);
         for byte in source {
             if byte.status.parity_error {
@@ -316,6 +316,8 @@ fn decode_message(
                 ));
             }
         }
+        let children = decode_bits(field_schema, &raw_value, range);
+        let value = apply_mask(field_schema, raw_value);
         validate_expected(
             field_schema.expected.as_ref(),
             &value,
@@ -343,7 +345,6 @@ fn decode_message(
                 }
             }
         }
-        let children = decode_bits(field_schema, &value, range);
         offsets.insert(field_schema.name.as_str(), (start, end));
         fields.push(DecodedField {
             name: field_schema.name.clone(),
@@ -373,6 +374,13 @@ fn decode_message(
         fields,
         diagnostics,
     })
+}
+
+fn apply_mask(field_schema: &crate::FieldSchema, value: DecodedValue) -> DecodedValue {
+    match (field_schema.mask, value) {
+        (Some(mask), DecodedValue::Integer(value)) => DecodedValue::Integer(value & mask),
+        (_, value) => value,
+    }
 }
 
 fn decode_value(
@@ -759,11 +767,33 @@ messages:
         let message = decoder.decode_packet(&packet).unwrap().unwrap();
 
         assert_eq!(message.message_id, "accelerometer");
+        assert_eq!(message.fields[0].value, DecodedValue::Integer(19));
         assert_eq!(
             message.summary,
             "Accel · X 256 raw Q8 m/s^2 · Y -256 raw Q8 m/s^2 · Z 512 raw Q8 m/s^2"
         );
         assert_eq!(message.severity, Severity::Info);
+    }
+
+    #[test]
+    fn masks_shtp_continuation_bit_out_of_packet_length() {
+        let decoder = CustomProtocolDecoder::new(load_protocol_schema(SH2_I2C_SCHEMA).unwrap());
+        let packet = TransportPacket {
+            transport: TransportKind::I2c,
+            streams: BTreeMap::from([("data".to_owned(), bytes(&[0x04, 0x80, 0x00, 0x07]))]),
+            attributes: BTreeMap::new(),
+            completeness: PacketCompleteness::Complete,
+        };
+
+        let message = decoder.decode_packet(&packet).unwrap().unwrap();
+
+        assert_eq!(message.message_id, "shtp_packet");
+        assert_eq!(message.summary, "SHTP shtp_command · seq 7 · 4 bytes");
+        assert_eq!(message.fields[0].value, DecodedValue::Integer(4));
+        assert_eq!(
+            message.fields[0].children[0].value,
+            DecodedValue::Boolean(true)
+        );
     }
 
     #[test]

@@ -384,6 +384,10 @@ Fields are read sequentially. A field may be conditional on an equality check
 against an earlier scalar or a transport attribute. Version 1 does not expose
 a general-purpose expression language. Size, count, and conditional references
 must point backwards, be type-compatible, and be resolved by schema validation.
+Unsigned integer fields may specify a `mask`; the decoder applies it to the
+field value used by expectations, enums, display text, and summaries. Named
+`bits` are still decoded from the unmasked wire value, so a flag may be split
+from the scalar payload it accompanies.
 
 Each decoded field carries its source byte range and derived sample range.
 Containers derive their range from their children. Calculated display values
