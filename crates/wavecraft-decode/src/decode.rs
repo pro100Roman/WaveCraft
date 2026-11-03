@@ -325,10 +325,24 @@ fn decode_message(
             &mut diagnostics,
         );
 
-        let mut display = field_schema.display.unit.clone().map(|unit| match &value {
-            DecodedValue::Integer(value) => format!("{value} {unit}"),
-            _ => unit,
-        });
+        let mut display = match &value {
+            DecodedValue::Integer(value) => field_schema
+                .display
+                .fixed_point_q
+                .map(|q| format_fixed_point(*value, q))
+                .map(|value| match &field_schema.display.unit {
+                    Some(unit) => format!("{value} {unit}"),
+                    None => value,
+                })
+                .or_else(|| {
+                    field_schema
+                        .display
+                        .unit
+                        .as_ref()
+                        .map(|unit| format!("{value} {unit}"))
+                }),
+            _ => field_schema.display.unit.clone(),
+        };
         if let DecodedValue::Integer(value) = value {
             if !field_schema.enum_values.is_empty() {
                 match field_schema.enum_values.get(&value) {
@@ -381,6 +395,18 @@ fn apply_mask(field_schema: &crate::FieldSchema, value: DecodedValue) -> Decoded
         (Some(mask), DecodedValue::Integer(value)) => DecodedValue::Integer(value & mask),
         (_, value) => value,
     }
+}
+
+fn format_fixed_point(value: i64, q: u8) -> String {
+    let scaled = value as f64 / (1_u64 << q) as f64;
+    let mut formatted = format!("{scaled:.6}");
+    while formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.pop();
+    }
+    formatted
 }
 
 fn decode_value(
@@ -770,9 +796,69 @@ messages:
         assert_eq!(message.fields[0].value, DecodedValue::Integer(19));
         assert_eq!(
             message.summary,
-            "Accel · X 256 raw Q8 m/s^2 · Y -256 raw Q8 m/s^2 · Z 512 raw Q8 m/s^2"
+            "Accelerometer (includes gravity) · X 1 m/s^2 · Y -1 m/s^2 · Z 2 m/s^2 · accuracy high"
         );
+        assert_eq!(
+            message.fields[5].display.as_deref(),
+            Some("accelerometer (acceleration including gravity)")
+        );
+        assert_eq!(message.fields[7].display.as_deref(), Some("high"));
+        assert_eq!(message.fields[9].display.as_deref(), Some("1 m/s^2"));
         assert_eq!(message.severity, Severity::Info);
+    }
+
+    #[test]
+    fn labels_and_scales_sh2_gyroscope_report() {
+        let decoder = CustomProtocolDecoder::new(load_protocol_schema(SH2_I2C_SCHEMA).unwrap());
+        let packet = TransportPacket {
+            transport: TransportKind::I2c,
+            streams: BTreeMap::from([(
+                "data".to_owned(),
+                bytes(&[
+                    0x13, 0x00, 0x03, 0x08, 0xFB, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02, 0x00,
+                    0x00, 0x02, 0x00, 0xFF, 0x00, 0x04,
+                ]),
+            )]),
+            attributes: BTreeMap::new(),
+            completeness: PacketCompleteness::Complete,
+        };
+
+        let message = decoder.decode_packet(&packet).unwrap().unwrap();
+
+        assert_eq!(message.message_id, "gyroscope_calibrated");
+        assert_eq!(
+            message.summary,
+            "Calibrated gyroscope (angular velocity) · X 1 rad/s · Y -0.5 rad/s · Z 2 rad/s · accuracy medium"
+        );
+        assert_eq!(message.fields[9].name, "angular_velocity_x");
+        assert_eq!(message.fields[9].display.as_deref(), Some("1 rad/s"));
+    }
+
+    #[test]
+    fn labels_and_scales_sh2_rotation_vector_report() {
+        let decoder = CustomProtocolDecoder::new(load_protocol_schema(SH2_I2C_SCHEMA).unwrap());
+        let packet = TransportPacket {
+            transport: TransportKind::I2c,
+            streams: BTreeMap::from([(
+                "data".to_owned(),
+                bytes(&[
+                    0x17, 0x00, 0x03, 0x09, 0xFB, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x10,
+                ]),
+            )]),
+            attributes: BTreeMap::new(),
+            completeness: PacketCompleteness::Complete,
+        };
+
+        let message = decoder.decode_packet(&packet).unwrap().unwrap();
+
+        assert_eq!(message.message_id, "rotation_vector");
+        assert_eq!(
+            message.summary,
+            "Rotation vector (orientation quaternion) · i 0 · j 0 · k 0 · real 1 · heading accuracy 1 rad · sensor accuracy high"
+        );
+        assert_eq!(message.fields[13].name, "heading_accuracy");
+        assert_eq!(message.fields[13].display.as_deref(), Some("1 rad"));
     }
 
     #[test]

@@ -6,7 +6,8 @@
 #   sensor report following a Base Timestamp (0xFB) is decoded;
 # - SHTP continuations and I2C reads split across several transactions are not
 #   reassembled;
-# - fixed-point values are displayed as raw signed integers with their Q point.
+# - fixed-point sensor values are converted to physical units while the decoder
+#   retains the original signed integer value.
 
 schema: wavecraft.protocol/v1
 
@@ -56,7 +57,7 @@ messages:
         type: u8
         expect: 0
         hidden: true
-    summary: "Product ID request · seq {shtp_sequence}"
+    summary: "SH-2 Product ID request · SHTP seq {shtp_sequence}"
 
   - id: product_id_response
     name: Product ID response
@@ -106,7 +107,7 @@ messages:
         type: u16le
         expect: 0
         hidden: true
-    summary: "Product {part_number} · v{version_major}"
+    summary: "BNO08x product {part_number} · firmware {version_major}.{version_minor}.{version_patch} · build {build_number} · reset {reset_cause}"
 
   - id: get_feature_request
     name: Get Feature request
@@ -162,7 +163,7 @@ messages:
           0x28: arvr_stabilized_rotation_vector
           0x29: arvr_stabilized_game_rotation_vector
           0x2A: gyro_integrated_rotation_vector
-    summary: "Get feature {feature_report}"
+    summary: "SH-2 Get Feature request · sensor {feature_report} · SHTP seq {shtp_sequence}"
 
   - id: set_feature_command
     name: Set Feature command
@@ -230,14 +231,14 @@ messages:
       - name: report_interval
         type: u32le
         display:
-          unit: us
+          unit: µs
       - name: batch_interval
         type: u32le
         display:
-          unit: us
+          unit: µs
       - name: sensor_specific
         type: u32le
-    summary: "Set {feature_report} · {report_interval}"
+    summary: "SH-2 Set Feature · sensor {feature_report} · report every {report_interval} · batch {batch_interval}"
 
   - id: get_feature_response
     name: Get Feature response
@@ -305,14 +306,14 @@ messages:
       - name: report_interval
         type: u32le
         display:
-          unit: us
+          unit: µs
       - name: batch_interval
         type: u32le
         display:
-          unit: us
+          unit: µs
       - name: sensor_specific
         type: u32le
-    summary: "Feature {feature_report} · {report_interval}"
+    summary: "SH-2 Feature configuration · sensor {feature_report} · report every {report_interval} · batch {batch_interval}"
 
   - id: accelerometer
     name: Accelerometer
@@ -325,7 +326,6 @@ messages:
       - name: packet_length
         type: u16le
         mask: 0x7FFF
-        hidden: true
       - name: channel
         type: u8
         enum:
@@ -340,32 +340,42 @@ messages:
       - name: base_delta
         type: s32le
         display:
-          unit: x100 us
-      - name: sensor_report
+          unit: 100 us ticks before host interrupt
+      - name: report_type
         type: u8
         expect: 0x01
-        hidden: true
+        enum:
+          0x01: accelerometer (acceleration including gravity)
       - name: sensor_sequence
         type: u8
-      - name: status_and_delay_msb
+      - name: accuracy
         type: u8
-      - name: delay_lsb
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
         type: u8
         display:
-          unit: x100 us
-      - name: x
+          unit: 100 us ticks
+      - name: acceleration_x
         type: s16le
         display:
-          unit: raw Q8 m/s^2
-      - name: y
+          unit: m/s^2
+          fixed_point_q: 8
+      - name: acceleration_y
         type: s16le
         display:
-          unit: raw Q8 m/s^2
-      - name: z
+          unit: m/s^2
+          fixed_point_q: 8
+      - name: acceleration_z
         type: s16le
         display:
-          unit: raw Q8 m/s^2
-    summary: "Accel · X {x} · Y {y} · Z {z}"
+          unit: m/s^2
+          fixed_point_q: 8
+    summary: "Accelerometer (includes gravity) · X {acceleration_x} · Y {acceleration_y} · Z {acceleration_z} · accuracy {accuracy}"
 
   - id: gyroscope_calibrated
     name: Gyroscope calibrated
@@ -378,7 +388,6 @@ messages:
       - name: packet_length
         type: u16le
         mask: 0x7FFF
-        hidden: true
       - name: channel
         type: u8
         enum:
@@ -393,32 +402,42 @@ messages:
       - name: base_delta
         type: s32le
         display:
-          unit: x100 us
-      - name: sensor_report
+          unit: 100 us ticks before host interrupt
+      - name: report_type
         type: u8
         expect: 0x02
-        hidden: true
+        enum:
+          0x02: calibrated gyroscope (angular velocity)
       - name: sensor_sequence
         type: u8
-      - name: status_and_delay_msb
+      - name: accuracy
         type: u8
-      - name: delay_lsb
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
         type: u8
         display:
-          unit: x100 us
-      - name: x
+          unit: 100 us ticks
+      - name: angular_velocity_x
         type: s16le
         display:
-          unit: raw Q9 rad/s
-      - name: y
+          unit: rad/s
+          fixed_point_q: 9
+      - name: angular_velocity_y
         type: s16le
         display:
-          unit: raw Q9 rad/s
-      - name: z
+          unit: rad/s
+          fixed_point_q: 9
+      - name: angular_velocity_z
         type: s16le
         display:
-          unit: raw Q9 rad/s
-    summary: "Gyro · X {x} · Y {y} · Z {z}"
+          unit: rad/s
+          fixed_point_q: 9
+    summary: "Calibrated gyroscope (angular velocity) · X {angular_velocity_x} · Y {angular_velocity_y} · Z {angular_velocity_z} · accuracy {accuracy}"
 
   - id: magnetic_field_calibrated
     name: Magnetic field calibrated
@@ -431,7 +450,6 @@ messages:
       - name: packet_length
         type: u16le
         mask: 0x7FFF
-        hidden: true
       - name: channel
         type: u8
         enum:
@@ -446,32 +464,42 @@ messages:
       - name: base_delta
         type: s32le
         display:
-          unit: x100 us
-      - name: sensor_report
+          unit: 100 us ticks before host interrupt
+      - name: report_type
         type: u8
         expect: 0x03
-        hidden: true
+        enum:
+          0x03: calibrated magnetometer (magnetic field)
       - name: sensor_sequence
         type: u8
-      - name: status_and_delay_msb
+      - name: accuracy
         type: u8
-      - name: delay_lsb
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
         type: u8
         display:
-          unit: x100 us
-      - name: x
+          unit: 100 us ticks
+      - name: magnetic_field_x
         type: s16le
         display:
-          unit: raw Q4 uT
-      - name: y
+          unit: µT
+          fixed_point_q: 4
+      - name: magnetic_field_y
         type: s16le
         display:
-          unit: raw Q4 uT
-      - name: z
+          unit: µT
+          fixed_point_q: 4
+      - name: magnetic_field_z
         type: s16le
         display:
-          unit: raw Q4 uT
-    summary: "Mag · X {x} · Y {y} · Z {z}"
+          unit: µT
+          fixed_point_q: 4
+    summary: "Calibrated magnetometer (magnetic field) · X {magnetic_field_x} · Y {magnetic_field_y} · Z {magnetic_field_z} · accuracy {accuracy}"
 
   - id: linear_acceleration
     name: Linear acceleration
@@ -484,7 +512,6 @@ messages:
       - name: packet_length
         type: u16le
         mask: 0x7FFF
-        hidden: true
       - name: channel
         type: u8
         enum:
@@ -499,32 +526,42 @@ messages:
       - name: base_delta
         type: s32le
         display:
-          unit: x100 us
-      - name: sensor_report
+          unit: 100 us ticks before host interrupt
+      - name: report_type
         type: u8
         expect: 0x04
-        hidden: true
+        enum:
+          0x04: linear acceleration (gravity removed)
       - name: sensor_sequence
         type: u8
-      - name: status_and_delay_msb
+      - name: accuracy
         type: u8
-      - name: delay_lsb
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
         type: u8
         display:
-          unit: x100 us
-      - name: x
+          unit: 100 us ticks
+      - name: linear_acceleration_x
         type: s16le
         display:
-          unit: raw Q8 m/s^2
-      - name: y
+          unit: m/s^2
+          fixed_point_q: 8
+      - name: linear_acceleration_y
         type: s16le
         display:
-          unit: raw Q8 m/s^2
-      - name: z
+          unit: m/s^2
+          fixed_point_q: 8
+      - name: linear_acceleration_z
         type: s16le
         display:
-          unit: raw Q8 m/s^2
-    summary: "Linear accel · X {x} · Y {y} · Z {z}"
+          unit: m/s^2
+          fixed_point_q: 8
+    summary: "Linear acceleration (gravity removed) · X {linear_acceleration_x} · Y {linear_acceleration_y} · Z {linear_acceleration_z} · accuracy {accuracy}"
 
   - id: gravity
     name: Gravity
@@ -537,7 +574,6 @@ messages:
       - name: packet_length
         type: u16le
         mask: 0x7FFF
-        hidden: true
       - name: channel
         type: u8
         enum:
@@ -552,32 +588,42 @@ messages:
       - name: base_delta
         type: s32le
         display:
-          unit: x100 us
-      - name: sensor_report
+          unit: 100 us ticks before host interrupt
+      - name: report_type
         type: u8
         expect: 0x06
-        hidden: true
+        enum:
+          0x06: gravity vector
       - name: sensor_sequence
         type: u8
-      - name: status_and_delay_msb
+      - name: accuracy
         type: u8
-      - name: delay_lsb
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
         type: u8
         display:
-          unit: x100 us
-      - name: x
+          unit: 100 us ticks
+      - name: gravity_x
         type: s16le
         display:
-          unit: raw Q8 m/s^2
-      - name: y
+          unit: m/s^2
+          fixed_point_q: 8
+      - name: gravity_y
         type: s16le
         display:
-          unit: raw Q8 m/s^2
-      - name: z
+          unit: m/s^2
+          fixed_point_q: 8
+      - name: gravity_z
         type: s16le
         display:
-          unit: raw Q8 m/s^2
-    summary: "Gravity · X {x} · Y {y} · Z {z}"
+          unit: m/s^2
+          fixed_point_q: 8
+    summary: "Gravity vector · X {gravity_x} · Y {gravity_y} · Z {gravity_z} · accuracy {accuracy}"
 
   - id: rotation_vector
     name: Rotation vector
@@ -590,7 +636,6 @@ messages:
       - name: packet_length
         type: u16le
         mask: 0x7FFF
-        hidden: true
       - name: channel
         type: u8
         enum:
@@ -605,40 +650,48 @@ messages:
       - name: base_delta
         type: s32le
         display:
-          unit: x100 us
-      - name: sensor_report
+          unit: 100 us ticks before host interrupt
+      - name: report_type
         type: u8
         expect: 0x05
-        hidden: true
+        enum:
+          0x05: orientation rotation vector (quaternion)
       - name: sensor_sequence
         type: u8
-      - name: status_and_delay_msb
-        type: u8
-      - name: delay_lsb
-        type: u8
-        display:
-          unit: x100 us
-      - name: i
-        type: s16le
-        display:
-          unit: raw Q14
-      - name: j
-        type: s16le
-        display:
-          unit: raw Q14
-      - name: k
-        type: s16le
-        display:
-          unit: raw Q14
-      - name: real
-        type: s16le
-        display:
-          unit: raw Q14
       - name: accuracy
+        type: u8
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
+        type: u8
+        display:
+          unit: 100 us ticks
+      - name: quaternion_i
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_j
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_k
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: quaternion_real
+        type: s16le
+        display:
+          fixed_point_q: 14
+      - name: heading_accuracy
         type: u16le
         display:
-          unit: raw Q12 rad
-    summary: "Rotation · i {i} · j {j} · k {k} · real {real}"
+          unit: rad
+          fixed_point_q: 12
+    summary: "Rotation vector (orientation quaternion) · i {quaternion_i} · j {quaternion_j} · k {quaternion_k} · real {quaternion_real} · heading accuracy {heading_accuracy} · sensor accuracy {accuracy}"
 
   - id: game_rotation_vector
     name: Game rotation vector
@@ -651,7 +704,6 @@ messages:
       - name: packet_length
         type: u16le
         mask: 0x7FFF
-        hidden: true
       - name: channel
         type: u8
         enum:
@@ -666,36 +718,43 @@ messages:
       - name: base_delta
         type: s32le
         display:
-          unit: x100 us
-      - name: sensor_report
+          unit: 100 us ticks before host interrupt
+      - name: report_type
         type: u8
         expect: 0x08
-        hidden: true
+        enum:
+          0x08: game orientation rotation vector (quaternion)
       - name: sensor_sequence
         type: u8
-      - name: status_and_delay_msb
+      - name: accuracy
         type: u8
-      - name: delay_lsb
+        mask: 0x03
+        enum:
+          0: unreliable
+          1: low
+          2: medium
+          3: high
+      - name: delay_low_8_bits
         type: u8
         display:
-          unit: x100 us
-      - name: i
+          unit: 100 us ticks
+      - name: quaternion_i
         type: s16le
         display:
-          unit: raw Q14
-      - name: j
+          fixed_point_q: 14
+      - name: quaternion_j
         type: s16le
         display:
-          unit: raw Q14
-      - name: k
+          fixed_point_q: 14
+      - name: quaternion_k
         type: s16le
         display:
-          unit: raw Q14
-      - name: real
+          fixed_point_q: 14
+      - name: quaternion_real
         type: s16le
         display:
-          unit: raw Q14
-    summary: "Game rotation · i {i} · j {j} · k {k} · real {real}"
+          fixed_point_q: 14
+    summary: "Game rotation vector (orientation quaternion) · i {quaternion_i} · j {quaternion_j} · k {quaternion_k} · real {quaternion_real} · sensor accuracy {accuracy}"
 
   - id: shtp_packet
     name: SHTP packet

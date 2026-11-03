@@ -3081,6 +3081,45 @@ messages:
     }
 
     #[test]
+    fn sh2_event_detail_explains_sensor_type_and_physical_values() {
+        let source = include_str!("../../../docs/examples/bno08x-sh2-i2c.wavecraft-protocol.yaml");
+        let decoder = CustomProtocolDecoder::new(load_protocol_schema(source).unwrap());
+        let values = [
+            0x13, 0x00, 0x03, 0x07, 0xFB, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x05, 0x00,
+            0x01, 0x00, 0xFF, 0x00, 0x02,
+        ];
+        let bytes = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| TimedByte {
+                value,
+                range: wavecraft_decode::SampleRange {
+                    start: index as u64 * 10,
+                    end: index as u64 * 10 + 8,
+                },
+                status: Default::default(),
+            })
+            .collect();
+        let packet = TransportPacket::single_stream(
+            TransportKind::I2c,
+            "data",
+            bytes,
+            PacketCompleteness::Complete,
+        );
+        let event = custom_message_event(decoder.decode_packet(&packet).unwrap().unwrap());
+
+        assert_eq!(
+            event.text,
+            "Accelerometer (includes gravity) · X 1 m/s^2 · Y -1 m/s^2 · Z 2 m/s^2 · accuracy high"
+        );
+        assert!(event
+            .detail
+            .contains("report_type=accelerometer (acceleration including gravity)"));
+        assert!(event.detail.contains("acceleration_x=1 m/s^2"));
+        assert!(event.detail.contains("accuracy=high"));
+    }
+
+    #[test]
     fn custom_yaml_must_match_the_selected_transport() {
         let source =
             include_str!("../../../docs/examples/motor-controller.wavecraft-protocol.yaml");

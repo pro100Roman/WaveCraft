@@ -248,9 +248,11 @@ decodes the SHTP header, Product ID and feature-control messages, plus common
 accelerometer, gyroscope, magnetometer, gravity, and rotation-vector reports.
 Add an I2C analyzer, map SCL and SDA, save it, then load the example YAML from
 the analyzer card. The current schema version decodes the first SH-2 sensor
-report in each I2C transaction and displays sensor values as raw fixed-point
-integers annotated with their Q point. It does not yet reassemble SHTP
-continuations or iterate over multiple reports in one cargo.
+report in each I2C transaction and converts raw fixed-point sensor integers
+from their documented Q point into physical units. Its
+summaries distinguish acceleration (including or excluding gravity), angular
+velocity, magnetic field, gravity, and orientation quaternions. It does not yet
+reassemble SHTP continuations or iterate over multiple reports in one cargo.
 
 ```yaml
 schema: wavecraft.protocol/v1
@@ -388,6 +390,9 @@ Unsigned integer fields may specify a `mask`; the decoder applies it to the
 field value used by expectations, enums, display text, and summaries. Named
 `bits` are still decoded from the unmasked wire value, so a flag may be split
 from the scalar payload it accompanies.
+Integer display options may specify `fixed_point_q`; the displayed physical
+value is the signed or unsigned wire integer divided by `2^Q`, followed by the
+optional `unit`. The decoded field retains the original integer value.
 
 Each decoded field carries its source byte range and derived sample range.
 Containers derive their range from their children. Calculated display values

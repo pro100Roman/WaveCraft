@@ -227,6 +227,7 @@ pub struct BitDefinition {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DisplayOptions {
     pub unit: Option<String>,
+    pub fixed_point_q: Option<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -906,7 +907,7 @@ fn parse_field(value: &Yaml, path: &str) -> Result<FieldSchema, SchemaError> {
     }
     let hidden = optional_bool(map, "hidden", &format!("{path}.hidden"))?.unwrap_or(false);
     let display = match get(map, "display") {
-        Some(value) => parse_display(value, &format!("{path}.display"))?,
+        Some(value) => parse_display(value, &kind, &format!("{path}.display"))?,
         None => DisplayOptions::default(),
     };
     Ok(FieldSchema {
@@ -1039,11 +1040,29 @@ fn parse_bits(
     Ok(result)
 }
 
-fn parse_display(value: &Yaml, path: &str) -> Result<DisplayOptions, SchemaError> {
+fn parse_display(
+    value: &Yaml,
+    kind: &FieldKind,
+    path: &str,
+) -> Result<DisplayOptions, SchemaError> {
     let map = as_map(value, path)?;
-    ensure_only_keys(map, &["unit"], path)?;
+    ensure_only_keys(map, &["unit", "fixed_point_q"], path)?;
+    let fixed_point_q = optional_u8(map, "fixed_point_q", &format!("{path}.fixed_point_q"))?;
+    if fixed_point_q.is_some() && !matches!(kind, FieldKind::Integer(_)) {
+        return Err(SchemaError::at(
+            format!("{path}.fixed_point_q"),
+            "fixed_point_q is only valid on integer fields",
+        ));
+    }
+    if fixed_point_q.is_some_and(|q| q > 31) {
+        return Err(SchemaError::at(
+            format!("{path}.fixed_point_q"),
+            "fixed_point_q must not exceed 31",
+        ));
+    }
     Ok(DisplayOptions {
         unit: optional_string(map, "unit", &format!("{path}.unit"))?,
+        fixed_point_q,
     })
 }
 
@@ -1503,6 +1522,18 @@ mod tests {
                 .find(|field| field.name == "packet_length")
                 .is_some_and(|field| field.mask == Some(0x7FFF))
         }));
+        let accelerometer = schema
+            .messages
+            .iter()
+            .find(|message| message.id == "accelerometer")
+            .unwrap();
+        let acceleration_x = accelerometer
+            .fields
+            .iter()
+            .find(|field| field.name == "acceleration_x")
+            .unwrap();
+        assert_eq!(acceleration_x.display.fixed_point_q, Some(8));
+        assert_eq!(acceleration_x.display.unit.as_deref(), Some("m/s^2"));
     }
 
     #[test]
@@ -1527,6 +1558,18 @@ mod tests {
             error.message(),
             "mask is only valid on unsigned integer fields"
         );
+    }
+
+    #[test]
+    fn rejects_fixed_point_q_larger_than_supported_integer_width() {
+        let source = replace_once(
+            &normalized_example(),
+            "          unit: rpm",
+            "          unit: rpm\n          fixed_point_q: 32",
+        );
+        let error = load_protocol_schema(&source).unwrap_err();
+        assert_eq!(error.path(), "messages[0].fields[4].display.fixed_point_q");
+        assert_eq!(error.message(), "fixed_point_q must not exceed 31");
     }
 
     #[test]
