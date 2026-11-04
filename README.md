@@ -49,6 +49,8 @@ The repository contains a working vertical slice of the new capture engine:
 - typed logic, oscilloscope, and signed 8-bit complex IQ sample batches;
 - a receive-only HackRF One adapter with runtime-loaded `libhackrf`, bounded IQ
   streaming, stable serial selection, and validated RF settings;
+- device-independent RF channelization and incremental binary FSK demodulation
+  with source-sample ranges preserved across arbitrary IQ batch boundaries;
 - coordinated cancellation and worker cleanup;
 - simulated instruments and a CLI demonstrating simultaneous capture;
 - capture support for the complete upstream DSLogic profile matrix, including

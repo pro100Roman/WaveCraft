@@ -1,9 +1,38 @@
 //! Device-independent signal processing for radio IQ captures.
 
+mod channelizer;
+mod fsk;
+
+pub use channelizer::{ChannelizedBatch, Channelizer, ChannelizerConfig, TimedComplexSample};
+pub use fsk::{FskConfig, FskDemodulator, FskPolarity, TimedSoftBit};
+
 use std::collections::VecDeque;
+use std::error::Error;
 use std::f64::consts::TAU;
+use std::fmt::{Display, Formatter};
 use std::ops::Range;
 use wavecraft_core::IqBatch;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DspError {
+    message: String,
+}
+
+impl DspError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl Display for DspError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+impl Error for DspError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SpectrumWindow {
