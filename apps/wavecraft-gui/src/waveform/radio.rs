@@ -6,6 +6,10 @@ const DEFAULT_WATERFALL_CAPACITY: usize = 256;
 const MAX_WATERFALL_TEXTURE_WIDTH: usize = 512;
 const MIN_POWER_DBFS: f32 = -120.0;
 const MAX_POWER_DBFS: f32 = 0.0;
+const NARROW_FREQUENCY_LABEL_DIVISIONS: &[u8] = &[0, 5, 10];
+const COMPACT_FREQUENCY_LABEL_DIVISIONS: &[u8] = &[0, 2, 5, 8, 10];
+const MEDIUM_FREQUENCY_LABEL_DIVISIONS: &[u8] = &[0, 2, 4, 5, 6, 8, 10];
+const DENSE_FREQUENCY_LABEL_DIVISIONS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 /// Bounded derived state for the RF spectrum and waterfall views.
 #[derive(Debug)]
@@ -243,16 +247,15 @@ fn paint_spectrum(ui: &egui::Ui, rect: Rect, spectrum: Option<&SpectrumFrame>) {
 
     let span_hz = spectrum.bin_width_hz * spectrum.power_dbfs.len() as f64;
     let low_hz = spectrum.center_frequency_hz as f64 - span_hz / 2.0;
-    let high_hz = spectrum.center_frequency_hz as f64 + span_hz / 2.0;
-    for (x, frequency, alignment) in [
-        (plot.left(), low_hz, egui::Align2::LEFT_TOP),
-        (
-            plot.center().x,
-            spectrum.center_frequency_hz as f64,
-            egui::Align2::CENTER_TOP,
-        ),
-        (plot.right(), high_hz, egui::Align2::RIGHT_TOP),
-    ] {
+    for &division in spectrum_frequency_label_divisions(plot.width()) {
+        let fraction = f32::from(division) / 10.0;
+        let x = egui::lerp(plot.x_range(), fraction);
+        let frequency = low_hz + span_hz * f64::from(division) / 10.0;
+        let alignment = match division {
+            0 => egui::Align2::LEFT_TOP,
+            10 => egui::Align2::RIGHT_TOP,
+            _ => egui::Align2::CENTER_TOP,
+        };
         ui.painter().text(
             Pos2::new(x, plot.bottom() + 5.0),
             alignment,
@@ -260,6 +263,18 @@ fn paint_spectrum(ui: &egui::Ui, rect: Rect, spectrum: Option<&SpectrumFrame>) {
             FontId::monospace(10.0),
             Color32::from_rgb(120, 140, 160),
         );
+    }
+}
+
+fn spectrum_frequency_label_divisions(plot_width: f32) -> &'static [u8] {
+    if plot_width >= 900.0 {
+        DENSE_FREQUENCY_LABEL_DIVISIONS
+    } else if plot_width >= 700.0 {
+        MEDIUM_FREQUENCY_LABEL_DIVISIONS
+    } else if plot_width >= 420.0 {
+        COMPACT_FREQUENCY_LABEL_DIVISIONS
+    } else {
+        NARROW_FREQUENCY_LABEL_DIVISIONS
     }
 }
 
@@ -385,5 +400,19 @@ mod tests {
     fn waterfall_color_clamps_outside_the_display_range() {
         assert_eq!(waterfall_color(-200.0), Color32::from_rgb(3, 6, 16));
         assert_eq!(waterfall_color(20.0), Color32::from_rgb(255, 65, 32));
+    }
+
+    #[test]
+    fn spectrum_frequency_labels_expand_with_available_width() {
+        assert_eq!(spectrum_frequency_label_divisions(300.0), &[0, 5, 10]);
+        assert_eq!(spectrum_frequency_label_divisions(500.0), &[0, 2, 5, 8, 10]);
+        assert_eq!(
+            spectrum_frequency_label_divisions(750.0),
+            &[0, 2, 4, 5, 6, 8, 10]
+        );
+        assert_eq!(
+            spectrum_frequency_label_divisions(1_000.0),
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        );
     }
 }
