@@ -216,8 +216,8 @@ Settings have two levels:
 ```rust
 pub enum RadioBackendSettings {
     HackRf(HackRfSettings),
-    LimeSdr(LimeSdrSettings),
-    AntSdr(AntSdrSettings),
+    LimeSdrUsb(LimeSdrUsbSettings),
+    AntSdrE200(AntSdrE200Settings),
 }
 ```
 

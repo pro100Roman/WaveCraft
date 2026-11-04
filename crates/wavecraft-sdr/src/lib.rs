@@ -6,9 +6,17 @@ use wavecraft_core::{CaptureError, CaptureSource, DeviceDescriptor, InstrumentKi
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RadioProvider {
     Simulator,
+    HackRf,
+    LimeSuiteNg,
+    Libiio,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RadioModel {
+    Simulated,
     HackRfOne,
-    LimeSdr,
-    AntSdr,
+    LimeSdrUsbTypeA,
+    AntSdrE200,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -99,31 +107,32 @@ pub struct HackRfSettings {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct LimeSdrSettings {
+pub struct LimeSdrUsbSettings {
     pub antenna: Option<String>,
     pub gain_db: Option<i32>,
     pub external_clock_hz: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AntSdrSettings {
+pub struct AntSdrE200Settings {
     pub antenna: Option<String>,
     pub gain_db: Option<i32>,
-    pub transport_hint: Option<String>,
+    pub iio_uri: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RadioProviderSettings {
     Simulator,
     HackRf(HackRfSettings),
-    LimeSdr(LimeSdrSettings),
-    AntSdr(AntSdrSettings),
+    LimeSdrUsb(LimeSdrUsbSettings),
+    AntSdrE200(AntSdrE200Settings),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredRadio {
     pub descriptor: DeviceDescriptor,
     pub provider: RadioProvider,
+    pub model: RadioModel,
     pub connection_backend: ConnectionBackend,
     pub persistent_id: Option<String>,
     pub capabilities: RadioCapabilities,
@@ -139,6 +148,31 @@ impl DiscoveredRadio {
         if self.capabilities.receive_channels == 0 {
             return Err(CaptureError::new(
                 "SDR discovery returned no receive channels",
+            ));
+        }
+        let identity_is_consistent = matches!(
+            (self.provider, self.model, self.connection_backend),
+            (
+                RadioProvider::Simulator,
+                RadioModel::Simulated,
+                ConnectionBackend::Simulator
+            ) | (
+                RadioProvider::HackRf,
+                RadioModel::HackRfOne,
+                ConnectionBackend::Usb
+            ) | (
+                RadioProvider::LimeSuiteNg,
+                RadioModel::LimeSdrUsbTypeA,
+                ConnectionBackend::Usb
+            ) | (
+                RadioProvider::Libiio,
+                RadioModel::AntSdrE200,
+                ConnectionBackend::Network
+            )
+        );
+        if !identity_is_consistent {
+            return Err(CaptureError::new(
+                "SDR provider, model, and connection backend are inconsistent",
             ));
         }
         Ok(())
@@ -208,12 +242,12 @@ mod tests {
     fn all_planned_physical_providers_have_distinct_settings() {
         let settings = [
             RadioProviderSettings::HackRf(HackRfSettings::default()),
-            RadioProviderSettings::LimeSdr(LimeSdrSettings::default()),
-            RadioProviderSettings::AntSdr(AntSdrSettings::default()),
+            RadioProviderSettings::LimeSdrUsb(LimeSdrUsbSettings::default()),
+            RadioProviderSettings::AntSdrE200(AntSdrE200Settings::default()),
         ];
         assert_eq!(settings.len(), 3);
-        assert_ne!(RadioProvider::HackRfOne, RadioProvider::LimeSdr);
-        assert_ne!(RadioProvider::LimeSdr, RadioProvider::AntSdr);
+        assert_ne!(RadioModel::HackRfOne, RadioModel::LimeSdrUsbTypeA);
+        assert_ne!(RadioModel::LimeSdrUsbTypeA, RadioModel::AntSdrE200);
     }
 
     #[test]
@@ -225,6 +259,7 @@ mod tests {
                 kind: InstrumentKind::RadioReceiver,
             },
             provider: RadioProvider::Simulator,
+            model: RadioModel::Simulated,
             connection_backend: ConnectionBackend::Simulator,
             persistent_id: Some("radio".to_owned()),
             capabilities: capabilities(),
@@ -239,5 +274,38 @@ mod tests {
             ..radio
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn selected_physical_models_use_their_required_host_transports() {
+        let descriptor = DeviceDescriptor {
+            id: DeviceId::new("physical-radio"),
+            name: "Physical radio".to_owned(),
+            kind: InstrumentKind::RadioReceiver,
+        };
+        let lime = DiscoveredRadio {
+            descriptor: descriptor.clone(),
+            provider: RadioProvider::LimeSuiteNg,
+            model: RadioModel::LimeSdrUsbTypeA,
+            connection_backend: ConnectionBackend::Usb,
+            persistent_id: None,
+            capabilities: capabilities(),
+        };
+        let antsdr = DiscoveredRadio {
+            descriptor,
+            provider: RadioProvider::Libiio,
+            model: RadioModel::AntSdrE200,
+            connection_backend: ConnectionBackend::Network,
+            persistent_id: None,
+            capabilities: capabilities(),
+        };
+
+        assert!(lime.validate().is_ok());
+        assert!(antsdr.validate().is_ok());
+        let invalid_antsdr = DiscoveredRadio {
+            connection_backend: ConnectionBackend::Usb,
+            ..antsdr
+        };
+        assert!(invalid_antsdr.validate().is_err());
     }
 }
