@@ -320,6 +320,8 @@ acquire synchronization. Once synchronized, every low-confidence bit is counted
 in its byte; a completed message above the limit is rejected instead of being
 shown as valid RAW data. The view reports the cumulative rejected-message count.
 Both settings are stored in recording metadata for reproducible offline decode.
+Minimum bit confidence defaults to zero, which disables confidence filtering
+until the operator explicitly enables it for a measured signal.
 
 The RF view labels this modulation-neutral output pane **RAW DATA**. Horizontal
 drag handles make the RF SPECTRUM, WATERFALL, and RAW DATA heights adjustable.

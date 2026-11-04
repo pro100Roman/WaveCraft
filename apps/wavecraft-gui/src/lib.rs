@@ -3200,7 +3200,7 @@ impl Default for RadioAnalyzerSettings {
             max_clock_error_ppm: 10_000,
             preamble_byte: 0xaa,
             preamble_bytes: 4,
-            minimum_bit_confidence_milli: 500,
+            minimum_bit_confidence_milli: 0,
             maximum_uncertain_bits: 0,
         }
     }
@@ -8436,7 +8436,7 @@ fn paint_radio_analyzer_configuration(
             paint_radio_parameter_label(
                 ui,
                 "Minimum bit confidence",
-                Some("Bits below this 0-to-1 demodulator confidence count as uncertain"),
+                Some("Bits below this 0-to-1 demodulator confidence count as uncertain; zero disables confidence filtering"),
             );
             ui.add_enabled_ui(controls_enabled, |ui| {
                 let mut confidence =
@@ -17122,6 +17122,8 @@ mod tests {
         );
         assert_eq!(settings.analyzer.symbol_rate_hz, 19_200);
         assert_eq!(settings.analyzer.deviation_hz, 35_000);
+        assert_eq!(settings.analyzer.minimum_bit_confidence_milli, 0);
+        assert_eq!(settings.analyzer.maximum_uncertain_bits, 0);
         assert_eq!(settings.trigger_posttrigger_micros, 2_000);
         settings
             .capture
