@@ -7785,13 +7785,19 @@ fn paint_radio_receive_configuration(
                     .or_insert(control.default_db);
                 let slider_response = ui
                     .add_enabled_ui(tuning_enabled, |ui| {
-                        ui.scope(|ui| {
-                            ui.spacing_mut().slider_width = RADIO_VALUE_WIDTH;
-                            ui.add(
-                                egui::Slider::new(value, control.range_db.clone())
-                                    .step_by(f64::from(control.step_db.max(1)))
-                                    .show_value(false),
-                            )
+                        ui.horizontal(|ui| {
+                            let response = ui
+                                .scope(|ui| {
+                                    ui.spacing_mut().slider_width = RADIO_VALUE_WIDTH;
+                                    ui.add(
+                                        egui::Slider::new(value, control.range_db.clone())
+                                            .step_by(f64::from(control.step_db.max(1)))
+                                            .show_value(false),
+                                    )
+                                })
+                                .inner;
+                            ui.label("dB");
+                            response
                         })
                         .inner
                     })
