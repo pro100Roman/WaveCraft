@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use wavecraft_dsp::SpectrumFrame;
 
+const DEFAULT_WATERFALL_CAPACITY: usize = 256;
+
 /// Bounded derived state for the RF spectrum and waterfall views.
 #[derive(Debug)]
 pub struct RadioDisplayStore {
@@ -8,6 +10,17 @@ pub struct RadioDisplayStore {
     waterfall: VecDeque<SpectrumFrame>,
     waterfall_capacity: usize,
     dropped_rows: u64,
+}
+
+impl Default for RadioDisplayStore {
+    fn default() -> Self {
+        Self {
+            newest_spectrum: None,
+            waterfall: VecDeque::with_capacity(DEFAULT_WATERFALL_CAPACITY),
+            waterfall_capacity: DEFAULT_WATERFALL_CAPACITY,
+            dropped_rows: 0,
+        }
+    }
 }
 
 impl RadioDisplayStore {

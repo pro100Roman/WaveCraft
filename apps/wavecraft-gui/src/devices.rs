@@ -92,6 +92,7 @@ pub(crate) fn capture_devices_for_target(
         CaptureTarget::LogicAnalyzer => Ok(vec![logic()?]),
         CaptureTarget::Oscilloscope => Ok(vec![scope()?]),
         CaptureTarget::Combined => Ok(vec![logic()?, scope()?]),
+        CaptureTarget::RadioReceiver => Ok(Vec::new()),
     }
 }
 

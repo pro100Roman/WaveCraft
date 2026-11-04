@@ -47,14 +47,16 @@ use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
 };
+use wavecraft_dsp::{SpectrumProcessor, SpectrumWindow};
 use wavecraft_hackrf::HackRfAdapter;
 use wavecraft_recording::{
     read_saleae, write_saleae, CompletionStatus, RecordingReader, RecordingWriter,
     SaleaeAnalogChannel, SaleaeCapture, SaleaeChannel, SaleaeDigitalCapture,
 };
 use wavecraft_sdr::{
-    DiscoveredRadio, RadioCapabilities, RadioCaptureSettings, RadioDiscoveryReport, RadioProvider,
-    RadioProviderFailure, RadioRegistry, ValueDomain,
+    DiscoveredRadio, HackRfSettings, RadioCapabilities, RadioCaptureSettings, RadioDiscoveryReport,
+    RadioProvider, RadioProviderAdapter, RadioProviderFailure, RadioProviderSettings,
+    RadioRegistry, ValueDomain,
 };
 use wavecraft_usb::{
     apply_dscope_configuration, auto_calibrate_dscope_with_progress, discover_supported_devices,
@@ -73,11 +75,13 @@ use wavecraft_usb::{
     DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_ALIGNMENT,
     DSLOGIC_SAMPLE_RATES_HZ, DSLOGIC_TRIGGER_STAGE_COUNT, REQUIRED_RESOURCE_FILES,
 };
+use waveform::radio::RadioDisplayStore;
 
 const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
 const BUILD_VERSION_LABEL: &str = concat!("Version: ", env!("WAVECRAFT_BUILD_VERSION"));
 const LOGIC_CHANNEL_COUNT: usize = 16;
+const RADIO_SPECTRUM_FFT_LENGTH: usize = 2_048;
 // Bound logic display storage by activity-preserving buckets. The bucket stride
 // expands to cover the configured finite or Loop duration without limiting the
 // decoder, recorder, or zoom-out domain to this in-memory bucket count.
@@ -1324,6 +1328,7 @@ fn capture_settings_tabs_for_view(
         Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
             capture_settings_tabs(false, scope_available)
         }
+        Some(WaveformTab::RadioReceiver) => Vec::new(),
         Some(WaveformTab::Combined) | None => {
             capture_settings_tabs(logic_available, scope_available)
         }
@@ -1334,6 +1339,7 @@ fn capture_settings_tabs_for_view(
 enum CaptureTarget {
     LogicAnalyzer,
     Oscilloscope,
+    RadioReceiver,
     Combined,
 }
 
@@ -1342,14 +1348,21 @@ impl CaptureTarget {
         match self {
             Self::LogicAnalyzer => "Logic Analyzer",
             Self::Oscilloscope => "Oscilloscope",
+            Self::RadioReceiver => "Radio Receiver",
             Self::Combined => "Combined",
         }
     }
 
-    fn is_available(self, has_logic_analyzer: bool, has_oscilloscope: bool) -> bool {
+    fn is_available(
+        self,
+        has_logic_analyzer: bool,
+        has_oscilloscope: bool,
+        has_radio_receiver: bool,
+    ) -> bool {
         match self {
             Self::LogicAnalyzer => has_logic_analyzer,
             Self::Oscilloscope => has_oscilloscope,
+            Self::RadioReceiver => has_radio_receiver,
             Self::Combined => has_logic_analyzer && has_oscilloscope,
         }
     }
@@ -1368,6 +1381,7 @@ enum WaveformTab {
     LogicAnalyzer,
     Oscilloscope,
     Lissajous,
+    RadioReceiver,
     Combined,
 }
 
@@ -1377,6 +1391,7 @@ impl WaveformTab {
             Self::LogicAnalyzer => "Logic Analyzer",
             Self::Oscilloscope => "Oscilloscope",
             Self::Lissajous => "Lissajous",
+            Self::RadioReceiver => "RF Spectrum",
             Self::Combined => "Combined",
         }
     }
@@ -1385,6 +1400,7 @@ impl WaveformTab {
         match self {
             Self::LogicAnalyzer => CaptureTarget::LogicAnalyzer,
             Self::Oscilloscope | Self::Lissajous => CaptureTarget::Oscilloscope,
+            Self::RadioReceiver => CaptureTarget::RadioReceiver,
             Self::Combined => CaptureTarget::Combined,
         }
     }
@@ -1393,7 +1409,7 @@ impl WaveformTab {
         match self {
             Self::LogicAnalyzer => Some(CaptureSettingsTab::DsLogic),
             Self::Oscilloscope | Self::Lissajous => Some(CaptureSettingsTab::DsCope),
-            Self::Combined => None,
+            Self::RadioReceiver | Self::Combined => None,
         }
     }
 }
@@ -1401,9 +1417,10 @@ impl WaveformTab {
 fn waveform_tabs(
     has_logic_analyzer: bool,
     has_oscilloscope: bool,
+    has_radio_receiver: bool,
     show_lissajous: bool,
 ) -> Vec<WaveformTab> {
-    let mut tabs = Vec::with_capacity(4);
+    let mut tabs = Vec::with_capacity(5);
     if has_logic_analyzer {
         tabs.push(WaveformTab::LogicAnalyzer);
     }
@@ -1412,6 +1429,9 @@ fn waveform_tabs(
     }
     if has_oscilloscope && show_lissajous {
         tabs.push(WaveformTab::Lissajous);
+    }
+    if has_radio_receiver {
+        tabs.push(WaveformTab::RadioReceiver);
     }
     if has_logic_analyzer && has_oscilloscope {
         tabs.push(WaveformTab::Combined);
@@ -1658,6 +1678,7 @@ struct WaveformStore {
     scope_capacity: usize,
     scope_rolling: bool,
     scope_revision: u64,
+    radio: RadioDisplayStore,
 }
 
 impl Default for WaveformStore {
@@ -1681,6 +1702,7 @@ impl Default for WaveformStore {
             scope_capacity: MAX_WAVEFORM_SAMPLES,
             scope_rolling: false,
             scope_revision: 0,
+            radio: RadioDisplayStore::default(),
         }
     }
 }
@@ -2867,10 +2889,12 @@ struct ActiveCapture {
     stopped: HashSet<DeviceId>,
     waveforms: WaveformStore,
     protocol_decode: ProtocolCaptureDecoder,
+    radio_spectrum: SpectrumProcessor,
     recorder: Option<FileRecorder>,
     recording_path: Option<PathBuf>,
     has_logic: bool,
     has_scope: bool,
+    has_radio: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2884,6 +2908,7 @@ struct CompletedCapture {
     protocol_decode: ProtocolCaptureDecoder,
     has_logic: bool,
     has_scope: bool,
+    has_radio: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2922,9 +2947,16 @@ struct LoadedRecording {
     capture: CompletedCapture,
     logic_settings: Option<LogicCaptureSettings>,
     scope_settings: Option<ScopeCaptureSettings>,
+    radio_settings: Option<RadioSettings>,
     logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
     scope_channel_names: [String; 2],
     completion: CompletionStatus,
+}
+
+struct RadioCaptureRequest {
+    device: DiscoveredRadio,
+    settings: RadioCaptureSettings,
+    provider_settings: RadioProviderSettings,
 }
 
 #[derive(Clone)]
@@ -3048,6 +3080,7 @@ enum WorkerSuccess {
         scope_config: DsCopeCaptureConfig,
         scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
         scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
+        radio_spectrum: Box<SpectrumProcessor>,
     },
     ScopeConfigured,
     ScopeAutoCalibrated(DsCopeCalibrationValues),
@@ -3129,6 +3162,7 @@ struct WaveCraftApp {
     scope_sessions: SessionTabs<CompletedCapture, ScopeSessionSettings>,
     session_name_editor: Option<SessionNameEditor>,
     combined_capture: Option<CompletedCapture>,
+    radio_capture: Option<CompletedCapture>,
     combined_settings: CombinedSessionSettings,
     status: String,
     last_error: Option<String>,
@@ -3207,6 +3241,7 @@ impl WaveCraftApp {
             scope_sessions: SessionTabs::new(ScopeSessionSettings::default()),
             session_name_editor: None,
             combined_capture: None,
+            radio_capture: None,
             combined_settings: CombinedSessionSettings {
                 logic_ratio: 0.55,
                 ..CombinedSessionSettings::default()
@@ -3391,6 +3426,35 @@ impl WaveCraftApp {
         normalize_radio_settings(&mut self.radio_settings, &radio.capabilities);
     }
 
+    fn radio_capture_request(&self, mode: AcquisitionMode) -> Result<RadioCaptureRequest, String> {
+        let device = selected_radio(&self.radios, self.selected_radio_id.as_deref())
+            .cloned()
+            .ok_or_else(|| "Select a connected radio receiver in Capture Setup".to_owned())?;
+        let mut settings = self.radio_settings.capture.clone();
+        settings.sample_limit =
+            (mode == AcquisitionMode::Single).then_some(settings.sample_rate_hz);
+        settings
+            .validate(&device.capabilities)
+            .map_err(|error| error.to_string())?;
+        let provider_settings = match device.provider {
+            RadioProvider::HackRf => RadioProviderSettings::HackRf(HackRfSettings {
+                lna_gain_db: radio_gain_u32(&self.radio_settings, "lna")?,
+                vga_gain_db: radio_gain_u32(&self.radio_settings, "vga")?,
+                amplifier_enabled: self.radio_settings.amplifier_enabled,
+            }),
+            provider => {
+                return Err(format!(
+                    "capture is not implemented for the {provider:?} radio provider"
+                ));
+            }
+        };
+        Ok(RadioCaptureRequest {
+            device,
+            settings,
+            provider_settings,
+        })
+    }
+
     fn begin_capture(&mut self, mode: AcquisitionMode, target: CaptureTarget) {
         if self.pending.is_some() || self.capture.is_some() {
             return;
@@ -3421,6 +3485,20 @@ impl WaveCraftApp {
                 self.last_error = Some(error);
                 return;
             }
+        };
+        let radio_request = if target == CaptureTarget::RadioReceiver {
+            match self.radio_capture_request(mode) {
+                Ok(request) => Some(request),
+                Err(error) => {
+                    self.capture_run_requested = false;
+                    self.requested_capture_target = None;
+                    self.record_capture = false;
+                    self.last_error = Some(error);
+                    return;
+                }
+            }
+        } else {
+            None
         };
         if self.record_capture && self.recording_path.trim().is_empty() {
             self.capture_run_requested = false;
@@ -3503,6 +3581,7 @@ impl WaveCraftApp {
         thread::spawn(move || {
             let result = start_capture(
                 devices,
+                radio_request,
                 &resource_directory,
                 logic_config,
                 scope_config,
@@ -3517,6 +3596,7 @@ impl WaveCraftApp {
                 scope_config,
                 scope_trigger_controls: started.scope_trigger_controls,
                 scope_calibration_controls: started.scope_calibration_controls,
+                radio_spectrum: Box::new(started.radio_spectrum),
             });
             let _ = sender.send(result);
         });
@@ -3759,6 +3839,7 @@ impl WaveCraftApp {
         }
         let has_logic = active.has_logic;
         let has_scope = active.has_scope;
+        let has_radio = active.has_radio;
         active.protocol_decode.finish();
         if !active.preserve_display_until_complete {
             self.set_completed_capture_for_target(
@@ -3768,6 +3849,7 @@ impl WaveCraftApp {
                     protocol_decode: active.protocol_decode,
                     has_logic,
                     has_scope,
+                    has_radio,
                 },
             );
         }
@@ -3824,6 +3906,7 @@ impl WaveCraftApp {
                 mut scope_config,
                 scope_trigger_controls,
                 scope_calibration_controls,
+                radio_spectrum,
             }) => {
                 let logic_config = *logic_config;
                 if !self.capture_run_requested {
@@ -3902,6 +3985,7 @@ impl WaveCraftApp {
                                 logic_settings: self.logic_settings,
                                 scope_config,
                                 scope_settings: self.scope_settings,
+                                radio_settings: &self.radio_settings,
                                 logic_channel_names: &self.logic_channel_names,
                                 scope_channel_names: &self.scope_channel_names,
                             },
@@ -3929,6 +4013,10 @@ impl WaveCraftApp {
                     .descriptors()
                     .iter()
                     .any(|device| device.kind == InstrumentKind::Oscilloscope);
+                let has_radio = session
+                    .descriptors()
+                    .iter()
+                    .any(|device| device.kind == InstrumentKind::RadioReceiver);
                 let has_scope_trigger = !scope_trigger_controls.is_empty();
                 let has_logic_trigger = has_logic && logic_config.trigger().is_some();
                 let rolling =
@@ -3960,7 +4048,8 @@ impl WaveCraftApp {
                     mode == AcquisitionMode::Run || mode == AcquisitionMode::Repetitive;
                 let preserve_display_until_complete = preserve_display_until_complete
                     && self.completed_capture_for_target(target).is_some()
-                    && !continue_roll;
+                    && !continue_roll
+                    && target != CaptureTarget::RadioReceiver;
                 let prior_protocol_history = retain_protocol_history
                     .then(|| self.completed_capture_for_target(target))
                     .flatten()
@@ -3999,10 +4088,12 @@ impl WaveCraftApp {
                     stopped: HashSet::new(),
                     waveforms,
                     protocol_decode,
+                    radio_spectrum: *radio_spectrum,
                     recorder,
                     recording_path: recording_path.clone(),
                     has_logic,
                     has_scope,
+                    has_radio,
                 });
                 self.status = match (mode, recording_path) {
                     (AcquisitionMode::Single, Some(path)) if has_logic_trigger => format!(
@@ -4062,6 +4153,7 @@ impl WaveCraftApp {
                     capture,
                     logic_settings,
                     scope_settings,
+                    radio_settings,
                     logic_channel_names,
                     scope_channel_names,
                     completion,
@@ -4073,11 +4165,15 @@ impl WaveCraftApp {
                     self.scope_settings = scope_settings;
                     self.scope_auto_sample_rate = false;
                 }
-                let target = match (capture.has_logic, capture.has_scope) {
-                    (true, true) => CaptureTarget::Combined,
-                    (true, false) => CaptureTarget::LogicAnalyzer,
-                    (false, true) => CaptureTarget::Oscilloscope,
-                    (false, false) => unreachable!("loaded captures contain waveform data"),
+                if let Some(radio_settings) = radio_settings {
+                    self.radio_settings = radio_settings;
+                }
+                let target = match (capture.has_logic, capture.has_scope, capture.has_radio) {
+                    (true, true, false) => CaptureTarget::Combined,
+                    (true, false, false) => CaptureTarget::LogicAnalyzer,
+                    (false, true, false) => CaptureTarget::Oscilloscope,
+                    (false, false, true) => CaptureTarget::RadioReceiver,
+                    _ => unreachable!("recordings contain one supported capture target"),
                 };
                 self.set_completed_capture_for_target(target, capture);
                 self.logic_marker_settings.clear();
@@ -4100,6 +4196,9 @@ impl WaveCraftApp {
                         self.save_active_scope_session_settings();
                         self.active_waveform_tab = Some(WaveformTab::Oscilloscope);
                         self.active_capture_settings_tab = CaptureSettingsTab::DsCope;
+                    }
+                    CaptureTarget::RadioReceiver => {
+                        self.active_waveform_tab = Some(WaveformTab::RadioReceiver);
                     }
                     CaptureTarget::Combined => {
                         self.combined_settings = self.current_combined_session_settings();
@@ -4259,6 +4358,11 @@ impl WaveCraftApp {
                                         logic.sample_rate_hz,
                                     );
                                 }
+                                if let CaptureBatch::Iq(iq) = &frame.payload {
+                                    for spectrum in active.radio_spectrum.push(iq) {
+                                        active.waveforms.radio.ingest(spectrum);
+                                    }
+                                }
                                 let enabled_scope_channels = active
                                     .scope_config
                                     .channels()
@@ -4315,6 +4419,7 @@ impl WaveCraftApp {
                 let recording_path = active.recording_path.take();
                 let has_logic = active.has_logic;
                 let has_scope = active.has_scope;
+                let has_radio = active.has_radio;
                 let restart_for_frontend =
                     self.scope_capture_restart_requested && self.capture_run_requested;
                 self.scope_capture_restart_requested = false;
@@ -4350,6 +4455,7 @@ impl WaveCraftApp {
                             protocol_decode: active.protocol_decode,
                             has_logic,
                             has_scope,
+                            has_radio,
                         },
                     );
                 }
@@ -4433,6 +4539,7 @@ impl WaveCraftApp {
         match target {
             CaptureTarget::LogicAnalyzer => self.logic_sessions.active_capture(),
             CaptureTarget::Oscilloscope => self.scope_sessions.active_capture(),
+            CaptureTarget::RadioReceiver => self.radio_capture.as_ref(),
             CaptureTarget::Combined => self.combined_capture.as_ref(),
         }
     }
@@ -4443,19 +4550,22 @@ impl WaveCraftApp {
             Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
                 self.scope_sessions.active_capture()
             }
+            Some(WaveformTab::RadioReceiver) => self.radio_capture.as_ref(),
             Some(WaveformTab::Combined) => self.combined_capture.as_ref(),
             None => None,
         }
     }
 
     fn has_displayed_completed_capture(&self) -> bool {
-        self.displayed_completed_capture().is_some()
+        self.displayed_completed_capture()
+            .is_some_and(|capture| capture.has_logic || capture.has_scope)
     }
 
     fn clear_completed_capture_for_target(&mut self, target: CaptureTarget) {
         match target {
             CaptureTarget::LogicAnalyzer => self.logic_sessions.clear_active(),
             CaptureTarget::Oscilloscope => self.scope_sessions.clear_active(),
+            CaptureTarget::RadioReceiver => self.radio_capture = None,
             CaptureTarget::Combined => self.combined_capture = None,
         }
     }
@@ -4467,6 +4577,7 @@ impl WaveCraftApp {
         match target {
             CaptureTarget::LogicAnalyzer => self.logic_sessions.take_active(),
             CaptureTarget::Oscilloscope => self.scope_sessions.take_active(),
+            CaptureTarget::RadioReceiver => self.radio_capture.take(),
             CaptureTarget::Combined => self.combined_capture.take(),
         }
     }
@@ -4479,6 +4590,7 @@ impl WaveCraftApp {
         match target {
             CaptureTarget::LogicAnalyzer => self.logic_sessions.replace_active(capture),
             CaptureTarget::Oscilloscope => self.scope_sessions.replace_active(capture),
+            CaptureTarget::RadioReceiver => self.radio_capture = Some(capture),
             CaptureTarget::Combined => self.combined_capture = Some(capture),
         }
     }
@@ -4584,6 +4696,7 @@ impl WaveCraftApp {
             WaveformTab::Oscilloscope | WaveformTab::Lissajous => {
                 self.save_active_scope_session_settings();
             }
+            WaveformTab::RadioReceiver => {}
             WaveformTab::Combined => {
                 self.combined_settings = self.current_combined_session_settings();
             }
@@ -4600,6 +4713,7 @@ impl WaveCraftApp {
                 let settings = self.scope_sessions.active_settings().clone();
                 self.apply_scope_session_settings(settings);
             }
+            WaveformTab::RadioReceiver => {}
             WaveformTab::Combined => {
                 self.apply_combined_session_settings(self.combined_settings.clone());
             }
@@ -4613,6 +4727,7 @@ impl WaveCraftApp {
         self.scope_sessions.reset(scope_settings);
         self.session_name_editor = None;
         self.combined_capture = None;
+        self.radio_capture = None;
     }
 
     fn set_error(&mut self, error: String) {
@@ -4649,6 +4764,14 @@ impl WaveCraftApp {
                 .combined_capture
                 .as_ref()
                 .is_some_and(|capture| capture.has_scope);
+        let displayed_radio = self
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.has_radio)
+            || self
+                .radio_capture
+                .as_ref()
+                .is_some_and(|capture| capture.has_radio);
         let has_logic_analyzer = displayed_logic
             || self
                 .devices
@@ -4659,9 +4782,11 @@ impl WaveCraftApp {
                 .devices
                 .iter()
                 .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100);
+        let has_radio_receiver = displayed_radio || !self.radios.is_empty();
         waveform_tabs(
             has_logic_analyzer,
             has_oscilloscope,
+            has_radio_receiver,
             self.scope_function_settings.lissajous.enabled,
         )
     }
@@ -7359,6 +7484,17 @@ fn normalize_radio_settings(settings: &mut RadioSettings, capabilities: &RadioCa
     }
 }
 
+fn radio_gain_u32(settings: &RadioSettings, id: &str) -> Result<Option<u32>, String> {
+    settings
+        .gains_db
+        .get(id)
+        .copied()
+        .map(|value| {
+            u32::try_from(value).map_err(|_| format!("radio gain {id} cannot be negative"))
+        })
+        .transpose()
+}
+
 fn normalize_gain_value(value: i32, minimum: i32, maximum: i32, step: u32) -> i32 {
     let clamped = value.clamp(minimum, maximum);
     let step = i64::from(step);
@@ -7502,25 +7638,7 @@ fn paint_radio_settings(
     failures: &[RadioProviderFailure],
     enabled: bool,
 ) -> bool {
-    let before = selected_id.clone();
-    let choices = radios
-        .iter()
-        .map(|radio| {
-            let id = radio.descriptor.id.as_str().to_owned();
-            (id.clone(), format!("{} · {id}", radio.descriptor.name))
-        })
-        .collect::<Vec<_>>();
-    ui.add_enabled_ui(enabled && !choices.is_empty(), |ui| {
-        egui::ComboBox::from_id_salt("radio_device_selector")
-            .width(ui.available_width())
-            .selected_text(selected_radio_text(radios, selected_id.as_deref()))
-            .show_ui(ui, |ui| {
-                for (id, text) in choices {
-                    ui.selectable_value(selected_id, Some(id), text);
-                }
-            });
-    });
-
+    let changed = paint_radio_device_selector(ui, radios, selected_id, enabled);
     for radio in radios {
         ui.add_space(4.0);
         egui::Frame::none()
@@ -7552,6 +7670,33 @@ fn paint_radio_settings(
             .color(Color32::LIGHT_RED),
         );
     }
+    changed
+}
+
+fn paint_radio_device_selector(
+    ui: &mut egui::Ui,
+    radios: &[DiscoveredRadio],
+    selected_id: &mut Option<String>,
+    enabled: bool,
+) -> bool {
+    let before = selected_id.clone();
+    let choices = radios
+        .iter()
+        .map(|radio| {
+            let id = radio.descriptor.id.as_str().to_owned();
+            (id.clone(), format!("{} · {id}", radio.descriptor.name))
+        })
+        .collect::<Vec<_>>();
+    ui.add_enabled_ui(enabled && !choices.is_empty(), |ui| {
+        egui::ComboBox::from_id_salt("radio_device_selector")
+            .width(ui.available_width())
+            .selected_text(selected_radio_text(radios, selected_id.as_deref()))
+            .show_ui(ui, |ui| {
+                for (id, text) in choices {
+                    ui.selectable_value(selected_id, Some(id), text);
+                }
+            });
+    });
     before != *selected_id
 }
 
@@ -7658,6 +7803,7 @@ fn paint_capture_device_selectors(
                 enabled,
             );
         }
+        Some(WaveformTab::RadioReceiver) => {}
         None => {}
     }
     (logic_changed, scope_changed)
@@ -7751,8 +7897,14 @@ impl eframe::App for WaveCraftApp {
             })
             .unwrap_or(UsbSpeedClass::HighSpeed);
         let selected_scope_device = self.selected_scope_device_ref().is_some();
+        let selected_radio_device =
+            selected_radio(&self.radios, self.selected_radio_id.as_deref()).is_some();
         let control_target_available = control_target.is_some_and(|target| {
-            target.is_available(selected_logic_device, selected_scope_device)
+            target.is_available(
+                selected_logic_device,
+                selected_scope_device,
+                selected_radio_device,
+            )
         });
         let scope_capture_requested = self.capture_run_requested
             && self
@@ -7804,7 +7956,7 @@ impl eframe::App for WaveCraftApp {
                         }
                     });
                     ui.separator();
-                    ui.label(RichText::new("USB capture workbench").color(TEXT_MUTED));
+                    ui.label(RichText::new("USB and SDR capture workbench").color(TEXT_MUTED));
                     ui.separator();
                     refresh_clicked = ui
                         .add_enabled(
@@ -7992,6 +8144,28 @@ impl eframe::App for WaveCraftApp {
                         );
                         logic_device_selection_changed |= logic_changed;
                         scope_device_selection_changed |= scope_changed;
+                        if self.active_waveform_tab == Some(WaveformTab::RadioReceiver) {
+                            radio_device_selection_changed |= paint_radio_device_selector(
+                                ui,
+                                &self.radios,
+                                &mut self.selected_radio_id,
+                                capture_settings_enabled,
+                            );
+                            if radio_device_selection_changed {
+                                self.reconcile_radio_settings();
+                            }
+                            if let Some(radio) =
+                                selected_radio(&self.radios, self.selected_radio_id.as_deref())
+                                    .cloned()
+                            {
+                                paint_radio_capture_settings(
+                                    ui,
+                                    &radio,
+                                    &mut self.radio_settings,
+                                    capture_settings_enabled,
+                                );
+                            }
+                        }
                         if self.active_waveform_tab.is_some() {
                             ui.add_space(12.0);
                         }
@@ -8007,14 +8181,16 @@ impl eframe::App for WaveCraftApp {
                             });
                             ui.add_space(6.0);
                         }
-                        if available_capture_settings_tabs.is_empty() {
+                        if available_capture_settings_tabs.is_empty()
+                            && self.active_waveform_tab != Some(WaveformTab::RadioReceiver)
+                        {
                             ui.label(
                                 RichText::new(
                                     "Connect a supported instrument to configure capture.",
                                 )
                                 .color(TEXT_MUTED),
                             );
-                        } else {
+                        } else if self.active_waveform_tab != Some(WaveformTab::RadioReceiver) {
                             paint_capture_settings(
                                 ui,
                                 self.active_capture_settings_tab,
@@ -8149,7 +8325,7 @@ impl eframe::App for WaveCraftApp {
                 self.scope_sessions.names(),
                 self.scope_sessions.active_index(),
             )),
-            Some(WaveformTab::Combined) | None => None,
+            Some(WaveformTab::RadioReceiver | WaveformTab::Combined) | None => None,
         };
         let mut session_tab_action = None;
         let mut session_name_commit = false;
@@ -8275,7 +8451,7 @@ impl eframe::App for WaveCraftApp {
                     CaptureTarget::Oscilloscope => {
                         self.scope_sessions.rename(editor.index, &editor.draft)
                     }
-                    CaptureTarget::Combined => false,
+                    CaptureTarget::RadioReceiver | CaptureTarget::Combined => false,
                 };
                 if renamed {
                     self.status = "Session renamed".to_owned();
@@ -8288,7 +8464,7 @@ impl eframe::App for WaveCraftApp {
                 SessionTabAction::Close(index) => match target {
                     CaptureTarget::LogicAnalyzer => self.logic_sessions.name(index),
                     CaptureTarget::Oscilloscope => self.scope_sessions.name(index),
-                    CaptureTarget::Combined => None,
+                    CaptureTarget::RadioReceiver | CaptureTarget::Combined => None,
                 }
                 .map(str::to_owned),
                 _ => None,
@@ -8377,7 +8553,9 @@ impl eframe::App for WaveCraftApp {
                         }
                     }
                 }
-                CaptureTarget::Combined => unreachable!("combined view has no session tabs"),
+                CaptureTarget::RadioReceiver | CaptureTarget::Combined => {
+                    unreachable!("radio and combined views have no session tabs")
+                }
             };
             if changed {
                 match action {
@@ -8389,8 +8567,8 @@ impl eframe::App for WaveCraftApp {
                             CaptureTarget::Oscilloscope => {
                                 self.scope_sessions.name(self.scope_sessions.active_index())
                             }
-                            CaptureTarget::Combined => {
-                                unreachable!("combined view has no session tabs")
+                            CaptureTarget::RadioReceiver | CaptureTarget::Combined => {
+                                unreachable!("radio and combined views have no session tabs")
                             }
                         }
                         .unwrap_or("session");
@@ -8774,6 +8952,34 @@ impl eframe::App for WaveCraftApp {
                                         channel_names: &self.scope_channel_names,
                                     },
                                 )
+                            },
+                        ));
+                    }
+                    Some(WaveformTab::RadioReceiver) => {
+                        let subtitle = waveforms.radio.newest_spectrum().map_or_else(
+                            || "Waiting for IQ samples".to_owned(),
+                            |spectrum| {
+                                format!(
+                                    "{} · {} FFT bins",
+                                    format_radio_value(spectrum.center_frequency_hz),
+                                    spectrum.power_dbfs.len()
+                                )
+                            },
+                        );
+                        let buffered_rows = waveforms.radio.waterfall().len();
+                        snapshot_plot_rect = Some(waveform_card_fill(
+                            ui,
+                            "RF SPECTRUM",
+                            &subtitle,
+                            |ui, rect| {
+                                ui.painter().rect_filled(rect, 0.0, BACKGROUND);
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{buffered_rows} spectrum frame(s) buffered"),
+                                    FontId::proportional(15.0),
+                                    TEXT_MUTED,
+                                );
                             },
                         ));
                     }
@@ -9378,6 +9584,7 @@ struct GuiRecordingSettings<'a> {
     logic_settings: LogicCaptureSettings,
     scope_config: DsCopeCaptureConfig,
     scope_settings: ScopeCaptureSettings,
+    radio_settings: &'a RadioSettings,
     logic_channel_names: &'a [String; LOGIC_CHANNEL_COUNT],
     scope_channel_names: &'a [String; 2],
 }
@@ -9392,6 +9599,7 @@ fn start_gui_recording(
         logic_settings,
         scope_config,
         scope_settings,
+        radio_settings,
         logic_channel_names,
         scope_channel_names,
     } = settings;
@@ -9407,6 +9615,29 @@ fn start_gui_recording(
         })?;
     let mut metadata = BTreeMap::new();
     metadata.insert("capture.command".to_owned(), "gui".to_owned());
+    metadata.insert(
+        "radio.center_frequency_hz".to_owned(),
+        radio_settings.capture.center_frequency_hz.to_string(),
+    );
+    metadata.insert(
+        "radio.sample_rate_hz".to_owned(),
+        radio_settings.capture.sample_rate_hz.to_string(),
+    );
+    metadata.insert(
+        "radio.bandwidth_hz".to_owned(),
+        radio_settings.capture.bandwidth_hz.to_string(),
+    );
+    metadata.insert(
+        "radio.receive_channel".to_owned(),
+        radio_settings.capture.receive_channel.to_string(),
+    );
+    metadata.insert(
+        "radio.amplifier_enabled".to_owned(),
+        radio_settings.amplifier_enabled.to_string(),
+    );
+    for (id, gain_db) in &radio_settings.gains_db {
+        metadata.insert(format!("radio.gain.{id}_db"), gain_db.to_string());
+    }
     metadata.insert(
         "logic.sample_rate_hz".to_owned(),
         logic_config.sample_rate_hz().to_string(),
@@ -9883,6 +10114,37 @@ fn scope_settings_from_recording_metadata(
     settings
 }
 
+fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -> RadioSettings {
+    let mut settings = RadioSettings::default();
+    if let Some(value) = recording_metadata_value(metadata, "radio.center_frequency_hz") {
+        settings.capture.center_frequency_hz = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.sample_rate_hz") {
+        settings.capture.sample_rate_hz = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.bandwidth_hz") {
+        settings.capture.bandwidth_hz = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.receive_channel") {
+        settings.capture.receive_channel = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.amplifier_enabled") {
+        settings.amplifier_enabled = value;
+    }
+    for (key, value) in metadata {
+        let Some(id) = key
+            .strip_prefix("radio.gain.")
+            .and_then(|key| key.strip_suffix("_db"))
+        else {
+            continue;
+        };
+        if let Ok(value) = value.parse::<i32>() {
+            settings.gains_db.insert(id.to_owned(), value);
+        }
+    }
+    settings
+}
+
 #[cfg(test)]
 fn read_gui_recording(input: impl Read) -> Result<LoadedRecording, String> {
     read_gui_recording_with_analyzers(input, &[])
@@ -9901,6 +10163,7 @@ fn read_gui_recording_with_analyzers(
     });
     let logic_settings = logic_settings_from_recording_metadata(&header.metadata);
     let mut scope_settings = scope_settings_from_recording_metadata(&header.metadata);
+    let radio_settings = radio_settings_from_recording_metadata(&header.metadata);
     let (logic_channel_names, scope_channel_names) =
         channel_names_from_recording_metadata(&header.metadata);
     let mut enabled_scope_channels = scope_settings.channels.map(|channel| channel.enabled);
@@ -9916,6 +10179,8 @@ fn read_gui_recording_with_analyzers(
     if header.metadata.contains_key("logic.sample_count") {
         waveforms.configure_logic_capture(logic_settings.sample_count);
     }
+    let mut radio_spectrum =
+        SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?;
     let mut protocol_decode = ProtocolCaptureDecoder::new(analyzers);
     while let Some(event) = reader.read_event().map_err(|error| error.to_string())? {
         if let CaptureEvent::Frame(frame) = event {
@@ -9926,6 +10191,11 @@ fn read_gui_recording_with_analyzers(
                     &logic.samples,
                     logic.sample_rate_hz,
                 );
+            }
+            if let CaptureBatch::Iq(iq) = &frame.payload {
+                for spectrum in radio_spectrum.push(iq) {
+                    waveforms.radio.ingest(spectrum);
+                }
             }
             waveforms.ingest_frame(&frame, enabled_scope_channels);
         }
@@ -9944,6 +10214,11 @@ fn read_gui_recording_with_analyzers(
         .iter()
         .any(|device| device.kind == InstrumentKind::Oscilloscope)
         || waveforms.scope_rate_hz > 0;
+    let has_radio = header
+        .devices
+        .iter()
+        .any(|device| device.kind == InstrumentKind::RadioReceiver)
+        || waveforms.radio.newest_spectrum().is_some();
     if has_scope && !has_scope_channel_metadata {
         for (channel, samples) in scope_settings
             .channels
@@ -9956,7 +10231,7 @@ fn read_gui_recording_with_analyzers(
             .trigger
             .clamp_to_channels(scope_settings.channels.map(|channel| channel.enabled));
     }
-    if !has_logic && !has_scope {
+    if !has_logic && !has_scope && !has_radio {
         return Err("recording does not contain a supported capture".to_owned());
     }
     Ok(LoadedRecording {
@@ -9965,9 +10240,11 @@ fn read_gui_recording_with_analyzers(
             protocol_decode,
             has_logic,
             has_scope,
+            has_radio,
         },
         logic_settings: has_logic.then_some(logic_settings),
         scope_settings: has_scope.then_some(scope_settings),
+        radio_settings: has_radio.then_some(radio_settings),
         logic_channel_names,
         scope_channel_names,
         completion,
@@ -10100,9 +10377,11 @@ fn read_gui_saleae_with_analyzers(
             protocol_decode,
             has_logic,
             has_scope,
+            has_radio: false,
         },
         logic_settings: has_logic.then_some(logic_settings),
         scope_settings: has_scope.then_some(scope_settings),
+        radio_settings: None,
         logic_channel_names: logic_names,
         scope_channel_names: scope_names,
         completion: CompletionStatus::Complete,
@@ -10215,16 +10494,20 @@ struct StartedCapture {
     session: CaptureSession,
     scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
+    radio_spectrum: SpectrumProcessor,
 }
 
 fn start_capture(
     devices: Vec<DiscoveredDevice>,
+    radio_request: Option<RadioCaptureRequest>,
     resource_directory: &Path,
     logic_config: DsLogicCaptureConfig,
     scope_config: DsCopeCaptureConfig,
     calibration_values: Option<DsCopeCalibrationValues>,
 ) -> Result<StartedCapture, String> {
-    let mut sources = Vec::<Box<dyn CaptureSource>>::with_capacity(devices.len());
+    let mut sources = Vec::<Box<dyn CaptureSource>>::with_capacity(
+        devices.len() + usize::from(radio_request.is_some()),
+    );
     let mut scope_trigger_controls = Vec::new();
     let mut scope_calibration_controls = Vec::new();
     for device in devices {
@@ -10264,11 +10547,29 @@ fn start_capture(
             }
         }
     }
+    if let Some(request) = radio_request {
+        let source = match request.device.provider {
+            RadioProvider::HackRf => HackRfAdapter::new().open(
+                &request.device,
+                request.settings,
+                request.provider_settings,
+            ),
+            provider => {
+                return Err(format!(
+                    "capture is not implemented for the {provider:?} radio provider"
+                ));
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        sources.push(source);
+    }
+    let radio_spectrum = SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?;
     let session = CaptureCoordinator::start(sources).map_err(|error| error.to_string())?;
     Ok(StartedCapture {
         session,
         scope_trigger_controls,
         scope_calibration_controls,
+        radio_spectrum,
     })
 }
 
@@ -15085,7 +15386,7 @@ fn format_duration(duration: Duration) -> String {
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use wavecraft_core::{LogicBatch, ScopeBatch};
+    use wavecraft_core::{Iq8, IqBatch, LogicBatch, ScopeBatch};
 
     #[test]
     fn motor_controller_example_recording_opens_and_decodes() {
@@ -15806,6 +16107,59 @@ mod tests {
     }
 
     #[test]
+    fn gui_recording_reader_restores_radio_iq_and_settings() {
+        let descriptor = DeviceDescriptor {
+            id: DeviceId::new("hackrf:test"),
+            name: "HackRF One".to_owned(),
+            kind: InstrumentKind::RadioReceiver,
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "radio.center_frequency_hz".to_owned(),
+            "433920000".to_owned(),
+        );
+        metadata.insert("radio.sample_rate_hz".to_owned(), "10000000".to_owned());
+        metadata.insert("radio.bandwidth_hz".to_owned(), "8000000".to_owned());
+        metadata.insert("radio.receive_channel".to_owned(), "0".to_owned());
+        metadata.insert("radio.gain.lna_db".to_owned(), "24".to_owned());
+        metadata.insert("radio.gain.vga_db".to_owned(), "20".to_owned());
+        metadata.insert("radio.amplifier_enabled".to_owned(), "true".to_owned());
+        let mut bytes = Vec::new();
+        {
+            let mut writer = RecordingWriter::new(&mut bytes, &[descriptor], metadata).unwrap();
+            writer
+                .write_event(&CaptureEvent::Frame(CaptureFrame {
+                    device_id: DeviceId::new("hackrf:test"),
+                    sequence: 0,
+                    captured_at: Duration::ZERO,
+                    payload: CaptureBatch::Iq(IqBatch {
+                        sample_rate_hz: 10_000_000,
+                        center_frequency_hz: 433_920_000,
+                        first_sample_index: 0,
+                        discontinuity: false,
+                        samples: vec![Iq8 { i: 64, q: 0 }; RADIO_SPECTRUM_FFT_LENGTH],
+                    }),
+                }))
+                .unwrap();
+            writer.finish(CompletionStatus::Complete).unwrap();
+        }
+
+        let loaded = read_gui_recording(Cursor::new(bytes)).expect("radio recording should reopen");
+
+        assert!(loaded.capture.has_radio);
+        assert!(!loaded.capture.has_logic);
+        assert!(!loaded.capture.has_scope);
+        assert_eq!(loaded.capture.waveforms.radio.waterfall().len(), 1);
+        let settings = loaded.radio_settings.expect("radio metadata should load");
+        assert_eq!(settings.capture.center_frequency_hz, 433_920_000);
+        assert_eq!(settings.capture.sample_rate_hz, 10_000_000);
+        assert_eq!(settings.capture.bandwidth_hz, 8_000_000);
+        assert_eq!(settings.gains_db.get("lna"), Some(&24));
+        assert_eq!(settings.gains_db.get("vga"), Some(&20));
+        assert!(settings.amplifier_enabled);
+    }
+
+    #[test]
     fn recordings_without_channel_names_use_hardware_identifiers() {
         let (logic_names, scope_names) = channel_names_from_recording_metadata(&BTreeMap::new());
 
@@ -16479,21 +16833,21 @@ mod tests {
 
     #[test]
     fn waveform_tabs_require_their_connected_devices() {
-        assert!(waveform_tabs(false, false, true).is_empty());
+        assert!(waveform_tabs(false, false, false, true).is_empty());
         assert_eq!(
-            waveform_tabs(true, false, true),
+            waveform_tabs(true, false, false, true),
             vec![WaveformTab::LogicAnalyzer]
         );
         assert_eq!(
-            waveform_tabs(false, true, false),
+            waveform_tabs(false, true, false, false),
             vec![WaveformTab::Oscilloscope]
         );
         assert_eq!(
-            waveform_tabs(false, true, true),
+            waveform_tabs(false, true, false, true),
             vec![WaveformTab::Oscilloscope, WaveformTab::Lissajous]
         );
         assert_eq!(
-            waveform_tabs(true, true, false),
+            waveform_tabs(true, true, false, false),
             vec![
                 WaveformTab::LogicAnalyzer,
                 WaveformTab::Oscilloscope,
@@ -16501,13 +16855,17 @@ mod tests {
             ]
         );
         assert_eq!(
-            waveform_tabs(true, true, true),
+            waveform_tabs(true, true, false, true),
             vec![
                 WaveformTab::LogicAnalyzer,
                 WaveformTab::Oscilloscope,
                 WaveformTab::Lissajous,
                 WaveformTab::Combined,
             ]
+        );
+        assert_eq!(
+            waveform_tabs(false, false, true, false),
+            vec![WaveformTab::RadioReceiver]
         );
     }
 
@@ -16526,6 +16884,10 @@ mod tests {
             CaptureTarget::Oscilloscope
         );
         assert_eq!(
+            WaveformTab::RadioReceiver.capture_target(),
+            CaptureTarget::RadioReceiver
+        );
+        assert_eq!(
             WaveformTab::Combined.capture_target(),
             CaptureTarget::Combined
         );
@@ -16542,16 +16904,18 @@ mod tests {
             WaveformTab::Lissajous.capture_settings_tab(),
             Some(CaptureSettingsTab::DsCope)
         );
+        assert_eq!(WaveformTab::RadioReceiver.capture_settings_tab(), None);
         assert_eq!(WaveformTab::Combined.capture_settings_tab(), None);
     }
 
     #[test]
     fn combined_capture_requires_both_instrument_types() {
-        assert!(CaptureTarget::LogicAnalyzer.is_available(true, false));
-        assert!(CaptureTarget::Oscilloscope.is_available(false, true));
-        assert!(!CaptureTarget::Combined.is_available(true, false));
-        assert!(!CaptureTarget::Combined.is_available(false, true));
-        assert!(CaptureTarget::Combined.is_available(true, true));
+        assert!(CaptureTarget::LogicAnalyzer.is_available(true, false, false));
+        assert!(CaptureTarget::Oscilloscope.is_available(false, true, false));
+        assert!(CaptureTarget::RadioReceiver.is_available(false, false, true));
+        assert!(!CaptureTarget::Combined.is_available(true, false, false));
+        assert!(!CaptureTarget::Combined.is_available(false, true, false));
+        assert!(CaptureTarget::Combined.is_available(true, true, false));
     }
 
     #[test]
