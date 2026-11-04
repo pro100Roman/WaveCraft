@@ -2,6 +2,7 @@
 
 mod decode;
 mod framing;
+mod radio;
 mod runtime;
 mod schema;
 mod transport;
@@ -12,6 +13,10 @@ pub use decode::{
     TransportValue,
 };
 pub use framing::{ByteStreamFramer, FramedBytes, FramingOutput};
+pub use radio::{
+    BitPolarity, BitTransformConfig, BitTransformOutput, BitTransformer, LineCode, TimedBit,
+    TimedBitBatch,
+};
 pub use runtime::{CustomProtocolRuntime, ProtocolRuntimeOutput};
 pub use schema::{
     load_protocol_schema, BitDefinition, ByteMatch, ChecksumAlgorithm, ChecksumValidation,

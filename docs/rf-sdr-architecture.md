@@ -451,6 +451,12 @@ A separate bounded bit pipeline may perform, in a declared order:
 - optional bit stuffing removal; and
 - radio CRC validation over an explicitly defined range.
 
+The first implemented transform stage accepts timed hard decisions with
+confidence, applies optional polarity inversion, and decodes streaming NRZ,
+NRZI, or Manchester line coding. NRZI state survives arbitrary input chunks;
+Manchester retains at most one chip and reports invalid or incomplete pairs.
+All transform state resets explicitly at a discontinuity.
+
 These operations are not application-field parsing. Their output is a
 `RadioPacket` containing timed bytes, source range, RSSI/power estimate,
 frequency-error estimate, confidence, and diagnostics. CRC failure does not
