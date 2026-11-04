@@ -1,4 +1,4 @@
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, TextureHandle, Vec2};
+use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use std::collections::VecDeque;
 use wavecraft_dsp::SpectrumFrame;
 
@@ -6,6 +6,7 @@ const DEFAULT_WATERFALL_CAPACITY: usize = 256;
 const MAX_WATERFALL_TEXTURE_WIDTH: usize = 512;
 const MIN_POWER_DBFS: f32 = -120.0;
 const MAX_POWER_DBFS: f32 = 0.0;
+const WATERFALL_HISTORY_HINT: &str = "Rows are the newest spectrum snapshots retained for the visible waterfall. Dropped counts older display rows discarded after this bounded history filled; it does not indicate lost HackRF or IQ samples.";
 const NARROW_FREQUENCY_LABEL_DIVISIONS: &[u8] = &[0, 5, 10];
 const COMPACT_FREQUENCY_LABEL_DIVISIONS: &[u8] = &[0, 2, 5, 8, 10];
 const MEDIUM_FREQUENCY_LABEL_DIVISIONS: &[u8] = &[0, 2, 4, 5, 6, 8, 10];
@@ -121,13 +122,23 @@ impl RadioViewState {
             title_rect.right_center() - Vec2::new(8.0, 0.0),
             egui::Align2::RIGHT_CENTER,
             format!(
-                "{} rows · {} dropped",
+                "{} rows · {} dropped · ⓘ",
                 store.waterfall().len(),
                 store.dropped_rows()
             ),
             FontId::proportional(11.0),
             Color32::from_rgb(105, 120, 140),
         );
+        let hint_rect = Rect::from_min_max(
+            Pos2::new(title_rect.center().x, title_rect.top()),
+            title_rect.max,
+        );
+        ui.interact(
+            hint_rect,
+            ui.id().with("waterfall_history_hint"),
+            Sense::hover(),
+        )
+        .on_hover_text(WATERFALL_HISTORY_HINT);
         let image_rect = Rect::from_min_max(
             Pos2::new(rect.left() + 8.0, title_rect.bottom()),
             Pos2::new(rect.right() - 8.0, rect.bottom() - 6.0),
