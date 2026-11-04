@@ -30,6 +30,7 @@ use recording::{
 use sessions::{SessionTabs, MAX_SESSION_TABS, SESSION_NAME_MAX_CHARS};
 use snapshot::{crop_snapshot_image, save_snapshot_image, PendingSnapshot};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek};
@@ -75,7 +76,7 @@ use wavecraft_usb::{
     DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_ALIGNMENT,
     DSLOGIC_SAMPLE_RATES_HZ, DSLOGIC_TRIGGER_STAGE_COUNT, REQUIRED_RESOURCE_FILES,
 };
-use waveform::radio::RadioDisplayStore;
+use waveform::radio::{RadioDisplayStore, RadioViewState};
 
 const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
@@ -3117,6 +3118,7 @@ struct WaveCraftApp {
     selected_radio_id: Option<String>,
     radio_discovery_failures: Vec<RadioProviderFailure>,
     radio_settings: RadioSettings,
+    radio_view: RefCell<RadioViewState>,
     active_capture_settings_tab: CaptureSettingsTab,
     logic_settings: LogicCaptureSettings,
     scope_settings: ScopeCaptureSettings,
@@ -3196,6 +3198,7 @@ impl WaveCraftApp {
             selected_radio_id: None,
             radio_discovery_failures: Vec::new(),
             radio_settings: RadioSettings::default(),
+            radio_view: RefCell::new(RadioViewState::default()),
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
             logic_settings: LogicCaptureSettings::default(),
             scope_settings: ScopeCaptureSettings::default(),
@@ -8616,7 +8619,7 @@ impl eframe::App for WaveCraftApp {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             RichText::new(
-                                "Connect a supported logic analyzer or oscilloscope, then Refresh",
+                                "Connect a supported instrument, then Refresh",
                             )
                             .color(TEXT_MUTED),
                         );
@@ -8966,20 +8969,14 @@ impl eframe::App for WaveCraftApp {
                                 )
                             },
                         );
-                        let buffered_rows = waveforms.radio.waterfall().len();
                         snapshot_plot_rect = Some(waveform_card_fill(
                             ui,
                             "RF SPECTRUM",
                             &subtitle,
                             |ui, rect| {
-                                ui.painter().rect_filled(rect, 0.0, BACKGROUND);
-                                ui.painter().text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    format!("{buffered_rows} spectrum frame(s) buffered"),
-                                    FontId::proportional(15.0),
-                                    TEXT_MUTED,
-                                );
+                                self.radio_view
+                                    .borrow_mut()
+                                    .paint(ui, rect, &waveforms.radio);
                             },
                         ));
                     }
