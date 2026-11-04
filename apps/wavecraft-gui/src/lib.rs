@@ -7581,6 +7581,14 @@ fn format_radio_mhz_number(value_hz: u64) -> String {
     format!("{whole}.{}", fractional.trim_end_matches('0'))
 }
 
+fn radio_edit_field_size(ui: &egui::Ui) -> egui::Vec2 {
+    let spacing = ui.spacing();
+    egui::vec2(
+        spacing.slider_width + spacing.item_spacing.x + spacing.interact_size.x,
+        spacing.interact_size.y,
+    )
+}
+
 fn paint_radio_mhz_control(
     ui: &mut egui::Ui,
     label: &str,
@@ -7615,8 +7623,9 @@ fn paint_radio_mhz_control(
         editor = editor.range(minimum_hz as f64 / 1_000_000.0..=maximum_hz as f64 / 1_000_000.0);
     }
     let changed = if unit_outside {
+        let editor_size = radio_edit_field_size(ui);
         ui.horizontal(|ui| {
-            let changed = ui.add(editor).changed();
+            let changed = ui.add_sized(editor_size, editor).changed();
             ui.label(RichText::new("MHz").small().color(TEXT_MUTED));
             changed
         })
@@ -7635,12 +7644,12 @@ fn paint_radio_bandwidth_control(ui: &mut egui::Ui, value: &mut u64, domain: &Va
             .small()
             .color(TEXT_MUTED),
     );
-    let editor_width = ui.available_width() / 3.0;
+    let editor_size = radio_edit_field_size(ui);
     ui.horizontal(|ui| {
         match domain {
             ValueDomain::Discrete(values) => {
                 egui::ComboBox::from_id_salt("radio_bandwidth")
-                    .width(editor_width)
+                    .width(editor_size.x)
                     .selected_text(format_radio_mhz_number(*value))
                     .show_ui(ui, |ui| {
                         for choice in values {
@@ -7651,7 +7660,8 @@ fn paint_radio_bandwidth_control(ui: &mut egui::Ui, value: &mut u64, domain: &Va
             ValueDomain::Stepped { range, step } => {
                 let mut value_mhz = *value as f64 / 1_000_000.0;
                 if ui
-                    .add(
+                    .add_sized(
+                        editor_size,
                         egui::DragValue::new(&mut value_mhz)
                             .range(
                                 *range.start() as f64 / 1_000_000.0
