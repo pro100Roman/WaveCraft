@@ -3055,7 +3055,9 @@ dependencies = [
  "wavecraft-core",
  "wavecraft-decode",
  "wavecraft-dsp",
+ "wavecraft-hackrf",
  "wavecraft-recording",
+ "wavecraft-sdr",
  "wavecraft-usb",
 ]
 

@@ -1,4 +1,5 @@
 use crate::CaptureTarget;
+use wavecraft_sdr::DiscoveredRadio;
 use wavecraft_usb::{DeviceModel, DiscoveredDevice, LinkStatus};
 
 pub(crate) struct DeviceEntry {
@@ -55,6 +56,22 @@ pub(crate) fn first_device_id_for_role(
         .map(|device| device.location.stable_id())
 }
 
+pub(crate) fn selected_radio<'a>(
+    radios: &'a [DiscoveredRadio],
+    selected_id: Option<&str>,
+) -> Option<&'a DiscoveredRadio> {
+    let selected_id = selected_id?;
+    radios
+        .iter()
+        .find(|radio| radio.descriptor.id.as_str() == selected_id)
+}
+
+pub(crate) fn first_radio_id(radios: &[DiscoveredRadio]) -> Option<String> {
+    radios
+        .first()
+        .map(|radio| radio.descriptor.id.as_str().to_owned())
+}
+
 pub(crate) fn capture_devices_for_target(
     devices: &[DeviceEntry],
     selected_logic_device_id: Option<&str>,
@@ -94,6 +111,10 @@ pub(crate) fn usb_speed_warning(devices: &[DiscoveredDevice]) -> Option<UsbSpeed
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wavecraft_core::{DeviceDescriptor, DeviceId, InstrumentKind};
+    use wavecraft_sdr::{
+        ConnectionBackend, RadioCapabilities, RadioModel, RadioProvider, ValueDomain,
+    };
     use wavecraft_usb::UsbSpeedClass;
 
     #[test]
@@ -153,6 +174,50 @@ mod tests {
         assert_eq!(combined_capture.len(), 2);
         assert_eq!(combined_capture[0].location.stable_id(), selected_logic_id);
         assert_eq!(combined_capture[1].location.stable_id(), selected_scope_id);
+    }
+
+    #[test]
+    fn identical_radios_are_selected_by_connection_id() {
+        let radio = |connection_id: &str, persistent_id: &str| DiscoveredRadio {
+            descriptor: DeviceDescriptor {
+                id: DeviceId::new(connection_id),
+                name: "HackRF One".to_owned(),
+                kind: InstrumentKind::RadioReceiver,
+            },
+            provider: RadioProvider::HackRf,
+            model: RadioModel::HackRfOne,
+            connection_backend: ConnectionBackend::Usb,
+            persistent_id: Some(persistent_id.to_owned()),
+            capabilities: RadioCapabilities {
+                frequency_hz: ValueDomain::Stepped {
+                    range: 1_000_000..=6_000_000_000,
+                    step: 1,
+                },
+                sample_rates_hz: ValueDomain::Stepped {
+                    range: 2_000_000..=20_000_000,
+                    step: 1,
+                },
+                bandwidths_hz: ValueDomain::Discrete(vec![1_750_000]),
+                receive_channels: 1,
+                gain_controls: Vec::new(),
+                supports_hardware_timestamps: false,
+                supports_external_clock: true,
+            },
+        };
+        let radios = vec![
+            radio("hackrf:serial-a", "serial-a"),
+            radio("hackrf:serial-b", "serial-b"),
+        ];
+
+        assert_eq!(first_radio_id(&radios).as_deref(), Some("hackrf:serial-a"));
+        assert_eq!(
+            selected_radio(&radios, Some("hackrf:serial-b"))
+                .expect("the exact HackRF connection should resolve")
+                .persistent_id
+                .as_deref(),
+            Some("serial-b")
+        );
+        assert!(selected_radio(&radios, Some("hackrf:missing")).is_none());
     }
 
     #[test]

@@ -8,8 +8,8 @@ mod theme;
 pub mod waveform;
 
 use devices::{
-    capture_devices_for_target, first_device_id_for_role, selected_device_for_role,
-    usb_speed_warning, DeviceEntry, DeviceRole, UsbSpeedWarning,
+    capture_devices_for_target, first_device_id_for_role, first_radio_id, selected_device_for_role,
+    selected_radio, usb_speed_warning, DeviceEntry, DeviceRole, UsbSpeedWarning,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use measurements::{
@@ -47,10 +47,12 @@ use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
 };
+use wavecraft_hackrf::HackRfAdapter;
 use wavecraft_recording::{
     read_saleae, write_saleae, CompletionStatus, RecordingReader, RecordingWriter,
     SaleaeAnalogChannel, SaleaeCapture, SaleaeChannel, SaleaeDigitalCapture,
 };
+use wavecraft_sdr::{DiscoveredRadio, RadioDiscoveryReport, RadioProviderFailure, RadioRegistry};
 use wavecraft_usb::{
     apply_dscope_configuration, auto_calibrate_dscope_with_progress, discover_supported_devices,
     prepare_device, read_dscope_calibration, write_dscope_calibration, DeviceModel,
@@ -3007,7 +3009,10 @@ struct CombinedSessionSettings {
 type FileRecorder = RecordingWriter<BufWriter<File>>;
 
 enum WorkerSuccess {
-    Devices(Vec<DiscoveredDevice>),
+    Devices {
+        usb: Vec<DiscoveredDevice>,
+        radio: RadioDiscoveryReport,
+    },
     Capture {
         session: CaptureSession,
         mode: AcquisitionMode,
@@ -3049,6 +3054,9 @@ struct WaveCraftApp {
     devices: Vec<DeviceEntry>,
     selected_logic_device_id: Option<String>,
     selected_scope_device_id: Option<String>,
+    radios: Vec<DiscoveredRadio>,
+    selected_radio_id: Option<String>,
+    radio_discovery_failures: Vec<RadioProviderFailure>,
     active_capture_settings_tab: CaptureSettingsTab,
     logic_settings: LogicCaptureSettings,
     scope_settings: ScopeCaptureSettings,
@@ -3123,6 +3131,9 @@ impl WaveCraftApp {
             devices: Vec::new(),
             selected_logic_device_id: None,
             selected_scope_device_id: None,
+            radios: Vec::new(),
+            selected_radio_id: None,
+            radio_discovery_failures: Vec::new(),
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
             logic_settings: LogicCaptureSettings::default(),
             scope_settings: ScopeCaptureSettings::default(),
@@ -3299,11 +3310,17 @@ impl WaveCraftApp {
         self.pending = Some(receiver);
         self.reset_session_captures();
         self.logic_marker_settings.clear();
-        self.status = "Discovering USB instruments…".to_owned();
+        self.status = "Discovering instruments…".to_owned();
         self.last_error = None;
         thread::spawn(move || {
+            let radio = RadioRegistry::new()
+                .with_adapter(HackRfAdapter::new())
+                .discover();
             let result = discover_supported_devices()
-                .map(|report| WorkerSuccess::Devices(report.devices))
+                .map(|report| WorkerSuccess::Devices {
+                    usb: report.devices,
+                    radio,
+                })
                 .map_err(|error| error.to_string());
             let _ = sender.send(result);
         });
@@ -3317,6 +3334,9 @@ impl WaveCraftApp {
         if self.selected_scope_device_id.is_none() {
             self.selected_scope_device_id =
                 first_device_id_for_role(&self.devices, DeviceRole::Oscilloscope);
+        }
+        if self.selected_radio_id.is_none() {
+            self.selected_radio_id = first_radio_id(&self.radios);
         }
     }
 
@@ -3744,17 +3764,20 @@ impl WaveCraftApp {
         };
         self.pending = None;
         match result {
-            Ok(WorkerSuccess::Devices(devices)) => {
-                self.usb_speed_warning = usb_speed_warning(&devices);
-                self.devices = devices
+            Ok(WorkerSuccess::Devices { usb, radio }) => {
+                self.usb_speed_warning = usb_speed_warning(&usb);
+                self.devices = usb
                     .into_iter()
                     .map(|device| DeviceEntry { device })
                     .collect();
+                self.radios = radio.devices;
+                self.radio_discovery_failures = radio.failures;
                 self.reconcile_device_selections();
-                self.status = if self.devices.is_empty() {
+                let detected_count = self.devices.len() + self.radios.len();
+                self.status = if detected_count == 0 {
                     "No supported instruments detected".to_owned()
                 } else {
-                    format!("Detected {} supported instrument(s)", self.devices.len())
+                    format!("Detected {detected_count} supported instrument(s)")
                 };
             }
             Ok(WorkerSuccess::Capture {
@@ -7180,7 +7203,7 @@ fn paint_calibration_progress_modal(
 
 fn paint_instrument_settings(ui: &mut egui::Ui, devices: &[DeviceEntry]) {
     if devices.is_empty() {
-        ui.label(RichText::new("No supported devices").color(TEXT_MUTED));
+        ui.label(RichText::new("No supported USB instruments").color(TEXT_MUTED));
         return;
     }
 
@@ -7216,6 +7239,73 @@ fn paint_instrument_settings(ui: &mut egui::Ui, devices: &[DeviceEntry]) {
                     .color(TEXT_MUTED),
                 );
             });
+    }
+}
+
+fn selected_radio_text(radios: &[DiscoveredRadio], selected_id: Option<&str>) -> String {
+    match selected_id {
+        Some(id) => selected_radio(radios, Some(id))
+            .map(|radio| format!("{} · {id}", radio.descriptor.name))
+            .unwrap_or_else(|| format!("Unavailable · {id}")),
+        None => "No radio receiver available".to_owned(),
+    }
+}
+
+fn paint_radio_settings(
+    ui: &mut egui::Ui,
+    radios: &[DiscoveredRadio],
+    selected_id: &mut Option<String>,
+    failures: &[RadioProviderFailure],
+    enabled: bool,
+) {
+    let choices = radios
+        .iter()
+        .map(|radio| {
+            let id = radio.descriptor.id.as_str().to_owned();
+            (id.clone(), format!("{} · {id}", radio.descriptor.name))
+        })
+        .collect::<Vec<_>>();
+    ui.add_enabled_ui(enabled && !choices.is_empty(), |ui| {
+        egui::ComboBox::from_id_salt("radio_device_selector")
+            .width(ui.available_width())
+            .selected_text(selected_radio_text(radios, selected_id.as_deref()))
+            .show_ui(ui, |ui| {
+                for (id, text) in choices {
+                    ui.selectable_value(selected_id, Some(id), text);
+                }
+            });
+    });
+
+    for radio in radios {
+        ui.add_space(4.0);
+        egui::Frame::none()
+            .fill(BACKGROUND)
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.label(RichText::new(&radio.descriptor.name).strong());
+                ui.small(RichText::new(radio.descriptor.id.as_str()).color(TEXT_MUTED));
+                ui.small(
+                    RichText::new(format!(
+                        "{:?} · {:?} · {} RX channel(s)",
+                        radio.provider,
+                        radio.connection_backend,
+                        radio.capabilities.receive_channels
+                    ))
+                    .color(TEXT_MUTED),
+                );
+            });
+    }
+
+    for failure in failures {
+        ui.add_space(4.0);
+        ui.small(
+            RichText::new(format!(
+                "{:?} discovery unavailable: {}",
+                failure.provider, failure.error
+            ))
+            .color(Color32::LIGHT_RED),
+        );
     }
 }
 
@@ -8566,7 +8656,7 @@ impl eframe::App for WaveCraftApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size([250.0, 240.0])
+            .fixed_size([330.0, 420.0])
             .show(context, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -8582,6 +8672,17 @@ impl eframe::App for WaveCraftApp {
                     });
                     ui.add_space(6.0);
                     paint_instrument_settings(ui, &self.devices);
+
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("RADIO RECEIVER").strong().color(ACCENT));
+                    ui.add_space(6.0);
+                    paint_radio_settings(
+                        ui,
+                        &self.radios,
+                        &mut self.selected_radio_id,
+                        &self.radio_discovery_failures,
+                        !settings_locked,
+                    );
 
                     if settings_locked {
                         ui.add_space(8.0);
