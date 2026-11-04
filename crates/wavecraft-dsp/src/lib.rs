@@ -102,13 +102,7 @@ pub struct SpectrumPowerTrigger {
 
 impl SpectrumPowerTrigger {
     pub fn new(config: SpectrumPowerTriggerConfig) -> Result<Self, String> {
-        if !config.threshold_dbfs.is_finite()
-            || !(MIN_TRIGGER_POWER_DBFS..=0.0).contains(&config.threshold_dbfs)
-        {
-            return Err(format!(
-                "spectrum trigger threshold must be between {MIN_TRIGGER_POWER_DBFS} and 0 dBFS"
-            ));
-        }
+        validate_trigger_threshold(config.threshold_dbfs)?;
         Ok(Self {
             processor: SpectrumProcessor::new(config.fft_length, config.window)?
                 .with_iq_correction(config.iq_correction_enabled),
@@ -120,6 +114,12 @@ impl SpectrumPowerTrigger {
     pub fn reset(&mut self) {
         self.processor.reset();
         self.triggered = false;
+    }
+
+    pub fn set_threshold_dbfs(&mut self, threshold_dbfs: f32) -> Result<(), String> {
+        validate_trigger_threshold(threshold_dbfs)?;
+        self.threshold_dbfs = threshold_dbfs;
+        Ok(())
     }
 
     pub fn push(&mut self, batch: &IqBatch) -> Option<SpectrumPowerTriggerEvent> {
@@ -150,6 +150,15 @@ impl SpectrumPowerTrigger {
         }
         None
     }
+}
+
+fn validate_trigger_threshold(threshold_dbfs: f32) -> Result<(), String> {
+    if !threshold_dbfs.is_finite() || !(MIN_TRIGGER_POWER_DBFS..=0.0).contains(&threshold_dbfs) {
+        return Err(format!(
+            "spectrum trigger threshold must be between {MIN_TRIGGER_POWER_DBFS} and 0 dBFS"
+        ));
+    }
+    Ok(())
 }
 
 const MIN_TRIGGER_POWER_DBFS: f32 = -120.0;
@@ -420,5 +429,22 @@ mod tests {
         assert_eq!(trigger.push(&tone_batch(0, false)), None);
         trigger.reset();
         assert_eq!(trigger.push(&tone_batch(100, true)), None);
+    }
+
+    #[test]
+    fn spectrum_power_trigger_threshold_can_change_while_armed() {
+        let mut trigger = SpectrumPowerTrigger::new(SpectrumPowerTriggerConfig {
+            fft_length: 8,
+            window: SpectrumWindow::Rectangular,
+            threshold_dbfs: -1.0,
+            iq_correction_enabled: false,
+        })
+        .unwrap();
+        assert_eq!(trigger.push(&tone_batch(0, false)), None);
+
+        trigger.set_threshold_dbfs(-10.0).unwrap();
+
+        assert!(trigger.push(&tone_batch(8, false)).is_some());
+        assert!(trigger.set_threshold_dbfs(-121.0).is_err());
     }
 }

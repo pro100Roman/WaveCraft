@@ -2,6 +2,7 @@ mod devices;
 mod measurements;
 mod protocol_analyzer;
 mod radio_analyzer;
+mod radio_trigger;
 mod recording;
 mod sessions;
 mod snapshot;
@@ -25,6 +26,7 @@ use protocol_analyzer::{
     ProtocolDecodedKind, PROTOCOLS,
 };
 use radio_analyzer::RadioAnalyzerRuntime;
+use radio_trigger::{RadioSingleTrigger, RadioSingleTriggerConfig};
 use recording::{
     choose_recording_save_path, choose_recording_to_open, choose_saleae_export_path,
     create_saleae_export_file,
@@ -88,6 +90,7 @@ const SAMPLE_COUNT: u64 = 1_000_000;
 const BUILD_VERSION_LABEL: &str = concat!("Version: ", env!("WAVECRAFT_BUILD_VERSION"));
 const LOGIC_CHANNEL_COUNT: usize = 16;
 const RADIO_SPECTRUM_FFT_LENGTH: usize = 2_048;
+const RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS: u64 = 1_000;
 // Bound logic display storage by activity-preserving buckets. The bucket stride
 // expands to cover the configured finite or Loop duration without limiting the
 // decoder, recorder, or zoom-out domain to this in-memory bucket count.
@@ -2909,6 +2912,53 @@ fn ingest_radio_iq(
     }
 }
 
+fn ingest_active_capture_frame(
+    active: &mut ActiveCapture,
+    frame: CaptureFrame,
+) -> Result<(), String> {
+    let event = CaptureEvent::Frame(frame);
+    if let Some(recorder) = active.recorder.as_mut() {
+        recorder
+            .write_event(&event)
+            .map_err(|error| format!("failed to write recording: {error}"))?;
+    }
+    let CaptureEvent::Frame(frame) = event else {
+        unreachable!("capture frame event changed variant");
+    };
+    if let CaptureBatch::Logic(logic) = &frame.payload {
+        active.protocol_decode.ingest_logic_frame(
+            frame.device_id.as_str(),
+            frame.sequence,
+            &logic.samples,
+            logic.sample_rate_hz,
+        );
+    }
+    if let CaptureBatch::Iq(iq) = &frame.payload {
+        ingest_radio_iq(
+            &mut active.waveforms,
+            &mut active.radio_spectrum,
+            &mut active.radio_analyzer,
+            iq,
+        );
+    }
+    let enabled_scope_channels = active
+        .scope_config
+        .channels()
+        .map(|channel| channel.enabled());
+    if active.waveforms.scope_rolling
+        && is_scope_frame_start(frame.sequence)
+        && matches!(&frame.payload, CaptureBatch::Scope(_))
+    {
+        active
+            .waveforms
+            .mark_scope_capture_start(enabled_scope_channels);
+    }
+    active
+        .waveforms
+        .ingest_frame(&frame, enabled_scope_channels);
+    Ok(())
+}
+
 struct ActiveCapture {
     session: CaptureSession,
     mode: AcquisitionMode,
@@ -2923,6 +2973,7 @@ struct ActiveCapture {
     protocol_decode: ProtocolCaptureDecoder,
     radio_spectrum: SpectrumProcessor,
     radio_analyzer: Option<RadioAnalyzerRuntime>,
+    radio_trigger: Option<RadioSingleTrigger>,
     recorder: Option<FileRecorder>,
     recording_path: Option<PathBuf>,
     has_logic: bool,
@@ -3081,6 +3132,8 @@ struct CombinedSessionSettings {
 struct RadioSettings {
     capture: RadioCaptureSettings,
     single_duration_millis: u64,
+    trigger_enabled: bool,
+    trigger_pretrigger_millis: u64,
     trigger_level_dbfs_tenths: i16,
     gains_db: BTreeMap<String, i32>,
     frequency_correction_milli_ppm: i32,
@@ -3203,6 +3256,8 @@ impl Default for RadioSettings {
                 sample_limit: None,
             },
             single_duration_millis: 1_000,
+            trigger_enabled: false,
+            trigger_pretrigger_millis: 10,
             trigger_level_dbfs_tenths: -500,
             gains_db: BTreeMap::new(),
             frequency_correction_milli_ppm: 0,
@@ -3585,7 +3640,9 @@ impl WaveCraftApp {
             .cloned()
             .ok_or_else(|| "Select a connected radio receiver in Capture Setup".to_owned())?;
         let mut settings = self.radio_settings.capture.clone();
-        settings.sample_limit = (mode == AcquisitionMode::Single)
+        let waits_for_trigger =
+            mode == AcquisitionMode::Single && self.radio_settings.trigger_enabled;
+        settings.sample_limit = (mode == AcquisitionMode::Single && !waits_for_trigger)
             .then(|| {
                 radio_single_sample_limit(
                     settings.sample_rate_hz,
@@ -4189,6 +4246,29 @@ impl WaveCraftApp {
                     .descriptors()
                     .iter()
                     .any(|device| device.kind == InstrumentKind::RadioReceiver);
+                let radio_trigger = if mode == AcquisitionMode::Single
+                    && target == CaptureTarget::RadioReceiver
+                    && has_radio
+                    && self.radio_settings.trigger_enabled
+                {
+                    let config = radio_single_trigger_config(&self.radio_settings);
+                    match config.and_then(RadioSingleTrigger::new) {
+                        Ok(trigger) => Some(trigger),
+                        Err(error) => {
+                            let cleanup = session.stop().err();
+                            self.set_error(match cleanup {
+                                Some(cleanup) => format!(
+                                    "failed to arm RF trigger: {error}; additionally failed to stop: {cleanup}"
+                                ),
+                                None => format!("failed to arm RF trigger: {error}"),
+                            });
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let waiting_for_radio_trigger = radio_trigger.is_some();
                 let has_scope_trigger = !scope_trigger_controls.is_empty();
                 let has_logic_trigger = has_logic && logic_config.trigger().is_some();
                 let rolling =
@@ -4263,6 +4343,7 @@ impl WaveCraftApp {
                     protocol_decode,
                     radio_spectrum: *radio_spectrum,
                     radio_analyzer: radio_analyzer.map(|analyzer| *analyzer),
+                    radio_trigger,
                     recorder,
                     recording_path: recording_path.clone(),
                     has_logic,
@@ -4270,6 +4351,11 @@ impl WaveCraftApp {
                     has_radio,
                 });
                 self.status = match (mode, recording_path) {
+                    (AcquisitionMode::Single, Some(path)) if waiting_for_radio_trigger => format!(
+                        "Single · waiting for RF trigger at {:.1} dBFS; recording to {}",
+                        f32::from(self.radio_settings.trigger_level_dbfs_tenths) / 10.0,
+                        path.display()
+                    ),
                     (AcquisitionMode::Single, Some(path)) if has_logic_trigger => format!(
                         "Single · waiting for logic trigger; recording to {}",
                         path.display()
@@ -4282,7 +4368,12 @@ impl WaveCraftApp {
                         )
                     }
                     (AcquisitionMode::Single, None) => {
-                        if has_logic_trigger {
+                        if waiting_for_radio_trigger {
+                            format!(
+                                "Single · waiting for RF trigger at {:.1} dBFS",
+                                f32::from(self.radio_settings.trigger_level_dbfs_tenths) / 10.0
+                            )
+                        } else if has_logic_trigger {
                             "Single · waiting for logic trigger".to_owned()
                         } else if has_scope_trigger
                             && scope_config.trigger().source() != DsCopeTriggerSource::Auto
@@ -4506,76 +4597,131 @@ impl WaveCraftApp {
 
     fn poll_capture(&mut self) {
         let mut finish_status = None::<(Result<String, String>, CompletionStatus)>;
+        let mut capture_status = None::<String>;
         let protocol_analyzers = self.protocol_analyzer.analyzers.clone();
+        let radio_trigger_threshold_dbfs =
+            f32::from(self.radio_settings.trigger_level_dbfs_tenths) / 10.0;
         if let Some(active) = self.capture.as_mut() {
             active.protocol_decode.reconfigure(&protocol_analyzers);
             loop {
                 match active.session.try_recv() {
-                    Ok(event) => {
-                        if let Some(recorder) = active.recorder.as_mut() {
-                            if let Err(error) = recorder.write_event(&event) {
-                                active.session.request_stop();
-                                finish_status = Some((
-                                    Err(format!("failed to write recording: {error}")),
-                                    CompletionStatus::Failed,
-                                ));
-                                break;
-                            }
-                        }
-                        match event {
-                            CaptureEvent::Frame(frame) => {
-                                if let CaptureBatch::Logic(logic) = &frame.payload {
-                                    active.protocol_decode.ingest_logic_frame(
-                                        frame.device_id.as_str(),
-                                        frame.sequence,
-                                        &logic.samples,
-                                        logic.sample_rate_hz,
-                                    );
-                                }
-                                if let CaptureBatch::Iq(iq) = &frame.payload {
-                                    ingest_radio_iq(
-                                        &mut active.waveforms,
-                                        &mut active.radio_spectrum,
-                                        &mut active.radio_analyzer,
-                                        iq,
-                                    );
-                                }
-                                let enabled_scope_channels = active
-                                    .scope_config
-                                    .channels()
-                                    .map(|channel| channel.enabled());
-                                if active.waveforms.scope_rolling
-                                    && is_scope_frame_start(frame.sequence)
-                                    && matches!(&frame.payload, CaptureBatch::Scope(_))
+                    Ok(event) => match event {
+                        CaptureEvent::Frame(frame) => {
+                            if let Some(trigger) = active.radio_trigger.as_mut() {
+                                if let Err(error) =
+                                    trigger.set_threshold_dbfs(radio_trigger_threshold_dbfs)
                                 {
-                                    active
-                                        .waveforms
-                                        .mark_scope_capture_start(enabled_scope_channels);
-                                }
-                                active
-                                    .waveforms
-                                    .ingest_frame(&frame, enabled_scope_channels);
-                            }
-                            CaptureEvent::SourceFailed { device_id, error } => {
-                                active.session.request_stop();
-                                finish_status = Some((
-                                    Err(format!("{device_id}: {error}")),
-                                    CompletionStatus::Failed,
-                                ));
-                                break;
-                            }
-                            CaptureEvent::SourceStopped { device_id } => {
-                                active.stopped.insert(device_id);
-                                if active.stopped.len() == active.session.descriptors().len() {
+                                    active.session.request_stop();
                                     finish_status = Some((
-                                        Ok("Capture complete".to_owned()),
-                                        CompletionStatus::Complete,
+                                        Err(format!("RF trigger update failed: {error}")),
+                                        CompletionStatus::Failed,
                                     ));
                                     break;
                                 }
                             }
+                            let trigger_armed = active
+                                .radio_trigger
+                                .as_ref()
+                                .is_some_and(RadioSingleTrigger::is_armed);
+                            if trigger_armed {
+                                if let CaptureBatch::Iq(iq) = &frame.payload {
+                                    for spectrum in active.radio_spectrum.push(iq) {
+                                        active.waveforms.radio.ingest(spectrum);
+                                    }
+                                }
+                            }
+                            let (frames, trigger_event, trigger_complete) = if let Some(trigger) =
+                                active.radio_trigger.as_mut()
+                            {
+                                match trigger.push(frame) {
+                                    Ok(output) => (output.frames, output.event, output.complete),
+                                    Err(error) => {
+                                        active.session.request_stop();
+                                        finish_status = Some((
+                                            Err(format!("RF trigger failed: {error}")),
+                                            CompletionStatus::Failed,
+                                        ));
+                                        break;
+                                    }
+                                }
+                            } else {
+                                (vec![frame], None, false)
+                            };
+                            if let Some(event) = trigger_event {
+                                active.radio_spectrum.reset();
+                                active.waveforms.radio = RadioDisplayStore::default();
+                                active.waveforms.radio_analysis = RadioAnalysisStore::default();
+                                capture_status = Some(format!(
+                                    "RF trigger · {:.3} MHz at {:.1} dBFS; capturing…",
+                                    event.frequency_hz / 1_000_000.0,
+                                    event.power_dbfs
+                                ));
+                            }
+                            for frame in frames {
+                                if let Err(error) = ingest_active_capture_frame(active, frame) {
+                                    active.session.request_stop();
+                                    finish_status = Some((Err(error), CompletionStatus::Failed));
+                                    break;
+                                }
+                            }
+                            if finish_status.is_some() {
+                                break;
+                            }
+                            if trigger_complete {
+                                active.session.request_stop();
+                                capture_status = Some(
+                                    "RF trigger captured; finishing Single acquisition…".to_owned(),
+                                );
+                            }
                         }
-                    }
+                        CaptureEvent::SourceFailed { device_id, error } => {
+                            if let Some(recorder) = active.recorder.as_mut() {
+                                if let Err(write_error) =
+                                    recorder.write_event(&CaptureEvent::SourceFailed {
+                                        device_id: device_id.clone(),
+                                        error: error.clone(),
+                                    })
+                                {
+                                    active.session.request_stop();
+                                    finish_status = Some((
+                                        Err(format!("failed to write recording: {write_error}")),
+                                        CompletionStatus::Failed,
+                                    ));
+                                    break;
+                                }
+                            }
+                            active.session.request_stop();
+                            finish_status = Some((
+                                Err(format!("{device_id}: {error}")),
+                                CompletionStatus::Failed,
+                            ));
+                            break;
+                        }
+                        CaptureEvent::SourceStopped { device_id } => {
+                            if let Some(recorder) = active.recorder.as_mut() {
+                                if let Err(error) =
+                                    recorder.write_event(&CaptureEvent::SourceStopped {
+                                        device_id: device_id.clone(),
+                                    })
+                                {
+                                    active.session.request_stop();
+                                    finish_status = Some((
+                                        Err(format!("failed to write recording: {error}")),
+                                        CompletionStatus::Failed,
+                                    ));
+                                    break;
+                                }
+                            }
+                            active.stopped.insert(device_id);
+                            if active.stopped.len() == active.session.descriptors().len() {
+                                finish_status = Some((
+                                    Ok("Capture complete".to_owned()),
+                                    CompletionStatus::Complete,
+                                ));
+                                break;
+                            }
+                        }
+                    },
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         finish_status = Some((
@@ -4586,6 +4732,10 @@ impl WaveCraftApp {
                     }
                 }
             }
+        }
+
+        if let Some(status) = capture_status {
+            self.status = status;
         }
 
         if let Some((result, completion)) = finish_status {
@@ -7688,10 +7838,40 @@ fn radio_single_sample_limit(sample_rate_hz: u64, duration_millis: u64) -> Resul
     if sample_rate_hz == 0 || duration_millis == 0 {
         return Err("RF Single duration and sample rate must be greater than zero".to_owned());
     }
+    radio_duration_sample_count(sample_rate_hz, duration_millis)
+}
+
+fn radio_duration_sample_count(sample_rate_hz: u64, duration_millis: u64) -> Result<u64, String> {
+    if sample_rate_hz == 0 {
+        return Err("RF sample rate must be greater than zero".to_owned());
+    }
     let samples = u128::from(sample_rate_hz)
         .saturating_mul(u128::from(duration_millis))
         .div_ceil(1_000);
     u64::try_from(samples).map_err(|_| "RF Single capture is too long".to_owned())
+}
+
+fn radio_single_trigger_config(
+    settings: &RadioSettings,
+) -> Result<RadioSingleTriggerConfig, String> {
+    if settings.trigger_pretrigger_millis > RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS {
+        return Err(format!(
+            "RF pre-trigger duration must not exceed {RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS} ms"
+        ));
+    }
+    Ok(RadioSingleTriggerConfig {
+        threshold_dbfs: f32::from(settings.trigger_level_dbfs_tenths) / 10.0,
+        pretrigger_samples: radio_duration_sample_count(
+            settings.capture.sample_rate_hz,
+            settings.trigger_pretrigger_millis,
+        )?,
+        posttrigger_samples: radio_single_sample_limit(
+            settings.capture.sample_rate_hz,
+            settings.single_duration_millis,
+        )?,
+        fft_length: RADIO_SPECTRUM_FFT_LENGTH,
+        iq_correction_enabled: settings.iq_correction_enabled,
+    })
 }
 
 fn hackrf_runtime_settings(settings: &RadioSettings) -> Result<HackRfRuntimeSettings, String> {
@@ -8374,7 +8554,9 @@ fn paint_radio_receive_configuration(
             paint_radio_parameter_label(
                 ui,
                 "Single duration",
-                Some("Capture time used by the RF Single action; Run remains continuous"),
+                Some(
+                    "Capture time used by RF Single; with trigger enabled, this is the time retained after the trigger",
+                ),
             );
             ui.add_enabled_ui(enabled, |ui| {
                 ui.horizontal(|ui| {
@@ -8402,8 +8584,50 @@ fn paint_radio_receive_configuration(
 
             paint_radio_parameter_label(
                 ui,
+                "Wait for trigger",
+                Some(
+                    "In RF Single mode, wait indefinitely until the spectrum peak reaches the trigger level",
+                ),
+            );
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.checkbox(&mut settings.trigger_enabled, "Enabled");
+            });
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
+                "Pre-trigger",
+                Some(
+                    "IQ history retained before the detected RF trigger, useful for preserving the start of short packets",
+                ),
+            );
+            ui.add_enabled_ui(enabled && settings.trigger_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    let mut milliseconds = settings.trigger_pretrigger_millis;
+                    if add_left_aligned_sized(
+                        ui,
+                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut milliseconds)
+                            .range(0..=RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS)
+                            .speed(1),
+                    )
+                    .changed()
+                    {
+                        settings.trigger_pretrigger_millis = milliseconds;
+                    }
+                    ui.label("ms");
+                });
+            });
+            settings.trigger_pretrigger_millis =
+                settings.trigger_pretrigger_millis.min(RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS);
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
                 "RF trigger level",
-                Some("Power threshold represented by the draggable T marker on the RF spectrum"),
+                Some(
+                    "Peak FFT-bin power threshold used by RF Single when Wait for trigger is enabled; also represented by the draggable T marker",
+                ),
             );
             ui.add_enabled_ui(enabled || runtime_enabled, |ui| {
                 ui.horizontal(|ui| {
@@ -10594,6 +10818,14 @@ fn start_gui_recording(
         radio_settings.single_duration_millis.to_string(),
     );
     metadata.insert(
+        "radio.trigger_enabled".to_owned(),
+        radio_settings.trigger_enabled.to_string(),
+    );
+    metadata.insert(
+        "radio.trigger_pretrigger_millis".to_owned(),
+        radio_settings.trigger_pretrigger_millis.to_string(),
+    );
+    metadata.insert(
         "radio.trigger_level_dbfs_tenths".to_owned(),
         radio_settings.trigger_level_dbfs_tenths.to_string(),
     );
@@ -11176,6 +11408,14 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.single_duration_millis") {
         settings.single_duration_millis = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.trigger_enabled") {
+        settings.trigger_enabled = value;
+    }
+    if let Some(value) =
+        recording_metadata_value::<u64>(metadata, "radio.trigger_pretrigger_millis")
+    {
+        settings.trigger_pretrigger_millis = value.min(RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS);
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.trigger_level_dbfs_tenths") {
         settings.trigger_level_dbfs_tenths = value;
@@ -16696,6 +16936,20 @@ mod tests {
     }
 
     #[test]
+    fn radio_single_trigger_derives_bounded_pre_and_posttrigger_samples() {
+        let mut settings = RadioSettings::default();
+        settings.capture.sample_rate_hz = 10_000_000;
+        settings.single_duration_millis = 250;
+        settings.trigger_pretrigger_millis = 10;
+
+        let config = radio_single_trigger_config(&settings).unwrap();
+
+        assert_eq!(config.pretrigger_samples, 100_000);
+        assert_eq!(config.posttrigger_samples, 2_500_000);
+        assert_eq!(config.fft_length, RADIO_SPECTRUM_FFT_LENGTH);
+    }
+
+    #[test]
     fn radio_runtime_settings_include_only_live_hackrf_controls() {
         let capabilities = wavecraft_hackrf::hackrf_one_capabilities();
         let mut initial = RadioSettings::default();
@@ -17517,6 +17771,11 @@ mod tests {
         metadata.insert("radio.bandwidth_hz".to_owned(), "8000000".to_owned());
         metadata.insert("radio.receive_channel".to_owned(), "0".to_owned());
         metadata.insert("radio.single_duration_millis".to_owned(), "2500".to_owned());
+        metadata.insert("radio.trigger_enabled".to_owned(), "true".to_owned());
+        metadata.insert(
+            "radio.trigger_pretrigger_millis".to_owned(),
+            "25".to_owned(),
+        );
         metadata.insert(
             "radio.trigger_level_dbfs_tenths".to_owned(),
             "-425".to_owned(),
@@ -17561,6 +17820,8 @@ mod tests {
         assert_eq!(settings.capture.sample_rate_hz, 10_000_000);
         assert_eq!(settings.capture.bandwidth_hz, 8_000_000);
         assert_eq!(settings.single_duration_millis, 2_500);
+        assert!(settings.trigger_enabled);
+        assert_eq!(settings.trigger_pretrigger_millis, 25);
         assert_eq!(settings.trigger_level_dbfs_tenths, -425);
         assert_eq!(settings.frequency_correction_milli_ppm, -12_500);
         assert_eq!(settings.gains_db.get("lna"), Some(&24));
