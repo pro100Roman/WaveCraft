@@ -777,7 +777,13 @@ fn paint_analysis(
     if !store.raw_messages().is_empty() {
         paint_raw_messages(ui, plot, store, raw_message_scroll_rows);
     } else if !store.soft_symbols().is_empty() {
-        paint_soft_symbols(ui, plot, store);
+        ui.painter().text(
+            plot.center(),
+            egui::Align2::CENTER_CENTER,
+            "Searching for preamble",
+            FontId::proportional(12.0),
+            Color32::from_rgb(105, 120, 140),
+        );
     } else if !store.analog_samples().is_empty() {
         paint_analog_samples(ui, plot, store);
     } else {
@@ -1090,60 +1096,6 @@ fn paint_raw_message_bytes(
         x += cell_width;
     }
     x
-}
-
-fn paint_soft_symbols(ui: &egui::Ui, plot: Rect, store: &RadioAnalysisStore) {
-    const MAX_VISIBLE_SYMBOLS: usize = 512;
-    let skip = store
-        .soft_symbols()
-        .len()
-        .saturating_sub(MAX_VISIBLE_SYMBOLS);
-    let symbols = store.soft_symbols().iter().skip(skip).collect::<Vec<_>>();
-    let Some(first) = symbols.first() else {
-        return;
-    };
-    let Some(last) = symbols.last() else {
-        return;
-    };
-    let start = first.source_range.start;
-    let span = last.source_range.end.saturating_sub(start).max(1) as f64;
-    for symbol in symbols {
-        let left = plot.left()
-            + plot.width()
-                * ((symbol.source_range.start.saturating_sub(start) as f64 / span) as f32);
-        let right = plot.left()
-            + plot.width() * ((symbol.source_range.end.saturating_sub(start) as f64 / span) as f32);
-        let symbol_rect = Rect::from_min_max(
-            Pos2::new(left, plot.top()),
-            Pos2::new(right.max(left + 1.0), plot.bottom()),
-        )
-        .intersect(plot);
-        let decision = symbol.decision().unwrap_or(0);
-        let confidence = symbol.confidence().unwrap_or(0.0).clamp(0.0, 1.0);
-        let base = if decision % 2 == 0 {
-            Color32::from_rgb(70, 135, 230)
-        } else {
-            Color32::from_rgb(70, 205, 145)
-        };
-        ui.painter().rect_filled(
-            symbol_rect,
-            1.0,
-            base.gamma_multiply(0.25 + 0.7 * confidence),
-        );
-        ui.painter().line_segment(
-            [symbol_rect.left_top(), symbol_rect.left_bottom()],
-            Stroke::new(1.0_f32, Color32::from_rgb(25, 35, 48)),
-        );
-        if symbol_rect.width() >= 12.0 {
-            ui.painter().text(
-                symbol_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                decision.to_string(),
-                FontId::monospace(10.0),
-                Color32::WHITE,
-            );
-        }
-    }
 }
 
 fn paint_analog_samples(ui: &egui::Ui, plot: Rect, store: &RadioAnalysisStore) {
@@ -1883,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn radio_view_renders_soft_symbol_analysis_lane() {
+    fn radio_view_renders_soft_symbol_search_status() {
         let context = egui::Context::default();
         let mut display = RadioDisplayStore::new(4).unwrap();
         display.ingest(frame(0, 100_000_000));

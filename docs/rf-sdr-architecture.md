@@ -324,9 +324,10 @@ Both settings are stored in recording metadata for reproducible offline decode.
 The RF view labels this modulation-neutral output pane **RAW DATA**. Horizontal
 drag handles make the RF SPECTRUM, WATERFALL, and RAW DATA heights adjustable.
 RAW DATA exposes both wheel scrolling and a draggable vertical scrollbar for
-older retained messages. Parameter names, panel titles, live status text, and
-errors use selectable labels so they can be highlighted and copied with the
-platform clipboard shortcut.
+older retained messages. While searching for a preamble, it shows a textual
+status instead of drawing every soft symbol as a vertical stripe. Parameter
+names, panel titles, live status text, and errors use selectable labels so they
+can be highlighted and copied with the platform clipboard shortcut.
 
 ### Modulation-neutral analyzer contracts
 
