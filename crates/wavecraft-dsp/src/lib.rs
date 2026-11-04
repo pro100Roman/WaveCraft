@@ -1,11 +1,15 @@
 //! Device-independent signal processing for radio IQ captures.
 
+mod analyzer;
 mod channelizer;
 mod demodulation;
 mod fsk;
 mod registry;
 mod timing;
 
+pub use analyzer::{
+    BinaryFskProfile, BinaryGfskProfile, DemodulationProfile, SignalAnalyzer, SignalAnalyzerProfile,
+};
 pub use channelizer::{ChannelizedBatch, Channelizer, ChannelizerConfig, TimedComplexSample};
 pub use demodulation::{
     DemodulatedBatch, Demodulator, TimedAnalogBatch, TimedAnalogSample, TimedSoftSymbol,

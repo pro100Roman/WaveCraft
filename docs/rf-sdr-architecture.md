@@ -5,9 +5,10 @@ spectrum DSP/display store, simulator, SDR facade, and receive-only HackRF One
 adapter are implemented. Channelization and the binary FSK/GFSK demodulator are
 also implemented, including bounded streaming GFSK matched filtering with
 configurable BT and adaptive symbol timing with bounded clock-error tracking.
-A stable-ID demodulator registry exposes typed FSK/GFSK factories without
-making them the top-level architecture. GUI analyzer configuration and
-rendering of timed soft symbols remain to be wired into live and recorded IQ.
+A stable-ID demodulator registry and modulation-tagged analyzer profiles expose
+typed FSK/GFSK factories without making them the top-level architecture. GUI
+configuration and rendering of timed soft symbols remain to be wired into live
+and recorded IQ.
 
 WaveCraft treats HackRF as the first backend for a generic radio-receiver
 instrument, not as a GUI-specific feature. The backend produces ordered raw IQ
@@ -304,9 +305,12 @@ demodulated output contracts.
 
 ### Reusable signal profiles
 
-The GUI initially builds this stack from typed settings. A later reusable
-`wavecraft.signal/v1` YAML format may describe a bounded composition of
-first-party blocks, but it does not contain expressions or executable DSP code.
+The implemented in-memory profile builds the channelizer and selected
+demodulator as one streaming analyzer. Its tagged FSK and GFSK variants keep
+GFSK-only BT out of the FSK profile. The GUI will build this stack from typed
+settings. A later reusable `wavecraft.signal/v1` YAML format may describe a
+bounded composition of first-party blocks, but it does not contain expressions
+or executable DSP code.
 It is separate from `wavecraft.protocol`, because RF acquisition and
 demodulation parameters answer a different question from the meaning of packet
 fields.
