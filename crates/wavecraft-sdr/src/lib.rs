@@ -106,6 +106,7 @@ pub struct HackRfSettings {
     pub lna_gain_db: Option<u32>,
     pub vga_gain_db: Option<u32>,
     pub amplifier_enabled: bool,
+    pub antenna_power_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

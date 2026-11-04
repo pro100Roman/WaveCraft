@@ -3047,6 +3047,7 @@ struct RadioSettings {
     capture: RadioCaptureSettings,
     gains_db: BTreeMap<String, i32>,
     amplifier_enabled: bool,
+    antenna_power_enabled: bool,
 }
 
 impl Default for RadioSettings {
@@ -3061,6 +3062,7 @@ impl Default for RadioSettings {
             },
             gains_db: BTreeMap::new(),
             amplifier_enabled: false,
+            antenna_power_enabled: false,
         }
     }
 }
@@ -3444,6 +3446,7 @@ impl WaveCraftApp {
                 lna_gain_db: radio_gain_u32(&self.radio_settings, "lna")?,
                 vga_gain_db: radio_gain_u32(&self.radio_settings, "vga")?,
                 amplifier_enabled: self.radio_settings.amplifier_enabled,
+                antenna_power_enabled: self.radio_settings.antenna_power_enabled,
             }),
             provider => {
                 return Err(format!(
@@ -7676,6 +7679,11 @@ fn paint_radio_capture_settings(
         if radio.provider == RadioProvider::HackRf {
             ui.add_space(4.0);
             ui.checkbox(&mut settings.amplifier_enabled, "Enable RF amplifier");
+            ui.checkbox(
+                &mut settings.antenna_power_enabled,
+                "Enable antenna port power (3.3 V)",
+            )
+            .on_hover_text("Only enable for an antenna or accessory designed for bias power");
         }
     });
 }
@@ -9681,6 +9689,10 @@ fn start_gui_recording(
         "radio.amplifier_enabled".to_owned(),
         radio_settings.amplifier_enabled.to_string(),
     );
+    metadata.insert(
+        "radio.antenna_power_enabled".to_owned(),
+        radio_settings.antenna_power_enabled.to_string(),
+    );
     for (id, gain_db) in &radio_settings.gains_db {
         metadata.insert(format!("radio.gain.{id}_db"), gain_db.to_string());
     }
@@ -10176,6 +10188,9 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.amplifier_enabled") {
         settings.amplifier_enabled = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.antenna_power_enabled") {
+        settings.antenna_power_enabled = value;
     }
     for (key, value) in metadata {
         let Some(id) = key
@@ -16185,6 +16200,7 @@ mod tests {
         metadata.insert("radio.gain.lna_db".to_owned(), "24".to_owned());
         metadata.insert("radio.gain.vga_db".to_owned(), "20".to_owned());
         metadata.insert("radio.amplifier_enabled".to_owned(), "true".to_owned());
+        metadata.insert("radio.antenna_power_enabled".to_owned(), "true".to_owned());
         let mut bytes = Vec::new();
         {
             let mut writer = RecordingWriter::new(&mut bytes, &[descriptor], metadata).unwrap();
@@ -16218,6 +16234,7 @@ mod tests {
         assert_eq!(settings.gains_db.get("lna"), Some(&24));
         assert_eq!(settings.gains_db.get("vga"), Some(&20));
         assert!(settings.amplifier_enabled);
+        assert!(settings.antenna_power_enabled);
     }
 
     #[test]

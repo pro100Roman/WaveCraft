@@ -225,7 +225,9 @@ impl HackRfCaptureSource {
                 .unwrap_or(DEFAULT_VGA_GAIN_DB),
         )?;
         self.runtime
-            .set_amplifier(device, self.provider_settings.amplifier_enabled)
+            .set_amplifier(device, self.provider_settings.amplifier_enabled)?;
+        self.runtime
+            .set_antenna_power(device, self.provider_settings.antenna_power_enabled)
     }
 
     fn receive(
@@ -488,6 +490,7 @@ struct HackRfApi {
     set_lna_gain: SetU32Fn,
     set_vga_gain: SetU32Fn,
     set_amplifier: SetU8Fn,
+    set_antenna_power: SetU8Fn,
     error_name: ErrorNameFn,
 }
 
@@ -512,6 +515,7 @@ impl HackRfApi {
                 set_lna_gain: load_symbol(&library, b"hackrf_set_lna_gain\0")?,
                 set_vga_gain: load_symbol(&library, b"hackrf_set_vga_gain\0")?,
                 set_amplifier: load_symbol(&library, b"hackrf_set_amp_enable\0")?,
+                set_antenna_power: load_symbol(&library, b"hackrf_set_antenna_enable\0")?,
                 error_name: load_symbol(&library, b"hackrf_error_name\0")?,
                 _library: library,
             })
@@ -766,6 +770,16 @@ impl HackRfRuntime {
         let code = unsafe { (self.api.set_amplifier)(device, u8::from(enabled)) };
         self.api.check("setting HackRF RF amplifier", code)
     }
+
+    fn set_antenna_power(
+        &self,
+        device: *mut HackRfDevice,
+        enabled: bool,
+    ) -> Result<(), CaptureError> {
+        // SAFETY: `device` is open and libhackrf accepts 0 or 1.
+        let code = unsafe { (self.api.set_antenna_power)(device, u8::from(enabled)) };
+        self.api.check("setting HackRF antenna port power", code)
+    }
 }
 
 impl Drop for HackRfRuntime {
@@ -877,6 +891,7 @@ mod tests {
             lna_gain_db: Some(24),
             vga_gain_db: Some(30),
             amplifier_enabled: true,
+            antenna_power_enabled: false,
         })
         .is_ok());
         assert!(validate_provider_settings(&HackRfSettings {
