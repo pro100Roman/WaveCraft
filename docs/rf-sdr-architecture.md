@@ -253,6 +253,12 @@ RF **Single** capture has an explicit duration stored in milliseconds and
 displayed in seconds. The application derives its exact sample limit from the
 selected sample rate and duration; **Run** capture remains continuous.
 
+The spectrum exposes a persisted RF trigger-level threshold in dBFS as a red
+`T` marker on the right edge, matching the oscilloscope trigger-level affordance.
+Dragging moves the horizontal dotted threshold line; double-click restores
+-50 dBFS. This UI threshold is the configuration surface for the planned
+channel-power trigger engine and does not yet gate acquisition by itself.
+
 ## Signal-decoder stack
 
 Radio decoding is an analyzer stack analogous to the existing

@@ -248,6 +248,12 @@ pub struct RadioViewState {
     waterfall_signature: Option<WaterfallSignature>,
 }
 
+pub struct RadioViewOptions<'a> {
+    pub analysis_enabled: bool,
+    pub trigger_level_dbfs_tenths: &'a mut i16,
+    pub trigger_controls_enabled: bool,
+}
+
 impl RadioViewState {
     pub fn paint(
         &mut self,
@@ -255,8 +261,13 @@ impl RadioViewState {
         rect: Rect,
         store: &RadioDisplayStore,
         analysis: &RadioAnalysisStore,
-        analysis_enabled: bool,
+        options: RadioViewOptions<'_>,
     ) {
+        let RadioViewOptions {
+            analysis_enabled,
+            trigger_level_dbfs_tenths,
+            trigger_controls_enabled,
+        } = options;
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_rgb(12, 16, 22));
         let gap = 12.0;
@@ -285,7 +296,13 @@ impl RadioViewState {
             ),
             Pos2::new(rect.right(), content_bottom),
         );
-        paint_spectrum(ui, spectrum_rect, store.newest_spectrum());
+        paint_spectrum(
+            ui,
+            spectrum_rect,
+            store.newest_spectrum(),
+            trigger_level_dbfs_tenths,
+            trigger_controls_enabled,
+        );
         self.paint_waterfall(ui, waterfall_rect, store);
         if show_analysis {
             let analysis_rect = Rect::from_min_max(
@@ -583,7 +600,13 @@ fn paint_analog_samples(ui: &egui::Ui, plot: Rect, store: &RadioAnalysisStore) {
     }
 }
 
-fn paint_spectrum(ui: &egui::Ui, rect: Rect, spectrum: Option<&SpectrumFrame>) {
+fn paint_spectrum(
+    ui: &egui::Ui,
+    rect: Rect,
+    spectrum: Option<&SpectrumFrame>,
+    trigger_level_dbfs_tenths: &mut i16,
+    trigger_controls_enabled: bool,
+) {
     ui.painter()
         .rect_filled(rect, 0.0, Color32::from_rgb(12, 16, 22));
     let plot = Rect::from_min_max(
@@ -636,9 +659,21 @@ fn paint_spectrum(ui: &egui::Ui, rect: Rect, spectrum: Option<&SpectrumFrame>) {
             FontId::proportional(14.0),
             Color32::from_rgb(105, 120, 140),
         );
+        paint_radio_trigger_level(
+            ui,
+            plot,
+            trigger_level_dbfs_tenths,
+            trigger_controls_enabled,
+        );
         return;
     };
     if spectrum.power_dbfs.len() < 2 {
+        paint_radio_trigger_level(
+            ui,
+            plot,
+            trigger_level_dbfs_tenths,
+            trigger_controls_enabled,
+        );
         return;
     }
     let points = spectrum
@@ -728,6 +763,99 @@ fn paint_spectrum(ui: &egui::Ui, rect: Rect, spectrum: Option<&SpectrumFrame>) {
             );
         }
     }
+    paint_radio_trigger_level(
+        ui,
+        plot,
+        trigger_level_dbfs_tenths,
+        trigger_controls_enabled,
+    );
+}
+
+fn radio_trigger_level_y(plot: Rect, level_dbfs_tenths: i16) -> f32 {
+    let level = f32::from(level_dbfs_tenths) / 10.0;
+    let normalized = ((level - MIN_POWER_DBFS) / (MAX_POWER_DBFS - MIN_POWER_DBFS)).clamp(0.0, 1.0);
+    egui::lerp(plot.y_range(), 1.0 - normalized)
+}
+
+fn radio_trigger_level_from_y(plot: Rect, y: f32) -> i16 {
+    let normalized = 1.0 - ((y - plot.top()) / plot.height().max(1.0)).clamp(0.0, 1.0);
+    let level = MIN_POWER_DBFS + normalized * (MAX_POWER_DBFS - MIN_POWER_DBFS);
+    (level * 10.0).round().clamp(-1_200.0, 0.0) as i16
+}
+
+fn paint_radio_trigger_level(
+    ui: &egui::Ui,
+    plot: Rect,
+    level_dbfs_tenths: &mut i16,
+    controls_enabled: bool,
+) {
+    const COLOR: Color32 = Color32::from_rgb(235, 72, 72);
+    const ARROW_BODY_WIDTH: f32 = 19.0;
+    const ARROW_TIP_WIDTH: f32 = 8.0;
+    const ARROW_HALF_HEIGHT: f32 = 9.0;
+    const DOT_SPACING: f32 = 7.0;
+    let arrow_x = plot.right() - 2.0;
+    let arrow_width = ARROW_BODY_WIDTH + ARROW_TIP_WIDTH;
+    let arrow_y = radio_trigger_level_y(plot, *level_dbfs_tenths);
+    let hit_rect = Rect::from_center_size(
+        Pos2::new(arrow_x - arrow_width * 0.5, arrow_y),
+        Vec2::new(arrow_width + 4.0, ARROW_HALF_HEIGHT * 2.0 + 10.0),
+    );
+    let response = ui.interact(
+        hit_rect,
+        ui.make_persistent_id("radio_trigger_level"),
+        if controls_enabled {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
+    );
+    let response = if controls_enabled {
+        response.on_hover_cursor(egui::CursorIcon::ResizeVertical)
+    } else {
+        response
+    }
+    .on_hover_text(format!(
+        "RF trigger level: {:.1} dBFS",
+        f32::from(*level_dbfs_tenths) / 10.0
+    ));
+    if controls_enabled {
+        if response.double_clicked() {
+            *level_dbfs_tenths = -500;
+        } else if response.dragged() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                *level_dbfs_tenths = radio_trigger_level_from_y(plot, pointer.y);
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+
+    let arrow_y = radio_trigger_level_y(plot, *level_dbfs_tenths);
+    let painter = ui.painter().with_clip_rect(plot);
+    let mut x = plot.left();
+    while x <= plot.right() {
+        painter.circle_filled(Pos2::new(x, arrow_y), 0.8, COLOR.gamma_multiply(0.45));
+        x += DOT_SPACING;
+    }
+    let body_left = arrow_x - ARROW_BODY_WIDTH;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(arrow_x, arrow_y - ARROW_HALF_HEIGHT),
+            Pos2::new(body_left, arrow_y - ARROW_HALF_HEIGHT),
+            Pos2::new(body_left - ARROW_TIP_WIDTH, arrow_y),
+            Pos2::new(body_left, arrow_y + ARROW_HALF_HEIGHT),
+            Pos2::new(arrow_x, arrow_y + ARROW_HALF_HEIGHT),
+        ],
+        COLOR,
+        Stroke::new(1.0_f32, Color32::from_rgb(12, 16, 22)),
+    ));
+    painter.text(
+        Pos2::new(arrow_x - ARROW_BODY_WIDTH * 0.5, arrow_y),
+        egui::Align2::CENTER_CENTER,
+        "T",
+        FontId::monospace(9.0),
+        Color32::WHITE,
+    );
 }
 
 fn spectrum_hover_label_rect(pointer: Pos2, bounds: Rect) -> Rect {
@@ -939,6 +1067,15 @@ mod tests {
     }
 
     #[test]
+    fn radio_trigger_level_maps_between_dbfs_and_plot_height() {
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 240.0));
+
+        assert_eq!(radio_trigger_level_y(plot, 0), plot.top());
+        assert_eq!(radio_trigger_level_y(plot, -1_200), plot.bottom());
+        assert_eq!(radio_trigger_level_from_y(plot, plot.center().y), -600);
+    }
+
+    #[test]
     fn analysis_store_bounds_soft_symbols_and_preserves_diagnostics() {
         let mut store = RadioAnalysisStore::new(2).unwrap();
         store
@@ -1046,6 +1183,7 @@ mod tests {
             }))
             .unwrap();
         let mut view = RadioViewState::default();
+        let mut trigger_level = -500;
 
         let output = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
@@ -1054,7 +1192,11 @@ mod tests {
                     ui.available_rect_before_wrap(),
                     &display,
                     &analysis,
-                    true,
+                    RadioViewOptions {
+                        analysis_enabled: true,
+                        trigger_level_dbfs_tenths: &mut trigger_level,
+                        trigger_controls_enabled: true,
+                    },
                 );
             });
         });

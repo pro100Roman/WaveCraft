@@ -81,7 +81,7 @@ use wavecraft_usb::{
     DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_ALIGNMENT,
     DSLOGIC_SAMPLE_RATES_HZ, DSLOGIC_TRIGGER_STAGE_COUNT, REQUIRED_RESOURCE_FILES,
 };
-use waveform::radio::{RadioAnalysisStore, RadioDisplayStore, RadioViewState};
+use waveform::radio::{RadioAnalysisStore, RadioDisplayStore, RadioViewOptions, RadioViewState};
 
 const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
@@ -3081,6 +3081,7 @@ struct CombinedSessionSettings {
 struct RadioSettings {
     capture: RadioCaptureSettings,
     single_duration_millis: u64,
+    trigger_level_dbfs_tenths: i16,
     gains_db: BTreeMap<String, i32>,
     frequency_correction_milli_ppm: i32,
     iq_correction_enabled: bool,
@@ -3202,6 +3203,7 @@ impl Default for RadioSettings {
                 sample_limit: None,
             },
             single_duration_millis: 1_000,
+            trigger_level_dbfs_tenths: -500,
             gains_db: BTreeMap::new(),
             frequency_correction_milli_ppm: 0,
             iq_correction_enabled: true,
@@ -8398,6 +8400,34 @@ fn paint_radio_receive_configuration(
                 settings.single_duration_millis.clamp(1, 3_600_000);
             ui.end_row();
 
+            paint_radio_parameter_label(
+                ui,
+                "RF trigger level",
+                Some("Power threshold represented by the draggable T marker on the RF spectrum"),
+            );
+            ui.add_enabled_ui(enabled || runtime_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    let mut level_dbfs = f64::from(settings.trigger_level_dbfs_tenths) / 10.0;
+                    if add_left_aligned_sized(
+                        ui,
+                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut level_dbfs)
+                            .range(-120.0..=0.0)
+                            .speed(0.1)
+                            .min_decimals(1)
+                            .max_decimals(1),
+                    )
+                    .changed()
+                    {
+                        settings.trigger_level_dbfs_tenths = (level_dbfs * 10.0).round() as i16;
+                    }
+                    ui.label("dBFS");
+                });
+            });
+            settings.trigger_level_dbfs_tenths =
+                settings.trigger_level_dbfs_tenths.clamp(-1_200, 0);
+            ui.end_row();
+
             paint_radio_parameter_label(ui, "Baseband bandwidth", bandwidth_help);
             ui.add_enabled_ui(tuning_enabled, |ui| {
                 paint_radio_bandwidth_value(
@@ -9498,6 +9528,7 @@ impl eframe::App for WaveCraftApp {
             });
         let mut decoded_data_panel_open = self.decoded_data_panel_open;
         let mut decoded_data_panel_width = self.decoded_data_panel_width;
+        let mut radio_trigger_level_dbfs_tenths = self.radio_settings.trigger_level_dbfs_tenths;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -9872,7 +9903,13 @@ impl eframe::App for WaveCraftApp {
                                         rect,
                                         &waveforms.radio,
                                         &waveforms.radio_analysis,
-                                        self.radio_settings.analyzer.enabled,
+                                        RadioViewOptions {
+                                            analysis_enabled: self.radio_settings.analyzer.enabled,
+                                            trigger_level_dbfs_tenths:
+                                                &mut radio_trigger_level_dbfs_tenths,
+                                            trigger_controls_enabled: capture_settings_enabled
+                                                || radio_runtime_controls_enabled,
+                                        },
                                     );
                             },
                         ));
@@ -9968,6 +10005,7 @@ impl eframe::App for WaveCraftApp {
         self.protocol_decode_cache = protocol_decode_cache;
         self.decoded_data_panel_open = decoded_data_panel_open;
         self.decoded_data_panel_width = decoded_data_panel_width;
+        self.radio_settings.trigger_level_dbfs_tenths = radio_trigger_level_dbfs_tenths;
         self.snapshot_plot_rect = snapshot_plot_rect;
         if snapshot_clicked {
             if let Some(plot_rect) = snapshot_plot_rect {
@@ -10556,6 +10594,10 @@ fn start_gui_recording(
         radio_settings.single_duration_millis.to_string(),
     );
     metadata.insert(
+        "radio.trigger_level_dbfs_tenths".to_owned(),
+        radio_settings.trigger_level_dbfs_tenths.to_string(),
+    );
+    metadata.insert(
         "radio.frequency_correction_milli_ppm".to_owned(),
         radio_settings.frequency_correction_milli_ppm.to_string(),
     );
@@ -11134,6 +11176,9 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.single_duration_millis") {
         settings.single_duration_millis = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.trigger_level_dbfs_tenths") {
+        settings.trigger_level_dbfs_tenths = value;
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.frequency_correction_milli_ppm")
     {
@@ -17473,6 +17518,10 @@ mod tests {
         metadata.insert("radio.receive_channel".to_owned(), "0".to_owned());
         metadata.insert("radio.single_duration_millis".to_owned(), "2500".to_owned());
         metadata.insert(
+            "radio.trigger_level_dbfs_tenths".to_owned(),
+            "-425".to_owned(),
+        );
+        metadata.insert(
             "radio.frequency_correction_milli_ppm".to_owned(),
             "-12500".to_owned(),
         );
@@ -17512,6 +17561,7 @@ mod tests {
         assert_eq!(settings.capture.sample_rate_hz, 10_000_000);
         assert_eq!(settings.capture.bandwidth_hz, 8_000_000);
         assert_eq!(settings.single_duration_millis, 2_500);
+        assert_eq!(settings.trigger_level_dbfs_tenths, -425);
         assert_eq!(settings.frequency_correction_milli_ppm, -12_500);
         assert_eq!(settings.gains_db.get("lna"), Some(&24));
         assert_eq!(settings.gains_db.get("vga"), Some(&20));
