@@ -7587,6 +7587,7 @@ fn paint_radio_mhz_control(
     value_hz: &mut u64,
     domain: &ValueDomain,
     unit_outside: bool,
+    help: Option<&str>,
 ) {
     let bounds = match domain {
         ValueDomain::Discrete(values) => values
@@ -7596,7 +7597,15 @@ fn paint_radio_mhz_control(
             .zip(values.iter().copied().max()),
         ValueDomain::Stepped { range, .. } => Some((*range.start(), *range.end())),
     };
-    ui.label(RichText::new(label).small().color(TEXT_MUTED));
+    let label = if help.is_some() {
+        format!("{label} ⓘ")
+    } else {
+        label.to_owned()
+    };
+    let label_response = ui.label(RichText::new(label).small().color(TEXT_MUTED));
+    if let Some(help) = help {
+        label_response.on_hover_text(help);
+    }
     let mut value_mhz = *value_hz as f64 / 1_000_000.0;
     let mut editor = egui::DragValue::new(&mut value_mhz)
         .speed(0.001)
@@ -7685,6 +7694,7 @@ fn paint_radio_capture_settings(
             &mut settings.capture.center_frequency_hz,
             &radio.capabilities.frequency_hz,
             true,
+            None,
         );
     });
     ui.add_space(4.0);
@@ -7695,6 +7705,9 @@ fn paint_radio_capture_settings(
             &mut settings.capture.sample_rate_hz,
             &radio.capabilities.sample_rates_hz,
             true,
+            (radio.provider == RadioProvider::HackRf).then_some(
+                "Supported range: 2–20 MHz. Step: 1 Hz (0.000001 MHz). HackRF supports any whole-Hz value in this range; 8 MHz or higher is recommended.",
+            ),
         );
     });
     ui.add_space(4.0);
