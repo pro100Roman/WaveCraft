@@ -735,7 +735,8 @@ fn waterfall_image(frames: &VecDeque<SpectrumFrame>) -> Option<egui::ColorImage>
     let width = bin_count.min(MAX_WATERFALL_TEXTURE_WIDTH);
     let height = frames.len();
     let mut image = egui::ColorImage::new([width, height], Color32::BLACK);
-    for (row, frame) in frames.iter().enumerate() {
+    // New rows enter at the top; older history moves down the image.
+    for (row, frame) in frames.iter().rev().enumerate() {
         for column in 0..width {
             let start = column * bin_count / width;
             let end = ((column + 1) * bin_count / width).max(start + 1);
@@ -849,7 +850,8 @@ mod tests {
         let image = waterfall_image(&frames).unwrap();
 
         assert_eq!(image.size, [MAX_WATERFALL_TEXTURE_WIDTH, 2]);
-        assert_ne!(image[(0, 0)], image[(0, 1)]);
+        assert_eq!(image[(0, 0)], waterfall_color(-40.0));
+        assert_eq!(image[(0, 1)], waterfall_color(-100.0));
     }
 
     #[test]

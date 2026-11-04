@@ -229,6 +229,8 @@ One generic **RF Spectrum** view contains:
 The implemented spectrum trace exposes the nearest FFT bin under the pointer
 with a crosshair and hover readout containing absolute frequency and dBFS
 power. This uses the same bin-center mapping as the rendered trace.
+The waterfall places each newest spectrum row at the top and moves older
+history downward.
 
 The capture settings panel identifies the selected backend as HackRF and owns
 hardware controls such as center frequency, sample rate, bandwidth, LNA/VGA
