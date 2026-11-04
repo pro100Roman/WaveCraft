@@ -8191,6 +8191,7 @@ fn paint_scaled_u64_value(
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
                 egui::DragValue::new(&mut scaled)
                     .range(range)
+                    .clamp_existing_to_range(false)
                     .speed(0.001)
                     .min_decimals(3)
                     .max_decimals(6),
@@ -8220,6 +8221,7 @@ fn paint_scaled_i64_value(
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
                 egui::DragValue::new(&mut scaled)
                     .range(range)
+                    .clamp_existing_to_range(false)
                     .speed(0.001)
                     .min_decimals(3)
                     .max_decimals(6),
@@ -17055,6 +17057,27 @@ mod tests {
             .capture
             .validate(&wavecraft_hackrf::hackrf_one_capabilities())
             .expect("default radio settings should be supported by HackRF One");
+    }
+
+    #[test]
+    fn analyzer_render_does_not_clamp_values_to_a_temporary_dependent_minimum() {
+        let context = egui::Context::default();
+        let mut settings = RadioAnalyzerSettings {
+            enabled: true,
+            output_sample_rate_hz: 0,
+            symbol_rate_hz: 19_200,
+            deviation_hz: 35_000,
+            ..RadioAnalyzerSettings::default()
+        };
+
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_radio_analyzer_configuration(ui, &mut settings, 0, true);
+            });
+        });
+
+        assert_eq!(settings.symbol_rate_hz, 19_200);
+        assert_eq!(settings.deviation_hz, 35_000);
     }
 
     #[test]

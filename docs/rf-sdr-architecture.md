@@ -292,6 +292,9 @@ Each layer declares its required input and typed output. A layer never reaches
 back into a hardware driver or reads pixels from the RF view. The analyzer
 configuration, including every DSP parameter, is snapshot into the project so
 offline results remain reproducible.
+Dependent numeric editor ranges are enforced on user edits, not passively while
+rendering, so a transiently unavailable processing rate cannot rewrite bit rate
+or frequency deviation to their minimum values.
 
 The FSK/GFSK raw view groups the synchronized byte stream into messages at
 each repeated configured preamble. It retains a bounded message history,
