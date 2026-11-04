@@ -29,8 +29,16 @@ impl RawRadioConfig {
 pub struct RawRadioOutput {
     /// Preamble bytes are included, followed by every byte decoded after lock.
     pub bytes: Vec<TimedByte>,
+    /// Preamble-delimited message starts in source-sample coordinates.
+    pub message_starts: Vec<RawRadioMessageStart>,
     pub diagnostics: Vec<DecodeDiagnostic>,
     pub synchronized: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawRadioMessageStart {
+    pub sample_index: u64,
+    pub preamble_bytes: usize,
 }
 
 /// Streaming raw-byte decoder that derives byte alignment from a repeated-byte preamble.
@@ -43,6 +51,8 @@ pub struct RawRadioDecoder {
     search_bits: Vec<TimedBit>,
     pending_bits: Vec<TimedBit>,
     synchronized: bool,
+    preamble_run_bytes: usize,
+    preamble_run_start: Option<u64>,
     last_input_end: Option<u64>,
 }
 
@@ -56,6 +66,8 @@ impl RawRadioDecoder {
             preamble_bits,
             config,
             synchronized: false,
+            preamble_run_bytes: 0,
+            preamble_run_start: None,
             last_input_end: None,
         })
     }
@@ -72,6 +84,8 @@ impl RawRadioDecoder {
         self.search_bits.clear();
         self.pending_bits.clear();
         self.synchronized = false;
+        self.preamble_run_bytes = 0;
+        self.preamble_run_start = None;
         self.last_input_end = None;
     }
 
@@ -92,7 +106,10 @@ impl RawRadioDecoder {
 
         for bit in &batch.bits {
             if self.synchronized {
-                self.push_synchronized_bit(*bit, &mut output.bytes);
+                if let Some(byte) = self.push_synchronized_bit(*bit) {
+                    self.observe_synchronized_byte(byte, &mut output.message_starts);
+                    output.bytes.push(byte);
+                }
             } else {
                 self.search_bits.push(*bit);
                 if self.search_bits.len() > self.preamble_bits.len() {
@@ -105,11 +122,19 @@ impl RawRadioDecoder {
                         .zip(&self.preamble_bits)
                         .all(|(actual, expected)| actual.value == *expected)
                 {
-                    output
-                        .bytes
-                        .extend(pack_bytes(&self.search_bits, self.config.bit_order));
+                    let preamble = pack_bytes(&self.search_bits, self.config.bit_order);
+                    let sample_index = preamble
+                        .first()
+                        .map_or(bit.range.start, |byte| byte.range.start);
+                    output.message_starts.push(RawRadioMessageStart {
+                        sample_index,
+                        preamble_bytes: self.config.preamble_bytes,
+                    });
+                    output.bytes.extend(preamble);
                     self.search_bits.clear();
                     self.synchronized = true;
+                    self.preamble_run_bytes = self.config.preamble_bytes;
+                    self.preamble_run_start = Some(sample_index);
                 }
             }
         }
@@ -127,11 +152,36 @@ impl RawRadioDecoder {
         output
     }
 
-    fn push_synchronized_bit(&mut self, bit: TimedBit, bytes: &mut Vec<TimedByte>) {
+    fn push_synchronized_bit(&mut self, bit: TimedBit) -> Option<TimedByte> {
         self.pending_bits.push(bit);
         if self.pending_bits.len() == 8 {
-            bytes.push(pack_timed_byte(&self.pending_bits, self.config.bit_order));
+            let byte = pack_timed_byte(&self.pending_bits, self.config.bit_order);
             self.pending_bits.clear();
+            Some(byte)
+        } else {
+            None
+        }
+    }
+
+    fn observe_synchronized_byte(
+        &mut self,
+        byte: TimedByte,
+        message_starts: &mut Vec<RawRadioMessageStart>,
+    ) {
+        if byte.value != self.config.preamble_byte {
+            self.preamble_run_bytes = 0;
+            self.preamble_run_start = None;
+            return;
+        }
+        if self.preamble_run_bytes == 0 {
+            self.preamble_run_start = Some(byte.range.start);
+        }
+        self.preamble_run_bytes = self.preamble_run_bytes.saturating_add(1);
+        if self.preamble_run_bytes == self.config.preamble_bytes {
+            message_starts.push(RawRadioMessageStart {
+                sample_index: self.preamble_run_start.unwrap_or(byte.range.start),
+                preamble_bytes: self.config.preamble_bytes,
+            });
         }
     }
 
@@ -250,6 +300,13 @@ mod tests {
             [0xaa, 0xaa, 0xaa, 0x12, 0x34]
         );
         assert_eq!(output.bytes[0].range, SampleRange { start: 16, end: 32 });
+        assert_eq!(
+            output.message_starts,
+            [RawRadioMessageStart {
+                sample_index: 16,
+                preamble_bytes: 3,
+            }]
+        );
     }
 
     #[test]
@@ -271,6 +328,47 @@ mod tests {
         assert_eq!(
             decoded.iter().map(|byte| byte.value).collect::<Vec<_>>(),
             [0xaa, 0xaa, 0xaa, 0x12, 0x34, 0x56]
+        );
+    }
+
+    #[test]
+    fn repeated_preamble_starts_a_new_raw_message() {
+        let mut decoder = RawRadioDecoder::new(config()).unwrap();
+        let input = byte_bits(&[0xaa, 0xaa, 0xaa, 0x12, 0x34, 0xaa, 0xaa, 0xaa, 0x56]);
+
+        let output = decoder.push(&bits(&input, 100, false)).unwrap();
+
+        assert_eq!(
+            output.message_starts,
+            [
+                RawRadioMessageStart {
+                    sample_index: 100,
+                    preamble_bytes: 3,
+                },
+                RawRadioMessageStart {
+                    sample_index: 180,
+                    preamble_bytes: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_preamble_boundary_survives_input_chunks() {
+        let mut decoder = RawRadioDecoder::new(config()).unwrap();
+        let first = byte_bits(&[0xaa, 0xaa, 0xaa, 0x12, 0xaa]);
+        let second = byte_bits(&[0xaa, 0xaa, 0x56]);
+        let first_end = first.len() as u64 * 2;
+        decoder.push(&bits(&first, 0, false)).unwrap();
+
+        let output = decoder.push(&bits(&second, first_end, false)).unwrap();
+
+        assert_eq!(
+            output.message_starts,
+            [RawRadioMessageStart {
+                sample_index: 64,
+                preamble_bytes: 3,
+            }]
         );
     }
 

@@ -1144,6 +1144,7 @@ mod tests {
                     status: ByteStatus::default(),
                 })
                 .collect(),
+            message_starts: vec![],
             diagnostics: vec![],
             synchronized: true,
         });

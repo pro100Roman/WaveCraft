@@ -31,7 +31,7 @@ pub use radio_packet::{
 pub use radio_pipeline::{
     RadioPacketPipeline, RadioPacketPipelineConfig, RadioPacketPipelineOutput,
 };
-pub use radio_raw::{RawRadioConfig, RawRadioDecoder, RawRadioOutput};
+pub use radio_raw::{RawRadioConfig, RawRadioDecoder, RawRadioMessageStart, RawRadioOutput};
 pub use runtime::{CustomProtocolRuntime, ProtocolRuntimeOutput};
 pub use schema::{
     load_protocol_schema, BitDefinition, ByteMatch, ChecksumAlgorithm, ChecksumValidation,
