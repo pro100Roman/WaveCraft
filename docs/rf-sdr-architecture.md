@@ -28,7 +28,8 @@ The first RF version must:
 - show a live spectrum and waterfall in a generic **RF Spectrum** view;
 - record raw IQ in native `.dsv` recordings and replay it through the same DSP;
 - detect discontinuities instead of silently joining samples across overruns;
-- support deterministic built-in 2-FSK and GFSK decoding; and
+- support deterministic built-in 2-FSK and GFSK decoding as the first
+  modulation family behind a modulation-neutral analyzer contract; and
 - hand framed packet bytes to the existing structured decoder model and, in a
   later schema revision, to custom YAML protocols.
 
@@ -54,19 +55,24 @@ HackRF callback / transfer pool
              `----> RF channelizer
                          |
                          v
-                   FSK/GFSK demodulator
+                 selected demodulator
                          |
-                         v
-                    timed soft bits
-                         |
-                         v
-              bit transforms + packet framer
-                         |
-                         v
-                    timed packet bytes
-                         |
-                         v
-                structured/YAML protocol parser
+             +-----------+-----------+
+             |                       |
+             v                       v
+      timed soft symbols      timed analog samples
+             |
+             v
+       symbol mapping
+             |
+             v
+   bit transforms + packet framer
+             |
+             v
+      timed packet bytes
+             |
+             v
+  structured/YAML protocol parser
 ```
 
 Raw IQ is the source of truth. Spectrum rows, waterfall pixels, discriminator
@@ -101,8 +107,10 @@ or GUI types.
 - complex normalization and optional DC/IQ correction;
 - frequency translation, FIR filtering, decimation, and rational resampling;
 - FFT windows, power spectra, averaging, and peak hold;
-- carrier detection, FSK discrimination, GFSK matched filtering, and symbol
-  timing; and
+- reusable carrier detection, AGC, squelch, AFC, carrier recovery, and symbol
+  timing;
+- pluggable digital and analog demodulators, with FSK/GFSK as the first digital
+  implementation; and
 - bitstream transformations and radio packet framing.
 
 The existing scope FFT can later use the same window and spectrum primitives,
@@ -238,6 +246,54 @@ back into a hardware driver or reads pixels from the RF view. The analyzer
 configuration, including every DSP parameter, is snapshot into the project so
 offline results remain reproducible.
 
+### Modulation-neutral analyzer contracts
+
+FSK/GFSK is the first implemented demodulator family, not the architecture's
+top-level abstraction. Channel selection, rate conversion, AGC, squelch, AFC,
+carrier recovery, and symbol timing are reusable DSP blocks. A selected
+demodulator consumes a channelized stream and produces one of two typed output
+families:
+
+- a digital demodulator emits timed soft symbols with a symbol alphabet,
+  per-symbol likelihoods or confidence, source-sample ranges, and lock
+  diagnostics; or
+- an analog demodulator emits a bounded real-valued sample stream with its
+  sample rate, source-sample mapping, and lock/squelch diagnostics.
+
+Binary FSK and GFSK map their two-symbol soft output into timed bits. Later
+OOK/ASK, M-FSK, BPSK/QPSK, and QAM implementations use the same soft-symbol
+contract with different alphabets and carrier/timing requirements. AM, FM, and
+SSB use the analog-stream contract and do not pass through a pretend bit or
+packet layer. Chirp and spread-spectrum schemes may provide a specialized
+first-party demodulator while still preserving the same channelized input,
+source ranges, bounded state, reset behavior, and diagnostics.
+
+Application-facing configuration uses a tagged modulation profile rather than
+placing FSK fields in shared settings. Each profile owns only parameters that
+apply to that modulation. The GUI renders the selected profile's controls
+dynamically, and recordings/projects persist the tagged profile and component
+versions. Adding a modulation must not change the raw IQ, channelizer,
+recording, or RF-view contracts.
+
+The implementation boundary is conceptually:
+
+```rust
+pub enum DemodulatedBatch {
+    SoftSymbols(TimedSoftSymbolBatch),
+    Analog(TimedAnalogBatch),
+}
+
+pub trait Demodulator {
+    fn reset(&mut self);
+    fn push(&mut self, input: &ChannelizedBatch)
+        -> Result<DemodulatedBatch, DspError>;
+}
+```
+
+Concrete blocks may use narrower internal types for efficiency. The public
+contract must report discontinuities and must never silently coerce analog or
+multi-symbol modulation into binary bits.
+
 ### Reusable signal profiles
 
 The GUI initially builds this stack from typed settings. A later reusable
@@ -279,8 +335,9 @@ protocol YAML. Importing or reloading a signal profile rebuilds the analyzer
 plan transactionally and keeps the previous valid plan on error.
 
 Built-in FSK/GFSK blocks are the reference implementation for the first
-version. A later out-of-process signal-decoder plugin uses the same typed
-soft-bit or packet output contracts. By default such a plugin receives a
+version. Later in-process modulation blocks and an out-of-process
+signal-decoder plugin use the same typed soft-symbol, analog-stream, or packet
+output contracts. By default such a plugin receives a
 host-channelized, rate-limited IQ stream rather than the entire wideband device
 stream; requesting full-rate IQ is an explicit capability with stricter queue,
 memory, and timeout limits.
@@ -340,14 +397,16 @@ explicit estimation tool; it must not silently change a saved decoder profile.
 Four-level FSK is also later work because it requires multi-threshold symbol
 decisions and a symbol-to-bit mapping rather than the binary slicer.
 
-### Symbol timing and soft bits
+### Symbol timing and soft symbols
 
 The discriminator stream passes through matched filtering and a clock-recovery
 stage such as an early/late or Gardner loop. A fixed-rate sampler is sufficient
 for deterministic initial tests, but production decoding must tolerate modest
 clock mismatch without accumulating a full-symbol error over a packet.
 
-The demodulator emits soft decisions rather than immediately packing bytes:
+Digital demodulators emit soft symbols rather than immediately packing bytes.
+The generic contract retains likelihoods for every member of the configured
+alphabet. Binary modulation can expose its compact compatibility view as:
 
 ```rust
 pub struct TimedSoftBit {
@@ -356,7 +415,8 @@ pub struct TimedSoftBit {
 }
 ```
 
-The sign is the hard decision and magnitude is confidence. `range` refers to
+For this binary view, the sign is the hard decision and magnitude is
+confidence. `range` refers to
 the contributing samples in the original IQ source domain. Low confidence,
 loss of carrier, loop unlock, and input discontinuity are explicit events so a
 framer can reject or mark a packet instead of returning convincing bad data.
@@ -522,11 +582,13 @@ only deterministic simulation and recorded fixtures.
    simulated and recorded IQ.
 5. Add `wavecraft-hackrf` discovery, configuration, cancellation, and receive
    streaming with opt-in hardware tests.
-6. Add channelization and built-in 2-FSK decoding, then GFSK matched filtering
-   and timing recovery.
-7. Add bit transforms, packet framing, CRC diagnostics, and packet inspection
+6. Add channelization, modulation-neutral timed-symbol contracts, reusable
+   synchronization, and built-in 2-FSK/GFSK decoding.
+7. Add pluggable-demodulator registration and analog-stream contracts before
+   expanding to additional digital and analog modulation families.
+8. Add bit transforms, packet framing, CRC diagnostics, and packet inspection
    in the GUI/CLI.
-8. Generalize the custom-protocol input contract in a new schema version and
+9. Generalize the custom-protocol input contract in a new schema version and
    attach YAML parsing above framed RF packet bytes.
 
 This order validates high-rate memory behavior, recording compatibility, and

@@ -51,11 +51,13 @@ project file, recording identity rules, and implementation sequence are
 specified in [Custom protocol decoding architecture](custom-protocols.md).
 
 Radio modulation decoding follows the same layering rule. An RF channelizer
-and FSK/GFSK demodulator consume IQ samples and emit timed soft bits; line-code,
-whitening, synchronization, and packet-framing stages turn those bits into
-timed packet bytes. Only then may a custom YAML schema assign application-level
-meaning to fields. YAML schemas do not implement filters, carrier recovery,
-symbol timing, or bit slicing.
+feeds a selected pluggable demodulator. Digital demodulators emit generic timed
+soft symbols that a modulation-specific mapper may turn into bits; analog
+demodulators emit bounded timed real-valued streams without pretending they are
+digital data. Line-code, whitening, synchronization, and packet-framing stages
+turn mapped bits into timed packet bytes. Only then may a custom YAML schema
+assign application-level meaning to fields. YAML schemas do not implement
+filters, carrier recovery, symbol timing, modulation, or bit slicing.
 
 Live capture and recording loading use the same incremental engine. Decoders
 consume ordered capture data independently of the GUI's bounded display
