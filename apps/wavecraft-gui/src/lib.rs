@@ -7645,7 +7645,7 @@ fn paint_radio_capture_settings(
             "Center frequency",
             &mut settings.capture.center_frequency_hz,
             &radio.capabilities.frequency_hz,
-            false,
+            true,
         );
         ui.add_space(4.0);
         paint_radio_mhz_control(
