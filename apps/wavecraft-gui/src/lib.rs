@@ -7534,11 +7534,22 @@ fn radio_hz_from_mhz(domain: &ValueDomain, value_mhz: f64) -> u64 {
     nearest_domain_value(domain, requested_hz)
 }
 
+fn format_radio_mhz_number(value_hz: u64) -> String {
+    let whole = value_hz / 1_000_000;
+    let remainder = value_hz % 1_000_000;
+    if remainder == 0 {
+        return whole.to_string();
+    }
+    let fractional = format!("{remainder:06}");
+    format!("{whole}.{}", fractional.trim_end_matches('0'))
+}
+
 fn paint_radio_mhz_control(
     ui: &mut egui::Ui,
     label: &str,
     value_hz: &mut u64,
     domain: &ValueDomain,
+    unit_outside: bool,
 ) {
     let bounds = match domain {
         ValueDomain::Discrete(values) => values
@@ -7553,45 +7564,65 @@ fn paint_radio_mhz_control(
     let mut editor = egui::DragValue::new(&mut value_mhz)
         .speed(0.001)
         .min_decimals(3)
-        .max_decimals(6)
-        .suffix(" MHz");
+        .max_decimals(6);
     if let Some((minimum_hz, maximum_hz)) = bounds {
         editor = editor.range(minimum_hz as f64 / 1_000_000.0..=maximum_hz as f64 / 1_000_000.0);
     }
-    if ui.add(editor).changed() {
+    let changed = if unit_outside {
+        ui.horizontal(|ui| {
+            let changed = ui.add(editor).changed();
+            ui.label(RichText::new("MHz").small().color(TEXT_MUTED));
+            changed
+        })
+        .inner
+    } else {
+        ui.add(editor.suffix(" MHz")).changed()
+    };
+    if changed {
         *value_hz = radio_hz_from_mhz(domain, value_mhz);
     }
 }
 
-fn paint_radio_domain_control(
-    ui: &mut egui::Ui,
-    id_salt: &'static str,
-    label: &str,
-    value: &mut u64,
-    domain: &ValueDomain,
-    width_fraction: f32,
-) {
-    ui.label(RichText::new(label).small().color(TEXT_MUTED));
-    match domain {
-        ValueDomain::Discrete(values) => {
-            egui::ComboBox::from_id_salt(id_salt)
-                .width(ui.available_width() * width_fraction.clamp(0.1, 1.0))
-                .selected_text(format_radio_value(*value))
-                .show_ui(ui, |ui| {
-                    for choice in values {
-                        ui.selectable_value(value, *choice, format_radio_value(*choice));
-                    }
-                });
+fn paint_radio_bandwidth_control(ui: &mut egui::Ui, value: &mut u64, domain: &ValueDomain) {
+    ui.label(
+        RichText::new("Baseband bandwidth")
+            .small()
+            .color(TEXT_MUTED),
+    );
+    let editor_width = ui.available_width() / 3.0;
+    ui.horizontal(|ui| {
+        match domain {
+            ValueDomain::Discrete(values) => {
+                egui::ComboBox::from_id_salt("radio_bandwidth")
+                    .width(editor_width)
+                    .selected_text(format_radio_mhz_number(*value))
+                    .show_ui(ui, |ui| {
+                        for choice in values {
+                            ui.selectable_value(value, *choice, format_radio_mhz_number(*choice));
+                        }
+                    });
+            }
+            ValueDomain::Stepped { range, step } => {
+                let mut value_mhz = *value as f64 / 1_000_000.0;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut value_mhz)
+                            .range(
+                                *range.start() as f64 / 1_000_000.0
+                                    ..=*range.end() as f64 / 1_000_000.0,
+                            )
+                            .speed(*step as f64 / 1_000_000.0)
+                            .min_decimals(3)
+                            .max_decimals(6),
+                    )
+                    .changed()
+                {
+                    *value = radio_hz_from_mhz(domain, value_mhz);
+                }
+            }
         }
-        ValueDomain::Stepped { range, step } => {
-            ui.add(
-                egui::DragValue::new(value)
-                    .range(range.clone())
-                    .speed((*step).max(1) as f64)
-                    .suffix(" Hz"),
-            );
-        }
-    }
+        ui.label(RichText::new("MHz").small().color(TEXT_MUTED));
+    });
     *value = nearest_domain_value(domain, *value);
 }
 
@@ -7614,6 +7645,7 @@ fn paint_radio_capture_settings(
             "Center frequency",
             &mut settings.capture.center_frequency_hz,
             &radio.capabilities.frequency_hz,
+            false,
         );
         ui.add_space(4.0);
         paint_radio_mhz_control(
@@ -7621,15 +7653,13 @@ fn paint_radio_capture_settings(
             "Sample rate",
             &mut settings.capture.sample_rate_hz,
             &radio.capabilities.sample_rates_hz,
+            true,
         );
         ui.add_space(4.0);
-        paint_radio_domain_control(
+        paint_radio_bandwidth_control(
             ui,
-            "radio_bandwidth",
-            "Baseband bandwidth",
             &mut settings.capture.bandwidth_hz,
             &radio.capabilities.bandwidths_hz,
-            1.0 / 3.0,
         );
         if settings.capture.bandwidth_hz > settings.capture.sample_rate_hz {
             ui.label(
@@ -15621,6 +15651,13 @@ mod tests {
             step: 1,
         };
         assert_eq!(radio_hz_from_mhz(&sample_rate_domain, 12.5), 12_500_000);
+    }
+
+    #[test]
+    fn radio_mhz_numbers_omit_the_unit_and_trailing_zeroes() {
+        assert_eq!(format_radio_mhz_number(1_750_000), "1.75");
+        assert_eq!(format_radio_mhz_number(5_500_000), "5.5");
+        assert_eq!(format_radio_mhz_number(20_000_000), "20");
     }
 
     #[test]
