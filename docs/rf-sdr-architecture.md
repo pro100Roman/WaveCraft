@@ -8,8 +8,9 @@ configurable BT and adaptive symbol timing with bounded clock-error tracking.
 A stable-ID demodulator registry and modulation-tagged analyzer profiles expose
 typed FSK/GFSK factories without making them the top-level architecture. The
 GUI persists those profiles and runs the selected analyzer for live and replayed
-IQ into a bounded modulation-neutral output store. Configuration controls and
-rendering of timed soft symbols remain to be added.
+IQ into a bounded modulation-neutral output store. An expandable Signal
+Analyzer panel edits the tagged channel, modulation, and timing settings;
+rendering of timed soft symbols remains to be added.
 
 WaveCraft treats HackRF as the first backend for a generic radio-receiver
 instrument, not as a GUI-specific feature. The backend produces ordered raw IQ

@@ -34,7 +34,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -7872,7 +7872,330 @@ fn paint_radio_capture_settings(
                         runtime_enabled,
                     );
                 });
+            ui.separator();
+            egui::CollapsingHeader::new(RichText::new("Signal analyzer").strong())
+                .id_salt("radio_signal_analyzer_section")
+                .default_open(false)
+                .show(ui, |ui| {
+                    paint_radio_analyzer_configuration(
+                        ui,
+                        &mut settings.analyzer,
+                        settings.capture.sample_rate_hz,
+                        enabled,
+                    );
+                });
         });
+}
+
+fn paint_scaled_u64_value(
+    ui: &mut egui::Ui,
+    value: &mut u64,
+    scale: f64,
+    range: RangeInclusive<f64>,
+    unit: &str,
+) {
+    let mut scaled = *value as f64 / scale;
+    let changed = ui
+        .horizontal(|ui| {
+            let changed = add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut scaled)
+                    .range(range)
+                    .speed(0.001)
+                    .min_decimals(3)
+                    .max_decimals(6),
+            )
+            .changed();
+            ui.label(unit);
+            changed
+        })
+        .inner;
+    if changed {
+        *value = (scaled * scale).round().max(0.0) as u64;
+    }
+}
+
+fn paint_scaled_i64_value(
+    ui: &mut egui::Ui,
+    value: &mut i64,
+    scale: f64,
+    range: RangeInclusive<f64>,
+    unit: &str,
+) {
+    let mut scaled = *value as f64 / scale;
+    let changed = ui
+        .horizontal(|ui| {
+            let changed = add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut scaled)
+                    .range(range)
+                    .speed(0.001)
+                    .min_decimals(3)
+                    .max_decimals(6),
+            )
+            .changed();
+            ui.label(unit);
+            changed
+        })
+        .inner;
+    if changed {
+        *value = (scaled * scale).round() as i64;
+    }
+}
+
+fn paint_radio_analyzer_configuration(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    capture_sample_rate_hz: u64,
+    enabled: bool,
+) {
+    ui.set_max_width(ui.available_width());
+    egui::Grid::new("radio_signal_analyzer_configuration")
+        .num_columns(2)
+        .max_col_width(126.0)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            paint_radio_parameter_label(
+                ui,
+                "Enable analyzer",
+                Some("Channelize captured IQ and run the selected demodulator"),
+            );
+            ui.add_enabled(
+                enabled,
+                egui::Checkbox::without_text(&mut settings.enabled),
+            );
+            ui.end_row();
+
+            let controls_enabled = enabled && settings.enabled;
+            paint_radio_parameter_label(
+                ui,
+                "Modulation",
+                Some("Selects a modulation-specific profile; unrelated parameters remain hidden"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                egui::ComboBox::from_id_salt("radio_analyzer_modulation")
+                    .width(RADIO_VALUE_WIDTH)
+                    .selected_text(match settings.demodulation {
+                        RadioDemodulation::BinaryFsk => "2-FSK",
+                        RadioDemodulation::BinaryGfsk => "GFSK",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut settings.demodulation,
+                            RadioDemodulation::BinaryFsk,
+                            "2-FSK",
+                        );
+                        ui.selectable_value(
+                            &mut settings.demodulation,
+                            RadioDemodulation::BinaryGfsk,
+                            "GFSK",
+                        );
+                    });
+            });
+            ui.end_row();
+
+            let half_span_mhz = capture_sample_rate_hz as f64 / 2_000_000.0;
+            paint_radio_parameter_label(
+                ui,
+                "Channel offset",
+                Some("Offset from the capture center frequency to the signal center"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                paint_scaled_i64_value(
+                    ui,
+                    &mut settings.channel_offset_hz,
+                    1_000_000.0,
+                    -half_span_mhz..=half_span_mhz,
+                    "MHz",
+                );
+            });
+            ui.end_row();
+
+            let capture_rate_mhz = capture_sample_rate_hz as f64 / 1_000_000.0;
+            paint_radio_parameter_label(
+                ui,
+                "Channel bandwidth",
+                Some("Full complex bandwidth retained around the selected channel"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                paint_scaled_u64_value(
+                    ui,
+                    &mut settings.channel_bandwidth_hz,
+                    1_000_000.0,
+                    0.000_001..=capture_rate_mhz.max(0.000_001),
+                    "MHz",
+                );
+            });
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
+                "Processing rate",
+                Some("IQ sample rate after channel filtering and bounded downsampling"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                paint_scaled_u64_value(
+                    ui,
+                    &mut settings.output_sample_rate_hz,
+                    1_000_000.0,
+                    0.000_001..=capture_rate_mhz.max(0.000_001),
+                    "MHz",
+                );
+            });
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
+                "Channel filter taps",
+                Some("Odd FIR length from 3 to 4095; more taps improve rejection but cost CPU"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                add_left_aligned_sized(
+                    ui,
+                    egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                    egui::DragValue::new(&mut settings.filter_tap_count)
+                        .range(3..=4_095)
+                        .speed(2),
+                );
+            });
+            settings.filter_tap_count = settings.filter_tap_count.clamp(3, 4_095) | 1;
+            ui.end_row();
+
+            let processing_rate_khz = settings.output_sample_rate_hz as f64 / 1_000.0;
+            paint_radio_parameter_label(ui, "Symbol rate", Some("Configured symbol clock"));
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                paint_scaled_u64_value(
+                    ui,
+                    &mut settings.symbol_rate_hz,
+                    1_000.0,
+                    0.001..=(processing_rate_khz / 2.0).max(0.001),
+                    "ksym/s",
+                );
+            });
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
+                "Frequency deviation",
+                Some("Expected mark or space displacement from the channel center"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                paint_scaled_u64_value(
+                    ui,
+                    &mut settings.deviation_hz,
+                    1_000.0,
+                    0.001..=(processing_rate_khz / 2.0).max(0.001),
+                    "kHz",
+                );
+            });
+            ui.end_row();
+
+            if settings.demodulation == RadioDemodulation::BinaryGfsk {
+                paint_radio_parameter_label(
+                    ui,
+                    "Gaussian BT",
+                    Some("Expected transmitter Gaussian bandwidth-time product"),
+                );
+                ui.add_enabled_ui(controls_enabled, |ui| {
+                    let mut bt = f64::from(settings.gfsk_bt_milli) / 1_000.0;
+                    if add_left_aligned_sized(
+                        ui,
+                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut bt)
+                            .range(0.01..=2.0)
+                            .speed(0.01)
+                            .min_decimals(2)
+                            .max_decimals(3),
+                    )
+                    .changed()
+                    {
+                        settings.gfsk_bt_milli = (bt * 1_000.0).round() as u32;
+                    }
+                });
+                ui.end_row();
+            }
+
+            paint_radio_parameter_label(ui, "Polarity", Some("Swaps mark and space decisions"));
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                egui::ComboBox::from_id_salt("radio_analyzer_polarity")
+                    .width(RADIO_VALUE_WIDTH)
+                    .selected_text(if settings.inverted {
+                        "Inverted"
+                    } else {
+                        "Normal"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut settings.inverted, false, "Normal");
+                        ui.selectable_value(&mut settings.inverted, true, "Inverted");
+                    });
+            });
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
+                "Adaptive timing",
+                Some("Tracks modest transmitter symbol-clock error; acquisition starts after transitions"),
+            );
+            ui.add_enabled(
+                controls_enabled,
+                egui::Checkbox::without_text(&mut settings.adaptive_timing),
+            );
+            ui.end_row();
+
+            if settings.adaptive_timing {
+                paint_radio_parameter_label(
+                    ui,
+                    "Timing loop bandwidth",
+                    Some("Higher values track faster but admit more timing jitter"),
+                );
+                ui.add_enabled_ui(controls_enabled, |ui| {
+                    let mut bandwidth =
+                        f64::from(settings.timing_loop_bandwidth_milli) / 1_000.0;
+                    if add_left_aligned_sized(
+                        ui,
+                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut bandwidth)
+                            .range(0.001..=1.0)
+                            .speed(0.001)
+                            .min_decimals(3)
+                            .max_decimals(3),
+                    )
+                    .changed()
+                    {
+                        settings.timing_loop_bandwidth_milli =
+                            (bandwidth * 1_000.0).round() as u32;
+                    }
+                });
+                ui.end_row();
+
+                paint_radio_parameter_label(
+                    ui,
+                    "Clock error limit",
+                    Some("Maximum symbol-clock correction allowed by the timing loop"),
+                );
+                ui.add_enabled_ui(controls_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        add_left_aligned_sized(
+                            ui,
+                            egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                            egui::DragValue::new(&mut settings.max_clock_error_ppm)
+                                .range(0..=250_000)
+                                .speed(100),
+                        );
+                        ui.label("ppm");
+                    });
+                });
+                ui.end_row();
+            }
+        });
+
+    if settings.enabled {
+        if let Err(error) = settings.signal_profile() {
+            ui.label(RichText::new(error).small().color(Color32::LIGHT_RED));
+        }
+    }
 }
 
 fn paint_radio_receive_configuration(
