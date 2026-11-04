@@ -1,6 +1,7 @@
 mod devices;
 mod measurements;
 mod protocol_analyzer;
+mod radio_analyzer;
 mod recording;
 mod sessions;
 mod snapshot;
@@ -23,6 +24,7 @@ use protocol_analyzer::{
     ProtocolDataFormat, ProtocolDecodeOutcome, ProtocolDecodeSnapshot, ProtocolDecodedEvent,
     ProtocolDecodedKind, PROTOCOLS,
 };
+use radio_analyzer::RadioAnalyzerRuntime;
 use recording::{
     choose_recording_save_path, choose_recording_to_open, choose_saleae_export_path,
     create_saleae_export_file,
@@ -48,10 +50,10 @@ use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
 };
+use wavecraft_decode::{BitOrder, RawRadioConfig};
 use wavecraft_dsp::{
-    BinaryFskProfile, BinaryGfskProfile, ChannelizerConfig, DemodulationProfile,
-    DemodulatorRegistry, FskPolarity, FskTiming, SignalAnalyzer, SignalAnalyzerProfile,
-    SpectrumProcessor, SpectrumWindow,
+    BinaryFskProfile, BinaryGfskProfile, ChannelizerConfig, DemodulationProfile, FskPolarity,
+    FskTiming, SignalAnalyzerProfile, SpectrumProcessor, SpectrumWindow,
 };
 use wavecraft_hackrf::{HackRfAdapter, HackRfRuntimeControl, HackRfRuntimeSettings};
 use wavecraft_recording::{
@@ -2887,7 +2889,7 @@ fn extend_bounded_to<T>(
 fn ingest_radio_iq(
     waveforms: &mut WaveformStore,
     spectrum: &mut SpectrumProcessor,
-    analyzer: &mut Option<SignalAnalyzer>,
+    analyzer: &mut Option<RadioAnalyzerRuntime>,
     iq: &wavecraft_core::IqBatch,
 ) {
     for frame in spectrum.push(iq) {
@@ -2895,9 +2897,11 @@ fn ingest_radio_iq(
     }
     let analysis = analyzer.as_mut().map(|analyzer| analyzer.push(iq));
     if let Some(analysis) = analysis {
-        let analysis = analysis
-            .map_err(|error| error.to_string())
-            .and_then(|output| waveforms.radio_analysis.ingest(output));
+        let analysis = analysis.and_then(|output| {
+            waveforms.radio_analysis.ingest(output.demodulated)?;
+            waveforms.radio_analysis.ingest_raw(output.raw);
+            Ok(())
+        });
         if let Err(error) = analysis {
             waveforms.radio_analysis.set_error(error);
             *analyzer = None;
@@ -2918,7 +2922,7 @@ struct ActiveCapture {
     waveforms: WaveformStore,
     protocol_decode: ProtocolCaptureDecoder,
     radio_spectrum: SpectrumProcessor,
-    radio_analyzer: Option<SignalAnalyzer>,
+    radio_analyzer: Option<RadioAnalyzerRuntime>,
     recorder: Option<FileRecorder>,
     recording_path: Option<PathBuf>,
     has_logic: bool,
@@ -2988,6 +2992,7 @@ struct RadioCaptureRequest {
     provider_settings: RadioProviderSettings,
     iq_correction_enabled: bool,
     analyzer_profile: Option<SignalAnalyzerProfile>,
+    raw_config: RawRadioConfig,
 }
 
 #[derive(Clone)]
@@ -3103,6 +3108,8 @@ struct RadioAnalyzerSettings {
     adaptive_timing: bool,
     timing_loop_bandwidth_milli: u32,
     max_clock_error_ppm: u32,
+    preamble_byte: u8,
+    preamble_bytes: usize,
 }
 
 impl Default for RadioAnalyzerSettings {
@@ -3121,11 +3128,21 @@ impl Default for RadioAnalyzerSettings {
             adaptive_timing: true,
             timing_loop_bandwidth_milli: 100,
             max_clock_error_ppm: 10_000,
+            preamble_byte: 0xaa,
+            preamble_bytes: 4,
         }
     }
 }
 
 impl RadioAnalyzerSettings {
+    fn raw_config(&self) -> RawRadioConfig {
+        RawRadioConfig {
+            preamble_byte: self.preamble_byte,
+            preamble_bytes: self.preamble_bytes,
+            bit_order: BitOrder::MostSignificantFirst,
+        }
+    }
+
     fn signal_profile(&self) -> Result<Option<SignalAnalyzerProfile>, String> {
         if !self.enabled {
             return Ok(None);
@@ -3209,7 +3226,7 @@ enum WorkerSuccess {
         scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
         radio_runtime_control: Option<HackRfRuntimeControl>,
         radio_spectrum: Box<SpectrumProcessor>,
-        radio_analyzer: Option<Box<SignalAnalyzer>>,
+        radio_analyzer: Option<Box<RadioAnalyzerRuntime>>,
     },
     ScopeConfigured,
     ScopeAutoCalibrated(DsCopeCalibrationValues),
@@ -3581,12 +3598,15 @@ impl WaveCraftApp {
             }
         };
         let analyzer_profile = self.radio_settings.analyzer.signal_profile()?;
+        let raw_config = self.radio_settings.analyzer.raw_config();
+        raw_config.validate().map_err(|error| error.to_string())?;
         Ok(RadioCaptureRequest {
             device,
             settings,
             provider_settings,
             iq_correction_enabled: self.radio_settings.iq_correction_enabled,
             analyzer_profile,
+            raw_config,
         })
     }
 
@@ -10463,6 +10483,14 @@ fn start_gui_recording(
             "max_clock_error_ppm",
             radio_settings.analyzer.max_clock_error_ppm.to_string(),
         ),
+        (
+            "preamble_byte",
+            radio_settings.analyzer.preamble_byte.to_string(),
+        ),
+        (
+            "preamble_bytes",
+            radio_settings.analyzer.preamble_bytes.to_string(),
+        ),
     ] {
         metadata.insert(format!("radio.analyzer.{key}"), value);
     }
@@ -11013,6 +11041,12 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.max_clock_error_ppm") {
         settings.analyzer.max_clock_error_ppm = value;
     }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.preamble_byte") {
+        settings.analyzer.preamble_byte = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.preamble_bytes") {
+        settings.analyzer.preamble_bytes = value;
+    }
     for (key, value) in metadata {
         let Some(id) = key
             .strip_prefix("radio.gain.")
@@ -11066,11 +11100,7 @@ fn read_gui_recording_with_analyzers(
             .with_iq_correction(radio_settings.iq_correction_enabled);
     let mut radio_analyzer = match radio_settings.analyzer.signal_profile() {
         Ok(Some(profile)) => {
-            let analyzer = DemodulatorRegistry::with_builtins()
-                .map_err(|error| error.to_string())
-                .and_then(|registry| {
-                    SignalAnalyzer::new(profile, &registry).map_err(|error| error.to_string())
-                });
+            let analyzer = RadioAnalyzerRuntime::new(profile, radio_settings.analyzer.raw_config());
             match analyzer {
                 Ok(analyzer) => Some(analyzer),
                 Err(error) => {
@@ -11398,7 +11428,7 @@ struct StartedCapture {
     scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
     radio_runtime_control: Option<HackRfRuntimeControl>,
     radio_spectrum: SpectrumProcessor,
-    radio_analyzer: Option<SignalAnalyzer>,
+    radio_analyzer: Option<RadioAnalyzerRuntime>,
 }
 
 fn start_capture(
@@ -11414,13 +11444,13 @@ fn start_capture(
         .is_some_and(|request| request.iq_correction_enabled);
     let radio_analyzer = radio_request
         .as_ref()
-        .and_then(|request| request.analyzer_profile.clone())
-        .map(|profile| {
-            let registry = DemodulatorRegistry::with_builtins()
-                .map_err(|error| format!("failed to initialize demodulators: {error}"))?;
-            SignalAnalyzer::new(profile, &registry)
-                .map_err(|error| format!("invalid radio analyzer profile: {error}"))
+        .and_then(|request| {
+            request
+                .analyzer_profile
+                .clone()
+                .map(|profile| (profile, request.raw_config))
         })
+        .map(|(profile, raw_config)| RadioAnalyzerRuntime::new(profile, raw_config))
         .transpose()?;
     let mut sources = Vec::<Box<dyn CaptureSource>>::with_capacity(
         devices.len() + usize::from(radio_request.is_some()),
@@ -16549,6 +16579,8 @@ mod tests {
                 "radio.analyzer.max_clock_error_ppm".to_owned(),
                 "20000".to_owned(),
             ),
+            ("radio.analyzer.preamble_byte".to_owned(), "85".to_owned()),
+            ("radio.analyzer.preamble_bytes".to_owned(), "12".to_owned()),
         ]);
 
         let settings = radio_settings_from_recording_metadata(&metadata).analyzer;
@@ -16566,6 +16598,8 @@ mod tests {
         assert!(!settings.adaptive_timing);
         assert_eq!(settings.timing_loop_bandwidth_milli, 50);
         assert_eq!(settings.max_clock_error_ppm, 20_000);
+        assert_eq!(settings.preamble_byte, 0x55);
+        assert_eq!(settings.preamble_bytes, 12);
     }
 
     #[test]
@@ -16583,8 +16617,7 @@ mod tests {
         };
         settings.demodulation = RadioDemodulation::BinaryFsk;
         let profile = settings.signal_profile().unwrap().unwrap();
-        let registry = DemodulatorRegistry::with_builtins().unwrap();
-        let mut analyzer = Some(SignalAnalyzer::new(profile, &registry).unwrap());
+        let mut analyzer = Some(RadioAnalyzerRuntime::new(profile, settings.raw_config()).unwrap());
         let mut spectrum =
             SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann).unwrap();
         let bits = [true, false, true, true, false, false, true];
@@ -17334,6 +17367,11 @@ mod tests {
             provider_settings: RadioProviderSettings::HackRf(HackRfSettings::default()),
             iq_correction_enabled: true,
             analyzer_profile: None,
+            raw_config: RawRadioConfig {
+                preamble_byte: 0xaa,
+                preamble_bytes: 4,
+                bit_order: BitOrder::MostSignificantFirst,
+            },
         };
         let logic_config = LogicCaptureSettings::default().capture_config().unwrap();
         let scope_config = ScopeCaptureSettings::default().capture_config().unwrap();

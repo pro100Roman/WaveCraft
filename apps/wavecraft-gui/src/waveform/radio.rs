@@ -1,5 +1,6 @@
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use std::collections::VecDeque;
+use wavecraft_decode::{DecodeDiagnostic, RawRadioOutput, TimedByte};
 use wavecraft_dsp::{DemodulatedBatch, SpectrumFrame, TimedAnalogSample, TimedSoftSymbol};
 
 const DEFAULT_WATERFALL_CAPACITY: usize = 256;
@@ -20,6 +21,10 @@ pub struct RadioAnalysisStore {
     dropped_items: u64,
     discontinuities: u64,
     error: Option<String>,
+    raw_bytes: VecDeque<TimedByte>,
+    raw_synchronized: bool,
+    raw_dropped_bytes: u64,
+    raw_diagnostics: VecDeque<DecodeDiagnostic>,
 }
 
 impl Default for RadioAnalysisStore {
@@ -33,6 +38,10 @@ impl Default for RadioAnalysisStore {
             dropped_items: 0,
             discontinuities: 0,
             error: None,
+            raw_bytes: VecDeque::new(),
+            raw_synchronized: false,
+            raw_dropped_bytes: 0,
+            raw_diagnostics: VecDeque::new(),
         }
     }
 }
@@ -54,6 +63,8 @@ impl RadioAnalysisStore {
                 batch.validate().map_err(|error| error.to_string())?;
                 if batch.discontinuity {
                     self.discontinuities = self.discontinuities.saturating_add(1);
+                    self.raw_bytes.clear();
+                    self.raw_synchronized = false;
                 }
                 if self.soft_symbol_alphabet_size != Some(batch.alphabet_size) {
                     self.soft_symbols.clear();
@@ -75,12 +86,25 @@ impl RadioAnalysisStore {
                 }
                 self.soft_symbols.clear();
                 self.soft_symbol_alphabet_size = None;
+                self.raw_bytes.clear();
+                self.raw_synchronized = false;
                 self.analog_samples.extend(batch.samples);
                 self.trim_analog_samples();
             }
         }
         self.error = None;
         Ok(())
+    }
+
+    pub fn ingest_raw(&mut self, output: RawRadioOutput) {
+        self.raw_synchronized = output.synchronized;
+        self.raw_bytes.extend(output.bytes);
+        let excess = self.raw_bytes.len().saturating_sub(self.capacity);
+        self.raw_bytes.drain(..excess);
+        self.raw_dropped_bytes = self.raw_dropped_bytes.saturating_add(excess as u64);
+        self.raw_diagnostics.extend(output.diagnostics);
+        let diagnostic_excess = self.raw_diagnostics.len().saturating_sub(32);
+        self.raw_diagnostics.drain(..diagnostic_excess);
     }
 
     pub fn set_error(&mut self, error: impl Into<String>) {
@@ -113,6 +137,22 @@ impl RadioAnalysisStore {
 
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    pub fn raw_bytes(&self) -> &VecDeque<TimedByte> {
+        &self.raw_bytes
+    }
+
+    pub fn raw_synchronized(&self) -> bool {
+        self.raw_synchronized
+    }
+
+    pub fn raw_dropped_bytes(&self) -> u64 {
+        self.raw_dropped_bytes
+    }
+
+    pub fn raw_diagnostics(&self) -> &VecDeque<DecodeDiagnostic> {
+        &self.raw_diagnostics
     }
 
     fn trim_soft_symbols(&mut self) {
