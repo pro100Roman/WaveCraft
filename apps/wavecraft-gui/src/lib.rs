@@ -7707,11 +7707,27 @@ fn paint_radio_capture_settings(
     runtime_enabled: bool,
 ) {
     ui.add_space(10.0);
-    egui::CollapsingHeader::new(RichText::new("Receive configuration").strong())
-        .id_salt("radio_receive_configuration_section")
-        .default_open(true)
+    let card_width = ui.available_width();
+    egui::Frame::none()
+        .fill(BACKGROUND)
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::same(10.0))
         .show(ui, |ui| {
-            paint_radio_receive_configuration(ui, radio, settings, enabled, runtime_enabled);
+            let content_width = (card_width - 20.0).max(0.0);
+            ui.set_width(content_width);
+            ui.set_max_width(content_width);
+            egui::CollapsingHeader::new(RichText::new("Receive configuration").strong())
+                .id_salt("radio_receive_configuration_section")
+                .default_open(true)
+                .show(ui, |ui| {
+                    paint_radio_receive_configuration(
+                        ui,
+                        radio,
+                        settings,
+                        enabled,
+                        runtime_enabled,
+                    );
+                });
         });
 }
 
