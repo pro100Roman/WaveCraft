@@ -90,7 +90,7 @@ const SAMPLE_COUNT: u64 = 1_000_000;
 const BUILD_VERSION_LABEL: &str = concat!("Version: ", env!("WAVECRAFT_BUILD_VERSION"));
 const LOGIC_CHANNEL_COUNT: usize = 16;
 const RADIO_SPECTRUM_FFT_LENGTH: usize = 2_048;
-const RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS: u64 = 1_000;
+const RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS: u64 = 1_000_000;
 const MAX_CAPTURE_EVENTS_PER_POLL: usize = 8;
 // Bound logic display storage by activity-preserving buckets. The bucket stride
 // expands to cover the configured finite or Loop duration without limiting the
@@ -3134,7 +3134,7 @@ struct RadioSettings {
     capture: RadioCaptureSettings,
     single_duration_millis: u64,
     trigger_enabled: bool,
-    trigger_pretrigger_millis: u64,
+    trigger_posttrigger_micros: u64,
     trigger_level_dbfs_tenths: i16,
     gains_db: BTreeMap<String, i32>,
     frequency_correction_milli_ppm: i32,
@@ -3258,7 +3258,7 @@ impl Default for RadioSettings {
             },
             single_duration_millis: 1_000,
             trigger_enabled: false,
-            trigger_pretrigger_millis: 10,
+            trigger_posttrigger_micros: 1_000,
             trigger_level_dbfs_tenths: -500,
             gains_db: BTreeMap::new(),
             frequency_correction_milli_ppm: 0,
@@ -4602,6 +4602,10 @@ impl WaveCraftApp {
         let protocol_analyzers = self.protocol_analyzer.analyzers.clone();
         let radio_trigger_threshold_dbfs =
             f32::from(self.radio_settings.trigger_level_dbfs_tenths) / 10.0;
+        let radio_trigger_posttrigger_samples = radio_microsecond_sample_count(
+            self.radio_settings.capture.sample_rate_hz,
+            self.radio_settings.trigger_posttrigger_micros,
+        );
         if let Some(active) = self.capture.as_mut() {
             active.protocol_decode.reconfigure(&protocol_analyzers);
             for _ in 0..MAX_CAPTURE_EVENTS_PER_POLL {
@@ -4609,9 +4613,15 @@ impl WaveCraftApp {
                     Ok(event) => match event {
                         CaptureEvent::Frame(frame) => {
                             if let Some(trigger) = active.radio_trigger.as_mut() {
-                                if let Err(error) =
-                                    trigger.set_threshold_dbfs(radio_trigger_threshold_dbfs)
-                                {
+                                let update_result = radio_trigger_posttrigger_samples
+                                    .as_ref()
+                                    .map_err(Clone::clone)
+                                    .and_then(|samples| {
+                                        trigger.set_threshold_dbfs(radio_trigger_threshold_dbfs)?;
+                                        trigger.set_posttrigger_samples(*samples);
+                                        Ok(())
+                                    });
+                                if let Err(error) = update_result {
                                     active.session.request_stop();
                                     finish_status = Some((
                                         Err(format!("RF trigger update failed: {error}")),
@@ -4650,8 +4660,6 @@ impl WaveCraftApp {
                             };
                             if let Some(event) = trigger_event {
                                 active.radio_spectrum.reset();
-                                active.waveforms.radio = RadioDisplayStore::default();
-                                active.waveforms.radio_analysis = RadioAnalysisStore::default();
                                 capture_status = Some(format!(
                                     "RF trigger · {:.3} MHz at {:.1} dBFS; capturing…",
                                     event.frequency_hz / 1_000_000.0,
@@ -7854,19 +7862,33 @@ fn radio_duration_sample_count(sample_rate_hz: u64, duration_millis: u64) -> Res
     u64::try_from(samples).map_err(|_| "RF Single capture is too long".to_owned())
 }
 
+fn radio_microsecond_sample_count(
+    sample_rate_hz: u64,
+    duration_micros: u64,
+) -> Result<u64, String> {
+    if sample_rate_hz == 0 {
+        return Err("RF sample rate must be greater than zero".to_owned());
+    }
+    let samples = u128::from(sample_rate_hz)
+        .saturating_mul(u128::from(duration_micros))
+        .div_ceil(1_000_000);
+    u64::try_from(samples).map_err(|_| "RF post-trigger interval is too long".to_owned())
+}
+
 fn radio_single_trigger_config(
     settings: &RadioSettings,
 ) -> Result<RadioSingleTriggerConfig, String> {
-    if settings.trigger_pretrigger_millis > RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS {
+    if settings.trigger_posttrigger_micros > RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS {
         return Err(format!(
-            "RF pre-trigger duration must not exceed {RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS} ms"
+            "RF post-trigger duration must not exceed {} ms",
+            RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS / 1_000
         ));
     }
     Ok(RadioSingleTriggerConfig {
         threshold_dbfs: f32::from(settings.trigger_level_dbfs_tenths) / 10.0,
-        pretrigger_samples: radio_duration_sample_count(
+        posttrigger_samples: radio_microsecond_sample_count(
             settings.capture.sample_rate_hz,
-            settings.trigger_pretrigger_millis,
+            settings.trigger_posttrigger_micros,
         )?,
         fft_length: RADIO_SPECTRUM_FFT_LENGTH,
         iq_correction_enabled: settings.iq_correction_enabled,
@@ -8564,7 +8586,7 @@ fn paint_radio_receive_configuration(
                 ui,
                 "Single duration",
                 Some(
-                    "Capture time used by RF Single when Wait for trigger is disabled; a triggered Single freezes immediately",
+                    "Capture time used by RF Single when Wait for trigger is disabled; a triggered Single uses Post-trigger instead",
                 ),
             );
             ui.add_enabled_ui(enabled, |ui| {
@@ -8595,7 +8617,7 @@ fn paint_radio_receive_configuration(
                 ui,
                 "Wait for trigger",
                 Some(
-                    "In RF Single mode, wait until the spectrum peak reaches the trigger level, then freeze immediately and discard later IQ",
+                    "In RF Single mode, wait until the spectrum peak reaches the trigger level, display the configured post-trigger interval, then freeze",
                 ),
             );
             ui.add_enabled_ui(enabled, |ui| {
@@ -8605,30 +8627,39 @@ fn paint_radio_receive_configuration(
 
             paint_radio_parameter_label(
                 ui,
-                "Pre-trigger",
+                "Post-trigger",
                 Some(
-                    "IQ history retained before the detected RF trigger, useful for preserving the start of short packets",
+                    "Additional IQ display time after the triggering FFT window. Resolution: 0.001 ms",
                 ),
             );
-            ui.add_enabled_ui(enabled && settings.trigger_enabled, |ui| {
+            ui.add_enabled_ui(
+                (enabled && settings.trigger_enabled) || trigger_runtime_enabled,
+                |ui| {
                 ui.horizontal(|ui| {
-                    let mut milliseconds = settings.trigger_pretrigger_millis;
+                    let mut milliseconds = settings.trigger_posttrigger_micros as f64 / 1_000.0;
                     if add_left_aligned_sized(
                         ui,
                         egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
                         egui::DragValue::new(&mut milliseconds)
-                            .range(0..=RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS)
-                            .speed(1),
+                            .range(
+                                0.0..=RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS as f64 / 1_000.0,
+                            )
+                            .speed(0.001)
+                            .min_decimals(3)
+                            .max_decimals(3),
                     )
                     .changed()
                     {
-                        settings.trigger_pretrigger_millis = milliseconds;
+                        settings.trigger_posttrigger_micros =
+                            (milliseconds * 1_000.0).round() as u64;
                     }
                     ui.label("ms");
                 });
-            });
-            settings.trigger_pretrigger_millis =
-                settings.trigger_pretrigger_millis.min(RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS);
+                },
+            );
+            settings.trigger_posttrigger_micros = settings
+                .trigger_posttrigger_micros
+                .min(RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS);
             ui.end_row();
 
             paint_radio_parameter_label(
@@ -10336,7 +10367,7 @@ impl eframe::App for WaveCraftApp {
                             RichText::new(if radio_runtime_controls_enabled {
                         "Device, sample-rate, IQ-correction, and antenna-power settings remain locked; tuning, frequency correction, and gain controls are live"
                             } else if radio_trigger_runtime_controls_enabled {
-                                "Settings remain locked while RF Single waits; the RF trigger level is live"
+                                "Settings remain locked while RF Single waits; RF trigger level and Post-trigger are live"
                             } else {
                                 "Settings are locked while an operation is running"
                             })
@@ -10846,8 +10877,8 @@ fn start_gui_recording(
         radio_settings.trigger_enabled.to_string(),
     );
     metadata.insert(
-        "radio.trigger_pretrigger_millis".to_owned(),
-        radio_settings.trigger_pretrigger_millis.to_string(),
+        "radio.trigger_posttrigger_micros".to_owned(),
+        radio_settings.trigger_posttrigger_micros.to_string(),
     );
     metadata.insert(
         "radio.trigger_level_dbfs_tenths".to_owned(),
@@ -11437,9 +11468,9 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
         settings.trigger_enabled = value;
     }
     if let Some(value) =
-        recording_metadata_value::<u64>(metadata, "radio.trigger_pretrigger_millis")
+        recording_metadata_value::<u64>(metadata, "radio.trigger_posttrigger_micros")
     {
-        settings.trigger_pretrigger_millis = value.min(RADIO_TRIGGER_PRETRIGGER_MAX_MILLIS);
+        settings.trigger_posttrigger_micros = value.min(RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS);
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.trigger_level_dbfs_tenths") {
         settings.trigger_level_dbfs_tenths = value;
@@ -16960,14 +16991,14 @@ mod tests {
     }
 
     #[test]
-    fn radio_single_trigger_derives_bounded_pretrigger_samples() {
+    fn radio_single_trigger_derives_fractional_millisecond_posttrigger_samples() {
         let mut settings = RadioSettings::default();
         settings.capture.sample_rate_hz = 10_000_000;
-        settings.trigger_pretrigger_millis = 10;
+        settings.trigger_posttrigger_micros = 125;
 
         let config = radio_single_trigger_config(&settings).unwrap();
 
-        assert_eq!(config.pretrigger_samples, 100_000);
+        assert_eq!(config.posttrigger_samples, 1_250);
         assert_eq!(config.fft_length, RADIO_SPECTRUM_FFT_LENGTH);
     }
 
@@ -17802,8 +17833,8 @@ mod tests {
         metadata.insert("radio.single_duration_millis".to_owned(), "2500".to_owned());
         metadata.insert("radio.trigger_enabled".to_owned(), "true".to_owned());
         metadata.insert(
-            "radio.trigger_pretrigger_millis".to_owned(),
-            "25".to_owned(),
+            "radio.trigger_posttrigger_micros".to_owned(),
+            "25000".to_owned(),
         );
         metadata.insert(
             "radio.trigger_level_dbfs_tenths".to_owned(),
@@ -17850,7 +17881,7 @@ mod tests {
         assert_eq!(settings.capture.bandwidth_hz, 8_000_000);
         assert_eq!(settings.single_duration_millis, 2_500);
         assert!(settings.trigger_enabled);
-        assert_eq!(settings.trigger_pretrigger_millis, 25);
+        assert_eq!(settings.trigger_posttrigger_micros, 25_000);
         assert_eq!(settings.trigger_level_dbfs_tenths, -425);
         assert_eq!(settings.frequency_correction_milli_ppm, -12_500);
         assert_eq!(settings.gains_db.get("lna"), Some(&24));
@@ -17971,7 +18002,7 @@ mod tests {
         .expect("GUI radio capture should start");
         let mut trigger = RadioSingleTrigger::new(RadioSingleTriggerConfig {
             threshold_dbfs: -120.0,
-            pretrigger_samples: 0,
+            posttrigger_samples: RADIO_SPECTRUM_FFT_LENGTH as u64,
             fft_length: RADIO_SPECTRUM_FFT_LENGTH,
             iq_correction_enabled: true,
         })
@@ -18006,7 +18037,7 @@ mod tests {
         session
             .stop()
             .expect("triggered HackRF capture should stop");
-        assert_eq!(retained_samples, RADIO_SPECTRUM_FFT_LENGTH);
+        assert_eq!(retained_samples, RADIO_SPECTRUM_FFT_LENGTH * 2);
     }
 
     #[test]

@@ -1,8 +1,7 @@
-use std::collections::VecDeque;
 use std::ops::Range;
 use std::time::Duration;
 
-use wavecraft_core::{CaptureBatch, CaptureFrame};
+use wavecraft_core::{CaptureBatch, CaptureFrame, IqBatch};
 use wavecraft_dsp::{
     SpectrumPowerTrigger, SpectrumPowerTriggerConfig, SpectrumPowerTriggerEvent, SpectrumWindow,
 };
@@ -10,7 +9,7 @@ use wavecraft_dsp::{
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RadioSingleTriggerConfig {
     pub threshold_dbfs: f32,
-    pub pretrigger_samples: u64,
+    pub posttrigger_samples: u64,
     pub fft_length: usize,
     pub iq_correction_enabled: bool,
 }
@@ -24,9 +23,8 @@ pub struct RadioSingleTriggerOutput {
 
 pub struct RadioSingleTrigger {
     detector: SpectrumPowerTrigger,
-    pretrigger: VecDeque<CaptureFrame>,
-    pretrigger_samples: u64,
-    retained_samples: u64,
+    posttrigger_samples: u64,
+    target_end_sample: Option<u64>,
     complete: bool,
 }
 
@@ -39,9 +37,8 @@ impl RadioSingleTrigger {
                 threshold_dbfs: config.threshold_dbfs,
                 iq_correction_enabled: config.iq_correction_enabled,
             })?,
-            pretrigger: VecDeque::new(),
-            pretrigger_samples: config.pretrigger_samples,
-            retained_samples: 0,
+            posttrigger_samples: config.posttrigger_samples,
+            target_end_sample: None,
             complete: false,
         })
     }
@@ -58,12 +55,21 @@ impl RadioSingleTrigger {
             });
         }
 
-        if iq.discontinuity {
-            self.clear_pretrigger();
+        if let Some(target_end_sample) = self.target_end_sample {
+            let frame_end = iq_end(iq)?;
+            let frames = trim_frame(frame, 0..target_end_sample)
+                .into_iter()
+                .collect();
+            self.complete = frame_end >= target_end_sample;
+            return Ok(RadioSingleTriggerOutput {
+                frames,
+                event: None,
+                complete: self.complete,
+            });
         }
+
         let event = self.detector.push(iq);
         let Some(event) = event else {
-            self.retain_pretrigger(frame)?;
             return Ok(RadioSingleTriggerOutput {
                 frames: Vec::new(),
                 event: None,
@@ -71,19 +77,14 @@ impl RadioSingleTrigger {
             });
         };
 
-        let retain_start = event
+        let target_end_sample = event
             .source_range
-            .start
-            .saturating_sub(self.pretrigger_samples);
-        let retain_end = event.source_range.end;
-        let mut frames = self
-            .pretrigger
-            .drain(..)
-            .filter_map(|queued| trim_frame(queued, retain_start..retain_end))
+            .end
+            .saturating_add(self.posttrigger_samples);
+        let frame_end = iq_end(iq)?;
+        let mut frames = trim_frame(frame, event.source_range.start..target_end_sample)
+            .into_iter()
             .collect::<Vec<_>>();
-        if let Some(frame) = trim_frame(frame, retain_start..retain_end) {
-            frames.push(frame);
-        }
         if let Some(CaptureFrame {
             payload: CaptureBatch::Iq(iq),
             ..
@@ -91,8 +92,10 @@ impl RadioSingleTrigger {
         {
             iq.discontinuity = true;
         }
-        self.retained_samples = 0;
-        self.complete = true;
+        self.complete = frame_end >= target_end_sample;
+        if !self.complete {
+            self.target_end_sample = Some(target_end_sample);
+        }
         Ok(RadioSingleTriggerOutput {
             frames,
             event: Some(event),
@@ -101,54 +104,26 @@ impl RadioSingleTrigger {
     }
 
     pub fn is_armed(&self) -> bool {
-        !self.complete
+        self.target_end_sample.is_none() && !self.complete
     }
 
     pub fn set_threshold_dbfs(&mut self, threshold_dbfs: f32) -> Result<(), String> {
         self.detector.set_threshold_dbfs(threshold_dbfs)
     }
 
-    fn retain_pretrigger(&mut self, frame: CaptureFrame) -> Result<(), String> {
-        let samples = iq_sample_count(&frame)?;
-        self.retained_samples = self.retained_samples.saturating_add(samples);
-        self.pretrigger.push_back(frame);
-        let mut excess = self
-            .retained_samples
-            .saturating_sub(self.pretrigger_samples);
-        while excess > 0 {
-            let Some(front) = self.pretrigger.pop_front() else {
-                break;
-            };
-            let front_samples = iq_sample_count(&front)?;
-            if excess >= front_samples {
-                self.retained_samples = self.retained_samples.saturating_sub(front_samples);
-                excess -= front_samples;
-                continue;
-            }
-            let CaptureBatch::Iq(iq) = &front.payload else {
-                unreachable!("pre-trigger queue only accepts IQ frames");
-            };
-            let start = iq.first_sample_index.saturating_add(excess);
-            if let Some(trimmed) = trim_frame(front, start..u64::MAX) {
-                self.pretrigger.push_front(trimmed);
-            }
-            self.retained_samples = self.retained_samples.saturating_sub(excess);
-            break;
+    pub fn set_posttrigger_samples(&mut self, posttrigger_samples: u64) {
+        if self.is_armed() {
+            self.posttrigger_samples = posttrigger_samples;
         }
-        Ok(())
-    }
-
-    fn clear_pretrigger(&mut self) {
-        self.pretrigger.clear();
-        self.retained_samples = 0;
     }
 }
 
-fn iq_sample_count(frame: &CaptureFrame) -> Result<u64, String> {
-    let CaptureBatch::Iq(iq) = &frame.payload else {
-        return Err("RF trigger received a non-IQ capture frame".to_owned());
-    };
-    u64::try_from(iq.samples.len()).map_err(|_| "IQ frame is too large".to_owned())
+fn iq_end(iq: &IqBatch) -> Result<u64, String> {
+    let samples =
+        u64::try_from(iq.samples.len()).map_err(|_| "IQ frame is too large".to_owned())?;
+    iq.first_sample_index
+        .checked_add(samples)
+        .ok_or_else(|| "IQ sample range overflowed".to_owned())
 }
 
 fn trim_frame(mut frame: CaptureFrame, keep: Range<u64>) -> Option<CaptureFrame> {
@@ -184,7 +159,7 @@ mod tests {
     fn trigger() -> RadioSingleTrigger {
         RadioSingleTrigger::new(RadioSingleTriggerConfig {
             threshold_dbfs: -10.0,
-            pretrigger_samples: 8,
+            posttrigger_samples: 4,
             fft_length: 8,
             iq_correction_enabled: false,
         })
@@ -229,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn freezes_on_trigger_and_discards_the_remaining_iq() {
+    fn waits_for_trigger_then_keeps_the_configured_posttrigger_interval() {
         let mut trigger = trigger();
         let waiting = trigger.push(iq_frame(0, quiet(8))).unwrap();
         assert!(waiting.frames.is_empty());
@@ -238,23 +213,22 @@ mod tests {
 
         let fired = trigger.push(iq_frame(8, tone(8))).unwrap();
         assert!(fired.event.is_some());
-        assert_eq!(
-            fired.frames.iter().map(range).collect::<Vec<_>>(),
-            [0..8, 8..16]
-        );
-        assert!(fired.complete);
+        assert_eq!(fired.frames.len(), 1);
+        assert_eq!(range(&fired.frames[0]), 8..16);
+        assert!(!fired.complete);
         let CaptureBatch::Iq(first) = &fired.frames[0].payload else {
             unreachable!();
         };
         assert!(first.discontinuity);
 
-        let discarded = trigger.push(iq_frame(16, quiet(8))).unwrap();
-        assert!(discarded.frames.is_empty());
-        assert!(discarded.complete);
+        let complete = trigger.push(iq_frame(16, quiet(8))).unwrap();
+        assert_eq!(complete.frames.len(), 1);
+        assert_eq!(range(&complete.frames[0]), 16..20);
+        assert!(complete.complete);
     }
 
     #[test]
-    fn bounds_pretrigger_to_configured_sample_count() {
+    fn does_not_buffer_iq_while_waiting_for_the_trigger() {
         let mut trigger = trigger();
         assert!(trigger
             .push(iq_frame(0, quiet(16)))
@@ -262,14 +236,12 @@ mod tests {
             .frames
             .is_empty());
         let fired = trigger.push(iq_frame(16, tone(8))).unwrap();
-        assert_eq!(
-            fired.frames.iter().map(range).collect::<Vec<_>>(),
-            [8..16, 16..24]
-        );
+        assert_eq!(fired.frames.len(), 1);
+        assert_eq!(range(&fired.frames[0]), 16..24);
     }
 
     #[test]
-    fn trims_the_triggering_input_after_the_trigger_fft_window() {
+    fn trims_the_triggering_input_after_the_posttrigger_interval() {
         let mut trigger = trigger();
 
         let output = trigger
@@ -278,6 +250,17 @@ mod tests {
 
         assert!(output.complete);
         assert_eq!(output.frames.len(), 1);
+        assert_eq!(range(&output.frames[0]), 0..12);
+    }
+
+    #[test]
+    fn posttrigger_interval_can_change_while_armed() {
+        let mut trigger = trigger();
+        trigger.set_posttrigger_samples(0);
+
+        let output = trigger.push(iq_frame(0, tone(8))).unwrap();
+
+        assert!(output.complete);
         assert_eq!(range(&output.frames[0]), 0..8);
     }
 }
