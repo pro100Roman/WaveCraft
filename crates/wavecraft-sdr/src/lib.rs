@@ -1,5 +1,6 @@
 //! Device-independent SDR discovery, capabilities, and configuration contracts.
 
+use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use wavecraft_core::{CaptureError, CaptureSource, DeviceDescriptor, InstrumentKind};
 
@@ -192,6 +193,94 @@ pub trait RadioProviderAdapter: Send + Sync {
     ) -> Result<Box<dyn CaptureSource>, CaptureError>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RadioProviderFailure {
+    pub provider: RadioProvider,
+    pub error: CaptureError,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RadioDiscoveryReport {
+    pub devices: Vec<DiscoveredRadio>,
+    pub failures: Vec<RadioProviderFailure>,
+}
+
+impl RadioDiscoveryReport {
+    pub fn device(&self, connection_id: &str) -> Option<&DiscoveredRadio> {
+        self.devices
+            .iter()
+            .find(|device| device.descriptor.id.as_str() == connection_id)
+    }
+}
+
+/// Aggregates independent SDR providers without allowing one provider failure
+/// to hide devices returned successfully by another.
+#[derive(Default)]
+pub struct RadioRegistry {
+    adapters: Vec<Box<dyn RadioProviderAdapter>>,
+}
+
+impl RadioRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_adapter(mut self, adapter: impl RadioProviderAdapter + 'static) -> Self {
+        self.adapters.push(Box::new(adapter));
+        self
+    }
+
+    pub fn push_adapter(&mut self, adapter: impl RadioProviderAdapter + 'static) {
+        self.adapters.push(Box::new(adapter));
+    }
+
+    pub fn discover(&self) -> RadioDiscoveryReport {
+        let mut report = RadioDiscoveryReport::default();
+        let mut connection_ids = HashSet::new();
+        for adapter in &self.adapters {
+            let provider = adapter.provider();
+            let devices = match adapter.discover() {
+                Ok(devices) => devices,
+                Err(error) => {
+                    report
+                        .failures
+                        .push(RadioProviderFailure { provider, error });
+                    continue;
+                }
+            };
+            for device in devices {
+                let validation = device.validate().and_then(|()| {
+                    if device.provider == provider {
+                        Ok(())
+                    } else {
+                        Err(CaptureError::new(
+                            "SDR adapter returned a device for a different provider",
+                        ))
+                    }
+                });
+                if let Err(error) = validation {
+                    report
+                        .failures
+                        .push(RadioProviderFailure { provider, error });
+                    continue;
+                }
+                if !connection_ids.insert(device.descriptor.id.clone()) {
+                    report.failures.push(RadioProviderFailure {
+                        provider,
+                        error: CaptureError::new(format!(
+                            "duplicate SDR connection ID {}",
+                            device.descriptor.id
+                        )),
+                    });
+                    continue;
+                }
+                report.devices.push(device);
+            }
+        }
+        report
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +306,51 @@ mod tests {
             }],
             supports_hardware_timestamps: false,
             supports_external_clock: false,
+        }
+    }
+
+    struct FixtureAdapter {
+        provider: RadioProvider,
+        result: Result<Vec<DiscoveredRadio>, CaptureError>,
+    }
+
+    impl RadioProviderAdapter for FixtureAdapter {
+        fn provider(&self) -> RadioProvider {
+            self.provider
+        }
+
+        fn discover(&self) -> Result<Vec<DiscoveredRadio>, CaptureError> {
+            self.result.clone()
+        }
+
+        fn open(
+            &self,
+            _device: &DiscoveredRadio,
+            _settings: RadioCaptureSettings,
+            _provider_settings: RadioProviderSettings,
+        ) -> Result<Box<dyn CaptureSource>, CaptureError> {
+            Err(CaptureError::new("fixture does not capture"))
+        }
+    }
+
+    fn discovered_radio(id: &str, provider: RadioProvider) -> DiscoveredRadio {
+        let (model, connection_backend) = match provider {
+            RadioProvider::Simulator => (RadioModel::Simulated, ConnectionBackend::Simulator),
+            RadioProvider::HackRf => (RadioModel::HackRfOne, ConnectionBackend::Usb),
+            RadioProvider::LimeSuiteNg => (RadioModel::LimeSdrUsbTypeA, ConnectionBackend::Usb),
+            RadioProvider::Libiio => (RadioModel::AntSdrE200, ConnectionBackend::Network),
+        };
+        DiscoveredRadio {
+            descriptor: DeviceDescriptor {
+                id: DeviceId::new(id),
+                name: id.to_owned(),
+                kind: InstrumentKind::RadioReceiver,
+            },
+            provider,
+            model,
+            connection_backend,
+            persistent_id: Some(id.to_owned()),
+            capabilities: capabilities(),
         }
     }
 
@@ -307,5 +441,81 @@ mod tests {
             ..antsdr
         };
         assert!(invalid_antsdr.validate().is_err());
+    }
+
+    #[test]
+    fn registry_preserves_successes_when_another_provider_fails() {
+        let registry = RadioRegistry::new()
+            .with_adapter(FixtureAdapter {
+                provider: RadioProvider::HackRf,
+                result: Err(CaptureError::new("libhackrf unavailable")),
+            })
+            .with_adapter(FixtureAdapter {
+                provider: RadioProvider::Simulator,
+                result: Ok(vec![discovered_radio(
+                    "sim:radio-0",
+                    RadioProvider::Simulator,
+                )]),
+            });
+
+        let report = registry.discover();
+        assert_eq!(report.devices.len(), 1);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].provider, RadioProvider::HackRf);
+        assert_eq!(
+            report.device("sim:radio-0").map(|device| device.model),
+            Some(RadioModel::Simulated)
+        );
+    }
+
+    #[test]
+    fn registry_selects_identical_models_by_exact_connection_id() {
+        let registry = RadioRegistry::new().with_adapter(FixtureAdapter {
+            provider: RadioProvider::HackRf,
+            result: Ok(vec![
+                discovered_radio("hackrf:serial-a", RadioProvider::HackRf),
+                discovered_radio("hackrf:serial-b", RadioProvider::HackRf),
+            ]),
+        });
+
+        let report = registry.discover();
+        assert_eq!(report.devices.len(), 2);
+        assert_eq!(
+            report
+                .device("hackrf:serial-b")
+                .and_then(|device| device.persistent_id.as_deref()),
+            Some("hackrf:serial-b")
+        );
+    }
+
+    #[test]
+    fn registry_reports_invalid_provider_identity_and_duplicate_ids() {
+        let registry = RadioRegistry::new()
+            .with_adapter(FixtureAdapter {
+                provider: RadioProvider::HackRf,
+                result: Ok(vec![discovered_radio(
+                    "shared-radio",
+                    RadioProvider::Simulator,
+                )]),
+            })
+            .with_adapter(FixtureAdapter {
+                provider: RadioProvider::Simulator,
+                result: Ok(vec![
+                    discovered_radio("shared-radio", RadioProvider::Simulator),
+                    discovered_radio("shared-radio", RadioProvider::Simulator),
+                ]),
+            });
+
+        let report = registry.discover();
+        assert_eq!(report.devices.len(), 1);
+        assert_eq!(report.failures.len(), 2);
+        assert!(report.failures[0]
+            .error
+            .to_string()
+            .contains("different provider"));
+        assert!(report.failures[1]
+            .error
+            .to_string()
+            .contains("duplicate SDR connection ID"));
     }
 }
