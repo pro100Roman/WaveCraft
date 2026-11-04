@@ -14,7 +14,7 @@ the RF view renders bounded timed soft-symbol decisions or analog output with
 drop, discontinuity, and analyzer-error diagnostics.
 For binary FSK, the panel also edits a one-byte hexadecimal preamble value and
 an independent preamble length in bytes. After acquisition, the RF view shows
-the bounded raw hexadecimal stream including the matched preamble bytes.
+the bounded raw message history including the matched preamble bytes.
 
 WaveCraft treats HackRF as the first backend for a generic radio-receiver
 instrument, not as a GUI-specific feature. The backend produces ordered raw IQ
@@ -255,7 +255,8 @@ sample limit from the selected sample rate and duration. With **Wait for
 trigger** enabled, the source remains active until the spectrum-power trigger
 fires. The triggering FFT window and a configurable 0–1000 ms post-trigger
 interval are committed to the display, analyzers, and recording before the view
-freezes; the post-trigger value has 0.001 ms resolution. Later IQ is discarded.
+freezes; the post-trigger value has 0.001 ms resolution and defaults to 20 ms.
+Later IQ is discarded.
 The live armed spectrum is a preview. **Run** remains continuous.
 
 The spectrum exposes a persisted RF trigger-level threshold in dBFS as a red
@@ -283,6 +284,13 @@ Each layer declares its required input and typed output. A layer never reaches
 back into a hardware driver or reads pixels from the RF view. The analyzer
 configuration, including every DSP parameter, is snapshot into the project so
 offline results remain reproducible.
+
+The FSK/GFSK raw view groups the synchronized byte stream into messages at
+each repeated configured preamble. It retains a bounded message history,
+renders the newest message first, and distinguishes preamble bytes from data
+bytes. The list can be scrolled to older retained messages, and hovering a row
+shows its full retained hexadecimal contents. A repeated preamble may span
+arbitrary IQ and demodulator batches.
 
 ### Modulation-neutral analyzer contracts
 
@@ -523,10 +531,11 @@ the failed packet is useful for RF debugging.
 Before packet boundaries are configured, a bounded raw-byte mode can acquire
 byte alignment from a repeated one-byte preamble. Its configuration contains
 the preamble byte, repetition count, and bit order. Output includes the
-preamble bytes and then every following byte until a discontinuity or reset;
-it intentionally does not infer packet boundaries. The initial GUI exposes
-this mode for binary FSK so users can inspect an unknown protocol before
-choosing length, delimiter, sync, whitening, or CRC settings.
+preamble bytes and then every following byte until the next configured
+preamble, discontinuity, or reset. Repeated preambles provide provisional
+message boundaries without assuming a length field, delimiter, sync word,
+whitening, or CRC. The initial GUI exposes this mode for binary FSK so users
+can inspect an unknown protocol before configuring a protocol-specific framer.
 
 Packet framing is bounded by maximum preamble search, packet bits, retained
 partial bits, and emitted packets per input chunk. A carrier end or IQ gap

@@ -3258,7 +3258,7 @@ impl Default for RadioSettings {
             },
             single_duration_millis: 1_000,
             trigger_enabled: false,
-            trigger_posttrigger_micros: 1_000,
+            trigger_posttrigger_micros: 20_000,
             trigger_level_dbfs_tenths: -500,
             gains_db: BTreeMap::new(),
             frequency_correction_milli_ppm: 0,
@@ -4069,6 +4069,7 @@ impl WaveCraftApp {
         let has_scope = active.has_scope;
         let has_radio = active.has_radio;
         active.protocol_decode.finish();
+        active.waveforms.radio_analysis.finish_raw_capture();
         if !active.preserve_display_until_complete {
             self.set_completed_capture_for_target(
                 active.target,
@@ -4770,6 +4771,7 @@ impl WaveCraftApp {
                 let recording_result =
                     finish_gui_recording(&mut active.recorder, recording_completion);
                 active.protocol_decode.finish();
+                active.waveforms.radio_analysis.finish_raw_capture();
                 let mut error = result.as_ref().err().cloned();
                 if let Err(stop_error) = stop_result {
                     append_error(&mut error, format!("failed to stop capture: {stop_error}"));
@@ -8629,7 +8631,7 @@ fn paint_radio_receive_configuration(
                 ui,
                 "Post-trigger",
                 Some(
-                    "Additional IQ display time after the triggering FFT window. Resolution: 0.001 ms",
+                    "Additional IQ display time after the triggering FFT window. Resolution: 0.001 ms. At 19.2 kbit/s, a 10-byte preamble alone lasts 4.167 ms, so allow enough time for the complete packet",
                 ),
             );
             ui.add_enabled_ui(

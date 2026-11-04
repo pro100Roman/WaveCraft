@@ -1,14 +1,41 @@
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use std::collections::VecDeque;
-use wavecraft_decode::{DecodeDiagnostic, RawRadioOutput, TimedByte};
+use wavecraft_decode::{DecodeDiagnostic, RawRadioMessageStart, RawRadioOutput, TimedByte};
 use wavecraft_dsp::{DemodulatedBatch, SpectrumFrame, TimedAnalogSample, TimedSoftSymbol};
 
 const DEFAULT_WATERFALL_CAPACITY: usize = 256;
 const DEFAULT_ANALYSIS_CAPACITY: usize = 100_000;
+const MAX_RAW_MESSAGE_COUNT: usize = 256;
 const MAX_WATERFALL_TEXTURE_WIDTH: usize = 512;
 const MIN_POWER_DBFS: f32 = -120.0;
 const MAX_POWER_DBFS: f32 = 0.0;
 const WATERFALL_HISTORY_HINT: &str = "Rows are the newest spectrum snapshots retained for the visible waterfall. Dropped counts older display rows discarded after this bounded history filled; it does not indicate lost HackRF or IQ samples.";
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawRadioMessage {
+    sequence: u64,
+    preamble_bytes: usize,
+    bytes: Vec<TimedByte>,
+    complete: bool,
+}
+
+impl RawRadioMessage {
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn preamble_bytes(&self) -> usize {
+        self.preamble_bytes.min(self.bytes.len())
+    }
+
+    pub fn bytes(&self) -> &[TimedByte] {
+        &self.bytes
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
 
 /// Bounded, modulation-neutral output retained for analyzer rendering.
 #[derive(Debug)]
@@ -22,6 +49,9 @@ pub struct RadioAnalysisStore {
     discontinuities: u64,
     error: Option<String>,
     raw_bytes: VecDeque<TimedByte>,
+    raw_messages: VecDeque<RawRadioMessage>,
+    next_raw_message_sequence: u64,
+    raw_dropped_messages: u64,
     raw_synchronized: bool,
     raw_dropped_bytes: u64,
     raw_diagnostics: VecDeque<DecodeDiagnostic>,
@@ -39,6 +69,9 @@ impl Default for RadioAnalysisStore {
             discontinuities: 0,
             error: None,
             raw_bytes: VecDeque::new(),
+            raw_messages: VecDeque::new(),
+            next_raw_message_sequence: 1,
+            raw_dropped_messages: 0,
             raw_synchronized: false,
             raw_dropped_bytes: 0,
             raw_diagnostics: VecDeque::new(),
@@ -63,7 +96,7 @@ impl RadioAnalysisStore {
                 batch.validate().map_err(|error| error.to_string())?;
                 if batch.discontinuity {
                     self.discontinuities = self.discontinuities.saturating_add(1);
-                    self.raw_bytes.clear();
+                    self.finish_raw_message();
                     self.raw_synchronized = false;
                 }
                 if self.soft_symbol_alphabet_size != Some(batch.alphabet_size) {
@@ -87,6 +120,7 @@ impl RadioAnalysisStore {
                 self.soft_symbols.clear();
                 self.soft_symbol_alphabet_size = None;
                 self.raw_bytes.clear();
+                self.raw_messages.clear();
                 self.raw_synchronized = false;
                 self.analog_samples.extend(batch.samples);
                 self.trim_analog_samples();
@@ -97,12 +131,44 @@ impl RadioAnalysisStore {
     }
 
     pub fn ingest_raw(&mut self, output: RawRadioOutput) {
-        self.raw_synchronized = output.synchronized;
-        self.raw_bytes.extend(output.bytes);
+        let RawRadioOutput {
+            bytes,
+            message_starts,
+            diagnostics,
+            synchronized,
+        } = output;
+        self.raw_synchronized = synchronized;
+        let mut message_starts = message_starts.into_iter().peekable();
+        for byte in bytes.iter().copied() {
+            while message_starts
+                .peek()
+                .is_some_and(|start| start.sample_index <= byte.range.start)
+            {
+                let Some(start) = message_starts.next() else {
+                    break;
+                };
+                self.start_raw_message(start);
+            }
+            if self.raw_messages.is_empty() && synchronized {
+                self.start_raw_message(RawRadioMessageStart {
+                    sample_index: byte.range.start,
+                    preamble_bytes: 0,
+                });
+            }
+            if let Some(message) = self.raw_messages.back_mut() {
+                message.bytes.push(byte);
+                let excess = message.bytes.len().saturating_sub(self.capacity);
+                message.bytes.drain(..excess);
+            }
+        }
+        for start in message_starts {
+            self.start_raw_message(start);
+        }
+        self.raw_bytes.extend(bytes);
         let excess = self.raw_bytes.len().saturating_sub(self.capacity);
         self.raw_bytes.drain(..excess);
         self.raw_dropped_bytes = self.raw_dropped_bytes.saturating_add(excess as u64);
-        self.raw_diagnostics.extend(output.diagnostics);
+        self.raw_diagnostics.extend(diagnostics);
         let diagnostic_excess = self.raw_diagnostics.len().saturating_sub(32);
         self.raw_diagnostics.drain(..diagnostic_excess);
     }
@@ -147,12 +213,25 @@ impl RadioAnalysisStore {
         self.raw_synchronized
     }
 
+    pub fn raw_messages(&self) -> &VecDeque<RawRadioMessage> {
+        &self.raw_messages
+    }
+
+    pub fn raw_dropped_messages(&self) -> u64 {
+        self.raw_dropped_messages
+    }
+
     pub fn raw_dropped_bytes(&self) -> u64 {
         self.raw_dropped_bytes
     }
 
     pub fn raw_diagnostics(&self) -> &VecDeque<DecodeDiagnostic> {
         &self.raw_diagnostics
+    }
+
+    pub fn finish_raw_capture(&mut self) {
+        self.finish_raw_message();
+        self.raw_synchronized = false;
     }
 
     fn trim_soft_symbols(&mut self) {
@@ -165,6 +244,38 @@ impl RadioAnalysisStore {
         let excess = self.analog_samples.len().saturating_sub(self.capacity);
         self.analog_samples.drain(..excess);
         self.dropped_items = self.dropped_items.saturating_add(excess as u64);
+    }
+
+    fn start_raw_message(&mut self, start: RawRadioMessageStart) {
+        let mut carried_bytes = Vec::new();
+        if let Some(current) = self.raw_messages.back_mut() {
+            current.complete = true;
+            if let Some(split) = current
+                .bytes
+                .iter()
+                .position(|byte| byte.range.start >= start.sample_index)
+            {
+                carried_bytes = current.bytes.split_off(split);
+            }
+        }
+        self.raw_messages.push_back(RawRadioMessage {
+            sequence: self.next_raw_message_sequence,
+            preamble_bytes: start.preamble_bytes,
+            bytes: carried_bytes,
+            complete: false,
+        });
+        self.next_raw_message_sequence = self.next_raw_message_sequence.saturating_add(1);
+        let message_capacity = self.capacity.min(MAX_RAW_MESSAGE_COUNT);
+        while self.raw_messages.len() > message_capacity {
+            self.raw_messages.pop_front();
+            self.raw_dropped_messages = self.raw_dropped_messages.saturating_add(1);
+        }
+    }
+
+    fn finish_raw_message(&mut self) {
+        if let Some(message) = self.raw_messages.back_mut() {
+            message.complete = true;
+        }
     }
 }
 
@@ -246,6 +357,7 @@ struct WaterfallSignature {
 pub struct RadioViewState {
     waterfall_texture: Option<TextureHandle>,
     waterfall_signature: Option<WaterfallSignature>,
+    raw_message_scroll_rows: usize,
 }
 
 pub struct RadioViewOptions<'a> {
@@ -275,7 +387,7 @@ impl RadioViewState {
             || analysis.error().is_some()
             || !analysis.soft_symbols().is_empty()
             || !analysis.analog_samples().is_empty()
-            || !analysis.raw_bytes().is_empty();
+            || !analysis.raw_messages().is_empty();
         let analysis_height = if show_analysis {
             rect.height().mul_add(0.24, 0.0).clamp(110.0, 180.0)
         } else {
@@ -309,7 +421,13 @@ impl RadioViewState {
                 Pos2::new(rect.left(), (content_bottom + gap).min(rect.bottom())),
                 rect.max,
             );
-            paint_analysis(ui, analysis_rect, analysis, analysis_enabled);
+            paint_analysis(
+                ui,
+                analysis_rect,
+                analysis,
+                analysis_enabled,
+                &mut self.raw_message_scroll_rows,
+            );
         }
     }
 
@@ -393,7 +511,13 @@ impl RadioViewState {
     }
 }
 
-fn paint_analysis(ui: &egui::Ui, rect: Rect, store: &RadioAnalysisStore, analysis_enabled: bool) {
+fn paint_analysis(
+    ui: &egui::Ui,
+    rect: Rect,
+    store: &RadioAnalysisStore,
+    analysis_enabled: bool,
+    raw_message_scroll_rows: &mut usize,
+) {
     if rect.width() <= 1.0 || rect.height() <= 1.0 {
         return;
     }
@@ -409,11 +533,16 @@ fn paint_analysis(ui: &egui::Ui, rect: Rect, store: &RadioAnalysisStore, analysi
     );
     let status = if let Some(error) = store.error() {
         format!("error · {error}")
-    } else if store.raw_synchronized() {
+    } else if !store.raw_messages().is_empty() {
+        let newest_bytes = store
+            .raw_messages()
+            .back()
+            .map_or(0, |message| message.bytes().len());
         format!(
-            "{} bytes · locked · {} dropped · {} gaps",
-            store.raw_bytes().len(),
-            store.raw_dropped_bytes(),
+            "{} messages · newest {} B · {} dropped · {} gaps",
+            store.raw_messages().len(),
+            newest_bytes,
+            store.raw_dropped_messages(),
             store.discontinuities()
         )
     } else if let Some(alphabet_size) = store.soft_symbol_alphabet_size() {
@@ -454,8 +583,8 @@ fn paint_analysis(ui: &egui::Ui, rect: Rect, store: &RadioAnalysisStore, analysi
     if plot.width() <= 1.0 || plot.height() <= 1.0 || store.error().is_some() {
         return;
     }
-    if !store.raw_bytes().is_empty() {
-        paint_raw_bytes(ui, plot, store);
+    if !store.raw_messages().is_empty() {
+        paint_raw_messages(ui, plot, store, raw_message_scroll_rows);
     } else if !store.soft_symbols().is_empty() {
         paint_soft_symbols(ui, plot, store);
     } else if !store.analog_samples().is_empty() {
@@ -475,26 +604,118 @@ fn paint_analysis(ui: &egui::Ui, rect: Rect, store: &RadioAnalysisStore, analysi
     }
 }
 
-fn paint_raw_bytes(ui: &egui::Ui, plot: Rect, store: &RadioAnalysisStore) {
-    const BYTE_CELL_WIDTH: f32 = 25.0;
-    const ROW_HEIGHT: f32 = 18.0;
-    let columns = (plot.width() / BYTE_CELL_WIDTH).floor().max(1.0) as usize;
-    let rows = (plot.height() / ROW_HEIGHT).floor().max(1.0) as usize;
-    let visible = columns.saturating_mul(rows);
-    let skip = store.raw_bytes().len().saturating_sub(visible);
-    for (index, byte) in store.raw_bytes().iter().skip(skip).enumerate() {
-        let row = index / columns;
-        let column = index % columns;
-        ui.painter().text(
+fn paint_raw_messages(
+    ui: &egui::Ui,
+    plot: Rect,
+    store: &RadioAnalysisStore,
+    scroll_rows: &mut usize,
+) {
+    const ROW_HEIGHT: f32 = 22.0;
+    const BYTE_CELL_WIDTH: f32 = 24.0;
+    const SEQUENCE_WIDTH: f32 = 48.0;
+    const SECTION_WIDTH: f32 = 38.0;
+    const STATE_WIDTH: f32 = 38.0;
+    let visible_rows = (plot.height() / ROW_HEIGHT).floor().max(1.0) as usize;
+    let maximum_scroll = store.raw_messages().len().saturating_sub(visible_rows);
+    *scroll_rows = (*scroll_rows).min(maximum_scroll);
+    let list_response = ui.interact(
+        plot,
+        ui.id().with("raw_message_list_scroll"),
+        Sense::hover(),
+    );
+    if list_response.hovered() {
+        let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
+        if scroll_delta < 0.0 {
+            *scroll_rows = scroll_rows.saturating_add(1).min(maximum_scroll);
+        } else if scroll_delta > 0.0 {
+            *scroll_rows = scroll_rows.saturating_sub(1);
+        }
+    }
+    for (row, message) in store
+        .raw_messages()
+        .iter()
+        .rev()
+        .skip(*scroll_rows)
+        .take(visible_rows)
+        .enumerate()
+    {
+        let row_rect = Rect::from_min_max(
+            Pos2::new(plot.left(), plot.top() + row as f32 * ROW_HEIGHT),
             Pos2::new(
-                plot.left() + column as f32 * BYTE_CELL_WIDTH,
-                plot.top() + row as f32 * ROW_HEIGHT,
+                plot.right(),
+                (plot.top() + (row + 1) as f32 * ROW_HEIGHT).min(plot.bottom()),
             ),
-            egui::Align2::LEFT_TOP,
-            format!("{:02X}", byte.value),
-            FontId::monospace(12.0),
-            Color32::from_rgb(150, 220, 255),
         );
+        ui.painter().rect_filled(
+            row_rect,
+            2.0,
+            if row % 2 == 0 {
+                Color32::from_rgb(15, 22, 31)
+            } else {
+                Color32::from_rgb(11, 17, 25)
+            },
+        );
+        ui.painter().text(
+            row_rect.left_center() + Vec2::new(5.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            format!("#{}", message.sequence()),
+            FontId::monospace(10.0),
+            Color32::from_rgb(105, 120, 140),
+        );
+
+        let mut x = row_rect.left() + SEQUENCE_WIDTH;
+        let right_limit = row_rect.right() - STATE_WIDTH;
+        let preamble_bytes = message.preamble_bytes();
+        paint_raw_section_label(ui, row_rect, x, "PRE", Color32::from_rgb(235, 180, 80));
+        x += SECTION_WIDTH;
+        x = paint_raw_message_bytes(
+            ui,
+            row_rect,
+            x,
+            right_limit,
+            &message.bytes()[..preamble_bytes],
+            BYTE_CELL_WIDTH,
+            Color32::from_rgb(245, 190, 90),
+        );
+        if x + SECTION_WIDTH < right_limit {
+            paint_raw_section_label(ui, row_rect, x, "DATA", Color32::from_rgb(105, 150, 175));
+            x += SECTION_WIDTH;
+            let _ = paint_raw_message_bytes(
+                ui,
+                row_rect,
+                x,
+                right_limit,
+                &message.bytes()[preamble_bytes..],
+                BYTE_CELL_WIDTH,
+                Color32::from_rgb(150, 220, 255),
+            );
+        }
+        ui.painter().text(
+            row_rect.right_center() - Vec2::new(5.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            if message.is_complete() { "" } else { "LIVE" },
+            FontId::monospace(9.0),
+            Color32::from_rgb(80, 205, 145),
+        );
+        let preamble = format_raw_hex(&message.bytes()[..preamble_bytes]);
+        let data = format_raw_hex(&message.bytes()[preamble_bytes..]);
+        ui.interact(
+            row_rect,
+            ui.id().with(("raw_message", message.sequence())),
+            Sense::hover(),
+        )
+        .on_hover_ui(|ui| {
+            ui.label(
+                egui::RichText::new(format!("PRE  {preamble}"))
+                    .monospace()
+                    .color(Color32::from_rgb(245, 190, 90)),
+            );
+            ui.label(
+                egui::RichText::new(format!("DATA {data}"))
+                    .monospace()
+                    .color(Color32::from_rgb(150, 220, 255)),
+            );
+        });
     }
     if let Some(diagnostic) = store.raw_diagnostics().back() {
         ui.painter().text(
@@ -505,6 +726,66 @@ fn paint_raw_bytes(ui: &egui::Ui, plot: Rect, store: &RadioAnalysisStore) {
             Color32::from_rgb(230, 180, 95),
         );
     }
+}
+
+fn format_raw_hex(bytes: &[TimedByte]) -> String {
+    const TOOLTIP_BYTE_LIMIT: usize = 512;
+    let mut text = bytes
+        .iter()
+        .take(TOOLTIP_BYTE_LIMIT)
+        .map(|byte| format!("{:02X}", byte.value))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if bytes.len() > TOOLTIP_BYTE_LIMIT {
+        text.push_str(&format!(" … (+{} B)", bytes.len() - TOOLTIP_BYTE_LIMIT));
+    }
+    if text.is_empty() {
+        text.push('—');
+    }
+    text
+}
+
+fn paint_raw_section_label(ui: &egui::Ui, row: Rect, x: f32, label: &str, color: Color32) {
+    ui.painter().text(
+        Pos2::new(x, row.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::monospace(9.0),
+        color,
+    );
+}
+
+fn paint_raw_message_bytes(
+    ui: &egui::Ui,
+    row: Rect,
+    mut x: f32,
+    right_limit: f32,
+    bytes: &[TimedByte],
+    cell_width: f32,
+    color: Color32,
+) -> f32 {
+    let visible = ((right_limit - x) / cell_width).floor().max(0.0) as usize;
+    for byte in bytes.iter().take(visible) {
+        ui.painter().text(
+            Pos2::new(x, row.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("{:02X}", byte.value),
+            FontId::monospace(11.0),
+            color,
+        );
+        x += cell_width;
+    }
+    if bytes.len() > visible && x < right_limit {
+        ui.painter().text(
+            Pos2::new(x, row.center().y),
+            egui::Align2::LEFT_CENTER,
+            "…",
+            FontId::monospace(11.0),
+            color,
+        );
+        x += cell_width;
+    }
+    x
 }
 
 fn paint_soft_symbols(ui: &egui::Ui, plot: Rect, store: &RadioAnalysisStore) {
@@ -1159,6 +1440,67 @@ mod tests {
             [0xaa, 0x42]
         );
         assert_eq!(store.raw_dropped_bytes(), 1);
+    }
+
+    #[test]
+    fn analysis_store_lists_preamble_delimited_messages_newest_first() {
+        let mut store = RadioAnalysisStore::new(32).unwrap();
+        let timed_bytes = |values: &[u8], first_index: u64| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| TimedByte {
+                    value: *value,
+                    range: SampleRange {
+                        start: first_index + index as u64 * 8,
+                        end: first_index + index as u64 * 8 + 8,
+                    },
+                    status: ByteStatus::default(),
+                })
+                .collect::<Vec<_>>()
+        };
+        store.ingest_raw(RawRadioOutput {
+            bytes: timed_bytes(&[0xaa, 0xaa, 0x12, 0xaa], 0),
+            message_starts: vec![RawRadioMessageStart {
+                sample_index: 0,
+                preamble_bytes: 2,
+            }],
+            diagnostics: vec![],
+            synchronized: true,
+        });
+        store.ingest_raw(RawRadioOutput {
+            bytes: timed_bytes(&[0xaa, 0x34], 32),
+            message_starts: vec![RawRadioMessageStart {
+                sample_index: 24,
+                preamble_bytes: 2,
+            }],
+            diagnostics: vec![],
+            synchronized: true,
+        });
+
+        let newest_first = store.raw_messages().iter().rev().collect::<Vec<_>>();
+
+        assert_eq!(newest_first.len(), 2);
+        assert_eq!(newest_first[0].sequence(), 2);
+        assert_eq!(newest_first[0].preamble_bytes(), 2);
+        assert_eq!(
+            newest_first[0]
+                .bytes()
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0xaa, 0xaa, 0x34]
+        );
+        assert!(!newest_first[0].is_complete());
+        assert_eq!(
+            newest_first[1]
+                .bytes()
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0xaa, 0xaa, 0x12]
+        );
+        assert!(newest_first[1].is_complete());
     }
 
     #[test]
