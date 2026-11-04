@@ -7628,6 +7628,13 @@ fn paint_radio_capture_settings(
             &radio.capabilities.bandwidths_hz,
             1.0 / 3.0,
         );
+        if settings.capture.bandwidth_hz > settings.capture.sample_rate_hz {
+            ui.label(
+                RichText::new("Bandwidth above sample rate may cause aliasing")
+                    .small()
+                    .color(Color32::from_rgb(255, 190, 80)),
+            );
+        }
 
         if radio.capabilities.receive_channels > 1 {
             ui.add_space(4.0);

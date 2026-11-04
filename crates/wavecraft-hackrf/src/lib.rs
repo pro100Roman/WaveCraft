@@ -28,11 +28,9 @@ const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DEFAULT_LNA_GAIN_DB: u32 = 16;
 const DEFAULT_VGA_GAIN_DB: u32 = 16;
 
-// libhackrf also accepts 24 and 28 MHz filters, but those exceed HackRF One's
-// maximum supported sample rate and are intentionally not offered for capture.
-const HACKRF_BANDWIDTHS_HZ: [u64; 14] = [
+const HACKRF_BANDWIDTHS_HZ: [u64; 16] = [
     1_750_000, 2_500_000, 3_500_000, 5_000_000, 5_500_000, 6_000_000, 7_000_000, 8_000_000,
-    9_000_000, 10_000_000, 12_000_000, 14_000_000, 15_000_000, 20_000_000,
+    9_000_000, 10_000_000, 12_000_000, 14_000_000, 15_000_000, 20_000_000, 24_000_000, 28_000_000,
 ];
 
 /// Capabilities advertised for a HackRF One receive channel.
@@ -143,13 +141,7 @@ fn validate_device(device: &DiscoveredRadio) -> Result<(), CaptureError> {
 }
 
 fn validate_capture_settings(settings: &RadioCaptureSettings) -> Result<(), CaptureError> {
-    settings.validate(&hackrf_one_capabilities())?;
-    if settings.bandwidth_hz > settings.sample_rate_hz {
-        return Err(CaptureError::new(
-            "HackRF baseband bandwidth must not exceed the sample rate",
-        ));
-    }
-    Ok(())
+    settings.validate(&hackrf_one_capabilities())
 }
 
 fn validate_provider_settings(settings: &HackRfSettings) -> Result<(), CaptureError> {
@@ -864,19 +856,21 @@ mod tests {
         assert!(capabilities.sample_rates_hz.contains(2_000_000));
         assert!(capabilities.sample_rates_hz.contains(20_000_000));
         assert!(capabilities.bandwidths_hz.contains(1_750_000));
+        assert!(capabilities.bandwidths_hz.contains(24_000_000));
+        assert!(capabilities.bandwidths_hz.contains(28_000_000));
         assert_eq!(capabilities.receive_channels, 1);
         assert!(!capabilities.supports_hardware_timestamps);
         assert!(capabilities.supports_external_clock);
     }
 
     #[test]
-    fn validates_cross_setting_and_gain_constraints() {
+    fn validates_filter_and_gain_constraints() {
         assert!(validate_capture_settings(&capture_settings()).is_ok());
-        let too_wide = RadioCaptureSettings {
-            bandwidth_hz: 2_500_000,
+        let widest_filter = RadioCaptureSettings {
+            bandwidth_hz: 28_000_000,
             ..capture_settings()
         };
-        assert!(validate_capture_settings(&too_wide).is_err());
+        assert!(validate_capture_settings(&widest_filter).is_ok());
         assert!(validate_provider_settings(&HackRfSettings {
             lna_gain_db: Some(24),
             vga_gain_db: Some(30),
