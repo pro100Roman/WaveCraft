@@ -247,6 +247,10 @@ The initial RF view remains separate from the current Combined view. A future
 combined RF/logic/scope view may align panes on coordinator time, but it must
 retain the same warning that independent sample clocks are not phase-locked.
 
+RF **Single** capture has an explicit duration stored in milliseconds and
+displayed in seconds. The application derives its exact sample limit from the
+selected sample rate and duration; **Run** capture remains continuous.
+
 ## Signal-decoder stack
 
 Radio decoding is an analyzer stack analogous to the existing

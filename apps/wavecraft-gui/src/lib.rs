@@ -3080,6 +3080,7 @@ struct CombinedSessionSettings {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RadioSettings {
     capture: RadioCaptureSettings,
+    single_duration_millis: u64,
     gains_db: BTreeMap<String, i32>,
     frequency_correction_milli_ppm: i32,
     iq_correction_enabled: bool,
@@ -3200,6 +3201,7 @@ impl Default for RadioSettings {
                 receive_channel: 0,
                 sample_limit: None,
             },
+            single_duration_millis: 1_000,
             gains_db: BTreeMap::new(),
             frequency_correction_milli_ppm: 0,
             iq_correction_enabled: true,
@@ -3581,8 +3583,14 @@ impl WaveCraftApp {
             .cloned()
             .ok_or_else(|| "Select a connected radio receiver in Capture Setup".to_owned())?;
         let mut settings = self.radio_settings.capture.clone();
-        settings.sample_limit =
-            (mode == AcquisitionMode::Single).then_some(settings.sample_rate_hz);
+        settings.sample_limit = (mode == AcquisitionMode::Single)
+            .then(|| {
+                radio_single_sample_limit(
+                    settings.sample_rate_hz,
+                    self.radio_settings.single_duration_millis,
+                )
+            })
+            .transpose()?;
         settings
             .validate(&device.capabilities)
             .map_err(|error| error.to_string())?;
@@ -7674,6 +7682,16 @@ fn radio_gain_u32(settings: &RadioSettings, id: &str) -> Result<Option<u32>, Str
         .transpose()
 }
 
+fn radio_single_sample_limit(sample_rate_hz: u64, duration_millis: u64) -> Result<u64, String> {
+    if sample_rate_hz == 0 || duration_millis == 0 {
+        return Err("RF Single duration and sample rate must be greater than zero".to_owned());
+    }
+    let samples = u128::from(sample_rate_hz)
+        .saturating_mul(u128::from(duration_millis))
+        .div_ceil(1_000);
+    u64::try_from(samples).map_err(|_| "RF Single capture is too long".to_owned())
+}
+
 fn hackrf_runtime_settings(settings: &RadioSettings) -> Result<HackRfRuntimeSettings, String> {
     Ok(HackRfRuntimeSettings {
         center_frequency_hz: settings.capture.center_frequency_hz,
@@ -8349,6 +8367,35 @@ fn paint_radio_receive_configuration(
                     &radio.capabilities.sample_rates_hz,
                 );
             });
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
+                "Single duration",
+                Some("Capture time used by the RF Single action; Run remains continuous"),
+            );
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.horizontal(|ui| {
+                    let mut duration_seconds = settings.single_duration_millis as f64 / 1_000.0;
+                    if add_left_aligned_sized(
+                        ui,
+                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut duration_seconds)
+                            .range(0.001..=3_600.0)
+                            .speed(0.01)
+                            .min_decimals(3)
+                            .max_decimals(3),
+                    )
+                    .changed()
+                    {
+                        settings.single_duration_millis =
+                            (duration_seconds * 1_000.0).round() as u64;
+                    }
+                    ui.label("s");
+                });
+            });
+            settings.single_duration_millis =
+                settings.single_duration_millis.clamp(1, 3_600_000);
             ui.end_row();
 
             paint_radio_parameter_label(ui, "Baseband bandwidth", bandwidth_help);
@@ -10505,6 +10552,10 @@ fn start_gui_recording(
         radio_settings.capture.receive_channel.to_string(),
     );
     metadata.insert(
+        "radio.single_duration_millis".to_owned(),
+        radio_settings.single_duration_millis.to_string(),
+    );
+    metadata.insert(
         "radio.frequency_correction_milli_ppm".to_owned(),
         radio_settings.frequency_correction_milli_ppm.to_string(),
     );
@@ -11080,6 +11131,9 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.receive_channel") {
         settings.capture.receive_channel = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.single_duration_millis") {
+        settings.single_duration_millis = value;
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.frequency_correction_milli_ppm")
     {
@@ -16587,6 +16641,16 @@ mod tests {
     }
 
     #[test]
+    fn radio_single_duration_derives_an_exact_bounded_sample_limit() {
+        assert_eq!(
+            radio_single_sample_limit(10_000_000, 1_500).unwrap(),
+            15_000_000
+        );
+        assert_eq!(radio_single_sample_limit(3, 1).unwrap(), 1);
+        assert!(radio_single_sample_limit(10_000_000, 0).is_err());
+    }
+
+    #[test]
     fn radio_runtime_settings_include_only_live_hackrf_controls() {
         let capabilities = wavecraft_hackrf::hackrf_one_capabilities();
         let mut initial = RadioSettings::default();
@@ -17407,6 +17471,7 @@ mod tests {
         metadata.insert("radio.sample_rate_hz".to_owned(), "10000000".to_owned());
         metadata.insert("radio.bandwidth_hz".to_owned(), "8000000".to_owned());
         metadata.insert("radio.receive_channel".to_owned(), "0".to_owned());
+        metadata.insert("radio.single_duration_millis".to_owned(), "2500".to_owned());
         metadata.insert(
             "radio.frequency_correction_milli_ppm".to_owned(),
             "-12500".to_owned(),
@@ -17446,6 +17511,7 @@ mod tests {
         assert_eq!(settings.capture.center_frequency_hz, 433_920_000);
         assert_eq!(settings.capture.sample_rate_hz, 10_000_000);
         assert_eq!(settings.capture.bandwidth_hz, 8_000_000);
+        assert_eq!(settings.single_duration_millis, 2_500);
         assert_eq!(settings.frequency_correction_milli_ppm, -12_500);
         assert_eq!(settings.gains_db.get("lna"), Some(&24));
         assert_eq!(settings.gains_db.get("vga"), Some(&20));
