@@ -6,6 +6,7 @@ mod radio;
 mod radio_crc;
 mod radio_packet;
 mod radio_pipeline;
+mod radio_raw;
 mod runtime;
 mod schema;
 mod transport;
@@ -30,6 +31,7 @@ pub use radio_packet::{
 pub use radio_pipeline::{
     RadioPacketPipeline, RadioPacketPipelineConfig, RadioPacketPipelineOutput,
 };
+pub use radio_raw::{RawRadioConfig, RawRadioDecoder, RawRadioOutput};
 pub use runtime::{CustomProtocolRuntime, ProtocolRuntimeOutput};
 pub use schema::{
     load_protocol_schema, BitDefinition, ByteMatch, ChecksumAlgorithm, ChecksumValidation,

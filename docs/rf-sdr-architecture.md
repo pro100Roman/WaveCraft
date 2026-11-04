@@ -481,6 +481,14 @@ frequency-error estimate, confidence, and diagnostics. CRC failure does not
 silently discard a packet unless the analyzer is configured to do so; keeping
 the failed packet is useful for RF debugging.
 
+Before packet boundaries are configured, a bounded raw-byte mode can acquire
+byte alignment from a repeated one-byte preamble. Its configuration contains
+the preamble byte, repetition count, and bit order. Output includes the
+preamble bytes and then every following byte until a discontinuity or reset;
+it intentionally does not infer packet boundaries. The initial GUI exposes
+this mode for binary FSK so users can inspect an unknown protocol before
+choosing length, delimiter, sync, whitening, or CRC settings.
+
 Packet framing is bounded by maximum preamble search, packet bits, retained
 partial bits, and emitted packets per input chunk. A carrier end or IQ gap
 flushes incomplete state with a diagnostic.
