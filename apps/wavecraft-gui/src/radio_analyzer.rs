@@ -179,7 +179,7 @@ mod tests {
             [false, true]
         );
         assert_eq!(bits.bits[1].range, SampleRange { start: 20, end: 30 });
-        assert!((bits.bits[1].confidence - 0.8).abs() < f32::EPSILON);
+        assert!((bits.bits[1].confidence - 0.6).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -215,6 +215,8 @@ mod tests {
             preamble_byte: 0xaa,
             preamble_bytes: 1,
             bit_order: BitOrder::MostSignificantFirst,
+            minimum_bit_confidence_milli: 500,
+            maximum_uncertain_bits: 0,
         };
         let mut runtime = RadioAnalyzerRuntime::new(profile(), raw_config).unwrap();
         let preamble = [true, false, true, false, true, false, true, false];

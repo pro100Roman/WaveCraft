@@ -3178,6 +3178,8 @@ struct RadioAnalyzerSettings {
     max_clock_error_ppm: u32,
     preamble_byte: u8,
     preamble_bytes: usize,
+    minimum_bit_confidence_milli: u16,
+    maximum_uncertain_bits: usize,
 }
 
 impl Default for RadioAnalyzerSettings {
@@ -3198,6 +3200,8 @@ impl Default for RadioAnalyzerSettings {
             max_clock_error_ppm: 10_000,
             preamble_byte: 0xaa,
             preamble_bytes: 4,
+            minimum_bit_confidence_milli: 500,
+            maximum_uncertain_bits: 0,
         }
     }
 }
@@ -3208,6 +3212,8 @@ impl RadioAnalyzerSettings {
             preamble_byte: self.preamble_byte,
             preamble_bytes: self.preamble_bytes,
             bit_order: BitOrder::MostSignificantFirst,
+            minimum_bit_confidence_milli: self.minimum_bit_confidence_milli,
+            maximum_uncertain_bits: self.maximum_uncertain_bits,
         }
     }
 
@@ -8427,6 +8433,50 @@ fn paint_radio_analyzer_configuration(
             settings.preamble_bytes = settings.preamble_bytes.clamp(1, 256);
             ui.end_row();
 
+            paint_radio_parameter_label(
+                ui,
+                "Minimum bit confidence",
+                Some("Bits below this 0-to-1 demodulator confidence count as uncertain"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                let mut confidence =
+                    f64::from(settings.minimum_bit_confidence_milli) / 1_000.0;
+                if add_left_aligned_sized(
+                    ui,
+                    egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                    egui::DragValue::new(&mut confidence)
+                        .range(0.0..=1.0)
+                        .speed(0.01)
+                        .min_decimals(2)
+                        .max_decimals(3),
+                )
+                .changed()
+                {
+                    settings.minimum_bit_confidence_milli =
+                        (confidence * 1_000.0).round() as u16;
+                }
+            });
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
+                "Maximum uncertain bits",
+                Some("Rejects a completed RAW message when more bits fall below the confidence threshold"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    add_left_aligned_sized(
+                        ui,
+                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut settings.maximum_uncertain_bits)
+                            .range(0..=1_000_000)
+                            .speed(1),
+                    );
+                    ui.label("bits");
+                });
+            });
+            ui.end_row();
+
             if settings.demodulation == RadioDemodulation::BinaryGfsk {
                 paint_radio_parameter_label(
                     ui,
@@ -11015,6 +11065,17 @@ fn start_gui_recording(
             "preamble_bytes",
             radio_settings.analyzer.preamble_bytes.to_string(),
         ),
+        (
+            "minimum_bit_confidence_milli",
+            radio_settings
+                .analyzer
+                .minimum_bit_confidence_milli
+                .to_string(),
+        ),
+        (
+            "maximum_uncertain_bits",
+            radio_settings.analyzer.maximum_uncertain_bits.to_string(),
+        ),
     ] {
         metadata.insert(format!("radio.analyzer.{key}"), value);
     }
@@ -11588,6 +11649,15 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.preamble_bytes") {
         settings.analyzer.preamble_bytes = value;
+    }
+    if let Some(value) =
+        recording_metadata_value(metadata, "radio.analyzer.minimum_bit_confidence_milli")
+    {
+        settings.analyzer.minimum_bit_confidence_milli = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.maximum_uncertain_bits")
+    {
+        settings.analyzer.maximum_uncertain_bits = value;
     }
     for (key, value) in metadata {
         let Some(id) = key
@@ -17217,6 +17287,14 @@ mod tests {
             ),
             ("radio.analyzer.preamble_byte".to_owned(), "85".to_owned()),
             ("radio.analyzer.preamble_bytes".to_owned(), "12".to_owned()),
+            (
+                "radio.analyzer.minimum_bit_confidence_milli".to_owned(),
+                "650".to_owned(),
+            ),
+            (
+                "radio.analyzer.maximum_uncertain_bits".to_owned(),
+                "3".to_owned(),
+            ),
         ]);
 
         let settings = radio_settings_from_recording_metadata(&metadata).analyzer;
@@ -17236,6 +17314,8 @@ mod tests {
         assert_eq!(settings.max_clock_error_ppm, 20_000);
         assert_eq!(settings.preamble_byte, 0x55);
         assert_eq!(settings.preamble_bytes, 12);
+        assert_eq!(settings.minimum_bit_confidence_milli, 650);
+        assert_eq!(settings.maximum_uncertain_bits, 3);
     }
 
     #[test]
@@ -18027,6 +18107,8 @@ mod tests {
                 preamble_byte: 0xaa,
                 preamble_bytes: 4,
                 bit_order: BitOrder::MostSignificantFirst,
+                minimum_bit_confidence_milli: 500,
+                maximum_uncertain_bits: 0,
             },
         };
         let logic_config = LogicCaptureSettings::default().capture_config().unwrap();
@@ -18099,6 +18181,8 @@ mod tests {
                 preamble_byte: 0xaa,
                 preamble_bytes: 4,
                 bit_order: BitOrder::MostSignificantFirst,
+                minimum_bit_confidence_milli: 500,
+                maximum_uncertain_bits: 0,
             },
         };
         let started = start_capture(

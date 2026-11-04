@@ -4,6 +4,7 @@ use crate::{
 };
 
 const MAX_PREAMBLE_BYTES: usize = 256;
+const MAX_UNCERTAIN_BITS: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawRadioConfig {
@@ -12,6 +13,10 @@ pub struct RawRadioConfig {
     /// Number of consecutive preamble bytes required before byte output starts.
     pub preamble_bytes: usize,
     pub bit_order: BitOrder,
+    /// Minimum accepted hard-decision confidence, in thousandths.
+    pub minimum_bit_confidence_milli: u16,
+    /// Maximum low-confidence bits retained in one preamble-delimited message.
+    pub maximum_uncertain_bits: usize,
 }
 
 impl RawRadioConfig {
@@ -19,6 +24,16 @@ impl RawRadioConfig {
         if !(1..=MAX_PREAMBLE_BYTES).contains(&self.preamble_bytes) {
             return Err(DecodeError::new(
                 "raw radio preamble length must be between 1 and 256 bytes",
+            ));
+        }
+        if self.minimum_bit_confidence_milli > 1_000 {
+            return Err(DecodeError::new(
+                "raw radio minimum bit confidence must be between 0 and 1",
+            ));
+        }
+        if self.maximum_uncertain_bits > MAX_UNCERTAIN_BITS {
+            return Err(DecodeError::new(
+                "raw radio maximum uncertain bits must not exceed 1000000",
             ));
         }
         Ok(())
@@ -39,6 +54,7 @@ pub struct RawRadioOutput {
 pub struct RawRadioMessageStart {
     pub sample_index: u64,
     pub preamble_bytes: usize,
+    pub maximum_uncertain_bits: usize,
 }
 
 /// Streaming raw-byte decoder that derives byte alignment from a repeated-byte preamble.
@@ -52,6 +68,7 @@ pub struct RawRadioDecoder {
     pending_bits: Vec<TimedBit>,
     synchronized: bool,
     preamble_run_bytes: usize,
+    preamble_run_uncertain_bits: usize,
     preamble_run_start: Option<u64>,
     last_input_start: Option<u64>,
 }
@@ -67,6 +84,7 @@ impl RawRadioDecoder {
             config,
             synchronized: false,
             preamble_run_bytes: 0,
+            preamble_run_uncertain_bits: 0,
             preamble_run_start: None,
             last_input_start: None,
         })
@@ -85,6 +103,7 @@ impl RawRadioDecoder {
         self.pending_bits.clear();
         self.synchronized = false;
         self.preamble_run_bytes = 0;
+        self.preamble_run_uncertain_bits = 0;
         self.preamble_run_start = None;
         self.last_input_start = None;
     }
@@ -123,19 +142,35 @@ impl RawRadioDecoder {
                         .iter()
                         .zip(&self.preamble_bits)
                         .all(|(actual, expected)| actual.value == *expected)
+                    && self
+                        .search_bits
+                        .iter()
+                        .filter(|bit| self.is_low_confidence(bit))
+                        .count()
+                        <= self.config.maximum_uncertain_bits
                 {
-                    let preamble = pack_bytes(&self.search_bits, self.config.bit_order);
+                    let preamble = pack_bytes(
+                        &self.search_bits,
+                        self.config.bit_order,
+                        self.minimum_bit_confidence(),
+                    );
                     let sample_index = preamble
                         .first()
                         .map_or(bit.range.start, |byte| byte.range.start);
+                    let preamble_uncertain_bits = preamble
+                        .iter()
+                        .map(|byte| usize::from(byte.status.low_confidence_bits))
+                        .sum();
                     output.message_starts.push(RawRadioMessageStart {
                         sample_index,
                         preamble_bytes: self.config.preamble_bytes,
+                        maximum_uncertain_bits: self.config.maximum_uncertain_bits,
                     });
                     output.bytes.extend(preamble);
                     self.search_bits.clear();
                     self.synchronized = true;
                     self.preamble_run_bytes = self.config.preamble_bytes;
+                    self.preamble_run_uncertain_bits = preamble_uncertain_bits;
                     self.preamble_run_start = Some(sample_index);
                 }
             }
@@ -162,7 +197,11 @@ impl RawRadioDecoder {
     fn push_synchronized_bit(&mut self, bit: TimedBit) -> Option<TimedByte> {
         self.pending_bits.push(bit);
         if self.pending_bits.len() == 8 {
-            let byte = pack_timed_byte(&self.pending_bits, self.config.bit_order);
+            let byte = pack_timed_byte(
+                &self.pending_bits,
+                self.config.bit_order,
+                self.minimum_bit_confidence(),
+            );
             self.pending_bits.clear();
             Some(byte)
         } else {
@@ -175,8 +214,15 @@ impl RawRadioDecoder {
         byte: TimedByte,
         message_starts: &mut Vec<RawRadioMessageStart>,
     ) {
-        if byte.value != self.config.preamble_byte {
+        let uncertain_bits = usize::from(byte.status.low_confidence_bits);
+        if byte.value != self.config.preamble_byte
+            || self
+                .preamble_run_uncertain_bits
+                .saturating_add(uncertain_bits)
+                > self.config.maximum_uncertain_bits
+        {
             self.preamble_run_bytes = 0;
+            self.preamble_run_uncertain_bits = 0;
             self.preamble_run_start = None;
             return;
         }
@@ -184,12 +230,24 @@ impl RawRadioDecoder {
             self.preamble_run_start = Some(byte.range.start);
         }
         self.preamble_run_bytes = self.preamble_run_bytes.saturating_add(1);
+        self.preamble_run_uncertain_bits = self
+            .preamble_run_uncertain_bits
+            .saturating_add(uncertain_bits);
         if self.preamble_run_bytes == self.config.preamble_bytes {
             message_starts.push(RawRadioMessageStart {
                 sample_index: self.preamble_run_start.unwrap_or(byte.range.start),
                 preamble_bytes: self.config.preamble_bytes,
+                maximum_uncertain_bits: self.config.maximum_uncertain_bits,
             });
         }
+    }
+
+    fn minimum_bit_confidence(&self) -> f32 {
+        f32::from(self.config.minimum_bit_confidence_milli) / 1_000.0
+    }
+
+    fn is_low_confidence(&self, bit: &TimedBit) -> bool {
+        bit.confidence < self.minimum_bit_confidence()
     }
 
     fn flush_partial_byte(&mut self, output: &mut RawRadioOutput, reason: &str) {
@@ -221,13 +279,21 @@ fn repeated_byte_bits(config: RawRadioConfig) -> Vec<bool> {
         .collect()
 }
 
-fn pack_bytes(bits: &[TimedBit], bit_order: BitOrder) -> Vec<TimedByte> {
+fn pack_bytes(
+    bits: &[TimedBit],
+    bit_order: BitOrder,
+    minimum_bit_confidence: f32,
+) -> Vec<TimedByte> {
     bits.chunks_exact(8)
-        .map(|bits| pack_timed_byte(bits, bit_order))
+        .map(|bits| pack_timed_byte(bits, bit_order, minimum_bit_confidence))
         .collect()
 }
 
-fn pack_timed_byte(bits: &[TimedBit], bit_order: BitOrder) -> TimedByte {
+fn pack_timed_byte(
+    bits: &[TimedBit],
+    bit_order: BitOrder,
+    minimum_bit_confidence: f32,
+) -> TimedByte {
     let value = bits.iter().enumerate().fold(0_u8, |value, (index, bit)| {
         let shift = match bit_order {
             BitOrder::MostSignificantFirst => 7 - index,
@@ -241,7 +307,13 @@ fn pack_timed_byte(bits: &[TimedBit], bit_order: BitOrder) -> TimedByte {
             start: bits[0].range.start,
             end: bits[7].range.end,
         },
-        status: ByteStatus::default(),
+        status: ByteStatus {
+            low_confidence_bits: bits
+                .iter()
+                .filter(|bit| bit.confidence < minimum_bit_confidence)
+                .count() as u8,
+            ..ByteStatus::default()
+        },
     }
 }
 
@@ -307,6 +379,8 @@ mod tests {
             preamble_byte: 0xaa,
             preamble_bytes: 3,
             bit_order: BitOrder::MostSignificantFirst,
+            minimum_bit_confidence_milli: 500,
+            maximum_uncertain_bits: 0,
         }
     }
 
@@ -333,6 +407,7 @@ mod tests {
             [RawRadioMessageStart {
                 sample_index: 16,
                 preamble_bytes: 3,
+                maximum_uncertain_bits: 0,
             }]
         );
     }
@@ -357,6 +432,37 @@ mod tests {
             decoded.iter().map(|byte| byte.value).collect::<Vec<_>>(),
             [0xaa, 0xaa, 0xaa, 0x12, 0x34, 0x56]
         );
+    }
+
+    #[test]
+    fn confidence_gate_rejects_an_uncertain_preamble() {
+        let input = byte_bits(&[0xaa, 0xaa, 0xaa, 0x12]);
+        let mut batch = bits(&input, 0, false);
+        batch.bits[3].confidence = 0.25;
+        let mut decoder = RawRadioDecoder::new(config()).unwrap();
+
+        let output = decoder.push(&batch).unwrap();
+
+        assert!(!output.synchronized);
+        assert!(output.bytes.is_empty());
+        assert!(output.message_starts.is_empty());
+    }
+
+    #[test]
+    fn confidence_gate_counts_allowed_uncertain_bits_in_output_bytes() {
+        let input = byte_bits(&[0xaa, 0xaa, 0xaa, 0x12]);
+        let mut batch = bits(&input, 0, false);
+        batch.bits[3].confidence = 0.25;
+        batch.bits[27].confidence = 0.25;
+        let mut allowed = config();
+        allowed.maximum_uncertain_bits = 2;
+        let mut decoder = RawRadioDecoder::new(allowed).unwrap();
+
+        let output = decoder.push(&batch).unwrap();
+
+        assert!(output.synchronized);
+        assert_eq!(output.bytes[0].status.low_confidence_bits, 1);
+        assert_eq!(output.bytes[3].status.low_confidence_bits, 1);
     }
 
     #[test]
@@ -396,10 +502,12 @@ mod tests {
                 RawRadioMessageStart {
                     sample_index: 100,
                     preamble_bytes: 3,
+                    maximum_uncertain_bits: 0,
                 },
                 RawRadioMessageStart {
                     sample_index: 180,
                     preamble_bytes: 3,
+                    maximum_uncertain_bits: 0,
                 },
             ]
         );
@@ -420,6 +528,7 @@ mod tests {
             [RawRadioMessageStart {
                 sample_index: 64,
                 preamble_bytes: 3,
+                maximum_uncertain_bits: 0,
             }]
         );
     }

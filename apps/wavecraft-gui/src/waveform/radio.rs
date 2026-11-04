@@ -19,6 +19,7 @@ const WATERFALL_HISTORY_HINT: &str = "Rows are the newest spectrum snapshots ret
 pub struct RawRadioMessage {
     sequence: u64,
     preamble_bytes: usize,
+    maximum_uncertain_bits: usize,
     bytes: Vec<TimedByte>,
     complete: bool,
 }
@@ -47,6 +48,17 @@ impl RawRadioMessage {
     pub fn is_complete(&self) -> bool {
         self.complete
     }
+
+    pub fn uncertain_bits(&self) -> usize {
+        self.bytes
+            .iter()
+            .map(|byte| usize::from(byte.status.low_confidence_bits))
+            .sum()
+    }
+
+    fn is_accepted(&self) -> bool {
+        self.uncertain_bits() <= self.maximum_uncertain_bits
+    }
 }
 
 /// Bounded, modulation-neutral output retained for analyzer rendering.
@@ -64,6 +76,7 @@ pub struct RadioAnalysisStore {
     raw_messages: VecDeque<RawRadioMessage>,
     next_raw_message_sequence: u64,
     raw_dropped_messages: u64,
+    raw_rejected_messages: u64,
     raw_synchronized: bool,
     raw_dropped_bytes: u64,
     raw_diagnostics: VecDeque<DecodeDiagnostic>,
@@ -84,6 +97,7 @@ impl Default for RadioAnalysisStore {
             raw_messages: VecDeque::new(),
             next_raw_message_sequence: 1,
             raw_dropped_messages: 0,
+            raw_rejected_messages: 0,
             raw_synchronized: false,
             raw_dropped_bytes: 0,
             raw_diagnostics: VecDeque::new(),
@@ -165,6 +179,7 @@ impl RadioAnalysisStore {
                 self.start_raw_message(RawRadioMessageStart {
                     sample_index: byte.range.start,
                     preamble_bytes: 0,
+                    maximum_uncertain_bits: usize::MAX,
                 });
             }
             if let Some(message) = self.raw_messages.back_mut() {
@@ -246,6 +261,10 @@ impl RadioAnalysisStore {
         self.raw_dropped_messages
     }
 
+    pub fn raw_rejected_messages(&self) -> u64 {
+        self.raw_rejected_messages
+    }
+
     pub fn raw_dropped_bytes(&self) -> u64 {
         self.raw_dropped_bytes
     }
@@ -274,7 +293,6 @@ impl RadioAnalysisStore {
     fn start_raw_message(&mut self, start: RawRadioMessageStart) {
         let mut carried_bytes = Vec::new();
         if let Some(current) = self.raw_messages.back_mut() {
-            current.complete = true;
             if let Some(split) = current
                 .bytes
                 .iter()
@@ -283,9 +301,11 @@ impl RadioAnalysisStore {
                 carried_bytes = current.bytes.split_off(split);
             }
         }
+        self.finish_raw_message();
         self.raw_messages.push_back(RawRadioMessage {
             sequence: self.next_raw_message_sequence,
             preamble_bytes: start.preamble_bytes,
+            maximum_uncertain_bits: start.maximum_uncertain_bits,
             bytes: carried_bytes,
             complete: false,
         });
@@ -298,8 +318,13 @@ impl RadioAnalysisStore {
     }
 
     fn finish_raw_message(&mut self) {
-        if let Some(message) = self.raw_messages.back_mut() {
+        let rejected = self.raw_messages.back_mut().is_some_and(|message| {
             message.complete = true;
+            !message.is_accepted()
+        });
+        if rejected {
+            self.raw_messages.pop_back();
+            self.raw_rejected_messages = self.raw_rejected_messages.saturating_add(1);
         }
     }
 }
@@ -695,22 +720,25 @@ fn paint_analysis(
         };
         if completed_messages == 0 {
             format!(
-                "0 messages{receiving} · {} dropped · {} gaps",
+                "0 messages{receiving} · {} rejected · {} dropped · {} gaps",
+                store.raw_rejected_messages(),
                 store.raw_dropped_messages(),
                 store.discontinuities()
             )
         } else {
             format!(
-                "{completed_messages} messages · newest data {newest_completed_data_bytes} B{receiving} · {} dropped · {} gaps",
+                "{completed_messages} messages · newest data {newest_completed_data_bytes} B{receiving} · {} rejected · {} dropped · {} gaps",
+                store.raw_rejected_messages(),
                 store.raw_dropped_messages(),
                 store.discontinuities()
             )
         }
     } else if let Some(alphabet_size) = store.soft_symbol_alphabet_size() {
         format!(
-            "searching preamble · {} symbols · alphabet {} · {} gaps",
+            "searching preamble · {} symbols · alphabet {} · {} rejected · {} gaps",
             store.soft_symbols().len(),
             alphabet_size,
+            store.raw_rejected_messages(),
             store.discontinuities()
         )
     } else if let Some(sample_rate_hz) = store.analog_sample_rate_hz() {
@@ -887,6 +915,11 @@ fn paint_raw_messages(
                 egui::RichText::new(format!("DATA ({} B) {data}", message.data_len()))
                     .monospace()
                     .color(Color32::from_rgb(150, 220, 255)),
+            );
+            ui.label(
+                egui::RichText::new(format!("UNCERTAIN {} bit(s)", message.uncertain_bits()))
+                    .monospace()
+                    .color(Color32::from_rgb(105, 150, 175)),
             );
         });
     }
@@ -1718,6 +1751,7 @@ mod tests {
             message_starts: vec![RawRadioMessageStart {
                 sample_index: 0,
                 preamble_bytes: 2,
+                maximum_uncertain_bits: 0,
             }],
             diagnostics: vec![],
             synchronized: true,
@@ -1727,6 +1761,7 @@ mod tests {
             message_starts: vec![RawRadioMessageStart {
                 sample_index: 24,
                 preamble_bytes: 2,
+                maximum_uncertain_bits: 0,
             }],
             diagnostics: vec![],
             synchronized: true,
@@ -1764,6 +1799,41 @@ mod tests {
 
         assert_eq!(store.completed_raw_message_count(), 2);
         assert!(!store.raw_message_in_progress());
+    }
+
+    #[test]
+    fn analysis_store_rejects_messages_over_the_uncertain_bit_limit() {
+        let mut store = RadioAnalysisStore::new(32).unwrap();
+        let uncertain_status = ByteStatus {
+            low_confidence_bits: 1,
+            ..ByteStatus::default()
+        };
+        store.ingest_raw(RawRadioOutput {
+            bytes: vec![
+                TimedByte {
+                    value: 0xaa,
+                    range: SampleRange { start: 0, end: 8 },
+                    status: ByteStatus::default(),
+                },
+                TimedByte {
+                    value: 0x12,
+                    range: SampleRange { start: 8, end: 16 },
+                    status: uncertain_status,
+                },
+            ],
+            message_starts: vec![RawRadioMessageStart {
+                sample_index: 0,
+                preamble_bytes: 1,
+                maximum_uncertain_bits: 0,
+            }],
+            diagnostics: vec![],
+            synchronized: true,
+        });
+
+        store.finish_raw_capture();
+
+        assert!(store.raw_messages().is_empty());
+        assert_eq!(store.raw_rejected_messages(), 1);
     }
 
     #[test]

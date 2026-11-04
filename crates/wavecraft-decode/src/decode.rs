@@ -37,6 +37,9 @@ impl SampleRange {
 pub struct ByteStatus {
     pub parity_error: bool,
     pub framing_error: bool,
+    /// Number of source bits whose demodulator confidence was below the
+    /// configured acceptance threshold.
+    pub low_confidence_bits: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

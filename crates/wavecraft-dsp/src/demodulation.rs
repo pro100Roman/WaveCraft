@@ -53,7 +53,21 @@ impl TimedSoftSymbol {
 
     pub fn confidence(&self) -> Option<f32> {
         let sum = self.likelihoods.iter().sum::<f32>();
-        (sum > 0.0).then(|| self.likelihoods.iter().copied().fold(0.0_f32, f32::max) / sum)
+        (sum > 0.0).then(|| {
+            let (best, second_best) = self.likelihoods.iter().copied().fold(
+                (0.0_f32, 0.0_f32),
+                |(best, second_best), likelihood| {
+                    if likelihood >= best {
+                        (likelihood, best)
+                    } else if likelihood > second_best {
+                        (best, likelihood)
+                    } else {
+                        (best, second_best)
+                    }
+                },
+            );
+            (best - second_best) / sum
+        })
     }
 }
 
@@ -158,7 +172,13 @@ mod tests {
 
         assert!(symbol.validate(3).is_ok());
         assert_eq!(symbol.decision(), Some(1));
-        assert_eq!(symbol.confidence(), Some(0.5));
+        assert_eq!(symbol.confidence(), Some(1.0 / 6.0));
+
+        let ambiguous = TimedSoftSymbol {
+            likelihoods: vec![0.5, 0.5],
+            source_range: 20..30,
+        };
+        assert_eq!(ambiguous.confidence(), Some(0.0));
     }
 
     #[test]

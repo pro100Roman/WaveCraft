@@ -310,6 +310,15 @@ stop closes it. The list can be scrolled to older retained messages, and
 hovering a row shows its full retained hexadecimal contents. A repeated
 preamble may span arbitrary IQ and demodulator batches.
 
+Raw acquisition also has a normalized minimum bit-confidence threshold and a
+maximum uncertain-bit count. Confidence is the likelihood margin between the
+winning and next-most-likely symbol, so zero is ambiguous and one is decisive.
+A preamble whose uncertain-bit count exceeds the configured maximum cannot
+acquire synchronization. Once synchronized, every low-confidence bit is counted
+in its byte; a completed message above the limit is rejected instead of being
+shown as valid RAW data. The view reports the cumulative rejected-message count.
+Both settings are stored in recording metadata for reproducible offline decode.
+
 The RF view labels this modulation-neutral output pane **RAW DATA**. Horizontal
 drag handles make the RF SPECTRUM, WATERFALL, and RAW DATA heights adjustable.
 RAW DATA exposes both wheel scrolling and a draggable vertical scrollbar for
