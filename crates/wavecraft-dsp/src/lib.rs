@@ -78,6 +78,82 @@ pub struct SpectrumProcessor {
     center_frequency_hz: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpectrumPowerTriggerConfig {
+    pub fft_length: usize,
+    pub window: SpectrumWindow,
+    pub threshold_dbfs: f32,
+    pub iq_correction_enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpectrumPowerTriggerEvent {
+    pub source_range: Range<u64>,
+    pub frequency_hz: f64,
+    pub power_dbfs: f32,
+}
+
+/// One-shot, FFT-bin power trigger sharing the spectrum processor's dBFS scale.
+pub struct SpectrumPowerTrigger {
+    processor: SpectrumProcessor,
+    threshold_dbfs: f32,
+    triggered: bool,
+}
+
+impl SpectrumPowerTrigger {
+    pub fn new(config: SpectrumPowerTriggerConfig) -> Result<Self, String> {
+        if !config.threshold_dbfs.is_finite()
+            || !(MIN_TRIGGER_POWER_DBFS..=0.0).contains(&config.threshold_dbfs)
+        {
+            return Err(format!(
+                "spectrum trigger threshold must be between {MIN_TRIGGER_POWER_DBFS} and 0 dBFS"
+            ));
+        }
+        Ok(Self {
+            processor: SpectrumProcessor::new(config.fft_length, config.window)?
+                .with_iq_correction(config.iq_correction_enabled),
+            threshold_dbfs: config.threshold_dbfs,
+            triggered: false,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.processor.reset();
+        self.triggered = false;
+    }
+
+    pub fn push(&mut self, batch: &IqBatch) -> Option<SpectrumPowerTriggerEvent> {
+        if self.triggered {
+            return None;
+        }
+        for frame in self.processor.push(batch) {
+            let Some((bin, power_dbfs)) = frame
+                .power_dbfs
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(&right.1))
+            else {
+                continue;
+            };
+            if power_dbfs < self.threshold_dbfs {
+                continue;
+            }
+            let span_hz = frame.bin_width_hz * frame.power_dbfs.len() as f64;
+            self.triggered = true;
+            return Some(SpectrumPowerTriggerEvent {
+                source_range: frame.source_range,
+                frequency_hz: frame.center_frequency_hz as f64 - span_hz / 2.0
+                    + bin as f64 * frame.bin_width_hz,
+                power_dbfs,
+            });
+        }
+        None
+    }
+}
+
+const MIN_TRIGGER_POWER_DBFS: f32 = -120.0;
+
 impl SpectrumProcessor {
     pub fn new(fft_length: usize, window: SpectrumWindow) -> Result<Self, String> {
         if fft_length < 2 || !fft_length.is_power_of_two() {
@@ -311,5 +387,38 @@ mod tests {
             .max_by(|left, right| left.1.total_cmp(right.1))
             .map(|(index, _)| index);
         assert_eq!(corrected_peak, Some(6));
+    }
+
+    #[test]
+    fn spectrum_power_trigger_reports_the_first_threshold_crossing_once() {
+        let mut trigger = SpectrumPowerTrigger::new(SpectrumPowerTriggerConfig {
+            fft_length: 8,
+            window: SpectrumWindow::Rectangular,
+            threshold_dbfs: -10.0,
+            iq_correction_enabled: false,
+        })
+        .unwrap();
+
+        let event = trigger.push(&tone_batch(0, false)).unwrap();
+
+        assert_eq!(event.source_range, 0..8);
+        assert_eq!(event.frequency_hz, 100_002_000.0);
+        assert!(event.power_dbfs > -3.0);
+        assert_eq!(trigger.push(&tone_batch(8, false)), None);
+    }
+
+    #[test]
+    fn spectrum_power_trigger_waits_below_threshold_and_can_reset() {
+        let mut trigger = SpectrumPowerTrigger::new(SpectrumPowerTriggerConfig {
+            fft_length: 8,
+            window: SpectrumWindow::Rectangular,
+            threshold_dbfs: -1.0,
+            iq_correction_enabled: false,
+        })
+        .unwrap();
+
+        assert_eq!(trigger.push(&tone_batch(0, false)), None);
+        trigger.reset();
+        assert_eq!(trigger.push(&tone_batch(100, true)), None);
     }
 }
