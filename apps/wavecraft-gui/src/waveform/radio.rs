@@ -263,9 +263,10 @@ impl RadioViewState {
         let show_analysis = analysis_enabled
             || analysis.error().is_some()
             || !analysis.soft_symbols().is_empty()
-            || !analysis.analog_samples().is_empty();
+            || !analysis.analog_samples().is_empty()
+            || !analysis.raw_bytes().is_empty();
         let analysis_height = if show_analysis {
-            rect.height().mul_add(0.18, 0.0).clamp(86.0, 126.0)
+            rect.height().mul_add(0.24, 0.0).clamp(110.0, 180.0)
         } else {
             0.0
         };
@@ -385,18 +386,24 @@ fn paint_analysis(ui: &egui::Ui, rect: Rect, store: &RadioAnalysisStore, analysi
     ui.painter().text(
         title_rect.left_center() + Vec2::new(8.0, 0.0),
         egui::Align2::LEFT_CENTER,
-        "DEMODULATION",
+        "FSK RAW DATA",
         FontId::proportional(12.0),
         Color32::from_rgb(145, 160, 180),
     );
     let status = if let Some(error) = store.error() {
         format!("error · {error}")
+    } else if store.raw_synchronized() {
+        format!(
+            "{} bytes · locked · {} dropped · {} gaps",
+            store.raw_bytes().len(),
+            store.raw_dropped_bytes(),
+            store.discontinuities()
+        )
     } else if let Some(alphabet_size) = store.soft_symbol_alphabet_size() {
         format!(
-            "{} symbols · alphabet {} · {} dropped · {} gaps",
+            "searching preamble · {} symbols · alphabet {} · {} gaps",
             store.soft_symbols().len(),
             alphabet_size,
-            store.dropped_items(),
             store.discontinuities()
         )
     } else if let Some(sample_rate_hz) = store.analog_sample_rate_hz() {
@@ -430,7 +437,9 @@ fn paint_analysis(ui: &egui::Ui, rect: Rect, store: &RadioAnalysisStore, analysi
     if plot.width() <= 1.0 || plot.height() <= 1.0 || store.error().is_some() {
         return;
     }
-    if !store.soft_symbols().is_empty() {
+    if !store.raw_bytes().is_empty() {
+        paint_raw_bytes(ui, plot, store);
+    } else if !store.soft_symbols().is_empty() {
         paint_soft_symbols(ui, plot, store);
     } else if !store.analog_samples().is_empty() {
         paint_analog_samples(ui, plot, store);
@@ -445,6 +454,38 @@ fn paint_analysis(ui: &egui::Ui, rect: Rect, store: &RadioAnalysisStore, analysi
             },
             FontId::proportional(12.0),
             Color32::from_rgb(105, 120, 140),
+        );
+    }
+}
+
+fn paint_raw_bytes(ui: &egui::Ui, plot: Rect, store: &RadioAnalysisStore) {
+    const BYTE_CELL_WIDTH: f32 = 25.0;
+    const ROW_HEIGHT: f32 = 18.0;
+    let columns = (plot.width() / BYTE_CELL_WIDTH).floor().max(1.0) as usize;
+    let rows = (plot.height() / ROW_HEIGHT).floor().max(1.0) as usize;
+    let visible = columns.saturating_mul(rows);
+    let skip = store.raw_bytes().len().saturating_sub(visible);
+    for (index, byte) in store.raw_bytes().iter().skip(skip).enumerate() {
+        let row = index / columns;
+        let column = index % columns;
+        ui.painter().text(
+            Pos2::new(
+                plot.left() + column as f32 * BYTE_CELL_WIDTH,
+                plot.top() + row as f32 * ROW_HEIGHT,
+            ),
+            egui::Align2::LEFT_TOP,
+            format!("{:02X}", byte.value),
+            FontId::monospace(12.0),
+            Color32::from_rgb(150, 220, 255),
+        );
+    }
+    if let Some(diagnostic) = store.raw_diagnostics().back() {
+        ui.painter().text(
+            plot.right_bottom(),
+            egui::Align2::RIGHT_BOTTOM,
+            &diagnostic.message,
+            FontId::proportional(9.0),
+            Color32::from_rgb(230, 180, 95),
         );
     }
 }
@@ -707,6 +748,7 @@ fn format_compact_decimal(value: f64, precision: usize, unit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wavecraft_decode::{ByteStatus, SampleRange};
     use wavecraft_dsp::{TimedAnalogBatch, TimedSoftSymbolBatch};
 
     fn frame(index: u64, frequency: u64) -> SpectrumFrame {
@@ -832,6 +874,38 @@ mod tests {
         assert_eq!(store.soft_symbol_alphabet_size(), None);
         assert_eq!(store.analog_samples().len(), 1);
         assert_eq!(store.analog_sample_rate_hz(), Some(48_000));
+    }
+
+    #[test]
+    fn analysis_store_bounds_synchronized_raw_bytes() {
+        let mut store = RadioAnalysisStore::new(2).unwrap();
+        store.ingest_raw(RawRadioOutput {
+            bytes: [0xaa, 0xaa, 0x42]
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| TimedByte {
+                    value,
+                    range: SampleRange {
+                        start: index as u64 * 8,
+                        end: index as u64 * 8 + 8,
+                    },
+                    status: ByteStatus::default(),
+                })
+                .collect(),
+            diagnostics: vec![],
+            synchronized: true,
+        });
+
+        assert!(store.raw_synchronized());
+        assert_eq!(
+            store
+                .raw_bytes()
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0xaa, 0x42]
+        );
+        assert_eq!(store.raw_dropped_bytes(), 1);
     }
 
     #[test]

@@ -12,6 +12,9 @@ IQ into a bounded modulation-neutral output store. An expandable Signal
 Analyzer panel edits the tagged channel, modulation, and timing settings;
 the RF view renders bounded timed soft-symbol decisions or analog output with
 drop, discontinuity, and analyzer-error diagnostics.
+For binary FSK, the panel also edits a one-byte hexadecimal preamble value and
+an independent preamble length in bytes. After acquisition, the RF view shows
+the bounded raw hexadecimal stream including the matched preamble bytes.
 
 WaveCraft treats HackRF as the first backend for a generic radio-receiver
 instrument, not as a GUI-specific feature. The backend produces ordered raw IQ

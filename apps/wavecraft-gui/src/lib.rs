@@ -8112,6 +8112,46 @@ fn paint_radio_analyzer_configuration(
             });
             ui.end_row();
 
+            paint_radio_parameter_label(
+                ui,
+                "Preamble value",
+                Some("One hexadecimal byte repeated at the start of the raw FSK data"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    add_left_aligned_sized(
+                        ui,
+                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut settings.preamble_byte)
+                            .range(0..=u8::MAX)
+                            .speed(1)
+                            .hexadecimal(2, false, true),
+                    );
+                    ui.label("hex");
+                });
+            });
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
+                "Preamble length",
+                Some("Number of consecutive preamble bytes required to align the raw FSK stream"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    add_left_aligned_sized(
+                        ui,
+                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut settings.preamble_bytes)
+                            .range(1..=256)
+                            .speed(1),
+                    );
+                    ui.label("bytes");
+                });
+            });
+            settings.preamble_bytes = settings.preamble_bytes.clamp(1, 256);
+            ui.end_row();
+
             if settings.demodulation == RadioDemodulation::BinaryGfsk {
                 paint_radio_parameter_label(
                     ui,
@@ -8214,6 +8254,12 @@ fn paint_radio_analyzer_configuration(
     if settings.enabled {
         if let Err(error) = settings.signal_profile() {
             ui.label(RichText::new(error).small().color(Color32::LIGHT_RED));
+        } else if let Err(error) = settings.raw_config().validate() {
+            ui.label(
+                RichText::new(error.to_string())
+                    .small()
+                    .color(Color32::LIGHT_RED),
+            );
         }
     }
 }
