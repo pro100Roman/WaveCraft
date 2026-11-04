@@ -3054,6 +3054,7 @@ dependencies = [
  "rfd",
  "wavecraft-core",
  "wavecraft-decode",
+ "wavecraft-dsp",
  "wavecraft-recording",
  "wavecraft-usb",
 ]

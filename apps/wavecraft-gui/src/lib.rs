@@ -5,6 +5,7 @@ mod recording;
 mod sessions;
 mod snapshot;
 mod theme;
+pub mod waveform;
 
 use devices::{
     capture_devices_for_target, first_device_id_for_role, selected_device_for_role,
