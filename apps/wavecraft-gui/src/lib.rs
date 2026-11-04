@@ -7408,8 +7408,8 @@ fn paint_instrument_settings(ui: &mut egui::Ui, devices: &[DeviceEntry]) {
 fn selected_radio_text(radios: &[DiscoveredRadio], selected_id: Option<&str>) -> String {
     match selected_id {
         Some(id) => selected_radio(radios, Some(id))
-            .map(|radio| format!("{} · {id}", radio.descriptor.name))
-            .unwrap_or_else(|| format!("Unavailable · {id}")),
+            .map(|radio| radio.descriptor.name.clone())
+            .unwrap_or_else(|| "Unavailable radio receiver".to_owned()),
         None => "No radio receiver available".to_owned(),
     }
 }
@@ -7527,12 +7527,13 @@ fn paint_radio_domain_control(
     label: &str,
     value: &mut u64,
     domain: &ValueDomain,
+    width_fraction: f32,
 ) {
     ui.label(RichText::new(label).small().color(TEXT_MUTED));
     match domain {
         ValueDomain::Discrete(values) => {
             egui::ComboBox::from_id_salt(id_salt)
-                .width(ui.available_width())
+                .width(ui.available_width() * width_fraction.clamp(0.1, 1.0))
                 .selected_text(format_radio_value(*value))
                 .show_ui(ui, |ui| {
                     for choice in values {
@@ -7572,6 +7573,7 @@ fn paint_radio_capture_settings(
             "Center frequency",
             &mut settings.capture.center_frequency_hz,
             &radio.capabilities.frequency_hz,
+            1.0,
         );
         ui.add_space(4.0);
         paint_radio_domain_control(
@@ -7580,6 +7582,7 @@ fn paint_radio_capture_settings(
             "Sample rate",
             &mut settings.capture.sample_rate_hz,
             &radio.capabilities.sample_rates_hz,
+            1.0,
         );
         ui.add_space(4.0);
         paint_radio_domain_control(
@@ -7588,6 +7591,7 @@ fn paint_radio_capture_settings(
             "Baseband bandwidth",
             &mut settings.capture.bandwidth_hz,
             &radio.capabilities.bandwidths_hz,
+            1.0 / 3.0,
         );
 
         if radio.capabilities.receive_channels > 1 {
@@ -7687,7 +7691,7 @@ fn paint_radio_device_selector(
         .iter()
         .map(|radio| {
             let id = radio.descriptor.id.as_str().to_owned();
-            (id.clone(), format!("{} · {id}", radio.descriptor.name))
+            (id.clone(), format!("{}\n{id}", radio.descriptor.name))
         })
         .collect::<Vec<_>>();
     ui.add_enabled_ui(enabled && !choices.is_empty(), |ui| {
@@ -7700,6 +7704,9 @@ fn paint_radio_device_selector(
                 }
             });
     });
+    if let Some(id) = selected_id.as_deref() {
+        ui.add(egui::Label::new(RichText::new(id).small().monospace().color(TEXT_MUTED)).wrap());
+    }
     before != *selected_id
 }
 
