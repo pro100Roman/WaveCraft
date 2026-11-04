@@ -226,6 +226,10 @@ One generic **RF Spectrum** view contains:
 - frequency, delta-frequency, and channel-power markers; and
 - visible overrun, dropped-row, and decoder-state indicators.
 
+The implemented spectrum trace exposes the nearest FFT bin under the pointer
+with a crosshair and hover readout containing absolute frequency and dBFS
+power. This uses the same bin-center mapping as the rendered trace.
+
 The capture settings panel identifies the selected backend as HackRF and owns
 hardware controls such as center frequency, sample rate, bandwidth, LNA/VGA
 gain, RF amplifier, and signed reference-frequency correction. HackRF

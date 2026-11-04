@@ -678,6 +678,49 @@ fn paint_spectrum(ui: &egui::Ui, rect: Rect, spectrum: Option<&SpectrumFrame>) {
             Color32::from_rgb(120, 140, 160),
         );
     }
+
+    let response = ui.interact(plot, ui.id().with("rf_spectrum_hover"), Sense::hover());
+    if let Some(pointer) = response.hover_pos() {
+        let fraction = ((pointer.x - plot.left()) / plot.width()).clamp(0.0, 1.0);
+        if let Some((bin, frequency_hz, power_dbfs)) = spectrum_value_at(spectrum, fraction) {
+            let x = egui::lerp(
+                plot.x_range(),
+                bin as f32 / (spectrum.power_dbfs.len() - 1) as f32,
+            );
+            let normalized =
+                ((power_dbfs - MIN_POWER_DBFS) / (MAX_POWER_DBFS - MIN_POWER_DBFS)).clamp(0.0, 1.0);
+            let point = Pos2::new(x, egui::lerp(plot.y_range(), 1.0 - normalized));
+            let painter = ui.painter().with_clip_rect(plot);
+            painter.line_segment(
+                [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+                Stroke::new(1.0_f32, Color32::from_rgb(120, 190, 220)),
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(plot.left(), point.y),
+                    Pos2::new(plot.right(), point.y),
+                ],
+                Stroke::new(0.75_f32, Color32::from_rgb(85, 115, 135)),
+            );
+            painter.circle_filled(point, 3.5, Color32::WHITE);
+            response.on_hover_ui(|ui| {
+                ui.monospace(format_frequency(frequency_hz));
+                ui.monospace(format!("{power_dbfs:.1} dBFS"));
+            });
+        }
+    }
+}
+
+fn spectrum_value_at(spectrum: &SpectrumFrame, fraction: f32) -> Option<(usize, f64, f32)> {
+    let last_bin = spectrum.power_dbfs.len().checked_sub(1)?;
+    let bin = (fraction.clamp(0.0, 1.0) * last_bin as f32).round() as usize;
+    let span_hz = spectrum.bin_width_hz * spectrum.power_dbfs.len() as f64;
+    let low_hz = spectrum.center_frequency_hz as f64 - span_hz / 2.0;
+    Some((
+        bin,
+        low_hz + bin as f64 * spectrum.bin_width_hz,
+        spectrum.power_dbfs[bin],
+    ))
 }
 
 fn waterfall_image(frames: &VecDeque<SpectrumFrame>) -> Option<egui::ColorImage> {
@@ -821,6 +864,29 @@ mod tests {
         assert_eq!(format_frequency(100_500_000.0), "100.5 MHz");
         assert_eq!(format_frequency(1_250_000_000.0), "1.25 GHz");
         assert_eq!(format_frequency(12_340.0), "12.34 kHz");
+    }
+
+    #[test]
+    fn spectrum_hover_uses_the_nearest_plotted_bin() {
+        let spectrum = SpectrumFrame {
+            source_range: 0..4,
+            center_frequency_hz: 868_000_000,
+            bin_width_hz: 1_000.0,
+            power_dbfs: vec![-80.0, -70.0, -60.0, -50.0],
+        };
+
+        assert_eq!(
+            spectrum_value_at(&spectrum, 0.0),
+            Some((0, 867_998_000.0, -80.0))
+        );
+        assert_eq!(
+            spectrum_value_at(&spectrum, 0.5),
+            Some((2, 868_000_000.0, -60.0))
+        );
+        assert_eq!(
+            spectrum_value_at(&spectrum, 1.0),
+            Some((3, 868_001_000.0, -50.0))
+        );
     }
 
     #[test]
