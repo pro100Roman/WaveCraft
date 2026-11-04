@@ -15,6 +15,9 @@ drop, discontinuity, and analyzer-error diagnostics.
 For binary FSK, the panel also edits a one-byte hexadecimal preamble value and
 an independent preamble length in bytes. After acquisition, the RF view shows
 the bounded raw message history including the matched preamble bytes.
+New radio sessions default to a 2 MHz capture sample rate, 1.75 MHz HackRF
+baseband bandwidth, and a GFSK analyzer profile with a 19.2 kbit/s binary bit
+rate and 35 kHz frequency deviation. The analyzer remains opt-in.
 
 WaveCraft treats HackRF as the first backend for a generic radio-receiver
 instrument, not as a GUI-specific feature. The backend produces ordered raw IQ

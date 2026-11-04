@@ -3184,13 +3184,13 @@ impl Default for RadioAnalyzerSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            demodulation: RadioDemodulation::BinaryFsk,
+            demodulation: RadioDemodulation::BinaryGfsk,
             channel_offset_hz: 0,
             channel_bandwidth_hz: 200_000,
             output_sample_rate_hz: 1_000_000,
             filter_tap_count: 129,
-            symbol_rate_hz: 100_000,
-            deviation_hz: 50_000,
+            symbol_rate_hz: 19_200,
+            deviation_hz: 35_000,
             gfsk_bt_milli: 500,
             inverted: false,
             adaptive_timing: true,
@@ -3262,8 +3262,8 @@ impl Default for RadioSettings {
         Self {
             capture: RadioCaptureSettings {
                 center_frequency_hz: 100_000_000,
-                sample_rate_hz: 10_000_000,
-                bandwidth_hz: 5_000_000,
+                sample_rate_hz: 2_000_000,
+                bandwidth_hz: 1_750_000,
                 receive_channel: 0,
                 sample_limit: None,
             },
@@ -17004,6 +17004,24 @@ mod tests {
     }
 
     #[test]
+    fn radio_defaults_match_the_initial_gfsk_profile() {
+        let settings = RadioSettings::default();
+
+        assert_eq!(settings.capture.sample_rate_hz, 2_000_000);
+        assert_eq!(settings.capture.bandwidth_hz, 1_750_000);
+        assert_eq!(
+            settings.analyzer.demodulation,
+            RadioDemodulation::BinaryGfsk
+        );
+        assert_eq!(settings.analyzer.symbol_rate_hz, 19_200);
+        assert_eq!(settings.analyzer.deviation_hz, 35_000);
+        settings
+            .capture
+            .validate(&wavecraft_hackrf::hackrf_one_capabilities())
+            .expect("default radio settings should be supported by HackRF One");
+    }
+
+    #[test]
     fn radio_single_duration_derives_an_exact_bounded_sample_limit() {
         assert_eq!(
             radio_single_sample_limit(10_000_000, 1_500).unwrap(),
@@ -17083,8 +17101,8 @@ mod tests {
         let DemodulationProfile::BinaryGfsk(gfsk) = profile.demodulation else {
             panic!("GFSK settings should build the GFSK profile variant");
         };
-        assert_eq!(gfsk.symbol_rate_hz, 100_000);
-        assert_eq!(gfsk.deviation_hz, 50_000);
+        assert_eq!(gfsk.symbol_rate_hz, 19_200);
+        assert_eq!(gfsk.deviation_hz, 35_000);
         assert_eq!(gfsk.bt, 0.5);
         assert!(matches!(gfsk.timing, FskTiming::Adaptive { .. }));
     }
