@@ -7582,6 +7582,7 @@ fn format_radio_mhz_number(value_hz: u64) -> String {
 }
 
 const RADIO_VALUE_WIDTH: f32 = 80.0;
+const RADIO_GAIN_HANDLE_ASPECT_RATIO: f32 = 1.8;
 
 fn add_left_aligned_sized(
     ui: &mut egui::Ui,
@@ -7603,6 +7604,45 @@ fn paint_radio_parameter_label(ui: &mut egui::Ui, label: &str, help: Option<&str
     if let Some(help) = help {
         response.on_hover_text(help);
     }
+}
+
+fn paint_radio_gain_slider(
+    ui: &mut egui::Ui,
+    value: &mut i32,
+    range: std::ops::RangeInclusive<i32>,
+    step: u32,
+) -> egui::Response {
+    let minimum = *range.start();
+    let maximum = *range.end();
+    ui.spacing_mut().slider_width = RADIO_VALUE_WIDTH;
+    let response = ui.add(
+        egui::Slider::new(value, range)
+            .step_by(f64::from(step.max(1)))
+            .show_value(false)
+            .handle_shape(egui::style::HandleShape::Rect {
+                aspect_ratio: RADIO_GAIN_HANDLE_ASPECT_RATIO,
+            }),
+    );
+    let fraction = if maximum > minimum {
+        (*value - minimum) as f32 / (maximum - minimum) as f32
+    } else {
+        0.0
+    }
+    .clamp(0.0, 1.0);
+    let handle_radius = response.rect.height() / 2.5;
+    let handle_half_width = handle_radius * RADIO_GAIN_HANDLE_ASPECT_RATIO;
+    let handle_x = egui::lerp(
+        response.rect.left() + handle_half_width..=response.rect.right() - handle_half_width,
+        fraction,
+    );
+    ui.painter().text(
+        Pos2::new(handle_x, response.rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        value.to_string(),
+        FontId::proportional(9.0),
+        ui.visuals().strong_text_color(),
+    );
+    response
 }
 
 fn paint_radio_mhz_value(ui: &mut egui::Ui, value_hz: &mut u64, domain: &ValueDomain) {
@@ -7788,11 +7828,11 @@ fn paint_radio_receive_configuration(
                         ui.horizontal(|ui| {
                             let response = ui
                                 .scope(|ui| {
-                                    ui.spacing_mut().slider_width = RADIO_VALUE_WIDTH;
-                                    ui.add(
-                                        egui::Slider::new(value, control.range_db.clone())
-                                            .step_by(f64::from(control.step_db.max(1)))
-                                            .show_value(false),
+                                    paint_radio_gain_slider(
+                                        ui,
+                                        value,
+                                        control.range_db.clone(),
+                                        control.step_db,
                                     )
                                 })
                                 .inner;
