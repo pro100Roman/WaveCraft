@@ -55,6 +55,7 @@ pub struct GainControlDescriptor {
     pub label: String,
     pub range_db: RangeInclusive<i32>,
     pub step_db: u32,
+    pub default_db: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -303,6 +304,7 @@ mod tests {
                 label: "Gain".to_owned(),
                 range_db: -12..=60,
                 step_db: 1,
+                default_db: 0,
             }],
             supports_hardware_timestamps: false,
             supports_external_clock: false,

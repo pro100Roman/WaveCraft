@@ -3055,7 +3055,7 @@ impl Default for RadioSettings {
             capture: RadioCaptureSettings {
                 center_frequency_hz: 100_000_000,
                 sample_rate_hz: 10_000_000,
-                bandwidth_hz: 8_000_000,
+                bandwidth_hz: 5_000_000,
                 receive_channel: 0,
                 sample_limit: None,
             },
@@ -7483,7 +7483,7 @@ fn normalize_radio_settings(settings: &mut RadioSettings, capabilities: &RadioCa
         settings
             .gains_db
             .entry(control.id.clone())
-            .or_insert(*control.range_db.start());
+            .or_insert(control.default_db);
     }
 }
 
@@ -7658,7 +7658,7 @@ fn paint_radio_capture_settings(
             let value = settings
                 .gains_db
                 .entry(control.id.clone())
-                .or_insert(*control.range_db.start());
+                .or_insert(control.default_db);
             ui.label(RichText::new(&control.label).small().color(TEXT_MUTED));
             ui.add(
                 egui::Slider::new(value, control.range_db.clone())
@@ -15569,7 +15569,7 @@ mod tests {
         assert_eq!(settings.capture.bandwidth_hz, 8_000_000);
         assert_eq!(settings.capture.receive_channel, 0);
         assert_eq!(settings.gains_db.get("lna"), Some(&40));
-        assert_eq!(settings.gains_db.get("vga"), Some(&0));
+        assert_eq!(settings.gains_db.get("vga"), Some(&16));
         assert!(!settings.gains_db.contains_key("stale"));
         settings
             .capture
