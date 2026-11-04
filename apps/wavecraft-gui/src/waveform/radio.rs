@@ -7,10 +7,6 @@ const MAX_WATERFALL_TEXTURE_WIDTH: usize = 512;
 const MIN_POWER_DBFS: f32 = -120.0;
 const MAX_POWER_DBFS: f32 = 0.0;
 const WATERFALL_HISTORY_HINT: &str = "Rows are the newest spectrum snapshots retained for the visible waterfall. Dropped counts older display rows discarded after this bounded history filled; it does not indicate lost HackRF or IQ samples.";
-const NARROW_FREQUENCY_LABEL_DIVISIONS: &[u8] = &[0, 5, 10];
-const COMPACT_FREQUENCY_LABEL_DIVISIONS: &[u8] = &[0, 2, 5, 8, 10];
-const MEDIUM_FREQUENCY_LABEL_DIVISIONS: &[u8] = &[0, 2, 4, 5, 6, 8, 10];
-const DENSE_FREQUENCY_LABEL_DIVISIONS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 /// Bounded derived state for the RF spectrum and waterfall views.
 #[derive(Debug)]
@@ -268,7 +264,7 @@ fn paint_spectrum(ui: &egui::Ui, rect: Rect, spectrum: Option<&SpectrumFrame>) {
 
     let span_hz = spectrum.bin_width_hz * spectrum.power_dbfs.len() as f64;
     let low_hz = spectrum.center_frequency_hz as f64 - span_hz / 2.0;
-    for &division in spectrum_frequency_label_divisions(plot.width()) {
+    for division in 0_u8..=10 {
         let fraction = f32::from(division) / 10.0;
         let x = egui::lerp(plot.x_range(), fraction);
         let frequency = low_hz + span_hz * f64::from(division) / 10.0;
@@ -284,18 +280,6 @@ fn paint_spectrum(ui: &egui::Ui, rect: Rect, spectrum: Option<&SpectrumFrame>) {
             FontId::monospace(10.0),
             Color32::from_rgb(120, 140, 160),
         );
-    }
-}
-
-fn spectrum_frequency_label_divisions(plot_width: f32) -> &'static [u8] {
-    if plot_width >= 900.0 {
-        DENSE_FREQUENCY_LABEL_DIVISIONS
-    } else if plot_width >= 700.0 {
-        MEDIUM_FREQUENCY_LABEL_DIVISIONS
-    } else if plot_width >= 420.0 {
-        COMPACT_FREQUENCY_LABEL_DIVISIONS
-    } else {
-        NARROW_FREQUENCY_LABEL_DIVISIONS
     }
 }
 
@@ -348,14 +332,20 @@ fn waterfall_color(power_dbfs: f32) -> Color32 {
 
 fn format_frequency(frequency_hz: f64) -> String {
     if frequency_hz.abs() >= 1.0e9 {
-        format!("{:.4} GHz", frequency_hz / 1.0e9)
+        format_compact_decimal(frequency_hz / 1.0e9, 4, "GHz")
     } else if frequency_hz.abs() >= 1.0e6 {
-        format!("{:.3} MHz", frequency_hz / 1.0e6)
+        format_compact_decimal(frequency_hz / 1.0e6, 3, "MHz")
     } else if frequency_hz.abs() >= 1.0e3 {
-        format!("{:.2} kHz", frequency_hz / 1.0e3)
+        format_compact_decimal(frequency_hz / 1.0e3, 2, "kHz")
     } else {
         format!("{frequency_hz:.0} Hz")
     }
+}
+
+fn format_compact_decimal(value: f64, precision: usize, unit: &str) -> String {
+    let value = format!("{value:.precision$}");
+    let value = value.trim_end_matches('0').trim_end_matches('.');
+    format!("{value} {unit}")
 }
 
 #[cfg(test)]
@@ -427,16 +417,10 @@ mod tests {
     }
 
     #[test]
-    fn spectrum_frequency_labels_expand_with_available_width() {
-        assert_eq!(spectrum_frequency_label_divisions(300.0), &[0, 5, 10]);
-        assert_eq!(spectrum_frequency_label_divisions(500.0), &[0, 2, 5, 8, 10]);
-        assert_eq!(
-            spectrum_frequency_label_divisions(750.0),
-            &[0, 2, 4, 5, 6, 8, 10]
-        );
-        assert_eq!(
-            spectrum_frequency_label_divisions(1_000.0),
-            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-        );
+    fn spectrum_frequency_labels_trim_redundant_zeroes() {
+        assert_eq!(format_frequency(100_000_000.0), "100 MHz");
+        assert_eq!(format_frequency(100_500_000.0), "100.5 MHz");
+        assert_eq!(format_frequency(1_250_000_000.0), "1.25 GHz");
+        assert_eq!(format_frequency(12_340.0), "12.34 kHz");
     }
 }
