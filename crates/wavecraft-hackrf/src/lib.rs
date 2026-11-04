@@ -148,6 +148,7 @@ pub struct HackRfRuntimeSettings {
     pub lna_gain_db: Option<u32>,
     pub vga_gain_db: Option<u32>,
     pub amplifier_enabled: bool,
+    pub frequency_correction_milli_ppm: i32,
 }
 
 #[derive(Clone)]
@@ -243,7 +244,7 @@ fn validate_runtime_settings(settings: &HackRfRuntimeSettings) -> Result<(), Cap
         vga_gain_db: settings.vga_gain_db,
         amplifier_enabled: settings.amplifier_enabled,
         antenna_power_enabled: false,
-        frequency_correction_milli_ppm: 0,
+        frequency_correction_milli_ppm: settings.frequency_correction_milli_ppm,
     })
 }
 
@@ -331,6 +332,8 @@ impl HackRfCaptureSource {
         let mut first_sample_index = 0_u64;
         let mut sequence = 0_u64;
         let mut center_frequency_hz = self.settings.center_frequency_hz;
+        let mut frequency_correction_milli_ppm =
+            self.provider_settings.frequency_correction_milli_ppm;
         let mut discontinuity = false;
 
         while !context.is_cancelled() {
@@ -344,9 +347,12 @@ impl HackRfCaptureSource {
                 .and_then(latest_runtime_settings)
             {
                 discard_pending_blocks(receiver, callback_state, &mut first_sample_index);
-                self.apply_runtime_settings(device, settings)?;
+                let correction_changed =
+                    settings.frequency_correction_milli_ppm != frequency_correction_milli_ppm;
+                self.apply_runtime_settings(device, settings, correction_changed)?;
                 discard_pending_blocks(receiver, callback_state, &mut first_sample_index);
                 center_frequency_hz = settings.center_frequency_hz;
+                frequency_correction_milli_ppm = settings.frequency_correction_milli_ppm;
                 discontinuity = true;
             }
 
@@ -413,14 +419,24 @@ impl HackRfCaptureSource {
         &self,
         device: *mut HackRfDevice,
         settings: HackRfRuntimeSettings,
+        correction_changed: bool,
     ) -> Result<(), CaptureError> {
+        if correction_changed {
+            self.runtime.set_sample_rate(
+                device,
+                corrected_programmed_rate(
+                    self.settings.sample_rate_hz as f64,
+                    settings.frequency_correction_milli_ppm,
+                )?,
+            )?;
+        }
         self.runtime
             .set_bandwidth(device, settings.bandwidth_hz as u32)?;
         self.runtime.set_frequency(
             device,
             corrected_programmed_frequency(
                 settings.center_frequency_hz,
-                self.provider_settings.frequency_correction_milli_ppm,
+                settings.frequency_correction_milli_ppm,
             )?,
         )?;
         self.runtime
@@ -1131,6 +1147,7 @@ mod tests {
             lna_gain_db: Some(16),
             vga_gain_db: Some(16),
             amplifier_enabled: false,
+            frequency_correction_milli_ppm: 0,
         };
         let latest = HackRfRuntimeSettings {
             center_frequency_hz: 433_920_000,
@@ -1138,6 +1155,7 @@ mod tests {
             lna_gain_db: Some(24),
             vga_gain_db: Some(20),
             amplifier_enabled: true,
+            frequency_correction_milli_ppm: 15_000,
         };
 
         control.update(first).unwrap();

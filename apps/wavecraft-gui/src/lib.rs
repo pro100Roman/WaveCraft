@@ -7681,6 +7681,7 @@ fn hackrf_runtime_settings(settings: &RadioSettings) -> Result<HackRfRuntimeSett
         lna_gain_db: radio_gain_u32(settings, "lna")?,
         vga_gain_db: radio_gain_u32(settings, "vga")?,
         amplifier_enabled: settings.amplifier_enabled,
+        frequency_correction_milli_ppm: settings.frequency_correction_milli_ppm,
     })
 }
 
@@ -7689,6 +7690,7 @@ fn radio_runtime_settings_differ(current: &RadioSettings, previous: &RadioSettin
         || current.capture.bandwidth_hz != previous.capture.bandwidth_hz
         || current.gains_db != previous.gains_db
         || current.amplifier_enabled != previous.amplifier_enabled
+        || current.frequency_correction_milli_ppm != previous.frequency_correction_milli_ppm
 }
 
 fn normalize_gain_value(value: i32, minimum: i32, maximum: i32, step: u32) -> i32 {
@@ -8309,10 +8311,10 @@ fn paint_radio_receive_configuration(
                     ui,
                     "Frequency correction",
                     Some(
-                        "Signed HackRF reference correction. Positive values compensate a fast clock. Applies to RF tuning and the sample clock when the next capture starts. Range: -200 to +200 ppm.",
+                        "Signed HackRF reference correction. Positive values compensate a fast clock. Changes apply to RF tuning and the sample clock during Run and reset the live DSP stream. Range: -200 to +200 ppm.",
                     ),
                 );
-                ui.add_enabled_ui(enabled, |ui| {
+                ui.add_enabled_ui(tuning_enabled, |ui| {
                     ui.horizontal(|ui| {
                         let mut correction_ppm =
                             f64::from(settings.frequency_correction_milli_ppm) / 1_000.0;
@@ -10001,7 +10003,7 @@ impl eframe::App for WaveCraftApp {
                         ui.add_space(8.0);
                         ui.small(
                             RichText::new(if radio_runtime_controls_enabled {
-                                "Device, sample-rate, IQ-correction, and antenna-power settings remain locked; tuning and gain controls are live"
+                        "Device, sample-rate, IQ-correction, and antenna-power settings remain locked; tuning, frequency correction, and gain controls are live"
                             } else {
                                 "Settings are locked while an operation is running"
                             })
@@ -16593,11 +16595,16 @@ mod tests {
         edited.capture.sample_rate_hz = 12_000_000;
         assert!(!radio_runtime_settings_differ(&edited, &initial));
 
+        let mut correction_only = initial.clone();
+        correction_only.frequency_correction_milli_ppm = -8_250;
+        assert!(radio_runtime_settings_differ(&correction_only, &initial));
+
         edited.capture.center_frequency_hz = 433_920_000;
         edited.capture.bandwidth_hz = 8_000_000;
         edited.gains_db.insert("lna".to_owned(), 24);
         edited.gains_db.insert("vga".to_owned(), 20);
         edited.amplifier_enabled = true;
+        edited.frequency_correction_milli_ppm = 12_500;
         assert!(radio_runtime_settings_differ(&edited, &initial));
         assert_eq!(
             hackrf_runtime_settings(&edited).unwrap(),
@@ -16607,6 +16614,7 @@ mod tests {
                 lna_gain_db: Some(24),
                 vga_gain_db: Some(20),
                 amplifier_enabled: true,
+                frequency_correction_milli_ppm: 12_500,
             }
         );
     }

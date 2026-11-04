@@ -49,6 +49,7 @@ fn discovers_and_receives_from_hackrf_one() {
             lna_gain_db: Some(24),
             vga_gain_db: Some(20),
             amplifier_enabled: false,
+            frequency_correction_milli_ppm: 0,
         })
         .expect("live HackRF settings should be accepted");
     let retuned = loop {

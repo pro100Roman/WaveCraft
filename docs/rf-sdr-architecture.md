@@ -230,9 +230,12 @@ The capture settings panel identifies the selected backend as HackRF and owns
 hardware controls such as center frequency, sample rate, bandwidth, LNA/VGA
 gain, RF amplifier, and signed reference-frequency correction. HackRF
 correction is stored in thousandths of a ppm and inversely adjusts both the
-programmed RF frequency and sample clock at capture start. Positive values
-compensate a fast reference while the IQ metadata retains the requested
-physical center frequency and sample rate. Device controls do not become rendering options.
+programmed RF frequency and sample clock. Positive values compensate a fast
+reference while the IQ metadata retains the requested physical center
+frequency and sample rate. During continuous Run capture, correction changes
+discard queued pre-change IQ, reprogram both clocks, and mark the next batch as
+discontinuous so stateful DSP resets. Device controls do not become rendering
+options.
 Retuning clears the waterfall or starts a visibly separate segment because its
 rows no longer share one frequency axis.
 
