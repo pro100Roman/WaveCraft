@@ -7707,12 +7707,22 @@ fn paint_radio_capture_settings(
     runtime_enabled: bool,
 ) {
     ui.add_space(10.0);
-    ui.label(
-        RichText::new("RECEIVE CONFIGURATION")
-            .strong()
-            .color(ACCENT),
-    );
-    ui.add_space(6.0);
+    egui::CollapsingHeader::new(RichText::new("Receive configuration").strong())
+        .id_salt("radio_receive_configuration_section")
+        .default_open(true)
+        .show(ui, |ui| {
+            paint_radio_receive_configuration(ui, radio, settings, enabled, runtime_enabled);
+        });
+}
+
+fn paint_radio_receive_configuration(
+    ui: &mut egui::Ui,
+    radio: &DiscoveredRadio,
+    settings: &mut RadioSettings,
+    enabled: bool,
+    runtime_enabled: bool,
+) {
+    ui.set_max_width(ui.available_width());
     let tuning_enabled = enabled || runtime_enabled;
     ui.add_enabled_ui(tuning_enabled, |ui| {
         paint_radio_mhz_control(
