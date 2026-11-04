@@ -29,5 +29,20 @@ pub(crate) fn configure_style(context: &egui::Context) {
     context.set_visuals(visuals);
     context.style_mut(|style| {
         style.interaction.tooltip_delay = TOOLTIP_DELAY_SECONDS;
+        style.interaction.selectable_labels = true;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_labels_are_selectable_for_copying() {
+        let context = egui::Context::default();
+
+        configure_style(&context);
+
+        assert!(context.style().interaction.selectable_labels);
+    }
 }

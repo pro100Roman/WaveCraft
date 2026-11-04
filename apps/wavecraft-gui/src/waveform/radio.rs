@@ -407,7 +407,7 @@ pub struct RadioViewOptions<'a> {
 impl RadioViewState {
     pub fn paint(
         &mut self,
-        ui: &egui::Ui,
+        ui: &mut egui::Ui,
         rect: Rect,
         store: &RadioDisplayStore,
         analysis: &RadioAnalysisStore,
@@ -498,23 +498,26 @@ impl RadioViewState {
         }
     }
 
-    fn paint_waterfall(&mut self, ui: &egui::Ui, rect: Rect, store: &RadioDisplayStore) {
+    fn paint_waterfall(&mut self, ui: &mut egui::Ui, rect: Rect, store: &RadioDisplayStore) {
         if rect.height() <= 1.0 {
             return;
         }
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_rgb(7, 10, 16));
         let title_rect = Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.top() + 22.0));
-        ui.painter().text(
-            title_rect.left_center() + Vec2::new(8.0, 0.0),
-            egui::Align2::LEFT_CENTER,
+        selectable_overlay_label(
+            ui,
+            title_rect,
+            "waterfall_title",
             "WATERFALL",
             FontId::proportional(12.0),
             Color32::from_rgb(145, 160, 180),
+            false,
         );
-        ui.painter().text(
-            title_rect.right_center() - Vec2::new(8.0, 0.0),
-            egui::Align2::RIGHT_CENTER,
+        selectable_overlay_label(
+            ui,
+            title_rect,
+            "waterfall_status",
             format!(
                 "{} rows · {} dropped · ⓘ",
                 store.waterfall().len(),
@@ -522,15 +525,7 @@ impl RadioViewState {
             ),
             FontId::proportional(11.0),
             Color32::from_rgb(105, 120, 140),
-        );
-        let hint_rect = Rect::from_min_max(
-            Pos2::new(title_rect.center().x, title_rect.top()),
-            title_rect.max,
-        );
-        ui.interact(
-            hint_rect,
-            ui.id().with("waterfall_history_hint"),
-            Sense::hover(),
+            true,
         )
         .on_hover_text(WATERFALL_HISTORY_HINT);
         let image_rect = Rect::from_min_max(
@@ -635,8 +630,34 @@ fn paint_radio_pane_divider(ui: &egui::Ui, rect: Rect, id: &'static str) -> Opti
         .then(|| ui.input(|input| input.pointer.delta().y))
 }
 
+fn selectable_overlay_label(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    id: &'static str,
+    text: impl Into<String>,
+    font: FontId,
+    color: Color32,
+    align_right: bool,
+) -> egui::Response {
+    let layout = if align_right {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    let mut label_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(id)
+            .max_rect(rect)
+            .layout(layout),
+    );
+    label_ui.add_space(8.0);
+    label_ui.add(
+        egui::Label::new(egui::RichText::new(text.into()).font(font).color(color)).selectable(true),
+    )
+}
+
 fn paint_analysis(
-    ui: &egui::Ui,
+    ui: &mut egui::Ui,
     rect: Rect,
     store: &RadioAnalysisStore,
     analysis_enabled: bool,
@@ -648,12 +669,14 @@ fn paint_analysis(
     ui.painter()
         .rect_filled(rect, 0.0, Color32::from_rgb(9, 13, 19));
     let title_rect = Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.top() + 22.0));
-    ui.painter().text(
-        title_rect.left_center() + Vec2::new(8.0, 0.0),
-        egui::Align2::LEFT_CENTER,
+    selectable_overlay_label(
+        ui,
+        title_rect,
+        "raw_data_title",
         "RAW DATA",
         FontId::proportional(12.0),
         Color32::from_rgb(145, 160, 180),
+        false,
     );
     let status = if let Some(error) = store.error() {
         format!("error · {error}")
@@ -703,9 +726,10 @@ fn paint_analysis(
     } else {
         "disabled".to_owned()
     };
-    ui.painter().text(
-        title_rect.right_center() - Vec2::new(8.0, 0.0),
-        egui::Align2::RIGHT_CENTER,
+    selectable_overlay_label(
+        ui,
+        title_rect,
+        "raw_data_status",
         status,
         FontId::proportional(10.0),
         if store.error().is_some() {
@@ -713,6 +737,7 @@ fn paint_analysis(
         } else {
             Color32::from_rgb(105, 120, 140)
         },
+        true,
     );
     let plot = Rect::from_min_max(
         Pos2::new(rect.left() + 8.0, title_rect.bottom() + 3.0),
@@ -743,7 +768,7 @@ fn paint_analysis(
 }
 
 fn paint_raw_messages(
-    ui: &egui::Ui,
+    ui: &mut egui::Ui,
     plot: Rect,
     store: &RadioAnalysisStore,
     scroll_rows: &mut usize,
@@ -906,12 +931,18 @@ fn paint_raw_messages(
         );
     }
     if let Some(diagnostic) = store.raw_diagnostics().back() {
-        ui.painter().text(
+        let diagnostic_rect = Rect::from_min_max(
+            Pos2::new(plot.left(), (plot.bottom() - 18.0).max(plot.top())),
             Pos2::new(content_right, plot.bottom()),
-            egui::Align2::RIGHT_BOTTOM,
+        );
+        selectable_overlay_label(
+            ui,
+            diagnostic_rect,
+            "raw_data_diagnostic",
             &diagnostic.message,
             FontId::proportional(9.0),
             Color32::from_rgb(230, 180, 95),
+            true,
         );
     } else if completed_messages == 0 && store.raw_message_in_progress() {
         ui.painter().text(

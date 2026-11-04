@@ -6254,7 +6254,14 @@ fn paint_logic_trigger_conditions(
             });
         }
         if !conditions.iter().any(Option::is_some) {
-            ui.small(RichText::new("Choose at least one condition").color(Color32::LIGHT_RED));
+            ui.add(
+                egui::Label::new(
+                    RichText::new("Choose at least one condition")
+                        .small()
+                        .color(Color32::LIGHT_RED),
+                )
+                .selectable(true),
+            );
         }
     });
 }
@@ -7188,7 +7195,10 @@ fn paint_protocol_analyzer_settings(
 
             if let Some(error) = &settings.custom_load_error {
                 ui.add_space(4.0);
-                ui.label(RichText::new(error).color(Color32::LIGHT_RED));
+                ui.add(
+                    egui::Label::new(RichText::new(error).color(Color32::LIGHT_RED))
+                        .selectable(true),
+                );
             }
 
             if settings.picker_open {
@@ -8007,7 +8017,7 @@ fn add_left_aligned_sized(
 }
 
 fn paint_radio_parameter_label(ui: &mut egui::Ui, label: &str, help: Option<&str>) {
-    let response = ui.label(label);
+    let response = ui.add(egui::Label::new(label).selectable(true));
     if let Some(help) = help {
         response.on_hover_text(help);
     }
@@ -8516,12 +8526,18 @@ fn paint_radio_analyzer_configuration(
 
     if settings.enabled {
         if let Err(error) = settings.signal_profile() {
-            ui.label(RichText::new(error).small().color(Color32::LIGHT_RED));
+            ui.add(
+                egui::Label::new(RichText::new(error).small().color(Color32::LIGHT_RED))
+                    .selectable(true),
+            );
         } else if let Err(error) = settings.raw_config().validate() {
-            ui.label(
-                RichText::new(error.to_string())
-                    .small()
-                    .color(Color32::LIGHT_RED),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(error.to_string())
+                        .small()
+                        .color(Color32::LIGHT_RED),
+                )
+                .selectable(true),
             );
         }
     }
@@ -9526,10 +9542,13 @@ impl eframe::App for WaveCraftApp {
                         TEXT_MUTED
                     };
                     ui.label(RichText::new("●").color(color));
-                    ui.label(&self.status);
+                    ui.add(egui::Label::new(&self.status).selectable(true));
                     if let Some(error) = &self.last_error {
                         ui.separator();
-                        ui.label(RichText::new(error).color(Color32::LIGHT_RED));
+                        ui.add(
+                            egui::Label::new(RichText::new(error).color(Color32::LIGHT_RED))
+                                .selectable(true),
+                        );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
@@ -12085,7 +12104,7 @@ fn waveform_card_fill(
     ui: &mut egui::Ui,
     title: &str,
     subtitle: &str,
-    paint: impl FnOnce(&egui::Ui, Rect),
+    paint: impl FnOnce(&mut egui::Ui, Rect),
 ) -> Rect {
     let plot_height = (ui.available_height() - WAVEFORM_CARD_CHROME_HEIGHT).max(64.0);
     waveform_card(ui, title, subtitle, plot_height, paint)
@@ -12273,7 +12292,7 @@ fn waveform_card(
     title: &str,
     subtitle: &str,
     height: f32,
-    paint: impl FnOnce(&egui::Ui, Rect),
+    paint: impl FnOnce(&mut egui::Ui, Rect),
 ) -> Rect {
     egui::Frame::none()
         .fill(PANEL)
@@ -12282,8 +12301,12 @@ fn waveform_card(
         .inner_margin(egui::Margin::same(12.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(title).strong().color(ACCENT));
-                ui.label(RichText::new(subtitle).color(TEXT_MUTED));
+                ui.add(
+                    egui::Label::new(RichText::new(title).strong().color(ACCENT)).selectable(true),
+                );
+                ui.add(
+                    egui::Label::new(RichText::new(subtitle).color(TEXT_MUTED)).selectable(true),
+                );
             });
             ui.add_space(8.0);
             let size = Vec2::new(ui.available_width(), height);
