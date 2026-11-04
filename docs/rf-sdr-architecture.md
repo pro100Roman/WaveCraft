@@ -258,7 +258,7 @@ sample limit from the selected sample rate and duration. With **Wait for
 trigger** enabled, the source remains active until the spectrum-power trigger
 fires. The triggering FFT window and a configurable 0–1000 ms post-trigger
 interval are committed to the display, analyzers, and recording before the view
-freezes; the post-trigger value has 0.001 ms resolution and defaults to 20 ms.
+freezes; the post-trigger value has 0.001 ms resolution and defaults to 2 ms.
 Later IQ is discarded.
 The live armed spectrum is a preview. **Run** remains continuous.
 

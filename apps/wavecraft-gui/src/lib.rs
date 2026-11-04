@@ -3269,7 +3269,7 @@ impl Default for RadioSettings {
             },
             single_duration_millis: 1_000,
             trigger_enabled: false,
-            trigger_posttrigger_micros: 20_000,
+            trigger_posttrigger_micros: 2_000,
             trigger_level_dbfs_tenths: -500,
             gains_db: BTreeMap::new(),
             frequency_correction_milli_ppm: 0,
@@ -17027,6 +17027,7 @@ mod tests {
         );
         assert_eq!(settings.analyzer.symbol_rate_hz, 19_200);
         assert_eq!(settings.analyzer.deviation_hz, 35_000);
+        assert_eq!(settings.trigger_posttrigger_micros, 2_000);
         settings
             .capture
             .validate(&wavecraft_hackrf::hackrf_one_capabilities())
