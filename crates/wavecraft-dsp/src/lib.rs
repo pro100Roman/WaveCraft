@@ -10,7 +10,7 @@ pub use demodulation::{
     DemodulatedBatch, Demodulator, TimedAnalogBatch, TimedAnalogSample, TimedSoftSymbol,
     TimedSoftSymbolBatch, MAX_SOFT_SYMBOL_ALPHABET_SIZE,
 };
-pub use fsk::{FskConfig, FskDemodulator, FskModulation, FskPolarity, TimedSoftBit};
+pub use fsk::{FskConfig, FskDemodulator, FskModulation, FskPolarity, FskTiming, TimedSoftBit};
 pub use timing::{RecoveredSymbol, SymbolTimingRecovery, TimedScalarSample, TimingRecoveryConfig};
 
 use std::collections::VecDeque;

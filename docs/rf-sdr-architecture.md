@@ -2,9 +2,9 @@
 
 Status: in progress. The core IQ model, bounded capture path, recording v2,
 spectrum DSP/display store, simulator, SDR facade, and receive-only HackRF One
-adapter are implemented. Channelization and the initial fixed-timing binary FSK
-demodulator are also implemented, including bounded streaming GFSK matched
-filtering with configurable BT; adaptive timing recovery remains next.
+adapter are implemented. Channelization and the binary FSK/GFSK demodulator are
+also implemented, including bounded streaming GFSK matched filtering with
+configurable BT and adaptive symbol timing with bounded clock-error tracking.
 GUI analyzer configuration and rendering of timed soft bits remain to be wired
 into the live and recorded IQ paths.
 
@@ -399,10 +399,12 @@ decisions and a symbol-to-bit mapping rather than the binary slicer.
 
 ### Symbol timing and soft symbols
 
-The discriminator stream passes through matched filtering and a clock-recovery
-stage such as an early/late or Gardner loop. A fixed-rate sampler is sufficient
-for deterministic initial tests, but production decoding must tolerate modest
-clock mismatch without accumulating a full-symbol error over a packet.
+The discriminator stream passes through matched filtering and clock recovery.
+The implemented scalar transition-aided loop interpolates symbol centers and
+tracks bounded clock error for binary FSK/GFSK and can be reused by OOK/ASK.
+Fixed source-time sampling remains available for deterministic captures. Later
+PSK/QAM demodulators can provide a different timing-error detector, such as a
+Gardner loop, behind the same timed-symbol contract.
 
 Digital demodulators emit soft symbols rather than immediately packing bytes.
 The generic contract retains likelihoods for every member of the configured

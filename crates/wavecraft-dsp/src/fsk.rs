@@ -1,6 +1,7 @@
 use crate::{
-    ChannelizedBatch, DemodulatedBatch, Demodulator, DspError, TimedComplexSample, TimedSoftSymbol,
-    TimedSoftSymbolBatch,
+    ChannelizedBatch, DemodulatedBatch, Demodulator, DspError, SymbolTimingRecovery,
+    TimedComplexSample, TimedScalarSample, TimedSoftSymbol, TimedSoftSymbolBatch,
+    TimingRecoveryConfig,
 };
 use std::collections::VecDeque;
 use std::f64::consts::PI;
@@ -22,6 +23,15 @@ pub enum FskModulation {
     Gfsk { bt: f64 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FskTiming {
+    Fixed,
+    Adaptive {
+        loop_bandwidth: f64,
+        max_clock_error_ppm: u32,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FskConfig {
     pub symbol_rate_hz: u64,
@@ -29,6 +39,7 @@ pub struct FskConfig {
     pub deviation_hz: u64,
     pub modulation: FskModulation,
     pub polarity: FskPolarity,
+    pub timing: FskTiming,
 }
 
 impl FskConfig {
@@ -45,6 +56,18 @@ impl FskConfig {
                     "GFSK BT must be finite and greater than zero",
                 ));
             }
+        }
+        if let FskTiming::Adaptive {
+            loop_bandwidth,
+            max_clock_error_ppm,
+        } = self.timing
+        {
+            TimingRecoveryConfig {
+                symbol_rate_hz: self.symbol_rate_hz,
+                loop_bandwidth,
+                max_clock_error_ppm,
+            }
+            .validate()?;
         }
         Ok(())
     }
@@ -68,10 +91,10 @@ impl From<TimedSoftBit> for TimedSoftSymbol {
     }
 }
 
-/// Incremental binary-FSK discriminator with fixed source-time symbol timing.
+/// Incremental binary-FSK discriminator with fixed or adaptive symbol timing.
 ///
-/// The first partial symbol after a discontinuity is discarded. Adaptive clock
-/// recovery and GFSK matched filtering are deliberately separate later stages.
+/// The first partial symbol after a discontinuity is discarded. GFSK matched
+/// filtering precedes the selected timing mode.
 pub struct FskDemodulator {
     config: FskConfig,
     previous_sample: Option<TimedComplexSample>,
@@ -86,6 +109,7 @@ pub struct FskDemodulator {
     symbol_range: Option<Range<u64>>,
     gaussian_filter: Vec<f64>,
     gaussian_history: VecDeque<DiscriminatorSample>,
+    timing_recovery: Option<SymbolTimingRecovery>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +122,17 @@ struct DiscriminatorSample {
 impl FskDemodulator {
     pub fn new(config: FskConfig) -> Result<Self, DspError> {
         config.validate()?;
+        let timing_recovery = match config.timing {
+            FskTiming::Fixed => None,
+            FskTiming::Adaptive {
+                loop_bandwidth,
+                max_clock_error_ppm,
+            } => Some(SymbolTimingRecovery::new(TimingRecoveryConfig {
+                symbol_rate_hz: config.symbol_rate_hz,
+                loop_bandwidth,
+                max_clock_error_ppm,
+            })?),
+        };
         Ok(Self {
             config,
             previous_sample: None,
@@ -112,11 +147,25 @@ impl FskDemodulator {
             symbol_range: None,
             gaussian_filter: Vec::new(),
             gaussian_history: VecDeque::new(),
+            timing_recovery,
         })
     }
 
     pub fn config(&self) -> &FskConfig {
         &self.config
+    }
+
+    pub fn timing_locked(&self) -> bool {
+        match &self.timing_recovery {
+            Some(timing_recovery) => timing_recovery.is_locked(),
+            None => true,
+        }
+    }
+
+    pub fn estimated_symbol_rate_hz(&self) -> Option<f64> {
+        self.timing_recovery
+            .as_ref()
+            .and_then(SymbolTimingRecovery::estimated_symbol_rate_hz)
     }
 
     pub fn reset(&mut self) {
@@ -132,6 +181,9 @@ impl FskDemodulator {
         self.symbol_range = None;
         self.gaussian_filter.clear();
         self.gaussian_history.clear();
+        if let Some(timing_recovery) = &mut self.timing_recovery {
+            timing_recovery.reset();
+        }
     }
 
     pub fn push(&mut self, batch: &ChannelizedBatch) -> Result<Vec<TimedSoftBit>, DspError> {
@@ -168,18 +220,21 @@ impl FskDemodulator {
         }
 
         let mut bits = Vec::new();
+        let mut timing_samples = Vec::new();
         for sample in &batch.samples {
             validate_sample(sample)?;
             let effective_index = effective_source_index(sample, batch)?;
             let Some(previous) = self.previous_sample.replace(sample.clone()) else {
-                let (number, remainder) = symbol_position(
-                    effective_index,
-                    batch.segment_start_sample_index,
-                    batch.source_sample_rate_hz,
-                    self.config.symbol_rate_hz,
-                )?;
-                self.current_symbol_number = Some(number);
-                self.current_symbol_complete = remainder == 0;
+                if self.config.timing == FskTiming::Fixed {
+                    let (number, remainder) = symbol_position(
+                        effective_index,
+                        batch.segment_start_sample_index,
+                        batch.source_sample_rate_hz,
+                        self.config.symbol_rate_hz,
+                    )?;
+                    self.current_symbol_number = Some(number);
+                    self.current_symbol_complete = remainder == 0;
+                }
                 continue;
             };
             if sample.source_range.start < previous.source_range.start {
@@ -206,47 +261,74 @@ impl FskDemodulator {
             let Some(discriminator) = self.filter_discriminator(discriminator) else {
                 continue;
             };
-            let (symbol_number, symbol_remainder) = symbol_position(
-                discriminator.effective_source_index,
-                batch.segment_start_sample_index,
-                batch.source_sample_rate_hz,
-                self.config.symbol_rate_hz,
-            )?;
-            let mut current_symbol_number = self.current_symbol_number.unwrap_or(symbol_number);
-            if self.likelihood_count == 0 && symbol_number > current_symbol_number + 1 {
-                current_symbol_number = symbol_number;
-                self.current_symbol_number = Some(symbol_number);
-                self.current_symbol_complete = symbol_remainder == 0;
-            }
-            self.likelihood_sum += discriminator.likelihood;
-            self.likelihood_count += 1;
-            extend_range(&mut self.symbol_range, discriminator.source_range);
-            if symbol_number > current_symbol_number {
-                if symbol_number != current_symbol_number + 1 {
-                    self.reset();
-                    return Err(DspError::new(
-                        "channelized sample spacing skipped an FSK symbol boundary",
-                    ));
-                }
-                if self.current_symbol_complete && self.likelihood_count != 0 {
-                    let likelihood =
-                        (self.likelihood_sum / self.likelihood_count as f64).clamp(-1.0, 1.0);
-                    if let Some(source_range) = self.symbol_range.take() {
-                        bits.push(TimedSoftBit {
-                            likelihood: likelihood as f32,
-                            source_range,
-                        });
-                    }
-                } else {
-                    self.symbol_range = None;
-                }
-                self.likelihood_sum = 0.0;
-                self.likelihood_count = 0;
-                self.current_symbol_number = Some(symbol_number);
-                self.current_symbol_complete = symbol_number == current_symbol_number + 1;
+            match self.config.timing {
+                FskTiming::Fixed => self.push_fixed_sample(discriminator, batch, &mut bits)?,
+                FskTiming::Adaptive { .. } => timing_samples.push(TimedScalarSample {
+                    value: discriminator.likelihood as f32,
+                    source_range: discriminator.source_range,
+                }),
             }
         }
+        if let Some(timing_recovery) = &mut self.timing_recovery {
+            bits.extend(
+                timing_recovery
+                    .push(&timing_samples, batch.sample_rate_hz, false)?
+                    .into_iter()
+                    .map(|symbol| TimedSoftBit {
+                        likelihood: symbol.value.clamp(-1.0, 1.0),
+                        source_range: symbol.source_range,
+                    }),
+            );
+        }
         Ok(bits)
+    }
+
+    fn push_fixed_sample(
+        &mut self,
+        discriminator: DiscriminatorSample,
+        batch: &ChannelizedBatch,
+        bits: &mut Vec<TimedSoftBit>,
+    ) -> Result<(), DspError> {
+        let (symbol_number, symbol_remainder) = symbol_position(
+            discriminator.effective_source_index,
+            batch.segment_start_sample_index,
+            batch.source_sample_rate_hz,
+            self.config.symbol_rate_hz,
+        )?;
+        let mut current_symbol_number = self.current_symbol_number.unwrap_or(symbol_number);
+        if self.likelihood_count == 0 && symbol_number > current_symbol_number + 1 {
+            current_symbol_number = symbol_number;
+            self.current_symbol_number = Some(symbol_number);
+            self.current_symbol_complete = symbol_remainder == 0;
+        }
+        self.likelihood_sum += discriminator.likelihood;
+        self.likelihood_count += 1;
+        extend_range(&mut self.symbol_range, discriminator.source_range);
+        if symbol_number <= current_symbol_number {
+            return Ok(());
+        }
+        if symbol_number != current_symbol_number + 1 {
+            self.reset();
+            return Err(DspError::new(
+                "channelized sample spacing skipped an FSK symbol boundary",
+            ));
+        }
+        if self.current_symbol_complete && self.likelihood_count != 0 {
+            let likelihood = (self.likelihood_sum / self.likelihood_count as f64).clamp(-1.0, 1.0);
+            if let Some(source_range) = self.symbol_range.take() {
+                bits.push(TimedSoftBit {
+                    likelihood: likelihood as f32,
+                    source_range,
+                });
+            }
+        } else {
+            self.symbol_range = None;
+        }
+        self.likelihood_sum = 0.0;
+        self.likelihood_count = 0;
+        self.current_symbol_number = Some(symbol_number);
+        self.current_symbol_complete = symbol_number == current_symbol_number + 1;
+        Ok(())
     }
 
     fn filter_discriminator(&mut self, sample: DiscriminatorSample) -> Option<DiscriminatorSample> {
@@ -445,6 +527,42 @@ mod tests {
         samples
     }
 
+    fn fsk_samples_with_clock_error(
+        bits: &[bool],
+        first_sample_index: u64,
+        actual_symbol_rate_hz: f64,
+        symbol_phase_samples: f64,
+    ) -> Vec<TimedComplexSample> {
+        const SAMPLE_RATE_HZ: f64 = 8_000.0;
+        const DEVIATION_HZ: f64 = 1_000.0;
+        let symbol_period = SAMPLE_RATE_HZ / actual_symbol_rate_hz;
+        let mut carrier_phase: f64 = 0.0;
+        let mut samples = Vec::new();
+        loop {
+            let sample_index = samples.len();
+            let symbol_index =
+                ((sample_index as f64 + symbol_phase_samples) / symbol_period).floor() as usize;
+            let Some(bit) = bits.get(symbol_index) else {
+                break;
+            };
+            let source_index = first_sample_index + sample_index as u64;
+            samples.push(TimedComplexSample {
+                i: carrier_phase.cos() as f32,
+                q: carrier_phase.sin() as f32,
+                source_range: source_index..source_index + 1,
+            });
+            let frequency = if *bit { DEVIATION_HZ } else { -DEVIATION_HZ };
+            carrier_phase += TAU * frequency / SAMPLE_RATE_HZ;
+        }
+        let source_index = first_sample_index + samples.len() as u64;
+        samples.push(TimedComplexSample {
+            i: carrier_phase.cos() as f32,
+            q: carrier_phase.sin() as f32,
+            source_range: source_index..source_index + 1,
+        });
+        samples
+    }
+
     fn gfsk_samples(bits: &[bool], first_sample_index: u64, bt: f64) -> Vec<TimedComplexSample> {
         const SAMPLE_RATE_HZ: u64 = 8_000;
         const SYMBOL_RATE_HZ: u64 = 1_000;
@@ -515,6 +633,7 @@ mod tests {
             deviation_hz: 1_000,
             modulation: FskModulation::Fsk,
             polarity: FskPolarity::Normal,
+            timing: FskTiming::Fixed,
         })
         .unwrap()
     }
@@ -606,6 +725,7 @@ mod tests {
                 deviation_hz: 1_000,
                 modulation: FskModulation::Gfsk { bt: 0.5 },
                 polarity: FskPolarity::Normal,
+                timing: FskTiming::Fixed,
             })
             .unwrap()
         };
@@ -643,6 +763,7 @@ mod tests {
                 deviation_hz: 1_000,
                 modulation: FskModulation::Gfsk { bt },
                 polarity: FskPolarity::Normal,
+                timing: FskTiming::Fixed,
             })
             .is_err());
         }
@@ -670,5 +791,90 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(1), Some(0), Some(1)]
         );
+    }
+
+    #[test]
+    fn adaptive_timing_tracks_clock_error_across_batches() {
+        let expected = [
+            true, false, true, false, true, false, true, false, true, true, false, true, false,
+            false, true, true, false, false, false, true, false, true, true, true, false, true,
+            false, false, true, false, true, false, false, true, true, false, true, true, false,
+            false,
+        ];
+        let actual_symbol_rate_hz = 1_004.0;
+        let samples = fsk_samples_with_clock_error(&expected, 0, actual_symbol_rate_hz, 2.7);
+        let make_demodulator = || {
+            FskDemodulator::new(FskConfig {
+                symbol_rate_hz: 1_000,
+                deviation_hz: 1_000,
+                modulation: FskModulation::Fsk,
+                polarity: FskPolarity::Normal,
+                timing: FskTiming::Adaptive {
+                    loop_bandwidth: 0.2,
+                    max_clock_error_ppm: 10_000,
+                },
+            })
+            .unwrap()
+        };
+
+        let mut whole = make_demodulator();
+        let whole_bits = whole.push(&batch(samples.clone(), true, 0)).unwrap();
+
+        let mut chunked = make_demodulator();
+        let chunked_bits = [0..17, 17..89, 89..211, 211..samples.len()]
+            .into_iter()
+            .enumerate()
+            .flat_map(|(index, range)| {
+                chunked
+                    .push(&batch(samples[range].to_vec(), index == 0, 0))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunked_bits, whole_bits);
+        assert!(whole.timing_locked());
+        assert!(chunked.timing_locked());
+        let estimated_symbol_rate_hz = whole.estimated_symbol_rate_hz().unwrap();
+        assert!(
+            (estimated_symbol_rate_hz - actual_symbol_rate_hz).abs() < 5.0,
+            "estimated {estimated_symbol_rate_hz} Hz"
+        );
+        let decisions = whole_bits
+            .iter()
+            .map(|bit| bit.likelihood.is_sign_positive())
+            .collect::<Vec<_>>();
+        assert!(decisions.len() >= expected.len() - 4);
+        assert!(expected
+            .windows(decisions.len())
+            .any(|window| window == decisions));
+    }
+
+    #[test]
+    fn adaptive_timing_follows_the_gfsk_matched_filter() {
+        let expected = (0..48).map(|index| index % 2 == 0).collect::<Vec<_>>();
+        let samples = gfsk_samples(&expected, 0, 0.5);
+        let mut demodulator = FskDemodulator::new(FskConfig {
+            symbol_rate_hz: 1_000,
+            deviation_hz: 1_000,
+            modulation: FskModulation::Gfsk { bt: 0.5 },
+            polarity: FskPolarity::Normal,
+            timing: FskTiming::Adaptive {
+                loop_bandwidth: 0.2,
+                max_clock_error_ppm: 10_000,
+            },
+        })
+        .unwrap();
+
+        let bits = demodulator.push(&batch(samples, true, 0)).unwrap();
+        let decisions = bits
+            .iter()
+            .map(|bit| bit.likelihood.is_sign_positive())
+            .collect::<Vec<_>>();
+
+        assert!(demodulator.timing_locked());
+        assert!(decisions.len() > 35);
+        assert!(expected
+            .windows(decisions.len())
+            .any(|window| window == decisions));
     }
 }
