@@ -53,7 +53,7 @@ pub struct RawRadioDecoder {
     synchronized: bool,
     preamble_run_bytes: usize,
     preamble_run_start: Option<u64>,
-    last_input_end: Option<u64>,
+    last_input_start: Option<u64>,
 }
 
 impl RawRadioDecoder {
@@ -68,7 +68,7 @@ impl RawRadioDecoder {
             synchronized: false,
             preamble_run_bytes: 0,
             preamble_run_start: None,
-            last_input_end: None,
+            last_input_start: None,
         })
     }
 
@@ -86,7 +86,7 @@ impl RawRadioDecoder {
         self.synchronized = false;
         self.preamble_run_bytes = 0;
         self.preamble_run_start = None;
-        self.last_input_end = None;
+        self.last_input_start = None;
     }
 
     pub fn push(&mut self, batch: &TimedBitBatch) -> Result<RawRadioOutput, DecodeError> {
@@ -95,12 +95,14 @@ impl RawRadioDecoder {
         if batch.discontinuity {
             self.flush_partial_byte(&mut output, "input discontinuity");
             self.reset();
-        } else if self
-            .last_input_end
-            .is_some_and(|end| batch.bits.first().is_some_and(|bit| bit.range.start < end))
-        {
+        } else if self.last_input_start.is_some_and(|start| {
+            batch
+                .bits
+                .first()
+                .is_some_and(|bit| bit.range.start < start)
+        }) {
             return Err(DecodeError::new(
-                "new raw radio bits overlap the previous input batch",
+                "new raw radio bits are not ordered after the previous input batch",
             ));
         }
 
@@ -139,7 +141,10 @@ impl RawRadioDecoder {
             }
         }
         if let Some(last) = batch.bits.last() {
-            self.last_input_end = Some(last.range.end);
+            // Source ranges describe every IQ sample that contributed to a bit
+            // decision. Filtering and interpolated timing recovery can therefore
+            // produce valid adjacent bits whose provenance ranges overlap.
+            self.last_input_start = Some(last.range.start);
         }
         output.synchronized = self.synchronized;
         Ok(output)
@@ -267,6 +272,27 @@ mod tests {
         }
     }
 
+    fn overlapping_bits(values: &[bool], first_bit: usize, discontinuity: bool) -> TimedBitBatch {
+        TimedBitBatch {
+            discontinuity,
+            bits: values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let start = (first_bit + index) as u64 * 2;
+                    TimedBit {
+                        value: *value,
+                        confidence: 0.9,
+                        range: SampleRange {
+                            start,
+                            end: start + 20,
+                        },
+                    }
+                })
+                .collect(),
+        }
+    }
+
     fn byte_bits(values: &[u8]) -> Vec<bool> {
         values
             .iter()
@@ -328,6 +354,30 @@ mod tests {
         assert_eq!(
             decoded.iter().map(|byte| byte.value).collect::<Vec<_>>(),
             [0xaa, 0xaa, 0xaa, 0x12, 0x34, 0x56]
+        );
+    }
+
+    #[test]
+    fn accepts_filtered_bit_ranges_that_overlap_across_input_batches() {
+        let input = byte_bits(&[0xaa, 0xaa, 0xaa, 0x12]);
+        let split = 19;
+        let mut decoder = RawRadioDecoder::new(config()).unwrap();
+
+        decoder
+            .push(&overlapping_bits(&input[..split], 0, false))
+            .unwrap();
+        let output = decoder
+            .push(&overlapping_bits(&input[split..], split, false))
+            .unwrap();
+
+        assert!(output.synchronized);
+        assert_eq!(
+            output
+                .bytes
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0xaa, 0xaa, 0xaa, 0x12]
         );
     }
 
