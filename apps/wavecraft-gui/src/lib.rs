@@ -7524,18 +7524,19 @@ fn format_radio_value(value_hz: u64) -> String {
     }
 }
 
-fn radio_frequency_hz_from_mhz(domain: &ValueDomain, frequency_mhz: f64) -> u64 {
-    if !frequency_mhz.is_finite() {
+fn radio_hz_from_mhz(domain: &ValueDomain, value_mhz: f64) -> u64 {
+    if !value_mhz.is_finite() {
         return nearest_domain_value(domain, 0);
     }
-    let requested_hz = (frequency_mhz * 1_000_000.0)
+    let requested_hz = (value_mhz * 1_000_000.0)
         .round()
         .clamp(0.0, u64::MAX as f64) as u64;
     nearest_domain_value(domain, requested_hz)
 }
 
-fn paint_radio_center_frequency_control(
+fn paint_radio_mhz_control(
     ui: &mut egui::Ui,
+    label: &str,
     value_hz: &mut u64,
     domain: &ValueDomain,
 ) {
@@ -7547,9 +7548,9 @@ fn paint_radio_center_frequency_control(
             .zip(values.iter().copied().max()),
         ValueDomain::Stepped { range, .. } => Some((*range.start(), *range.end())),
     };
-    ui.label(RichText::new("Center frequency").small().color(TEXT_MUTED));
-    let mut frequency_mhz = *value_hz as f64 / 1_000_000.0;
-    let mut editor = egui::DragValue::new(&mut frequency_mhz)
+    ui.label(RichText::new(label).small().color(TEXT_MUTED));
+    let mut value_mhz = *value_hz as f64 / 1_000_000.0;
+    let mut editor = egui::DragValue::new(&mut value_mhz)
         .speed(0.001)
         .min_decimals(3)
         .max_decimals(6)
@@ -7558,7 +7559,7 @@ fn paint_radio_center_frequency_control(
         editor = editor.range(minimum_hz as f64 / 1_000_000.0..=maximum_hz as f64 / 1_000_000.0);
     }
     if ui.add(editor).changed() {
-        *value_hz = radio_frequency_hz_from_mhz(domain, frequency_mhz);
+        *value_hz = radio_hz_from_mhz(domain, value_mhz);
     }
 }
 
@@ -7608,19 +7609,18 @@ fn paint_radio_capture_settings(
     );
     ui.add_space(6.0);
     ui.add_enabled_ui(enabled, |ui| {
-        paint_radio_center_frequency_control(
+        paint_radio_mhz_control(
             ui,
+            "Center frequency",
             &mut settings.capture.center_frequency_hz,
             &radio.capabilities.frequency_hz,
         );
         ui.add_space(4.0);
-        paint_radio_domain_control(
+        paint_radio_mhz_control(
             ui,
-            "radio_sample_rate",
             "Sample rate",
             &mut settings.capture.sample_rate_hz,
             &radio.capabilities.sample_rates_hz,
-            1.0,
         );
         ui.add_space(4.0);
         paint_radio_domain_control(
@@ -15606,18 +15606,21 @@ mod tests {
     }
 
     #[test]
-    fn radio_center_frequency_converts_fractional_mhz_to_hz() {
+    fn radio_values_convert_fractional_mhz_to_hz() {
         let domain = ValueDomain::Stepped {
             range: 1_000_000..=6_000_000_000,
             step: 1,
         };
 
-        assert_eq!(
-            radio_frequency_hz_from_mhz(&domain, 433.920_125),
-            433_920_125
-        );
-        assert_eq!(radio_frequency_hz_from_mhz(&domain, 0.5), 1_000_000);
-        assert_eq!(radio_frequency_hz_from_mhz(&domain, 6_100.0), 6_000_000_000);
+        assert_eq!(radio_hz_from_mhz(&domain, 433.920_125), 433_920_125);
+        assert_eq!(radio_hz_from_mhz(&domain, 0.5), 1_000_000);
+        assert_eq!(radio_hz_from_mhz(&domain, 6_100.0), 6_000_000_000);
+
+        let sample_rate_domain = ValueDomain::Stepped {
+            range: 2_000_000..=20_000_000,
+            step: 1,
+        };
+        assert_eq!(radio_hz_from_mhz(&sample_rate_domain, 12.5), 12_500_000);
     }
 
     #[test]
