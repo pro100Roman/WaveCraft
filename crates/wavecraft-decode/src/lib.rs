@@ -3,6 +3,7 @@
 mod decode;
 mod framing;
 mod radio;
+mod radio_packet;
 mod runtime;
 mod schema;
 mod transport;
@@ -16,6 +17,10 @@ pub use framing::{ByteStreamFramer, FramedBytes, FramingOutput};
 pub use radio::{
     BitPolarity, BitTransformConfig, BitTransformOutput, BitTransformer, LineCode, TimedBit,
     TimedBitBatch,
+};
+pub use radio_packet::{
+    BitOrder, RadioPacket, RadioPacketFramer, RadioPacketFramerConfig, RadioPacketFramingOutput,
+    RadioPacketLength, SyncWordConfig,
 };
 pub use runtime::{CustomProtocolRuntime, ProtocolRuntimeOutput};
 pub use schema::{

@@ -457,6 +457,13 @@ NRZI, or Manchester line coding. NRZI state survives arbitrary input chunks;
 Manchester retains at most one chip and reports invalid or incomplete pairs.
 All transform state resets explicitly at a discontinuity.
 
+The implemented radio framer searches for a configured sync word with an
+explicit Hamming-distance limit, packs timed bits MSB-first or LSB-first, and
+emits fixed-size or bounded length-field packets. Sync search, length fields,
+packet storage, and partial state all have explicit limits. Gaps flush partial
+packets with diagnostics, and accepted sync errors remain attached to the
+packet rather than being hidden.
+
 These operations are not application-field parsing. Their output is a
 `RadioPacket` containing timed bytes, source range, RSSI/power estimate,
 frequency-error estimate, confidence, and diagnostics. CRC failure does not
