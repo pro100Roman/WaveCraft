@@ -304,7 +304,9 @@ The FSK/GFSK raw view groups the synchronized byte stream into messages at
 each repeated configured preamble. It retains a bounded message history,
 renders the newest completed message first, and distinguishes preamble bytes
 from data bytes. Each row reports the decoded data length in bytes, excluding
-the configured preamble. An in-progress raw stream is reported as receiving but
+the configured preamble. Preamble bytes are collapsed by default in each row
+and can be expanded independently from its `PRE` control; the row tooltip always
+retains the full preamble. An in-progress raw stream is reported as receiving but
 is not inserted into the stable message list until the next preamble or capture
 stop closes it. The list can be scrolled to older retained messages, and
 hovering a row shows its full retained hexadecimal contents. A repeated

@@ -805,6 +805,7 @@ fn paint_raw_messages(
     const BYTE_CELL_WIDTH: f32 = 24.0;
     const SEQUENCE_WIDTH: f32 = 48.0;
     const SECTION_WIDTH: f32 = 38.0;
+    const PREAMBLE_TOGGLE_WIDTH: f32 = 72.0;
     const LENGTH_WIDTH: f32 = 76.0;
     const SCROLLBAR_WIDTH: f32 = 7.0;
     const SCROLLBAR_GAP: f32 = 5.0;
@@ -867,17 +868,52 @@ fn paint_raw_messages(
         let mut x = row_rect.left() + SEQUENCE_WIDTH;
         let right_limit = row_rect.right() - LENGTH_WIDTH;
         let preamble_bytes = message.preamble_bytes();
-        paint_raw_section_label(ui, row_rect, x, "PRE", Color32::from_rgb(235, 180, 80));
-        x += SECTION_WIDTH;
-        x = paint_raw_message_bytes(
+        let expansion_id = ui.id().with(("raw_preamble_expanded", message.sequence()));
+        let mut preamble_expanded =
+            ui.data(|data| data.get_temp::<bool>(expansion_id).unwrap_or(false));
+        let toggle_rect = Rect::from_min_size(
+            Pos2::new(x, row_rect.top()),
+            Vec2::new(PREAMBLE_TOGGLE_WIDTH, row_rect.height()),
+        );
+        let toggle = ui
+            .interact(toggle_rect, expansion_id, Sense::click())
+            .on_hover_text(if preamble_expanded {
+                "Collapse preamble bytes"
+            } else {
+                "Expand preamble bytes"
+            });
+        if toggle.clicked() {
+            preamble_expanded = !preamble_expanded;
+            ui.data_mut(|data| data.insert_temp(expansion_id, preamble_expanded));
+        }
+        paint_raw_section_label(
             ui,
             row_rect,
             x,
-            right_limit,
-            &message.bytes()[..preamble_bytes],
-            BYTE_CELL_WIDTH,
-            Color32::from_rgb(245, 190, 90),
+            &format!(
+                "[{}] PRE {}",
+                if preamble_expanded { "-" } else { "+" },
+                preamble_bytes
+            ),
+            if toggle.hovered() {
+                Color32::from_rgb(255, 205, 105)
+            } else {
+                Color32::from_rgb(235, 180, 80)
+            },
         );
+        x += PREAMBLE_TOGGLE_WIDTH;
+        let displayed_preamble = displayed_raw_preamble(message, preamble_expanded);
+        if !displayed_preamble.is_empty() {
+            x = paint_raw_message_bytes(
+                ui,
+                row_rect,
+                x,
+                right_limit,
+                displayed_preamble,
+                BYTE_CELL_WIDTH,
+                Color32::from_rgb(245, 190, 90),
+            );
+        }
         if x + SECTION_WIDTH < right_limit {
             paint_raw_section_label(ui, row_rect, x, "DATA", Color32::from_rgb(105, 150, 175));
             x += SECTION_WIDTH;
@@ -985,6 +1021,14 @@ fn paint_raw_messages(
             FontId::proportional(11.0),
             Color32::from_rgb(105, 120, 140),
         );
+    }
+}
+
+fn displayed_raw_preamble(message: &RawRadioMessage, expanded: bool) -> &[TimedByte] {
+    if expanded {
+        &message.bytes()[..message.preamble_bytes()]
+    } else {
+        &[]
     }
 }
 
@@ -1775,6 +1819,8 @@ mod tests {
         assert_eq!(newest_first[0].sequence(), 2);
         assert_eq!(newest_first[0].preamble_bytes(), 2);
         assert_eq!(newest_first[0].data_len(), 1);
+        assert!(displayed_raw_preamble(newest_first[0], false).is_empty());
+        assert_eq!(displayed_raw_preamble(newest_first[0], true).len(), 2);
         assert_eq!(
             newest_first[0]
                 .bytes()
