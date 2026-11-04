@@ -7521,6 +7521,44 @@ fn format_radio_value(value_hz: u64) -> String {
     }
 }
 
+fn radio_frequency_hz_from_mhz(domain: &ValueDomain, frequency_mhz: f64) -> u64 {
+    if !frequency_mhz.is_finite() {
+        return nearest_domain_value(domain, 0);
+    }
+    let requested_hz = (frequency_mhz * 1_000_000.0)
+        .round()
+        .clamp(0.0, u64::MAX as f64) as u64;
+    nearest_domain_value(domain, requested_hz)
+}
+
+fn paint_radio_center_frequency_control(
+    ui: &mut egui::Ui,
+    value_hz: &mut u64,
+    domain: &ValueDomain,
+) {
+    let bounds = match domain {
+        ValueDomain::Discrete(values) => values
+            .iter()
+            .copied()
+            .min()
+            .zip(values.iter().copied().max()),
+        ValueDomain::Stepped { range, .. } => Some((*range.start(), *range.end())),
+    };
+    ui.label(RichText::new("Center frequency").small().color(TEXT_MUTED));
+    let mut frequency_mhz = *value_hz as f64 / 1_000_000.0;
+    let mut editor = egui::DragValue::new(&mut frequency_mhz)
+        .speed(0.001)
+        .min_decimals(3)
+        .max_decimals(6)
+        .suffix(" MHz");
+    if let Some((minimum_hz, maximum_hz)) = bounds {
+        editor = editor.range(minimum_hz as f64 / 1_000_000.0..=maximum_hz as f64 / 1_000_000.0);
+    }
+    if ui.add(editor).changed() {
+        *value_hz = radio_frequency_hz_from_mhz(domain, frequency_mhz);
+    }
+}
+
 fn paint_radio_domain_control(
     ui: &mut egui::Ui,
     id_salt: &'static str,
@@ -7567,13 +7605,10 @@ fn paint_radio_capture_settings(
     );
     ui.add_space(6.0);
     ui.add_enabled_ui(enabled, |ui| {
-        paint_radio_domain_control(
+        paint_radio_center_frequency_control(
             ui,
-            "radio_center_frequency",
-            "Center frequency",
             &mut settings.capture.center_frequency_hz,
             &radio.capabilities.frequency_hz,
-            1.0,
         );
         ui.add_space(4.0);
         paint_radio_domain_control(
@@ -15546,6 +15581,21 @@ mod tests {
         assert_eq!(nearest_domain_value(&domain, 15), 18);
         assert_eq!(nearest_domain_value(&domain, 23), 26);
         assert_eq!(nearest_domain_value(&domain, 100), 26);
+    }
+
+    #[test]
+    fn radio_center_frequency_converts_fractional_mhz_to_hz() {
+        let domain = ValueDomain::Stepped {
+            range: 1_000_000..=6_000_000_000,
+            step: 1,
+        };
+
+        assert_eq!(
+            radio_frequency_hz_from_mhz(&domain, 433.920_125),
+            433_920_125
+        );
+        assert_eq!(radio_frequency_hz_from_mhz(&domain, 0.5), 1_000_000);
+        assert_eq!(radio_frequency_hz_from_mhz(&domain, 6_100.0), 6_000_000_000);
     }
 
     #[test]
