@@ -48,7 +48,10 @@ use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
 };
-use wavecraft_dsp::{SpectrumProcessor, SpectrumWindow};
+use wavecraft_dsp::{
+    BinaryFskProfile, BinaryGfskProfile, ChannelizerConfig, DemodulationProfile, FskPolarity,
+    FskTiming, SignalAnalyzerProfile, SpectrumProcessor, SpectrumWindow,
+};
 use wavecraft_hackrf::{HackRfAdapter, HackRfRuntimeControl, HackRfRuntimeSettings};
 use wavecraft_recording::{
     read_saleae, write_saleae, CompletionStatus, RecordingReader, RecordingWriter,
@@ -3050,6 +3053,97 @@ struct RadioSettings {
     iq_correction_enabled: bool,
     amplifier_enabled: bool,
     antenna_power_enabled: bool,
+    analyzer: RadioAnalyzerSettings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RadioDemodulation {
+    BinaryFsk,
+    BinaryGfsk,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RadioAnalyzerSettings {
+    enabled: bool,
+    demodulation: RadioDemodulation,
+    channel_offset_hz: i64,
+    channel_bandwidth_hz: u64,
+    output_sample_rate_hz: u64,
+    filter_tap_count: usize,
+    symbol_rate_hz: u64,
+    deviation_hz: u64,
+    gfsk_bt_milli: u32,
+    inverted: bool,
+    adaptive_timing: bool,
+    timing_loop_bandwidth_milli: u32,
+    max_clock_error_ppm: u32,
+}
+
+impl Default for RadioAnalyzerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            demodulation: RadioDemodulation::BinaryFsk,
+            channel_offset_hz: 0,
+            channel_bandwidth_hz: 200_000,
+            output_sample_rate_hz: 1_000_000,
+            filter_tap_count: 129,
+            symbol_rate_hz: 100_000,
+            deviation_hz: 50_000,
+            gfsk_bt_milli: 500,
+            inverted: false,
+            adaptive_timing: true,
+            timing_loop_bandwidth_milli: 100,
+            max_clock_error_ppm: 10_000,
+        }
+    }
+}
+
+impl RadioAnalyzerSettings {
+    fn signal_profile(&self) -> Result<Option<SignalAnalyzerProfile>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let timing = if self.adaptive_timing {
+            FskTiming::Adaptive {
+                loop_bandwidth: f64::from(self.timing_loop_bandwidth_milli) / 1_000.0,
+                max_clock_error_ppm: self.max_clock_error_ppm,
+            }
+        } else {
+            FskTiming::Fixed
+        };
+        let polarity = if self.inverted {
+            FskPolarity::Inverted
+        } else {
+            FskPolarity::Normal
+        };
+        let demodulation = match self.demodulation {
+            RadioDemodulation::BinaryFsk => DemodulationProfile::BinaryFsk(BinaryFskProfile {
+                symbol_rate_hz: self.symbol_rate_hz,
+                deviation_hz: self.deviation_hz,
+                polarity,
+                timing,
+            }),
+            RadioDemodulation::BinaryGfsk => DemodulationProfile::BinaryGfsk(BinaryGfskProfile {
+                symbol_rate_hz: self.symbol_rate_hz,
+                deviation_hz: self.deviation_hz,
+                bt: f64::from(self.gfsk_bt_milli) / 1_000.0,
+                polarity,
+                timing,
+            }),
+        };
+        let profile = SignalAnalyzerProfile {
+            channel: ChannelizerConfig {
+                frequency_offset_hz: self.channel_offset_hz,
+                bandwidth_hz: self.channel_bandwidth_hz,
+                output_sample_rate_hz: self.output_sample_rate_hz,
+                filter_tap_count: self.filter_tap_count,
+            },
+            demodulation,
+        };
+        profile.validate().map_err(|error| error.to_string())?;
+        Ok(Some(profile))
+    }
 }
 
 impl Default for RadioSettings {
@@ -3066,6 +3160,7 @@ impl Default for RadioSettings {
             iq_correction_enabled: true,
             amplifier_enabled: false,
             antenna_power_enabled: false,
+            analyzer: RadioAnalyzerSettings::default(),
         }
     }
 }
@@ -3458,6 +3553,7 @@ impl WaveCraftApp {
                 ));
             }
         };
+        self.radio_settings.analyzer.signal_profile()?;
         Ok(RadioCaptureRequest {
             device,
             settings,
@@ -9947,6 +10043,66 @@ fn start_gui_recording(
         "radio.antenna_power_enabled".to_owned(),
         radio_settings.antenna_power_enabled.to_string(),
     );
+    metadata.insert(
+        "radio.analyzer.enabled".to_owned(),
+        radio_settings.analyzer.enabled.to_string(),
+    );
+    metadata.insert(
+        "radio.analyzer.demodulation".to_owned(),
+        match radio_settings.analyzer.demodulation {
+            RadioDemodulation::BinaryFsk => "fsk2",
+            RadioDemodulation::BinaryGfsk => "gfsk2",
+        }
+        .to_owned(),
+    );
+    for (key, value) in [
+        (
+            "channel_offset_hz",
+            radio_settings.analyzer.channel_offset_hz.to_string(),
+        ),
+        (
+            "channel_bandwidth_hz",
+            radio_settings.analyzer.channel_bandwidth_hz.to_string(),
+        ),
+        (
+            "output_sample_rate_hz",
+            radio_settings.analyzer.output_sample_rate_hz.to_string(),
+        ),
+        (
+            "filter_tap_count",
+            radio_settings.analyzer.filter_tap_count.to_string(),
+        ),
+        (
+            "symbol_rate_hz",
+            radio_settings.analyzer.symbol_rate_hz.to_string(),
+        ),
+        (
+            "deviation_hz",
+            radio_settings.analyzer.deviation_hz.to_string(),
+        ),
+        (
+            "gfsk_bt_milli",
+            radio_settings.analyzer.gfsk_bt_milli.to_string(),
+        ),
+        ("inverted", radio_settings.analyzer.inverted.to_string()),
+        (
+            "adaptive_timing",
+            radio_settings.analyzer.adaptive_timing.to_string(),
+        ),
+        (
+            "timing_loop_bandwidth_milli",
+            radio_settings
+                .analyzer
+                .timing_loop_bandwidth_milli
+                .to_string(),
+        ),
+        (
+            "max_clock_error_ppm",
+            radio_settings.analyzer.max_clock_error_ppm.to_string(),
+        ),
+    ] {
+        metadata.insert(format!("radio.analyzer.{key}"), value);
+    }
     for (id, gain_db) in &radio_settings.gains_db {
         metadata.insert(format!("radio.gain.{id}_db"), gain_db.to_string());
     }
@@ -10448,6 +10604,51 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.antenna_power_enabled") {
         settings.antenna_power_enabled = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.enabled") {
+        settings.analyzer.enabled = value;
+    }
+    if let Some(value) = metadata.get("radio.analyzer.demodulation") {
+        settings.analyzer.demodulation = match value.as_str() {
+            "gfsk2" => RadioDemodulation::BinaryGfsk,
+            _ => RadioDemodulation::BinaryFsk,
+        };
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.channel_offset_hz") {
+        settings.analyzer.channel_offset_hz = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.channel_bandwidth_hz") {
+        settings.analyzer.channel_bandwidth_hz = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.output_sample_rate_hz")
+    {
+        settings.analyzer.output_sample_rate_hz = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.filter_tap_count") {
+        settings.analyzer.filter_tap_count = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.symbol_rate_hz") {
+        settings.analyzer.symbol_rate_hz = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.deviation_hz") {
+        settings.analyzer.deviation_hz = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.gfsk_bt_milli") {
+        settings.analyzer.gfsk_bt_milli = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.inverted") {
+        settings.analyzer.inverted = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.adaptive_timing") {
+        settings.analyzer.adaptive_timing = value;
+    }
+    if let Some(value) =
+        recording_metadata_value(metadata, "radio.analyzer.timing_loop_bandwidth_milli")
+    {
+        settings.analyzer.timing_loop_bandwidth_milli = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.max_clock_error_ppm") {
+        settings.analyzer.max_clock_error_ppm = value;
     }
     for (key, value) in metadata {
         let Some(id) = key
@@ -15888,6 +16089,89 @@ mod tests {
                 amplifier_enabled: true,
             }
         );
+    }
+
+    #[test]
+    fn radio_analyzer_settings_build_a_tagged_signal_profile() {
+        let mut settings = RadioAnalyzerSettings::default();
+        assert!(settings.signal_profile().unwrap().is_none());
+
+        settings.enabled = true;
+        settings.demodulation = RadioDemodulation::BinaryGfsk;
+        settings.channel_offset_hz = 125_000;
+        settings.gfsk_bt_milli = 500;
+        let profile = settings
+            .signal_profile()
+            .unwrap()
+            .expect("enabled analyzer should build a profile");
+
+        assert_eq!(profile.channel.frequency_offset_hz, 125_000);
+        let DemodulationProfile::BinaryGfsk(gfsk) = profile.demodulation else {
+            panic!("GFSK settings should build the GFSK profile variant");
+        };
+        assert_eq!(gfsk.symbol_rate_hz, 100_000);
+        assert_eq!(gfsk.deviation_hz, 50_000);
+        assert_eq!(gfsk.bt, 0.5);
+        assert!(matches!(gfsk.timing, FskTiming::Adaptive { .. }));
+    }
+
+    #[test]
+    fn radio_analyzer_settings_round_trip_from_recording_metadata() {
+        let metadata = BTreeMap::from([
+            ("radio.analyzer.enabled".to_owned(), "true".to_owned()),
+            ("radio.analyzer.demodulation".to_owned(), "gfsk2".to_owned()),
+            (
+                "radio.analyzer.channel_offset_hz".to_owned(),
+                "-125000".to_owned(),
+            ),
+            (
+                "radio.analyzer.channel_bandwidth_hz".to_owned(),
+                "250000".to_owned(),
+            ),
+            (
+                "radio.analyzer.output_sample_rate_hz".to_owned(),
+                "1000000".to_owned(),
+            ),
+            (
+                "radio.analyzer.filter_tap_count".to_owned(),
+                "257".to_owned(),
+            ),
+            (
+                "radio.analyzer.symbol_rate_hz".to_owned(),
+                "100000".to_owned(),
+            ),
+            ("radio.analyzer.deviation_hz".to_owned(), "50000".to_owned()),
+            ("radio.analyzer.gfsk_bt_milli".to_owned(), "300".to_owned()),
+            ("radio.analyzer.inverted".to_owned(), "true".to_owned()),
+            (
+                "radio.analyzer.adaptive_timing".to_owned(),
+                "false".to_owned(),
+            ),
+            (
+                "radio.analyzer.timing_loop_bandwidth_milli".to_owned(),
+                "50".to_owned(),
+            ),
+            (
+                "radio.analyzer.max_clock_error_ppm".to_owned(),
+                "20000".to_owned(),
+            ),
+        ]);
+
+        let settings = radio_settings_from_recording_metadata(&metadata).analyzer;
+
+        assert!(settings.enabled);
+        assert_eq!(settings.demodulation, RadioDemodulation::BinaryGfsk);
+        assert_eq!(settings.channel_offset_hz, -125_000);
+        assert_eq!(settings.channel_bandwidth_hz, 250_000);
+        assert_eq!(settings.output_sample_rate_hz, 1_000_000);
+        assert_eq!(settings.filter_tap_count, 257);
+        assert_eq!(settings.symbol_rate_hz, 100_000);
+        assert_eq!(settings.deviation_hz, 50_000);
+        assert_eq!(settings.gfsk_bt_milli, 300);
+        assert!(settings.inverted);
+        assert!(!settings.adaptive_timing);
+        assert_eq!(settings.timing_loop_bandwidth_milli, 50);
+        assert_eq!(settings.max_clock_error_ppm, 20_000);
     }
 
     #[test]
