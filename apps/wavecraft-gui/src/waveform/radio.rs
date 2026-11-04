@@ -201,6 +201,10 @@ fn paint_spectrum(ui: &egui::Ui, rect: Rect, spectrum: Option<&SpectrumFrame>) {
             Stroke::new(1.0_f32, Color32::from_rgb(35, 44, 56)),
         );
     }
+    ui.painter().line_segment(
+        [plot.center_top(), plot.center_bottom()],
+        Stroke::new(1.5_f32, Color32::from_rgb(75, 145, 165)),
+    );
     for division in 0..=6 {
         let fraction = division as f32 / 6.0;
         let y = egui::lerp(plot.y_range(), fraction);
