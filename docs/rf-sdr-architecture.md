@@ -296,6 +296,10 @@ Dependent numeric editor ranges are enforced on user edits, not passively while
 rendering, so a transiently unavailable processing rate cannot rewrite bit rate
 or frequency deviation to their minimum values.
 
+Ending a capture or a squelch-delimited burst may leave fewer than eight raw
+bits after the last complete byte. This expected tail is discarded silently;
+an incomplete byte caused by an input discontinuity remains a visible warning.
+
 The FSK/GFSK raw view groups the synchronized byte stream into messages at
 each repeated configured preamble. It retains a bounded message history,
 renders the newest completed message first, and distinguishes preamble bytes

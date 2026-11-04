@@ -151,8 +151,10 @@ impl RawRadioDecoder {
     }
 
     pub fn finish(&mut self) -> RawRadioOutput {
-        let mut output = RawRadioOutput::default();
-        self.flush_partial_byte(&mut output, "end of stream");
+        // A capture or squelch-delimited burst may end at any bit position.
+        // Dropping fewer than eight remaining bits is therefore an expected
+        // boundary condition, not a decode warning.
+        let output = RawRadioOutput::default();
         self.reset();
         output
     }
@@ -447,6 +449,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0xaa, 0xaa, 0xaa, 0x56]
         );
+    }
+
+    #[test]
+    fn normal_finish_silently_discards_a_partial_byte() {
+        let mut decoder = RawRadioDecoder::new(config()).unwrap();
+        let mut input = byte_bits(&[0xaa, 0xaa, 0xaa, 0x12]);
+        input.extend([true, false]);
+        assert!(decoder.push(&bits(&input, 0, false)).unwrap().synchronized);
+
+        let output = decoder.finish();
+
+        assert!(output.diagnostics.is_empty());
+        assert!(!decoder.is_synchronized());
     }
 
     #[test]
