@@ -52,7 +52,10 @@ use wavecraft_recording::{
     read_saleae, write_saleae, CompletionStatus, RecordingReader, RecordingWriter,
     SaleaeAnalogChannel, SaleaeCapture, SaleaeChannel, SaleaeDigitalCapture,
 };
-use wavecraft_sdr::{DiscoveredRadio, RadioDiscoveryReport, RadioProviderFailure, RadioRegistry};
+use wavecraft_sdr::{
+    DiscoveredRadio, RadioCapabilities, RadioCaptureSettings, RadioDiscoveryReport, RadioProvider,
+    RadioProviderFailure, RadioRegistry, ValueDomain,
+};
 use wavecraft_usb::{
     apply_dscope_configuration, auto_calibrate_dscope_with_progress, discover_supported_devices,
     prepare_device, read_dscope_calibration, write_dscope_calibration, DeviceModel,
@@ -3006,6 +3009,29 @@ struct CombinedSessionSettings {
     viewport: WaveformViewport,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RadioSettings {
+    capture: RadioCaptureSettings,
+    gains_db: BTreeMap<String, i32>,
+    amplifier_enabled: bool,
+}
+
+impl Default for RadioSettings {
+    fn default() -> Self {
+        Self {
+            capture: RadioCaptureSettings {
+                center_frequency_hz: 100_000_000,
+                sample_rate_hz: 10_000_000,
+                bandwidth_hz: 8_000_000,
+                receive_channel: 0,
+                sample_limit: None,
+            },
+            gains_db: BTreeMap::new(),
+            amplifier_enabled: false,
+        }
+    }
+}
+
 type FileRecorder = RecordingWriter<BufWriter<File>>;
 
 enum WorkerSuccess {
@@ -3057,6 +3083,7 @@ struct WaveCraftApp {
     radios: Vec<DiscoveredRadio>,
     selected_radio_id: Option<String>,
     radio_discovery_failures: Vec<RadioProviderFailure>,
+    radio_settings: RadioSettings,
     active_capture_settings_tab: CaptureSettingsTab,
     logic_settings: LogicCaptureSettings,
     scope_settings: ScopeCaptureSettings,
@@ -3134,6 +3161,7 @@ impl WaveCraftApp {
             radios: Vec::new(),
             selected_radio_id: None,
             radio_discovery_failures: Vec::new(),
+            radio_settings: RadioSettings::default(),
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
             logic_settings: LogicCaptureSettings::default(),
             scope_settings: ScopeCaptureSettings::default(),
@@ -3354,6 +3382,13 @@ impl WaveCraftApp {
             self.selected_scope_device_id.as_deref(),
             DeviceRole::Oscilloscope,
         )
+    }
+
+    fn reconcile_radio_settings(&mut self) {
+        let Some(radio) = selected_radio(&self.radios, self.selected_radio_id.as_deref()) else {
+            return;
+        };
+        normalize_radio_settings(&mut self.radio_settings, &radio.capabilities);
     }
 
     fn begin_capture(&mut self, mode: AcquisitionMode, target: CaptureTarget) {
@@ -7251,13 +7286,223 @@ fn selected_radio_text(radios: &[DiscoveredRadio], selected_id: Option<&str>) ->
     }
 }
 
+fn nearest_domain_value(domain: &ValueDomain, requested: u64) -> u64 {
+    match domain {
+        ValueDomain::Discrete(values) => values
+            .iter()
+            .copied()
+            .min_by_key(|value| value.abs_diff(requested))
+            .unwrap_or(requested),
+        ValueDomain::Stepped { range, step } => {
+            if *step == 0 {
+                return requested.clamp(*range.start(), *range.end());
+            }
+            let maximum = range.start().saturating_add(
+                range
+                    .end()
+                    .saturating_sub(*range.start())
+                    .saturating_div(*step)
+                    .saturating_mul(*step),
+            );
+            let clamped = requested.clamp(*range.start(), maximum);
+            let offset = clamped.saturating_sub(*range.start());
+            let lower = range
+                .start()
+                .saturating_add((offset / step).saturating_mul(*step));
+            let upper = lower.saturating_add(*step).min(maximum);
+            if clamped.abs_diff(lower) <= clamped.abs_diff(upper) {
+                lower
+            } else {
+                upper
+            }
+        }
+    }
+}
+
+fn normalize_radio_settings(settings: &mut RadioSettings, capabilities: &RadioCapabilities) {
+    settings.capture.center_frequency_hz = nearest_domain_value(
+        &capabilities.frequency_hz,
+        settings.capture.center_frequency_hz,
+    );
+    settings.capture.sample_rate_hz = nearest_domain_value(
+        &capabilities.sample_rates_hz,
+        settings.capture.sample_rate_hz,
+    );
+    settings.capture.bandwidth_hz =
+        nearest_domain_value(&capabilities.bandwidths_hz, settings.capture.bandwidth_hz);
+    settings.capture.receive_channel = settings
+        .capture
+        .receive_channel
+        .min(capabilities.receive_channels.saturating_sub(1));
+
+    settings.gains_db.retain(|id, value| {
+        let Some(control) = capabilities
+            .gain_controls
+            .iter()
+            .find(|control| control.id == *id)
+        else {
+            return false;
+        };
+        *value = normalize_gain_value(
+            *value,
+            *control.range_db.start(),
+            *control.range_db.end(),
+            control.step_db,
+        );
+        true
+    });
+    for control in &capabilities.gain_controls {
+        settings
+            .gains_db
+            .entry(control.id.clone())
+            .or_insert(*control.range_db.start());
+    }
+}
+
+fn normalize_gain_value(value: i32, minimum: i32, maximum: i32, step: u32) -> i32 {
+    let clamped = value.clamp(minimum, maximum);
+    let step = i64::from(step);
+    if step == 0 {
+        return clamped;
+    }
+    let offset = i64::from(clamped) - i64::from(minimum);
+    let rounded_steps = (offset + step / 2) / step;
+    (i64::from(minimum) + rounded_steps * step).min(i64::from(maximum)) as i32
+}
+
+fn format_radio_value(value_hz: u64) -> String {
+    if value_hz >= 1_000_000_000 && value_hz % 1_000_000_000 == 0 {
+        format!("{} GHz", value_hz / 1_000_000_000)
+    } else if value_hz >= 1_000_000 && value_hz % 1_000_000 == 0 {
+        format!("{} MHz", value_hz / 1_000_000)
+    } else if value_hz >= 1_000 && value_hz % 1_000 == 0 {
+        format!("{} kHz", value_hz / 1_000)
+    } else {
+        format!("{value_hz} Hz")
+    }
+}
+
+fn paint_radio_domain_control(
+    ui: &mut egui::Ui,
+    id_salt: &'static str,
+    label: &str,
+    value: &mut u64,
+    domain: &ValueDomain,
+) {
+    ui.label(RichText::new(label).small().color(TEXT_MUTED));
+    match domain {
+        ValueDomain::Discrete(values) => {
+            egui::ComboBox::from_id_salt(id_salt)
+                .width(ui.available_width())
+                .selected_text(format_radio_value(*value))
+                .show_ui(ui, |ui| {
+                    for choice in values {
+                        ui.selectable_value(value, *choice, format_radio_value(*choice));
+                    }
+                });
+        }
+        ValueDomain::Stepped { range, step } => {
+            ui.add(
+                egui::DragValue::new(value)
+                    .range(range.clone())
+                    .speed((*step).max(1) as f64)
+                    .suffix(" Hz"),
+            );
+        }
+    }
+    *value = nearest_domain_value(domain, *value);
+}
+
+fn paint_radio_capture_settings(
+    ui: &mut egui::Ui,
+    radio: &DiscoveredRadio,
+    settings: &mut RadioSettings,
+    enabled: bool,
+) {
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new("RECEIVE CONFIGURATION")
+            .strong()
+            .color(ACCENT),
+    );
+    ui.add_space(6.0);
+    ui.add_enabled_ui(enabled, |ui| {
+        paint_radio_domain_control(
+            ui,
+            "radio_center_frequency",
+            "Center frequency",
+            &mut settings.capture.center_frequency_hz,
+            &radio.capabilities.frequency_hz,
+        );
+        ui.add_space(4.0);
+        paint_radio_domain_control(
+            ui,
+            "radio_sample_rate",
+            "Sample rate",
+            &mut settings.capture.sample_rate_hz,
+            &radio.capabilities.sample_rates_hz,
+        );
+        ui.add_space(4.0);
+        paint_radio_domain_control(
+            ui,
+            "radio_bandwidth",
+            "Baseband bandwidth",
+            &mut settings.capture.bandwidth_hz,
+            &radio.capabilities.bandwidths_hz,
+        );
+
+        if radio.capabilities.receive_channels > 1 {
+            ui.add_space(4.0);
+            ui.label(RichText::new("Receive channel").small().color(TEXT_MUTED));
+            egui::ComboBox::from_id_salt("radio_receive_channel")
+                .width(ui.available_width())
+                .selected_text(format!("RX {}", settings.capture.receive_channel))
+                .show_ui(ui, |ui| {
+                    for channel in 0..radio.capabilities.receive_channels {
+                        ui.selectable_value(
+                            &mut settings.capture.receive_channel,
+                            channel,
+                            format!("RX {channel}"),
+                        );
+                    }
+                });
+        }
+
+        for control in &radio.capabilities.gain_controls {
+            ui.add_space(4.0);
+            let value = settings
+                .gains_db
+                .entry(control.id.clone())
+                .or_insert(*control.range_db.start());
+            ui.label(RichText::new(&control.label).small().color(TEXT_MUTED));
+            ui.add(
+                egui::Slider::new(value, control.range_db.clone())
+                    .step_by(f64::from(control.step_db.max(1)))
+                    .suffix(" dB"),
+            );
+            *value = normalize_gain_value(
+                *value,
+                *control.range_db.start(),
+                *control.range_db.end(),
+                control.step_db,
+            );
+        }
+
+        if radio.provider == RadioProvider::HackRf {
+            ui.add_space(4.0);
+            ui.checkbox(&mut settings.amplifier_enabled, "Enable RF amplifier");
+        }
+    });
+}
+
 fn paint_radio_settings(
     ui: &mut egui::Ui,
     radios: &[DiscoveredRadio],
     selected_id: &mut Option<String>,
     failures: &[RadioProviderFailure],
     enabled: bool,
-) {
+) -> bool {
+    let before = selected_id.clone();
     let choices = radios
         .iter()
         .map(|radio| {
@@ -7307,6 +7552,7 @@ fn paint_radio_settings(
             .color(Color32::LIGHT_RED),
         );
     }
+    before != *selected_id
 }
 
 fn selected_device_text(
@@ -7474,6 +7720,7 @@ impl eframe::App for WaveCraftApp {
         self.reconcile_capture_settings_tab();
         self.reconcile_waveform_tab();
         self.reconcile_device_selections();
+        self.reconcile_radio_settings();
         self.poll_capture();
         self.poll_repetitive_capture();
         self.finish_pending_snapshot(context);
@@ -7488,6 +7735,7 @@ impl eframe::App for WaveCraftApp {
         let mut calibration_action = None;
         let mut logic_device_selection_changed = false;
         let mut scope_device_selection_changed = false;
+        let mut radio_device_selection_changed = false;
         let capture_settings_enabled = !self.is_busy();
         let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
         let selected_logic_device = self.selected_logic_device().is_some();
@@ -8676,13 +8924,26 @@ impl eframe::App for WaveCraftApp {
                     ui.add_space(14.0);
                     ui.label(RichText::new("RADIO RECEIVER").strong().color(ACCENT));
                     ui.add_space(6.0);
-                    paint_radio_settings(
+                    radio_device_selection_changed |= paint_radio_settings(
                         ui,
                         &self.radios,
                         &mut self.selected_radio_id,
                         &self.radio_discovery_failures,
                         !settings_locked,
                     );
+                    if radio_device_selection_changed {
+                        self.reconcile_radio_settings();
+                    }
+                    if let Some(radio) =
+                        selected_radio(&self.radios, self.selected_radio_id.as_deref()).cloned()
+                    {
+                        paint_radio_capture_settings(
+                            ui,
+                            &radio,
+                            &mut self.radio_settings,
+                            !settings_locked,
+                        );
+                    }
 
                     if settings_locked {
                         ui.add_space(8.0);
@@ -8934,6 +9195,10 @@ impl eframe::App for WaveCraftApp {
             }
             self.last_error = None;
             self.status = "Capture device selection updated".to_owned();
+        }
+        if radio_device_selection_changed {
+            self.last_error = None;
+            self.status = "Radio device selection updated".to_owned();
         }
         if scope_device_selection_changed
             && self.selected_scope_device_ref().is_some()
@@ -14937,6 +15202,45 @@ mod tests {
             sessions.active_settings().device_id.as_deref(),
             Some("usb-logic-a")
         );
+    }
+
+    #[test]
+    fn radio_settings_follow_selected_device_capabilities() {
+        let capabilities = wavecraft_hackrf::hackrf_one_capabilities();
+        let mut settings = RadioSettings::default();
+        settings.capture.center_frequency_hz = 100;
+        settings.capture.sample_rate_hz = 21_000_000;
+        settings.capture.bandwidth_hz = 8_100_000;
+        settings.capture.receive_channel = 7;
+        settings.gains_db.insert("lna".to_owned(), 39);
+        settings.gains_db.insert("stale".to_owned(), 10);
+
+        normalize_radio_settings(&mut settings, &capabilities);
+
+        assert_eq!(settings.capture.center_frequency_hz, 1_000_000);
+        assert_eq!(settings.capture.sample_rate_hz, 20_000_000);
+        assert_eq!(settings.capture.bandwidth_hz, 8_000_000);
+        assert_eq!(settings.capture.receive_channel, 0);
+        assert_eq!(settings.gains_db.get("lna"), Some(&40));
+        assert_eq!(settings.gains_db.get("vga"), Some(&0));
+        assert!(!settings.gains_db.contains_key("stale"));
+        settings
+            .capture
+            .validate(&capabilities)
+            .expect("normalized radio settings should validate");
+    }
+
+    #[test]
+    fn stepped_radio_domains_choose_the_nearest_supported_value() {
+        let domain = ValueDomain::Stepped {
+            range: 10..=30,
+            step: 8,
+        };
+
+        assert_eq!(nearest_domain_value(&domain, 9), 10);
+        assert_eq!(nearest_domain_value(&domain, 15), 18);
+        assert_eq!(nearest_domain_value(&domain, 23), 26);
+        assert_eq!(nearest_domain_value(&domain, 100), 26);
     }
 
     #[test]
