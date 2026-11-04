@@ -5,6 +5,7 @@ mod framing;
 mod radio;
 mod radio_crc;
 mod radio_packet;
+mod radio_pipeline;
 mod runtime;
 mod schema;
 mod transport;
@@ -25,6 +26,9 @@ pub use radio_crc::{
 pub use radio_packet::{
     BitOrder, RadioPacket, RadioPacketFramer, RadioPacketFramerConfig, RadioPacketFramingOutput,
     RadioPacketLength, SyncWordConfig,
+};
+pub use radio_pipeline::{
+    RadioPacketPipeline, RadioPacketPipelineConfig, RadioPacketPipelineOutput,
 };
 pub use runtime::{CustomProtocolRuntime, ProtocolRuntimeOutput};
 pub use schema::{

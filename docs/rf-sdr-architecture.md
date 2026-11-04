@@ -470,6 +470,11 @@ and transmitted field location. A mismatch is attached to the retained packet
 with its source range. An optional discard policy is returned separately so
 failed bytes remain inspectable instead of being erased by validation.
 
+A single streaming packet pipeline now composes line decoding, sync search,
+byte packing, framing, and optional CRC validation. It produces timed packets
+and stable diagnostics identically across arbitrary input chunks. This is the
+UI/CLI boundary; callers do not coordinate the individual state machines.
+
 These operations are not application-field parsing. Their output is a
 `RadioPacket` containing timed bytes, source range, RSSI/power estimate,
 frequency-error estimate, confidence, and diagnostics. CRC failure does not
