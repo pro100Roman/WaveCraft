@@ -228,7 +228,11 @@ One generic **RF Spectrum** view contains:
 
 The capture settings panel identifies the selected backend as HackRF and owns
 hardware controls such as center frequency, sample rate, bandwidth, LNA/VGA
-gain, and RF amplifier. Device controls do not become rendering options.
+gain, RF amplifier, and signed reference-frequency correction. HackRF
+correction is stored in thousandths of a ppm and inversely adjusts both the
+programmed RF frequency and sample clock at capture start. Positive values
+compensate a fast reference while the IQ metadata retains the requested
+physical center frequency and sample rate. Device controls do not become rendering options.
 Retuning clears the waterfall or starts a visibly separate segment because its
 rows no longer share one frequency axis.
 

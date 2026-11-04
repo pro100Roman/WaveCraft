@@ -3081,6 +3081,7 @@ struct CombinedSessionSettings {
 struct RadioSettings {
     capture: RadioCaptureSettings,
     gains_db: BTreeMap<String, i32>,
+    frequency_correction_milli_ppm: i32,
     iq_correction_enabled: bool,
     amplifier_enabled: bool,
     antenna_power_enabled: bool,
@@ -3200,6 +3201,7 @@ impl Default for RadioSettings {
                 sample_limit: None,
             },
             gains_db: BTreeMap::new(),
+            frequency_correction_milli_ppm: 0,
             iq_correction_enabled: true,
             amplifier_enabled: false,
             antenna_power_enabled: false,
@@ -3590,6 +3592,7 @@ impl WaveCraftApp {
                 vga_gain_db: radio_gain_u32(&self.radio_settings, "vga")?,
                 amplifier_enabled: self.radio_settings.amplifier_enabled,
                 antenna_power_enabled: self.radio_settings.antenna_power_enabled,
+                frequency_correction_milli_ppm: self.radio_settings.frequency_correction_milli_ppm,
             }),
             provider => {
                 return Err(format!(
@@ -8301,6 +8304,41 @@ fn paint_radio_receive_configuration(
             });
             ui.end_row();
 
+            if radio.provider == RadioProvider::HackRf {
+                paint_radio_parameter_label(
+                    ui,
+                    "Frequency correction",
+                    Some(
+                        "Signed HackRF reference correction. Positive values compensate a fast clock. Applies to RF tuning and the sample clock when the next capture starts. Range: -200 to +200 ppm.",
+                    ),
+                );
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut correction_ppm =
+                            f64::from(settings.frequency_correction_milli_ppm) / 1_000.0;
+                        if add_left_aligned_sized(
+                            ui,
+                            egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                            egui::DragValue::new(&mut correction_ppm)
+                                .range(-200.0..=200.0)
+                                .speed(0.001)
+                                .min_decimals(3)
+                                .max_decimals(3),
+                        )
+                        .changed()
+                        {
+                            settings.frequency_correction_milli_ppm =
+                                (correction_ppm * 1_000.0).round() as i32;
+                        }
+                        ui.label("ppm");
+                    });
+                });
+                settings.frequency_correction_milli_ppm = settings
+                    .frequency_correction_milli_ppm
+                    .clamp(-200_000, 200_000);
+                ui.end_row();
+            }
+
             paint_radio_parameter_label(ui, "Sample rate", sample_rate_help);
             ui.add_enabled_ui(enabled, |ui| {
                 paint_radio_mhz_value(
@@ -10465,6 +10503,10 @@ fn start_gui_recording(
         radio_settings.capture.receive_channel.to_string(),
     );
     metadata.insert(
+        "radio.frequency_correction_milli_ppm".to_owned(),
+        radio_settings.frequency_correction_milli_ppm.to_string(),
+    );
+    metadata.insert(
         "radio.iq_correction_enabled".to_owned(),
         radio_settings.iq_correction_enabled.to_string(),
     );
@@ -11036,6 +11078,10 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.receive_channel") {
         settings.capture.receive_channel = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.frequency_correction_milli_ppm")
+    {
+        settings.frequency_correction_milli_ppm = value;
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.amplifier_enabled") {
         settings.amplifier_enabled = value;
@@ -17353,6 +17399,10 @@ mod tests {
         metadata.insert("radio.sample_rate_hz".to_owned(), "10000000".to_owned());
         metadata.insert("radio.bandwidth_hz".to_owned(), "8000000".to_owned());
         metadata.insert("radio.receive_channel".to_owned(), "0".to_owned());
+        metadata.insert(
+            "radio.frequency_correction_milli_ppm".to_owned(),
+            "-12500".to_owned(),
+        );
         metadata.insert("radio.gain.lna_db".to_owned(), "24".to_owned());
         metadata.insert("radio.gain.vga_db".to_owned(), "20".to_owned());
         metadata.insert("radio.amplifier_enabled".to_owned(), "true".to_owned());
@@ -17388,6 +17438,7 @@ mod tests {
         assert_eq!(settings.capture.center_frequency_hz, 433_920_000);
         assert_eq!(settings.capture.sample_rate_hz, 10_000_000);
         assert_eq!(settings.capture.bandwidth_hz, 8_000_000);
+        assert_eq!(settings.frequency_correction_milli_ppm, -12_500);
         assert_eq!(settings.gains_db.get("lna"), Some(&24));
         assert_eq!(settings.gains_db.get("vga"), Some(&20));
         assert!(!settings.iq_correction_enabled);
