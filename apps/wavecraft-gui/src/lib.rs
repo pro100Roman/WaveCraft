@@ -7421,6 +7421,18 @@ fn selected_radio_text(radios: &[DiscoveredRadio], selected_id: Option<&str>) ->
     }
 }
 
+fn displayed_radio_id(radio: &DiscoveredRadio) -> String {
+    let id = radio.descriptor.id.as_str();
+    if radio.provider != RadioProvider::HackRf {
+        return id.to_owned();
+    }
+    let Some(serial) = id.strip_prefix("hackrf:") else {
+        return id.to_owned();
+    };
+    let serial = serial.trim_start_matches('0');
+    format!("hackrf:{}", if serial.is_empty() { "0" } else { serial })
+}
+
 fn nearest_domain_value(domain: &ValueDomain, requested: u64) -> u64 {
     match domain {
         ValueDomain::Discrete(values) => values
@@ -7743,7 +7755,7 @@ fn paint_radio_settings(
             .inner_margin(egui::Margin::same(10.0))
             .show(ui, |ui| {
                 ui.label(RichText::new(&radio.descriptor.name).strong());
-                ui.small(RichText::new(radio.descriptor.id.as_str()).color(TEXT_MUTED));
+                ui.small(RichText::new(displayed_radio_id(radio)).color(TEXT_MUTED));
                 ui.small(
                     RichText::new(format!(
                         "{:?} · {:?} · {} RX channel(s)",
@@ -7780,7 +7792,8 @@ fn paint_radio_device_selector(
         .iter()
         .map(|radio| {
             let id = radio.descriptor.id.as_str().to_owned();
-            (id.clone(), format!("{}\n{id}", radio.descriptor.name))
+            let displayed_id = displayed_radio_id(radio);
+            (id, format!("{}\n{displayed_id}", radio.descriptor.name))
         })
         .collect::<Vec<_>>();
     ui.add_enabled_ui(enabled && !choices.is_empty(), |ui| {
@@ -7794,7 +7807,18 @@ fn paint_radio_device_selector(
             });
     });
     if let Some(id) = selected_id.as_deref() {
-        ui.add(egui::Label::new(RichText::new(id).small().monospace().color(TEXT_MUTED)).wrap());
+        let displayed_id = selected_radio(radios, Some(id))
+            .map(displayed_radio_id)
+            .unwrap_or_else(|| id.to_owned());
+        ui.add(
+            egui::Label::new(
+                RichText::new(displayed_id)
+                    .small()
+                    .monospace()
+                    .color(TEXT_MUTED),
+            )
+            .wrap(),
+        );
     }
     before != *selected_id
 }
@@ -15641,6 +15665,24 @@ mod tests {
             .capture
             .validate(&capabilities)
             .expect("normalized radio settings should validate");
+    }
+
+    #[test]
+    fn displayed_hackrf_id_omits_serial_leading_zeroes() {
+        let radio = DiscoveredRadio {
+            descriptor: DeviceDescriptor {
+                id: DeviceId::new("hackrf:0000000000001234"),
+                name: "HackRF One".to_owned(),
+                kind: InstrumentKind::RadioReceiver,
+            },
+            provider: RadioProvider::HackRf,
+            model: wavecraft_sdr::RadioModel::HackRfOne,
+            connection_backend: wavecraft_sdr::ConnectionBackend::Usb,
+            persistent_id: Some("0000000000001234".to_owned()),
+            capabilities: wavecraft_hackrf::hackrf_one_capabilities(),
+        };
+
+        assert_eq!(displayed_radio_id(&radio), "hackrf:1234");
     }
 
     #[test]
