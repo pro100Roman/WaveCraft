@@ -6,9 +6,10 @@ adapter are implemented. Channelization and the binary FSK/GFSK demodulator are
 also implemented, including bounded streaming GFSK matched filtering with
 configurable BT and adaptive symbol timing with bounded clock-error tracking.
 A stable-ID demodulator registry and modulation-tagged analyzer profiles expose
-typed FSK/GFSK factories without making them the top-level architecture. GUI
-configuration and rendering of timed soft symbols remain to be wired into live
-and recorded IQ.
+typed FSK/GFSK factories without making them the top-level architecture. The
+GUI persists those profiles and runs the selected analyzer for live and replayed
+IQ into a bounded modulation-neutral output store. Configuration controls and
+rendering of timed soft symbols remain to be added.
 
 WaveCraft treats HackRF as the first backend for a generic radio-receiver
 instrument, not as a GUI-specific feature. The backend produces ordered raw IQ

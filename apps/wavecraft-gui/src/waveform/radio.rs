@@ -1,12 +1,132 @@
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use std::collections::VecDeque;
-use wavecraft_dsp::SpectrumFrame;
+use wavecraft_dsp::{DemodulatedBatch, SpectrumFrame, TimedAnalogSample, TimedSoftSymbol};
 
 const DEFAULT_WATERFALL_CAPACITY: usize = 256;
+const DEFAULT_ANALYSIS_CAPACITY: usize = 100_000;
 const MAX_WATERFALL_TEXTURE_WIDTH: usize = 512;
 const MIN_POWER_DBFS: f32 = -120.0;
 const MAX_POWER_DBFS: f32 = 0.0;
 const WATERFALL_HISTORY_HINT: &str = "Rows are the newest spectrum snapshots retained for the visible waterfall. Dropped counts older display rows discarded after this bounded history filled; it does not indicate lost HackRF or IQ samples.";
+
+/// Bounded, modulation-neutral output retained for analyzer rendering.
+#[derive(Debug)]
+pub struct RadioAnalysisStore {
+    soft_symbols: VecDeque<TimedSoftSymbol>,
+    soft_symbol_alphabet_size: Option<u16>,
+    analog_samples: VecDeque<TimedAnalogSample>,
+    analog_sample_rate_hz: Option<u64>,
+    capacity: usize,
+    dropped_items: u64,
+    discontinuities: u64,
+    error: Option<String>,
+}
+
+impl Default for RadioAnalysisStore {
+    fn default() -> Self {
+        Self {
+            soft_symbols: VecDeque::with_capacity(DEFAULT_ANALYSIS_CAPACITY),
+            soft_symbol_alphabet_size: None,
+            analog_samples: VecDeque::new(),
+            analog_sample_rate_hz: None,
+            capacity: DEFAULT_ANALYSIS_CAPACITY,
+            dropped_items: 0,
+            discontinuities: 0,
+            error: None,
+        }
+    }
+}
+
+impl RadioAnalysisStore {
+    pub fn new(capacity: usize) -> Result<Self, String> {
+        if capacity == 0 {
+            return Err("radio analysis capacity must be greater than zero".to_owned());
+        }
+        Ok(Self {
+            capacity,
+            ..Self::default()
+        })
+    }
+
+    pub fn ingest(&mut self, batch: DemodulatedBatch) -> Result<(), String> {
+        match batch {
+            DemodulatedBatch::SoftSymbols(batch) => {
+                batch.validate().map_err(|error| error.to_string())?;
+                if batch.discontinuity {
+                    self.discontinuities = self.discontinuities.saturating_add(1);
+                }
+                if self.soft_symbol_alphabet_size != Some(batch.alphabet_size) {
+                    self.soft_symbols.clear();
+                    self.soft_symbol_alphabet_size = Some(batch.alphabet_size);
+                }
+                self.analog_samples.clear();
+                self.analog_sample_rate_hz = None;
+                self.soft_symbols.extend(batch.symbols);
+                self.trim_soft_symbols();
+            }
+            DemodulatedBatch::Analog(batch) => {
+                batch.validate().map_err(|error| error.to_string())?;
+                if batch.discontinuity {
+                    self.discontinuities = self.discontinuities.saturating_add(1);
+                }
+                if self.analog_sample_rate_hz != Some(batch.sample_rate_hz) {
+                    self.analog_samples.clear();
+                    self.analog_sample_rate_hz = Some(batch.sample_rate_hz);
+                }
+                self.soft_symbols.clear();
+                self.soft_symbol_alphabet_size = None;
+                self.analog_samples.extend(batch.samples);
+                self.trim_analog_samples();
+            }
+        }
+        self.error = None;
+        Ok(())
+    }
+
+    pub fn set_error(&mut self, error: impl Into<String>) {
+        self.error = Some(error.into());
+    }
+
+    pub fn soft_symbols(&self) -> &VecDeque<TimedSoftSymbol> {
+        &self.soft_symbols
+    }
+
+    pub fn soft_symbol_alphabet_size(&self) -> Option<u16> {
+        self.soft_symbol_alphabet_size
+    }
+
+    pub fn analog_samples(&self) -> &VecDeque<TimedAnalogSample> {
+        &self.analog_samples
+    }
+
+    pub fn analog_sample_rate_hz(&self) -> Option<u64> {
+        self.analog_sample_rate_hz
+    }
+
+    pub fn dropped_items(&self) -> u64 {
+        self.dropped_items
+    }
+
+    pub fn discontinuities(&self) -> u64 {
+        self.discontinuities
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    fn trim_soft_symbols(&mut self) {
+        let excess = self.soft_symbols.len().saturating_sub(self.capacity);
+        self.soft_symbols.drain(..excess);
+        self.dropped_items = self.dropped_items.saturating_add(excess as u64);
+    }
+
+    fn trim_analog_samples(&mut self) {
+        let excess = self.analog_samples.len().saturating_sub(self.capacity);
+        self.analog_samples.drain(..excess);
+        self.dropped_items = self.dropped_items.saturating_add(excess as u64);
+    }
+}
 
 /// Bounded derived state for the RF spectrum and waterfall views.
 #[derive(Debug)]
@@ -351,6 +471,7 @@ fn format_compact_decimal(value: f64, precision: usize, unit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wavecraft_dsp::{TimedAnalogBatch, TimedSoftSymbolBatch};
 
     fn frame(index: u64, frequency: u64) -> SpectrumFrame {
         SpectrumFrame {
@@ -422,5 +543,58 @@ mod tests {
         assert_eq!(format_frequency(100_500_000.0), "100.5 MHz");
         assert_eq!(format_frequency(1_250_000_000.0), "1.25 GHz");
         assert_eq!(format_frequency(12_340.0), "12.34 kHz");
+    }
+
+    #[test]
+    fn analysis_store_bounds_soft_symbols_and_preserves_diagnostics() {
+        let mut store = RadioAnalysisStore::new(2).unwrap();
+        store
+            .ingest(DemodulatedBatch::SoftSymbols(TimedSoftSymbolBatch {
+                alphabet_size: 2,
+                discontinuity: true,
+                symbols: (0..3)
+                    .map(|index| TimedSoftSymbol {
+                        likelihoods: vec![0.25, 0.75],
+                        source_range: index..index + 1,
+                    })
+                    .collect(),
+            }))
+            .unwrap();
+
+        assert_eq!(store.soft_symbols().len(), 2);
+        assert_eq!(store.soft_symbols()[0].source_range, 1..2);
+        assert_eq!(store.soft_symbol_alphabet_size(), Some(2));
+        assert_eq!(store.dropped_items(), 1);
+        assert_eq!(store.discontinuities(), 1);
+    }
+
+    #[test]
+    fn analysis_store_switches_cleanly_between_output_families() {
+        let mut store = RadioAnalysisStore::new(4).unwrap();
+        store
+            .ingest(DemodulatedBatch::SoftSymbols(TimedSoftSymbolBatch {
+                alphabet_size: 2,
+                discontinuity: false,
+                symbols: vec![TimedSoftSymbol {
+                    likelihoods: vec![0.75, 0.25],
+                    source_range: 0..1,
+                }],
+            }))
+            .unwrap();
+        store
+            .ingest(DemodulatedBatch::Analog(TimedAnalogBatch {
+                sample_rate_hz: 48_000,
+                discontinuity: false,
+                samples: vec![TimedAnalogSample {
+                    value: 0.25,
+                    source_range: 1..2,
+                }],
+            }))
+            .unwrap();
+
+        assert!(store.soft_symbols().is_empty());
+        assert_eq!(store.soft_symbol_alphabet_size(), None);
+        assert_eq!(store.analog_samples().len(), 1);
+        assert_eq!(store.analog_sample_rate_hz(), Some(48_000));
     }
 }
