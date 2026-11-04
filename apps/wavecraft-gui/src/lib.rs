@@ -7589,6 +7589,21 @@ fn radio_edit_field_size(ui: &egui::Ui) -> egui::Vec2 {
     )
 }
 
+fn add_left_aligned_sized(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    widget: impl egui::Widget,
+) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        size,
+        egui::Layout::left_to_right(egui::Align::Center)
+            .with_main_align(egui::Align::Min)
+            .with_main_justify(true),
+        |ui| ui.add(widget),
+    )
+    .inner
+}
+
 fn paint_radio_mhz_control(
     ui: &mut egui::Ui,
     label: &str,
@@ -7605,11 +7620,6 @@ fn paint_radio_mhz_control(
             .zip(values.iter().copied().max()),
         ValueDomain::Stepped { range, .. } => Some((*range.start(), *range.end())),
     };
-    let label = if help.is_some() {
-        format!("{label} ⓘ")
-    } else {
-        label.to_owned()
-    };
     let label_response = ui.label(RichText::new(label).small().color(TEXT_MUTED));
     if let Some(help) = help {
         label_response.on_hover_text(help);
@@ -7625,7 +7635,7 @@ fn paint_radio_mhz_control(
     let changed = if unit_outside {
         let editor_size = radio_edit_field_size(ui);
         ui.horizontal(|ui| {
-            let changed = ui.add_sized(editor_size, editor).changed();
+            let changed = add_left_aligned_sized(ui, editor_size, editor).changed();
             ui.label(RichText::new("MHz").small().color(TEXT_MUTED));
             changed
         })
@@ -7659,19 +7669,18 @@ fn paint_radio_bandwidth_control(ui: &mut egui::Ui, value: &mut u64, domain: &Va
             }
             ValueDomain::Stepped { range, step } => {
                 let mut value_mhz = *value as f64 / 1_000_000.0;
-                if ui
-                    .add_sized(
-                        editor_size,
-                        egui::DragValue::new(&mut value_mhz)
-                            .range(
-                                *range.start() as f64 / 1_000_000.0
-                                    ..=*range.end() as f64 / 1_000_000.0,
-                            )
-                            .speed(*step as f64 / 1_000_000.0)
-                            .min_decimals(3)
-                            .max_decimals(6),
-                    )
-                    .changed()
+                if add_left_aligned_sized(
+                    ui,
+                    editor_size,
+                    egui::DragValue::new(&mut value_mhz)
+                        .range(
+                            *range.start() as f64 / 1_000_000.0..=*range.end() as f64 / 1_000_000.0,
+                        )
+                        .speed(*step as f64 / 1_000_000.0)
+                        .min_decimals(3)
+                        .max_decimals(6),
+                )
+                .changed()
                 {
                     *value = radio_hz_from_mhz(domain, value_mhz);
                 }
