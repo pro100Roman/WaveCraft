@@ -7581,13 +7581,7 @@ fn format_radio_mhz_number(value_hz: u64) -> String {
     format!("{whole}.{}", fractional.trim_end_matches('0'))
 }
 
-fn radio_edit_field_size(ui: &egui::Ui) -> egui::Vec2 {
-    let spacing = ui.spacing();
-    egui::vec2(
-        spacing.slider_width + spacing.item_spacing.x + spacing.interact_size.x,
-        spacing.interact_size.y,
-    )
-}
+const RADIO_VALUE_WIDTH: f32 = 80.0;
 
 fn add_left_aligned_sized(
     ui: &mut egui::Ui,
@@ -7604,14 +7598,14 @@ fn add_left_aligned_sized(
     .inner
 }
 
-fn paint_radio_mhz_control(
-    ui: &mut egui::Ui,
-    label: &str,
-    value_hz: &mut u64,
-    domain: &ValueDomain,
-    unit_outside: bool,
-    help: Option<&str>,
-) {
+fn paint_radio_parameter_label(ui: &mut egui::Ui, label: &str, help: Option<&str>) {
+    let response = ui.label(label);
+    if let Some(help) = help {
+        response.on_hover_text(help);
+    }
+}
+
+fn paint_radio_mhz_value(ui: &mut egui::Ui, value_hz: &mut u64, domain: &ValueDomain) {
     let bounds = match domain {
         ValueDomain::Discrete(values) => values
             .iter()
@@ -7620,10 +7614,6 @@ fn paint_radio_mhz_control(
             .zip(values.iter().copied().max()),
         ValueDomain::Stepped { range, .. } => Some((*range.start(), *range.end())),
     };
-    let label_response = ui.label(RichText::new(label).small().color(TEXT_MUTED));
-    if let Some(help) = help {
-        label_response.on_hover_text(help);
-    }
     let mut value_mhz = *value_hz as f64 / 1_000_000.0;
     let mut editor = egui::DragValue::new(&mut value_mhz)
         .speed(0.001)
@@ -7632,42 +7622,26 @@ fn paint_radio_mhz_control(
     if let Some((minimum_hz, maximum_hz)) = bounds {
         editor = editor.range(minimum_hz as f64 / 1_000_000.0..=maximum_hz as f64 / 1_000_000.0);
     }
-    let changed = if unit_outside {
-        let editor_size = radio_edit_field_size(ui);
-        ui.horizontal(|ui| {
+    let editor_size = egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y);
+    let changed = ui
+        .horizontal(|ui| {
             let changed = add_left_aligned_sized(ui, editor_size, editor).changed();
-            ui.label(RichText::new("MHz").small().color(TEXT_MUTED));
+            ui.label("MHz");
             changed
         })
-        .inner
-    } else {
-        ui.add(editor.suffix(" MHz")).changed()
-    };
+        .inner;
     if changed {
         *value_hz = radio_hz_from_mhz(domain, value_mhz);
     }
 }
 
-fn paint_radio_bandwidth_control(
-    ui: &mut egui::Ui,
-    value: &mut u64,
-    domain: &ValueDomain,
-    help: Option<&str>,
-) {
-    let label_response = ui.label(
-        RichText::new("Baseband bandwidth")
-            .small()
-            .color(TEXT_MUTED),
-    );
-    if let Some(help) = help {
-        label_response.on_hover_text(help);
-    }
-    let editor_size = radio_edit_field_size(ui);
+fn paint_radio_bandwidth_value(ui: &mut egui::Ui, value: &mut u64, domain: &ValueDomain) {
+    let editor_size = egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y);
     ui.horizontal(|ui| {
         match domain {
             ValueDomain::Discrete(values) => {
                 egui::ComboBox::from_id_salt("radio_bandwidth")
-                    .width(editor_size.x)
+                    .width(RADIO_VALUE_WIDTH)
                     .selected_text(format_radio_mhz_number(*value))
                     .show_ui(ui, |ui| {
                         for choice in values {
@@ -7694,7 +7668,7 @@ fn paint_radio_bandwidth_control(
                 }
             }
         }
-        ui.label(RichText::new("MHz").small().color(TEXT_MUTED));
+        ui.label("MHz");
     });
     *value = nearest_domain_value(domain, *value);
 }
@@ -7740,116 +7714,139 @@ fn paint_radio_receive_configuration(
 ) {
     ui.set_max_width(ui.available_width());
     let tuning_enabled = enabled || runtime_enabled;
-    ui.add_enabled_ui(tuning_enabled, |ui| {
-        paint_radio_mhz_control(
-            ui,
-            "Center frequency",
-            &mut settings.capture.center_frequency_hz,
-            &radio.capabilities.frequency_hz,
-            true,
-            (radio.provider == RadioProvider::HackRf).then_some(
-                "Tunes the frequency at the center of the RF spectrum and waterfall. HackRF One range: 1 MHz–6 GHz. This can be changed while capture is running.",
-            ),
-        );
-    });
-    ui.add_space(4.0);
-    ui.add_enabled_ui(enabled, |ui| {
-        paint_radio_mhz_control(
-            ui,
-            "Sample rate",
-            &mut settings.capture.sample_rate_hz,
-            &radio.capabilities.sample_rates_hz,
-            true,
-            (radio.provider == RadioProvider::HackRf).then_some(
-                "Sets the I/Q sampling rate and the captured RF frequency span. Supported range: 2–20 MHz. Step: 1 Hz (0.000001 MHz). HackRF supports any whole-Hz value in this range; 8 MHz or higher is recommended.",
-            ),
-        );
-    });
-    ui.add_space(4.0);
-    ui.add_enabled_ui(tuning_enabled, |ui| {
-        paint_radio_bandwidth_control(
-            ui,
-            &mut settings.capture.bandwidth_hz,
-            &radio.capabilities.bandwidths_hz,
-            (radio.provider == RadioProvider::HackRf).then_some(
-                "Selects the HackRF analog baseband low-pass filter width. A narrower filter rejects more out-of-band noise and interference. Keep it at or below the sample rate to limit aliasing.",
-            ),
-        );
-    });
+    let center_frequency_help = (radio.provider == RadioProvider::HackRf).then_some(
+        "Tunes the frequency at the center of the RF spectrum and waterfall. HackRF One range: 1 MHz–6 GHz. This can be changed while capture is running.",
+    );
+    let sample_rate_help = (radio.provider == RadioProvider::HackRf).then_some(
+        "Sets the I/Q sampling rate and the captured RF frequency span. Supported range: 2–20 MHz. Step: 1 Hz (0.000001 MHz). HackRF supports any whole-Hz value in this range; 8 MHz or higher is recommended.",
+    );
+    let bandwidth_help = (radio.provider == RadioProvider::HackRf).then_some(
+        "Selects the HackRF analog baseband low-pass filter width. A narrower filter rejects more out-of-band noise and interference. Keep it at or below the sample rate to limit aliasing.",
+    );
+    egui::Grid::new("radio_receive_configuration")
+        .num_columns(2)
+        .max_col_width(126.0)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            paint_radio_parameter_label(ui, "Center frequency", center_frequency_help);
+            ui.add_enabled_ui(tuning_enabled, |ui| {
+                paint_radio_mhz_value(
+                    ui,
+                    &mut settings.capture.center_frequency_hz,
+                    &radio.capabilities.frequency_hz,
+                );
+            });
+            ui.end_row();
+
+            paint_radio_parameter_label(ui, "Sample rate", sample_rate_help);
+            ui.add_enabled_ui(enabled, |ui| {
+                paint_radio_mhz_value(
+                    ui,
+                    &mut settings.capture.sample_rate_hz,
+                    &radio.capabilities.sample_rates_hz,
+                );
+            });
+            ui.end_row();
+
+            paint_radio_parameter_label(ui, "Baseband bandwidth", bandwidth_help);
+            ui.add_enabled_ui(tuning_enabled, |ui| {
+                paint_radio_bandwidth_value(
+                    ui,
+                    &mut settings.capture.bandwidth_hz,
+                    &radio.capabilities.bandwidths_hz,
+                );
+            });
+            ui.end_row();
+
+            if radio.capabilities.receive_channels > 1 {
+                ui.label("Receive channel");
+                ui.add_enabled_ui(enabled, |ui| {
+                    egui::ComboBox::from_id_salt("radio_receive_channel")
+                        .width(RADIO_VALUE_WIDTH)
+                        .selected_text(format!("RX {}", settings.capture.receive_channel))
+                        .show_ui(ui, |ui| {
+                            for channel in 0..radio.capabilities.receive_channels {
+                                ui.selectable_value(
+                                    &mut settings.capture.receive_channel,
+                                    channel,
+                                    format!("RX {channel}"),
+                                );
+                            }
+                        });
+                });
+                ui.end_row();
+            }
+
+            for control in &radio.capabilities.gain_controls {
+                paint_radio_parameter_label(ui, &control.label, control.help.as_deref());
+                let value = settings
+                    .gains_db
+                    .entry(control.id.clone())
+                    .or_insert(control.default_db);
+                let slider_response = ui
+                    .add_enabled_ui(tuning_enabled, |ui| {
+                        ui.scope(|ui| {
+                            let value_editor_width = ui.spacing().interact_size.x;
+                            let item_spacing = ui.spacing().item_spacing.x;
+                            ui.spacing_mut().slider_width =
+                                (RADIO_VALUE_WIDTH - value_editor_width - item_spacing).max(24.0);
+                            ui.add(
+                                egui::Slider::new(value, control.range_db.clone())
+                                    .step_by(f64::from(control.step_db.max(1)))
+                                    .suffix(" dB"),
+                            )
+                        })
+                        .inner
+                    })
+                    .inner;
+                if let Some(help) = &control.help {
+                    slider_response.on_hover_text(help);
+                }
+                *value = normalize_gain_value(
+                    *value,
+                    *control.range_db.start(),
+                    *control.range_db.end(),
+                    control.step_db,
+                );
+                ui.end_row();
+            }
+
+            if radio.provider == RadioProvider::HackRf {
+                let iq_help = "Remove the measured I/Q DC offset before spectrum processing";
+                paint_radio_parameter_label(ui, "IQ correction", Some(iq_help));
+                ui.add_enabled(
+                    enabled,
+                    egui::Checkbox::without_text(&mut settings.iq_correction_enabled),
+                )
+                .on_hover_text(iq_help);
+                ui.end_row();
+
+                let amplifier_help = "Adds roughly 11 dB of HackRF front-end gain. Leave disabled around strong signals to reduce overload and distortion.";
+                paint_radio_parameter_label(ui, "RF amplifier", Some(amplifier_help));
+                ui.add_enabled(
+                    tuning_enabled,
+                    egui::Checkbox::without_text(&mut settings.amplifier_enabled),
+                )
+                .on_hover_text(amplifier_help);
+                ui.end_row();
+
+                let antenna_help =
+                    "Only enable for an antenna or accessory designed for bias power";
+                paint_radio_parameter_label(ui, "Antenna port power (3.3 V)", Some(antenna_help));
+                ui.add_enabled(
+                    enabled,
+                    egui::Checkbox::without_text(&mut settings.antenna_power_enabled),
+                )
+                .on_hover_text(antenna_help);
+                ui.end_row();
+            }
+        });
     if settings.capture.bandwidth_hz > settings.capture.sample_rate_hz {
         ui.label(
             RichText::new("Bandwidth above sample rate may cause aliasing")
                 .small()
                 .color(Color32::from_rgb(255, 190, 80)),
         );
-    }
-
-    if radio.capabilities.receive_channels > 1 {
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.add_space(4.0);
-            ui.label(RichText::new("Receive channel").small().color(TEXT_MUTED));
-            egui::ComboBox::from_id_salt("radio_receive_channel")
-                .width(ui.available_width())
-                .selected_text(format!("RX {}", settings.capture.receive_channel))
-                .show_ui(ui, |ui| {
-                    for channel in 0..radio.capabilities.receive_channels {
-                        ui.selectable_value(
-                            &mut settings.capture.receive_channel,
-                            channel,
-                            format!("RX {channel}"),
-                        );
-                    }
-                });
-        });
-    }
-
-    ui.add_enabled_ui(tuning_enabled, |ui| {
-        for control in &radio.capabilities.gain_controls {
-            ui.add_space(4.0);
-            let value = settings
-                .gains_db
-                .entry(control.id.clone())
-                .or_insert(control.default_db);
-            let label_response = ui.label(RichText::new(&control.label).small().color(TEXT_MUTED));
-            if let Some(help) = &control.help {
-                label_response.on_hover_text(help);
-            }
-            let slider_response = ui.add(
-                egui::Slider::new(value, control.range_db.clone())
-                    .step_by(f64::from(control.step_db.max(1)))
-                    .suffix(" dB"),
-            );
-            if let Some(help) = &control.help {
-                slider_response.on_hover_text(help);
-            }
-            *value = normalize_gain_value(
-                *value,
-                *control.range_db.start(),
-                *control.range_db.end(),
-                control.step_db,
-            );
-        }
-    });
-
-    if radio.provider == RadioProvider::HackRf {
-        ui.add_space(4.0);
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.checkbox(&mut settings.iq_correction_enabled, "Enable IQ correction")
-                .on_hover_text("Remove the measured I/Q DC offset before spectrum processing");
-        });
-        ui.add_enabled_ui(tuning_enabled, |ui| {
-            ui.checkbox(&mut settings.amplifier_enabled, "Enable RF amplifier")
-                .on_hover_text(
-                    "Adds roughly 11 dB of HackRF front-end gain. Leave disabled around strong signals to reduce overload and distortion.",
-                );
-        });
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.checkbox(
-                &mut settings.antenna_power_enabled,
-                "Enable antenna port power (3.3 V)",
-            )
-            .on_hover_text("Only enable for an antenna or accessory designed for bias power");
-        });
     }
 }
 
