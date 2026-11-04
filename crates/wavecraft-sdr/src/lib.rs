@@ -108,6 +108,11 @@ pub struct HackRfSettings {
     pub vga_gain_db: Option<u32>,
     pub amplifier_enabled: bool,
     pub antenna_power_enabled: bool,
+    /// Signed correction in thousandths of one part per million.
+    ///
+    /// Positive values compensate a fast reference oscillator by programming
+    /// proportionally lower RF and sample-clock frequencies.
+    pub frequency_correction_milli_ppm: i32,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

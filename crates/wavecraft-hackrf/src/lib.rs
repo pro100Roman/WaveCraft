@@ -27,6 +27,8 @@ const RECEIVE_QUEUE_CAPACITY: usize = 8;
 const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DEFAULT_LNA_GAIN_DB: u32 = 16;
 const DEFAULT_VGA_GAIN_DB: u32 = 16;
+const MAX_FREQUENCY_CORRECTION_MILLI_PPM: i32 = 200_000;
+const MILLI_PPM_SCALE: f64 = 1_000_000_000.0;
 
 const HACKRF_BANDWIDTHS_HZ: [u64; 16] = [
     1_750_000, 2_500_000, 3_500_000, 5_000_000, 5_500_000, 6_000_000, 7_000_000, 8_000_000,
@@ -201,6 +203,13 @@ fn validate_capture_settings(settings: &RadioCaptureSettings) -> Result<(), Capt
 }
 
 fn validate_provider_settings(settings: &HackRfSettings) -> Result<(), CaptureError> {
+    if settings.frequency_correction_milli_ppm.unsigned_abs()
+        > MAX_FREQUENCY_CORRECTION_MILLI_PPM as u32
+    {
+        return Err(CaptureError::new(
+            "HackRF frequency correction must be between -200 and +200 ppm",
+        ));
+    }
     let lna_gain_db = settings.lna_gain_db.unwrap_or(DEFAULT_LNA_GAIN_DB);
     if lna_gain_db > 40 || lna_gain_db % 8 != 0 {
         return Err(CaptureError::new(
@@ -234,6 +243,7 @@ fn validate_runtime_settings(settings: &HackRfRuntimeSettings) -> Result<(), Cap
         vga_gain_db: settings.vga_gain_db,
         amplifier_enabled: settings.amplifier_enabled,
         antenna_power_enabled: false,
+        frequency_correction_milli_ppm: 0,
     })
 }
 
@@ -282,12 +292,17 @@ impl CaptureSource for HackRfCaptureSource {
 
 impl HackRfCaptureSource {
     fn configure(&self, device: *mut HackRfDevice) -> Result<(), CaptureError> {
-        self.runtime
-            .set_sample_rate(device, self.settings.sample_rate_hz as f64)?;
+        let correction = self.provider_settings.frequency_correction_milli_ppm;
+        self.runtime.set_sample_rate(
+            device,
+            corrected_programmed_rate(self.settings.sample_rate_hz as f64, correction)?,
+        )?;
         self.runtime
             .set_bandwidth(device, self.settings.bandwidth_hz as u32)?;
-        self.runtime
-            .set_frequency(device, self.settings.center_frequency_hz)?;
+        self.runtime.set_frequency(
+            device,
+            corrected_programmed_frequency(self.settings.center_frequency_hz, correction)?,
+        )?;
         self.runtime.set_lna_gain(
             device,
             self.provider_settings
@@ -401,8 +416,13 @@ impl HackRfCaptureSource {
     ) -> Result<(), CaptureError> {
         self.runtime
             .set_bandwidth(device, settings.bandwidth_hz as u32)?;
-        self.runtime
-            .set_frequency(device, settings.center_frequency_hz)?;
+        self.runtime.set_frequency(
+            device,
+            corrected_programmed_frequency(
+                settings.center_frequency_hz,
+                self.provider_settings.frequency_correction_milli_ppm,
+            )?,
+        )?;
         self.runtime
             .set_lna_gain(device, settings.lna_gain_db.unwrap_or(DEFAULT_LNA_GAIN_DB))?;
         self.runtime
@@ -416,6 +436,33 @@ fn latest_runtime_settings(
     receiver: &Receiver<HackRfRuntimeSettings>,
 ) -> Option<HackRfRuntimeSettings> {
     receiver.try_iter().last()
+}
+
+fn corrected_programmed_frequency(
+    requested_hz: u64,
+    correction_milli_ppm: i32,
+) -> Result<u64, CaptureError> {
+    let corrected = corrected_programmed_rate(requested_hz as f64, correction_milli_ppm)?;
+    if !(0.0..=u64::MAX as f64).contains(&corrected) {
+        return Err(CaptureError::new(
+            "corrected HackRF center frequency is outside the valid range",
+        ));
+    }
+    Ok(corrected.round() as u64)
+}
+
+fn corrected_programmed_rate(
+    requested_hz: f64,
+    correction_milli_ppm: i32,
+) -> Result<f64, CaptureError> {
+    let factor = 1.0 + f64::from(correction_milli_ppm) / MILLI_PPM_SCALE;
+    let corrected = requested_hz / factor;
+    if !corrected.is_finite() || corrected <= 0.0 {
+        return Err(CaptureError::new(
+            "corrected HackRF clock rate is outside the valid range",
+        ));
+    }
+    Ok(corrected)
 }
 
 fn discard_pending_blocks(
@@ -1017,13 +1064,33 @@ mod tests {
             vga_gain_db: Some(30),
             amplifier_enabled: true,
             antenna_power_enabled: false,
+            frequency_correction_milli_ppm: 25_000,
         })
         .is_ok());
+        assert!(validate_provider_settings(&HackRfSettings {
+            frequency_correction_milli_ppm: 200_001,
+            ..HackRfSettings::default()
+        })
+        .is_err());
         assert!(validate_provider_settings(&HackRfSettings {
             lna_gain_db: Some(10),
             ..HackRfSettings::default()
         })
         .is_err());
+    }
+
+    #[test]
+    fn signed_ppm_correction_compensates_rf_and_sample_clock_programming() {
+        assert_eq!(
+            corrected_programmed_frequency(868_000_000, 10_000).unwrap(),
+            867_991_320
+        );
+        assert_eq!(
+            corrected_programmed_frequency(868_000_000, -10_000).unwrap(),
+            868_008_680
+        );
+        let sample_rate = corrected_programmed_rate(10_000_000.0, 10_000).unwrap();
+        assert!((sample_rate - 9_999_900.001).abs() < 0.001);
     }
 
     #[test]
