@@ -1,6 +1,9 @@
 # RF/SDR capture and signal-decoding architecture
 
-Status: planned.
+Status: in progress. The core IQ model, bounded capture path, recording v2,
+spectrum DSP/display store, simulator, SDR facade, and receive-only HackRF One
+adapter are implemented. Application-level provider aggregation and live RF
+controls remain to be wired before the GUI advertises physical HackRF support.
 
 WaveCraft treats HackRF as the first backend for a generic radio-receiver
 instrument, not as a GUI-specific feature. The backend produces ordered raw IQ

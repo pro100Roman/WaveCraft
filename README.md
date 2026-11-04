@@ -46,7 +46,9 @@ The repository contains a working vertical slice of the new capture engine:
 
 - independent capture workers for every instrument;
 - a shared monotonic timeline across workers;
-- typed logic and oscilloscope sample batches;
+- typed logic, oscilloscope, and signed 8-bit complex IQ sample batches;
+- a receive-only HackRF One adapter with runtime-loaded `libhackrf`, bounded IQ
+  streaming, stable serial selection, and validated RF settings;
 - coordinated cancellation and worker cleanup;
 - simulated instruments and a CLI demonstrating simultaneous capture;
 - capture support for the complete upstream DSLogic profile matrix, including
@@ -340,6 +342,21 @@ instrument. The second prepares and captures from explicitly selected DSLogic
 and DSCope devices through the automation contract. Close WaveCraft and DSView
 so the instruments are idle before running either command.
 
+HackRF One support is implemented as a receive-only backend crate and loads
+`libhackrf` at runtime, so normal builds and tests do not require HackRF host
+software. Install current HackRF host tools before using the backend. If the
+library is outside the platform search path, set `WAVECRAFT_LIBHACKRF_PATH` to
+the complete shared-library path. The opt-in discovery and finite-IQ capture
+check is:
+
+```sh
+cargo test -p wavecraft-hackrf --test hardware -- --ignored --nocapture
+```
+
+Close other HackRF applications before running the check. The generic RF GUI
+acquisition controls and provider aggregation are tracked separately from the
+backend implementation.
+
 The numeric shorthand (for example, `wavecraft-cli -- 2`) is the simulated
 capture duration in seconds.
 Run all checks with:
@@ -385,6 +402,8 @@ same method, live status/progress callbacks, and structured exceptions. See
 ## Workspace layout
 
 - `crates/wavecraft-core`: device-independent capture types and concurrency.
+- `crates/wavecraft-sdr`: device-independent radio discovery and configuration contracts.
+- `crates/wavecraft-hackrf`: runtime-loaded HackRF One discovery and receive-only IQ capture.
 - `crates/wavecraft-recording`: native recording plus Saleae `.sal` import/export.
 - `crates/wavecraft-sim`: deterministic simulated logic and scope sources.
 - `crates/wavecraft-usb`: USB discovery, claimed sessions, control transport, FPGA loading, and DSLogic/DSCope capture.

@@ -3060,6 +3060,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wavecraft-hackrf"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "wavecraft-core",
+ "wavecraft-sdr",
+]
+
+[[package]]
 name = "wavecraft-recording"
 version = "0.1.0"
 dependencies = [

@@ -1,10 +1,12 @@
 use crate::{CaptureBatch, CaptureError, CaptureEvent, CaptureFrame, CaptureSource, DeviceId};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+const CAPTURE_EVENT_CAPACITY: usize = 64;
 
 /// Services available to one capture worker.
 pub struct CaptureContext {
@@ -13,7 +15,7 @@ pub struct CaptureContext {
     cancelled: Arc<AtomicBool>,
     start_gate: Arc<StartGate>,
     start_synchronized: Arc<AtomicBool>,
-    sender: Sender<CaptureEvent>,
+    sender: SyncSender<CaptureEvent>,
 }
 
 impl CaptureContext {
@@ -170,7 +172,7 @@ impl CaptureCoordinator {
         let timeline_origin = Instant::now();
         let worker_barrier = Arc::new(Barrier::new(sources.len() + 1));
         let start_gate = Arc::new(StartGate::new(sources.len()));
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(CAPTURE_EVENT_CAPACITY);
         let mut workers = Vec::with_capacity(sources.len());
 
         for (source, descriptor) in sources.into_iter().zip(descriptors.iter()) {
@@ -220,7 +222,7 @@ impl CaptureCoordinator {
         worker_barrier.wait();
         Ok(CaptureSession {
             descriptors,
-            receiver,
+            receiver: Some(receiver),
             cancelled,
             start_gate,
             workers,
@@ -230,7 +232,7 @@ impl CaptureCoordinator {
 
 pub struct CaptureSession {
     descriptors: Vec<crate::DeviceDescriptor>,
-    receiver: Receiver<CaptureEvent>,
+    receiver: Option<Receiver<CaptureEvent>>,
     cancelled: Arc<AtomicBool>,
     start_gate: Arc<StartGate>,
     workers: Vec<JoinHandle<()>>,
@@ -242,11 +244,17 @@ impl CaptureSession {
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<CaptureEvent, RecvTimeoutError> {
-        self.receiver.recv_timeout(timeout)
+        match &self.receiver {
+            Some(receiver) => receiver.recv_timeout(timeout),
+            None => Err(RecvTimeoutError::Disconnected),
+        }
     }
 
     pub fn try_recv(&self) -> Result<CaptureEvent, TryRecvError> {
-        self.receiver.try_recv()
+        match &self.receiver {
+            Some(receiver) => receiver.try_recv(),
+            None => Err(TryRecvError::Disconnected),
+        }
     }
 
     pub fn request_stop(&self) {
@@ -256,6 +264,7 @@ impl CaptureSession {
 
     pub fn stop(mut self) -> Result<(), CaptureError> {
         self.request_stop();
+        self.receiver.take();
         self.join_workers()
     }
 
@@ -275,6 +284,7 @@ impl CaptureSession {
 impl Drop for CaptureSession {
     fn drop(&mut self) {
         self.request_stop();
+        self.receiver.take();
         let _ = self.join_workers();
     }
 }
@@ -283,6 +293,7 @@ impl Drop for CaptureSession {
 mod tests {
     use super::*;
     use crate::{DeviceDescriptor, InstrumentKind, Iq8, IqBatch, LogicBatch, ScopeBatch};
+    use std::sync::atomic::AtomicBool;
 
     struct OneFrameSource {
         descriptor: DeviceDescriptor,
@@ -350,6 +361,39 @@ mod tests {
         descriptor: DeviceDescriptor,
     }
 
+    struct BurstSource {
+        descriptor: DeviceDescriptor,
+        finished: Arc<AtomicBool>,
+    }
+
+    impl CaptureSource for BurstSource {
+        fn descriptor(&self) -> DeviceDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn run(self: Box<Self>, context: CaptureContext) -> Result<(), CaptureError> {
+            context.synchronize_start()?;
+            for sequence in 0..=CAPTURE_EVENT_CAPACITY as u64 {
+                if context
+                    .emit(
+                        sequence,
+                        context.elapsed(),
+                        CaptureBatch::Logic(LogicBatch {
+                            sample_rate_hz: 1,
+                            channel_count: 1,
+                            samples: vec![0],
+                        }),
+                    )
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            self.finished.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
     impl CaptureSource for PreparationFailureSource {
         fn descriptor(&self) -> DeviceDescriptor {
             self.descriptor.clone()
@@ -391,6 +435,25 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn capture_event_queue_is_bounded_and_stop_unblocks_a_producer() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let session = CaptureCoordinator::start(vec![Box::new(BurstSource {
+            descriptor: DeviceDescriptor {
+                id: DeviceId::new("burst"),
+                name: "burst".to_owned(),
+                kind: InstrumentKind::LogicAnalyzer,
+            },
+            finished: Arc::clone(&finished),
+        })])
+        .unwrap();
+
+        thread::sleep(Duration::from_millis(20));
+        assert!(!finished.load(Ordering::Acquire));
+        session.stop().unwrap();
+        assert!(finished.load(Ordering::Acquire));
     }
 
     #[test]
