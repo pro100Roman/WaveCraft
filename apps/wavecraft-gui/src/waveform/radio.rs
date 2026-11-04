@@ -9,6 +9,10 @@ const MAX_RAW_MESSAGE_COUNT: usize = 256;
 const MAX_WATERFALL_TEXTURE_WIDTH: usize = 512;
 const MIN_POWER_DBFS: f32 = -120.0;
 const MAX_POWER_DBFS: f32 = 0.0;
+const RADIO_PANE_DIVIDER_HEIGHT: f32 = 12.0;
+const MIN_SPECTRUM_HEIGHT: f32 = 120.0;
+const MIN_WATERFALL_HEIGHT: f32 = 80.0;
+const MIN_RAW_DATA_HEIGHT: f32 = 80.0;
 const WATERFALL_HISTORY_HINT: &str = "Rows are the newest spectrum snapshots retained for the visible waterfall. Dropped counts older display rows discarded after this bounded history filled; it does not indicate lost HackRF or IQ samples.";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -374,11 +378,24 @@ struct WaterfallSignature {
     center_frequency_hz: u64,
 }
 
-#[derive(Default)]
 pub struct RadioViewState {
     waterfall_texture: Option<TextureHandle>,
     waterfall_signature: Option<WaterfallSignature>,
     raw_message_scroll_rows: usize,
+    spectrum_height_ratio: f32,
+    raw_data_height_ratio: f32,
+}
+
+impl Default for RadioViewState {
+    fn default() -> Self {
+        Self {
+            waterfall_texture: None,
+            waterfall_signature: None,
+            raw_message_scroll_rows: 0,
+            spectrum_height_ratio: 0.54,
+            raw_data_height_ratio: 0.24,
+        }
+    }
 }
 
 pub struct RadioViewOptions<'a> {
@@ -403,31 +420,31 @@ impl RadioViewState {
         } = options;
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_rgb(12, 16, 22));
-        let gap = 12.0;
         let show_analysis = analysis_enabled
             || analysis.error().is_some()
             || !analysis.soft_symbols().is_empty()
             || !analysis.analog_samples().is_empty()
             || !analysis.raw_messages().is_empty();
-        let analysis_height = if show_analysis {
-            rect.height().mul_add(0.24, 0.0).clamp(110.0, 180.0)
-        } else {
-            0.0
-        };
-        let content_bottom = if show_analysis {
-            (rect.bottom() - analysis_height - gap).max(rect.top())
-        } else {
-            rect.bottom()
-        };
-        let upper_height = (content_bottom - rect.top()).max(0.0);
-        let spectrum_height = (upper_height * 0.54).max(120.0).min(upper_height);
+        let (spectrum_height, waterfall_height, analysis_height) = radio_pane_heights(
+            rect.height(),
+            show_analysis,
+            self.spectrum_height_ratio,
+            self.raw_data_height_ratio,
+        );
         let spectrum_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), spectrum_height));
+        let spectrum_divider_rect = Rect::from_min_size(
+            Pos2::new(rect.left(), spectrum_rect.bottom()),
+            Vec2::new(rect.width(), RADIO_PANE_DIVIDER_HEIGHT),
+        );
         let waterfall_rect = Rect::from_min_max(
             Pos2::new(
                 rect.left(),
-                (spectrum_rect.bottom() + gap).min(rect.bottom()),
+                spectrum_divider_rect.bottom().min(rect.bottom()),
             ),
-            Pos2::new(rect.right(), content_bottom),
+            Pos2::new(
+                rect.right(),
+                (spectrum_divider_rect.bottom() + waterfall_height).min(rect.bottom()),
+            ),
         );
         paint_spectrum(
             ui,
@@ -437,11 +454,40 @@ impl RadioViewState {
             trigger_controls_enabled,
         );
         self.paint_waterfall(ui, waterfall_rect, store);
+        if let Some(delta) = paint_radio_pane_divider(
+            ui,
+            spectrum_divider_rect,
+            "radio_spectrum_waterfall_divider",
+        ) {
+            let upper_height = spectrum_height + waterfall_height;
+            if upper_height > 0.0 {
+                self.spectrum_height_ratio =
+                    ((spectrum_height + delta) / upper_height).clamp(0.0, 1.0);
+            }
+        }
         if show_analysis {
+            let analysis_divider_rect = Rect::from_min_size(
+                Pos2::new(rect.left(), waterfall_rect.bottom()),
+                Vec2::new(rect.width(), RADIO_PANE_DIVIDER_HEIGHT),
+            );
             let analysis_rect = Rect::from_min_max(
-                Pos2::new(rect.left(), (content_bottom + gap).min(rect.bottom())),
+                Pos2::new(
+                    rect.left(),
+                    analysis_divider_rect.bottom().min(rect.bottom()),
+                ),
                 rect.max,
             );
+            if let Some(delta) = paint_radio_pane_divider(
+                ui,
+                analysis_divider_rect,
+                "radio_waterfall_raw_data_divider",
+            ) {
+                let usable_height = spectrum_height + waterfall_height + analysis_height;
+                if usable_height > 0.0 {
+                    self.raw_data_height_ratio =
+                        ((analysis_height - delta) / usable_height).clamp(0.0, 1.0);
+                }
+            }
             paint_analysis(
                 ui,
                 analysis_rect,
@@ -532,6 +578,63 @@ impl RadioViewState {
     }
 }
 
+fn radio_pane_heights(
+    total_height: f32,
+    show_raw_data: bool,
+    spectrum_ratio: f32,
+    raw_data_ratio: f32,
+) -> (f32, f32, f32) {
+    let divider_count = if show_raw_data { 2.0 } else { 1.0 };
+    let usable_height = (total_height - divider_count * RADIO_PANE_DIVIDER_HEIGHT).max(0.0);
+    if !show_raw_data {
+        let minimum_scale = (usable_height / (MIN_SPECTRUM_HEIGHT + MIN_WATERFALL_HEIGHT)).min(1.0);
+        let minimum_spectrum = MIN_SPECTRUM_HEIGHT * minimum_scale;
+        let minimum_waterfall = MIN_WATERFALL_HEIGHT * minimum_scale;
+        let spectrum = (usable_height * spectrum_ratio.clamp(0.0, 1.0)).clamp(
+            minimum_spectrum,
+            (usable_height - minimum_waterfall).max(minimum_spectrum),
+        );
+        return (spectrum, usable_height - spectrum, 0.0);
+    }
+
+    let minimum_total = MIN_SPECTRUM_HEIGHT + MIN_WATERFALL_HEIGHT + MIN_RAW_DATA_HEIGHT;
+    let minimum_scale = (usable_height / minimum_total).min(1.0);
+    let minimum_spectrum = MIN_SPECTRUM_HEIGHT * minimum_scale;
+    let minimum_waterfall = MIN_WATERFALL_HEIGHT * minimum_scale;
+    let minimum_raw_data = MIN_RAW_DATA_HEIGHT * minimum_scale;
+    let raw_data = (usable_height * raw_data_ratio.clamp(0.0, 1.0)).clamp(
+        minimum_raw_data,
+        (usable_height - minimum_spectrum - minimum_waterfall).max(minimum_raw_data),
+    );
+    let upper_height = usable_height - raw_data;
+    let spectrum = (upper_height * spectrum_ratio.clamp(0.0, 1.0)).clamp(
+        minimum_spectrum,
+        (upper_height - minimum_waterfall).max(minimum_spectrum),
+    );
+    (spectrum, upper_height - spectrum, raw_data)
+}
+
+fn paint_radio_pane_divider(ui: &egui::Ui, rect: Rect, id: &'static str) -> Option<f32> {
+    if rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return None;
+    }
+    let response = ui
+        .interact(rect, ui.id().with(id), Sense::drag())
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    let color = if response.dragged() || response.hovered() {
+        Color32::from_rgb(90, 110, 135)
+    } else {
+        Color32::from_rgb(42, 55, 72)
+    };
+    ui.painter().line_segment(
+        [rect.left_center(), rect.right_center()],
+        Stroke::new(if response.hovered() { 2.0_f32 } else { 1.0_f32 }, color),
+    );
+    response
+        .dragged()
+        .then(|| ui.input(|input| input.pointer.delta().y))
+}
+
 fn paint_analysis(
     ui: &egui::Ui,
     rect: Rect,
@@ -548,7 +651,7 @@ fn paint_analysis(
     ui.painter().text(
         title_rect.left_center() + Vec2::new(8.0, 0.0),
         egui::Align2::LEFT_CENTER,
-        "FSK RAW DATA",
+        "RAW DATA",
         FontId::proportional(12.0),
         Color32::from_rgb(145, 160, 180),
     );
@@ -650,6 +753,8 @@ fn paint_raw_messages(
     const SEQUENCE_WIDTH: f32 = 48.0;
     const SECTION_WIDTH: f32 = 38.0;
     const LENGTH_WIDTH: f32 = 76.0;
+    const SCROLLBAR_WIDTH: f32 = 7.0;
+    const SCROLLBAR_GAP: f32 = 5.0;
     let visible_rows = (plot.height() / ROW_HEIGHT).floor().max(1.0) as usize;
     let completed_messages = store.completed_raw_message_count();
     let maximum_scroll = completed_messages.saturating_sub(visible_rows);
@@ -667,6 +772,12 @@ fn paint_raw_messages(
             *scroll_rows = scroll_rows.saturating_sub(1);
         }
     }
+    let show_scrollbar = maximum_scroll > 0;
+    let content_right = if show_scrollbar {
+        plot.right() - SCROLLBAR_WIDTH - SCROLLBAR_GAP
+    } else {
+        plot.right()
+    };
     for (row, message) in store
         .raw_messages()
         .iter()
@@ -679,7 +790,7 @@ fn paint_raw_messages(
         let row_rect = Rect::from_min_max(
             Pos2::new(plot.left(), plot.top() + row as f32 * ROW_HEIGHT),
             Pos2::new(
-                plot.right(),
+                content_right,
                 (plot.top() + (row + 1) as f32 * ROW_HEIGHT).min(plot.bottom()),
             ),
         );
@@ -754,9 +865,49 @@ fn paint_raw_messages(
             );
         });
     }
+    if show_scrollbar {
+        let track = Rect::from_min_max(
+            Pos2::new(plot.right() - SCROLLBAR_WIDTH, plot.top()),
+            plot.right_bottom(),
+        );
+        let thumb_height = (track.height() * visible_rows as f32 / completed_messages as f32)
+            .clamp(20.0_f32.min(track.height()), track.height());
+        let travel = (track.height() - thumb_height).max(0.0);
+        let thumb_top = track.top()
+            + travel * (*scroll_rows as f32 / maximum_scroll.max(1) as f32).clamp(0.0, 1.0);
+        let thumb = Rect::from_min_size(
+            Pos2::new(track.left(), thumb_top),
+            Vec2::new(track.width(), thumb_height),
+        );
+        let response = ui
+            .interact(
+                track,
+                ui.id().with("raw_message_scrollbar"),
+                Sense::click_and_drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+        if response.clicked() || response.dragged() {
+            if let Some(pointer) = response.interact_pointer_pos().filter(|_| travel > 0.0) {
+                let fraction =
+                    ((pointer.y - track.top() - thumb_height / 2.0) / travel).clamp(0.0, 1.0);
+                *scroll_rows = (fraction * maximum_scroll as f32).round() as usize;
+            }
+        }
+        ui.painter()
+            .rect_filled(track, 3.5, Color32::from_rgb(18, 26, 36));
+        ui.painter().rect_filled(
+            thumb,
+            3.5,
+            if response.hovered() || response.dragged() {
+                Color32::from_rgb(105, 130, 160)
+            } else {
+                Color32::from_rgb(65, 82, 105)
+            },
+        );
+    }
     if let Some(diagnostic) = store.raw_diagnostics().back() {
         ui.painter().text(
-            plot.right_bottom(),
+            Pos2::new(content_right, plot.bottom()),
             egui::Align2::RIGHT_BOTTOM,
             &diagnostic.message,
             FontId::proportional(9.0),
@@ -1294,6 +1445,33 @@ mod tests {
             bin_width_hz: 1_000.0,
             power_dbfs: vec![-80.0; 8],
         }
+    }
+
+    #[test]
+    fn radio_pane_heights_fill_the_view_and_respect_minimums() {
+        let (spectrum, waterfall, raw_data) = radio_pane_heights(600.0, true, 0.54, 0.24);
+
+        assert!(spectrum >= MIN_SPECTRUM_HEIGHT);
+        assert!(waterfall >= MIN_WATERFALL_HEIGHT);
+        assert!(raw_data >= MIN_RAW_DATA_HEIGHT);
+        assert!(
+            (spectrum + waterfall + raw_data + RADIO_PANE_DIVIDER_HEIGHT * 2.0 - 600.0).abs()
+                < f32::EPSILON
+        );
+
+        let (spectrum, waterfall, raw_data) = radio_pane_heights(600.0, false, 0.54, 0.24);
+        assert_eq!(raw_data, 0.0);
+        assert!((spectrum + waterfall + RADIO_PANE_DIVIDER_HEIGHT - 600.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn radio_pane_ratios_resize_spectrum_and_raw_data() {
+        let default = radio_pane_heights(600.0, true, 0.54, 0.24);
+        let resized = radio_pane_heights(600.0, true, 0.70, 0.35);
+
+        assert!(resized.0 > default.0);
+        assert!(resized.2 > default.2);
+        assert!(resized.1 < default.1);
     }
 
     #[test]
