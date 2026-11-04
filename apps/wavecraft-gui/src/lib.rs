@@ -7714,7 +7714,10 @@ fn paint_radio_capture_settings(
             ui.add_space(4.0);
             ui.checkbox(&mut settings.iq_correction_enabled, "Enable IQ correction")
                 .on_hover_text("Remove the measured I/Q DC offset before spectrum processing");
-            ui.checkbox(&mut settings.amplifier_enabled, "Enable RF amplifier");
+            ui.checkbox(&mut settings.amplifier_enabled, "Enable RF amplifier")
+                .on_hover_text(
+                    "Adds roughly 11 dB of HackRF front-end gain. Leave disabled around strong signals to reduce overload and distortion.",
+                );
             ui.checkbox(
                 &mut settings.antenna_power_enabled,
                 "Enable antenna port power (3.3 V)",
