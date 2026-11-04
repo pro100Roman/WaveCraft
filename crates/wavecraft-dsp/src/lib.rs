@@ -3,6 +3,7 @@
 mod channelizer;
 mod demodulation;
 mod fsk;
+mod timing;
 
 pub use channelizer::{ChannelizedBatch, Channelizer, ChannelizerConfig, TimedComplexSample};
 pub use demodulation::{
@@ -10,6 +11,7 @@ pub use demodulation::{
     TimedSoftSymbolBatch, MAX_SOFT_SYMBOL_ALPHABET_SIZE,
 };
 pub use fsk::{FskConfig, FskDemodulator, FskModulation, FskPolarity, TimedSoftBit};
+pub use timing::{RecoveredSymbol, SymbolTimingRecovery, TimedScalarSample, TimingRecoveryConfig};
 
 use std::collections::VecDeque;
 use std::error::Error;
