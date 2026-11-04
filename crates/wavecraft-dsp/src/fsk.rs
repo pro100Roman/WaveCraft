@@ -1,4 +1,7 @@
-use crate::{ChannelizedBatch, DspError, TimedComplexSample};
+use crate::{
+    ChannelizedBatch, DemodulatedBatch, Demodulator, DspError, TimedComplexSample, TimedSoftSymbol,
+    TimedSoftSymbolBatch,
+};
 use std::collections::VecDeque;
 use std::f64::consts::PI;
 use std::f64::consts::TAU;
@@ -53,6 +56,16 @@ pub struct TimedSoftBit {
     /// magnitude up to one expresses decision confidence.
     pub likelihood: f32,
     pub source_range: Range<u64>,
+}
+
+impl From<TimedSoftBit> for TimedSoftSymbol {
+    fn from(bit: TimedSoftBit) -> Self {
+        let one_likelihood = (bit.likelihood.clamp(-1.0, 1.0) + 1.0) * 0.5;
+        Self {
+            likelihoods: vec![1.0 - one_likelihood, one_likelihood],
+            source_range: bit.source_range,
+        }
+    }
 }
 
 /// Incremental binary-FSK discriminator with fixed source-time symbol timing.
@@ -284,6 +297,24 @@ impl FskDemodulator {
             gaussian_filter_tap_count(batch.sample_rate_hz, self.config.symbol_rate_hz)?;
         }
         Ok(())
+    }
+}
+
+impl Demodulator for FskDemodulator {
+    fn reset(&mut self) {
+        FskDemodulator::reset(self);
+    }
+
+    fn push(&mut self, input: &ChannelizedBatch) -> Result<DemodulatedBatch, DspError> {
+        let symbols = FskDemodulator::push(self, input)?
+            .into_iter()
+            .map(TimedSoftSymbol::from)
+            .collect();
+        Ok(DemodulatedBatch::SoftSymbols(TimedSoftSymbolBatch {
+            alphabet_size: 2,
+            discontinuity: input.discontinuity,
+            symbols,
+        }))
     }
 }
 
@@ -615,5 +646,29 @@ mod tests {
             })
             .is_err());
         }
+    }
+
+    #[test]
+    fn generic_demodulator_contract_exposes_binary_soft_symbols() {
+        let expected = [true, false, true];
+        let mut demodulator: Box<dyn Demodulator> = Box::new(demodulator());
+        let output = demodulator
+            .push(&batch(fsk_samples(&expected, 0), true, 0))
+            .unwrap();
+        let DemodulatedBatch::SoftSymbols(symbols) = output else {
+            panic!("binary FSK must emit soft symbols");
+        };
+
+        assert!(symbols.validate().is_ok());
+        assert_eq!(symbols.alphabet_size, 2);
+        assert!(symbols.discontinuity);
+        assert_eq!(
+            symbols
+                .symbols
+                .iter()
+                .map(TimedSoftSymbol::decision)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(0), Some(1)]
+        );
     }
 }

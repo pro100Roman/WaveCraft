@@ -1,9 +1,14 @@
 //! Device-independent signal processing for radio IQ captures.
 
 mod channelizer;
+mod demodulation;
 mod fsk;
 
 pub use channelizer::{ChannelizedBatch, Channelizer, ChannelizerConfig, TimedComplexSample};
+pub use demodulation::{
+    DemodulatedBatch, Demodulator, TimedAnalogBatch, TimedAnalogSample, TimedSoftSymbol,
+    TimedSoftSymbolBatch, MAX_SOFT_SYMBOL_ALPHABET_SIZE,
+};
 pub use fsk::{FskConfig, FskDemodulator, FskModulation, FskPolarity, TimedSoftBit};
 
 use std::collections::VecDeque;
