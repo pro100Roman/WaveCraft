@@ -16157,6 +16157,71 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a connected HackRF One and installed libhackrf"]
+    fn gui_hackrf_capture_pipeline_receives_and_spectrally_processes_iq() {
+        let adapter = HackRfAdapter::new();
+        let device = adapter
+            .discover()
+            .expect("GUI HackRF discovery should succeed")
+            .into_iter()
+            .next()
+            .expect("a HackRF One should be connected");
+        let request = RadioCaptureRequest {
+            device,
+            settings: RadioCaptureSettings {
+                center_frequency_hz: 100_000_000,
+                sample_rate_hz: 2_000_000,
+                bandwidth_hz: 1_750_000,
+                receive_channel: 0,
+                sample_limit: Some(4_096),
+            },
+            provider_settings: RadioProviderSettings::HackRf(HackRfSettings::default()),
+        };
+        let logic_config = LogicCaptureSettings::default().capture_config().unwrap();
+        let scope_config = ScopeCaptureSettings::default().capture_config().unwrap();
+        let started = start_capture(
+            Vec::new(),
+            Some(request),
+            Path::new("."),
+            logic_config,
+            scope_config,
+            None,
+        )
+        .expect("GUI radio capture should start");
+        let StartedCapture {
+            session,
+            mut radio_spectrum,
+            ..
+        } = started;
+        let frame = match session
+            .recv_timeout(Duration::from_secs(5))
+            .expect("GUI radio capture should produce an event")
+        {
+            CaptureEvent::Frame(frame) => frame,
+            CaptureEvent::SourceFailed { error, .. } => {
+                panic!("GUI radio capture failed: {error}")
+            }
+            CaptureEvent::SourceStopped { .. } => {
+                panic!("GUI radio capture stopped before producing IQ")
+            }
+        };
+        let CaptureBatch::Iq(iq) = frame.payload else {
+            panic!("GUI radio capture should emit IQ batches");
+        };
+        let spectra = radio_spectrum.push(&iq);
+
+        assert!(!iq.samples.is_empty());
+        assert_eq!(iq.sample_rate_hz, 2_000_000);
+        assert!(!spectra.is_empty());
+        assert!(spectra
+            .iter()
+            .all(|spectrum| spectrum.power_dbfs.len() == RADIO_SPECTRUM_FFT_LENGTH));
+        session
+            .stop()
+            .expect("GUI radio capture should stop cleanly");
+    }
+
+    #[test]
     fn recordings_without_channel_names_use_hardware_identifiers() {
         let (logic_names, scope_names) = channel_names_from_recording_metadata(&BTreeMap::new());
 
