@@ -2958,6 +2958,7 @@ struct RadioCaptureRequest {
     device: DiscoveredRadio,
     settings: RadioCaptureSettings,
     provider_settings: RadioProviderSettings,
+    iq_correction_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -3046,6 +3047,7 @@ struct CombinedSessionSettings {
 struct RadioSettings {
     capture: RadioCaptureSettings,
     gains_db: BTreeMap<String, i32>,
+    iq_correction_enabled: bool,
     amplifier_enabled: bool,
     antenna_power_enabled: bool,
 }
@@ -3061,6 +3063,7 @@ impl Default for RadioSettings {
                 sample_limit: None,
             },
             gains_db: BTreeMap::new(),
+            iq_correction_enabled: true,
             amplifier_enabled: false,
             antenna_power_enabled: false,
         }
@@ -3458,6 +3461,7 @@ impl WaveCraftApp {
             device,
             settings,
             provider_settings,
+            iq_correction_enabled: self.radio_settings.iq_correction_enabled,
         })
     }
 
@@ -7708,6 +7712,8 @@ fn paint_radio_capture_settings(
 
         if radio.provider == RadioProvider::HackRf {
             ui.add_space(4.0);
+            ui.checkbox(&mut settings.iq_correction_enabled, "Enable IQ correction")
+                .on_hover_text("Remove the measured I/Q DC offset before spectrum processing");
             ui.checkbox(&mut settings.amplifier_enabled, "Enable RF amplifier");
             ui.checkbox(
                 &mut settings.antenna_power_enabled,
@@ -9716,6 +9722,10 @@ fn start_gui_recording(
         radio_settings.capture.receive_channel.to_string(),
     );
     metadata.insert(
+        "radio.iq_correction_enabled".to_owned(),
+        radio_settings.iq_correction_enabled.to_string(),
+    );
+    metadata.insert(
         "radio.amplifier_enabled".to_owned(),
         radio_settings.amplifier_enabled.to_string(),
     );
@@ -10219,6 +10229,9 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     if let Some(value) = recording_metadata_value(metadata, "radio.amplifier_enabled") {
         settings.amplifier_enabled = value;
     }
+    if let Some(value) = recording_metadata_value(metadata, "radio.iq_correction_enabled") {
+        settings.iq_correction_enabled = value;
+    }
     if let Some(value) = recording_metadata_value(metadata, "radio.antenna_power_enabled") {
         settings.antenna_power_enabled = value;
     }
@@ -10271,7 +10284,8 @@ fn read_gui_recording_with_analyzers(
         waveforms.configure_logic_capture(logic_settings.sample_count);
     }
     let mut radio_spectrum =
-        SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?;
+        SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?
+            .with_iq_correction(radio_settings.iq_correction_enabled);
     let mut protocol_decode = ProtocolCaptureDecoder::new(analyzers);
     while let Some(event) = reader.read_event().map_err(|error| error.to_string())? {
         if let CaptureEvent::Frame(frame) = event {
@@ -10596,6 +10610,9 @@ fn start_capture(
     scope_config: DsCopeCaptureConfig,
     calibration_values: Option<DsCopeCalibrationValues>,
 ) -> Result<StartedCapture, String> {
+    let iq_correction_enabled = radio_request
+        .as_ref()
+        .is_some_and(|request| request.iq_correction_enabled);
     let mut sources = Vec::<Box<dyn CaptureSource>>::with_capacity(
         devices.len() + usize::from(radio_request.is_some()),
     );
@@ -10654,7 +10671,8 @@ fn start_capture(
         .map_err(|error| error.to_string())?;
         sources.push(source);
     }
-    let radio_spectrum = SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?;
+    let radio_spectrum = SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?
+        .with_iq_correction(iq_correction_enabled);
     let session = CaptureCoordinator::start(sources).map_err(|error| error.to_string())?;
     Ok(StartedCapture {
         session,
@@ -16240,6 +16258,7 @@ mod tests {
         metadata.insert("radio.gain.lna_db".to_owned(), "24".to_owned());
         metadata.insert("radio.gain.vga_db".to_owned(), "20".to_owned());
         metadata.insert("radio.amplifier_enabled".to_owned(), "true".to_owned());
+        metadata.insert("radio.iq_correction_enabled".to_owned(), "false".to_owned());
         metadata.insert("radio.antenna_power_enabled".to_owned(), "true".to_owned());
         let mut bytes = Vec::new();
         {
@@ -16273,6 +16292,7 @@ mod tests {
         assert_eq!(settings.capture.bandwidth_hz, 8_000_000);
         assert_eq!(settings.gains_db.get("lna"), Some(&24));
         assert_eq!(settings.gains_db.get("vga"), Some(&20));
+        assert!(!settings.iq_correction_enabled);
         assert!(settings.amplifier_enabled);
         assert!(settings.antenna_power_enabled);
     }
@@ -16297,6 +16317,7 @@ mod tests {
                 sample_limit: Some(4_096),
             },
             provider_settings: RadioProviderSettings::HackRf(HackRfSettings::default()),
+            iq_correction_enabled: true,
         };
         let logic_config = LogicCaptureSettings::default().capture_config().unwrap();
         let scope_config = ScopeCaptureSettings::default().capture_config().unwrap();

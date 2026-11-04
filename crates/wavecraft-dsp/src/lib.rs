@@ -52,6 +52,7 @@ pub struct SpectrumFrame {
 pub struct SpectrumProcessor {
     fft_length: usize,
     window: SpectrumWindow,
+    iq_correction_enabled: bool,
     samples: VecDeque<(f64, f64)>,
     first_sample_index: Option<u64>,
     expected_next_index: Option<u64>,
@@ -67,12 +68,18 @@ impl SpectrumProcessor {
         Ok(Self {
             fft_length,
             window,
+            iq_correction_enabled: false,
             samples: VecDeque::with_capacity(fft_length),
             first_sample_index: None,
             expected_next_index: None,
             sample_rate_hz: None,
             center_frequency_hz: None,
         })
+    }
+
+    pub fn with_iq_correction(mut self, enabled: bool) -> Self {
+        self.iq_correction_enabled = enabled;
+        self
     }
 
     pub fn reset(&mut self) {
@@ -115,20 +122,20 @@ impl SpectrumProcessor {
         let mut frames = Vec::new();
         while self.samples.len() >= self.fft_length {
             let start = self.first_sample_index.unwrap_or(batch.first_sample_index);
-            let mut values = self
-                .samples
-                .drain(..self.fft_length)
-                .enumerate()
-                .map(|(index, value)| {
-                    let scale = match self.window {
-                        SpectrumWindow::Rectangular => 1.0,
-                        SpectrumWindow::Hann => {
-                            0.5 - 0.5 * (TAU * index as f64 / (self.fft_length - 1) as f64).cos()
-                        }
-                    };
-                    (value.0 * scale, value.1 * scale)
-                })
-                .collect::<Vec<_>>();
+            let mut values = self.samples.drain(..self.fft_length).collect::<Vec<_>>();
+            if self.iq_correction_enabled {
+                remove_iq_dc_offset(&mut values);
+            }
+            values.iter_mut().enumerate().for_each(|(index, value)| {
+                let scale = match self.window {
+                    SpectrumWindow::Rectangular => 1.0,
+                    SpectrumWindow::Hann => {
+                        0.5 - 0.5 * (TAU * index as f64 / (self.fft_length - 1) as f64).cos()
+                    }
+                };
+                value.0 *= scale;
+                value.1 *= scale;
+            });
             fft_in_place(&mut values);
             let normalization = self.fft_length as f64;
             let half = self.fft_length / 2;
@@ -151,6 +158,22 @@ impl SpectrumProcessor {
             self.first_sample_index = Some(start + self.fft_length as u64);
         }
         frames
+    }
+}
+
+fn remove_iq_dc_offset(values: &mut [(f64, f64)]) {
+    if values.is_empty() {
+        return;
+    }
+    let (i_sum, q_sum) = values
+        .iter()
+        .fold((0.0, 0.0), |sum, value| (sum.0 + value.0, sum.1 + value.1));
+    let length = values.len() as f64;
+    let i_mean = i_sum / length;
+    let q_mean = q_sum / length;
+    for value in values {
+        value.0 -= i_mean;
+        value.1 -= q_mean;
     }
 }
 
@@ -242,5 +265,33 @@ mod tests {
 
         let frame = processor.push(&tone_batch(100, true)).remove(0);
         assert_eq!(frame.source_range, 100..108);
+    }
+
+    #[test]
+    fn iq_correction_removes_the_dc_offset_before_the_fft() {
+        let mut offset = tone_batch(0, false);
+        for sample in &mut offset.samples {
+            sample.i += 20;
+            sample.q -= 10;
+        }
+        let uncorrected = SpectrumProcessor::new(8, SpectrumWindow::Rectangular)
+            .unwrap()
+            .push(&offset)
+            .remove(0);
+        let corrected = SpectrumProcessor::new(8, SpectrumWindow::Rectangular)
+            .unwrap()
+            .with_iq_correction(true)
+            .push(&offset)
+            .remove(0);
+
+        let dc_bin = 4;
+        assert!(corrected.power_dbfs[dc_bin] < uncorrected.power_dbfs[dc_bin] - 40.0);
+        let corrected_peak = corrected
+            .power_dbfs
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index);
+        assert_eq!(corrected_peak, Some(6));
     }
 }
