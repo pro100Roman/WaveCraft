@@ -46,6 +46,12 @@ impl RadioDisplayStore {
     }
 
     pub fn ingest(&mut self, frame: SpectrumFrame) {
+        if self.newest_spectrum.as_ref().is_some_and(|current| {
+            current.center_frequency_hz != frame.center_frequency_hz
+                || current.bin_width_hz != frame.bin_width_hz
+        }) {
+            self.clear_for_retune();
+        }
         self.newest_spectrum = Some(frame.clone());
         if self.waterfall.len() == self.waterfall_capacity {
             self.waterfall.pop_front();
@@ -382,10 +388,13 @@ mod tests {
     fn retune_clears_rows_that_no_longer_share_a_frequency_axis() {
         let mut store = RadioDisplayStore::new(4).unwrap();
         store.ingest(frame(0, 100_000_000));
-        store.clear_for_retune();
+        store.ingest(frame(8, 101_000_000));
 
-        assert!(store.waterfall().is_empty());
-        assert!(store.newest_spectrum().is_none());
+        assert_eq!(store.waterfall().len(), 1);
+        assert_eq!(
+            store.newest_spectrum().unwrap().center_frequency_hz,
+            101_000_000
+        );
     }
 
     #[test]

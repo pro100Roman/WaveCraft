@@ -49,15 +49,14 @@ use wavecraft_core::{
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
 };
 use wavecraft_dsp::{SpectrumProcessor, SpectrumWindow};
-use wavecraft_hackrf::HackRfAdapter;
+use wavecraft_hackrf::{HackRfAdapter, HackRfRuntimeControl, HackRfRuntimeSettings};
 use wavecraft_recording::{
     read_saleae, write_saleae, CompletionStatus, RecordingReader, RecordingWriter,
     SaleaeAnalogChannel, SaleaeCapture, SaleaeChannel, SaleaeDigitalCapture,
 };
 use wavecraft_sdr::{
     DiscoveredRadio, HackRfSettings, RadioCapabilities, RadioCaptureSettings, RadioDiscoveryReport,
-    RadioProvider, RadioProviderAdapter, RadioProviderFailure, RadioProviderSettings,
-    RadioRegistry, ValueDomain,
+    RadioProvider, RadioProviderFailure, RadioProviderSettings, RadioRegistry, ValueDomain,
 };
 use wavecraft_usb::{
     apply_dscope_configuration, auto_calibrate_dscope_with_progress, discover_supported_devices,
@@ -2887,6 +2886,7 @@ struct ActiveCapture {
     scope_config: DsCopeCaptureConfig,
     scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
+    radio_runtime_control: Option<HackRfRuntimeControl>,
     stopped: HashSet<DeviceId>,
     waveforms: WaveformStore,
     protocol_decode: ProtocolCaptureDecoder,
@@ -3086,6 +3086,7 @@ enum WorkerSuccess {
         scope_config: DsCopeCaptureConfig,
         scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
         scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
+        radio_runtime_control: Option<HackRfRuntimeControl>,
         radio_spectrum: Box<SpectrumProcessor>,
     },
     ScopeConfigured,
@@ -3606,6 +3607,7 @@ impl WaveCraftApp {
                 scope_config,
                 scope_trigger_controls: started.scope_trigger_controls,
                 scope_calibration_controls: started.scope_calibration_controls,
+                radio_runtime_control: started.radio_runtime_control,
                 radio_spectrum: Box::new(started.radio_spectrum),
             });
             let _ = sender.send(result);
@@ -3916,6 +3918,7 @@ impl WaveCraftApp {
                 mut scope_config,
                 scope_trigger_controls,
                 scope_calibration_controls,
+                radio_runtime_control,
                 radio_spectrum,
             }) => {
                 let logic_config = *logic_config;
@@ -4095,6 +4098,7 @@ impl WaveCraftApp {
                     scope_config,
                     scope_trigger_controls,
                     scope_calibration_controls,
+                    radio_runtime_control,
                     stopped: HashSet::new(),
                     waveforms,
                     protocol_decode,
@@ -7517,6 +7521,23 @@ fn radio_gain_u32(settings: &RadioSettings, id: &str) -> Result<Option<u32>, Str
         .transpose()
 }
 
+fn hackrf_runtime_settings(settings: &RadioSettings) -> Result<HackRfRuntimeSettings, String> {
+    Ok(HackRfRuntimeSettings {
+        center_frequency_hz: settings.capture.center_frequency_hz,
+        bandwidth_hz: settings.capture.bandwidth_hz,
+        lna_gain_db: radio_gain_u32(settings, "lna")?,
+        vga_gain_db: radio_gain_u32(settings, "vga")?,
+        amplifier_enabled: settings.amplifier_enabled,
+    })
+}
+
+fn radio_runtime_settings_differ(current: &RadioSettings, previous: &RadioSettings) -> bool {
+    current.capture.center_frequency_hz != previous.capture.center_frequency_hz
+        || current.capture.bandwidth_hz != previous.capture.bandwidth_hz
+        || current.gains_db != previous.gains_db
+        || current.amplifier_enabled != previous.amplifier_enabled
+}
+
 fn normalize_gain_value(value: i32, minimum: i32, maximum: i32, step: u32) -> i32 {
     let clamped = value.clamp(minimum, maximum);
     let step = i64::from(step);
@@ -7647,6 +7668,7 @@ fn paint_radio_capture_settings(
     radio: &DiscoveredRadio,
     settings: &mut RadioSettings,
     enabled: bool,
+    runtime_enabled: bool,
 ) {
     ui.add_space(10.0);
     ui.label(
@@ -7655,7 +7677,8 @@ fn paint_radio_capture_settings(
             .color(ACCENT),
     );
     ui.add_space(6.0);
-    ui.add_enabled_ui(enabled, |ui| {
+    let tuning_enabled = enabled || runtime_enabled;
+    ui.add_enabled_ui(tuning_enabled, |ui| {
         paint_radio_mhz_control(
             ui,
             "Center frequency",
@@ -7663,7 +7686,9 @@ fn paint_radio_capture_settings(
             &radio.capabilities.frequency_hz,
             true,
         );
-        ui.add_space(4.0);
+    });
+    ui.add_space(4.0);
+    ui.add_enabled_ui(enabled, |ui| {
         paint_radio_mhz_control(
             ui,
             "Sample rate",
@@ -7671,21 +7696,25 @@ fn paint_radio_capture_settings(
             &radio.capabilities.sample_rates_hz,
             true,
         );
-        ui.add_space(4.0);
+    });
+    ui.add_space(4.0);
+    ui.add_enabled_ui(tuning_enabled, |ui| {
         paint_radio_bandwidth_control(
             ui,
             &mut settings.capture.bandwidth_hz,
             &radio.capabilities.bandwidths_hz,
         );
-        if settings.capture.bandwidth_hz > settings.capture.sample_rate_hz {
-            ui.label(
-                RichText::new("Bandwidth above sample rate may cause aliasing")
-                    .small()
-                    .color(Color32::from_rgb(255, 190, 80)),
-            );
-        }
+    });
+    if settings.capture.bandwidth_hz > settings.capture.sample_rate_hz {
+        ui.label(
+            RichText::new("Bandwidth above sample rate may cause aliasing")
+                .small()
+                .color(Color32::from_rgb(255, 190, 80)),
+        );
+    }
 
-        if radio.capabilities.receive_channels > 1 {
+    if radio.capabilities.receive_channels > 1 {
+        ui.add_enabled_ui(enabled, |ui| {
             ui.add_space(4.0);
             ui.label(RichText::new("Receive channel").small().color(TEXT_MUTED));
             egui::ComboBox::from_id_salt("radio_receive_channel")
@@ -7700,8 +7729,10 @@ fn paint_radio_capture_settings(
                         );
                     }
                 });
-        }
+        });
+    }
 
+    ui.add_enabled_ui(tuning_enabled, |ui| {
         for control in &radio.capabilities.gain_controls {
             ui.add_space(4.0);
             let value = settings
@@ -7732,22 +7763,28 @@ fn paint_radio_capture_settings(
                 control.step_db,
             );
         }
+    });
 
-        if radio.provider == RadioProvider::HackRf {
-            ui.add_space(4.0);
+    if radio.provider == RadioProvider::HackRf {
+        ui.add_space(4.0);
+        ui.add_enabled_ui(enabled, |ui| {
             ui.checkbox(&mut settings.iq_correction_enabled, "Enable IQ correction")
                 .on_hover_text("Remove the measured I/Q DC offset before spectrum processing");
+        });
+        ui.add_enabled_ui(tuning_enabled, |ui| {
             ui.checkbox(&mut settings.amplifier_enabled, "Enable RF amplifier")
                 .on_hover_text(
                     "Adds roughly 11 dB of HackRF front-end gain. Leave disabled around strong signals to reduce overload and distortion.",
                 );
+        });
+        ui.add_enabled_ui(enabled, |ui| {
             ui.checkbox(
                 &mut settings.antenna_power_enabled,
                 "Enable antenna port power (3.3 V)",
             )
             .on_hover_text("Only enable for an antenna or accessory designed for bias power");
-        }
-    });
+        });
+    }
 }
 
 fn paint_radio_settings(
@@ -8017,6 +8054,12 @@ impl eframe::App for WaveCraftApp {
         let mut scope_device_selection_changed = false;
         let mut radio_device_selection_changed = false;
         let capture_settings_enabled = !self.is_busy();
+        let radio_runtime_controls_enabled = self.capture.as_ref().is_some_and(|active| {
+            active.mode == AcquisitionMode::Run
+                && active.target == CaptureTarget::RadioReceiver
+                && active.radio_runtime_control.is_some()
+        });
+        let radio_settings_before_ui = self.radio_settings.clone();
         let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
         let selected_logic_device = self.selected_logic_device().is_some();
         let logic_settings_speed = self
@@ -8297,6 +8340,7 @@ impl eframe::App for WaveCraftApp {
                                     &radio,
                                     &mut self.radio_settings,
                                     capture_settings_enabled,
+                                    radio_runtime_controls_enabled,
                                 );
                             }
                         }
@@ -9276,14 +9320,19 @@ impl eframe::App for WaveCraftApp {
                             &radio,
                             &mut self.radio_settings,
                             !settings_locked,
+                            radio_runtime_controls_enabled,
                         );
                     }
 
                     if settings_locked {
                         ui.add_space(8.0);
                         ui.small(
-                            RichText::new("Settings are locked while an operation is running")
-                                .color(TEXT_MUTED),
+                            RichText::new(if radio_runtime_controls_enabled {
+                                "Device, sample-rate, IQ-correction, and antenna-power settings remain locked; tuning and gain controls are live"
+                            } else {
+                                "Settings are locked while an operation is running"
+                            })
+                            .color(TEXT_MUTED),
                         );
                     }
 
@@ -9533,6 +9582,27 @@ impl eframe::App for WaveCraftApp {
         if radio_device_selection_changed {
             self.last_error = None;
             self.status = "Radio device selection updated".to_owned();
+        }
+        if radio_runtime_settings_differ(&self.radio_settings, &radio_settings_before_ui) {
+            let runtime_control = self.capture.as_ref().and_then(|active| {
+                (active.mode == AcquisitionMode::Run
+                    && active.target == CaptureTarget::RadioReceiver)
+                    .then_some(active.radio_runtime_control.as_ref())
+                    .flatten()
+            });
+            if let Some(runtime_control) = runtime_control {
+                let update_result =
+                    hackrf_runtime_settings(&self.radio_settings).and_then(|settings| {
+                        runtime_control.update(settings).map_err(|e| e.to_string())
+                    });
+                match update_result {
+                    Ok(()) => {
+                        self.status = "Updating HackRF tuning during capture…".to_owned();
+                        self.last_error = None;
+                    }
+                    Err(error) => self.set_error(error),
+                }
+            }
         }
         if scope_device_selection_changed
             && self.selected_scope_device_ref().is_some()
@@ -10637,6 +10707,7 @@ struct StartedCapture {
     session: CaptureSession,
     scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
+    radio_runtime_control: Option<HackRfRuntimeControl>,
     radio_spectrum: SpectrumProcessor,
 }
 
@@ -10656,6 +10727,7 @@ fn start_capture(
     );
     let mut scope_trigger_controls = Vec::new();
     let mut scope_calibration_controls = Vec::new();
+    let mut radio_runtime_control = None;
     for device in devices {
         if device.link_status() == LinkStatus::Unsupported {
             return Err(format!(
@@ -10695,18 +10767,23 @@ fn start_capture(
     }
     if let Some(request) = radio_request {
         let source = match request.device.provider {
-            RadioProvider::HackRf => HackRfAdapter::new().open(
-                &request.device,
-                request.settings,
-                request.provider_settings,
-            ),
+            RadioProvider::HackRf => {
+                let (source, control) = HackRfAdapter::new()
+                    .open_with_runtime_control(
+                        &request.device,
+                        request.settings,
+                        request.provider_settings,
+                    )
+                    .map_err(|error| error.to_string())?;
+                radio_runtime_control = Some(control);
+                source
+            }
             provider => {
                 return Err(format!(
                     "capture is not implemented for the {provider:?} radio provider"
                 ));
             }
-        }
-        .map_err(|error| error.to_string())?;
+        };
         sources.push(source);
     }
     let radio_spectrum = SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?
@@ -10716,6 +10793,7 @@ fn start_capture(
         session,
         scope_trigger_controls,
         scope_calibration_controls,
+        radio_runtime_control,
         radio_spectrum,
     })
 }
@@ -15534,6 +15612,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use wavecraft_core::{Iq8, IqBatch, LogicBatch, ScopeBatch};
+    use wavecraft_sdr::RadioProviderAdapter;
 
     #[test]
     fn motor_controller_example_recording_opens_and_decodes() {
@@ -15676,6 +15755,33 @@ mod tests {
             .capture
             .validate(&capabilities)
             .expect("normalized radio settings should validate");
+    }
+
+    #[test]
+    fn radio_runtime_settings_include_only_live_hackrf_controls() {
+        let capabilities = wavecraft_hackrf::hackrf_one_capabilities();
+        let mut initial = RadioSettings::default();
+        normalize_radio_settings(&mut initial, &capabilities);
+        let mut edited = initial.clone();
+        edited.capture.sample_rate_hz = 12_000_000;
+        assert!(!radio_runtime_settings_differ(&edited, &initial));
+
+        edited.capture.center_frequency_hz = 433_920_000;
+        edited.capture.bandwidth_hz = 8_000_000;
+        edited.gains_db.insert("lna".to_owned(), 24);
+        edited.gains_db.insert("vga".to_owned(), 20);
+        edited.amplifier_enabled = true;
+        assert!(radio_runtime_settings_differ(&edited, &initial));
+        assert_eq!(
+            hackrf_runtime_settings(&edited).unwrap(),
+            HackRfRuntimeSettings {
+                center_frequency_hz: 433_920_000,
+                bandwidth_hz: 8_000_000,
+                lna_gain_db: Some(24),
+                vga_gain_db: Some(20),
+                amplifier_enabled: true,
+            }
+        );
     }
 
     #[test]

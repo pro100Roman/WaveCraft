@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wavecraft_core::{
@@ -96,6 +96,70 @@ impl HackRfAdapter {
     fn load_runtime(&self) -> Result<Arc<HackRfRuntime>, CaptureError> {
         HackRfRuntime::load(self.library_path.as_deref()).map(Arc::new)
     }
+
+    fn capture_source(
+        &self,
+        device: &DiscoveredRadio,
+        settings: RadioCaptureSettings,
+        provider_settings: RadioProviderSettings,
+    ) -> Result<HackRfCaptureSource, CaptureError> {
+        validate_device(device)?;
+        validate_capture_settings(&settings)?;
+        let RadioProviderSettings::HackRf(provider_settings) = provider_settings else {
+            return Err(CaptureError::new(
+                "HackRF capture requires HackRF provider settings",
+            ));
+        };
+        validate_provider_settings(&provider_settings)?;
+        let serial = device.persistent_id.clone().ok_or_else(|| {
+            CaptureError::new("HackRF One does not expose a serial number and cannot be reopened")
+        })?;
+        let runtime = self.load_runtime()?;
+
+        Ok(HackRfCaptureSource {
+            descriptor: device.descriptor.clone(),
+            serial,
+            settings,
+            provider_settings,
+            runtime_settings_receiver: None,
+            runtime,
+        })
+    }
+
+    pub fn open_with_runtime_control(
+        &self,
+        device: &DiscoveredRadio,
+        settings: RadioCaptureSettings,
+        provider_settings: RadioProviderSettings,
+    ) -> Result<(Box<dyn CaptureSource>, HackRfRuntimeControl), CaptureError> {
+        let mut source = self.capture_source(device, settings, provider_settings)?;
+        let (sender, receiver) = mpsc::channel();
+        source.runtime_settings_receiver = Some(receiver);
+        Ok((Box::new(source), HackRfRuntimeControl { sender }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HackRfRuntimeSettings {
+    pub center_frequency_hz: u64,
+    pub bandwidth_hz: u64,
+    pub lna_gain_db: Option<u32>,
+    pub vga_gain_db: Option<u32>,
+    pub amplifier_enabled: bool,
+}
+
+#[derive(Clone)]
+pub struct HackRfRuntimeControl {
+    sender: Sender<HackRfRuntimeSettings>,
+}
+
+impl HackRfRuntimeControl {
+    pub fn update(&self, settings: HackRfRuntimeSettings) -> Result<(), CaptureError> {
+        validate_runtime_settings(&settings)?;
+        self.sender
+            .send(settings)
+            .map_err(|_| CaptureError::new("HackRF capture is no longer running"))
+    }
 }
 
 impl RadioProviderAdapter for HackRfAdapter {
@@ -114,26 +178,8 @@ impl RadioProviderAdapter for HackRfAdapter {
         settings: RadioCaptureSettings,
         provider_settings: RadioProviderSettings,
     ) -> Result<Box<dyn CaptureSource>, CaptureError> {
-        validate_device(device)?;
-        validate_capture_settings(&settings)?;
-        let RadioProviderSettings::HackRf(provider_settings) = provider_settings else {
-            return Err(CaptureError::new(
-                "HackRF capture requires HackRF provider settings",
-            ));
-        };
-        validate_provider_settings(&provider_settings)?;
-        let serial = device.persistent_id.clone().ok_or_else(|| {
-            CaptureError::new("HackRF One does not expose a serial number and cannot be reopened")
-        })?;
-        let runtime = self.load_runtime()?;
-
-        Ok(Box::new(HackRfCaptureSource {
-            descriptor: device.descriptor.clone(),
-            serial,
-            settings,
-            provider_settings,
-            runtime,
-        }))
+        self.capture_source(device, settings, provider_settings)
+            .map(|source| Box::new(source) as Box<dyn CaptureSource>)
     }
 }
 
@@ -170,11 +216,33 @@ fn validate_provider_settings(settings: &HackRfSettings) -> Result<(), CaptureEr
     Ok(())
 }
 
+fn validate_runtime_settings(settings: &HackRfRuntimeSettings) -> Result<(), CaptureError> {
+    let capabilities = hackrf_one_capabilities();
+    if !capabilities
+        .frequency_hz
+        .contains(settings.center_frequency_hz)
+    {
+        return Err(CaptureError::new("HackRF center frequency is unsupported"));
+    }
+    if !capabilities.bandwidths_hz.contains(settings.bandwidth_hz) {
+        return Err(CaptureError::new(
+            "HackRF baseband bandwidth is unsupported",
+        ));
+    }
+    validate_provider_settings(&HackRfSettings {
+        lna_gain_db: settings.lna_gain_db,
+        vga_gain_db: settings.vga_gain_db,
+        amplifier_enabled: settings.amplifier_enabled,
+        antenna_power_enabled: false,
+    })
+}
+
 struct HackRfCaptureSource {
     descriptor: DeviceDescriptor,
     serial: String,
     settings: RadioCaptureSettings,
     provider_settings: HackRfSettings,
+    runtime_settings_receiver: Option<Receiver<HackRfRuntimeSettings>>,
     runtime: Arc<HackRfRuntime>,
 }
 
@@ -247,10 +315,24 @@ impl HackRfCaptureSource {
     ) -> Result<(), CaptureError> {
         let mut first_sample_index = 0_u64;
         let mut sequence = 0_u64;
+        let mut center_frequency_hz = self.settings.center_frequency_hz;
+        let mut discontinuity = false;
 
         while !context.is_cancelled() {
             if let Some(error) = callback_state.failure() {
                 return Err(CaptureError::new(error));
+            }
+
+            if let Some(settings) = self
+                .runtime_settings_receiver
+                .as_ref()
+                .and_then(latest_runtime_settings)
+            {
+                discard_pending_blocks(receiver, callback_state, &mut first_sample_index);
+                self.apply_runtime_settings(device, settings)?;
+                discard_pending_blocks(receiver, callback_state, &mut first_sample_index);
+                center_frequency_hz = settings.center_frequency_hz;
+                discontinuity = true;
             }
 
             match receiver.recv_timeout(RECEIVE_POLL_INTERVAL) {
@@ -275,14 +357,15 @@ impl HackRfCaptureSource {
                         block.captured_at,
                         CaptureBatch::Iq(IqBatch {
                             sample_rate_hz: self.settings.sample_rate_hz,
-                            center_frequency_hz: self.settings.center_frequency_hz,
+                            center_frequency_hz,
                             first_sample_index,
-                            discontinuity: false,
+                            discontinuity,
                             samples,
                         }),
                     );
                     callback_state.recycle_buffer(block.bytes);
                     emit_result?;
+                    discontinuity = false;
                     first_sample_index += sample_count as u64;
                     sequence += 1;
                     if self
@@ -309,6 +392,40 @@ impl HackRfCaptureSource {
             }
         }
         Ok(())
+    }
+
+    fn apply_runtime_settings(
+        &self,
+        device: *mut HackRfDevice,
+        settings: HackRfRuntimeSettings,
+    ) -> Result<(), CaptureError> {
+        self.runtime
+            .set_bandwidth(device, settings.bandwidth_hz as u32)?;
+        self.runtime
+            .set_frequency(device, settings.center_frequency_hz)?;
+        self.runtime
+            .set_lna_gain(device, settings.lna_gain_db.unwrap_or(DEFAULT_LNA_GAIN_DB))?;
+        self.runtime
+            .set_vga_gain(device, settings.vga_gain_db.unwrap_or(DEFAULT_VGA_GAIN_DB))?;
+        self.runtime
+            .set_amplifier(device, settings.amplifier_enabled)
+    }
+}
+
+fn latest_runtime_settings(
+    receiver: &Receiver<HackRfRuntimeSettings>,
+) -> Option<HackRfRuntimeSettings> {
+    receiver.try_iter().last()
+}
+
+fn discard_pending_blocks(
+    receiver: &Receiver<ReceivedBlock>,
+    callback_state: &RxCallbackState,
+    first_sample_index: &mut u64,
+) {
+    for block in receiver.try_iter() {
+        *first_sample_index = first_sample_index.saturating_add((block.bytes.len() / 2) as u64);
+        callback_state.recycle_buffer(block.bytes);
     }
 }
 
@@ -935,6 +1052,36 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(samples, vec![Iq8 { i: -1, q: 2 }, Iq8 { i: -128, q: 127 }]);
+    }
+
+    #[test]
+    fn runtime_control_validates_and_coalesces_to_the_latest_settings() {
+        let (sender, receiver) = mpsc::channel();
+        let control = HackRfRuntimeControl { sender };
+        let first = HackRfRuntimeSettings {
+            center_frequency_hz: 100_000_000,
+            bandwidth_hz: 5_000_000,
+            lna_gain_db: Some(16),
+            vga_gain_db: Some(16),
+            amplifier_enabled: false,
+        };
+        let latest = HackRfRuntimeSettings {
+            center_frequency_hz: 433_920_000,
+            bandwidth_hz: 8_000_000,
+            lna_gain_db: Some(24),
+            vga_gain_db: Some(20),
+            amplifier_enabled: true,
+        };
+
+        control.update(first).unwrap();
+        control.update(latest).unwrap();
+        assert_eq!(latest_runtime_settings(&receiver), Some(latest));
+        assert!(control
+            .update(HackRfRuntimeSettings {
+                lna_gain_db: Some(10),
+                ..latest
+            })
+            .is_err());
     }
 
     #[test]
