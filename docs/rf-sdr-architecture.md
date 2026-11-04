@@ -464,6 +464,12 @@ packet storage, and partial state all have explicit limits. Gaps flush partial
 packets with diagnostics, and accepted sync errors remain attached to the
 packet rather than being hidden.
 
+Radio CRC validation supports explicitly configured 8-, 16-, 24-, or 32-bit
+polynomials, initial values, reflection, final XOR, byte order, covered range,
+and transmitted field location. A mismatch is attached to the retained packet
+with its source range. An optional discard policy is returned separately so
+failed bytes remain inspectable instead of being erased by validation.
+
 These operations are not application-field parsing. Their output is a
 `RadioPacket` containing timed bytes, source range, RSSI/power estimate,
 frequency-error estimate, confidence, and diagnostics. CRC failure does not

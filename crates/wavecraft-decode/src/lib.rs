@@ -3,6 +3,7 @@
 mod decode;
 mod framing;
 mod radio;
+mod radio_crc;
 mod radio_packet;
 mod runtime;
 mod schema;
@@ -17,6 +18,9 @@ pub use framing::{ByteStreamFramer, FramedBytes, FramingOutput};
 pub use radio::{
     BitPolarity, BitTransformConfig, BitTransformOutput, BitTransformer, LineCode, TimedBit,
     TimedBitBatch,
+};
+pub use radio_crc::{
+    calculate_crc, CrcParameters, CrcValidation, RadioCrcConfig, RadioCrcValidator,
 };
 pub use radio_packet::{
     BitOrder, RadioPacket, RadioPacketFramer, RadioPacketFramerConfig, RadioPacketFramingOutput,
