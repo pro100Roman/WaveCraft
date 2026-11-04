@@ -264,8 +264,11 @@ The spectrum exposes a persisted RF trigger-level threshold in dBFS as a red
 Dragging moves the horizontal dotted threshold line; double-click restores
 -50 dBFS. The first trigger implementation compares this threshold with the
 strongest bin in each 2048-point Hann-windowed spectrum. It is a one-shot RF
-Single trigger; channel-integrated power, hysteresis, and minimum-duration
-qualification remain future refinements.
+Single trigger. After raw FSK/GFSK acquisition locks to its preamble, the same
+threshold also acts as a burst squelch over only the configured analyzer channel
+bandwidth. Falling below it closes and resets the raw message instead of decoding
+the following noise as payload. Channel-integrated power, hysteresis, and
+minimum-duration qualification remain future refinements.
 
 ## Signal-decoder stack
 

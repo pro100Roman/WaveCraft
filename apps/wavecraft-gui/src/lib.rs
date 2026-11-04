@@ -2895,15 +2895,24 @@ fn ingest_radio_iq(
     spectrum: &mut SpectrumProcessor,
     analyzer: &mut Option<RadioAnalyzerRuntime>,
     iq: &wavecraft_core::IqBatch,
+    squelch_threshold_dbfs: f32,
 ) {
-    for frame in spectrum.push(iq) {
+    let spectrum_frames = spectrum.push(iq);
+    let analysis = analyzer
+        .as_mut()
+        .map(|analyzer| analyzer.push(iq, &spectrum_frames, squelch_threshold_dbfs));
+    for frame in spectrum_frames {
         waveforms.radio.ingest(frame);
     }
-    let analysis = analyzer.as_mut().map(|analyzer| analyzer.push(iq));
     if let Some(analysis) = analysis {
         let analysis = analysis.and_then(|output| {
-            waveforms.radio_analysis.ingest(output.demodulated)?;
+            if let Some(demodulated) = output.demodulated {
+                waveforms.radio_analysis.ingest(demodulated)?;
+            }
             waveforms.radio_analysis.ingest_raw(output.raw);
+            if output.burst_ended {
+                waveforms.radio_analysis.finish_raw_capture();
+            }
             Ok(())
         });
         if let Err(error) = analysis {
@@ -2916,6 +2925,7 @@ fn ingest_radio_iq(
 fn ingest_active_capture_frame(
     active: &mut ActiveCapture,
     frame: CaptureFrame,
+    radio_squelch_threshold_dbfs: f32,
 ) -> Result<(), String> {
     let event = CaptureEvent::Frame(frame);
     if let Some(recorder) = active.recorder.as_mut() {
@@ -2940,6 +2950,7 @@ fn ingest_active_capture_frame(
             &mut active.radio_spectrum,
             &mut active.radio_analyzer,
             iq,
+            radio_squelch_threshold_dbfs,
         );
     }
     let enabled_scope_channels = active
@@ -4668,7 +4679,11 @@ impl WaveCraftApp {
                                 ));
                             }
                             for frame in frames {
-                                if let Err(error) = ingest_active_capture_frame(active, frame) {
+                                if let Err(error) = ingest_active_capture_frame(
+                                    active,
+                                    frame,
+                                    radio_trigger_threshold_dbfs,
+                                ) {
                                     active.session.request_stop();
                                     finish_status = Some((Err(error), CompletionStatus::Failed));
                                     break;
@@ -8668,7 +8683,7 @@ fn paint_radio_receive_configuration(
                 ui,
                 "RF trigger level",
                 Some(
-                    "Peak FFT-bin power threshold used by RF Single when Wait for trigger is enabled; also represented by the draggable T marker",
+                    "Peak FFT-bin power threshold used by RF Single when Wait for trigger is enabled. After an FSK/GFSK preamble locks, the same level acts as squelch inside the configured analyzer channel and closes RAW data when the RF burst ends. Also represented by the draggable T marker",
                 ),
             );
             ui.add_enabled_ui(enabled || trigger_runtime_enabled, |ui| {
@@ -11621,7 +11636,13 @@ fn read_gui_recording_with_analyzers(
                 );
             }
             if let CaptureBatch::Iq(iq) = &frame.payload {
-                ingest_radio_iq(&mut waveforms, &mut radio_spectrum, &mut radio_analyzer, iq);
+                ingest_radio_iq(
+                    &mut waveforms,
+                    &mut radio_spectrum,
+                    &mut radio_analyzer,
+                    iq,
+                    f32::from(radio_settings.trigger_level_dbfs_tenths) / 10.0,
+                );
             }
             waveforms.ingest_frame(&frame, enabled_scope_channels);
         }
@@ -17179,6 +17200,7 @@ mod tests {
                 discontinuity: false,
                 samples,
             },
+            -50.0,
         );
 
         assert!(analyzer.is_some());
