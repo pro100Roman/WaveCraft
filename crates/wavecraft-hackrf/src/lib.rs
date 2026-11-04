@@ -50,6 +50,10 @@ pub fn hackrf_one_capabilities() -> RadioCapabilities {
             GainControlDescriptor {
                 id: "lna".to_owned(),
                 label: "IF (LNA) gain".to_owned(),
+                help: Some(
+                    "Controls IF-stage gain from 0–40 dB in 8 dB steps. Raise it for weak signals; too much gain can overload the receiver."
+                        .to_owned(),
+                ),
                 range_db: 0..=40,
                 step_db: 8,
                 default_db: DEFAULT_LNA_GAIN_DB as i32,
@@ -57,6 +61,10 @@ pub fn hackrf_one_capabilities() -> RadioCapabilities {
             GainControlDescriptor {
                 id: "vga".to_owned(),
                 label: "Baseband (VGA) gain".to_owned(),
+                help: Some(
+                    "Controls baseband gain from 0–62 dB in 2 dB steps. Adjust it after IF gain; too much gain can clip and distort the digitized signal."
+                        .to_owned(),
+                ),
                 range_db: 0..=62,
                 step_db: 2,
                 default_db: DEFAULT_VGA_GAIN_DB as i32,

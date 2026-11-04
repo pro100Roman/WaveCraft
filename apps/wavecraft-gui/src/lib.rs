@@ -7708,12 +7708,23 @@ fn paint_radio_capture_settings(
                 .gains_db
                 .entry(control.id.clone())
                 .or_insert(control.default_db);
-            ui.label(RichText::new(&control.label).small().color(TEXT_MUTED));
-            ui.add(
+            let label = if control.help.is_some() {
+                format!("{} ⓘ", control.label)
+            } else {
+                control.label.clone()
+            };
+            let label_response = ui.label(RichText::new(label).small().color(TEXT_MUTED));
+            if let Some(help) = &control.help {
+                label_response.on_hover_text(help);
+            }
+            let slider_response = ui.add(
                 egui::Slider::new(value, control.range_db.clone())
                     .step_by(f64::from(control.step_db.max(1)))
                     .suffix(" dB"),
             );
+            if let Some(help) = &control.help {
+                slider_response.on_hover_text(help);
+            }
             *value = normalize_gain_value(
                 *value,
                 *control.range_db.start(),

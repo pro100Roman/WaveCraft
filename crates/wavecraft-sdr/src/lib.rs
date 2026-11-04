@@ -53,6 +53,7 @@ impl ValueDomain {
 pub struct GainControlDescriptor {
     pub id: String,
     pub label: String,
+    pub help: Option<String>,
     pub range_db: RangeInclusive<i32>,
     pub step_db: u32,
     pub default_db: i32,
@@ -303,6 +304,7 @@ mod tests {
             gain_controls: vec![GainControlDescriptor {
                 id: "gain".to_owned(),
                 label: "Gain".to_owned(),
+                help: None,
                 range_db: -12..=60,
                 step_db: 1,
                 default_db: 0,
