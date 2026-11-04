@@ -703,12 +703,50 @@ fn paint_spectrum(ui: &egui::Ui, rect: Rect, spectrum: Option<&SpectrumFrame>) {
                 Stroke::new(0.75_f32, Color32::from_rgb(85, 115, 135)),
             );
             painter.circle_filled(point, 3.5, Color32::WHITE);
-            response.on_hover_ui(|ui| {
-                ui.monospace(format_frequency(frequency_hz));
-                ui.monospace(format!("{power_dbfs:.1} dBFS"));
-            });
+            let screen = ui.ctx().input(|input| input.screen_rect());
+            let label_rect = spectrum_hover_label_rect(pointer, screen);
+            let label_painter = ui.painter();
+            label_painter.rect_filled(label_rect, 4.0, Color32::from_rgb(24, 31, 42));
+            label_painter.rect_stroke(
+                label_rect,
+                4.0,
+                Stroke::new(1.0_f32, Color32::from_rgb(70, 105, 125)),
+            );
+            label_painter.text(
+                label_rect.left_top() + Vec2::new(8.0, 5.0),
+                egui::Align2::LEFT_TOP,
+                format_frequency(frequency_hz),
+                FontId::monospace(11.0),
+                Color32::WHITE,
+            );
+            label_painter.text(
+                label_rect.left_bottom() + Vec2::new(8.0, -5.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("{power_dbfs:.1} dBFS"),
+                FontId::monospace(11.0),
+                Color32::from_rgb(150, 220, 255),
+            );
         }
     }
+}
+
+fn spectrum_hover_label_rect(pointer: Pos2, bounds: Rect) -> Rect {
+    const GAP: f32 = 12.0;
+    let size = Vec2::new(150.0, 40.0);
+    let mut min = Pos2::new(pointer.x + GAP, pointer.y - GAP - size.y);
+    if min.x + size.x > bounds.right() {
+        min.x = pointer.x - GAP - size.x;
+    }
+    if min.y < bounds.top() {
+        min.y = pointer.y + GAP;
+    }
+    min.x = min
+        .x
+        .clamp(bounds.left(), (bounds.right() - size.x).max(bounds.left()));
+    min.y = min
+        .y
+        .clamp(bounds.top(), (bounds.bottom() - size.y).max(bounds.top()));
+    Rect::from_min_size(min, size)
 }
 
 fn spectrum_value_at(spectrum: &SpectrumFrame, fraction: f32) -> Option<(usize, f64, f32)> {
@@ -889,6 +927,15 @@ mod tests {
             spectrum_value_at(&spectrum, 1.0),
             Some((3, 868_001_000.0, -50.0))
         );
+    }
+
+    #[test]
+    fn spectrum_hover_label_prefers_right_and_above_the_pointer() {
+        let bounds = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let label = spectrum_hover_label_rect(Pos2::new(300.0, 300.0), bounds);
+
+        assert_eq!(label.left(), 312.0);
+        assert_eq!(label.bottom(), 288.0);
     }
 
     #[test]
