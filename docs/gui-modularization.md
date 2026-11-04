@@ -256,32 +256,49 @@ detailed sequence in `rf-sdr-architecture.md`. Its initial scope is
 receive-only, single-channel IQ streaming. HackRF-specific gain and amplifier
 controls remain in `HackRfSettings` and are surfaced through capabilities.
 
-### LimeSDR
+### LimeSDR-USB Type-A
 
 `wavecraft-limesdr` is a separate adapter using the same raw IQ and capture
 contracts. The placeholder allows multiple receive channels, model-dependent
 frequency/sample-rate domains, named gain stages, and optional timing/clock
-capabilities. The binding technology and initial supported LimeSDR model must
-be selected and documented before implementation; the generic GUI must not
-depend on that choice.
+capabilities. The first target is the LimeSDR-USB board with the integrated USB
+Type-A plug, using the native Lime Suite NG device API. Lime Suite NG lists
+LimeSDR USB as a supported USB device and is the recommended API for new
+applications. The generic GUI must not depend on the Lime Suite NG API.
+
+References:
+
+- [Lime Suite NG documentation](https://github.com/myriadrf/LimeSuiteNG/blob/develop/docs/index.rst)
+- [LimeSDR-USB hardware description](https://wiki.myriadrf.org/LimeSDR-USB_hardware_description)
 
 Initial LimeSDR support may deliberately expose one receive channel even when
 the selected hardware can provide more. Multi-channel coherent capture should
 be enabled only after `IqBatch`, recording, synchronization, and DSP semantics
 for channel identity are specified and tested.
 
-### AntSDR
+### AntSDR E200
 
 `wavecraft-antsdr` is also a separate adapter. AntSDR is treated as a device
-family, not one assumed USB protocol. Model detection, host transport, channel
-count, sample formats, clocks, and tuning controls remain backend-reported
-capabilities. The first supported model and binding must be named explicitly
-before implementation begins.
+family, not one assumed USB protocol. The first target is the AntSDR E200 using
+libiio/IIOD over its Gigabit Ethernet interface. The USB Type-C interface is a
+UART connection and is not the RF sample transport. Discovery may use bounded
+libiio network scanning, but an explicit device URI/IP must also be supported.
 
-This placeholder prevents assumptions from one AntSDR model leaking into
+The E200 can contain an AD9361 or AD9363. The adapter must probe the RFIC and
+derive tuning and bandwidth limits from its IIO attributes rather than assuming
+the wider AD9361 ranges. Initial support is receive-only and may expose one
+channel even when the detected hardware/firmware exposes two.
+
+References:
+
+- [AntSDR E200 hardware manual](https://antsdr-docs.microphase.cn/en/latest/device_and_usage_manual/ANTSDR_E_Series_Module/ANTSDR_E200_Reference_Manual/AntsdrE200_Reference_Manual.html)
+- [AntSDR E200 RF parameters](https://antsdr-docs.microphase.cn/en/latest/device_and_usage_manual/ANTSDR_E_Series_Module/ANTSDR_E200_Reference_Manual/AntsdrE200_RF_parameters.html)
+- [libiio](https://github.com/analogdevicesinc/libiio)
+
+This adapter boundary prevents E200 assumptions from leaking into
 `wavecraft-core`, `wavecraft-sdr`, or the RF view. Network discovery, if needed
-by a selected model, belongs in this adapter and must be opt-in or bounded so a
-GUI refresh cannot block the render loop.
+by the E200, belongs in this adapter and must be opt-in or bounded so a GUI
+refresh cannot block the render loop.
 
 ## Discovery and selection flow
 
@@ -374,8 +391,8 @@ each step:
 10. Add `acquisition::radio`, `devices::radio`, and `waveform::radio` against
     simulated and recorded IQ.
 11. Implement the HackRF One adapter and opt-in hardware tests.
-12. Implement LimeSDR and AntSDR adapters independently after choosing and
-    documenting the first supported model and binding for each.
+12. Implement the LimeSDR-USB Type-A adapter with Lime Suite NG and the AntSDR
+    E200 adapter with libiio over Gigabit Ethernet as independent changes.
 
 Steps 1 through 8 are structural and should not change behavior. RF placeholder
 types may be introduced when step 9 begins; creating unused device enums or

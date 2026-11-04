@@ -82,6 +82,14 @@ native or pure-Rust hardware binding, transfer callbacks, and conversion into
 The exact binding is an internal backend decision; applications depend on the
 WaveCraft capture interface, not directly on the HackRF API.
 
+The same interface is implemented independently by `wavecraft-limesdr` for the
+LimeSDR-USB Type-A board through Lime Suite NG, and by `wavecraft-antsdr` for
+the AntSDR E200 through libiio/IIOD over Gigabit Ethernet. Provider identity,
+physical model, and connection backend are separate values: for example,
+AntSDR E200 is a model, libiio is its initial provider adapter, and network is
+its connection backend. Backend libraries never leak into core, DSP, recording,
+or GUI types.
+
 `wavecraft-dsp` owns reusable, hardware-independent processing:
 
 - complex normalization and optional DC/IQ correction;
