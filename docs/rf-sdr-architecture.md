@@ -291,11 +291,12 @@ offline results remain reproducible.
 The FSK/GFSK raw view groups the synchronized byte stream into messages at
 each repeated configured preamble. It retains a bounded message history,
 renders the newest completed message first, and distinguishes preamble bytes
-from data bytes. An in-progress raw stream is reported as receiving but is not
-inserted into the stable message list until the next preamble or capture stop
-closes it. The list can be scrolled to older retained messages, and hovering a
-row shows its full retained hexadecimal contents. A repeated preamble may span
-arbitrary IQ and demodulator batches.
+from data bytes. Each row reports the decoded data length in bytes, excluding
+the configured preamble. An in-progress raw stream is reported as receiving but
+is not inserted into the stable message list until the next preamble or capture
+stop closes it. The list can be scrolled to older retained messages, and
+hovering a row shows its full retained hexadecimal contents. A repeated
+preamble may span arbitrary IQ and demodulator batches.
 
 ### Modulation-neutral analyzer contracts
 

@@ -32,6 +32,14 @@ impl RawRadioMessage {
         &self.bytes
     }
 
+    pub fn data_bytes(&self) -> &[TimedByte] {
+        &self.bytes[self.preamble_bytes()..]
+    }
+
+    pub fn data_len(&self) -> usize {
+        self.data_bytes().len()
+    }
+
     pub fn is_complete(&self) -> bool {
         self.complete
     }
@@ -548,12 +556,12 @@ fn paint_analysis(
         format!("error · {error}")
     } else if !store.raw_messages().is_empty() {
         let completed_messages = store.completed_raw_message_count();
-        let newest_completed_bytes = store
+        let newest_completed_data_bytes = store
             .raw_messages()
             .iter()
             .rev()
             .find(|message| message.is_complete())
-            .map_or(0, |message| message.bytes().len());
+            .map_or(0, RawRadioMessage::data_len);
         let receiving = if store.raw_message_in_progress() {
             " · receiving"
         } else {
@@ -567,7 +575,7 @@ fn paint_analysis(
             )
         } else {
             format!(
-                "{completed_messages} messages · newest {newest_completed_bytes} B{receiving} · {} dropped · {} gaps",
+                "{completed_messages} messages · newest data {newest_completed_data_bytes} B{receiving} · {} dropped · {} gaps",
                 store.raw_dropped_messages(),
                 store.discontinuities()
             )
@@ -641,7 +649,7 @@ fn paint_raw_messages(
     const BYTE_CELL_WIDTH: f32 = 24.0;
     const SEQUENCE_WIDTH: f32 = 48.0;
     const SECTION_WIDTH: f32 = 38.0;
-    const STATE_WIDTH: f32 = 38.0;
+    const LENGTH_WIDTH: f32 = 76.0;
     let visible_rows = (plot.height() / ROW_HEIGHT).floor().max(1.0) as usize;
     let completed_messages = store.completed_raw_message_count();
     let maximum_scroll = completed_messages.saturating_sub(visible_rows);
@@ -693,7 +701,7 @@ fn paint_raw_messages(
         );
 
         let mut x = row_rect.left() + SEQUENCE_WIDTH;
-        let right_limit = row_rect.right() - STATE_WIDTH;
+        let right_limit = row_rect.right() - LENGTH_WIDTH;
         let preamble_bytes = message.preamble_bytes();
         paint_raw_section_label(ui, row_rect, x, "PRE", Color32::from_rgb(235, 180, 80));
         x += SECTION_WIDTH;
@@ -714,7 +722,7 @@ fn paint_raw_messages(
                 row_rect,
                 x,
                 right_limit,
-                &message.bytes()[preamble_bytes..],
+                message.data_bytes(),
                 BYTE_CELL_WIDTH,
                 Color32::from_rgb(150, 220, 255),
             );
@@ -722,12 +730,12 @@ fn paint_raw_messages(
         ui.painter().text(
             row_rect.right_center() - Vec2::new(5.0, 0.0),
             egui::Align2::RIGHT_CENTER,
-            if message.is_complete() { "" } else { "LIVE" },
-            FontId::monospace(9.0),
-            Color32::from_rgb(80, 205, 145),
+            format!("LEN {} B", message.data_len()),
+            FontId::monospace(10.0),
+            Color32::from_rgb(105, 150, 175),
         );
         let preamble = format_raw_hex(&message.bytes()[..preamble_bytes]);
-        let data = format_raw_hex(&message.bytes()[preamble_bytes..]);
+        let data = format_raw_hex(message.data_bytes());
         ui.interact(
             row_rect,
             ui.id().with(("raw_message", message.sequence())),
@@ -740,7 +748,7 @@ fn paint_raw_messages(
                     .color(Color32::from_rgb(245, 190, 90)),
             );
             ui.label(
-                egui::RichText::new(format!("DATA {data}"))
+                egui::RichText::new(format!("DATA ({} B) {data}", message.data_len()))
                     .monospace()
                     .color(Color32::from_rgb(150, 220, 255)),
             );
@@ -1522,6 +1530,7 @@ mod tests {
         assert!(store.raw_message_in_progress());
         assert_eq!(newest_first[0].sequence(), 2);
         assert_eq!(newest_first[0].preamble_bytes(), 2);
+        assert_eq!(newest_first[0].data_len(), 1);
         assert_eq!(
             newest_first[0]
                 .bytes()
@@ -1539,6 +1548,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0xaa, 0xaa, 0x12]
         );
+        assert_eq!(newest_first[1].data_len(), 1);
         assert!(newest_first[1].is_complete());
 
         store.finish_raw_capture();
