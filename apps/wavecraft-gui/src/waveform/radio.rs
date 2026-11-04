@@ -209,21 +209,50 @@ pub struct RadioViewState {
 }
 
 impl RadioViewState {
-    pub fn paint(&mut self, ui: &egui::Ui, rect: Rect, store: &RadioDisplayStore) {
+    pub fn paint(
+        &mut self,
+        ui: &egui::Ui,
+        rect: Rect,
+        store: &RadioDisplayStore,
+        analysis: &RadioAnalysisStore,
+        analysis_enabled: bool,
+    ) {
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_rgb(12, 16, 22));
         let gap = 12.0;
-        let spectrum_height = (rect.height() * 0.54).max(120.0).min(rect.height());
+        let show_analysis = analysis_enabled
+            || analysis.error().is_some()
+            || !analysis.soft_symbols().is_empty()
+            || !analysis.analog_samples().is_empty();
+        let analysis_height = if show_analysis {
+            rect.height().mul_add(0.18, 0.0).clamp(86.0, 126.0)
+        } else {
+            0.0
+        };
+        let content_bottom = if show_analysis {
+            (rect.bottom() - analysis_height - gap).max(rect.top())
+        } else {
+            rect.bottom()
+        };
+        let upper_height = (content_bottom - rect.top()).max(0.0);
+        let spectrum_height = (upper_height * 0.54).max(120.0).min(upper_height);
         let spectrum_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), spectrum_height));
         let waterfall_rect = Rect::from_min_max(
             Pos2::new(
                 rect.left(),
                 (spectrum_rect.bottom() + gap).min(rect.bottom()),
             ),
-            rect.max,
+            Pos2::new(rect.right(), content_bottom),
         );
         paint_spectrum(ui, spectrum_rect, store.newest_spectrum());
         self.paint_waterfall(ui, waterfall_rect, store);
+        if show_analysis {
+            let analysis_rect = Rect::from_min_max(
+                Pos2::new(rect.left(), (content_bottom + gap).min(rect.bottom())),
+                rect.max,
+            );
+            paint_analysis(ui, analysis_rect, analysis, analysis_enabled);
+        }
     }
 
     fn paint_waterfall(&mut self, ui: &egui::Ui, rect: Rect, store: &RadioDisplayStore) {
@@ -303,6 +332,173 @@ impl RadioViewState {
                 Color32::WHITE,
             );
         }
+    }
+}
+
+fn paint_analysis(ui: &egui::Ui, rect: Rect, store: &RadioAnalysisStore, analysis_enabled: bool) {
+    if rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return;
+    }
+    ui.painter()
+        .rect_filled(rect, 0.0, Color32::from_rgb(9, 13, 19));
+    let title_rect = Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.top() + 22.0));
+    ui.painter().text(
+        title_rect.left_center() + Vec2::new(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        "DEMODULATION",
+        FontId::proportional(12.0),
+        Color32::from_rgb(145, 160, 180),
+    );
+    let status = if let Some(error) = store.error() {
+        format!("error · {error}")
+    } else if let Some(alphabet_size) = store.soft_symbol_alphabet_size() {
+        format!(
+            "{} symbols · alphabet {} · {} dropped · {} gaps",
+            store.soft_symbols().len(),
+            alphabet_size,
+            store.dropped_items(),
+            store.discontinuities()
+        )
+    } else if let Some(sample_rate_hz) = store.analog_sample_rate_hz() {
+        format!(
+            "{} samples · {} Hz · {} dropped · {} gaps",
+            store.analog_samples().len(),
+            sample_rate_hz,
+            store.dropped_items(),
+            store.discontinuities()
+        )
+    } else if analysis_enabled {
+        "waiting for lock or symbols".to_owned()
+    } else {
+        "disabled".to_owned()
+    };
+    ui.painter().text(
+        title_rect.right_center() - Vec2::new(8.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        status,
+        FontId::proportional(10.0),
+        if store.error().is_some() {
+            Color32::LIGHT_RED
+        } else {
+            Color32::from_rgb(105, 120, 140)
+        },
+    );
+    let plot = Rect::from_min_max(
+        Pos2::new(rect.left() + 8.0, title_rect.bottom() + 3.0),
+        Pos2::new(rect.right() - 8.0, rect.bottom() - 7.0),
+    );
+    if plot.width() <= 1.0 || plot.height() <= 1.0 || store.error().is_some() {
+        return;
+    }
+    if !store.soft_symbols().is_empty() {
+        paint_soft_symbols(ui, plot, store);
+    } else if !store.analog_samples().is_empty() {
+        paint_analog_samples(ui, plot, store);
+    } else {
+        ui.painter().text(
+            plot.center(),
+            egui::Align2::CENTER_CENTER,
+            if analysis_enabled {
+                "Waiting for demodulator output"
+            } else {
+                "Enable Signal analyzer in Capture Setup"
+            },
+            FontId::proportional(12.0),
+            Color32::from_rgb(105, 120, 140),
+        );
+    }
+}
+
+fn paint_soft_symbols(ui: &egui::Ui, plot: Rect, store: &RadioAnalysisStore) {
+    const MAX_VISIBLE_SYMBOLS: usize = 512;
+    let skip = store
+        .soft_symbols()
+        .len()
+        .saturating_sub(MAX_VISIBLE_SYMBOLS);
+    let symbols = store.soft_symbols().iter().skip(skip).collect::<Vec<_>>();
+    let Some(first) = symbols.first() else {
+        return;
+    };
+    let Some(last) = symbols.last() else {
+        return;
+    };
+    let start = first.source_range.start;
+    let span = last.source_range.end.saturating_sub(start).max(1) as f64;
+    for symbol in symbols {
+        let left = plot.left()
+            + plot.width()
+                * ((symbol.source_range.start.saturating_sub(start) as f64 / span) as f32);
+        let right = plot.left()
+            + plot.width() * ((symbol.source_range.end.saturating_sub(start) as f64 / span) as f32);
+        let symbol_rect = Rect::from_min_max(
+            Pos2::new(left, plot.top()),
+            Pos2::new(right.max(left + 1.0), plot.bottom()),
+        )
+        .intersect(plot);
+        let decision = symbol.decision().unwrap_or(0);
+        let confidence = symbol.confidence().unwrap_or(0.0).clamp(0.0, 1.0);
+        let base = if decision % 2 == 0 {
+            Color32::from_rgb(70, 135, 230)
+        } else {
+            Color32::from_rgb(70, 205, 145)
+        };
+        ui.painter().rect_filled(
+            symbol_rect,
+            1.0,
+            base.gamma_multiply(0.25 + 0.7 * confidence),
+        );
+        ui.painter().line_segment(
+            [symbol_rect.left_top(), symbol_rect.left_bottom()],
+            Stroke::new(1.0_f32, Color32::from_rgb(25, 35, 48)),
+        );
+        if symbol_rect.width() >= 12.0 {
+            ui.painter().text(
+                symbol_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                decision.to_string(),
+                FontId::monospace(10.0),
+                Color32::WHITE,
+            );
+        }
+    }
+}
+
+fn paint_analog_samples(ui: &egui::Ui, plot: Rect, store: &RadioAnalysisStore) {
+    const MAX_VISIBLE_SAMPLES: usize = 2_048;
+    let skip = store
+        .analog_samples()
+        .len()
+        .saturating_sub(MAX_VISIBLE_SAMPLES);
+    let samples = store.analog_samples().iter().skip(skip).collect::<Vec<_>>();
+    let Some(first) = samples.first() else {
+        return;
+    };
+    let Some(last) = samples.last() else {
+        return;
+    };
+    let start = first.source_range.start;
+    let span = last.source_range.end.saturating_sub(start).max(1) as f64;
+    let points = samples
+        .into_iter()
+        .map(|sample| {
+            let center = sample.source_range.start.saturating_add(
+                sample
+                    .source_range
+                    .end
+                    .saturating_sub(sample.source_range.start)
+                    / 2,
+            );
+            let x =
+                plot.left() + plot.width() * ((center.saturating_sub(start) as f64 / span) as f32);
+            let y = egui::lerp(plot.y_range(), (1.0 - sample.value.clamp(-1.0, 1.0)) * 0.5);
+            Pos2::new(x, y)
+        })
+        .collect::<Vec<_>>();
+    if points.len() > 1 {
+        ui.painter().with_clip_rect(plot).add(egui::Shape::line(
+            points,
+            Stroke::new(1.35_f32, Color32::from_rgb(75, 225, 170)),
+        ));
     }
 }
 
@@ -596,5 +792,44 @@ mod tests {
         assert_eq!(store.soft_symbol_alphabet_size(), None);
         assert_eq!(store.analog_samples().len(), 1);
         assert_eq!(store.analog_sample_rate_hz(), Some(48_000));
+    }
+
+    #[test]
+    fn radio_view_renders_soft_symbol_analysis_lane() {
+        let context = egui::Context::default();
+        let mut display = RadioDisplayStore::new(4).unwrap();
+        display.ingest(frame(0, 100_000_000));
+        let mut analysis = RadioAnalysisStore::new(4).unwrap();
+        analysis
+            .ingest(DemodulatedBatch::SoftSymbols(TimedSoftSymbolBatch {
+                alphabet_size: 2,
+                discontinuity: false,
+                symbols: vec![
+                    TimedSoftSymbol {
+                        likelihoods: vec![0.9, 0.1],
+                        source_range: 0..8,
+                    },
+                    TimedSoftSymbol {
+                        likelihoods: vec![0.1, 0.9],
+                        source_range: 8..16,
+                    },
+                ],
+            }))
+            .unwrap();
+        let mut view = RadioViewState::default();
+
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                view.paint(
+                    ui,
+                    ui.available_rect_before_wrap(),
+                    &display,
+                    &analysis,
+                    true,
+                );
+            });
+        });
+
+        assert!(!output.shapes.is_empty());
     }
 }

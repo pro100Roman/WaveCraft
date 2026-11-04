@@ -9710,7 +9710,13 @@ impl eframe::App for WaveCraftApp {
                             |ui, rect| {
                                 self.radio_view
                                     .borrow_mut()
-                                    .paint(ui, rect, &waveforms.radio);
+                                    .paint(
+                                        ui,
+                                        rect,
+                                        &waveforms.radio,
+                                        &waveforms.radio_analysis,
+                                        self.radio_settings.analyzer.enabled,
+                                    );
                             },
                         ));
                     }
