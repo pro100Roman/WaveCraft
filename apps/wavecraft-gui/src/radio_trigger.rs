@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::time::Duration;
 
-use wavecraft_core::{CaptureBatch, CaptureFrame, IqBatch};
+use wavecraft_core::{CaptureBatch, CaptureFrame};
 use wavecraft_dsp::{
     SpectrumPowerTrigger, SpectrumPowerTriggerConfig, SpectrumPowerTriggerEvent, SpectrumWindow,
 };
@@ -11,7 +11,6 @@ use wavecraft_dsp::{
 pub struct RadioSingleTriggerConfig {
     pub threshold_dbfs: f32,
     pub pretrigger_samples: u64,
-    pub posttrigger_samples: u64,
     pub fft_length: usize,
     pub iq_correction_enabled: bool,
 }
@@ -27,19 +26,12 @@ pub struct RadioSingleTrigger {
     detector: SpectrumPowerTrigger,
     pretrigger: VecDeque<CaptureFrame>,
     pretrigger_samples: u64,
-    posttrigger_samples: u64,
     retained_samples: u64,
-    target_end_sample: Option<u64>,
     complete: bool,
 }
 
 impl RadioSingleTrigger {
     pub fn new(config: RadioSingleTriggerConfig) -> Result<Self, String> {
-        if config.posttrigger_samples == 0 {
-            return Err(
-                "RF trigger post-trigger sample count must be greater than zero".to_owned(),
-            );
-        }
         Ok(Self {
             detector: SpectrumPowerTrigger::new(SpectrumPowerTriggerConfig {
                 fft_length: config.fft_length,
@@ -49,9 +41,7 @@ impl RadioSingleTrigger {
             })?,
             pretrigger: VecDeque::new(),
             pretrigger_samples: config.pretrigger_samples,
-            posttrigger_samples: config.posttrigger_samples,
             retained_samples: 0,
-            target_end_sample: None,
             complete: false,
         })
     }
@@ -65,19 +55,6 @@ impl RadioSingleTrigger {
                 frames: Vec::new(),
                 event: None,
                 complete: true,
-            });
-        }
-
-        if let Some(target_end_sample) = self.target_end_sample {
-            let frame_end = iq_end(iq)?;
-            let frames = trim_frame(frame, 0..target_end_sample)
-                .into_iter()
-                .collect();
-            self.complete = frame_end >= target_end_sample;
-            return Ok(RadioSingleTriggerOutput {
-                frames,
-                event: None,
-                complete: self.complete,
             });
         }
 
@@ -98,17 +75,13 @@ impl RadioSingleTrigger {
             .source_range
             .start
             .saturating_sub(self.pretrigger_samples);
-        let target_end_sample = event
-            .source_range
-            .start
-            .saturating_add(self.posttrigger_samples);
-        let frame_end = iq_end(iq)?;
+        let retain_end = event.source_range.end;
         let mut frames = self
             .pretrigger
             .drain(..)
-            .filter_map(|queued| trim_frame(queued, retain_start..target_end_sample))
+            .filter_map(|queued| trim_frame(queued, retain_start..retain_end))
             .collect::<Vec<_>>();
-        if let Some(frame) = trim_frame(frame, retain_start..target_end_sample) {
+        if let Some(frame) = trim_frame(frame, retain_start..retain_end) {
             frames.push(frame);
         }
         if let Some(CaptureFrame {
@@ -119,10 +92,7 @@ impl RadioSingleTrigger {
             iq.discontinuity = true;
         }
         self.retained_samples = 0;
-        self.complete = frame_end >= target_end_sample;
-        if !self.complete {
-            self.target_end_sample = Some(target_end_sample);
-        }
+        self.complete = true;
         Ok(RadioSingleTriggerOutput {
             frames,
             event: Some(event),
@@ -131,7 +101,7 @@ impl RadioSingleTrigger {
     }
 
     pub fn is_armed(&self) -> bool {
-        self.target_end_sample.is_none() && !self.complete
+        !self.complete
     }
 
     pub fn set_threshold_dbfs(&mut self, threshold_dbfs: f32) -> Result<(), String> {
@@ -181,14 +151,6 @@ fn iq_sample_count(frame: &CaptureFrame) -> Result<u64, String> {
     u64::try_from(iq.samples.len()).map_err(|_| "IQ frame is too large".to_owned())
 }
 
-fn iq_end(iq: &IqBatch) -> Result<u64, String> {
-    let samples =
-        u64::try_from(iq.samples.len()).map_err(|_| "IQ frame is too large".to_owned())?;
-    iq.first_sample_index
-        .checked_add(samples)
-        .ok_or_else(|| "IQ sample range overflowed".to_owned())
-}
-
 fn trim_frame(mut frame: CaptureFrame, keep: Range<u64>) -> Option<CaptureFrame> {
     let CaptureBatch::Iq(iq) = &mut frame.payload else {
         return None;
@@ -214,7 +176,7 @@ fn trim_frame(mut frame: CaptureFrame, keep: Range<u64>) -> Option<CaptureFrame>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wavecraft_core::{DeviceId, Iq8};
+    use wavecraft_core::{DeviceId, Iq8, IqBatch};
 
     const SAMPLE_RATE_HZ: u64 = 8_000;
     const CENTER_FREQUENCY_HZ: u64 = 868_500_000;
@@ -223,7 +185,6 @@ mod tests {
         RadioSingleTrigger::new(RadioSingleTriggerConfig {
             threshold_dbfs: -10.0,
             pretrigger_samples: 8,
-            posttrigger_samples: 12,
             fft_length: 8,
             iq_correction_enabled: false,
         })
@@ -268,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn waits_then_flushes_pretrigger_and_completes_after_posttrigger() {
+    fn freezes_on_trigger_and_discards_the_remaining_iq() {
         let mut trigger = trigger();
         let waiting = trigger.push(iq_frame(0, quiet(8))).unwrap();
         assert!(waiting.frames.is_empty());
@@ -281,16 +242,15 @@ mod tests {
             fired.frames.iter().map(range).collect::<Vec<_>>(),
             [0..8, 8..16]
         );
-        assert!(!fired.complete);
+        assert!(fired.complete);
         let CaptureBatch::Iq(first) = &fired.frames[0].payload else {
             unreachable!();
         };
         assert!(first.discontinuity);
 
-        let complete = trigger.push(iq_frame(16, quiet(8))).unwrap();
-        assert_eq!(complete.frames.len(), 1);
-        assert_eq!(range(&complete.frames[0]), 16..20);
-        assert!(complete.complete);
+        let discarded = trigger.push(iq_frame(16, quiet(8))).unwrap();
+        assert!(discarded.frames.is_empty());
+        assert!(discarded.complete);
     }
 
     #[test]
@@ -309,14 +269,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_posttrigger_length() {
-        let result = RadioSingleTrigger::new(RadioSingleTriggerConfig {
-            threshold_dbfs: -10.0,
-            pretrigger_samples: 8,
-            posttrigger_samples: 0,
-            fft_length: 8,
-            iq_correction_enabled: false,
-        });
-        assert!(result.is_err());
+    fn trims_the_triggering_input_after_the_trigger_fft_window() {
+        let mut trigger = trigger();
+
+        let output = trigger
+            .push(iq_frame(0, [tone(8), quiet(8)].concat()))
+            .unwrap();
+
+        assert!(output.complete);
+        assert_eq!(output.frames.len(), 1);
+        assert_eq!(range(&output.frames[0]), 0..8);
     }
 }

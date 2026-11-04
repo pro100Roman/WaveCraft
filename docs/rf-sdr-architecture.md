@@ -253,10 +253,11 @@ RF **Single** capture has an explicit duration stored in milliseconds and
 displayed in seconds. Without a trigger, the application derives its exact
 sample limit from the selected sample rate and duration. With **Wait for
 trigger** enabled, the source remains active until the spectrum-power trigger
-fires, then retains the configured Single duration after the trigger. A bounded
-0–1000 ms IQ ring supplies the requested pre-trigger history. Only the retained
-pre-trigger and post-trigger interval is committed to the display, analyzers,
-and recording; the live armed spectrum is a preview. **Run** remains continuous.
+fires, then freezes immediately. A bounded 0–1000 ms IQ ring supplies the
+requested pre-trigger history. Only that history and the FFT window which
+crossed the threshold are committed to the display, analyzers, and recording;
+the remainder of the current IQ block and queued later blocks are discarded.
+The live armed spectrum is a preview. **Run** remains continuous.
 
 The spectrum exposes a persisted RF trigger-level threshold in dBFS as a red
 `T` marker on the right edge, matching the oscilloscope trigger-level affordance.

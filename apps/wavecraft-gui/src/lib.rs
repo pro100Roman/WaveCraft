@@ -7868,10 +7868,6 @@ fn radio_single_trigger_config(
             settings.capture.sample_rate_hz,
             settings.trigger_pretrigger_millis,
         )?,
-        posttrigger_samples: radio_single_sample_limit(
-            settings.capture.sample_rate_hz,
-            settings.single_duration_millis,
-        )?,
         fft_length: RADIO_SPECTRUM_FFT_LENGTH,
         iq_correction_enabled: settings.iq_correction_enabled,
     })
@@ -8558,7 +8554,7 @@ fn paint_radio_receive_configuration(
                 ui,
                 "Single duration",
                 Some(
-                    "Capture time used by RF Single; with trigger enabled, this is the time retained after the trigger",
+                    "Capture time used by RF Single when Wait for trigger is disabled; a triggered Single freezes immediately",
                 ),
             );
             ui.add_enabled_ui(enabled, |ui| {
@@ -8589,7 +8585,7 @@ fn paint_radio_receive_configuration(
                 ui,
                 "Wait for trigger",
                 Some(
-                    "In RF Single mode, wait indefinitely until the spectrum peak reaches the trigger level",
+                    "In RF Single mode, wait until the spectrum peak reaches the trigger level, then freeze immediately and discard later IQ",
                 ),
             );
             ui.add_enabled_ui(enabled, |ui| {
@@ -16939,16 +16935,14 @@ mod tests {
     }
 
     #[test]
-    fn radio_single_trigger_derives_bounded_pre_and_posttrigger_samples() {
+    fn radio_single_trigger_derives_bounded_pretrigger_samples() {
         let mut settings = RadioSettings::default();
         settings.capture.sample_rate_hz = 10_000_000;
-        settings.single_duration_millis = 250;
         settings.trigger_pretrigger_millis = 10;
 
         let config = radio_single_trigger_config(&settings).unwrap();
 
         assert_eq!(config.pretrigger_samples, 100_000);
-        assert_eq!(config.posttrigger_samples, 2_500_000);
         assert_eq!(config.fft_length, RADIO_SPECTRUM_FFT_LENGTH);
     }
 
@@ -17946,7 +17940,6 @@ mod tests {
         let mut trigger = RadioSingleTrigger::new(RadioSingleTriggerConfig {
             threshold_dbfs: -120.0,
             pretrigger_samples: 0,
-            posttrigger_samples: 4_096,
             fft_length: RADIO_SPECTRUM_FFT_LENGTH,
             iq_correction_enabled: true,
         })
@@ -17981,7 +17974,7 @@ mod tests {
         session
             .stop()
             .expect("triggered HackRF capture should stop");
-        assert_eq!(retained_samples, 4_096);
+        assert_eq!(retained_samples, RADIO_SPECTRUM_FFT_LENGTH);
     }
 
     #[test]
