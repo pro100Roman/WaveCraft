@@ -7919,6 +7919,13 @@ fn radio_trigger_level_controls_are_enabled(
     capture_settings_enabled || trigger_runtime_enabled
 }
 
+fn radio_trigger_level_runtime_controls_are_enabled(
+    run_runtime_enabled: bool,
+    single_trigger_runtime_enabled: bool,
+) -> bool {
+    run_runtime_enabled || single_trigger_runtime_enabled
+}
+
 fn hackrf_runtime_settings(settings: &RadioSettings) -> Result<HackRfRuntimeSettings, String> {
     Ok(HackRfRuntimeSettings {
         center_frequency_hz: settings.capture.center_frequency_hz,
@@ -8686,7 +8693,7 @@ fn paint_radio_receive_configuration(
                     "Peak FFT-bin power threshold used by RF Single when Wait for trigger is enabled. After an FSK/GFSK preamble locks, the same level acts as squelch inside the configured analyzer channel and closes RAW data when the RF burst ends. Also represented by the draggable T marker",
                 ),
             );
-            ui.add_enabled_ui(enabled || trigger_runtime_enabled, |ui| {
+            ui.add_enabled_ui(enabled || runtime_enabled || trigger_runtime_enabled, |ui| {
                 ui.horizontal(|ui| {
                     let mut level_dbfs = f64::from(settings.trigger_level_dbfs_tenths) / 10.0;
                     if add_left_aligned_sized(
@@ -9093,9 +9100,14 @@ impl eframe::App for WaveCraftApp {
                     .as_ref()
                     .is_some_and(RadioSingleTrigger::is_armed)
         });
+        let radio_trigger_level_runtime_controls_enabled =
+            radio_trigger_level_runtime_controls_are_enabled(
+                radio_runtime_controls_enabled,
+                radio_trigger_runtime_controls_enabled,
+            );
         let rf_trigger_level_controls_enabled = radio_trigger_level_controls_are_enabled(
             capture_settings_enabled,
-            radio_trigger_runtime_controls_enabled,
+            radio_trigger_level_runtime_controls_enabled,
         );
         let radio_settings_before_ui = self.radio_settings.clone();
         let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
@@ -10382,7 +10394,7 @@ impl eframe::App for WaveCraftApp {
                         ui.add_space(8.0);
                         ui.small(
                             RichText::new(if radio_runtime_controls_enabled {
-                        "Device, sample-rate, IQ-correction, and antenna-power settings remain locked; tuning, frequency correction, and gain controls are live"
+                        "Device, sample-rate, IQ-correction, and antenna-power settings remain locked; tuning, frequency correction, gains, and RF trigger level are live"
                             } else if radio_trigger_runtime_controls_enabled {
                                 "Settings remain locked while RF Single waits; RF trigger level and Post-trigger are live"
                             } else {
@@ -17044,7 +17056,16 @@ mod tests {
     }
 
     #[test]
-    fn radio_trigger_level_stays_editable_while_single_is_armed() {
+    fn radio_trigger_level_stays_editable_during_run_and_while_single_is_armed() {
+        assert!(radio_trigger_level_runtime_controls_are_enabled(
+            true, false
+        ));
+        assert!(radio_trigger_level_runtime_controls_are_enabled(
+            false, true
+        ));
+        assert!(!radio_trigger_level_runtime_controls_are_enabled(
+            false, false
+        ));
         assert!(radio_trigger_level_controls_are_enabled(false, true));
         assert!(radio_trigger_level_controls_are_enabled(true, false));
         assert!(!radio_trigger_level_controls_are_enabled(false, false));

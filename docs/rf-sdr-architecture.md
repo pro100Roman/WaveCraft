@@ -271,7 +271,9 @@ Single trigger. After raw FSK/GFSK acquisition locks to its preamble, the same
 threshold also acts as a burst squelch over only the configured analyzer channel
 bandwidth. Falling below it closes and resets the raw message instead of decoding
 the following noise as payload. Channel-integrated power, hysteresis, and
-minimum-duration qualification remain future refinements.
+minimum-duration qualification remain future refinements. The RF trigger-level
+field and spectrum `T` marker remain editable during continuous **Run**, so the
+squelch boundary changes without restarting capture.
 
 ## Signal-decoder stack
 
@@ -300,6 +302,11 @@ is not inserted into the stable message list until the next preamble or capture
 stop closes it. The list can be scrolled to older retained messages, and
 hovering a row shows its full retained hexadecimal contents. A repeated
 preamble may span arbitrary IQ and demodulator batches.
+
+The RF view labels this modulation-neutral output pane **RAW DATA**. Horizontal
+drag handles make the RF SPECTRUM, WATERFALL, and RAW DATA heights adjustable.
+RAW DATA exposes both wheel scrolling and a draggable vertical scrollbar for
+older retained messages.
 
 ### Modulation-neutral analyzer contracts
 
