@@ -5,8 +5,9 @@ spectrum DSP/display store, simulator, SDR facade, and receive-only HackRF One
 adapter are implemented. Channelization and the binary FSK/GFSK demodulator are
 also implemented, including bounded streaming GFSK matched filtering with
 configurable BT and adaptive symbol timing with bounded clock-error tracking.
-GUI analyzer configuration and rendering of timed soft bits remain to be wired
-into the live and recorded IQ paths.
+A stable-ID demodulator registry exposes typed FSK/GFSK factories without
+making them the top-level architecture. GUI analyzer configuration and
+rendering of timed soft symbols remain to be wired into live and recorded IQ.
 
 WaveCraft treats HackRF as the first backend for a generic radio-receiver
 instrument, not as a GUI-specific feature. The backend produces ordered raw IQ
@@ -293,6 +294,13 @@ pub trait Demodulator {
 Concrete blocks may use narrower internal types for efficiency. The public
 contract must report discontinuities and must never silently coerce analog or
 multi-symbol modulation into binary bits.
+
+An in-process registry selects factories by stable IDs such as `fsk2` and
+`gfsk2`. Each descriptor declares its output family and alphabet size, while
+the factory accepts only its modulation-specific typed configuration. Duplicate
+IDs and mismatched configuration types are rejected. Additional digital or
+analog factories can register without changing the channelized input or
+demodulated output contracts.
 
 ### Reusable signal profiles
 
@@ -586,8 +594,8 @@ only deterministic simulation and recorded fixtures.
    streaming with opt-in hardware tests.
 6. Add channelization, modulation-neutral timed-symbol contracts, reusable
    synchronization, and built-in 2-FSK/GFSK decoding.
-7. Add pluggable-demodulator registration and analog-stream contracts before
-   expanding to additional digital and analog modulation families.
+7. Wire the pluggable-demodulator registry and tagged profiles into the GUI and
+   recording path before expanding to additional modulation families.
 8. Add bit transforms, packet framing, CRC diagnostics, and packet inspection
    in the GUI/CLI.
 9. Generalize the custom-protocol input contract in a new schema version and

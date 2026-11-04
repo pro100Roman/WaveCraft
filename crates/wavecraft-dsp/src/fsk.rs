@@ -1,8 +1,9 @@
 use crate::{
-    ChannelizedBatch, DemodulatedBatch, Demodulator, DspError, SymbolTimingRecovery,
-    TimedComplexSample, TimedScalarSample, TimedSoftSymbol, TimedSoftSymbolBatch,
-    TimingRecoveryConfig,
+    ChannelizedBatch, DemodulatedBatch, Demodulator, DemodulatorDescriptor, DemodulatorFactory,
+    DemodulatorOutputKind, DemodulatorRegistry, DspError, SymbolTimingRecovery, TimedComplexSample,
+    TimedScalarSample, TimedSoftSymbol, TimedSoftSymbolBatch, TimingRecoveryConfig,
 };
+use std::any::Any;
 use std::collections::VecDeque;
 use std::f64::consts::PI;
 use std::f64::consts::TAU;
@@ -10,6 +11,9 @@ use std::ops::Range;
 
 const GFSK_FILTER_SPAN_SYMBOLS: u64 = 4;
 const MAX_GFSK_FILTER_TAPS: usize = 4_095;
+
+pub const BINARY_FSK_DEMODULATOR_ID: &str = "fsk2";
+pub const BINARY_GFSK_DEMODULATOR_ID: &str = "gfsk2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FskPolarity {
@@ -398,6 +402,73 @@ impl Demodulator for FskDemodulator {
             symbols,
         }))
     }
+}
+
+#[derive(Clone, Copy)]
+enum BinaryFskKind {
+    Fsk,
+    Gfsk,
+}
+
+struct BinaryFskFactory {
+    descriptor: DemodulatorDescriptor,
+    kind: BinaryFskKind,
+}
+
+impl BinaryFskFactory {
+    fn new(id: &str, display_name: &str, kind: BinaryFskKind) -> Self {
+        Self {
+            descriptor: DemodulatorDescriptor {
+                id: id.to_owned(),
+                display_name: display_name.to_owned(),
+                output: DemodulatorOutputKind::SoftSymbols { alphabet_size: 2 },
+            },
+            kind,
+        }
+    }
+}
+
+impl DemodulatorFactory for BinaryFskFactory {
+    fn descriptor(&self) -> &DemodulatorDescriptor {
+        &self.descriptor
+    }
+
+    fn create(&self, config: &dyn Any) -> Result<Box<dyn Demodulator>, DspError> {
+        let config = config.downcast_ref::<FskConfig>().ok_or_else(|| {
+            DspError::new(format!(
+                "demodulator '{}' requires FskConfig",
+                self.descriptor.id
+            ))
+        })?;
+        let modulation_matches = matches!(
+            (self.kind, config.modulation),
+            (BinaryFskKind::Fsk, FskModulation::Fsk)
+                | (BinaryFskKind::Gfsk, FskModulation::Gfsk { .. })
+        );
+        if !modulation_matches {
+            return Err(DspError::new(format!(
+                "demodulator '{}' does not match the configured FSK modulation",
+                self.descriptor.id
+            )));
+        }
+        Ok(Box::new(FskDemodulator::new(config.clone())?))
+    }
+}
+
+pub(crate) fn register_builtin_fsk_demodulators(
+    registry: &mut DemodulatorRegistry,
+) -> Result<(), DspError> {
+    registry.register(BinaryFskFactory::new(
+        BINARY_FSK_DEMODULATOR_ID,
+        "Binary FSK",
+        BinaryFskKind::Fsk,
+    ))?;
+    registry.register(BinaryFskFactory::new(
+        BINARY_GFSK_DEMODULATOR_ID,
+        "Binary GFSK",
+        BinaryFskKind::Gfsk,
+    ))?;
+    Ok(())
 }
 
 fn gaussian_filter_tap_count(sample_rate_hz: u64, symbol_rate_hz: u64) -> Result<usize, DspError> {

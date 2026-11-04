@@ -3,6 +3,7 @@
 mod channelizer;
 mod demodulation;
 mod fsk;
+mod registry;
 mod timing;
 
 pub use channelizer::{ChannelizedBatch, Channelizer, ChannelizerConfig, TimedComplexSample};
@@ -10,7 +11,13 @@ pub use demodulation::{
     DemodulatedBatch, Demodulator, TimedAnalogBatch, TimedAnalogSample, TimedSoftSymbol,
     TimedSoftSymbolBatch, MAX_SOFT_SYMBOL_ALPHABET_SIZE,
 };
-pub use fsk::{FskConfig, FskDemodulator, FskModulation, FskPolarity, FskTiming, TimedSoftBit};
+pub use fsk::{
+    FskConfig, FskDemodulator, FskModulation, FskPolarity, FskTiming, TimedSoftBit,
+    BINARY_FSK_DEMODULATOR_ID, BINARY_GFSK_DEMODULATOR_ID,
+};
+pub use registry::{
+    DemodulatorDescriptor, DemodulatorFactory, DemodulatorOutputKind, DemodulatorRegistry,
+};
 pub use timing::{RecoveredSymbol, SymbolTimingRecovery, TimedScalarSample, TimingRecoveryConfig};
 
 use std::collections::VecDeque;
