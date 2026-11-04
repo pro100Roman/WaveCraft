@@ -7771,12 +7771,7 @@ fn paint_radio_capture_settings(
                 .gains_db
                 .entry(control.id.clone())
                 .or_insert(control.default_db);
-            let label = if control.help.is_some() {
-                format!("{} ⓘ", control.label)
-            } else {
-                control.label.clone()
-            };
-            let label_response = ui.label(RichText::new(label).small().color(TEXT_MUTED));
+            let label_response = ui.label(RichText::new(&control.label).small().color(TEXT_MUTED));
             if let Some(help) = &control.help {
                 label_response.on_hover_text(help);
             }
