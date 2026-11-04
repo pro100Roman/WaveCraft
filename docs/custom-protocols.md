@@ -226,7 +226,13 @@ rather than silently dropping it.
 ## YAML protocol files
 
 The recommended filename is `<name>.wavecraft-protocol.yaml`. The root `schema`
-field is required and controls compatibility:
+field is required and controls compatibility.
+
+The complete authoring guide, including every accepted field, type, default,
+constraint, capability, and current limitation, is the
+[Custom protocol YAML reference](custom-protocol-yaml.md). That reference
+describes the implemented `wavecraft.protocol/v1` loader; this document focuses
+on architecture and future direction.
 
 The complete copyable example is
 [`examples/motor-controller.wavecraft-protocol.yaml`](examples/motor-controller.wavecraft-protocol.yaml).
@@ -361,39 +367,38 @@ Version 1 supports these bounded strategies:
 - `length_field` reads a bounded integer at a fixed offset and computes total
   frame bytes as `decoded_length + adjustment`.
 
-Every strategy requires or derives `max_frame_bytes`. The engine rejects a
-schema whose maximum exceeds the application limit. At runtime an overlong,
-unterminated, or impossible frame emits a diagnostic, releases buffered data,
-and follows the declared resynchronization rule. The parser distinguishes an
+Every strategy requires, defaults, or derives a maximum frame size. The engine
+rejects a schema whose maximum exceeds the application limit. Stream-framing
+strategies diagnose overlong or impossible frames and apply their documented
+recovery behavior. A plain `transport_transaction` trusts the transaction
+boundary supplied by the transport decoder. The parser distinguishes an
 incomplete final frame from an invalid complete frame.
 
 For `length_field`, `sync` is optional. When present, the framer searches for
-that sequence before reading the length. `resync: next_sync` discards input up
-to the next candidate sequence after an invalid length or failed parse. The
+that sequence before reading the length. After an invalid length,
+`resync: next_sync` advances and searches for the next candidate sequence. The
 schema compiler validates that the length bytes fit within the prefix needed
 to determine a frame.
 
 ### Message selection and fields
 
-Messages are evaluated in document order. A `match` clause contains bounded
-checks against fixed byte offsets and transport attributes. At most one message
-may match. Schema validation rejects identical match clauses, and runtime
-ambiguity produces a diagnostic rather than silently selecting a message.
+All message definitions are tested. A `match` clause contains bounded checks
+against fixed byte offsets. At most one message may match. Schema validation
+rejects identical match clauses, and runtime ambiguity produces a diagnostic
+rather than silently selecting a message.
 One message may be declared as the default for otherwise unmatched frames.
 
-Version 1 field types are:
+The implemented version 1 field types are:
 
 - `u8`, `s8`, `u16le`, `u16be`, `s16le`, `s16be`, `u32le`, `u32be`, `s32le`,
   and `s32be`;
 - fixed-size `bytes` and UTF-8 or ASCII `string`;
-- bounded arrays whose count references an earlier integer field;
 - enums over integer fields; and
 - named bit fields over integer fields.
 
-Fields are read sequentially. A field may be conditional on an equality check
-against an earlier scalar or a transport attribute. Version 1 does not expose
-a general-purpose expression language. Size, count, and conditional references
-must point backwards, be type-compatible, and be resolved by schema validation.
+Fields are fixed-size and read sequentially from byte zero. The implemented
+version 1 format does not support arrays, conditional fields, transport-
+attribute matching, or a general-purpose expression language.
 Unsigned integer fields may specify a `mask`; the decoder applies it to the
 field value used by expectations, enums, display text, and summaries. Named
 `bits` are still decoded from the unmasked wire value, so a flag may be split

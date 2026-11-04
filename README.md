@@ -392,6 +392,10 @@ same method, live status/progress callbacks, and structured exceptions. See
 - `apps/wavecraft-cli`: simultaneous-capture development harness.
 - `apps/wavecraft-gui`: native device selection, capture controls, status, and waveform rendering.
 - `docs/architecture.md`: design constraints and planned hardware integration.
+- `docs/custom-protocol-yaml.md`: complete authoring reference for custom
+  UART, SPI, and I2C protocol YAML files.
+- `docs/custom-protocols.md`: custom protocol decoding architecture and future
+  direction.
 - `docs/recording-format.md`: native `.dsv` framing and Saleae interoperability.
 - `docs/automation-and-mcp.md`: proposed CLI, service, SCPI, Saleae API, and MCP automation architecture.
 - `docs/saleae-logic-device-support.md`: feasibility and integration paths for Saleae Logic devices (excluding Logic MSO).
