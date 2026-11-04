@@ -7648,12 +7648,20 @@ fn paint_radio_mhz_control(
     }
 }
 
-fn paint_radio_bandwidth_control(ui: &mut egui::Ui, value: &mut u64, domain: &ValueDomain) {
-    ui.label(
+fn paint_radio_bandwidth_control(
+    ui: &mut egui::Ui,
+    value: &mut u64,
+    domain: &ValueDomain,
+    help: Option<&str>,
+) {
+    let label_response = ui.label(
         RichText::new("Baseband bandwidth")
             .small()
             .color(TEXT_MUTED),
     );
+    if let Some(help) = help {
+        label_response.on_hover_text(help);
+    }
     let editor_size = radio_edit_field_size(ui);
     ui.horizontal(|ui| {
         match domain {
@@ -7713,7 +7721,9 @@ fn paint_radio_capture_settings(
             &mut settings.capture.center_frequency_hz,
             &radio.capabilities.frequency_hz,
             true,
-            None,
+            (radio.provider == RadioProvider::HackRf).then_some(
+                "Tunes the frequency at the center of the RF spectrum and waterfall. HackRF One range: 1 MHz–6 GHz. This can be changed while capture is running.",
+            ),
         );
     });
     ui.add_space(4.0);
@@ -7725,7 +7735,7 @@ fn paint_radio_capture_settings(
             &radio.capabilities.sample_rates_hz,
             true,
             (radio.provider == RadioProvider::HackRf).then_some(
-                "Supported range: 2–20 MHz. Step: 1 Hz (0.000001 MHz). HackRF supports any whole-Hz value in this range; 8 MHz or higher is recommended.",
+                "Sets the I/Q sampling rate and the captured RF frequency span. Supported range: 2–20 MHz. Step: 1 Hz (0.000001 MHz). HackRF supports any whole-Hz value in this range; 8 MHz or higher is recommended.",
             ),
         );
     });
@@ -7735,6 +7745,9 @@ fn paint_radio_capture_settings(
             ui,
             &mut settings.capture.bandwidth_hz,
             &radio.capabilities.bandwidths_hz,
+            (radio.provider == RadioProvider::HackRf).then_some(
+                "Selects the HackRF analog baseband low-pass filter width. A narrower filter rejects more out-of-band noise and interference. Keep it at or below the sample rate to limit aliasing.",
+            ),
         );
     });
     if settings.capture.bandwidth_hz > settings.capture.sample_rate_hz {
