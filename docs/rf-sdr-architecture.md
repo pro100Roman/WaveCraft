@@ -415,6 +415,12 @@ explicit estimation tool; it must not silently change a saved decoder profile.
 Four-level FSK is also later work because it requires multi-threshold symbol
 decisions and a symbol-to-bit mapping rather than the binary slicer.
 
+For the implemented binary 2-FSK and GFSK profiles, one symbol carries exactly
+one raw bit. The GUI therefore presents this setting as **Bit rate** in bit/s,
+while the modulation-neutral DSP profile retains the `symbol_rate_hz` name.
+Those values are identical for the current binary modes but will differ for a
+future M-FSK profile that maps multiple bits to each symbol.
+
 ### Symbol timing and soft symbols
 
 The discriminator stream passes through matched filtering and clock recovery.

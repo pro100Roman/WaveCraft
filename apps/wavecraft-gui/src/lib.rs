@@ -8084,14 +8084,18 @@ fn paint_radio_analyzer_configuration(
             ui.end_row();
 
             let processing_rate_khz = settings.output_sample_rate_hz as f64 / 1_000.0;
-            paint_radio_parameter_label(ui, "Symbol rate", Some("Configured symbol clock"));
+            paint_radio_parameter_label(
+                ui,
+                "Bit rate",
+                Some("Raw bit rate for binary FSK/GFSK; one symbol carries one bit"),
+            );
             ui.add_enabled_ui(controls_enabled, |ui| {
                 paint_scaled_u64_value(
                     ui,
                     &mut settings.symbol_rate_hz,
                     1_000.0,
                     0.001..=(processing_rate_khz / 2.0).max(0.001),
-                    "ksym/s",
+                    "kbit/s",
                 );
             });
             ui.end_row();
