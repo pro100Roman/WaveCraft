@@ -217,6 +217,19 @@ impl RadioAnalysisStore {
         &self.raw_messages
     }
 
+    pub fn completed_raw_message_count(&self) -> usize {
+        self.raw_messages
+            .iter()
+            .filter(|message| message.is_complete())
+            .count()
+    }
+
+    pub fn raw_message_in_progress(&self) -> bool {
+        self.raw_messages
+            .back()
+            .is_some_and(|message| !message.is_complete())
+    }
+
     pub fn raw_dropped_messages(&self) -> u64 {
         self.raw_dropped_messages
     }
@@ -534,17 +547,31 @@ fn paint_analysis(
     let status = if let Some(error) = store.error() {
         format!("error · {error}")
     } else if !store.raw_messages().is_empty() {
-        let newest_bytes = store
+        let completed_messages = store.completed_raw_message_count();
+        let newest_completed_bytes = store
             .raw_messages()
-            .back()
+            .iter()
+            .rev()
+            .find(|message| message.is_complete())
             .map_or(0, |message| message.bytes().len());
-        format!(
-            "{} messages · newest {} B · {} dropped · {} gaps",
-            store.raw_messages().len(),
-            newest_bytes,
-            store.raw_dropped_messages(),
-            store.discontinuities()
-        )
+        let receiving = if store.raw_message_in_progress() {
+            " · receiving"
+        } else {
+            ""
+        };
+        if completed_messages == 0 {
+            format!(
+                "0 messages{receiving} · {} dropped · {} gaps",
+                store.raw_dropped_messages(),
+                store.discontinuities()
+            )
+        } else {
+            format!(
+                "{completed_messages} messages · newest {newest_completed_bytes} B{receiving} · {} dropped · {} gaps",
+                store.raw_dropped_messages(),
+                store.discontinuities()
+            )
+        }
     } else if let Some(alphabet_size) = store.soft_symbol_alphabet_size() {
         format!(
             "searching preamble · {} symbols · alphabet {} · {} gaps",
@@ -616,7 +643,8 @@ fn paint_raw_messages(
     const SECTION_WIDTH: f32 = 38.0;
     const STATE_WIDTH: f32 = 38.0;
     let visible_rows = (plot.height() / ROW_HEIGHT).floor().max(1.0) as usize;
-    let maximum_scroll = store.raw_messages().len().saturating_sub(visible_rows);
+    let completed_messages = store.completed_raw_message_count();
+    let maximum_scroll = completed_messages.saturating_sub(visible_rows);
     *scroll_rows = (*scroll_rows).min(maximum_scroll);
     let list_response = ui.interact(
         plot,
@@ -635,6 +663,7 @@ fn paint_raw_messages(
         .raw_messages()
         .iter()
         .rev()
+        .filter(|message| message.is_complete())
         .skip(*scroll_rows)
         .take(visible_rows)
         .enumerate()
@@ -724,6 +753,14 @@ fn paint_raw_messages(
             &diagnostic.message,
             FontId::proportional(9.0),
             Color32::from_rgb(230, 180, 95),
+        );
+    } else if completed_messages == 0 && store.raw_message_in_progress() {
+        ui.painter().text(
+            plot.center(),
+            egui::Align2::CENTER_CENTER,
+            "Receiving raw bytes; the next preamble or capture stop closes the message",
+            FontId::proportional(11.0),
+            Color32::from_rgb(105, 120, 140),
         );
     }
 }
@@ -1481,6 +1518,8 @@ mod tests {
         let newest_first = store.raw_messages().iter().rev().collect::<Vec<_>>();
 
         assert_eq!(newest_first.len(), 2);
+        assert_eq!(store.completed_raw_message_count(), 1);
+        assert!(store.raw_message_in_progress());
         assert_eq!(newest_first[0].sequence(), 2);
         assert_eq!(newest_first[0].preamble_bytes(), 2);
         assert_eq!(
@@ -1501,6 +1540,11 @@ mod tests {
             [0xaa, 0xaa, 0x12]
         );
         assert!(newest_first[1].is_complete());
+
+        store.finish_raw_capture();
+
+        assert_eq!(store.completed_raw_message_count(), 2);
+        assert!(!store.raw_message_in_progress());
     }
 
     #[test]
