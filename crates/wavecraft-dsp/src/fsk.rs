@@ -1,6 +1,11 @@
 use crate::{ChannelizedBatch, DspError, TimedComplexSample};
+use std::collections::VecDeque;
+use std::f64::consts::PI;
 use std::f64::consts::TAU;
 use std::ops::Range;
+
+const GFSK_FILTER_SPAN_SYMBOLS: u64 = 4;
+const MAX_GFSK_FILTER_TAPS: usize = 4_095;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FskPolarity {
@@ -8,11 +13,18 @@ pub enum FskPolarity {
     Inverted,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FskModulation {
+    Fsk,
+    Gfsk { bt: f64 },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct FskConfig {
     pub symbol_rate_hz: u64,
     /// Expected positive or negative tone displacement from channel center.
     pub deviation_hz: u64,
+    pub modulation: FskModulation,
     pub polarity: FskPolarity,
 }
 
@@ -23,6 +35,13 @@ impl FskConfig {
         }
         if self.deviation_hz == 0 {
             return Err(DspError::new("FSK deviation must be nonzero"));
+        }
+        if let FskModulation::Gfsk { bt } = self.modulation {
+            if !bt.is_finite() || bt <= 0.0 {
+                return Err(DspError::new(
+                    "GFSK BT must be finite and greater than zero",
+                ));
+            }
         }
         Ok(())
     }
@@ -52,6 +71,15 @@ pub struct FskDemodulator {
     likelihood_sum: f64,
     likelihood_count: u64,
     symbol_range: Option<Range<u64>>,
+    gaussian_filter: Vec<f64>,
+    gaussian_history: VecDeque<DiscriminatorSample>,
+}
+
+#[derive(Clone, Debug)]
+struct DiscriminatorSample {
+    likelihood: f64,
+    effective_source_index: u64,
+    source_range: Range<u64>,
 }
 
 impl FskDemodulator {
@@ -69,6 +97,8 @@ impl FskDemodulator {
             likelihood_sum: 0.0,
             likelihood_count: 0,
             symbol_range: None,
+            gaussian_filter: Vec::new(),
+            gaussian_history: VecDeque::new(),
         })
     }
 
@@ -87,6 +117,8 @@ impl FskDemodulator {
         self.likelihood_sum = 0.0;
         self.likelihood_count = 0;
         self.symbol_range = None;
+        self.gaussian_filter.clear();
+        self.gaussian_history.clear();
     }
 
     pub fn push(&mut self, batch: &ChannelizedBatch) -> Result<Vec<TimedSoftBit>, DspError> {
@@ -111,6 +143,16 @@ impl FskDemodulator {
         self.sample_rate_hz = Some(batch.sample_rate_hz);
         self.center_frequency_hz = Some(batch.center_frequency_hz);
         self.segment_start_sample_index = Some(batch.segment_start_sample_index);
+        if matches!(self.config.modulation, FskModulation::Gfsk { .. })
+            && self.gaussian_filter.is_empty()
+        {
+            self.gaussian_filter = design_gaussian_matched_filter(
+                batch.sample_rate_hz,
+                self.config.symbol_rate_hz,
+                self.config.modulation,
+            )?;
+            self.gaussian_history = VecDeque::with_capacity(self.gaussian_filter.len());
+        }
 
         let mut bits = Vec::new();
         for sample in &batch.samples {
@@ -143,19 +185,29 @@ impl FskDemodulator {
                 FskPolarity::Normal => 1.0,
                 FskPolarity::Inverted => -1.0,
             };
-            self.likelihood_sum += polarity * frequency_hz / self.config.deviation_hz as f64;
-            self.likelihood_count += 1;
-            extend_range(
-                &mut self.symbol_range,
-                previous.source_range.start..sample.source_range.end,
-            );
-            let (symbol_number, _) = symbol_position(
-                effective_index,
+            let discriminator = DiscriminatorSample {
+                likelihood: polarity * frequency_hz / self.config.deviation_hz as f64,
+                effective_source_index: effective_index,
+                source_range: previous.source_range.start..sample.source_range.end,
+            };
+            let Some(discriminator) = self.filter_discriminator(discriminator) else {
+                continue;
+            };
+            let (symbol_number, symbol_remainder) = symbol_position(
+                discriminator.effective_source_index,
                 batch.segment_start_sample_index,
                 batch.source_sample_rate_hz,
                 self.config.symbol_rate_hz,
             )?;
-            let current_symbol_number = self.current_symbol_number.unwrap_or(symbol_number);
+            let mut current_symbol_number = self.current_symbol_number.unwrap_or(symbol_number);
+            if self.likelihood_count == 0 && symbol_number > current_symbol_number + 1 {
+                current_symbol_number = symbol_number;
+                self.current_symbol_number = Some(symbol_number);
+                self.current_symbol_complete = symbol_remainder == 0;
+            }
+            self.likelihood_sum += discriminator.likelihood;
+            self.likelihood_count += 1;
+            extend_range(&mut self.symbol_range, discriminator.source_range);
             if symbol_number > current_symbol_number {
                 if symbol_number != current_symbol_number + 1 {
                     self.reset();
@@ -163,7 +215,7 @@ impl FskDemodulator {
                         "channelized sample spacing skipped an FSK symbol boundary",
                     ));
                 }
-                if self.current_symbol_complete {
+                if self.current_symbol_complete && self.likelihood_count != 0 {
                     let likelihood =
                         (self.likelihood_sum / self.likelihood_count as f64).clamp(-1.0, 1.0);
                     if let Some(source_range) = self.symbol_range.take() {
@@ -178,10 +230,37 @@ impl FskDemodulator {
                 self.likelihood_sum = 0.0;
                 self.likelihood_count = 0;
                 self.current_symbol_number = Some(symbol_number);
-                self.current_symbol_complete = true;
+                self.current_symbol_complete = symbol_number == current_symbol_number + 1;
             }
         }
         Ok(bits)
+    }
+
+    fn filter_discriminator(&mut self, sample: DiscriminatorSample) -> Option<DiscriminatorSample> {
+        if matches!(self.config.modulation, FskModulation::Fsk) {
+            return Some(sample);
+        }
+
+        self.gaussian_history.push_back(sample);
+        if self.gaussian_history.len() < self.gaussian_filter.len() {
+            return None;
+        }
+        let likelihood = self
+            .gaussian_history
+            .iter()
+            .zip(&self.gaussian_filter)
+            .map(|(sample, coefficient)| sample.likelihood * coefficient)
+            .sum();
+        let midpoint = self.gaussian_filter.len() / 2;
+        let effective_source_index = self.gaussian_history.get(midpoint)?.effective_source_index;
+        let source_range = self.gaussian_history.front()?.source_range.start
+            ..self.gaussian_history.back()?.source_range.end;
+        self.gaussian_history.pop_front();
+        Some(DiscriminatorSample {
+            likelihood,
+            effective_source_index,
+            source_range,
+        })
     }
 
     fn validate_batch(&self, batch: &ChannelizedBatch) -> Result<(), DspError> {
@@ -201,8 +280,53 @@ impl FskDemodulator {
                 "FSK deviation must remain below the channel Nyquist frequency",
             ));
         }
+        if matches!(self.config.modulation, FskModulation::Gfsk { .. }) {
+            gaussian_filter_tap_count(batch.sample_rate_hz, self.config.symbol_rate_hz)?;
+        }
         Ok(())
     }
+}
+
+fn gaussian_filter_tap_count(sample_rate_hz: u64, symbol_rate_hz: u64) -> Result<usize, DspError> {
+    let span_samples = u128::from(sample_rate_hz)
+        .saturating_mul(u128::from(GFSK_FILTER_SPAN_SYMBOLS))
+        .div_ceil(u128::from(symbol_rate_hz));
+    let mut tap_count = usize::try_from(span_samples)
+        .map_err(|_| DspError::new("GFSK matched filter is too large"))?
+        .saturating_add(1);
+    if tap_count % 2 == 0 {
+        tap_count = tap_count.saturating_add(1);
+    }
+    if tap_count > MAX_GFSK_FILTER_TAPS {
+        return Err(DspError::new(
+            "GFSK matched filter exceeds 4095 taps; reduce the channel sample rate",
+        ));
+    }
+    Ok(tap_count)
+}
+
+fn design_gaussian_matched_filter(
+    sample_rate_hz: u64,
+    symbol_rate_hz: u64,
+    modulation: FskModulation,
+) -> Result<Vec<f64>, DspError> {
+    let FskModulation::Gfsk { bt } = modulation else {
+        return Ok(Vec::new());
+    };
+    let tap_count = gaussian_filter_tap_count(sample_rate_hz, symbol_rate_hz)?;
+    let samples_per_symbol = sample_rate_hz as f64 / symbol_rate_hz as f64;
+    let midpoint = (tap_count / 2) as isize;
+    let mut taps = (0..tap_count)
+        .map(|index| {
+            let time_symbols = (index as isize - midpoint) as f64 / samples_per_symbol;
+            (-2.0 * (PI * bt * time_symbols).powi(2) / 2.0_f64.ln()).exp()
+        })
+        .collect::<Vec<_>>();
+    let sum = taps.iter().sum::<f64>();
+    for tap in &mut taps {
+        *tap /= sum;
+    }
+    Ok(taps)
 }
 
 fn effective_source_index(
@@ -290,6 +414,54 @@ mod tests {
         samples
     }
 
+    fn gfsk_samples(bits: &[bool], first_sample_index: u64, bt: f64) -> Vec<TimedComplexSample> {
+        const SAMPLE_RATE_HZ: u64 = 8_000;
+        const SYMBOL_RATE_HZ: u64 = 1_000;
+        const DEVIATION_HZ: f64 = 1_000.0;
+        const SAMPLES_PER_SYMBOL: usize = (SAMPLE_RATE_HZ / SYMBOL_RATE_HZ) as usize;
+        let levels = bits
+            .iter()
+            .flat_map(|bit| {
+                std::iter::repeat(if *bit { 1.0 } else { -1.0 }).take(SAMPLES_PER_SYMBOL)
+            })
+            .collect::<Vec<_>>();
+        let taps = design_gaussian_matched_filter(
+            SAMPLE_RATE_HZ,
+            SYMBOL_RATE_HZ,
+            FskModulation::Gfsk { bt },
+        )
+        .unwrap();
+        let midpoint = (taps.len() / 2) as isize;
+        let shaped = (0..levels.len())
+            .map(|sample_index| {
+                taps.iter()
+                    .enumerate()
+                    .map(|(tap_index, tap)| {
+                        let level_index = (sample_index as isize + tap_index as isize - midpoint)
+                            .clamp(0, levels.len() as isize - 1)
+                            as usize;
+                        levels[level_index] * tap
+                    })
+                    .sum::<f64>()
+            })
+            .collect::<Vec<_>>();
+
+        let mut phase: f64 = 0.0;
+        let mut samples = Vec::with_capacity(shaped.len() + 1);
+        for sample_index in 0..=shaped.len() {
+            let index = first_sample_index + sample_index as u64;
+            samples.push(TimedComplexSample {
+                i: phase.cos() as f32,
+                q: phase.sin() as f32,
+                source_range: index..index + 1,
+            });
+            if let Some(level) = shaped.get(sample_index) {
+                phase += TAU * DEVIATION_HZ * level / SAMPLE_RATE_HZ as f64;
+            }
+        }
+        samples
+    }
+
     fn batch(
         samples: Vec<TimedComplexSample>,
         discontinuity: bool,
@@ -310,6 +482,7 @@ mod tests {
         FskDemodulator::new(FskConfig {
             symbol_rate_hz: 1_000,
             deviation_hz: 1_000,
+            modulation: FskModulation::Fsk,
             polarity: FskPolarity::Normal,
         })
         .unwrap()
@@ -387,5 +560,60 @@ mod tests {
             .push(&batch(fsk_samples(&[true], 0), true, 0))
             .unwrap();
         assert!(bits[0].likelihood.is_sign_negative());
+    }
+
+    #[test]
+    fn gfsk_matched_filter_decodes_shaped_symbols_across_batches() {
+        let expected = [
+            true, true, true, false, true, false, false, true, true, false, true, false, false,
+            false,
+        ];
+        let samples = gfsk_samples(&expected, 0, 0.5);
+        let make_demodulator = || {
+            FskDemodulator::new(FskConfig {
+                symbol_rate_hz: 1_000,
+                deviation_hz: 1_000,
+                modulation: FskModulation::Gfsk { bt: 0.5 },
+                polarity: FskPolarity::Normal,
+            })
+            .unwrap()
+        };
+
+        let mut whole = make_demodulator();
+        let whole_bits = whole.push(&batch(samples.clone(), true, 0)).unwrap();
+
+        let mut chunked = make_demodulator();
+        let chunked_bits = [0..13, 13..41, 41..76, 76..samples.len()]
+            .into_iter()
+            .enumerate()
+            .flat_map(|(index, range)| {
+                chunked
+                    .push(&batch(samples[range].to_vec(), index == 0, 0))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunked_bits, whole_bits);
+        assert_eq!(
+            whole_bits
+                .iter()
+                .map(|bit| bit.likelihood.is_sign_positive())
+                .collect::<Vec<_>>(),
+            expected[3..expected.len() - 2]
+        );
+        assert!(whole_bits.iter().all(|bit| bit.likelihood.abs() > 0.35));
+    }
+
+    #[test]
+    fn rejects_invalid_gfsk_bt() {
+        for bt in [0.0, -0.5, f64::NAN] {
+            assert!(FskDemodulator::new(FskConfig {
+                symbol_rate_hz: 1_000,
+                deviation_hz: 1_000,
+                modulation: FskModulation::Gfsk { bt },
+                polarity: FskPolarity::Normal,
+            })
+            .is_err());
+        }
     }
 }

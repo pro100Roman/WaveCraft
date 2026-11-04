@@ -4,7 +4,7 @@ mod channelizer;
 mod fsk;
 
 pub use channelizer::{ChannelizedBatch, Channelizer, ChannelizerConfig, TimedComplexSample};
-pub use fsk::{FskConfig, FskDemodulator, FskPolarity, TimedSoftBit};
+pub use fsk::{FskConfig, FskDemodulator, FskModulation, FskPolarity, TimedSoftBit};
 
 use std::collections::VecDeque;
 use std::error::Error;

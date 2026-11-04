@@ -1,7 +1,8 @@
 use std::f64::consts::TAU;
 use wavecraft_core::{Iq8, IqBatch};
 use wavecraft_dsp::{
-    Channelizer, ChannelizerConfig, FskConfig, FskDemodulator, FskPolarity, TimedSoftBit,
+    Channelizer, ChannelizerConfig, FskConfig, FskDemodulator, FskModulation, FskPolarity,
+    TimedSoftBit,
 };
 
 const SOURCE_SAMPLE_RATE_HZ: u64 = 64_000;
@@ -39,6 +40,7 @@ fn decode_with_chunks(samples: &[Iq8], chunk_lengths: &[usize]) -> Vec<TimedSoft
     let mut demodulator = FskDemodulator::new(FskConfig {
         symbol_rate_hz: SYMBOL_RATE_HZ,
         deviation_hz: DEVIATION_HZ as u64,
+        modulation: FskModulation::Fsk,
         polarity: FskPolarity::Normal,
     })
     .unwrap();

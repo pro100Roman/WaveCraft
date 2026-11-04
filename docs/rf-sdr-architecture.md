@@ -3,9 +3,10 @@
 Status: in progress. The core IQ model, bounded capture path, recording v2,
 spectrum DSP/display store, simulator, SDR facade, and receive-only HackRF One
 adapter are implemented. Channelization and the initial fixed-timing binary FSK
-demodulator are also implemented; GFSK matched filtering and adaptive timing
-recovery remain next. Application-level provider aggregation and live RF controls
-remain to be wired before the GUI advertises physical HackRF support.
+demodulator are also implemented, including bounded streaming GFSK matched
+filtering with configurable BT; adaptive timing recovery remains next.
+GUI analyzer configuration and rendering of timed soft bits remain to be wired
+into the live and recorded IQ paths.
 
 WaveCraft treats HackRF as the first backend for a generic radio-receiver
 instrument, not as a GUI-specific feature. The backend produces ordered raw IQ
