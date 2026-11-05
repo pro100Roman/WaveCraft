@@ -19,6 +19,7 @@ pub(crate) fn toolbar_action_button(label: &str, color: Color32) -> egui::Button
 }
 
 pub(crate) fn configure_style(context: &egui::Context) {
+    context.set_fonts(wavecraft_font_definitions());
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = PANEL;
     visuals.window_fill = PANEL;
@@ -33,6 +34,19 @@ pub(crate) fn configure_style(context: &egui::Context) {
     });
 }
 
+fn wavecraft_font_definitions() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    let proportional = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    let hack = "Hack".to_owned();
+    if !proportional.contains(&hack) {
+        proportional.push(hack);
+    }
+    fonts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,5 +58,14 @@ mod tests {
         configure_style(&context);
 
         assert!(context.style().interaction.selectable_labels);
+    }
+
+    #[test]
+    fn proportional_text_has_the_symbol_font_fallback() {
+        let fonts = wavecraft_font_definitions();
+
+        assert!(fonts.families[&egui::FontFamily::Proportional]
+            .iter()
+            .any(|font| font == "Hack"));
     }
 }

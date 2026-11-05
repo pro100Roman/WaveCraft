@@ -16336,13 +16336,16 @@ fn paint_scope_measurements(
             FontId::monospace(HEADER_FONT_SIZE),
             color,
         );
-        painter.text(
-            panel.right_top() + Vec2::new(-PADDING, 5.0),
-            egui::Align2::RIGHT_TOP,
-            "⠿",
-            FontId::proportional(13.0),
-            color,
-        );
+        let grip_origin = panel.right_top() + Vec2::new(-PADDING - 7.0, 7.0);
+        for row in 0..3 {
+            for column in 0..2 {
+                painter.circle_filled(
+                    grip_origin + Vec2::new(column as f32 * 4.0, row as f32 * 4.0),
+                    1.0,
+                    color,
+                );
+            }
+        }
 
         for (ordinal, kind) in selected.into_iter().enumerate() {
             let row = ordinal;

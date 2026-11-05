@@ -557,7 +557,7 @@ impl RadioViewState {
             title_rect,
             "waterfall_status",
             format!(
-                "{} rows · {} dropped · ⓘ",
+                "{} rows · {} dropped · ℹ",
                 store.waterfall().len(),
                 store.dropped_rows()
             ),
