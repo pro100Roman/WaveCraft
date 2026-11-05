@@ -333,10 +333,13 @@ until the operator explicitly enables it for a measured signal.
 The RF view labels this modulation-neutral output pane **RAW DATA**. Horizontal
 drag handles make the RF SPECTRUM, WATERFALL, and RAW DATA heights adjustable.
 RAW DATA exposes both wheel scrolling and a draggable vertical scrollbar for
-older retained messages. While searching for a preamble, it shows a textual
-status instead of drawing every soft symbol as a vertical stripe. Parameter
-names, panel titles, live status text, and errors use selectable labels so they
-can be highlighted and copied with the platform clipboard shortcut.
+older retained messages. New messages remain pinned to the top while the list
+is at its newest position. Once the user scrolls into retained history, incoming
+messages preserve the visible rows until the user returns to the top. While
+searching for a preamble, it shows a textual status instead of drawing every
+soft symbol as a vertical stripe. Parameter names, panel titles, live status
+text, and errors use selectable labels so they can be highlighted and copied
+with the platform clipboard shortcut.
 
 ### Modulation-neutral analyzer contracts
 

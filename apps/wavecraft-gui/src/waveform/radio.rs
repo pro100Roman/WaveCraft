@@ -420,6 +420,7 @@ pub struct RadioViewState {
     waterfall_texture: Option<TextureHandle>,
     waterfall_signature: Option<WaterfallSignature>,
     raw_message_scroll_rows: usize,
+    raw_message_newest_completed_sequence: Option<u64>,
     spectrum_height_ratio: f32,
     raw_data_height_ratio: f32,
 }
@@ -430,6 +431,7 @@ impl Default for RadioViewState {
             waterfall_texture: None,
             waterfall_signature: None,
             raw_message_scroll_rows: 0,
+            raw_message_newest_completed_sequence: None,
             spectrum_height_ratio: 0.54,
             raw_data_height_ratio: 0.24,
         }
@@ -463,6 +465,10 @@ impl RadioViewState {
             || !analysis.soft_symbols().is_empty()
             || !analysis.analog_samples().is_empty()
             || !analysis.raw_messages().is_empty();
+        if analysis.raw_messages().is_empty() {
+            self.raw_message_scroll_rows = 0;
+            self.raw_message_newest_completed_sequence = None;
+        }
         let (spectrum_height, waterfall_height, analysis_height) = radio_pane_heights(
             rect.height(),
             show_analysis,
@@ -532,6 +538,7 @@ impl RadioViewState {
                 analysis,
                 analysis_enabled,
                 &mut self.raw_message_scroll_rows,
+                &mut self.raw_message_newest_completed_sequence,
             );
         }
     }
@@ -697,6 +704,7 @@ fn paint_analysis(
     store: &RadioAnalysisStore,
     analysis_enabled: bool,
     raw_message_scroll_rows: &mut usize,
+    raw_message_newest_completed_sequence: &mut Option<u64>,
 ) {
     if rect.width() <= 1.0 || rect.height() <= 1.0 {
         return;
@@ -803,7 +811,13 @@ fn paint_analysis(
         return;
     }
     if !store.raw_messages().is_empty() {
-        paint_raw_messages(ui, plot, store, raw_message_scroll_rows);
+        paint_raw_messages(
+            ui,
+            plot,
+            store,
+            raw_message_scroll_rows,
+            raw_message_newest_completed_sequence,
+        );
     } else if !store.soft_symbols().is_empty() {
         ui.painter().text(
             plot.center(),
@@ -834,6 +848,7 @@ fn paint_raw_messages(
     plot: Rect,
     store: &RadioAnalysisStore,
     scroll_rows: &mut usize,
+    newest_completed_sequence: &mut Option<u64>,
 ) {
     const ROW_HEIGHT: f32 = 22.0;
     const BYTE_CELL_WIDTH: f32 = 24.0;
@@ -846,7 +861,22 @@ fn paint_raw_messages(
     let visible_rows = (plot.height() / ROW_HEIGHT).floor().max(1.0) as usize;
     let completed_messages = store.completed_raw_message_count();
     let maximum_scroll = completed_messages.saturating_sub(visible_rows);
-    *scroll_rows = (*scroll_rows).min(maximum_scroll);
+    let completed_newest_first = || {
+        store
+            .raw_messages()
+            .iter()
+            .rev()
+            .filter(|message| message.is_complete())
+    };
+    *scroll_rows = retained_raw_message_scroll_rows(
+        *scroll_rows,
+        *newest_completed_sequence,
+        completed_newest_first().map(RawRadioMessage::sequence),
+        visible_rows,
+    );
+    *newest_completed_sequence = completed_newest_first()
+        .next()
+        .map(RawRadioMessage::sequence);
     let list_response = ui.interact(
         plot,
         ui.id().with("raw_message_list_scroll"),
@@ -1055,6 +1085,36 @@ fn paint_raw_messages(
             FontId::proportional(11.0),
             Color32::from_rgb(105, 120, 140),
         );
+    }
+}
+
+fn retained_raw_message_scroll_rows<I>(
+    scroll_rows: usize,
+    previous_newest_sequence: Option<u64>,
+    completed_newest_first: I,
+    visible_rows: usize,
+) -> usize
+where
+    I: IntoIterator<Item = u64>,
+{
+    let mut completed_messages = 0_usize;
+    let mut rows_inserted_before_previous_newest = None;
+    for sequence in completed_newest_first {
+        if previous_newest_sequence == Some(sequence)
+            && rows_inserted_before_previous_newest.is_none()
+        {
+            rows_inserted_before_previous_newest = Some(completed_messages);
+        }
+        completed_messages += 1;
+    }
+
+    let maximum_scroll = completed_messages.saturating_sub(visible_rows);
+    if scroll_rows == 0 {
+        0
+    } else {
+        scroll_rows
+            .saturating_add(rows_inserted_before_previous_newest.unwrap_or(0))
+            .min(maximum_scroll)
     }
 }
 
@@ -1564,6 +1624,30 @@ mod tests {
         assert!(resized.0 > default.0);
         assert!(resized.2 > default.2);
         assert!(resized.1 < default.1);
+    }
+
+    #[test]
+    fn raw_message_scroll_follows_new_messages_at_the_top() {
+        assert_eq!(
+            retained_raw_message_scroll_rows(0, Some(5), [7, 6, 5, 4, 3], 2),
+            0
+        );
+    }
+
+    #[test]
+    fn raw_message_scroll_retains_visible_rows_away_from_the_top() {
+        assert_eq!(
+            retained_raw_message_scroll_rows(2, Some(5), [7, 6, 5, 4, 3, 2, 1], 2),
+            4
+        );
+    }
+
+    #[test]
+    fn raw_message_scroll_clamps_when_retained_history_is_discarded() {
+        assert_eq!(
+            retained_raw_message_scroll_rows(4, Some(5), [7, 6, 5, 4, 3], 2),
+            3
+        );
     }
 
     #[test]
