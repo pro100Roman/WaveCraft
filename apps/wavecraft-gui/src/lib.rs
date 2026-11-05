@@ -2289,7 +2289,9 @@ fn paint_decoded_data_panel(
                         if retained_offset != scroll_output.state.offset.y {
                             scroll_output.state.offset.y = retained_offset;
                             scroll_output.state.store(ui.ctx(), scroll_output.id);
-                            ui.ctx().request_repaint();
+                            ui.ctx().request_discard(
+                                "retain decoded-message position after prepending data",
+                            );
                         }
                     }
                 }
