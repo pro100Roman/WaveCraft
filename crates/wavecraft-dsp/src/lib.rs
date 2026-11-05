@@ -12,8 +12,8 @@ pub use analyzer::{
 };
 pub use channelizer::{ChannelizedBatch, Channelizer, ChannelizerConfig, TimedComplexSample};
 pub use demodulation::{
-    DemodulatedBatch, Demodulator, TimedAnalogBatch, TimedAnalogSample, TimedSoftSymbol,
-    TimedSoftSymbolBatch, MAX_SOFT_SYMBOL_ALPHABET_SIZE,
+    DemodulatedBatch, Demodulator, DemodulatorTelemetry, TimedAnalogBatch, TimedAnalogSample,
+    TimedSoftSymbol, TimedSoftSymbolBatch, MAX_SOFT_SYMBOL_ALPHABET_SIZE,
 };
 pub use fsk::{
     FskConfig, FskDemodulator, FskModulation, FskPolarity, FskTiming, TimedSoftBit,

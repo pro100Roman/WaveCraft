@@ -25,7 +25,7 @@ use protocol_analyzer::{
     ProtocolDataFormat, ProtocolDecodeOutcome, ProtocolDecodeSnapshot, ProtocolDecodedEvent,
     ProtocolDecodedKind, PROTOCOLS,
 };
-use radio_analyzer::RadioAnalyzerRuntime;
+use radio_analyzer::{RadioAnalyzerRuntime, RadioDspOutput, RadioDspWorker};
 use radio_trigger::{RadioSingleTrigger, RadioSingleTriggerConfig};
 use recording::{
     choose_recording_save_path, choose_recording_to_open, choose_saleae_export_path,
@@ -2901,11 +2901,26 @@ fn ingest_radio_iq(
     let analysis = analyzer
         .as_mut()
         .map(|analyzer| analyzer.push(iq, &spectrum_frames, squelch_threshold_dbfs));
-    for frame in spectrum_frames {
+    let analysis_failed = analysis.as_ref().is_some_and(Result::is_err);
+    ingest_radio_dsp_output(
+        waveforms,
+        RadioDspOutput {
+            spectrum: spectrum_frames,
+            analysis,
+        },
+    );
+    if analysis_failed {
+        *analyzer = None;
+    }
+}
+
+fn ingest_radio_dsp_output(waveforms: &mut WaveformStore, output: RadioDspOutput) {
+    for frame in output.spectrum {
         waveforms.radio.ingest(frame);
     }
-    if let Some(analysis) = analysis {
+    if let Some(analysis) = output.analysis {
         let analysis = analysis.and_then(|output| {
+            waveforms.radio_analysis.set_telemetry(output.telemetry);
             if let Some(demodulated) = output.demodulated {
                 waveforms.radio_analysis.ingest(demodulated)?;
             }
@@ -2917,7 +2932,6 @@ fn ingest_radio_iq(
         });
         if let Err(error) = analysis {
             waveforms.radio_analysis.set_error(error);
-            *analyzer = None;
         }
     }
 }
@@ -2945,13 +2959,9 @@ fn ingest_active_capture_frame(
         );
     }
     if let CaptureBatch::Iq(iq) = &frame.payload {
-        ingest_radio_iq(
-            &mut active.waveforms,
-            &mut active.radio_spectrum,
-            &mut active.radio_analyzer,
-            iq,
-            radio_squelch_threshold_dbfs,
-        );
+        active
+            .radio_dsp
+            .push(iq.clone(), radio_squelch_threshold_dbfs)?;
     }
     let enabled_scope_channels = active
         .scope_config
@@ -2984,7 +2994,7 @@ struct ActiveCapture {
     waveforms: WaveformStore,
     protocol_decode: ProtocolCaptureDecoder,
     radio_spectrum: SpectrumProcessor,
-    radio_analyzer: Option<RadioAnalyzerRuntime>,
+    radio_dsp: RadioDspWorker,
     radio_trigger: Option<RadioSingleTrigger>,
     recorder: Option<FileRecorder>,
     recording_path: Option<PathBuf>,
@@ -3178,6 +3188,9 @@ struct RadioAnalyzerSettings {
     max_clock_error_ppm: u32,
     preamble_byte: u8,
     preamble_bytes: usize,
+    sync_word: u64,
+    sync_word_bytes: u8,
+    maximum_preamble_bit_errors: usize,
     minimum_bit_confidence_milli: u16,
     maximum_uncertain_bits: usize,
 }
@@ -3187,10 +3200,12 @@ impl Default for RadioAnalyzerSettings {
         Self {
             enabled: false,
             demodulation: RadioDemodulation::BinaryGfsk,
-            channel_offset_hz: 0,
+            // Capture both observed 868.1/868.5 MHz channels around 868.3 MHz;
+            // start with the 868.1 MHz channel selected for demodulation.
+            channel_offset_hz: -200_000,
             channel_bandwidth_hz: 200_000,
-            output_sample_rate_hz: 1_000_000,
-            filter_tap_count: 129,
+            output_sample_rate_hz: 512_000,
+            filter_tap_count: 257,
             symbol_rate_hz: 19_200,
             deviation_hz: 35_000,
             gfsk_bt_milli: 500,
@@ -3200,6 +3215,9 @@ impl Default for RadioAnalyzerSettings {
             max_clock_error_ppm: 10_000,
             preamble_byte: 0xaa,
             preamble_bytes: 4,
+            sync_word: 0,
+            sync_word_bytes: 0,
+            maximum_preamble_bit_errors: 1,
             minimum_bit_confidence_milli: 0,
             maximum_uncertain_bits: 0,
         }
@@ -3211,6 +3229,9 @@ impl RadioAnalyzerSettings {
         RawRadioConfig {
             preamble_byte: self.preamble_byte,
             preamble_bytes: self.preamble_bytes,
+            sync_word: self.sync_word,
+            sync_word_bytes: self.sync_word_bytes,
+            maximum_preamble_bit_errors: self.maximum_preamble_bit_errors,
             bit_order: BitOrder::MostSignificantFirst,
             minimum_bit_confidence_milli: self.minimum_bit_confidence_milli,
             maximum_uncertain_bits: self.maximum_uncertain_bits,
@@ -3267,8 +3288,8 @@ impl Default for RadioSettings {
     fn default() -> Self {
         Self {
             capture: RadioCaptureSettings {
-                center_frequency_hz: 100_000_000,
-                sample_rate_hz: 2_000_000,
+                center_frequency_hz: 868_300_000,
+                sample_rate_hz: 8_000_000,
                 bandwidth_hz: 1_750_000,
                 receive_channel: 0,
                 sample_limit: None,
@@ -3305,7 +3326,7 @@ enum WorkerSuccess {
         scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
         radio_runtime_control: Option<HackRfRuntimeControl>,
         radio_spectrum: Box<SpectrumProcessor>,
-        radio_analyzer: Option<Box<RadioAnalyzerRuntime>>,
+        radio_dsp: Box<RadioDspWorker>,
     },
     ScopeConfigured,
     ScopeAutoCalibrated(DsCopeCalibrationValues),
@@ -3841,7 +3862,7 @@ impl WaveCraftApp {
                 scope_calibration_controls: started.scope_calibration_controls,
                 radio_runtime_control: started.radio_runtime_control,
                 radio_spectrum: Box::new(started.radio_spectrum),
-                radio_analyzer: started.radio_analyzer.map(Box::new),
+                radio_dsp: Box::new(started.radio_dsp),
             });
             let _ = sender.send(result);
         });
@@ -4154,7 +4175,7 @@ impl WaveCraftApp {
                 scope_calibration_controls,
                 radio_runtime_control,
                 radio_spectrum,
-                radio_analyzer,
+                radio_dsp,
             }) => {
                 let logic_config = *logic_config;
                 if !self.capture_run_requested {
@@ -4361,7 +4382,7 @@ impl WaveCraftApp {
                     waveforms,
                     protocol_decode,
                     radio_spectrum: *radio_spectrum,
-                    radio_analyzer: radio_analyzer.map(|analyzer| *analyzer),
+                    radio_dsp: *radio_dsp,
                     radio_trigger,
                     recorder,
                     recording_path: recording_path.clone(),
@@ -4765,6 +4786,22 @@ impl WaveCraftApp {
                     }
                 }
             }
+            loop {
+                match active.radio_dsp.try_recv() {
+                    Ok(output) => ingest_radio_dsp_output(&mut active.waveforms, output),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if finish_status.is_none() {
+                            active.session.request_stop();
+                            finish_status = Some((
+                                Err("radio DSP worker disconnected".to_owned()),
+                                CompletionStatus::Failed,
+                            ));
+                        }
+                        break;
+                    }
+                }
+            }
         }
 
         if let Some(status) = capture_status {
@@ -4784,6 +4821,15 @@ impl WaveCraftApp {
                     self.scope_capture_restart_requested && self.capture_run_requested;
                 self.scope_capture_restart_requested = false;
                 let stop_result = active.session.stop();
+                let radio_dsp_error = match active.radio_dsp.finish() {
+                    Ok(outputs) => {
+                        for output in outputs {
+                            ingest_radio_dsp_output(&mut active.waveforms, output);
+                        }
+                        None
+                    }
+                    Err(error) => Some(error),
+                };
                 let recording_completion = if stop_result.is_ok() {
                     completion
                 } else {
@@ -4796,6 +4842,9 @@ impl WaveCraftApp {
                 let mut error = result.as_ref().err().cloned();
                 if let Err(stop_error) = stop_result {
                     append_error(&mut error, format!("failed to stop capture: {stop_error}"));
+                }
+                if let Some(dsp_error) = radio_dsp_error {
+                    append_error(&mut error, dsp_error);
                 }
                 if let Err(recording_error) = recording_result {
                     append_error(
@@ -8435,6 +8484,72 @@ fn paint_radio_analyzer_configuration(
 
             paint_radio_parameter_label(
                 ui,
+                "Sync word",
+                Some("Optional 1-to-8-byte word after the repeated preamble; unlike 0xAA, it establishes an unambiguous byte boundary"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    add_left_aligned_sized(
+                        ui,
+                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut settings.sync_word)
+                            .range(0..=u64::MAX)
+                            .speed(1)
+                            .hexadecimal(16, false, true),
+                    );
+                    ui.label("hex");
+                });
+            });
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
+                "Sync word length",
+                Some("Zero disables the separate sync word; bytes are taken big-endian from the value above"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    add_left_aligned_sized(
+                        ui,
+                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut settings.sync_word_bytes)
+                            .range(0..=8)
+                            .speed(1),
+                    );
+                    ui.label("bytes");
+                });
+            });
+            settings.sync_word_bytes = settings.sync_word_bytes.min(8);
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
+                "Preamble bit errors",
+                Some("Maximum hard-decision mismatches accepted across the repeated preamble and sync word"),
+            );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    add_left_aligned_sized(
+                        ui,
+                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                        egui::DragValue::new(&mut settings.maximum_preamble_bit_errors)
+                            .range(0..=64)
+                            .speed(1),
+                    );
+                    ui.label("bits");
+                });
+            });
+            let acquisition_bits = settings
+                .preamble_bytes
+                .saturating_add(usize::from(settings.sync_word_bytes))
+                .saturating_mul(8);
+            settings.maximum_preamble_bit_errors = settings
+                .maximum_preamble_bit_errors
+                .min(acquisition_bits.saturating_sub(1));
+            ui.end_row();
+
+            paint_radio_parameter_label(
+                ui,
                 "Minimum bit confidence",
                 Some("Bits below this 0-to-1 demodulator confidence count as uncertain; zero disables confidence filtering"),
             );
@@ -11065,6 +11180,18 @@ fn start_gui_recording(
             "preamble_bytes",
             radio_settings.analyzer.preamble_bytes.to_string(),
         ),
+        ("sync_word", radio_settings.analyzer.sync_word.to_string()),
+        (
+            "sync_word_bytes",
+            radio_settings.analyzer.sync_word_bytes.to_string(),
+        ),
+        (
+            "maximum_preamble_bit_errors",
+            radio_settings
+                .analyzer
+                .maximum_preamble_bit_errors
+                .to_string(),
+        ),
         (
             "minimum_bit_confidence_milli",
             radio_settings
@@ -11650,6 +11777,17 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.preamble_bytes") {
         settings.analyzer.preamble_bytes = value;
     }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.sync_word") {
+        settings.analyzer.sync_word = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.sync_word_bytes") {
+        settings.analyzer.sync_word_bytes = value;
+    }
+    if let Some(value) =
+        recording_metadata_value(metadata, "radio.analyzer.maximum_preamble_bit_errors")
+    {
+        settings.analyzer.maximum_preamble_bit_errors = value;
+    }
     if let Some(value) =
         recording_metadata_value(metadata, "radio.analyzer.minimum_bit_confidence_milli")
     {
@@ -12046,7 +12184,7 @@ struct StartedCapture {
     scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
     radio_runtime_control: Option<HackRfRuntimeControl>,
     radio_spectrum: SpectrumProcessor,
-    radio_analyzer: Option<RadioAnalyzerRuntime>,
+    radio_dsp: RadioDspWorker,
 }
 
 fn start_capture(
@@ -12136,6 +12274,10 @@ fn start_capture(
     }
     let radio_spectrum = SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?
         .with_iq_correction(iq_correction_enabled);
+    let radio_dsp_spectrum =
+        SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?
+            .with_iq_correction(iq_correction_enabled);
+    let radio_dsp = RadioDspWorker::start(radio_dsp_spectrum, radio_analyzer);
     let session = CaptureCoordinator::start(sources).map_err(|error| error.to_string())?;
     Ok(StartedCapture {
         session,
@@ -12143,7 +12285,7 @@ fn start_capture(
         scope_calibration_controls,
         radio_runtime_control,
         radio_spectrum,
-        radio_analyzer,
+        radio_dsp,
     })
 }
 
@@ -17114,7 +17256,8 @@ mod tests {
     fn radio_defaults_match_the_initial_gfsk_profile() {
         let settings = RadioSettings::default();
 
-        assert_eq!(settings.capture.sample_rate_hz, 2_000_000);
+        assert_eq!(settings.capture.center_frequency_hz, 868_300_000);
+        assert_eq!(settings.capture.sample_rate_hz, 8_000_000);
         assert_eq!(settings.capture.bandwidth_hz, 1_750_000);
         assert_eq!(
             settings.analyzer.demodulation,
@@ -17122,6 +17265,10 @@ mod tests {
         );
         assert_eq!(settings.analyzer.symbol_rate_hz, 19_200);
         assert_eq!(settings.analyzer.deviation_hz, 35_000);
+        assert_eq!(settings.analyzer.channel_offset_hz, -200_000);
+        assert_eq!(settings.analyzer.output_sample_rate_hz, 512_000);
+        assert_eq!(settings.analyzer.filter_tap_count, 257);
+        assert_eq!(settings.analyzer.maximum_preamble_bit_errors, 1);
         assert_eq!(settings.analyzer.minimum_bit_confidence_milli, 0);
         assert_eq!(settings.analyzer.maximum_uncertain_bits, 0);
         assert_eq!(settings.trigger_posttrigger_micros, 2_000);
@@ -17289,6 +17436,12 @@ mod tests {
             ),
             ("radio.analyzer.preamble_byte".to_owned(), "85".to_owned()),
             ("radio.analyzer.preamble_bytes".to_owned(), "12".to_owned()),
+            ("radio.analyzer.sync_word".to_owned(), "11732".to_owned()),
+            ("radio.analyzer.sync_word_bytes".to_owned(), "2".to_owned()),
+            (
+                "radio.analyzer.maximum_preamble_bit_errors".to_owned(),
+                "2".to_owned(),
+            ),
             (
                 "radio.analyzer.minimum_bit_confidence_milli".to_owned(),
                 "650".to_owned(),
@@ -17316,6 +17469,9 @@ mod tests {
         assert_eq!(settings.max_clock_error_ppm, 20_000);
         assert_eq!(settings.preamble_byte, 0x55);
         assert_eq!(settings.preamble_bytes, 12);
+        assert_eq!(settings.sync_word, 0x2dd4);
+        assert_eq!(settings.sync_word_bytes, 2);
+        assert_eq!(settings.maximum_preamble_bit_errors, 2);
         assert_eq!(settings.minimum_bit_confidence_milli, 650);
         assert_eq!(settings.maximum_uncertain_bits, 3);
     }
@@ -17336,8 +17492,9 @@ mod tests {
         settings.demodulation = RadioDemodulation::BinaryFsk;
         let profile = settings.signal_profile().unwrap().unwrap();
         let mut analyzer = Some(RadioAnalyzerRuntime::new(profile, settings.raw_config()).unwrap());
-        let mut spectrum =
-            SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann).unwrap();
+        // Keep the FFT shorter than this focused synthetic burst so the
+        // analyzer's burst gate receives a channel-power observation.
+        let mut spectrum = SpectrumProcessor::new(256, SpectrumWindow::Hann).unwrap();
         let bits = [true, false, true, true, false, false, true];
         let mut phase: f64 = 0.0;
         let samples = bits
@@ -18096,8 +18253,8 @@ mod tests {
         let request = RadioCaptureRequest {
             device,
             settings: RadioCaptureSettings {
-                center_frequency_hz: 100_000_000,
-                sample_rate_hz: 2_000_000,
+                center_frequency_hz: 868_300_000,
+                sample_rate_hz: 8_000_000,
                 bandwidth_hz: 1_750_000,
                 receive_channel: 0,
                 sample_limit: Some(4_096),
@@ -18108,6 +18265,9 @@ mod tests {
             raw_config: RawRadioConfig {
                 preamble_byte: 0xaa,
                 preamble_bytes: 4,
+                sync_word: 0,
+                sync_word_bytes: 0,
+                maximum_preamble_bit_errors: 0,
                 bit_order: BitOrder::MostSignificantFirst,
                 minimum_bit_confidence_milli: 500,
                 maximum_uncertain_bits: 0,
@@ -18126,7 +18286,7 @@ mod tests {
         .expect("GUI radio capture should start");
         let StartedCapture {
             session,
-            mut radio_spectrum,
+            mut radio_dsp,
             ..
         } = started;
         let frame = match session
@@ -18144,10 +18304,18 @@ mod tests {
         let CaptureBatch::Iq(iq) = frame.payload else {
             panic!("GUI radio capture should emit IQ batches");
         };
-        let spectra = radio_spectrum.push(&iq);
+        radio_dsp
+            .push(iq.clone(), -50.0)
+            .expect("GUI radio DSP worker should accept IQ");
+        let spectra = radio_dsp
+            .finish()
+            .expect("GUI radio DSP worker should finish")
+            .into_iter()
+            .flat_map(|output| output.spectrum)
+            .collect::<Vec<_>>();
 
         assert!(!iq.samples.is_empty());
-        assert_eq!(iq.sample_rate_hz, 2_000_000);
+        assert_eq!(iq.sample_rate_hz, 8_000_000);
         assert!(!spectra.is_empty());
         assert!(spectra
             .iter()
@@ -18182,6 +18350,9 @@ mod tests {
             raw_config: RawRadioConfig {
                 preamble_byte: 0xaa,
                 preamble_bytes: 4,
+                sync_word: 0,
+                sync_word_bytes: 0,
+                maximum_preamble_bit_errors: 0,
                 bit_order: BitOrder::MostSignificantFirst,
                 minimum_bit_confidence_milli: 500,
                 maximum_uncertain_bits: 0,

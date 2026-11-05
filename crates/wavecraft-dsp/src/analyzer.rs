@@ -1,6 +1,7 @@
 use crate::{
-    Channelizer, ChannelizerConfig, DemodulatedBatch, Demodulator, DemodulatorRegistry, DspError,
-    FskConfig, FskPolarity, FskTiming, BINARY_FSK_DEMODULATOR_ID, BINARY_GFSK_DEMODULATOR_ID,
+    Channelizer, ChannelizerConfig, DemodulatedBatch, Demodulator, DemodulatorRegistry,
+    DemodulatorTelemetry, DspError, FskConfig, FskPolarity, FskTiming, BINARY_FSK_DEMODULATOR_ID,
+    BINARY_GFSK_DEMODULATOR_ID,
 };
 use wavecraft_core::IqBatch;
 
@@ -112,6 +113,10 @@ impl SignalAnalyzer {
     pub fn push(&mut self, input: &IqBatch) -> Result<DemodulatedBatch, DspError> {
         let channelized = self.channelizer.push(input)?;
         self.demodulator.push(&channelized)
+    }
+
+    pub fn telemetry(&self) -> DemodulatorTelemetry {
+        self.demodulator.telemetry()
     }
 }
 

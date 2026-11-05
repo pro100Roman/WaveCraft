@@ -1,3 +1,4 @@
+use crate::radio_analyzer::RadioAnalyzerTelemetry;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use std::collections::VecDeque;
 use wavecraft_decode::{DecodeDiagnostic, RawRadioMessageStart, RawRadioOutput, TimedByte};
@@ -80,6 +81,7 @@ pub struct RadioAnalysisStore {
     raw_synchronized: bool,
     raw_dropped_bytes: u64,
     raw_diagnostics: VecDeque<DecodeDiagnostic>,
+    telemetry: RadioAnalyzerTelemetry,
 }
 
 impl Default for RadioAnalysisStore {
@@ -101,6 +103,7 @@ impl Default for RadioAnalysisStore {
             raw_synchronized: false,
             raw_dropped_bytes: 0,
             raw_diagnostics: VecDeque::new(),
+            telemetry: RadioAnalyzerTelemetry::default(),
         }
     }
 }
@@ -202,6 +205,14 @@ impl RadioAnalysisStore {
 
     pub fn set_error(&mut self, error: impl Into<String>) {
         self.error = Some(error.into());
+    }
+
+    pub fn set_telemetry(&mut self, telemetry: RadioAnalyzerTelemetry) {
+        self.telemetry = telemetry;
+    }
+
+    pub fn telemetry(&self) -> RadioAnalyzerTelemetry {
+        self.telemetry
     }
 
     pub fn soft_symbols(&self) -> &VecDeque<TimedSoftSymbol> {
@@ -703,7 +714,7 @@ fn paint_analysis(
         Color32::from_rgb(145, 160, 180),
         false,
     );
-    let status = if let Some(error) = store.error() {
+    let mut status = if let Some(error) = store.error() {
         format!("error · {error}")
     } else if !store.raw_messages().is_empty() {
         let completed_messages = store.completed_raw_message_count();
@@ -754,6 +765,24 @@ fn paint_analysis(
     } else {
         "disabled".to_owned()
     };
+    if store.error().is_none() && analysis_enabled {
+        let telemetry = store.telemetry();
+        if let Some(power) = telemetry.channel_power_dbfs {
+            status.push_str(&format!(" · P {power:.1} dBFS"));
+        }
+        if let Some(noise) = telemetry.noise_floor_dbfs {
+            status.push_str(&format!(" · noise {noise:.1}"));
+        }
+        if let Some(offset) = telemetry.estimated_frequency_offset_hz {
+            status.push_str(&format!(" · CFO {offset:+.0} Hz"));
+        }
+        if telemetry.timing_locked {
+            status.push_str(&format!(
+                " · timing {:.0}%",
+                telemetry.timing_lock_quality * 100.0
+            ));
+        }
+    }
     selectable_overlay_label(
         ui,
         title_rect,

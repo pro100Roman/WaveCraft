@@ -1,5 +1,12 @@
 use crate::DspError;
+use std::collections::VecDeque;
 use std::ops::Range;
+
+const TRANSITION_HYSTERESIS: f32 = 0.12;
+const ACQUISITION_TRANSITIONS: usize = 4;
+const MAX_ACQUISITION_INTERVALS: usize = 8;
+const MAX_LOCKED_PHASE_ERROR_SYMBOLS: f64 = 0.38;
+const BAD_TRANSITIONS_BEFORE_UNLOCK: u8 = 3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TimingRecoveryConfig {
@@ -62,6 +69,11 @@ pub struct SymbolTimingRecovery {
     previous_sample: Option<TimedScalarSample>,
     next_input_sample: u64,
     locked: bool,
+    slicer_level: Option<bool>,
+    acquisition_intervals: VecDeque<f64>,
+    bad_transition_count: u8,
+    lock_quality: f32,
+    pending_crossing_sample: Option<f64>,
 }
 
 impl SymbolTimingRecovery {
@@ -79,6 +91,11 @@ impl SymbolTimingRecovery {
             previous_sample: None,
             next_input_sample: 0,
             locked: false,
+            slicer_level: None,
+            acquisition_intervals: VecDeque::with_capacity(MAX_ACQUISITION_INTERVALS),
+            bad_transition_count: 0,
+            lock_quality: 0.0,
+            pending_crossing_sample: None,
         })
     }
 
@@ -97,6 +114,11 @@ impl SymbolTimingRecovery {
         self.previous_sample = None;
         self.next_input_sample = 0;
         self.locked = false;
+        self.slicer_level = None;
+        self.acquisition_intervals.clear();
+        self.bad_transition_count = 0;
+        self.lock_quality = 0.0;
+        self.pending_crossing_sample = None;
     }
 
     pub fn is_locked(&self) -> bool {
@@ -106,6 +128,11 @@ impl SymbolTimingRecovery {
     pub fn estimated_symbol_rate_hz(&self) -> Option<f64> {
         (self.locked && self.period_samples > 0.0)
             .then(|| self.sample_rate_hz.unwrap_or_default() as f64 / self.period_samples)
+    }
+
+    /// Normalized confidence in the current timing lock.
+    pub fn lock_quality(&self) -> f32 {
+        self.lock_quality
     }
 
     pub fn push(
@@ -143,14 +170,35 @@ impl SymbolTimingRecovery {
                 ));
             }
 
-            if crossed_threshold(previous.value, sample.value) {
+            if let Some(crossing) =
+                zero_crossing_time(previous.value, sample.value, current_sample_index - 1.0)
+            {
+                match self.slicer_level {
+                    Some(false) if previous.value <= 0.0 && sample.value > 0.0 => {
+                        self.pending_crossing_sample = Some(crossing);
+                    }
+                    Some(false) if previous.value > 0.0 && sample.value <= 0.0 => {
+                        self.pending_crossing_sample = None;
+                    }
+                    Some(true) if previous.value >= 0.0 && sample.value < 0.0 => {
+                        self.pending_crossing_sample = Some(crossing);
+                    }
+                    Some(true) if previous.value < 0.0 && sample.value >= 0.0 => {
+                        self.pending_crossing_sample = None;
+                    }
+                    _ => {}
+                }
+            }
+            if self.observe_slicer_level(sample.value) {
                 let denominator = f64::from(previous.value.abs() + sample.value.abs());
-                let fraction = if denominator > f64::EPSILON {
-                    f64::from(previous.value.abs()) / denominator
-                } else {
-                    0.5
-                };
-                self.observe_transition(current_sample_index - 1.0 + fraction);
+                let fallback = current_sample_index - 1.0
+                    + if denominator > f64::EPSILON {
+                        f64::from(previous.value.abs()) / denominator
+                    } else {
+                        0.5
+                    };
+                let transition_sample = self.pending_crossing_sample.take().unwrap_or(fallback);
+                self.observe_transition(transition_sample);
             }
 
             while let Some(center) = self.next_symbol_center_sample {
@@ -211,6 +259,22 @@ impl SymbolTimingRecovery {
             return;
         }
         let symbol_periods = (elapsed / self.period_samples).round().max(1.0) as u64;
+        let interval_period = elapsed / symbol_periods as f64;
+        if !self.locked {
+            let error_ppm = f64::from(self.config.max_clock_error_ppm) / 1_000_000.0;
+            let minimum_period = self.nominal_period_samples * (1.0 - error_ppm);
+            let maximum_period = self.nominal_period_samples * (1.0 + error_ppm);
+            if (minimum_period..=maximum_period).contains(&interval_period) {
+                self.acquisition_intervals.push_back(interval_period);
+                while self.acquisition_intervals.len() > MAX_ACQUISITION_INTERVALS {
+                    self.acquisition_intervals.pop_front();
+                }
+            } else {
+                self.acquisition_intervals.clear();
+                self.transition_reference_sample = Some(transition_sample);
+                self.observed_symbol_periods = 0;
+            }
+        }
         self.observed_symbol_periods = self.observed_symbol_periods.saturating_add(symbol_periods);
         let reference_transition = self
             .transition_reference_sample
@@ -222,14 +286,35 @@ impl SymbolTimingRecovery {
         let maximum_period = self.nominal_period_samples * (1.0 + error_ppm);
         let measured_period = measured_period.clamp(minimum_period, maximum_period);
 
-        if !self.locked {
+        if !self.locked && self.acquisition_intervals.len() >= ACQUISITION_TRANSITIONS - 1 {
             self.period_samples = measured_period;
             self.next_symbol_center_sample = Some(transition_sample + self.period_samples * 0.5);
             self.locked = true;
+            self.bad_transition_count = 0;
+            self.lock_quality = 0.5;
         } else {
+            if !self.locked {
+                self.last_transition_sample = Some(transition_sample);
+                return;
+            }
             let predicted_transition =
                 previous_transition + symbol_periods as f64 * self.period_samples;
             let phase_error = transition_sample - predicted_transition;
+            let normalized_error = phase_error.abs() / self.period_samples.max(f64::EPSILON);
+            if normalized_error > MAX_LOCKED_PHASE_ERROR_SYMBOLS {
+                self.bad_transition_count = self.bad_transition_count.saturating_add(1);
+                self.lock_quality = (self.lock_quality - 0.2).max(0.0);
+                if self.bad_transition_count >= BAD_TRANSITIONS_BEFORE_UNLOCK {
+                    self.reacquire_from(transition_sample);
+                    return;
+                }
+            } else {
+                self.bad_transition_count = self.bad_transition_count.saturating_sub(1);
+                let observation_quality =
+                    (1.0 - normalized_error / MAX_LOCKED_PHASE_ERROR_SYMBOLS) as f32;
+                self.lock_quality =
+                    (self.lock_quality * 0.9 + observation_quality * 0.1).clamp(0.0, 1.0);
+            }
             let rate_gain = self.config.loop_bandwidth * self.config.loop_bandwidth * 0.25;
             self.period_samples += rate_gain * (measured_period - self.period_samples);
             self.period_samples = self.period_samples.clamp(minimum_period, maximum_period);
@@ -239,10 +324,47 @@ impl SymbolTimingRecovery {
         }
         self.last_transition_sample = Some(transition_sample);
     }
+
+    fn observe_slicer_level(&mut self, value: f32) -> bool {
+        let next_level = match self.slicer_level {
+            None if value >= TRANSITION_HYSTERESIS => Some(true),
+            None if value <= -TRANSITION_HYSTERESIS => Some(false),
+            Some(false) if value >= TRANSITION_HYSTERESIS => Some(true),
+            Some(true) if value <= -TRANSITION_HYSTERESIS => Some(false),
+            level => level,
+        };
+        let transitioned =
+            self.slicer_level.is_some() && next_level.is_some() && self.slicer_level != next_level;
+        self.slicer_level = next_level;
+        transitioned
+    }
+
+    fn reacquire_from(&mut self, transition_sample: f64) {
+        self.locked = false;
+        self.next_symbol_center_sample = None;
+        self.transition_reference_sample = Some(transition_sample);
+        self.last_transition_sample = Some(transition_sample);
+        self.observed_symbol_periods = 0;
+        self.acquisition_intervals.clear();
+        self.bad_transition_count = 0;
+        self.lock_quality = 0.0;
+        self.pending_crossing_sample = None;
+        self.period_samples = self.nominal_period_samples;
+    }
 }
 
-fn crossed_threshold(previous: f32, current: f32) -> bool {
-    (previous < 0.0 && current >= 0.0) || (previous >= 0.0 && current < 0.0)
+fn zero_crossing_time(previous: f32, current: f32, previous_sample_index: f64) -> Option<f64> {
+    let crossed = (previous <= 0.0 && current > 0.0) || (previous >= 0.0 && current < 0.0);
+    if !crossed {
+        return None;
+    }
+    let denominator = f64::from(previous.abs() + current.abs());
+    let fraction = if denominator > f64::EPSILON {
+        f64::from(previous.abs()) / denominator
+    } else {
+        0.5
+    };
+    Some(previous_sample_index + fraction)
 }
 
 #[cfg(test)]
@@ -329,7 +451,7 @@ mod tests {
         let samples = alternating_samples(20, 1_000.0, 1.0, 0);
         let mut recovery = recovery();
         assert!(!recovery
-            .push(&samples[..24], SAMPLE_RATE_HZ, true)
+            .push(&samples[..40], SAMPLE_RATE_HZ, true)
             .unwrap()
             .is_empty());
         assert!(recovery.is_locked());
@@ -340,5 +462,23 @@ mod tests {
             .unwrap();
         assert!(output.is_empty());
         assert!(!recovery.is_locked());
+    }
+
+    #[test]
+    fn hysteresis_ignores_small_noise_crossings() {
+        let samples = (0..128)
+            .map(|index| TimedScalarSample {
+                value: if index % 2 == 0 { 0.05 } else { -0.05 },
+                source_range: index..index + 1,
+            })
+            .collect::<Vec<_>>();
+        let mut recovery = recovery();
+
+        assert!(recovery
+            .push(&samples, SAMPLE_RATE_HZ, true)
+            .unwrap()
+            .is_empty());
+        assert!(!recovery.is_locked());
+        assert_eq!(recovery.lock_quality(), 0.0);
     }
 }

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wavecraft_core::{CaptureBatch, CaptureCoordinator, CaptureEvent};
 use wavecraft_hackrf::{HackRfAdapter, HackRfRuntimeSettings};
 use wavecraft_sdr::{
@@ -19,8 +19,8 @@ fn discovers_and_receives_from_hackrf_one() {
         .open_with_runtime_control(
             &device,
             RadioCaptureSettings {
-                center_frequency_hz: 100_000_000,
-                sample_rate_hz: 2_000_000,
+                center_frequency_hz: 868_100_000,
+                sample_rate_hz: 8_000_000,
                 bandwidth_hz: 1_750_000,
                 receive_channel: 0,
                 sample_limit: None,
@@ -41,10 +41,10 @@ fn discovers_and_receives_from_hackrf_one() {
         panic!("HackRF should emit IQ batches");
     };
     assert!(!batch.samples.is_empty());
-    assert_eq!(batch.sample_rate_hz, 2_000_000);
+    assert_eq!(batch.sample_rate_hz, 8_000_000);
     control
         .update(HackRfRuntimeSettings {
-            center_frequency_hz: 101_000_000,
+            center_frequency_hz: 868_500_000,
             bandwidth_hz: 2_500_000,
             lna_gain_db: Some(24),
             vga_gain_db: Some(20),
@@ -61,7 +61,7 @@ fn discovers_and_receives_from_hackrf_one() {
                 let CaptureBatch::Iq(batch) = frame.payload else {
                     continue;
                 };
-                if batch.center_frequency_hz == 101_000_000 {
+                if batch.center_frequency_hz == 868_500_000 {
                     break batch;
                 }
             }
@@ -74,5 +74,26 @@ fn discovers_and_receives_from_hackrf_one() {
         }
     };
     assert!(retuned.discontinuity);
+    let shortfall_check_deadline = Instant::now() + Duration::from_millis(1_200);
+    let mut received_after_retune = 0_usize;
+    while Instant::now() < shortfall_check_deadline {
+        match session
+            .recv_timeout(Duration::from_millis(250))
+            .expect("HackRF should continue streaming while shortfalls are monitored")
+        {
+            CaptureEvent::Frame(frame) => {
+                if matches!(frame.payload, CaptureBatch::Iq(_)) {
+                    received_after_retune += 1;
+                }
+            }
+            CaptureEvent::SourceFailed { error, .. } => {
+                panic!("HackRF streaming or shortfall monitoring failed: {error}")
+            }
+            CaptureEvent::SourceStopped { .. } => {
+                panic!("HackRF stopped during shortfall monitoring")
+            }
+        }
+    }
+    assert!(received_after_retune > 0);
     session.stop().expect("HackRF should stop cleanly");
 }

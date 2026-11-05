@@ -25,6 +25,7 @@ use wavecraft_sdr::{
 const HACKRF_ONE_USB_PRODUCT_ID: c_int = 0x6089;
 const RECEIVE_QUEUE_CAPACITY: usize = 8;
 const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const SHORTFALL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_LNA_GAIN_DB: u32 = 16;
 const DEFAULT_VGA_GAIN_DB: u32 = 16;
 const MAX_FREQUENCY_CORRECTION_MILLI_PPM: i32 = 200_000;
@@ -335,10 +336,22 @@ impl HackRfCaptureSource {
         let mut frequency_correction_milli_ppm =
             self.provider_settings.frequency_correction_milli_ppm;
         let mut discontinuity = false;
+        let mut shortfall_poll = Instant::now();
 
         while !context.is_cancelled() {
             if let Some(error) = callback_state.failure() {
                 return Err(CaptureError::new(error));
+            }
+            if shortfall_poll.elapsed() >= SHORTFALL_POLL_INTERVAL {
+                if let Some(state) = self.runtime.m0_state(device)? {
+                    if state.num_shortfalls > 0 {
+                        return Err(CaptureError::new(format!(
+                            "HackRF reported {} RX shortfall(s); longest lost span was {} bytes",
+                            state.num_shortfalls, state.longest_shortfall
+                        )));
+                    }
+                }
+                shortfall_poll = Instant::now();
             }
 
             if let Some(settings) = self
@@ -660,6 +673,23 @@ type SetSampleRateFn = unsafe extern "C" fn(*mut HackRfDevice, f64) -> c_int;
 type SetU32Fn = unsafe extern "C" fn(*mut HackRfDevice, u32) -> c_int;
 type SetU8Fn = unsafe extern "C" fn(*mut HackRfDevice, u8) -> c_int;
 type ErrorNameFn = unsafe extern "C" fn(c_int) -> *const c_char;
+type GetM0StateFn = unsafe extern "C" fn(*mut HackRfDevice, *mut HackRfM0State) -> c_int;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct HackRfM0State {
+    requested_mode: u16,
+    request_flag: u16,
+    active_mode: u32,
+    m0_count: u32,
+    m4_count: u32,
+    num_shortfalls: u32,
+    longest_shortfall: u32,
+    shortfall_limit: u32,
+    threshold: u32,
+    next_mode: u32,
+    error: u32,
+}
 
 struct HackRfApi {
     _library: Library,
@@ -679,6 +709,7 @@ struct HackRfApi {
     set_vga_gain: SetU32Fn,
     set_amplifier: SetU8Fn,
     set_antenna_power: SetU8Fn,
+    get_m0_state: Option<GetM0StateFn>,
     error_name: ErrorNameFn,
 }
 
@@ -704,6 +735,7 @@ impl HackRfApi {
                 set_vga_gain: load_symbol(&library, b"hackrf_set_vga_gain\0")?,
                 set_amplifier: load_symbol(&library, b"hackrf_set_amp_enable\0")?,
                 set_antenna_power: load_symbol(&library, b"hackrf_set_antenna_enable\0")?,
+                get_m0_state: load_optional_symbol(&library, b"hackrf_get_m0_state\0"),
                 error_name: load_symbol(&library, b"hackrf_error_name\0")?,
                 _library: library,
             })
@@ -740,6 +772,11 @@ unsafe fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, Capt
                 String::from_utf8_lossy(&name[..name.len().saturating_sub(1)])
             ))
         })
+}
+
+unsafe fn load_optional_symbol<T: Copy>(library: &Library, name: &[u8]) -> Option<T> {
+    // SAFETY: the caller supplies the exact ABI type for the requested symbol.
+    unsafe { library.get::<T>(name) }.ok().map(|symbol| *symbol)
 }
 
 fn load_library(path: Option<&Path>) -> Result<Library, CaptureError> {
@@ -921,6 +958,18 @@ impl HackRfRuntime {
                 .check("querying HackRF receive stream", error)
                 .map(|()| false),
         }
+    }
+
+    fn m0_state(&self, device: *mut HackRfDevice) -> Result<Option<HackRfM0State>, CaptureError> {
+        let Some(get_m0_state) = self.api.get_m0_state else {
+            return Ok(None);
+        };
+        let mut state = HackRfM0State::default();
+        // SAFETY: `device` is open and `state` is valid writable storage for the C ABI struct.
+        let code = unsafe { get_m0_state(device, &mut state) };
+        self.api
+            .check("querying HackRF RX shortfall counters", code)?;
+        Ok(Some(state))
     }
 
     fn set_frequency(&self, device: *mut HackRfDevice, value: u64) -> Result<(), CaptureError> {

@@ -4,6 +4,9 @@ use std::f64::consts::{PI, TAU};
 use std::ops::Range;
 use wavecraft_core::IqBatch;
 
+const DC_TRACKING_GAIN: f64 = 1.0 / 16_384.0;
+const MIXER_RENORMALIZE_INTERVAL: u32 = 4_096;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChannelizerConfig {
     /// Signed channel offset from the input batch center frequency.
@@ -74,8 +77,14 @@ pub struct Channelizer {
     input_sample_rate_hz: Option<u64>,
     input_center_frequency_hz: Option<u64>,
     segment_start_sample_index: Option<u64>,
-    mixer_phase: f64,
-    mixer_step: f64,
+    mixer_i: f64,
+    mixer_q: f64,
+    mixer_step_i: f64,
+    mixer_step_q: f64,
+    mixer_samples_since_normalize: u32,
+    dc_i: f64,
+    dc_q: f64,
+    dc_initialized: bool,
     resample_accumulator: u64,
     pending_discontinuity: bool,
 }
@@ -92,8 +101,14 @@ impl Channelizer {
             input_sample_rate_hz: None,
             input_center_frequency_hz: None,
             segment_start_sample_index: None,
-            mixer_phase: 0.0,
-            mixer_step: 0.0,
+            mixer_i: 1.0,
+            mixer_q: 0.0,
+            mixer_step_i: 1.0,
+            mixer_step_q: 0.0,
+            mixer_samples_since_normalize: 0,
+            dc_i: 0.0,
+            dc_q: 0.0,
+            dc_initialized: false,
             resample_accumulator: 0,
             pending_discontinuity: false,
         })
@@ -111,8 +126,14 @@ impl Channelizer {
         self.input_sample_rate_hz = None;
         self.input_center_frequency_hz = None;
         self.segment_start_sample_index = None;
-        self.mixer_phase = 0.0;
-        self.mixer_step = 0.0;
+        self.mixer_i = 1.0;
+        self.mixer_q = 0.0;
+        self.mixer_step_i = 1.0;
+        self.mixer_step_q = 0.0;
+        self.mixer_samples_since_normalize = 0;
+        self.dc_i = 0.0;
+        self.dc_q = 0.0;
+        self.dc_initialized = false;
         self.resample_accumulator = 0;
         self.pending_discontinuity = true;
     }
@@ -132,13 +153,31 @@ impl Channelizer {
         let mut output = Vec::new();
         for (offset, sample) in batch.samples.iter().enumerate() {
             let source_index = batch.first_sample_index.saturating_add(offset as u64);
-            let oscillator = (self.mixer_phase.cos(), self.mixer_phase.sin());
-            let input = (f64::from(sample.i) / 128.0, f64::from(sample.q) / 128.0);
+            let raw = (f64::from(sample.i) / 128.0, f64::from(sample.q) / 128.0);
+            if !self.dc_initialized {
+                self.dc_initialized = true;
+            } else {
+                self.dc_i += DC_TRACKING_GAIN * (raw.0 - self.dc_i);
+                self.dc_q += DC_TRACKING_GAIN * (raw.1 - self.dc_q);
+            }
+            let input = (raw.0 - self.dc_i, raw.1 - self.dc_q);
             let mixed = (
-                input.0 * oscillator.0 - input.1 * oscillator.1,
-                input.0 * oscillator.1 + input.1 * oscillator.0,
+                input.0 * self.mixer_i - input.1 * self.mixer_q,
+                input.0 * self.mixer_q + input.1 * self.mixer_i,
             );
-            self.mixer_phase = wrap_phase(self.mixer_phase + self.mixer_step);
+            let next_i = self.mixer_i * self.mixer_step_i - self.mixer_q * self.mixer_step_q;
+            let next_q = self.mixer_i * self.mixer_step_q + self.mixer_q * self.mixer_step_i;
+            self.mixer_i = next_i;
+            self.mixer_q = next_q;
+            self.mixer_samples_since_normalize += 1;
+            if self.mixer_samples_since_normalize == MIXER_RENORMALIZE_INTERVAL {
+                let magnitude = self.mixer_i.hypot(self.mixer_q);
+                if magnitude > f64::EPSILON {
+                    self.mixer_i /= magnitude;
+                    self.mixer_q /= magnitude;
+                }
+                self.mixer_samples_since_normalize = 0;
+            }
 
             self.history.push_back((mixed.0, mixed.1, source_index));
             if self.history.len() > self.config.filter_tap_count {
@@ -235,10 +274,18 @@ impl Channelizer {
         self.input_sample_rate_hz = Some(batch.sample_rate_hz);
         self.input_center_frequency_hz = Some(batch.center_frequency_hz);
         self.segment_start_sample_index = Some(batch.first_sample_index);
-        self.mixer_step =
+        let mixer_step =
             -TAU * self.config.frequency_offset_hz as f64 / batch.sample_rate_hz as f64;
+        self.mixer_step_i = mixer_step.cos();
+        self.mixer_step_q = mixer_step.sin();
         let reduced_index = batch.first_sample_index % batch.sample_rate_hz;
-        self.mixer_phase = wrap_phase(self.mixer_step * reduced_index as f64);
+        let mixer_phase = wrap_phase(mixer_step * reduced_index as f64);
+        self.mixer_i = mixer_phase.cos();
+        self.mixer_q = mixer_phase.sin();
+        self.mixer_samples_since_normalize = 0;
+        self.dc_i = 0.0;
+        self.dc_q = 0.0;
+        self.dc_initialized = false;
         self.resample_accumulator = 0;
         self.pending_discontinuity = true;
     }

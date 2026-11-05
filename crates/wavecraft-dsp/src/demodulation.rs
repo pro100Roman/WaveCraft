@@ -153,10 +153,23 @@ pub enum DemodulatedBatch {
     Analog(TimedAnalogBatch),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DemodulatorTelemetry {
+    pub timing_locked: bool,
+    pub timing_lock_quality: f32,
+    pub estimated_symbol_rate_hz: Option<f64>,
+    pub estimated_frequency_offset_hz: Option<f64>,
+    pub estimated_tone_separation_hz: Option<f64>,
+}
+
 pub trait Demodulator: Send {
     fn reset(&mut self);
 
     fn push(&mut self, input: &ChannelizedBatch) -> Result<DemodulatedBatch, DspError>;
+
+    fn telemetry(&self) -> DemodulatorTelemetry {
+        DemodulatorTelemetry::default()
+    }
 }
 
 #[cfg(test)]

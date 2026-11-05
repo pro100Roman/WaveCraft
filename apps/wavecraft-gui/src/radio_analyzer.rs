@@ -1,16 +1,127 @@
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::thread::{self, JoinHandle};
 use wavecraft_core::IqBatch;
 use wavecraft_decode::{
     RawRadioConfig, RawRadioDecoder, RawRadioOutput, SampleRange, TimedBit, TimedBitBatch,
 };
 use wavecraft_dsp::{
     DemodulatedBatch, DemodulatorRegistry, SignalAnalyzer, SignalAnalyzerProfile, SpectrumFrame,
-    TimedSoftSymbolBatch,
+    SpectrumProcessor, TimedSoftSymbolBatch,
 };
+
+const SQUELCH_RELEASE_FRAMES: usize = 3;
+const AUTOMATIC_SQUELCH_MARGIN_DB: f32 = 8.0;
+const NOISE_FLOOR_RISE_GAIN: f32 = 0.005;
+const NOISE_FLOOR_FALL_GAIN: f32 = 0.2;
+const RADIO_DSP_INPUT_CAPACITY: usize = 8;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RadioAnalyzerTelemetry {
+    pub burst_active: bool,
+    pub channel_power_dbfs: Option<f32>,
+    pub noise_floor_dbfs: Option<f32>,
+    pub effective_squelch_dbfs: Option<f32>,
+    pub timing_locked: bool,
+    pub timing_lock_quality: f32,
+    pub estimated_symbol_rate_hz: Option<f64>,
+    pub estimated_frequency_offset_hz: Option<f64>,
+    pub estimated_tone_separation_hz: Option<f64>,
+}
 
 pub struct RadioAnalyzerOutput {
     pub demodulated: Option<DemodulatedBatch>,
     pub raw: RawRadioOutput,
     pub burst_ended: bool,
+    pub telemetry: RadioAnalyzerTelemetry,
+}
+
+pub struct RadioDspOutput {
+    pub spectrum: Vec<SpectrumFrame>,
+    pub analysis: Option<Result<RadioAnalyzerOutput, String>>,
+}
+
+struct RadioDspInput {
+    iq: IqBatch,
+    squelch_threshold_dbfs: f32,
+}
+
+/// Runs spectrum generation, channelization, and demodulation away from the UI thread.
+pub struct RadioDspWorker {
+    sender: Option<SyncSender<RadioDspInput>>,
+    receiver: Receiver<RadioDspOutput>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl RadioDspWorker {
+    pub fn start(
+        mut spectrum: SpectrumProcessor,
+        mut analyzer: Option<RadioAnalyzerRuntime>,
+    ) -> Self {
+        let (input_sender, input_receiver) =
+            mpsc::sync_channel::<RadioDspInput>(RADIO_DSP_INPUT_CAPACITY);
+        let (output_sender, output_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            while let Ok(input) = input_receiver.recv() {
+                let frames = spectrum.push(&input.iq);
+                let analysis = analyzer
+                    .as_mut()
+                    .map(|runtime| runtime.push(&input.iq, &frames, input.squelch_threshold_dbfs));
+                if analysis.as_ref().is_some_and(Result::is_err) {
+                    analyzer = None;
+                }
+                if output_sender
+                    .send(RadioDspOutput {
+                        spectrum: frames,
+                        analysis,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            sender: Some(input_sender),
+            receiver: output_receiver,
+            worker: Some(worker),
+        }
+    }
+
+    pub fn push(&self, iq: IqBatch, squelch_threshold_dbfs: f32) -> Result<(), String> {
+        self.sender
+            .as_ref()
+            .ok_or_else(|| "radio DSP worker is stopped".to_owned())?
+            .send(RadioDspInput {
+                iq,
+                squelch_threshold_dbfs,
+            })
+            .map_err(|_| "radio DSP worker disconnected".to_owned())
+    }
+
+    pub fn try_recv(&self) -> Result<RadioDspOutput, TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<RadioDspOutput>, String> {
+        self.sender.take();
+        if self
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err())
+        {
+            return Err("radio DSP worker panicked".to_owned());
+        }
+        Ok(self.receiver.try_iter().collect())
+    }
+}
+
+impl Drop for RadioDspWorker {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// Composition of the configured signal analyzer and raw-byte acquisition.
@@ -19,6 +130,11 @@ pub struct RadioAnalyzerRuntime {
     raw: RawRadioDecoder,
     channel_frequency_offset_hz: i64,
     channel_bandwidth_hz: u64,
+    burst_active: bool,
+    quiet_spectrum_frames: usize,
+    last_channel_power_dbfs: Option<f32>,
+    noise_floor_dbfs: Option<f32>,
+    effective_squelch_dbfs: Option<f32>,
 }
 
 impl RadioAnalyzerRuntime {
@@ -35,6 +151,11 @@ impl RadioAnalyzerRuntime {
             raw,
             channel_frequency_offset_hz,
             channel_bandwidth_hz,
+            burst_active: false,
+            quiet_spectrum_frames: 0,
+            last_channel_power_dbfs: None,
+            noise_floor_dbfs: None,
+            effective_squelch_dbfs: None,
         })
     }
 
@@ -44,23 +165,64 @@ impl RadioAnalyzerRuntime {
         spectrum: &[SpectrumFrame],
         squelch_threshold_dbfs: f32,
     ) -> Result<RadioAnalyzerOutput, String> {
-        if self.raw.is_synchronized()
-            && !spectrum.is_empty()
-            && !spectrum.iter().any(|frame| {
+        let powers = spectrum
+            .iter()
+            .filter_map(|frame| {
                 channel_power_dbfs(
                     frame,
                     self.channel_frequency_offset_hz,
                     self.channel_bandwidth_hz,
                 )
-                .is_some_and(|power| power >= squelch_threshold_dbfs)
             })
-        {
+            .collect::<Vec<_>>();
+        self.last_channel_power_dbfs = powers.iter().copied().max_by(f32::total_cmp);
+        if !self.burst_active && !powers.is_empty() {
+            let mut sorted = powers.clone();
+            sorted.sort_by(f32::total_cmp);
+            let observation = sorted[sorted.len() / 5];
+            self.noise_floor_dbfs = Some(self.noise_floor_dbfs.map_or(observation, |noise| {
+                let gain = if observation < noise {
+                    NOISE_FLOOR_FALL_GAIN
+                } else {
+                    NOISE_FLOOR_RISE_GAIN
+                };
+                noise + gain * (observation - noise)
+            }));
+        }
+        let effective_squelch_dbfs = self
+            .noise_floor_dbfs
+            .map(|noise| squelch_threshold_dbfs.min(noise + AUTOMATIC_SQUELCH_MARGIN_DB))
+            .unwrap_or(squelch_threshold_dbfs);
+        self.effective_squelch_dbfs = Some(effective_squelch_dbfs);
+        let signal_present = powers.iter().any(|power| *power >= effective_squelch_dbfs);
+        if signal_present {
+            if !self.burst_active {
+                self.signal.reset();
+                self.raw.reset();
+            }
+            self.burst_active = true;
+            self.quiet_spectrum_frames = 0;
+        } else if self.burst_active && !powers.is_empty() {
+            self.quiet_spectrum_frames = self.quiet_spectrum_frames.saturating_add(powers.len());
+        }
+        if self.burst_active && self.quiet_spectrum_frames >= SQUELCH_RELEASE_FRAMES {
             let raw = self.raw.finish();
             self.signal.reset();
+            self.burst_active = false;
+            self.quiet_spectrum_frames = 0;
             return Ok(RadioAnalyzerOutput {
                 demodulated: None,
                 raw,
                 burst_ended: true,
+                telemetry: self.telemetry(),
+            });
+        }
+        if !self.burst_active {
+            return Ok(RadioAnalyzerOutput {
+                demodulated: None,
+                raw: RawRadioOutput::default(),
+                burst_ended: false,
+                telemetry: self.telemetry(),
             });
         }
         let demodulated = self.signal.push(input).map_err(|error| error.to_string())?;
@@ -73,7 +235,23 @@ impl RadioAnalyzerRuntime {
             demodulated: Some(demodulated),
             raw,
             burst_ended: false,
+            telemetry: self.telemetry(),
         })
+    }
+
+    fn telemetry(&self) -> RadioAnalyzerTelemetry {
+        let demodulator = self.signal.telemetry();
+        RadioAnalyzerTelemetry {
+            burst_active: self.burst_active,
+            channel_power_dbfs: self.last_channel_power_dbfs,
+            noise_floor_dbfs: self.noise_floor_dbfs,
+            effective_squelch_dbfs: self.effective_squelch_dbfs,
+            timing_locked: demodulator.timing_locked,
+            timing_lock_quality: demodulator.timing_lock_quality,
+            estimated_symbol_rate_hz: demodulator.estimated_symbol_rate_hz,
+            estimated_frequency_offset_hz: demodulator.estimated_frequency_offset_hz,
+            estimated_tone_separation_hz: demodulator.estimated_tone_separation_hz,
+        }
     }
 }
 
@@ -210,10 +388,41 @@ mod tests {
     }
 
     #[test]
+    fn radio_dsp_worker_processes_all_queued_iq_before_finishing() {
+        let spectrum = SpectrumProcessor::new(8, wavecraft_dsp::SpectrumWindow::Hann).unwrap();
+        let mut worker = RadioDspWorker::start(spectrum, None);
+        for first_sample_index in [0, 8] {
+            worker
+                .push(
+                    IqBatch {
+                        sample_rate_hz: 8_000,
+                        center_frequency_hz: 100_000_000,
+                        first_sample_index,
+                        discontinuity: first_sample_index == 0,
+                        samples: vec![Iq8 { i: 64, q: 0 }; 8],
+                    },
+                    -50.0,
+                )
+                .unwrap();
+        }
+
+        let outputs = worker.finish().unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.iter().all(|output| output.spectrum.len() == 1));
+        assert!(outputs.iter().all(|output| output.analysis.is_none()));
+        assert_eq!(outputs[0].spectrum[0].source_range, 0..8);
+        assert_eq!(outputs[1].spectrum[0].source_range, 8..16);
+    }
+
+    #[test]
     fn closes_a_synchronized_raw_message_below_the_channel_threshold() {
         let raw_config = RawRadioConfig {
             preamble_byte: 0xaa,
             preamble_bytes: 1,
+            sync_word: 0,
+            sync_word_bytes: 0,
+            maximum_preamble_bit_errors: 0,
             bit_order: BitOrder::MostSignificantFirst,
             minimum_bit_confidence_milli: 500,
             maximum_uncertain_bits: 0,
@@ -239,6 +448,7 @@ mod tests {
             })
             .unwrap();
         assert!(runtime.raw.is_synchronized());
+        runtime.burst_active = true;
         let quiet_spectrum = SpectrumFrame {
             source_range: 0..8,
             center_frequency_hz: 100_000_000,
@@ -255,7 +465,11 @@ mod tests {
                     discontinuity: false,
                     samples: vec![Iq8 { i: 0, q: 0 }; 8],
                 },
-                &[quiet_spectrum],
+                &[
+                    quiet_spectrum.clone(),
+                    quiet_spectrum.clone(),
+                    quiet_spectrum,
+                ],
                 -50.0,
             )
             .unwrap();
