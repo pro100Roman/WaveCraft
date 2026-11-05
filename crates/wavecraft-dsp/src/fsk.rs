@@ -119,6 +119,8 @@ pub struct FskDemodulator {
     symbol_range: Option<Range<u64>>,
     gaussian_filter: Vec<f64>,
     gaussian_history: VecDeque<DiscriminatorSample>,
+    gaussian_started: bool,
+    carrier_acquisition: VecDeque<DiscriminatorSample>,
     timing_recovery: Option<SymbolTimingRecovery>,
     tone_tracker: ToneTracker,
 }
@@ -128,6 +130,7 @@ struct DiscriminatorSample {
     likelihood: f64,
     effective_source_index: u64,
     source_range: Range<u64>,
+    tone_acquisition_eligible: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -184,6 +187,16 @@ impl ToneTracker {
             self.lower = Some(lower);
             self.upper = Some(upper);
         }
+        self.normalize_acquired(value)
+    }
+
+    fn is_acquired(&self) -> bool {
+        self.lower.is_some() && self.upper.is_some()
+    }
+
+    fn normalize_acquired(&self, value: f64) -> Option<f64> {
+        let lower = self.lower?;
+        let upper = self.upper?;
         let midpoint = (lower + upper) * 0.5;
         let half_separation = ((upper - lower) * 0.5).max(MIN_TONE_SEPARATION * 0.5);
         Some((value - midpoint) / half_separation)
@@ -226,6 +239,8 @@ impl FskDemodulator {
             symbol_range: None,
             gaussian_filter: Vec::new(),
             gaussian_history: VecDeque::new(),
+            gaussian_started: false,
+            carrier_acquisition: VecDeque::new(),
             timing_recovery,
             tone_tracker: ToneTracker::default(),
         })
@@ -281,6 +296,8 @@ impl FskDemodulator {
         self.symbol_range = None;
         self.gaussian_filter.clear();
         self.gaussian_history.clear();
+        self.gaussian_started = false;
+        self.carrier_acquisition.clear();
         self.tone_tracker.reset();
         if let Some(timing_recovery) = &mut self.timing_recovery {
             timing_recovery.reset();
@@ -354,32 +371,63 @@ impl FskDemodulator {
                 likelihood: frequency_hz / self.config.deviation_hz as f64,
                 effective_source_index: effective_index,
                 source_range: previous.source_range.start..sample.source_range.end,
+                tone_acquisition_eligible: true,
             };
-            let Some(mut discriminator) = self.filter_discriminator(discriminator) else {
-                continue;
-            };
-            if matches!(self.config.timing, FskTiming::Adaptive { .. }) {
-                let acquisition_samples = carrier_acquisition_sample_count(
-                    batch.sample_rate_hz,
-                    self.config.symbol_rate_hz,
-                );
-                let Some(normalized) = self
-                    .tone_tracker
-                    .normalize(discriminator.likelihood, acquisition_samples)
-                else {
-                    continue;
-                };
-                discriminator.likelihood = normalized;
-            }
-            if self.config.polarity == FskPolarity::Inverted {
-                discriminator.likelihood = -discriminator.likelihood;
-            }
-            match self.config.timing {
-                FskTiming::Fixed => self.push_fixed_sample(discriminator, batch, &mut bits)?,
-                FskTiming::Adaptive { .. } => timing_samples.push(TimedScalarSample {
-                    value: discriminator.likelihood as f32,
-                    source_range: discriminator.source_range,
-                }),
+            for mut discriminator in self.filter_discriminator(discriminator) {
+                if matches!(self.config.timing, FskTiming::Adaptive { .. }) {
+                    let acquisition_samples = carrier_acquisition_sample_count(
+                        batch.sample_rate_hz,
+                        self.config.symbol_rate_hz,
+                    );
+                    if !self.tone_tracker.is_acquired() {
+                        self.carrier_acquisition.push_back(discriminator.clone());
+                        let retained_acquisition_samples =
+                            acquisition_samples.saturating_add(self.gaussian_filter.len() / 2);
+                        while self.carrier_acquisition.len() > retained_acquisition_samples {
+                            self.carrier_acquisition.pop_front();
+                        }
+                        if !discriminator.tone_acquisition_eligible {
+                            continue;
+                        }
+                        if self
+                            .tone_tracker
+                            .normalize(discriminator.likelihood, acquisition_samples)
+                            .is_none()
+                        {
+                            continue;
+                        }
+                        for mut acquired in self.carrier_acquisition.drain(..) {
+                            acquired.likelihood = self
+                                .tone_tracker
+                                .normalize_acquired(acquired.likelihood)
+                                .ok_or_else(|| {
+                                    DspError::new("FSK tone acquisition lost its tone centres")
+                                })?;
+                            if self.config.polarity == FskPolarity::Inverted {
+                                acquired.likelihood = -acquired.likelihood;
+                            }
+                            timing_samples.push(TimedScalarSample {
+                                value: acquired.likelihood as f32,
+                                source_range: acquired.source_range,
+                            });
+                        }
+                        continue;
+                    }
+                    discriminator.likelihood = self
+                        .tone_tracker
+                        .normalize(discriminator.likelihood, acquisition_samples)
+                        .ok_or_else(|| DspError::new("FSK tone tracking lost its tone centres"))?;
+                }
+                if self.config.polarity == FskPolarity::Inverted {
+                    discriminator.likelihood = -discriminator.likelihood;
+                }
+                match self.config.timing {
+                    FskTiming::Fixed => self.push_fixed_sample(discriminator, batch, &mut bits)?,
+                    FskTiming::Adaptive { .. } => timing_samples.push(TimedScalarSample {
+                        value: discriminator.likelihood as f32,
+                        source_range: discriminator.source_range,
+                    }),
+                }
             }
         }
         if let Some(timing_recovery) = &mut self.timing_recovery {
@@ -444,31 +492,56 @@ impl FskDemodulator {
         Ok(())
     }
 
-    fn filter_discriminator(&mut self, sample: DiscriminatorSample) -> Option<DiscriminatorSample> {
+    fn filter_discriminator(&mut self, sample: DiscriminatorSample) -> Vec<DiscriminatorSample> {
         if matches!(self.config.modulation, FskModulation::Fsk) {
-            return Some(sample);
+            return vec![sample];
         }
 
         self.gaussian_history.push_back(sample);
         if self.gaussian_history.len() < self.gaussian_filter.len() {
-            return None;
+            return Vec::new();
         }
-        let likelihood = self
-            .gaussian_history
-            .iter()
-            .zip(&self.gaussian_filter)
-            .map(|(sample, coefficient)| sample.likelihood * coefficient)
-            .sum();
         let midpoint = self.gaussian_filter.len() / 2;
-        let effective_source_index = self.gaussian_history.get(midpoint)?.effective_source_index;
-        let source_range = self.gaussian_history.front()?.source_range.start
-            ..self.gaussian_history.back()?.source_range.end;
+        let first_output =
+            if !self.gaussian_started && matches!(self.config.timing, FskTiming::Adaptive { .. }) {
+                0
+            } else {
+                midpoint
+            };
+        let history_start = self
+            .gaussian_history
+            .front()
+            .map(|sample| sample.source_range.start)
+            .unwrap_or_default();
+        let outputs = (first_output..=midpoint)
+            .map(|output_index| {
+                let likelihood = self
+                    .gaussian_filter
+                    .iter()
+                    .enumerate()
+                    .map(|(tap_index, coefficient)| {
+                        let history_index = (output_index as isize + tap_index as isize
+                            - midpoint as isize)
+                            .clamp(0, self.gaussian_history.len() as isize - 1)
+                            as usize;
+                        self.gaussian_history[history_index].likelihood * coefficient
+                    })
+                    .sum();
+                let range_end_index =
+                    (output_index + midpoint).min(self.gaussian_history.len().saturating_sub(1));
+                DiscriminatorSample {
+                    likelihood,
+                    effective_source_index: self.gaussian_history[output_index]
+                        .effective_source_index,
+                    source_range: history_start
+                        ..self.gaussian_history[range_end_index].source_range.end,
+                    tone_acquisition_eligible: output_index == midpoint,
+                }
+            })
+            .collect();
+        self.gaussian_started = true;
         self.gaussian_history.pop_front();
-        Some(DiscriminatorSample {
-            likelihood,
-            effective_source_index,
-            source_range,
-        })
+        outputs
     }
 
     fn validate_batch(&self, batch: &ChannelizedBatch) -> Result<(), DspError> {
@@ -1077,10 +1150,53 @@ mod tests {
             .map(|bit| bit.likelihood.is_sign_positive())
             .collect::<Vec<_>>();
 
-        assert!(demodulator.timing_locked());
+        assert!(
+            demodulator.timing_locked(),
+            "timing quality {}, carrier {:?}/{:?} Hz, recovered {} decisions: {decisions:?}",
+            demodulator.timing_lock_quality(),
+            demodulator.estimated_frequency_offset_hz(),
+            demodulator.estimated_tone_separation_hz(),
+            decisions.len()
+        );
         assert!(decisions.len() > 35);
         assert!(expected
             .windows(decisions.len())
             .any(|window| window == decisions));
+    }
+
+    #[test]
+    fn adaptive_gfsk_preserves_a_ten_byte_preamble_for_framing() {
+        let preamble = (0..80).map(|index| index % 2 == 0).collect::<Vec<_>>();
+        let payload = [
+            false, false, true, false, true, true, false, true, true, false, false, true, false,
+            true, true, false,
+        ];
+        let expected = preamble.iter().copied().chain(payload).collect::<Vec<_>>();
+        let samples = gfsk_samples(&expected, 0, 0.5);
+        let mut demodulator = FskDemodulator::new(FskConfig {
+            symbol_rate_hz: 1_000,
+            deviation_hz: 1_000,
+            modulation: FskModulation::Gfsk { bt: 0.5 },
+            polarity: FskPolarity::Normal,
+            timing: FskTiming::Adaptive {
+                loop_bandwidth: 0.2,
+                max_clock_error_ppm: 10_000,
+            },
+        })
+        .unwrap();
+
+        let decisions = demodulator
+            .push(&batch(samples, true, 0))
+            .unwrap()
+            .into_iter()
+            .map(|bit| bit.likelihood.is_sign_positive())
+            .collect::<Vec<_>>();
+
+        assert!(
+            decisions
+                .windows(preamble.len())
+                .any(|window| window == preamble),
+            "ten-byte preamble was not retained in {decisions:?}"
+        );
     }
 }

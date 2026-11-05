@@ -5,6 +5,9 @@ script_directory="$(cd "$(dirname "$0")" && pwd)"
 project_root="$(cd "$script_directory/.." && pwd)"
 bundle="$project_root/target/release/bundle/osx/WaveCraft.app"
 contents="$bundle/Contents"
+shim_source="$script_directory/macos-libhackrf-no-detach.c"
+shim_build_directory="$project_root/target/release/macos-shim"
+shim_library="$shim_build_directory/libwavecraft-libusb-no-detach.dylib"
 universal=false
 
 if [[ $# -gt 1 ]]; then
@@ -54,13 +57,38 @@ if "$universal"; then
         target/aarch64-apple-darwin/release/wavecraft-gui \
         target/x86_64-apple-darwin/release/wavecraft-gui \
         -output target/release/wavecraft-gui
+
+    mkdir -p "$shim_build_directory"
+    xcrun clang -arch arm64 \
+        -dynamiclib \
+        -undefined dynamic_lookup \
+        -o "$shim_build_directory/libwavecraft-libusb-no-detach-arm64.dylib" \
+        "$shim_source"
+    xcrun clang -arch x86_64 \
+        -dynamiclib \
+        -undefined dynamic_lookup \
+        -o "$shim_build_directory/libwavecraft-libusb-no-detach-x86_64.dylib" \
+        "$shim_source"
+    lipo -create \
+        "$shim_build_directory/libwavecraft-libusb-no-detach-arm64.dylib" \
+        "$shim_build_directory/libwavecraft-libusb-no-detach-x86_64.dylib" \
+        -output "$shim_library"
 else
     cargo build --release --locked -p wavecraft-gui
+    mkdir -p "$shim_build_directory"
+    xcrun clang \
+        -dynamiclib \
+        -undefined dynamic_lookup \
+        -o "$shim_library" \
+        "$shim_source"
 fi
 
 rm -rf "$bundle"
-mkdir -p "$contents/MacOS" "$contents/Resources"
-install -m 755 target/release/wavecraft-gui "$contents/MacOS/WaveCraft"
+mkdir -p "$contents/Frameworks" "$contents/MacOS" "$contents/Resources"
+install -m 755 packaging/macos/WaveCraft "$contents/MacOS/WaveCraft"
+install -m 755 target/release/wavecraft-gui "$contents/MacOS/WaveCraft-bin"
+install -m 755 "$shim_library" \
+    "$contents/Frameworks/libwavecraft-libusb-no-detach.dylib"
 cp packaging/macos/Info.plist "$contents/Info.plist"
 cp -R resources/fpga "$contents/Resources/fpga"
 /usr/libexec/PlistBuddy -c \
@@ -68,6 +96,9 @@ cp -R resources/fpga "$contents/Resources/fpga"
     "$contents/Info.plist"
 
 if command -v codesign >/dev/null 2>&1; then
+    codesign --force --sign - \
+        "$contents/Frameworks/libwavecraft-libusb-no-detach.dylib"
+    codesign --force --sign - "$contents/MacOS/WaveCraft-bin"
     codesign --force --deep --sign - "$bundle"
 fi
 

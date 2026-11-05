@@ -213,6 +213,23 @@ Launch the development build directly through Cargo with:
 cargo run -p wavecraft-gui
 ```
 
+On macOS, current `libhackrf` may fail to open HackRF One as a normal user
+because it asks `libusb` to detach a kernel driver before claiming the device's
+vendor-specific interface. macOS treats that detach as privileged whole-device
+capture even though HackRF interface 0 can be claimed directly. Use the scoped
+source launcher to skip only that unnecessary detach without running WaveCraft
+as root or modifying the Homebrew installation:
+
+```sh
+./scripts/run-wavecraft-hackrf-macos.sh
+```
+
+Pass `--release` to the launcher for an optimized source build. Physically
+reconnect HackRF before launching if it was previously opened with `sudo`, as
+macOS may retain the privileged-capture state until reconnection. Close other
+HackRF and WebUSB applications first because the device supports only one
+exclusive owner.
+
 Build the optimized release executable with:
 
 ```sh
@@ -245,9 +262,11 @@ open target/release/bundle/osx/WaveCraft.app
 ```
 
 Double-clicking `WaveCraft.app` launches the GUI without opening Terminal. The
-bundle includes the FPGA resources and the application locates them relative to
-its executable. Double-clicking the raw `target/release/wavecraft-gui` Unix binary
-will still open Terminal because it is not an application bundle.
+bundle includes the FPGA resources and the scoped macOS `libhackrf` workaround,
+and the application locates both relative to its executable. This lets HackRF
+One open as a normal user without `sudo`. Double-clicking the raw
+`target/release/wavecraft-gui` Unix binary will still open Terminal because it
+is not an application bundle and does not use the bundle launcher.
 
 Windows builds use the GUI subsystem and therefore do not create a console
 window when launched normally. Linux desktop packages should install a

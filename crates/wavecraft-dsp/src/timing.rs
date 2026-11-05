@@ -74,6 +74,7 @@ pub struct SymbolTimingRecovery {
     bad_transition_count: u8,
     lock_quality: f32,
     pending_crossing_sample: Option<f64>,
+    acquisition_samples: Vec<TimedScalarSample>,
 }
 
 impl SymbolTimingRecovery {
@@ -96,6 +97,7 @@ impl SymbolTimingRecovery {
             bad_transition_count: 0,
             lock_quality: 0.0,
             pending_crossing_sample: None,
+            acquisition_samples: Vec::new(),
         })
     }
 
@@ -119,6 +121,7 @@ impl SymbolTimingRecovery {
         self.bad_transition_count = 0;
         self.lock_quality = 0.0;
         self.pending_crossing_sample = None;
+        self.acquisition_samples.clear();
     }
 
     pub fn is_locked(&self) -> bool {
@@ -159,6 +162,9 @@ impl SymbolTimingRecovery {
         for sample in samples {
             let current_sample_index = self.next_input_sample as f64;
             self.next_input_sample = self.next_input_sample.saturating_add(1);
+            if !self.locked {
+                self.acquisition_samples.push(sample.clone());
+            }
             let Some(previous) = self.previous_sample.take() else {
                 self.previous_sample = Some(sample.clone());
                 continue;
@@ -212,8 +218,15 @@ impl SymbolTimingRecovery {
                         value: previous.value + (sample.value - previous.value) * fraction,
                         source_range: previous.source_range.start..sample.source_range.end,
                     });
+                } else if let Some(symbol) =
+                    interpolate_acquisition_sample(&self.acquisition_samples, center)
+                {
+                    recovered.push(symbol);
                 }
                 self.next_symbol_center_sample = Some(center + self.period_samples);
+            }
+            if self.locked {
+                self.acquisition_samples.clear();
             }
             self.previous_sample = Some(sample.clone());
         }
@@ -288,7 +301,8 @@ impl SymbolTimingRecovery {
 
         if !self.locked && self.acquisition_intervals.len() >= ACQUISITION_TRANSITIONS - 1 {
             self.period_samples = measured_period;
-            self.next_symbol_center_sample = Some(transition_sample + self.period_samples * 0.5);
+            self.next_symbol_center_sample =
+                Some((reference_transition - self.period_samples * 0.5).max(0.0));
             self.locked = true;
             self.bad_transition_count = 0;
             self.lock_quality = 0.5;
@@ -351,6 +365,21 @@ impl SymbolTimingRecovery {
         self.pending_crossing_sample = None;
         self.period_samples = self.nominal_period_samples;
     }
+}
+
+fn interpolate_acquisition_sample(
+    samples: &[TimedScalarSample],
+    center: f64,
+) -> Option<RecoveredSymbol> {
+    let lower_index = center.floor().max(0.0) as usize;
+    let upper_index = lower_index.saturating_add(1);
+    let lower = samples.get(lower_index)?;
+    let upper = samples.get(upper_index)?;
+    let fraction = (center - lower_index as f64).clamp(0.0, 1.0) as f32;
+    Some(RecoveredSymbol {
+        value: lower.value + (upper.value - lower.value) * fraction,
+        source_range: lower.source_range.start..upper.source_range.end,
+    })
 }
 
 fn zero_crossing_time(previous: f32, current: f32, previous_sample_index: f64) -> Option<f64> {

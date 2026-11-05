@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+
+contents_directory=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+shim_library="$contents_directory/Frameworks/libwavecraft-libusb-no-detach.dylib"
+wavecraft_binary="$contents_directory/MacOS/WaveCraft-bin"
+
+for libusb_library in \
+    /opt/homebrew/lib/libusb-1.0.dylib \
+    /usr/local/lib/libusb-1.0.dylib
+do
+    if [ -r "$libusb_library" ]; then
+        if [ -n "${DYLD_INSERT_LIBRARIES:-}" ]; then
+            DYLD_INSERT_LIBRARIES="$libusb_library:$shim_library:$DYLD_INSERT_LIBRARIES"
+        else
+            DYLD_INSERT_LIBRARIES="$libusb_library:$shim_library"
+        fi
+        export DYLD_INSERT_LIBRARIES
+        break
+    fi
+done
+
+exec "$wavecraft_binary" "$@"
