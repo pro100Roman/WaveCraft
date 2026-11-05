@@ -3646,21 +3646,6 @@ impl WaveCraftApp {
         app
     }
 
-    fn active_saved_capture_settings_kind(&self) -> Option<SavedCaptureSettingsKind> {
-        match self.active_waveform_tab {
-            Some(WaveformTab::LogicAnalyzer) => Some(SavedCaptureSettingsKind::LogicAnalyzer),
-            Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
-                Some(SavedCaptureSettingsKind::Oscilloscope)
-            }
-            Some(WaveformTab::RadioReceiver) => Some(SavedCaptureSettingsKind::RadioFrequency),
-            Some(WaveformTab::Combined) => Some(match self.active_capture_settings_tab {
-                CaptureSettingsTab::DsLogic => SavedCaptureSettingsKind::LogicAnalyzer,
-                CaptureSettingsTab::DsCope => SavedCaptureSettingsKind::Oscilloscope,
-            }),
-            None => None,
-        }
-    }
-
     fn apply_saved_capture_settings(&mut self) {
         if let Some(profile) = self.saved_capture_settings.profiles.logic_analyzer.as_ref() {
             self.logic_settings = logic_settings_from_recording_metadata(&profile.values);
@@ -6628,7 +6613,7 @@ fn paint_capture_settings(
     visualization_editor: ScopeVisualizationSettingsEditor<'_>,
     availability: CaptureSettingsAvailability,
     calibration_action: &mut Option<ScopeCalibrationAction>,
-) {
+) -> bool {
     let LogicCaptureSettingsEditor {
         settings: logic_settings,
         speed: logic_speed,
@@ -6650,7 +6635,7 @@ fn paint_capture_settings(
         scope_channel_names,
     } = visualization_editor;
     let card_width = ui.available_width();
-    egui::Frame::none()
+    let save_clicked = egui::Frame::none()
         .fill(BACKGROUND)
         .rounding(egui::Rounding::same(6.0))
         .inner_margin(egui::Margin::same(10.0))
@@ -7422,8 +7407,44 @@ fn paint_capture_settings(
                     }
                 }
             }
-        });
+            paint_capture_settings_save_button(
+                ui,
+                match tab {
+                    CaptureSettingsTab::DsLogic => SavedCaptureSettingsKind::LogicAnalyzer,
+                    CaptureSettingsTab::DsCope => SavedCaptureSettingsKind::Oscilloscope,
+                },
+                availability.capture,
+            )
+        })
+        .inner;
     scope_settings.clamp_to_channel_limits();
+    save_clicked
+}
+
+fn paint_capture_settings_save_button(
+    ui: &mut egui::Ui,
+    kind: SavedCaptureSettingsKind,
+    enabled: bool,
+) -> bool {
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 20.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            ui.add_space(8.0);
+            ui.add_enabled(
+                enabled,
+                toolbar_action_button(&format!("💾 Save {} settings", kind.label()), ACCENT)
+                    .small()
+                    .min_size(Vec2::new(136.0, 20.0)),
+            )
+            .on_hover_text("Replace the saved defaults for this instrument type")
+            .clicked()
+        },
+    )
+    .inner
 }
 
 fn paint_logic_marker_settings(
@@ -8491,7 +8512,8 @@ fn paint_radio_capture_settings(
     enabled: bool,
     runtime_enabled: bool,
     trigger_runtime_enabled: bool,
-) {
+    show_save_button: bool,
+) -> bool {
     ui.add_space(10.0);
     let card_width = ui.available_width();
     egui::Frame::none()
@@ -8527,7 +8549,14 @@ fn paint_radio_capture_settings(
                         enabled,
                     );
                 });
-        });
+            show_save_button
+                && paint_capture_settings_save_button(
+                    ui,
+                    SavedCaptureSettingsKind::RadioFrequency,
+                    enabled,
+                )
+        })
+        .inner
 }
 
 fn paint_scaled_u64_value(
@@ -9835,17 +9864,9 @@ impl eframe::App for WaveCraftApp {
             )
             .show(context, |ui| {
                 let available_capture_settings_tabs = self.available_capture_settings_tabs();
-                let saved_settings_kind = self.active_saved_capture_settings_kind();
                 let content_width = ui.available_width();
-                let footer_height = if saved_settings_kind.is_some() {
-                    42.0
-                } else {
-                    0.0
-                };
-                let scroll_height = (ui.available_height() - footer_height).max(0.0);
                 egui::ScrollArea::vertical()
                     .max_width(content_width)
-                    .max_height(scroll_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(content_width);
@@ -9876,14 +9897,18 @@ impl eframe::App for WaveCraftApp {
                                 selected_radio(&self.radios, self.selected_radio_id.as_deref())
                                     .cloned()
                             {
-                                paint_radio_capture_settings(
+                                if paint_radio_capture_settings(
                                     ui,
                                     &radio,
                                     &mut self.radio_settings,
                                     capture_settings_enabled,
                                     radio_runtime_controls_enabled,
                                     radio_trigger_runtime_controls_enabled,
-                                );
+                                    true,
+                                ) {
+                                    save_capture_settings_kind =
+                                        Some(SavedCaptureSettingsKind::RadioFrequency);
+                                }
                             }
                         }
                         if self.active_waveform_tab.is_some() {
@@ -9910,8 +9935,8 @@ impl eframe::App for WaveCraftApp {
                                 )
                                 .color(TEXT_MUTED),
                             );
-                        } else if self.active_waveform_tab != Some(WaveformTab::RadioReceiver) {
-                            paint_capture_settings(
+                        } else if self.active_waveform_tab != Some(WaveformTab::RadioReceiver)
+                            && paint_capture_settings(
                                 ui,
                                 self.active_capture_settings_tab,
                                 LogicCaptureSettingsEditor {
@@ -9943,41 +9968,19 @@ impl eframe::App for WaveCraftApp {
                                     manual_calibration: manual_calibration_enabled,
                                 },
                                 &mut calibration_action,
-                            );
+                            )
+                        {
+                            save_capture_settings_kind =
+                                Some(match self.active_capture_settings_tab {
+                                    CaptureSettingsTab::DsLogic => {
+                                        SavedCaptureSettingsKind::LogicAnalyzer
+                                    }
+                                    CaptureSettingsTab::DsCope => {
+                                        SavedCaptureSettingsKind::Oscilloscope
+                                    }
+                                });
                         }
                     });
-                if let Some(kind) = saved_settings_kind {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(content_width, footer_height),
-                        egui::Layout::bottom_up(egui::Align::Min),
-                        |ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.add_space(8.0);
-                                    if ui
-                                        .add_enabled(
-                                            capture_settings_enabled,
-                                            toolbar_action_button(
-                                                &format!("Save {} settings", kind.label()),
-                                                ACCENT,
-                                            )
-                                            .min_size(Vec2::new(136.0, 24.0)),
-                                        )
-                                        .on_hover_text(
-                                            "Replace the saved defaults for this instrument type",
-                                        )
-                                        .clicked()
-                                    {
-                                        save_capture_settings_kind = Some(kind);
-                                    }
-                                },
-                            );
-                            ui.add_space(6.0);
-                            ui.separator();
-                        },
-                    );
-                }
             });
 
         if let Some(kind) = save_capture_settings_kind {
@@ -10917,6 +10920,7 @@ impl eframe::App for WaveCraftApp {
                             !settings_locked,
                             radio_runtime_controls_enabled,
                             radio_trigger_runtime_controls_enabled,
+                            false,
                         );
                     }
 
