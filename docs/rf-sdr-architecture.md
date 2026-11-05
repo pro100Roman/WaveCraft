@@ -248,9 +248,12 @@ options.
 Retuning clears the waterfall or starts a visibly separate segment because its
 rows no longer share one frequency axis.
 
-The initial RF view remains separate from the current Combined view. A future
-combined RF/logic/scope view may align panes on coordinator time, but it must
-retain the same warning that independent sample clocks are not phase-locked.
+The RF view remains visually separate from the logic/scope panes, but a
+Combined acquisition includes the selected radio in the same coordinator
+session. Operators can switch to the RF Spectrum tab while DSLogic and DSCope
+continue running. A future unified three-pane view may align all panes on
+coordinator time, but it must retain the warning that independent sample clocks
+are not phase-locked.
 
 RF **Single** capture has an explicit duration stored in milliseconds and
 displayed in seconds. Without a trigger, the application derives its exact

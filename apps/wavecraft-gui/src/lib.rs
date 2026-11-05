@@ -1366,7 +1366,7 @@ fn capture_settings_tabs_for_view(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum CaptureTarget {
     LogicAnalyzer,
     Oscilloscope,
@@ -1404,6 +1404,29 @@ impl CaptureTarget {
 
     fn includes_logic_analyzer(self) -> bool {
         matches!(self, Self::LogicAnalyzer | Self::Combined)
+    }
+
+    fn includes_radio_receiver(self) -> bool {
+        matches!(self, Self::RadioReceiver | Self::Combined)
+    }
+
+    fn captures_selected_radio(self, has_selected_radio: bool) -> bool {
+        self == Self::RadioReceiver || (self == Self::Combined && has_selected_radio)
+    }
+
+    fn includes(self, target: Self) -> bool {
+        self == target
+            || (self == Self::Combined
+                && matches!(
+                    target,
+                    Self::LogicAnalyzer | Self::Oscilloscope | Self::RadioReceiver
+                ))
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        (self.includes_logic_analyzer() && other.includes_logic_analyzer())
+            || (self.includes_oscilloscope() && other.includes_oscilloscope())
+            || (self.includes_radio_receiver() && other.includes_radio_receiver())
     }
 }
 
@@ -3473,11 +3496,12 @@ struct WaveCraftApp {
     manual_calibration_save_requested: Option<DsCopeCalibrationValues>,
     record_capture: bool,
     recording_path: String,
-    capture_run_requested: bool,
+    capture_requests: HashSet<CaptureTarget>,
     requested_capture_target: Option<CaptureTarget>,
     logic_acquisition_mode: AcquisitionMode,
     repetitive_interval_seconds: f32,
     scheduled_repetitive_capture: Option<ScheduledRepetitiveCapture>,
+    queued_capture_rearms: Vec<(AcquisitionMode, CaptureTarget)>,
     devices: Vec<DeviceEntry>,
     selected_logic_device_id: Option<String>,
     selected_scope_device_id: Option<String>,
@@ -3526,7 +3550,7 @@ struct WaveCraftApp {
     calibration_active: bool,
     calibration_modal: Option<CalibrationProgressModal>,
     usb_speed_warning: Option<UsbSpeedWarning>,
-    capture: Option<ActiveCapture>,
+    captures: Vec<ActiveCapture>,
     logic_sessions: SessionTabs<CompletedCapture, LogicSessionSettings>,
     scope_sessions: SessionTabs<CompletedCapture, ScopeSessionSettings>,
     session_name_editor: Option<SessionNameEditor>,
@@ -3567,11 +3591,12 @@ impl WaveCraftApp {
             manual_calibration_save_requested: None,
             record_capture: false,
             recording_path: "capture.dsv".to_owned(),
-            capture_run_requested: false,
+            capture_requests: HashSet::new(),
             requested_capture_target: None,
             logic_acquisition_mode: AcquisitionMode::Single,
             repetitive_interval_seconds: 1.0,
             scheduled_repetitive_capture: None,
+            queued_capture_rearms: Vec::new(),
             devices: Vec::new(),
             selected_logic_device_id: None,
             selected_scope_device_id: None,
@@ -3620,7 +3645,7 @@ impl WaveCraftApp {
             calibration_active: false,
             calibration_modal: None,
             usb_speed_warning: None,
-            capture: None,
+            captures: Vec::new(),
             logic_sessions: SessionTabs::new(LogicSessionSettings::default()),
             scope_sessions: SessionTabs::new(ScopeSessionSettings::default()),
             session_name_editor: None,
@@ -3799,14 +3824,12 @@ impl WaveCraftApp {
     }
 
     fn begin_open_recording(&mut self, path: PathBuf) {
-        if self.is_busy() {
+        if self.pending.is_some() {
             return;
         }
         let (sender, receiver) = mpsc::channel();
         self.pending = Some(receiver);
-        self.capture_run_requested = false;
         self.requested_capture_target = None;
-        self.scheduled_repetitive_capture = None;
         self.scope_configuration_due = None;
         self.status = format!("Opening capture {}…", path.display());
         self.last_error = None;
@@ -3823,7 +3846,7 @@ impl WaveCraftApp {
     }
 
     fn begin_export_saleae(&mut self, path: PathBuf) {
-        if self.is_busy() {
+        if self.pending.is_some() {
             return;
         }
         let Some(completed) = self.displayed_completed_capture() else {
@@ -3857,12 +3880,13 @@ impl WaveCraftApp {
     }
 
     fn begin_refresh(&mut self) {
-        if self.pending.is_some() || self.capture.is_some() {
+        if self.pending.is_some() || !self.captures.is_empty() {
             return;
         }
         let (sender, receiver) = mpsc::channel();
-        self.capture_run_requested = false;
         self.requested_capture_target = None;
+        self.capture_requests.clear();
+        self.queued_capture_rearms.clear();
         self.scheduled_repetitive_capture = None;
         self.scope_capture_restart_requested = false;
         self.scope_configuration_due = None;
@@ -3968,16 +3992,21 @@ impl WaveCraftApp {
     }
 
     fn begin_capture(&mut self, mode: AcquisitionMode, target: CaptureTarget) {
-        if self.pending.is_some() || self.capture.is_some() {
+        let continuing_request = self.capture_is_requested(target);
+        if self.pending.is_some()
+            || self.capture_target_is_active(target)
+            || self
+                .capture_requests
+                .iter()
+                .any(|requested| *requested != target && requested.overlaps(target))
+        {
             return;
         }
-        if !self.capture_run_requested && target.includes_logic_analyzer() {
+        if !continuing_request && target.includes_logic_analyzer() {
             self.logic_marker_settings.clear();
         }
         self.scheduled_repetitive_capture = None;
         if self.record_capture && mode.runs_continuously() {
-            self.capture_run_requested = false;
-            self.requested_capture_target = None;
             self.record_capture = false;
             self.last_error =
                 Some("Complete-capture recording is available in Single mode only".to_owned());
@@ -3991,19 +4020,17 @@ impl WaveCraftApp {
         ) {
             Ok(devices) => devices,
             Err(error) => {
-                self.capture_run_requested = false;
-                self.requested_capture_target = None;
                 self.record_capture = false;
                 self.last_error = Some(error);
                 return;
             }
         };
-        let radio_request = if target == CaptureTarget::RadioReceiver {
+        let radio_request = if target.captures_selected_radio(
+            selected_radio(&self.radios, self.selected_radio_id.as_deref()).is_some(),
+        ) {
             match self.radio_capture_request(mode) {
                 Ok(request) => Some(request),
                 Err(error) => {
-                    self.capture_run_requested = false;
-                    self.requested_capture_target = None;
                     self.record_capture = false;
                     self.last_error = Some(error);
                     return;
@@ -4013,8 +4040,6 @@ impl WaveCraftApp {
             None
         };
         if self.record_capture && self.recording_path.trim().is_empty() {
-            self.capture_run_requested = false;
-            self.requested_capture_target = None;
             self.record_capture = false;
             self.last_error = Some("Enter a recording file path".to_owned());
             return;
@@ -4022,8 +4047,6 @@ impl WaveCraftApp {
         let scope_config = match self.scope_settings.capture_config() {
             Ok(config) => config,
             Err(error) => {
-                self.capture_run_requested = false;
-                self.requested_capture_target = None;
                 self.record_capture = false;
                 self.last_error = Some(error);
                 return;
@@ -4032,8 +4055,6 @@ impl WaveCraftApp {
         let logic_config = match self.logic_settings.capture_config() {
             Ok(config) => config,
             Err(error) => {
-                self.capture_run_requested = false;
-                self.requested_capture_target = None;
                 self.record_capture = false;
                 self.last_error = Some(error);
                 return;
@@ -4043,8 +4064,6 @@ impl WaveCraftApp {
         if matches!(mode, AcquisitionMode::Repetitive | AcquisitionMode::Loop)
             && target != CaptureTarget::LogicAnalyzer
         {
-            self.capture_run_requested = false;
-            self.requested_capture_target = None;
             self.record_capture = false;
             self.last_error = Some(
                 "Repetitive and Loop modes are available for Logic Analyzer capture only"
@@ -4055,18 +4074,17 @@ impl WaveCraftApp {
         if mode == AcquisitionMode::Loop
             && logic_config.operation_mode() != DsLogicOperationMode::Stream
         {
-            self.capture_run_requested = false;
-            self.requested_capture_target = None;
             self.record_capture = false;
             self.last_error = Some("Loop mode requires DSLogic Stream mode".to_owned());
             return;
         }
         let calibration_values = self.manual_calibration.as_ref().map(|editor| editor.values);
 
-        let retain_protocol_history =
-            mode == AcquisitionMode::Repetitive && self.capture_run_requested;
-        let continuing_loop = mode == AcquisitionMode::Loop && self.capture_run_requested;
-        self.capture_run_requested = true;
+        let retain_protocol_history = mode == AcquisitionMode::Repetitive && continuing_request;
+        let continuing_loop = mode == AcquisitionMode::Loop && continuing_request;
+        self.capture_requests.insert(target);
+        self.queued_capture_rearms
+            .retain(|(_, queued_target)| *queued_target != target);
         self.requested_capture_target = Some(target);
         let resource_directory = PathBuf::from(self.resource_directory.trim());
         let (sender, receiver) = mpsc::channel();
@@ -4117,7 +4135,7 @@ impl WaveCraftApp {
     }
 
     fn begin_scope_configuration(&mut self) {
-        if self.pending.is_some() || self.capture.is_some() {
+        if self.pending.is_some() || self.capture_target_is_active(CaptureTarget::Oscilloscope) {
             return;
         }
         self.scope_configuration_due = None;
@@ -4161,7 +4179,7 @@ impl WaveCraftApp {
     }
 
     fn begin_auto_calibration(&mut self) {
-        if self.is_busy() {
+        if self.pending.is_some() || self.capture_target_is_active(CaptureTarget::Oscilloscope) {
             return;
         }
         let Some(device) = self.selected_scope_device_for_operation() else {
@@ -4208,7 +4226,7 @@ impl WaveCraftApp {
     }
 
     fn begin_save_auto_calibration(&mut self, values: DsCopeCalibrationValues) {
-        if self.is_busy() {
+        if self.pending.is_some() || self.capture_target_is_active(CaptureTarget::Oscilloscope) {
             return;
         }
         let Some(device) = self.selected_scope_device_for_operation() else {
@@ -4243,7 +4261,7 @@ impl WaveCraftApp {
     }
 
     fn begin_manual_calibration(&mut self) {
-        if self.is_busy() {
+        if self.pending.is_some() || self.capture_target_is_active(CaptureTarget::Oscilloscope) {
             return;
         }
         let Some(device) = self.selected_scope_device_for_operation() else {
@@ -4270,13 +4288,13 @@ impl WaveCraftApp {
         if self.pending.is_some() || self.manual_calibration.is_some() {
             return;
         }
-        if let Some(active) = self.capture.as_ref() {
+        if let Some(active) = self.capture_for_target(CaptureTarget::Oscilloscope) {
             if active.mode != AcquisitionMode::Run {
                 return;
             }
+            active.session.request_stop();
             self.manual_calibration_load_requested = true;
             self.scope_capture_restart_requested = false;
-            active.session.request_stop();
             self.status = "Loading calibration while continuous acquisition pauses…".to_owned();
             self.last_error = None;
         } else {
@@ -4285,7 +4303,7 @@ impl WaveCraftApp {
     }
 
     fn begin_save_manual_calibration(&mut self, values: DsCopeCalibrationValues) {
-        if self.is_busy() {
+        if self.pending.is_some() || self.capture_target_is_active(CaptureTarget::Oscilloscope) {
             return;
         }
         let Some(device) = self.selected_scope_device_for_operation() else {
@@ -4321,10 +4339,10 @@ impl WaveCraftApp {
         if self.pending.is_some() {
             return;
         }
-        if let Some(active) = self.capture.as_ref() {
+        if let Some(active) = self.capture_for_target(CaptureTarget::Oscilloscope) {
+            active.session.request_stop();
             self.manual_calibration_save_requested = Some(values);
             self.scope_capture_restart_requested = false;
-            active.session.request_stop();
             self.status = "Pausing acquisition to save calibration…".to_owned();
             self.last_error = None;
         } else {
@@ -4332,13 +4350,24 @@ impl WaveCraftApp {
         }
     }
 
-    fn stop_capture(&mut self) {
-        self.capture_run_requested = false;
-        self.requested_capture_target = None;
-        self.scheduled_repetitive_capture = None;
-        let Some(mut active) = self.capture.take() else {
+    fn stop_capture(&mut self, target: CaptureTarget) {
+        let Some(index) = self
+            .captures
+            .iter()
+            .position(|capture| capture.target.includes(target))
+        else {
             return;
         };
+        let mut active = self.captures.swap_remove(index);
+        self.capture_requests.remove(&active.target);
+        self.queued_capture_rearms
+            .retain(|(_, target)| *target != active.target);
+        if self
+            .scheduled_repetitive_capture
+            .is_some_and(|scheduled| scheduled.target == active.target)
+        {
+            self.scheduled_repetitive_capture = None;
+        }
         self.status = "Stopping capture…".to_owned();
         active.session.request_stop();
         let (protocol_decode, logic_decode_error) = finish_logic_decode(&mut active);
@@ -4430,7 +4459,7 @@ impl WaveCraftApp {
                 radio_dsp,
             }) => {
                 let logic_config = *logic_config;
-                if !self.capture_run_requested {
+                if !self.capture_is_requested(target) {
                     self.requested_capture_target = None;
                     match session.stop() {
                         Ok(()) => self.status = "Acquisition stopped".to_owned(),
@@ -4539,7 +4568,7 @@ impl WaveCraftApp {
                     .iter()
                     .any(|device| device.kind == InstrumentKind::RadioReceiver);
                 let radio_trigger = if mode == AcquisitionMode::Single
-                    && target == CaptureTarget::RadioReceiver
+                    && target.includes_radio_receiver()
                     && has_radio
                     && self.radio_settings.trigger_enabled
                 {
@@ -4624,7 +4653,7 @@ impl WaveCraftApp {
                 }
                 waveforms.scope_capacity = scope_capacity;
                 waveforms.scope_rolling = rolling;
-                self.capture = Some(ActiveCapture {
+                self.captures.push(ActiveCapture {
                     session,
                     mode,
                     target,
@@ -4647,6 +4676,8 @@ impl WaveCraftApp {
                     has_scope,
                     has_radio,
                 });
+                self.requested_capture_target = None;
+                self.record_capture = false;
                 self.status = match (mode, recording_path) {
                     (AcquisitionMode::Single, Some(path)) if waiting_for_radio_trigger => format!(
                         "Single · waiting for RF trigger at {:.1} dBFS; recording to {}",
@@ -4731,6 +4762,7 @@ impl WaveCraftApp {
                     self.radio_settings = radio_settings;
                 }
                 let target = match (capture.has_logic, capture.has_scope, capture.has_radio) {
+                    (true, true, true) => CaptureTarget::Combined,
                     (true, true, false) => CaptureTarget::Combined,
                     (true, false, false) => CaptureTarget::LogicAnalyzer,
                     (false, true, false) => CaptureTarget::Oscilloscope,
@@ -4812,8 +4844,8 @@ impl WaveCraftApp {
                 }
                 self.manual_calibration = Some(ManualCalibrationEditor { values, range });
                 self.status = "Loaded DSCope calibration values".to_owned();
-                if self.capture_run_requested {
-                    if let Some(target) = self.requested_capture_target {
+                if let Some(target) = self.requested_capture_target {
+                    if self.capture_is_requested(target) {
                         self.begin_capture(AcquisitionMode::Run, target);
                     }
                 }
@@ -4821,8 +4853,8 @@ impl WaveCraftApp {
             Ok(WorkerSuccess::ScopeCalibrationSaved) => {
                 self.manual_calibration = None;
                 self.status = "DSCope manual calibration saved and verified".to_owned();
-                if self.capture_run_requested {
-                    if let Some(target) = self.requested_capture_target {
+                if let Some(target) = self.requested_capture_target {
+                    if self.capture_is_requested(target) {
                         self.begin_capture(AcquisitionMode::Run, target);
                     }
                 }
@@ -4893,6 +4925,25 @@ impl WaveCraftApp {
     }
 
     fn poll_capture(&mut self) {
+        let targets = self
+            .captures
+            .iter()
+            .map(|capture| capture.target)
+            .collect::<Vec<_>>();
+        for target in targets {
+            self.poll_capture_target(target);
+        }
+    }
+
+    fn poll_capture_target(&mut self, target: CaptureTarget) {
+        let Some(index) = self
+            .captures
+            .iter()
+            .position(|capture| capture.target == target)
+        else {
+            return;
+        };
+        let mut active = self.captures.swap_remove(index);
         let mut finish_status = None::<(Result<String, String>, CompletionStatus)>;
         let mut capture_status = None::<String>;
         let protocol_analyzers = self.protocol_analyzer.analyzers.clone();
@@ -4902,7 +4953,8 @@ impl WaveCraftApp {
             self.radio_settings.capture.sample_rate_hz,
             self.radio_settings.trigger_posttrigger_micros,
         );
-        if let Some(active) = self.capture.as_mut() {
+        {
+            let active = &mut active;
             if active.protocol_analyzers != protocol_analyzers {
                 match active.logic_decode.reconfigure(protocol_analyzers.clone()) {
                     Ok(()) => active.protocol_analyzers = protocol_analyzers.clone(),
@@ -4945,23 +4997,27 @@ impl WaveCraftApp {
                                     }
                                 }
                             }
-                            let (frames, trigger_event, trigger_complete) = if let Some(trigger) =
-                                active.radio_trigger.as_mut()
-                            {
-                                match trigger.push(frame) {
-                                    Ok(output) => (output.frames, output.event, output.complete),
-                                    Err(error) => {
-                                        active.session.request_stop();
-                                        finish_status = Some((
-                                            Err(format!("RF trigger failed: {error}")),
-                                            CompletionStatus::Failed,
-                                        ));
-                                        break;
+                            let frame_is_iq = matches!(&frame.payload, CaptureBatch::Iq(_));
+                            let (frames, trigger_event, trigger_complete) =
+                                if let (Some(trigger), true) =
+                                    (active.radio_trigger.as_mut(), frame_is_iq)
+                                {
+                                    match trigger.push(frame) {
+                                        Ok(output) => {
+                                            (output.frames, output.event, output.complete)
+                                        }
+                                        Err(error) => {
+                                            active.session.request_stop();
+                                            finish_status = Some((
+                                                Err(format!("RF trigger failed: {error}")),
+                                                CompletionStatus::Failed,
+                                            ));
+                                            break;
+                                        }
                                     }
-                                }
-                            } else {
-                                (vec![frame], None, false)
-                            };
+                                } else {
+                                    (vec![frame], None, false)
+                                };
                             if let Some(event) = trigger_event {
                                 active.radio_spectrum.reset();
                                 capture_status = Some(format!(
@@ -5089,126 +5145,133 @@ impl WaveCraftApp {
             self.status = status;
         }
 
-        if let Some((result, completion)) = finish_status {
-            if let Some(mut active) = self.capture.take() {
-                let mode = active.mode;
-                let target = active.target;
-                let preserve_display_until_complete = active.preserve_display_until_complete;
-                let recording_path = active.recording_path.take();
-                let has_logic = active.has_logic;
-                let has_scope = active.has_scope;
-                let has_radio = active.has_radio;
-                let restart_for_frontend =
-                    self.scope_capture_restart_requested && self.capture_run_requested;
-                self.scope_capture_restart_requested = false;
-                let (protocol_decode, logic_decode_error) = finish_logic_decode(&mut active);
-                let stop_result = active.session.stop();
-                let radio_dsp_error = match active.radio_dsp.finish() {
-                    Ok(outputs) => {
-                        for output in outputs {
-                            ingest_radio_dsp_output(&mut active.waveforms, output);
-                        }
-                        None
+        let Some((result, completion)) = finish_status else {
+            self.captures.push(active);
+            return;
+        };
+        {
+            let mode = active.mode;
+            let target = active.target;
+            let preserve_display_until_complete = active.preserve_display_until_complete;
+            let recording_path = active.recording_path.take();
+            let has_logic = active.has_logic;
+            let has_scope = active.has_scope;
+            let has_radio = active.has_radio;
+            let restart_for_frontend = self.scope_capture_restart_requested
+                && self.capture_is_requested(target)
+                && target.includes_oscilloscope();
+            self.scope_capture_restart_requested = false;
+            let (protocol_decode, logic_decode_error) = finish_logic_decode(&mut active);
+            let stop_result = active.session.stop();
+            let radio_dsp_error = match active.radio_dsp.finish() {
+                Ok(outputs) => {
+                    for output in outputs {
+                        ingest_radio_dsp_output(&mut active.waveforms, output);
                     }
-                    Err(error) => Some(error),
-                };
-                let recording_completion = if stop_result.is_ok() {
-                    completion
-                } else {
-                    CompletionStatus::Failed
-                };
-                let recording_result =
-                    finish_gui_recording(&mut active.recorder, recording_completion);
-                active.waveforms.radio_analysis.finish_raw_capture();
-                let mut error = result.as_ref().err().cloned();
-                if let Err(stop_error) = stop_result {
-                    append_error(&mut error, format!("failed to stop capture: {stop_error}"));
+                    None
                 }
-                if let Some(dsp_error) = radio_dsp_error {
-                    append_error(&mut error, dsp_error);
-                }
-                if let Some(decode_error) = logic_decode_error {
-                    append_error(&mut error, decode_error);
-                }
-                if let Err(recording_error) = recording_result {
-                    append_error(
-                        &mut error,
-                        format!("failed to finish recording: {recording_error}"),
-                    );
-                }
-                let update_completed_capture = if restart_for_frontend {
-                    !preserve_display_until_complete
-                } else {
-                    completion == CompletionStatus::Complete || !preserve_display_until_complete
-                };
-                if update_completed_capture {
-                    self.set_completed_capture_for_target(
-                        target,
-                        CompletedCapture {
-                            waveforms: active.waveforms,
-                            protocol_decode,
-                            has_logic,
-                            has_scope,
-                            has_radio,
-                        },
-                    );
-                }
-                if error.is_none() && self.manual_calibration_load_requested {
-                    self.manual_calibration_load_requested = false;
-                    self.begin_manual_calibration();
+                Err(error) => Some(error),
+            };
+            let recording_completion = if stop_result.is_ok() {
+                completion
+            } else {
+                CompletionStatus::Failed
+            };
+            let recording_result = finish_gui_recording(&mut active.recorder, recording_completion);
+            active.waveforms.radio_analysis.finish_raw_capture();
+            let mut error = result.as_ref().err().cloned();
+            if let Err(stop_error) = stop_result {
+                append_error(&mut error, format!("failed to stop capture: {stop_error}"));
+            }
+            if let Some(dsp_error) = radio_dsp_error {
+                append_error(&mut error, dsp_error);
+            }
+            if let Some(decode_error) = logic_decode_error {
+                append_error(&mut error, decode_error);
+            }
+            if let Err(recording_error) = recording_result {
+                append_error(
+                    &mut error,
+                    format!("failed to finish recording: {recording_error}"),
+                );
+            }
+            let update_completed_capture = if restart_for_frontend {
+                !preserve_display_until_complete
+            } else {
+                completion == CompletionStatus::Complete || !preserve_display_until_complete
+            };
+            if update_completed_capture {
+                self.set_completed_capture_for_target(
+                    target,
+                    CompletedCapture {
+                        waveforms: active.waveforms,
+                        protocol_decode,
+                        has_logic,
+                        has_scope,
+                        has_radio,
+                    },
+                );
+            }
+            if error.is_none() && self.manual_calibration_load_requested {
+                self.manual_calibration_load_requested = false;
+                self.begin_manual_calibration();
+                return;
+            }
+            if error.is_none() {
+                if let Some(values) = self.manual_calibration_save_requested.take() {
+                    self.begin_save_manual_calibration(values);
                     return;
                 }
-                if error.is_none() {
-                    if let Some(values) = self.manual_calibration_save_requested.take() {
-                        self.begin_save_manual_calibration(values);
-                        return;
-                    }
+            }
+            let repeat = error.is_none()
+                && (restart_for_frontend
+                    || should_rearm_acquisition(
+                        mode,
+                        self.capture_is_requested(target),
+                        completion,
+                        false,
+                    ));
+            if !repeat {
+                self.capture_requests.remove(&target);
+            }
+            if recording_path.is_some() {
+                self.record_capture = false;
+            }
+            match error {
+                Some(error) => self.set_error(error),
+                None if restart_for_frontend => {
+                    self.status = "Reconfiguring oscilloscope frontend…".to_owned();
                 }
-                let repeat = error.is_none()
-                    && (restart_for_frontend
-                        || should_rearm_acquisition(
-                            mode,
-                            self.capture_run_requested,
-                            completion,
-                            false,
-                        ));
-                if !repeat {
-                    self.capture_run_requested = false;
-                    self.requested_capture_target = None;
+                None => {
+                    let capture_status =
+                        result.ok().unwrap_or_else(|| "Capture complete".to_owned());
+                    self.status = recording_path.map_or(capture_status.clone(), |path| {
+                        format!("{capture_status} · recording saved to {}", path.display())
+                    });
                 }
-                if recording_path.is_some() {
-                    self.record_capture = false;
-                }
-                match error {
-                    Some(error) => self.set_error(error),
-                    None if restart_for_frontend => {
-                        self.status = "Reconfiguring oscilloscope frontend…".to_owned();
-                    }
-                    None => {
-                        let capture_status =
-                            result.ok().unwrap_or_else(|| "Capture complete".to_owned());
-                        self.status = recording_path.map_or(capture_status.clone(), |path| {
-                            format!("{capture_status} · recording saved to {}", path.display())
-                        });
-                    }
-                }
-                if repeat {
-                    if mode == AcquisitionMode::Repetitive && !restart_for_frontend {
-                        let interval = repetitive_interval(
-                            self.logic_settings.operation_mode,
-                            self.repetitive_interval_seconds,
-                        );
-                        self.scheduled_repetitive_capture = Some(ScheduledRepetitiveCapture {
-                            due: Instant::now() + interval,
-                            target,
-                        });
-                        self.status = format!(
-                            "Repetitive · next acquisition in {:.1} s",
-                            interval.as_secs_f32()
-                        );
-                    } else {
-                        self.begin_capture(mode, target);
-                    }
+            }
+            if repeat {
+                if mode == AcquisitionMode::Repetitive && !restart_for_frontend {
+                    let interval = repetitive_interval(
+                        self.logic_settings.operation_mode,
+                        self.repetitive_interval_seconds,
+                    );
+                    self.scheduled_repetitive_capture = Some(ScheduledRepetitiveCapture {
+                        due: Instant::now() + interval,
+                        target,
+                    });
+                    self.status = format!(
+                        "Repetitive · next acquisition in {:.1} s",
+                        interval.as_secs_f32()
+                    );
+                } else if self.pending.is_none() {
+                    self.begin_capture(mode, target);
+                } else if !self
+                    .queued_capture_rearms
+                    .iter()
+                    .any(|(_, queued_target)| *queued_target == target)
+                {
+                    self.queued_capture_rearms.push((mode, target));
                 }
             }
         }
@@ -5218,7 +5281,7 @@ impl WaveCraftApp {
         let Some(scheduled) = self.scheduled_repetitive_capture else {
             return;
         };
-        if !self.capture_run_requested {
+        if !self.capture_is_requested(scheduled.target) {
             self.scheduled_repetitive_capture = None;
             return;
         }
@@ -5227,6 +5290,19 @@ impl WaveCraftApp {
         }
         self.scheduled_repetitive_capture = None;
         self.begin_capture(AcquisitionMode::Repetitive, scheduled.target);
+    }
+
+    fn poll_queued_capture_rearms(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let Some(index) = self.queued_capture_rearms.iter().position(|(_, target)| {
+            self.capture_is_requested(*target) && !self.capture_target_is_active(*target)
+        }) else {
+            return;
+        };
+        let (mode, target) = self.queued_capture_rearms.remove(index);
+        self.begin_capture(mode, target);
     }
 
     fn completed_capture_for_target(&self, target: CaptureTarget) -> Option<&CompletedCapture> {
@@ -5425,9 +5501,11 @@ impl WaveCraftApp {
     }
 
     fn set_error(&mut self, error: String) {
-        self.capture_run_requested = false;
-        self.requested_capture_target = None;
-        self.scheduled_repetitive_capture = None;
+        if let Some(target) = self.requested_capture_target.take() {
+            self.capture_requests.remove(&target);
+            self.queued_capture_rearms
+                .retain(|(_, queued_target)| *queued_target != target);
+        }
         self.scope_capture_restart_requested = false;
         self.manual_calibration_load_requested = false;
         self.manual_calibration_save_requested = None;
@@ -5440,28 +5518,19 @@ impl WaveCraftApp {
     }
 
     fn available_waveform_tabs(&self) -> Vec<WaveformTab> {
-        let displayed_logic = self
-            .capture
-            .as_ref()
-            .is_some_and(|capture| capture.has_logic)
+        let displayed_logic = self.captures.iter().any(|capture| capture.has_logic)
             || self.logic_sessions.any(|capture| capture.has_logic)
             || self
                 .combined_capture
                 .as_ref()
                 .is_some_and(|capture| capture.has_logic);
-        let displayed_scope = self
-            .capture
-            .as_ref()
-            .is_some_and(|capture| capture.has_scope)
+        let displayed_scope = self.captures.iter().any(|capture| capture.has_scope)
             || self.scope_sessions.any(|capture| capture.has_scope)
             || self
                 .combined_capture
                 .as_ref()
                 .is_some_and(|capture| capture.has_scope);
-        let displayed_radio = self
-            .capture
-            .as_ref()
-            .is_some_and(|capture| capture.has_radio)
+        let displayed_radio = self.captures.iter().any(|capture| capture.has_radio)
             || self
                 .radio_capture
                 .as_ref()
@@ -5507,19 +5576,13 @@ impl WaveCraftApp {
             .devices
             .iter()
             .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100);
-        let has_logic_capture = self
-            .capture
-            .as_ref()
-            .is_some_and(|capture| capture.has_logic)
+        let has_logic_capture = self.captures.iter().any(|capture| capture.has_logic)
             || self.logic_sessions.any(|capture| capture.has_logic)
             || self
                 .combined_capture
                 .as_ref()
                 .is_some_and(|capture| capture.has_logic);
-        let has_scope_capture = self
-            .capture
-            .as_ref()
-            .is_some_and(|capture| capture.has_scope)
+        let has_scope_capture = self.captures.iter().any(|capture| capture.has_scope)
             || self.scope_sessions.any(|capture| capture.has_scope)
             || self
                 .combined_capture
@@ -5564,9 +5627,46 @@ impl WaveCraftApp {
         }
     }
 
+    fn capture_is_requested(&self, target: CaptureTarget) -> bool {
+        self.capture_requests.contains(&target)
+    }
+
+    fn capture_for_target(&self, target: CaptureTarget) -> Option<&ActiveCapture> {
+        self.captures
+            .iter()
+            .find(|capture| capture.target.includes(target))
+    }
+
+    fn capture_for_target_mut(&mut self, target: CaptureTarget) -> Option<&mut ActiveCapture> {
+        self.captures
+            .iter_mut()
+            .find(|capture| capture.target.includes(target))
+    }
+
+    fn capture_target_is_active(&self, target: CaptureTarget) -> bool {
+        self.captures
+            .iter()
+            .any(|capture| capture.target.overlaps(target))
+    }
+
+    fn capture_target_can_start(&self, target: CaptureTarget) -> bool {
+        self.pending.is_none()
+            && !self.capture_target_is_active(target)
+            && !self
+                .capture_requests
+                .iter()
+                .any(|requested| requested.overlaps(target))
+    }
+
+    fn active_capture_for_view(&self) -> Option<&ActiveCapture> {
+        self.active_waveform_tab
+            .map(WaveformTab::capture_target)
+            .and_then(|target| self.capture_for_target(target))
+    }
+
     fn is_busy(&self) -> bool {
         self.pending.is_some()
-            || self.capture.is_some()
+            || !self.captures.is_empty()
             || self.scheduled_repetitive_capture.is_some()
     }
 }
@@ -9585,6 +9685,7 @@ impl eframe::App for WaveCraftApp {
         self.reconcile_radio_settings();
         self.poll_capture();
         self.poll_repetitive_capture();
+        self.poll_queued_capture_rearms();
         self.finish_pending_snapshot(context);
 
         let mut refresh_clicked = false;
@@ -9599,19 +9700,26 @@ impl eframe::App for WaveCraftApp {
         let mut logic_device_selection_changed = false;
         let mut scope_device_selection_changed = false;
         let mut radio_device_selection_changed = false;
-        let capture_settings_enabled = !self.is_busy();
-        let radio_runtime_controls_enabled = self.capture.as_ref().is_some_and(|active| {
-            active.mode == AcquisitionMode::Run
-                && active.target == CaptureTarget::RadioReceiver
-                && active.radio_runtime_control.is_some()
-        });
-        let radio_trigger_runtime_controls_enabled = self.capture.as_ref().is_some_and(|active| {
-            active.target == CaptureTarget::RadioReceiver
-                && active
-                    .radio_trigger
-                    .as_ref()
-                    .is_some_and(RadioSingleTrigger::is_armed)
-        });
+        let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
+        let capture_settings_enabled = control_target
+            .map_or(true, |target| !self.capture_target_is_active(target))
+            && self.pending.is_none();
+        let radio_runtime_controls_enabled = self
+            .capture_for_target(CaptureTarget::RadioReceiver)
+            .is_some_and(|active| {
+                active.mode == AcquisitionMode::Run
+                    && active.has_radio
+                    && active.radio_runtime_control.is_some()
+            });
+        let radio_trigger_runtime_controls_enabled = self
+            .capture_for_target(CaptureTarget::RadioReceiver)
+            .is_some_and(|active| {
+                active.has_radio
+                    && active
+                        .radio_trigger
+                        .as_ref()
+                        .is_some_and(RadioSingleTrigger::is_armed)
+            });
         let radio_trigger_level_runtime_controls_enabled =
             radio_trigger_level_runtime_controls_are_enabled(
                 radio_runtime_controls_enabled,
@@ -9622,7 +9730,6 @@ impl eframe::App for WaveCraftApp {
             radio_trigger_level_runtime_controls_enabled,
         );
         let radio_settings_before_ui = self.radio_settings.clone();
-        let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
         let selected_logic_device = self.selected_logic_device().is_some();
         let logic_settings_speed = self
             .selected_logic_device()
@@ -9645,32 +9752,28 @@ impl eframe::App for WaveCraftApp {
                 selected_radio_device,
             )
         });
-        let scope_capture_requested = self.capture_run_requested
-            && self
-                .requested_capture_target
-                .is_some_and(CaptureTarget::includes_oscilloscope);
+        let scope_capture_requested = self
+            .capture_requests
+            .iter()
+            .any(|target| target.includes_oscilloscope());
+        let active_scope_capture = self.capture_for_target(CaptureTarget::Oscilloscope);
         let manual_calibration_enabled = manual_calibration_control_is_enabled(
             self.pending.is_some(),
             selected_scope_device,
             self.manual_calibration.is_some(),
-            self.capture
-                .as_ref()
-                .filter(|active| active.target.includes_oscilloscope())
-                .map(|active| active.mode),
+            active_scope_capture.map(|active| active.mode),
         );
         let trigger_controls_enabled = scope_trigger_controls_are_enabled(
             self.pending.is_some(),
             scope_capture_requested,
             selected_scope_device,
-            self.capture
-                .as_ref()
-                .map(|active| !active.scope_trigger_controls.is_empty()),
+            active_scope_capture.map(|active| !active.scope_trigger_controls.is_empty()),
         );
         let frontend_controls_enabled = scope_frontend_controls_are_enabled(
             self.pending.is_some(),
             scope_capture_requested,
             selected_scope_device,
-        ) && !(self.record_capture && self.is_busy());
+        ) && !(self.record_capture && self.pending.is_some());
         let scope_settings_before_ui = self.scope_settings;
         let scope_auto_sample_rate_before_ui = self.scope_auto_sample_rate;
         let manual_calibration_before_ui =
@@ -9706,7 +9809,9 @@ impl eframe::App for WaveCraftApp {
                     ui.separator();
                     if ui
                         .add_enabled(
-                            !self.is_busy() && control_target_available,
+                            control_target.is_some_and(|target| {
+                                self.capture_target_can_start(target)
+                            }) && control_target_available,
                             toolbar_action_button("⏺ Record", Color32::LIGHT_RED)
                                 .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
                         )
@@ -9717,7 +9822,7 @@ impl eframe::App for WaveCraftApp {
                     }
                     if ui
                         .add_enabled(
-                            !self.is_busy(),
+                            self.pending.is_none(),
                             toolbar_action_button("📂 Open", TEXT_MUTED)
                                 .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
                         )
@@ -9728,7 +9833,7 @@ impl eframe::App for WaveCraftApp {
                     }
                     if ui
                         .add_enabled(
-                            !self.is_busy() && self.has_displayed_completed_capture(),
+                            self.pending.is_none() && self.has_displayed_completed_capture(),
                             toolbar_action_button("Export", TEXT_MUTED)
                                 .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
                         )
@@ -9751,11 +9856,13 @@ impl eframe::App for WaveCraftApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let logic_only = control_target == Some(CaptureTarget::LogicAnalyzer);
-                        let acquisition_active = self.capture_run_requested
-                            && self.requested_capture_target == control_target
-                            && (self.capture.is_some()
-                                || self.pending.is_some()
-                                || self.scheduled_repetitive_capture.is_some());
+                        let acquisition_active = control_target.is_some_and(|control| {
+                            self.capture_for_target(control).is_some()
+                                || self
+                                    .capture_requests
+                                    .iter()
+                                    .any(|requested| requested.includes(control))
+                        });
                         let start_mode = if logic_only {
                             self.logic_acquisition_mode
                         } else {
@@ -9764,7 +9871,9 @@ impl eframe::App for WaveCraftApp {
                         let run_stop_clicked = ui
                             .add_enabled(
                                 acquisition_active
-                                    || (!self.is_busy()
+                                    || (control_target.is_some_and(|target| {
+                                        self.capture_target_can_start(target)
+                                    })
                                         && control_target_available
                                         && !self.record_capture),
                                 if acquisition_active {
@@ -9801,7 +9910,9 @@ impl eframe::App for WaveCraftApp {
                         }
                         if ui
                             .add_enabled(
-                                !self.is_busy() && control_target_available,
+                                control_target.is_some_and(|target| {
+                                    self.capture_target_can_start(target)
+                                }) && control_target_available,
                                 toolbar_action_button("▶ Single", SCOPE_COLORS[0]),
                             )
                             .on_hover_text("Wait for one trigger, acquire once, then stop")
@@ -9843,8 +9954,7 @@ impl eframe::App for WaveCraftApp {
         }
 
         let (displayed_logic_sample_count, displayed_logic_sample_rate_hz) = self
-            .capture
-            .as_ref()
+            .active_capture_for_view()
             .filter(|active| !active.preserve_display_until_complete)
             .map(|active| &active.waveforms)
             .or_else(|| {
@@ -9909,6 +10019,24 @@ impl eframe::App for WaveCraftApp {
                                     save_capture_settings_kind =
                                         Some(SavedCaptureSettingsKind::RadioFrequency);
                                 }
+                            }
+                        } else if self.active_waveform_tab == Some(WaveformTab::Combined)
+                            && !self.radios.is_empty()
+                        {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("Radio receiver · included")
+                                    .small()
+                                    .color(TEXT_MUTED),
+                            );
+                            radio_device_selection_changed |= paint_radio_device_selector(
+                                ui,
+                                &self.radios,
+                                &mut self.selected_radio_id,
+                                capture_settings_enabled,
+                            );
+                            if radio_device_selection_changed {
+                                self.reconcile_radio_settings();
                             }
                         }
                         if self.active_waveform_tab.is_some() {
@@ -10094,7 +10222,7 @@ impl eframe::App for WaveCraftApp {
         let mut session_name_cancel = false;
         if let Some((target, tab_names, active_tab)) = session_tab_state {
             let tab_count = tab_names.len();
-            let sessions_enabled = !self.is_busy();
+            let sessions_enabled = self.pending.is_none() && !self.capture_target_is_active(target);
             egui::TopBottomPanel::bottom("session_tabs")
                 .frame(
                     egui::Frame::none()
@@ -10354,8 +10482,7 @@ impl eframe::App for WaveCraftApp {
         let protocol_analyzer_for_waveform = self.protocol_analyzer.clone();
         let mut protocol_decode_cache = std::mem::take(&mut self.protocol_decode_cache);
         let streamed_protocol_decode = self
-            .capture
-            .as_ref()
+            .active_capture_for_view()
             .filter(|active| !active.preserve_display_until_complete)
             .map(|active| active.protocol_decode_snapshot.clone())
             .or_else(|| {
@@ -10389,8 +10516,7 @@ impl eframe::App for WaveCraftApp {
 
                 let empty_waveforms = WaveformStore::default();
                 let waveforms = self
-                    .capture
-                    .as_ref()
+                    .active_capture_for_view()
                     .filter(|active| !active.preserve_display_until_complete)
                     .map(|active| &active.waveforms)
                     .or_else(|| {
@@ -10429,8 +10555,7 @@ impl eframe::App for WaveCraftApp {
                     .map(|channel| channel.vertical_offset);
                 let mut scope_trigger_settings = self.scope_settings.trigger;
                 let scope_settings = self
-                    .capture
-                    .as_ref()
+                    .active_capture_for_view()
                     .map(|active| ScopeCaptureSettings::from_capture_config(active.scope_config))
                     .or_else(|| {
                         self.calibration_active
@@ -11148,17 +11273,35 @@ impl eframe::App for WaveCraftApp {
             }
         }
         if stop_clicked {
-            self.capture_run_requested = false;
-            self.requested_capture_target = None;
-            let repetitive_waiting = self.scheduled_repetitive_capture.take().is_some();
-            self.scope_capture_restart_requested = false;
-            self.scope_configuration_due = None;
-            if self.capture.is_some() {
-                self.stop_capture();
-            } else if self.pending.is_some() {
-                self.status = "Stopping acquisition after device preparation…".to_owned();
-            } else if repetitive_waiting {
-                self.status = "Acquisition stopped".to_owned();
+            if let Some(target) = control_target {
+                let requested = self
+                    .capture_requests
+                    .iter()
+                    .copied()
+                    .find(|requested| requested.includes(target));
+                if let Some(requested) = requested {
+                    self.capture_requests.remove(&requested);
+                    self.queued_capture_rearms
+                        .retain(|(_, target)| *target != requested);
+                    if self.requested_capture_target == Some(requested) {
+                        self.requested_capture_target = None;
+                    }
+                    if self
+                        .scheduled_repetitive_capture
+                        .is_some_and(|scheduled| scheduled.target == requested)
+                    {
+                        self.scheduled_repetitive_capture = None;
+                    }
+                }
+                self.scope_capture_restart_requested = false;
+                self.scope_configuration_due = None;
+                if self.capture_target_is_active(target) {
+                    self.stop_capture(target);
+                } else if self.pending.is_some() {
+                    self.status = "Stopping acquisition after device preparation…".to_owned();
+                } else {
+                    self.status = "Acquisition stopped".to_owned();
+                }
             }
         }
         match calibration_action {
@@ -11186,12 +11329,13 @@ impl eframe::App for WaveCraftApp {
             self.status = "Radio device selection updated".to_owned();
         }
         if radio_runtime_settings_differ(&self.radio_settings, &radio_settings_before_ui) {
-            let runtime_control = self.capture.as_ref().and_then(|active| {
-                (active.mode == AcquisitionMode::Run
-                    && active.target == CaptureTarget::RadioReceiver)
-                    .then_some(active.radio_runtime_control.as_ref())
-                    .flatten()
-            });
+            let runtime_control = self
+                .capture_for_target(CaptureTarget::RadioReceiver)
+                .and_then(|active| {
+                    (active.mode == AcquisitionMode::Run && active.has_radio)
+                        .then_some(active.radio_runtime_control.as_ref())
+                        .flatten()
+                });
             if let Some(runtime_control) = runtime_control {
                 let update_result =
                     hackrf_runtime_settings(&self.radio_settings).and_then(|settings| {
@@ -11208,7 +11352,8 @@ impl eframe::App for WaveCraftApp {
         }
         if scope_device_selection_changed
             && self.selected_scope_device_ref().is_some()
-            && !self.is_busy()
+            && self.pending.is_none()
+            && !self.capture_target_is_active(CaptureTarget::Oscilloscope)
         {
             self.scope_configuration_due = Some(Instant::now() + SCOPE_CONFIGURATION_DEBOUNCE);
         }
@@ -11236,7 +11381,7 @@ impl eframe::App for WaveCraftApp {
         if manual_calibration_changed && !runtime_frontend_changed && scope_capture_requested {
             if let (Some(values), Some(active)) = (
                 self.manual_calibration.as_ref().map(|editor| editor.values),
-                self.capture.as_ref(),
+                self.capture_for_target(CaptureTarget::Oscilloscope),
             ) {
                 runtime_calibration_applied = active
                     .scope_calibration_controls
@@ -11257,13 +11402,14 @@ impl eframe::App for WaveCraftApp {
             self.scope_configuration_due = None;
             self.status = "Applying manual calibration during capture…".to_owned();
             self.last_error = None;
-        } else if trigger_changed && self.capture.is_some() {
+        } else if trigger_changed && self.capture_target_is_active(CaptureTarget::Oscilloscope) {
             let update_result = self
                 .scope_settings
                 .trigger
                 .capture_config()
                 .and_then(|trigger| {
-                    let Some(active) = self.capture.as_mut() else {
+                    let Some(active) = self.capture_for_target_mut(CaptureTarget::Oscilloscope)
+                    else {
                         return Err("capture ended before the trigger update".to_owned());
                     };
                     let updated_config = active
@@ -11302,15 +11448,17 @@ impl eframe::App for WaveCraftApp {
             if scope_capture_requested && selected_scope_device {
                 self.scope_configuration_due = None;
                 self.scope_capture_restart_requested = true;
-                if let Some(active) = self.capture.as_ref() {
+                if let Some(active) = self.capture_for_target(CaptureTarget::Oscilloscope) {
                     active.session.request_stop();
                 }
                 self.status = "Reconfiguring oscilloscope frontend…".to_owned();
-            } else if !self.is_busy() {
+            } else if self.pending.is_none()
+                && !self.capture_target_is_active(CaptureTarget::Oscilloscope)
+            {
                 self.begin_scope_configuration();
             }
         }
-        if self.pending.is_some() || self.capture.is_some() {
+        if self.pending.is_some() || !self.captures.is_empty() {
             context.request_repaint_after(Duration::from_millis(16));
         } else if let Some(scheduled) = self.scheduled_repetitive_capture {
             context.request_repaint_after(scheduled.due.saturating_duration_since(Instant::now()));
@@ -20074,6 +20222,25 @@ mod tests {
         assert!(!CaptureTarget::Combined.is_available(true, false, false));
         assert!(!CaptureTarget::Combined.is_available(false, true, false));
         assert!(CaptureTarget::Combined.is_available(true, true, false));
+        assert!(CaptureTarget::Combined.includes_radio_receiver());
+        assert!(CaptureTarget::Combined.captures_selected_radio(true));
+        assert!(!CaptureTarget::Combined.captures_selected_radio(false));
+        assert!(CaptureTarget::RadioReceiver.captures_selected_radio(false));
+        assert!(CaptureTarget::Combined.includes(CaptureTarget::LogicAnalyzer));
+        assert!(CaptureTarget::Combined.includes(CaptureTarget::Oscilloscope));
+        assert!(CaptureTarget::Combined.includes(CaptureTarget::RadioReceiver));
+        assert!(!CaptureTarget::LogicAnalyzer.includes(CaptureTarget::RadioReceiver));
+    }
+
+    #[test]
+    fn independent_instrument_targets_can_capture_concurrently() {
+        assert!(!CaptureTarget::LogicAnalyzer.overlaps(CaptureTarget::Oscilloscope));
+        assert!(!CaptureTarget::LogicAnalyzer.overlaps(CaptureTarget::RadioReceiver));
+        assert!(!CaptureTarget::Oscilloscope.overlaps(CaptureTarget::RadioReceiver));
+        assert!(CaptureTarget::LogicAnalyzer.overlaps(CaptureTarget::LogicAnalyzer));
+        assert!(CaptureTarget::Combined.overlaps(CaptureTarget::LogicAnalyzer));
+        assert!(CaptureTarget::Combined.overlaps(CaptureTarget::Oscilloscope));
+        assert!(CaptureTarget::Combined.overlaps(CaptureTarget::RadioReceiver));
     }
 
     #[test]

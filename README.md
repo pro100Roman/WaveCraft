@@ -58,7 +58,10 @@ The repository contains a working vertical slice of the new capture engine:
   legacy 16-channel models and DSLogic U3Pro32;
 - finite one- or two-channel capture from DSCope U3P100 with configurable sampling and
   per-channel front-end settings;
-- concurrent physical capture from one DSLogic and one DSCope on a shared timeline;
+- concurrent physical capture from one DSLogic, one DSCope, and one radio
+  receiver on a shared timeline;
+- independent GUI capture sessions, so idle instruments and capture-file
+  operations remain available while another instrument is running;
 - a native desktop capture workbench with synchronized, interactive waveform views;
 - logic timing tools and oscilloscope measurements, markers, math, FFT, and XY views;
 - time-aligned I²C and SPI byte decoding in dedicated logic-analyzer rows;
