@@ -1,7 +1,7 @@
 use crate::{
     ChannelizedBatch, DemodulatedBatch, Demodulator, DemodulatorDescriptor, DemodulatorFactory,
     DemodulatorOutputKind, DemodulatorRegistry, DemodulatorTelemetry, DspError,
-    SymbolTimingRecovery, TimedComplexSample, TimedScalarSample, TimedSoftSymbol,
+    MuellerMullerClockRecovery, TimedComplexSample, TimedScalarSample, TimedSoftSymbol,
     TimedSoftSymbolBatch, TimingRecoveryConfig,
 };
 use std::any::Any;
@@ -103,8 +103,9 @@ impl From<TimedSoftBit> for TimedSoftSymbol {
 
 /// Incremental binary-FSK discriminator with fixed or adaptive symbol timing.
 ///
-/// The first partial symbol after a discontinuity is discarded. GFSK matched
-/// filtering precedes the selected timing mode.
+/// Adaptive timing follows GNU Radio's GFSK receive ordering: quadrature
+/// discriminator, Mueller-and-Muller clock recovery, then a zero slicer.
+/// Fixed timing retains the optional GFSK receive filter.
 pub struct FskDemodulator {
     config: FskConfig,
     previous_sample: Option<TimedComplexSample>,
@@ -119,9 +120,7 @@ pub struct FskDemodulator {
     symbol_range: Option<Range<u64>>,
     gaussian_filter: Vec<f64>,
     gaussian_history: VecDeque<DiscriminatorSample>,
-    gaussian_started: bool,
-    carrier_acquisition: VecDeque<DiscriminatorSample>,
-    timing_recovery: Option<SymbolTimingRecovery>,
+    timing_recovery: Option<MuellerMullerClockRecovery>,
     tone_tracker: ToneTracker,
 }
 
@@ -130,7 +129,6 @@ struct DiscriminatorSample {
     likelihood: f64,
     effective_source_index: u64,
     source_range: Range<u64>,
-    tone_acquisition_eligible: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -190,10 +188,6 @@ impl ToneTracker {
         self.normalize_acquired(value)
     }
 
-    fn is_acquired(&self) -> bool {
-        self.lower.is_some() && self.upper.is_some()
-    }
-
     fn normalize_acquired(&self, value: f64) -> Option<f64> {
         let lower = self.lower?;
         let upper = self.upper?;
@@ -219,7 +213,7 @@ impl FskDemodulator {
             FskTiming::Adaptive {
                 loop_bandwidth,
                 max_clock_error_ppm,
-            } => Some(SymbolTimingRecovery::new(TimingRecoveryConfig {
+            } => Some(MuellerMullerClockRecovery::new(TimingRecoveryConfig {
                 symbol_rate_hz: config.symbol_rate_hz,
                 loop_bandwidth,
                 max_clock_error_ppm,
@@ -239,8 +233,6 @@ impl FskDemodulator {
             symbol_range: None,
             gaussian_filter: Vec::new(),
             gaussian_history: VecDeque::new(),
-            gaussian_started: false,
-            carrier_acquisition: VecDeque::new(),
             timing_recovery,
             tone_tracker: ToneTracker::default(),
         })
@@ -260,7 +252,7 @@ impl FskDemodulator {
     pub fn estimated_symbol_rate_hz(&self) -> Option<f64> {
         self.timing_recovery
             .as_ref()
-            .and_then(SymbolTimingRecovery::estimated_symbol_rate_hz)
+            .and_then(MuellerMullerClockRecovery::estimated_symbol_rate_hz)
     }
 
     /// Estimated residual carrier offset relative to the configured channel center.
@@ -280,7 +272,7 @@ impl FskDemodulator {
     pub fn timing_lock_quality(&self) -> f32 {
         self.timing_recovery
             .as_ref()
-            .map_or(1.0, SymbolTimingRecovery::lock_quality)
+            .map_or(1.0, MuellerMullerClockRecovery::lock_quality)
     }
 
     pub fn reset(&mut self) {
@@ -296,8 +288,6 @@ impl FskDemodulator {
         self.symbol_range = None;
         self.gaussian_filter.clear();
         self.gaussian_history.clear();
-        self.gaussian_started = false;
-        self.carrier_acquisition.clear();
         self.tone_tracker.reset();
         if let Some(timing_recovery) = &mut self.timing_recovery {
             timing_recovery.reset();
@@ -327,6 +317,7 @@ impl FskDemodulator {
         self.center_frequency_hz = Some(batch.center_frequency_hz);
         self.segment_start_sample_index = Some(batch.segment_start_sample_index);
         if matches!(self.config.modulation, FskModulation::Gfsk { .. })
+            && self.config.timing == FskTiming::Fixed
             && self.gaussian_filter.is_empty()
         {
             self.gaussian_filter = design_gaussian_matched_filter(
@@ -371,7 +362,6 @@ impl FskDemodulator {
                 likelihood: frequency_hz / self.config.deviation_hz as f64,
                 effective_source_index: effective_index,
                 source_range: previous.source_range.start..sample.source_range.end,
-                tone_acquisition_eligible: true,
             };
             for mut discriminator in self.filter_discriminator(discriminator) {
                 if matches!(self.config.timing, FskTiming::Adaptive { .. }) {
@@ -379,44 +369,11 @@ impl FskDemodulator {
                         batch.sample_rate_hz,
                         self.config.symbol_rate_hz,
                     );
-                    if !self.tone_tracker.is_acquired() {
-                        self.carrier_acquisition.push_back(discriminator.clone());
-                        let retained_acquisition_samples =
-                            acquisition_samples.saturating_add(self.gaussian_filter.len() / 2);
-                        while self.carrier_acquisition.len() > retained_acquisition_samples {
-                            self.carrier_acquisition.pop_front();
-                        }
-                        if !discriminator.tone_acquisition_eligible {
-                            continue;
-                        }
-                        if self
-                            .tone_tracker
-                            .normalize(discriminator.likelihood, acquisition_samples)
-                            .is_none()
-                        {
-                            continue;
-                        }
-                        for mut acquired in self.carrier_acquisition.drain(..) {
-                            acquired.likelihood = self
-                                .tone_tracker
-                                .normalize_acquired(acquired.likelihood)
-                                .ok_or_else(|| {
-                                    DspError::new("FSK tone acquisition lost its tone centres")
-                                })?;
-                            if self.config.polarity == FskPolarity::Inverted {
-                                acquired.likelihood = -acquired.likelihood;
-                            }
-                            timing_samples.push(TimedScalarSample {
-                                value: acquired.likelihood as f32,
-                                source_range: acquired.source_range,
-                            });
-                        }
-                        continue;
-                    }
-                    discriminator.likelihood = self
+                    // Track tone telemetry without gating or renormalizing the
+                    // GNU Radio-compatible discriminator stream.
+                    let _ = self
                         .tone_tracker
-                        .normalize(discriminator.likelihood, acquisition_samples)
-                        .ok_or_else(|| DspError::new("FSK tone tracking lost its tone centres"))?;
+                        .normalize(discriminator.likelihood, acquisition_samples);
                 }
                 if self.config.polarity == FskPolarity::Inverted {
                     discriminator.likelihood = -discriminator.likelihood;
@@ -493,7 +450,9 @@ impl FskDemodulator {
     }
 
     fn filter_discriminator(&mut self, sample: DiscriminatorSample) -> Vec<DiscriminatorSample> {
-        if matches!(self.config.modulation, FskModulation::Fsk) {
+        if matches!(self.config.modulation, FskModulation::Fsk)
+            || matches!(self.config.timing, FskTiming::Adaptive { .. })
+        {
             return vec![sample];
         }
 
@@ -502,18 +461,12 @@ impl FskDemodulator {
             return Vec::new();
         }
         let midpoint = self.gaussian_filter.len() / 2;
-        let first_output =
-            if !self.gaussian_started && matches!(self.config.timing, FskTiming::Adaptive { .. }) {
-                0
-            } else {
-                midpoint
-            };
         let history_start = self
             .gaussian_history
             .front()
             .map(|sample| sample.source_range.start)
             .unwrap_or_default();
-        let outputs = (first_output..=midpoint)
+        let outputs = (midpoint..=midpoint)
             .map(|output_index| {
                 let likelihood = self
                     .gaussian_filter
@@ -535,11 +488,9 @@ impl FskDemodulator {
                         .effective_source_index,
                     source_range: history_start
                         ..self.gaussian_history[range_end_index].source_range.end,
-                    tone_acquisition_eligible: output_index == midpoint,
                 }
             })
             .collect();
-        self.gaussian_started = true;
         self.gaussian_history.pop_front();
         outputs
     }
@@ -561,7 +512,9 @@ impl FskDemodulator {
                 "FSK deviation must remain below the channel Nyquist frequency",
             ));
         }
-        if matches!(self.config.modulation, FskModulation::Gfsk { .. }) {
+        if matches!(self.config.modulation, FskModulation::Gfsk { .. })
+            && self.config.timing == FskTiming::Fixed
+        {
             gaussian_filter_tap_count(batch.sample_rate_hz, self.config.symbol_rate_hz)?;
         }
         Ok(())
@@ -1119,9 +1072,8 @@ mod tests {
             .iter()
             .map(|bit| bit.likelihood.is_sign_positive())
             .collect::<Vec<_>>();
-        // Carrier-centre acquisition and the validated timing lock intentionally
-        // consume the first few preamble symbols instead of making decisions
-        // from an uncalibrated threshold.
+        // M&M begins producing decisions immediately and converges without
+        // consuming a separate carrier-acquisition prefix.
         assert!(decisions.len() >= expected.len() - 10);
         assert!(expected
             .windows(decisions.len())
@@ -1129,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_timing_follows_the_gfsk_matched_filter() {
+    fn adaptive_timing_follows_the_gnu_radio_gfsk_chain() {
         let expected = (0..48).map(|index| index % 2 == 0).collect::<Vec<_>>();
         let samples = gfsk_samples(&expected, 0, 0.5);
         let mut demodulator = FskDemodulator::new(FskConfig {

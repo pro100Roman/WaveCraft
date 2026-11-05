@@ -121,15 +121,19 @@ or GUI types.
 - reusable carrier detection, AGC, squelch, AFC, carrier recovery, and symbol
   timing;
 - pluggable digital and analog demodulators, with FSK/GFSK as the first digital
-  implementation; and
-- bitstream transformations and radio packet framing.
+  implementation.
+
+`wavecraft-decode` owns modulation-independent bitstream transformations,
+preamble/sync acquisition, and radio packet framing. `wavecraft-radio` composes
+the DSP demodulator output with squelch and raw framing without introducing GUI
+or hardware-driver dependencies.
 
 The existing scope FFT can later use the same window and spectrum primitives,
 but its migration is not a prerequisite for the first RF slice.
 
 `wavecraft-recording` serializes raw IQ batches and RF capture metadata.
-`wavecraft-gui`, the CLI, and automation consume the core, DSP, recording, and
-backend APIs without duplicating device or decoder behavior.
+`wavecraft-gui`, the CLI, and automation consume the core, DSP, radio,
+recording, and backend APIs without duplicating device or decoder behavior.
 
 ## Core IQ model
 

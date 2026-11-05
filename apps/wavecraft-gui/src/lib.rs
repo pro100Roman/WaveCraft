@@ -29,7 +29,7 @@ use protocol_analyzer::{
     ProtocolAnalyzerSettings, ProtocolCaptureDecoder, ProtocolDataFormat, ProtocolDecodeOutcome,
     ProtocolDecodeSnapshot, ProtocolDecodedEvent, ProtocolDecodedKind, PROTOCOLS,
 };
-use radio_analyzer::{RadioAnalyzerRuntime, RadioDspOutput, RadioDspWorker};
+use radio_analyzer::{process_radio_iq, RadioAnalyzerRuntime, RadioDspOutput, RadioDspWorker};
 use radio_trigger::{RadioSingleTrigger, RadioSingleTriggerConfig};
 use recording::{
     choose_recording_save_path, choose_recording_to_open, choose_saleae_export_path,
@@ -3018,28 +3018,15 @@ fn ingest_radio_iq(
     iq: &wavecraft_core::IqBatch,
     squelch_threshold_dbfs: f32,
 ) {
-    let spectrum_frames = spectrum.push(iq);
-    let analysis = analyzer
-        .as_mut()
-        .map(|analyzer| analyzer.push(iq, &spectrum_frames, squelch_threshold_dbfs));
-    let analysis_failed = analysis.as_ref().is_some_and(Result::is_err);
-    ingest_radio_dsp_output(
-        waveforms,
-        RadioDspOutput {
-            spectrum: spectrum_frames,
-            analysis,
-        },
-    );
-    if analysis_failed {
-        *analyzer = None;
-    }
+    let output = process_radio_iq(spectrum, analyzer, iq, squelch_threshold_dbfs);
+    ingest_radio_dsp_output(waveforms, output);
 }
 
 fn ingest_radio_dsp_output(waveforms: &mut WaveformStore, output: RadioDspOutput) {
     for frame in output.spectrum {
         waveforms.radio.ingest(frame);
     }
-    if let Some(analysis) = output.analysis {
+    for analysis in output.analyses {
         let analysis = analysis.and_then(|output| {
             waveforms.radio_analysis.set_telemetry(output.telemetry);
             if let Some(demodulated) = output.demodulated {
@@ -8893,7 +8880,7 @@ fn paint_radio_analyzer_configuration(
             paint_radio_parameter_label(
                 ui,
                 "Preamble length",
-                Some("Number of consecutive preamble bytes required to align the raw FSK stream"),
+                Some("Minimum consecutive preamble bytes required; additional matching bytes before sync remain part of the preamble"),
             );
             ui.add_enabled_ui(controls_enabled, |ui| {
                 ui.horizontal(|ui| {
@@ -8953,7 +8940,7 @@ fn paint_radio_analyzer_configuration(
             paint_radio_parameter_label(
                 ui,
                 "Preamble bit errors",
-                Some("Maximum hard-decision mismatches accepted across the repeated preamble and sync word"),
+                Some("Maximum hard-decision mismatches accepted in the sync word, or in the preamble when sync is disabled"),
             );
             ui.add_enabled_ui(controls_enabled, |ui| {
                 ui.horizontal(|ui| {
@@ -8967,10 +8954,11 @@ fn paint_radio_analyzer_configuration(
                     ui.label("bits");
                 });
             });
-            let acquisition_bits = settings
-                .preamble_bytes
-                .saturating_add(usize::from(settings.sync_word_bytes))
-                .saturating_mul(8);
+            let acquisition_bits = if settings.sync_word_bytes > 0 {
+                usize::from(settings.sync_word_bytes).saturating_mul(8)
+            } else {
+                settings.preamble_bytes.saturating_mul(8)
+            };
             settings.maximum_preamble_bit_errors = settings
                 .maximum_preamble_bit_errors
                 .min(acquisition_bits.saturating_sub(1));
@@ -9064,7 +9052,7 @@ fn paint_radio_analyzer_configuration(
             paint_radio_parameter_label(
                 ui,
                 "Adaptive timing",
-                Some("Tracks modest transmitter symbol-clock error; acquisition starts after transitions"),
+                Some("GNU Radio-style Mueller-and-Muller symbol synchronization after quadrature demodulation"),
             );
             ui.add_enabled(
                 controls_enabled,

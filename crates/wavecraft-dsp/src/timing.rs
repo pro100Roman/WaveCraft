@@ -51,6 +51,165 @@ pub struct RecoveredSymbol {
     pub source_range: Range<u64>,
 }
 
+/// Streaming Mueller-and-Muller clock recovery for a real decision metric.
+///
+/// This follows GNU Radio's binary GFSK path: interpolate one soft sample,
+/// calculate the decision-directed M&M error, update the clock period and
+/// fractional phase, then advance to the next symbol.
+pub struct MuellerMullerClockRecovery {
+    config: TimingRecoveryConfig,
+    sample_rate_hz: Option<u64>,
+    nominal_period_samples: f64,
+    period_samples: f64,
+    fractional_phase: f64,
+    pending_advance: usize,
+    samples: VecDeque<TimedScalarSample>,
+    last_output: Option<f32>,
+    output_count: usize,
+    error_average: f32,
+    last_input_start: Option<u64>,
+}
+
+impl MuellerMullerClockRecovery {
+    pub fn new(config: TimingRecoveryConfig) -> Result<Self, DspError> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            sample_rate_hz: None,
+            nominal_period_samples: 0.0,
+            period_samples: 0.0,
+            fractional_phase: 0.5,
+            pending_advance: 0,
+            samples: VecDeque::new(),
+            last_output: None,
+            output_count: 0,
+            error_average: 1.0,
+            last_input_start: None,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.sample_rate_hz = None;
+        self.nominal_period_samples = 0.0;
+        self.period_samples = 0.0;
+        self.fractional_phase = 0.5;
+        self.pending_advance = 0;
+        self.samples.clear();
+        self.last_output = None;
+        self.output_count = 0;
+        self.error_average = 1.0;
+        self.last_input_start = None;
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.output_count >= 4
+    }
+
+    pub fn estimated_symbol_rate_hz(&self) -> Option<f64> {
+        (self.output_count >= 2 && self.period_samples > 0.0)
+            .then(|| self.sample_rate_hz.unwrap_or_default() as f64 / self.period_samples)
+    }
+
+    pub fn lock_quality(&self) -> f32 {
+        let acquisition = (self.output_count as f32 / 8.0).clamp(0.0, 1.0);
+        acquisition * (1.0 - self.error_average.clamp(0.0, 1.0))
+    }
+
+    pub fn push(
+        &mut self,
+        input: &[TimedScalarSample],
+        sample_rate_hz: u64,
+        discontinuity: bool,
+    ) -> Result<Vec<RecoveredSymbol>, DspError> {
+        validate_timing_input(input, sample_rate_hz, self.config.symbol_rate_hz)?;
+        if discontinuity
+            || self
+                .sample_rate_hz
+                .is_some_and(|rate| rate != sample_rate_hz)
+        {
+            self.reset();
+        }
+        if input.first().is_some_and(|sample| {
+            self.last_input_start
+                .is_some_and(|start| sample.source_range.start < start)
+        }) {
+            self.reset();
+            return Err(DspError::new(
+                "M&M timing-recovery samples are not ordered by source range",
+            ));
+        }
+        if self.sample_rate_hz.is_none() {
+            self.sample_rate_hz = Some(sample_rate_hz);
+            self.nominal_period_samples = sample_rate_hz as f64 / self.config.symbol_rate_hz as f64;
+            self.period_samples = self.nominal_period_samples;
+        }
+        self.samples.extend(input.iter().cloned());
+        if let Some(last) = input.last() {
+            self.last_input_start = Some(last.source_range.start);
+        }
+
+        self.discard_pending_advance();
+        let gain_mu = mueller_muller_phase_gain(self.config.loop_bandwidth);
+        let gain_omega = 0.25 * gain_mu * gain_mu;
+        let relative_limit = f64::from(self.config.max_clock_error_ppm) / 1_000_000.0;
+        let period_limit = self.nominal_period_samples * relative_limit;
+        let minimum_period = self.nominal_period_samples - period_limit;
+        let maximum_period = self.nominal_period_samples + period_limit;
+        let mut recovered = Vec::new();
+
+        while self.pending_advance == 0 && self.samples.len() >= 2 {
+            let first = &self.samples[0];
+            let second = &self.samples[1];
+            let fraction = self.fractional_phase as f32;
+            let output = first.value + (second.value - first.value) * fraction;
+            let error = self.last_output.map_or(0.0, |previous| {
+                binary_slice(previous) * output - binary_slice(output) * previous
+            });
+            self.last_output = Some(output);
+            self.output_count = self.output_count.saturating_add(1);
+            self.error_average = self.error_average * 0.9 + error.abs().min(1.0) * 0.1;
+            recovered.push(RecoveredSymbol {
+                value: output,
+                source_range: first.source_range.start..second.source_range.end,
+            });
+
+            self.period_samples = (self.period_samples + gain_omega * f64::from(error))
+                .clamp(minimum_period, maximum_period);
+            let next_phase =
+                self.fractional_phase + self.period_samples + gain_mu * f64::from(error);
+            let advance = next_phase.floor().max(1.0) as usize;
+            self.fractional_phase = next_phase - advance as f64;
+            let drained = advance.min(self.samples.len());
+            self.samples.drain(..drained);
+            self.pending_advance = advance - drained;
+            self.discard_pending_advance();
+        }
+        Ok(recovered)
+    }
+
+    fn discard_pending_advance(&mut self) {
+        let discard = self.pending_advance.min(self.samples.len());
+        self.samples.drain(..discard);
+        self.pending_advance -= discard;
+    }
+}
+
+fn binary_slice(value: f32) -> f32 {
+    if value >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+fn mueller_muller_phase_gain(loop_bandwidth: f64) -> f64 {
+    // GNU Radio's GFSK defaults derive loop bandwidth from gain_mu and
+    // gain_omega = 0.25 * gain_mu^2. Invert that relation so the existing
+    // WaveCraft loop-bandwidth setting drives the same M&M update law.
+    let combined_gain = 2.0 * (1.0 - (-loop_bandwidth).exp());
+    2.0 * ((1.0 + combined_gain).sqrt() - 1.0)
+}
+
 /// Streaming transition-aided timing recovery for a real decision metric.
 ///
 /// The loop acquires after two transitions, interpolates decisions at symbol
@@ -238,29 +397,47 @@ impl SymbolTimingRecovery {
         samples: &[TimedScalarSample],
         sample_rate_hz: u64,
     ) -> Result<(), DspError> {
-        if sample_rate_hz == 0 {
-            return Err(DspError::new("timing-recovery sample rate must be nonzero"));
-        }
-        if self.config.symbol_rate_hz.saturating_mul(2) > sample_rate_hz {
+        validate_timing_input(samples, sample_rate_hz, self.config.symbol_rate_hz)
+    }
+}
+
+fn validate_timing_input(
+    samples: &[TimedScalarSample],
+    sample_rate_hz: u64,
+    symbol_rate_hz: u64,
+) -> Result<(), DspError> {
+    if sample_rate_hz == 0 {
+        return Err(DspError::new("timing-recovery sample rate must be nonzero"));
+    }
+    if symbol_rate_hz.saturating_mul(2) > sample_rate_hz {
+        return Err(DspError::new(
+            "symbol timing requires at least two samples per symbol",
+        ));
+    }
+    for sample in samples {
+        if !sample.value.is_finite() {
             return Err(DspError::new(
-                "symbol timing requires at least two samples per symbol",
+                "timing-recovery sample contains a non-finite value",
             ));
         }
-        for sample in samples {
-            if !sample.value.is_finite() {
-                return Err(DspError::new(
-                    "timing-recovery sample contains a non-finite value",
-                ));
-            }
-            if sample.source_range.is_empty() {
-                return Err(DspError::new(
-                    "timing-recovery sample has an empty source range",
-                ));
-            }
+        if sample.source_range.is_empty() {
+            return Err(DspError::new(
+                "timing-recovery sample has an empty source range",
+            ));
         }
-        Ok(())
     }
+    if samples
+        .windows(2)
+        .any(|samples| samples[0].source_range.start > samples[1].source_range.start)
+    {
+        return Err(DspError::new(
+            "timing-recovery samples are not ordered by source range",
+        ));
+    }
+    Ok(())
+}
 
+impl SymbolTimingRecovery {
     fn observe_transition(&mut self, transition_sample: f64) {
         let Some(previous_transition) = self.last_transition_sample else {
             self.transition_reference_sample = Some(transition_sample);
@@ -430,6 +607,44 @@ mod tests {
             max_clock_error_ppm: 10_000,
         })
         .unwrap()
+    }
+
+    fn mueller_muller_recovery() -> MuellerMullerClockRecovery {
+        MuellerMullerClockRecovery::new(TimingRecoveryConfig {
+            symbol_rate_hz: CONFIGURED_SYMBOL_RATE_HZ,
+            loop_bandwidth: 0.1,
+            max_clock_error_ppm: 10_000,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn mueller_muller_recovery_is_chunk_independent_with_arbitrary_phase() {
+        let samples = alternating_samples(120, 1_004.0, 2.7, 10_000);
+        let mut whole = mueller_muller_recovery();
+        let whole_symbols = whole.push(&samples, SAMPLE_RATE_HZ, true).unwrap();
+
+        let mut chunked = mueller_muller_recovery();
+        let mut chunked_symbols = Vec::new();
+        for (index, range) in [0..7, 7..83, 83..314, 314..samples.len()]
+            .into_iter()
+            .enumerate()
+        {
+            chunked_symbols.extend(
+                chunked
+                    .push(&samples[range], SAMPLE_RATE_HZ, index == 0)
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(chunked_symbols, whole_symbols);
+        assert!(whole.is_locked());
+        assert!(whole_symbols.len() >= 115);
+        assert!(whole_symbols
+            .windows(2)
+            .all(|symbols| symbols[0].value.is_sign_positive()
+                != symbols[1].value.is_sign_positive()));
+        assert!((whole.estimated_symbol_rate_hz().unwrap() - 1_004.0).abs() < 5.0);
     }
 
     #[test]

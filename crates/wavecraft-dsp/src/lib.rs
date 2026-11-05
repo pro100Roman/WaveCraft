@@ -22,7 +22,10 @@ pub use fsk::{
 pub use registry::{
     DemodulatorDescriptor, DemodulatorFactory, DemodulatorOutputKind, DemodulatorRegistry,
 };
-pub use timing::{RecoveredSymbol, SymbolTimingRecovery, TimedScalarSample, TimingRecoveryConfig};
+pub use timing::{
+    MuellerMullerClockRecovery, RecoveredSymbol, SymbolTimingRecovery, TimedScalarSample,
+    TimingRecoveryConfig,
+};
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -183,6 +186,10 @@ impl SpectrumProcessor {
     pub fn with_iq_correction(mut self, enabled: bool) -> Self {
         self.iq_correction_enabled = enabled;
         self
+    }
+
+    pub fn fft_length(&self) -> usize {
+        self.fft_length
     }
 
     pub fn reset(&mut self) {

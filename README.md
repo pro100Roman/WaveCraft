@@ -427,6 +427,9 @@ same method, live status/progress callbacks, and structured exceptions. See
 ## Workspace layout
 
 - `crates/wavecraft-core`: device-independent capture types and concurrency.
+- `crates/wavecraft-decode`: bitstream transforms, synchronization, framing, and protocol decoding.
+- `crates/wavecraft-dsp`: channelization, spectrum processing, and reusable demodulators.
+- `crates/wavecraft-radio`: device-independent composition of radio DSP, squelch, and raw framing.
 - `crates/wavecraft-sdr`: device-independent radio discovery and configuration contracts.
 - `crates/wavecraft-hackrf`: runtime-loaded HackRF One discovery and receive-only IQ capture.
 - `crates/wavecraft-recording`: native recording plus Saleae `.sal` import/export.

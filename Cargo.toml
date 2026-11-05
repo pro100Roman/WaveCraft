@@ -8,6 +8,7 @@ members = [
     "crates/wavecraft-dsp",
     "crates/wavecraft-hackrf",
     "crates/wavecraft-recording",
+    "crates/wavecraft-radio",
     "crates/wavecraft-sdr",
     "crates/wavecraft-sim",
     "crates/wavecraft-usb",
