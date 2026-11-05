@@ -20,11 +20,11 @@ the wideband integer IQ stream and tracks DC once per input chunk, then fans the
 prepared samples out to the active per-channel mixers and FIR filters. Its shared
 spectrum FFT also gates inactive channels before channelization. Decoded rows
 retain and display their originating channel offset.
-For binary FSK/GFSK, the panel selects raw discovery or fixed-length packet
-decoding. Raw discovery edits a repeated hexadecimal preamble. Packet mode
-edits an unwhitened sync word, packet length, and optional post-sync additive
-whitening LFSR. The RF view shows bounded raw-message or completed-packet
-history with source timing retained.
+For binary FSK/GFSK, the panel selects raw discovery or fixed packet decoding.
+Both modes edit a repeated hexadecimal preamble and unwhitened sync word.
+Packet mode can apply an optional post-sync additive whitening LFSR. The RF
+view shows bounded raw-message or completed-packet history with source timing
+retained.
 New radio sessions default to a 2 MHz capture sample rate, 1.75 MHz HackRF
 baseband bandwidth, and a GFSK analyzer profile with a 19.2 kbit/s binary bit
 rate and 35 kHz frequency deviation. The analyzer remains opt-in.
@@ -592,10 +592,13 @@ the individual state machines.
 In fixed-decoding mode the same view is labeled **PACKETS**. Until configurable
 length-field framing is exposed, it collects post-sync bytes through the end of
 the stream or an input discontinuity instead of assuming a constant packet
-length. Signal Analyzer settings expose whitening enablement, LFSR width, tap
-mask, seed, shift direction, output inversion, covered data-bit range, and
-excluded-bit advancement. These settings are saved in capture profiles and
-recording metadata so replay uses the same packet transform.
+length. Acquisition requires the configured preamble immediately before sync,
+and PACKETS rows retain that preamble separately from dewhitened data. A final
+sub-byte tail is ignored rather than discarding complete bytes. Signal Analyzer
+settings expose whitening enablement, LFSR width, tap mask, seed, shift
+direction, output inversion, covered data-bit range, and excluded-bit
+advancement. These settings are saved in capture profiles and recording
+metadata so replay uses the same packet transform.
 Whitening can use a **Custom** preset that exposes those individual fields or
 the fixed **PN9** preset used by standard SX127x FSK packet whitening. PN9 uses
 the x⁹ + x⁵ + 1 polynomial and resets to seed `0x1FF` after each sync word.

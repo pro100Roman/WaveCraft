@@ -4,6 +4,7 @@ use crate::{
 };
 
 const MAX_SYNC_WORD_BITS: usize = 256;
+const MAX_PREAMBLE_BITS: usize = 2_048;
 const MAX_SYNC_SEARCH_BITS: usize = 1_048_576;
 const MAX_PACKET_BYTES: usize = 1_048_576;
 
@@ -38,6 +39,8 @@ pub enum RadioPacketLength {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RadioPacketFramerConfig {
+    /// Optional byte-aligned preamble required immediately before sync.
+    pub preamble: Vec<bool>,
     /// Sync is detected and consumed; packet bytes begin with the following bit.
     pub sync: SyncWordConfig,
     /// Optional additive dewhitening applied only after sync is accepted.
@@ -50,6 +53,11 @@ pub struct RadioPacketFramerConfig {
 
 impl RadioPacketFramerConfig {
     pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.preamble.len() > MAX_PREAMBLE_BITS || self.preamble.len() % 8 != 0 {
+            return Err(DecodeError::new(
+                "radio preamble must be byte-aligned and no longer than 256 bytes",
+            ));
+        }
         if self.sync.bits.is_empty() || self.sync.bits.len() > MAX_SYNC_WORD_BITS {
             return Err(DecodeError::new(
                 "radio sync word must contain between 1 and 256 bits",
@@ -60,11 +68,11 @@ impl RadioPacketFramerConfig {
                 "radio sync error limit must be smaller than the sync word",
             ));
         }
-        if self.max_search_bits < self.sync.bits.len()
+        if self.max_search_bits < self.acquisition_bit_count()
             || self.max_search_bits > MAX_SYNC_SEARCH_BITS
         {
             return Err(DecodeError::new(
-                "radio sync search limit must fit the sync word and not exceed 1048576 bits",
+                "radio sync search limit must fit the preamble and sync word and not exceed 1048576 bits",
             ));
         }
         if let Some(whitening) = self.whitening {
@@ -96,10 +104,15 @@ impl RadioPacketFramerConfig {
         }
         Ok(())
     }
+
+    fn acquisition_bit_count(&self) -> usize {
+        self.preamble.len().saturating_add(self.sync.bits.len())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RadioPacket {
+    pub preamble: Vec<TimedByte>,
     pub bytes: Vec<TimedByte>,
     pub range: SampleRange,
     pub confidence: f32,
@@ -118,10 +131,11 @@ pub struct RadioPacketFramer {
     search_bits: Vec<TimedBit>,
     packet_bits: Vec<TimedBit>,
     packet_target_bits: Option<usize>,
+    matched_preamble: Vec<TimedByte>,
     sync_range: Option<SampleRange>,
     sync_bit_errors: usize,
     whitening: Option<AdditiveWhitening>,
-    last_input_end: Option<u64>,
+    last_input_start: Option<u64>,
 }
 
 impl RadioPacketFramer {
@@ -132,10 +146,11 @@ impl RadioPacketFramer {
             search_bits: Vec::with_capacity(config.max_search_bits),
             packet_bits: Vec::new(),
             packet_target_bits: fixed_target_bits(config.length),
+            matched_preamble: Vec::new(),
             sync_range: None,
             sync_bit_errors: 0,
             whitening,
-            last_input_end: None,
+            last_input_start: None,
             config,
         })
     }
@@ -152,12 +167,13 @@ impl RadioPacketFramer {
         self.search_bits.clear();
         self.packet_bits.clear();
         self.packet_target_bits = fixed_target_bits(self.config.length);
+        self.matched_preamble.clear();
         self.sync_range = None;
         self.sync_bit_errors = 0;
         if let Some(whitening) = &mut self.whitening {
             whitening.reset();
         }
-        self.last_input_end = None;
+        self.last_input_start = None;
     }
 
     pub fn push(&mut self, batch: &TimedBitBatch) -> Result<RadioPacketFramingOutput, DecodeError> {
@@ -166,12 +182,14 @@ impl RadioPacketFramer {
         if batch.discontinuity {
             self.flush_partial_packet(&mut output, "input discontinuity");
             self.reset();
-        } else if self
-            .last_input_end
-            .is_some_and(|end| batch.bits.first().is_some_and(|bit| bit.range.start < end))
-        {
+        } else if self.last_input_start.is_some_and(|start| {
+            batch
+                .bits
+                .first()
+                .is_some_and(|bit| bit.range.start < start)
+        }) {
             return Err(DecodeError::new(
-                "new radio packet bits overlap the previous input batch",
+                "new radio packet bits are not ordered after the previous input batch",
             ));
         }
 
@@ -179,10 +197,18 @@ impl RadioPacketFramer {
         for bit in &batch.bits {
             if self.sync_range.is_none() {
                 self.search_bits.push(*bit);
-                if let Some(bit_errors) = self.matches_sync_suffix() {
-                    let sync_start = self.search_bits.len() - self.config.sync.bits.len();
+                if let Some(bit_errors) = self.matches_acquisition_suffix() {
+                    let acquisition_start = self
+                        .search_bits
+                        .len()
+                        .saturating_sub(self.config.acquisition_bit_count());
+                    let sync_start = acquisition_start + self.config.preamble.len();
                     let first = self.search_bits[sync_start];
                     let last = *self.search_bits.last().unwrap_or(&first);
+                    self.matched_preamble = pack_timed_bytes(
+                        &self.search_bits[acquisition_start..sync_start],
+                        self.config.bit_order,
+                    )?;
                     self.sync_range = Some(covering_range(first.range, last.range));
                     self.sync_bit_errors = bit_errors;
                     self.search_bits.clear();
@@ -194,7 +220,7 @@ impl RadioPacketFramer {
                     continue;
                 }
                 if self.search_bits.len() > self.config.max_search_bits {
-                    let retained = self.config.sync.bits.len().saturating_sub(1);
+                    let retained = self.config.acquisition_bit_count().saturating_sub(1);
                     let discard = self.search_bits.len().saturating_sub(retained);
                     self.search_bits.drain(..discard);
                     discarded_search_bits = discarded_search_bits.saturating_add(discard);
@@ -229,7 +255,9 @@ impl RadioPacketFramer {
             ));
         }
         if let Some(last) = batch.bits.last() {
-            self.last_input_end = Some(last.range.end);
+            // Filtered symbol decisions can have overlapping provenance ranges;
+            // only their start positions must remain ordered.
+            self.last_input_start = Some(last.range.start);
         }
         Ok(output)
     }
@@ -241,12 +269,21 @@ impl RadioPacketFramer {
         output
     }
 
-    fn matches_sync_suffix(&self) -> Option<usize> {
-        if self.search_bits.len() < self.config.sync.bits.len() {
+    fn matches_acquisition_suffix(&self) -> Option<usize> {
+        let acquisition_bits = self.config.acquisition_bit_count();
+        if self.search_bits.len() < acquisition_bits {
             return None;
         }
-        let start = self.search_bits.len() - self.config.sync.bits.len();
-        let errors = self.search_bits[start..]
+        let start = self.search_bits.len() - acquisition_bits;
+        if self.search_bits[start..start + self.config.preamble.len()]
+            .iter()
+            .zip(&self.config.preamble)
+            .any(|(actual, expected)| actual.value != *expected)
+        {
+            return None;
+        }
+        let sync_start = start + self.config.preamble.len();
+        let errors = self.search_bits[sync_start..]
             .iter()
             .zip(&self.config.sync.bits)
             .filter(|(actual, expected)| actual.value != **expected)
@@ -298,7 +335,9 @@ impl RadioPacketFramer {
             .sync_range
             .ok_or_else(|| DecodeError::new("radio packet is missing its sync range"))?;
         let bytes = pack_timed_bytes(&self.packet_bits, self.config.bit_order)?;
+        let preamble = std::mem::take(&mut self.matched_preamble);
         let last_range = bytes.last().map_or(sync_range, |byte| byte.range);
+        let first_range = preamble.first().map_or(sync_range, |byte| byte.range);
         let confidence = if self.packet_bits.is_empty() {
             0.0
         } else {
@@ -321,8 +360,9 @@ impl RadioPacketFramer {
             ));
         }
         let packet = RadioPacket {
+            preamble,
             bytes,
-            range: covering_range(sync_range, last_range),
+            range: covering_range(first_range, last_range),
             confidence,
             diagnostics,
         };
@@ -334,13 +374,15 @@ impl RadioPacketFramer {
         if self.sync_range.is_none() || self.packet_bits.is_empty() {
             return;
         }
-        if self.config.length == RadioPacketLength::UntilEndOfStream
-            && self.packet_bits.len() % 8 == 0
-        {
-            if let Ok(packet) = self.take_packet() {
-                output.packets.push(packet);
-                return;
+        if self.config.length == RadioPacketLength::UntilEndOfStream {
+            let complete_bit_count = self.packet_bits.len() / 8 * 8;
+            self.packet_bits.truncate(complete_bit_count);
+            if complete_bit_count > 0 {
+                if let Ok(packet) = self.take_packet() {
+                    output.packets.push(packet);
+                }
             }
+            return;
         }
         output.diagnostics.push(packet_diagnostic(
             "radio.framing.incomplete_packet",
@@ -357,6 +399,7 @@ impl RadioPacketFramer {
         self.search_bits.clear();
         self.packet_bits.clear();
         self.packet_target_bits = fixed_target_bits(self.config.length);
+        self.matched_preamble.clear();
         self.sync_range = None;
         self.sync_bit_errors = 0;
         if let Some(whitening) = &mut self.whitening {
@@ -487,6 +530,7 @@ mod tests {
 
     fn fixed_config(bit_order: BitOrder) -> RadioPacketFramerConfig {
         RadioPacketFramerConfig {
+            preamble: Vec::new(),
             sync: SyncWordConfig {
                 bits: vec![true, false, true, false],
                 max_bit_errors: 0,
@@ -560,9 +604,13 @@ mod tests {
     fn until_end_of_stream_emits_all_post_sync_bytes_on_finish() {
         let mut config = fixed_config(BitOrder::MostSignificantFirst);
         config.length = RadioPacketLength::UntilEndOfStream;
-        let mut values = config.sync.bits.clone();
+        config.preamble = byte_bits(0xAA, config.bit_order);
+        let mut values = config.preamble.clone();
+        values.extend(config.sync.bits.clone());
         values.extend(byte_bits(0xA5, config.bit_order));
         values.extend(byte_bits(0x3C, config.bit_order));
+        values.extend(byte_bits(0x7E, config.bit_order));
+        values.extend([true, false, true, false]);
         let mut framer = RadioPacketFramer::new(config).unwrap();
 
         let pushed = framer.push(&timed_bits(&values, 0, false)).unwrap();
@@ -570,14 +618,29 @@ mod tests {
 
         assert!(pushed.packets.is_empty());
         assert!(finished.diagnostics.is_empty());
+        assert_eq!(finished.packets[0].preamble[0].value, 0xAA);
         assert_eq!(
             finished.packets[0]
                 .bytes
                 .iter()
                 .map(|byte| byte.value)
                 .collect::<Vec<_>>(),
-            [0xA5, 0x3C]
+            [0xA5, 0x3C, 0x7E]
         );
+    }
+
+    #[test]
+    fn configured_preamble_is_required_before_sync() {
+        let mut config = fixed_config(BitOrder::MostSignificantFirst);
+        config.preamble = byte_bits(0xAA, config.bit_order);
+        config.length = RadioPacketLength::Fixed { packet_bytes: 1 };
+        let mut values = config.sync.bits.clone();
+        values.extend(byte_bits(0xA5, config.bit_order));
+        let mut framer = RadioPacketFramer::new(config).unwrap();
+
+        let output = framer.push(&timed_bits(&values, 0, false)).unwrap();
+
+        assert!(output.packets.is_empty());
     }
 
     #[test]
@@ -601,6 +664,7 @@ mod tests {
     #[test]
     fn length_field_frames_a_bounded_packet() {
         let config = RadioPacketFramerConfig {
+            preamble: Vec::new(),
             sync: SyncWordConfig {
                 bits: vec![true, true, false, false],
                 max_bit_errors: 0,
@@ -638,6 +702,7 @@ mod tests {
     #[test]
     fn dewhitens_after_sync_before_decoding_a_length_field() {
         let mut config = RadioPacketFramerConfig {
+            preamble: Vec::new(),
             sync: SyncWordConfig {
                 bits: vec![true, true, false, false],
                 max_bit_errors: 0,

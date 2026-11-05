@@ -3510,6 +3510,12 @@ impl RadioAnalyzerSettings {
                 if self.sync_word_bytes == 0 {
                     return Err("packet decoding requires a sync word".to_owned());
                 }
+                let preamble_bits = std::iter::repeat(self.preamble_byte)
+                    .take(self.preamble_bytes)
+                    .flat_map(|byte| {
+                        (0..8).map(move |bit_index| byte & (1 << (7 - bit_index)) != 0)
+                    })
+                    .collect();
                 let sync_bits = (0..self.sync_word_bytes)
                     .flat_map(|byte_index| {
                         let shift = u32::from(self.sync_word_bytes - byte_index - 1) * 8;
@@ -3522,6 +3528,7 @@ impl RadioAnalyzerSettings {
                 let config = RadioPacketPipelineConfig {
                     bit_transform: BitTransformConfig::default(),
                     framing: RadioPacketFramerConfig {
+                        preamble: preamble_bits,
                         sync: SyncWordConfig {
                             bits: sync_bits,
                             max_bit_errors: self.maximum_preamble_bit_errors,
@@ -9331,7 +9338,7 @@ fn paint_radio_analyzer_configuration(
             paint_radio_parameter_label(
                 ui,
                 "Data decoding",
-                Some("Raw mode discovers byte alignment from a repeated preamble; packet mode emits fixed-length post-sync packets and can dewhiten them"),
+                Some("RAW discovers byte alignment from a repeated preamble; Fixed requires the configured preamble and sync, then dewhitens post-sync data"),
             );
             ui.add_enabled_ui(controls_enabled, |ui| {
                 egui::ComboBox::from_id_salt("radio_analyzer_data_mode")
@@ -19325,6 +19332,10 @@ mod tests {
         let RadioDataDecoderConfig::Packets(config) = settings.decoder_config().unwrap() else {
             panic!("packet settings should build a packet decoder");
         };
+        assert_eq!(
+            config.framing.preamble,
+            [true, false, true, false, true, false, true, false].repeat(4)
+        );
         assert_eq!(
             config.framing.sync.bits,
             [

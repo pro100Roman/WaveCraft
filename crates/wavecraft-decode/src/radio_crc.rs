@@ -215,6 +215,7 @@ mod tests {
 
     fn packet(values: &[u8]) -> RadioPacket {
         RadioPacket {
+            preamble: Vec::new(),
             bytes: values
                 .iter()
                 .enumerate()

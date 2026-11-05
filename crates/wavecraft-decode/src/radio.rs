@@ -86,7 +86,7 @@ pub struct BitTransformer {
     config: BitTransformConfig,
     previous_nrzi_chip: Option<TimedBit>,
     pending_manchester_chip: Option<TimedBit>,
-    last_input_end: Option<u64>,
+    last_input_start: Option<u64>,
 }
 
 impl BitTransformer {
@@ -95,7 +95,7 @@ impl BitTransformer {
             config,
             previous_nrzi_chip: None,
             pending_manchester_chip: None,
-            last_input_end: None,
+            last_input_start: None,
         }
     }
 
@@ -106,7 +106,7 @@ impl BitTransformer {
     pub fn reset(&mut self) {
         self.previous_nrzi_chip = None;
         self.pending_manchester_chip = None;
-        self.last_input_end = None;
+        self.last_input_start = None;
     }
 
     pub fn push(&mut self, batch: &TimedBitBatch) -> Result<BitTransformOutput, DecodeError> {
@@ -121,12 +121,14 @@ impl BitTransformer {
                 ));
             }
             self.reset();
-        } else if self
-            .last_input_end
-            .is_some_and(|end| batch.bits.first().is_some_and(|bit| bit.range.start < end))
-        {
+        } else if self.last_input_start.is_some_and(|start| {
+            batch
+                .bits
+                .first()
+                .is_some_and(|bit| bit.range.start < start)
+        }) {
             return Err(DecodeError::new(
-                "new timed bits overlap the previous input batch",
+                "new timed bits are not ordered after the previous input batch",
             ));
         }
 
@@ -182,7 +184,9 @@ impl BitTransformer {
             }
         }
         if let Some(last) = batch.bits.last() {
-            self.last_input_end = Some(last.range.end);
+            // Source ranges cover every sample contributing to a decision, so
+            // filtered adjacent bits may legitimately overlap.
+            self.last_input_start = Some(last.range.start);
         }
         Ok(output)
     }
@@ -197,7 +201,7 @@ impl BitTransformer {
             ));
         }
         self.previous_nrzi_chip = None;
-        self.last_input_end = None;
+        self.last_input_start = None;
         output
     }
 }

@@ -470,6 +470,7 @@ mod tests {
         let config = RadioPacketPipelineConfig {
             bit_transform: BitTransformConfig::default(),
             framing: RadioPacketFramerConfig {
+                preamble: Vec::new(),
                 sync: SyncWordConfig {
                     bits: vec![true, false, true, false],
                     max_bit_errors: 0,

@@ -264,13 +264,15 @@ impl RadioAnalysisStore {
         self.raw_diagnostics.extend(output.diagnostics);
         for packet in output.packets {
             let sample_index = packet
-                .bytes
+                .preamble
                 .first()
+                .or_else(|| packet.bytes.first())
                 .map_or(packet.range.start, |byte| byte.range.start);
+            let preamble_bytes = packet.preamble.len();
             self.start_raw_message(
                 RawRadioMessageStart {
                     sample_index,
-                    preamble_bytes: 0,
+                    preamble_bytes,
                     maximum_uncertain_bits: usize::MAX,
                 },
                 channel_frequency_offset_hz,
@@ -279,10 +281,12 @@ impl RadioAnalysisStore {
             if let Some(message_index) = self.active_raw_message_index(channel_frequency_offset_hz)
             {
                 let message = &mut self.raw_messages[message_index];
+                message.bytes.extend(packet.preamble.iter().copied());
                 message.bytes.extend(packet.bytes.iter().copied());
                 let excess = message.bytes.len().saturating_sub(self.capacity);
                 message.bytes.drain(..excess);
             }
+            self.raw_bytes.extend(packet.preamble);
             self.raw_bytes.extend(packet.bytes);
             let excess = self.raw_bytes.len().saturating_sub(self.capacity);
             self.raw_bytes.drain(..excess);
@@ -937,7 +941,6 @@ fn paint_analysis(
             ui,
             plot,
             store,
-            packet_mode,
             raw_message_scroll_rows,
             raw_message_newest_completed_sequence,
         );
@@ -974,7 +977,6 @@ fn paint_raw_messages(
     ui: &mut egui::Ui,
     plot: Rect,
     store: &RadioAnalysisStore,
-    packet_mode: bool,
     scroll_rows: &mut usize,
     newest_completed_sequence: &mut Option<u64>,
 ) {
@@ -1070,49 +1072,47 @@ fn paint_raw_messages(
         );
         x += CHANNEL_WIDTH;
         let preamble_bytes = message.preamble_bytes();
-        if !packet_mode {
-            let expansion_id = ui.id().with(("raw_preamble_expanded", message.sequence()));
-            let mut preamble_expanded =
-                ui.data(|data| data.get_temp::<bool>(expansion_id).unwrap_or(false));
-            let toggle_rect = Rect::from_min_size(
-                Pos2::new(x, row_rect.top()),
-                Vec2::new(PREAMBLE_TOGGLE_WIDTH, row_rect.height()),
-            );
-            let toggle = ui
-                .interact(toggle_rect, expansion_id, Sense::click())
-                .on_hover_text(if preamble_expanded {
-                    "Collapse preamble bytes"
-                } else {
-                    "Expand preamble bytes"
-                });
-            if toggle.clicked() {
-                preamble_expanded = !preamble_expanded;
-                ui.data_mut(|data| data.insert_temp(expansion_id, preamble_expanded));
-            }
-            paint_raw_section_label(
+        let expansion_id = ui.id().with(("raw_preamble_expanded", message.sequence()));
+        let mut preamble_expanded =
+            ui.data(|data| data.get_temp::<bool>(expansion_id).unwrap_or(false));
+        let toggle_rect = Rect::from_min_size(
+            Pos2::new(x, row_rect.top()),
+            Vec2::new(PREAMBLE_TOGGLE_WIDTH, row_rect.height()),
+        );
+        let toggle = ui
+            .interact(toggle_rect, expansion_id, Sense::click())
+            .on_hover_text(if preamble_expanded {
+                "Collapse preamble bytes"
+            } else {
+                "Expand preamble bytes"
+            });
+        if toggle.clicked() {
+            preamble_expanded = !preamble_expanded;
+            ui.data_mut(|data| data.insert_temp(expansion_id, preamble_expanded));
+        }
+        paint_raw_section_label(
+            ui,
+            row_rect,
+            x,
+            "PRE",
+            if toggle.hovered() {
+                Color32::from_rgb(255, 205, 105)
+            } else {
+                Color32::from_rgb(235, 180, 80)
+            },
+        );
+        x += PREAMBLE_TOGGLE_WIDTH;
+        let displayed_preamble = displayed_raw_preamble(message, preamble_expanded);
+        if !displayed_preamble.is_empty() {
+            x = paint_raw_message_bytes(
                 ui,
                 row_rect,
                 x,
-                "PRE",
-                if toggle.hovered() {
-                    Color32::from_rgb(255, 205, 105)
-                } else {
-                    Color32::from_rgb(235, 180, 80)
-                },
+                right_limit,
+                displayed_preamble,
+                BYTE_CELL_WIDTH,
+                Color32::from_rgb(245, 190, 90),
             );
-            x += PREAMBLE_TOGGLE_WIDTH;
-            let displayed_preamble = displayed_raw_preamble(message, preamble_expanded);
-            if !displayed_preamble.is_empty() {
-                x = paint_raw_message_bytes(
-                    ui,
-                    row_rect,
-                    x,
-                    right_limit,
-                    displayed_preamble,
-                    BYTE_CELL_WIDTH,
-                    Color32::from_rgb(245, 190, 90),
-                );
-            }
         }
         if x + SECTION_WIDTH < right_limit {
             paint_raw_section_label(ui, row_rect, x, "DATA", Color32::from_rgb(105, 150, 175));
@@ -1151,13 +1151,11 @@ fn paint_raw_messages(
                 .monospace()
                 .color(Color32::from_rgb(125, 175, 145)),
             );
-            if !packet_mode {
-                ui.label(
-                    egui::RichText::new(format!("PRE  {preamble}"))
-                        .monospace()
-                        .color(Color32::from_rgb(245, 190, 90)),
-                );
-            }
+            ui.label(
+                egui::RichText::new(format!("PRE  {preamble}"))
+                    .monospace()
+                    .color(Color32::from_rgb(245, 190, 90)),
+            );
             ui.label(
                 egui::RichText::new(format!("DATA ({} B) {data}", message.data_len()))
                     .monospace()
@@ -2055,6 +2053,11 @@ mod tests {
         store.ingest_packets(
             RadioPacketPipelineOutput {
                 packets: vec![RadioPacket {
+                    preamble: vec![TimedByte {
+                        value: 0xaa,
+                        range: SampleRange { start: 84, end: 92 },
+                        status: ByteStatus::default(),
+                    }],
                     bytes: [0x10, 0x20, 0x30]
                         .into_iter()
                         .enumerate()
@@ -2085,7 +2088,8 @@ mod tests {
         assert!(message.is_complete());
         assert_eq!(message.channel_frequency_offset_hz(), 200_000);
         assert_eq!(message.channel_name(), "Packets");
-        assert_eq!(message.preamble_bytes(), 0);
+        assert_eq!(message.preamble_bytes(), 1);
+        assert_eq!(message.bytes()[0].value, 0xaa);
         assert_eq!(
             message
                 .data_bytes()

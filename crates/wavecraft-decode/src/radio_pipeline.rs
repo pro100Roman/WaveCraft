@@ -152,6 +152,31 @@ mod tests {
         }
     }
 
+    fn overlapping_timed_bits(
+        values: &[bool],
+        first_bit: usize,
+        discontinuity: bool,
+    ) -> TimedBitBatch {
+        TimedBitBatch {
+            discontinuity,
+            bits: values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let start = (first_bit + index) as u64 * 2;
+                    TimedBit {
+                        value: *value,
+                        confidence: 0.9,
+                        range: SampleRange {
+                            start,
+                            end: start + 20,
+                        },
+                    }
+                })
+                .collect(),
+        }
+    }
+
     fn config(discard_failed: bool) -> RadioPacketPipelineConfig {
         RadioPacketPipelineConfig {
             bit_transform: BitTransformConfig {
@@ -159,6 +184,7 @@ mod tests {
                 line_code: LineCode::Nrz,
             },
             framing: RadioPacketFramerConfig {
+                preamble: Vec::new(),
                 sync: SyncWordConfig {
                     bits: vec![true, false, true, false, true, false, true, false],
                     max_bit_errors: 0,
@@ -212,9 +238,30 @@ mod tests {
         }
     }
 
+    fn pn9_whitening_config() -> AdditiveWhiteningConfig {
+        AdditiveWhiteningConfig {
+            width: 9,
+            polynomial: 0x21,
+            seed: 0x1ff,
+            direction: WhiteningDirection::ShiftRight,
+            invert_output: false,
+            start_bit: 0,
+            end_bit: None,
+            advance_excluded_bits: false,
+        }
+    }
+
     fn whiten_after_sync(values: &[bool], sync_bits: usize) -> Vec<bool> {
+        whiten_after_sync_with(values, sync_bits, whitening_config())
+    }
+
+    fn whiten_after_sync_with(
+        values: &[bool],
+        sync_bits: usize,
+        config: AdditiveWhiteningConfig,
+    ) -> Vec<bool> {
         let mut result = values[..sync_bits].to_vec();
-        let mut whitening = AdditiveWhitening::new(whitening_config()).unwrap();
+        let mut whitening = AdditiveWhitening::new(config).unwrap();
         result.extend(
             values[sync_bits..]
                 .iter()
@@ -256,6 +303,41 @@ mod tests {
             [0x10, 0x20, 0x30, 0x9C]
         );
         assert!(expected.packets[0].diagnostics.is_empty());
+    }
+
+    #[test]
+    fn pn9_pipeline_accepts_overlapping_filtered_ranges_across_chunks() {
+        let mut config = config(false);
+        config.crc = None;
+        config.framing.length = RadioPacketLength::Fixed { packet_bytes: 2 };
+        config.framing.whitening = Some(pn9_whitening_config());
+        config.framing.preamble = byte_bits(0xAA).collect();
+        let acquisition_bits = config.framing.preamble.len() + config.framing.sync.bits.len();
+        let mut clear = config.framing.preamble.clone();
+        clear.extend(config.framing.sync.bits.clone());
+        clear.extend(byte_bits(0xA5));
+        clear.extend(byte_bits(0x3C));
+        let encoded = whiten_after_sync_with(&clear, acquisition_bits, pn9_whitening_config());
+        let split = 13;
+        let mut pipeline = RadioPacketPipeline::new(config).unwrap();
+
+        let first = pipeline
+            .push(&overlapping_timed_bits(&encoded[..split], 0, false))
+            .unwrap();
+        let second = pipeline
+            .push(&overlapping_timed_bits(&encoded[split..], split, false))
+            .unwrap();
+
+        assert!(first.packets.is_empty());
+        assert_eq!(second.packets[0].preamble[0].value, 0xAA);
+        assert_eq!(
+            second.packets[0]
+                .bytes
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0xA5, 0x3C]
+        );
     }
 
     #[test]
