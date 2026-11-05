@@ -537,11 +537,12 @@ framer can reject or mark a packet instead of returning convincing bad data.
 ### Bit transforms and packet framing
 
 Physical radio protocols often transform bits before application bytes exist.
-A separate bounded bit pipeline may perform, in a declared order:
+A separate bounded bit pipeline performs protocol-declared transforms. The
+default packet receive order is:
 
 - polarity inversion and NRZ/NRZI or Manchester decoding;
-- dewhitening with a configured polynomial, width, seed, and bit order;
 - preamble and sync-word detection with an explicit Hamming-distance limit;
+- dewhitening of the configured post-sync packet-bit range;
 - fixed, delimiter, or length-field packet framing;
 - LSB-first or MSB-first byte packing;
 - optional bit stuffing removal; and
@@ -554,11 +555,17 @@ Manchester retains at most one chip and reports invalid or incomplete pairs.
 All transform state resets explicitly at a discontinuity.
 
 The implemented radio framer searches for a configured sync word with an
-explicit Hamming-distance limit, packs timed bits MSB-first or LSB-first, and
-emits fixed-size or bounded length-field packets. Sync search, length fields,
-packet storage, and partial state all have explicit limits. Gaps flush partial
-packets with diagnostics, and accepted sync errors remain attached to the
-packet rather than being hidden.
+explicit Hamming-distance limit. Once sync is accepted, it resets an optional
+additive-whitening LFSR and XORs its PN sequence with the configured packet-bit
+range before interpreting a length field or packing bytes. The configuration
+declares the LFSR width, tap mask, seed, shift direction, output inversion,
+covered range, and whether excluded bits advance the register. Dewhitening
+changes only bit values; confidence and source ranges remain attached. The
+framer then packs timed bits MSB-first or LSB-first and emits fixed-size or
+bounded length-field packets. Sync search, length fields, packet storage, and
+partial state all have explicit limits. Gaps flush partial packets with
+diagnostics, and accepted sync errors remain attached to the packet rather than
+being hidden.
 
 Radio CRC validation supports explicitly configured 8-, 16-, 24-, or 32-bit
 polynomials, initial values, reflection, final XOR, byte order, covered range,
@@ -567,9 +574,10 @@ with its source range. An optional discard policy is returned separately so
 failed bytes remain inspectable instead of being erased by validation.
 
 A single streaming packet pipeline now composes line decoding, sync search,
-byte packing, framing, and optional CRC validation. It produces timed packets
-and stable diagnostics identically across arbitrary input chunks. This is the
-UI/CLI boundary; callers do not coordinate the individual state machines.
+optional post-sync dewhitening, byte packing, framing, and optional CRC
+validation. It produces timed packets and stable diagnostics identically across
+arbitrary input chunks. This is the UI/CLI boundary; callers do not coordinate
+the individual state machines.
 
 These operations are not application-field parsing. Their output is a
 `RadioPacket` containing timed bytes, source range, RSSI/power estimate,

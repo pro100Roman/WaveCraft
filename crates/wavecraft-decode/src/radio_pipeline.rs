@@ -125,8 +125,9 @@ fn pipeline_diagnostic(
 mod tests {
     use super::*;
     use crate::{
-        calculate_crc, BitOrder, BitPolarity, CrcParameters, Endian, LineCode, RadioPacketLength,
-        SyncWordConfig, TimedBit,
+        calculate_crc, AdditiveWhitening, AdditiveWhiteningConfig, BitOrder, BitPolarity,
+        CrcParameters, Endian, LineCode, RadioPacketLength, SyncWordConfig, TimedBit,
+        WhiteningDirection,
     };
 
     fn byte_bits(value: u8) -> impl Iterator<Item = bool> {
@@ -162,6 +163,7 @@ mod tests {
                     bits: vec![true, false, true, false, true, false, true, false],
                     max_bit_errors: 0,
                 },
+                whitening: None,
                 bit_order: BitOrder::MostSignificantFirst,
                 length: RadioPacketLength::Fixed { packet_bytes: 4 },
                 max_search_bits: 64,
@@ -195,6 +197,42 @@ mod tests {
             bits.extend(byte_bits(byte));
         }
         bits
+    }
+
+    fn whitening_config() -> AdditiveWhiteningConfig {
+        AdditiveWhiteningConfig {
+            width: 7,
+            polynomial: 0b100_0001,
+            seed: 0b101_1011,
+            direction: WhiteningDirection::ShiftRight,
+            invert_output: false,
+            start_bit: 0,
+            end_bit: None,
+            advance_excluded_bits: false,
+        }
+    }
+
+    fn whiten_after_sync(values: &[bool], sync_bits: usize) -> Vec<bool> {
+        let mut result = values[..sync_bits].to_vec();
+        let mut whitening = AdditiveWhitening::new(whitening_config()).unwrap();
+        result.extend(
+            values[sync_bits..]
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    whitening
+                        .transform(TimedBit {
+                            value: *value,
+                            confidence: 1.0,
+                            range: SampleRange {
+                                start: index as u64,
+                                end: index as u64 + 1,
+                            },
+                        })
+                        .value
+                }),
+        );
+        result
     }
 
     #[test]
@@ -235,5 +273,32 @@ mod tests {
         );
         assert!(discarded.packets.is_empty());
         assert_eq!(discarded.diagnostics[0].code, "radio.crc.mismatch");
+    }
+
+    #[test]
+    fn dewhitening_happens_after_sync_and_before_crc_validation() {
+        let mut pipeline_config = config(false);
+        pipeline_config.framing.whitening = Some(whitening_config());
+        let sync_bits = pipeline_config.framing.sync.bits.len();
+        let encoded = whiten_after_sync(&encoded_packet(true), sync_bits);
+        let mut pipeline = RadioPacketPipeline::new(pipeline_config).unwrap();
+
+        let first = pipeline
+            .push(&timed_bits(&encoded[..19], 0, false))
+            .unwrap();
+        let second = pipeline
+            .push(&timed_bits(&encoded[19..], 19, false))
+            .unwrap();
+
+        assert!(first.packets.is_empty());
+        assert_eq!(
+            second.packets[0]
+                .bytes
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0x10, 0x20, 0x30, 0x9C]
+        );
+        assert!(second.packets[0].diagnostics.is_empty());
     }
 }

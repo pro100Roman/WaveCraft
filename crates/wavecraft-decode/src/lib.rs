@@ -7,6 +7,7 @@ mod radio_crc;
 mod radio_packet;
 mod radio_pipeline;
 mod radio_raw;
+mod radio_whitening;
 mod runtime;
 mod schema;
 mod transport;
@@ -32,6 +33,7 @@ pub use radio_pipeline::{
     RadioPacketPipeline, RadioPacketPipelineConfig, RadioPacketPipelineOutput,
 };
 pub use radio_raw::{RawRadioConfig, RawRadioDecoder, RawRadioMessageStart, RawRadioOutput};
+pub use radio_whitening::{AdditiveWhitening, AdditiveWhiteningConfig, WhiteningDirection};
 pub use runtime::{CustomProtocolRuntime, ProtocolRuntimeOutput};
 pub use schema::{
     load_protocol_schema, BitDefinition, ByteMatch, ChecksumAlgorithm, ChecksumValidation,

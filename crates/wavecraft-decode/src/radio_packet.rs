@@ -1,6 +1,6 @@
 use crate::{
-    ByteStatus, DecodeDiagnostic, DecodeError, Endian, SampleRange, Severity, TimedBit,
-    TimedBitBatch, TimedByte,
+    AdditiveWhitening, AdditiveWhiteningConfig, ByteStatus, DecodeDiagnostic, DecodeError, Endian,
+    SampleRange, Severity, TimedBit, TimedBitBatch, TimedByte,
 };
 
 const MAX_SYNC_WORD_BITS: usize = 256;
@@ -38,6 +38,8 @@ pub enum RadioPacketLength {
 pub struct RadioPacketFramerConfig {
     /// Sync is detected and consumed; packet bytes begin with the following bit.
     pub sync: SyncWordConfig,
+    /// Optional additive dewhitening applied only after sync is accepted.
+    pub whitening: Option<AdditiveWhiteningConfig>,
     pub bit_order: BitOrder,
     pub length: RadioPacketLength,
     /// Maximum noise bits searched before old search state is discarded.
@@ -62,6 +64,9 @@ impl RadioPacketFramerConfig {
             return Err(DecodeError::new(
                 "radio sync search limit must fit the sync word and not exceed 1048576 bits",
             ));
+        }
+        if let Some(whitening) = self.whitening {
+            whitening.validate()?;
         }
         match self.length {
             RadioPacketLength::Fixed { packet_bytes } => {
@@ -112,18 +117,21 @@ pub struct RadioPacketFramer {
     packet_target_bits: Option<usize>,
     sync_range: Option<SampleRange>,
     sync_bit_errors: usize,
+    whitening: Option<AdditiveWhitening>,
     last_input_end: Option<u64>,
 }
 
 impl RadioPacketFramer {
     pub fn new(config: RadioPacketFramerConfig) -> Result<Self, DecodeError> {
         config.validate()?;
+        let whitening = config.whitening.map(AdditiveWhitening::new).transpose()?;
         Ok(Self {
             search_bits: Vec::with_capacity(config.max_search_bits),
             packet_bits: Vec::new(),
             packet_target_bits: fixed_target_bits(config.length),
             sync_range: None,
             sync_bit_errors: 0,
+            whitening,
             last_input_end: None,
             config,
         })
@@ -143,6 +151,9 @@ impl RadioPacketFramer {
         self.packet_target_bits = fixed_target_bits(self.config.length);
         self.sync_range = None;
         self.sync_bit_errors = 0;
+        if let Some(whitening) = &mut self.whitening {
+            whitening.reset();
+        }
         self.last_input_end = None;
     }
 
@@ -174,6 +185,9 @@ impl RadioPacketFramer {
                     self.search_bits.clear();
                     self.packet_bits.clear();
                     self.packet_target_bits = fixed_target_bits(self.config.length);
+                    if let Some(whitening) = &mut self.whitening {
+                        whitening.reset();
+                    }
                     continue;
                 }
                 if self.search_bits.len() > self.config.max_search_bits {
@@ -185,7 +199,11 @@ impl RadioPacketFramer {
                 continue;
             }
 
-            self.packet_bits.push(*bit);
+            let bit = self
+                .whitening
+                .as_mut()
+                .map_or(*bit, |whitening| whitening.transform(*bit));
+            self.packet_bits.push(bit);
             if self.packet_target_bits.is_none() {
                 self.packet_target_bits = self.decode_length_target(&mut output);
                 if self.sync_range.is_none() {
@@ -330,6 +348,9 @@ impl RadioPacketFramer {
         self.packet_target_bits = fixed_target_bits(self.config.length);
         self.sync_range = None;
         self.sync_bit_errors = 0;
+        if let Some(whitening) = &mut self.whitening {
+            whitening.reset();
+        }
     }
 }
 
@@ -458,10 +479,44 @@ mod tests {
                 bits: vec![true, false, true, false],
                 max_bit_errors: 0,
             },
+            whitening: None,
             bit_order,
             length: RadioPacketLength::Fixed { packet_bytes: 2 },
             max_search_bits: 32,
         }
+    }
+
+    fn whitening_config() -> AdditiveWhiteningConfig {
+        AdditiveWhiteningConfig {
+            width: 7,
+            polynomial: 0b100_0001,
+            seed: 0b101_1011,
+            direction: crate::WhiteningDirection::ShiftRight,
+            invert_output: false,
+            start_bit: 0,
+            end_bit: None,
+            advance_excluded_bits: false,
+        }
+    }
+
+    fn apply_whitening(values: &[bool], config: AdditiveWhiteningConfig) -> Vec<bool> {
+        let mut whitening = AdditiveWhitening::new(config).unwrap();
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                whitening
+                    .transform(TimedBit {
+                        value: *value,
+                        confidence: 1.0,
+                        range: SampleRange {
+                            start: index as u64,
+                            end: index as u64 + 1,
+                        },
+                    })
+                    .value
+            })
+            .collect()
     }
 
     #[test]
@@ -514,6 +569,7 @@ mod tests {
                 bits: vec![true, true, false, false],
                 max_bit_errors: 0,
             },
+            whitening: None,
             bit_order: BitOrder::MostSignificantFirst,
             length: RadioPacketLength::LengthField {
                 offset_bytes: 0,
@@ -540,6 +596,72 @@ mod tests {
                 .map(|byte| byte.value)
                 .collect::<Vec<_>>(),
             [3, 0x10, 0x20]
+        );
+    }
+
+    #[test]
+    fn dewhitens_after_sync_before_decoding_a_length_field() {
+        let mut config = RadioPacketFramerConfig {
+            sync: SyncWordConfig {
+                bits: vec![true, true, false, false],
+                max_bit_errors: 0,
+            },
+            whitening: Some(whitening_config()),
+            bit_order: BitOrder::MostSignificantFirst,
+            length: RadioPacketLength::LengthField {
+                offset_bytes: 0,
+                width_bytes: 1,
+                endian: Endian::Big,
+                adjustment: 0,
+                max_packet_bytes: 16,
+            },
+            max_search_bits: 32,
+        };
+        let mut clear_packet = Vec::new();
+        for byte in [3_u8, 0x10, 0x20] {
+            clear_packet.extend(byte_bits(byte, config.bit_order));
+        }
+        let encoded_packet = apply_whitening(&clear_packet, config.whitening.unwrap());
+        let mut values = config.sync.bits.clone();
+        values.extend(encoded_packet);
+        let mut framer = RadioPacketFramer::new(config.clone()).unwrap();
+
+        let first = framer.push(&timed_bits(&values[..17], 0, false)).unwrap();
+        let second = framer.push(&timed_bits(&values[17..], 34, false)).unwrap();
+
+        assert!(first.packets.is_empty());
+        assert_eq!(
+            second.packets[0]
+                .bytes
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [3, 0x10, 0x20]
+        );
+        assert_eq!(second.packets[0].confidence, 0.75);
+
+        config.length = RadioPacketLength::Fixed { packet_bytes: 1 };
+        let mut repeated = config.sync.bits.clone();
+        repeated.extend(apply_whitening(
+            &byte_bits(0xA5, config.bit_order),
+            config.whitening.unwrap(),
+        ));
+        repeated.extend(config.sync.bits.clone());
+        repeated.extend(apply_whitening(
+            &byte_bits(0x5A, config.bit_order),
+            config.whitening.unwrap(),
+        ));
+        let packets = RadioPacketFramer::new(config)
+            .unwrap()
+            .push(&timed_bits(&repeated, 0, false))
+            .unwrap()
+            .packets;
+        assert_eq!(
+            packets
+                .iter()
+                .map(|packet| packet.bytes[0].value)
+                .collect::<Vec<_>>(),
+            [0xA5, 0x5A]
         );
     }
 
