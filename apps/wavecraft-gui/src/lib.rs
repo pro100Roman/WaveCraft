@@ -8553,7 +8553,7 @@ fn paint_radio_analyzer_configuration(
                         egui::DragValue::new(&mut settings.sync_word)
                             .range(0..=u64::MAX)
                             .speed(1)
-                            .hexadecimal(16, false, true),
+                            .hexadecimal(2, false, true),
                     );
                     ui.label("hex");
                 });
