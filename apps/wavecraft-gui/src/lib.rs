@@ -2049,6 +2049,31 @@ fn decoded_panel_entry_id(
     ))
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct DecodedPanelScrollAnchor {
+    newest_start_sample: Option<u64>,
+    newest_content_y: f32,
+}
+
+#[derive(Default)]
+struct DecodedMessagesPaintOutput {
+    selected_range: Option<(u64, u64)>,
+    newest_content_y: Option<f32>,
+    previous_newest_content_y: Option<f32>,
+}
+
+fn retained_decoded_scroll_offset(
+    current_offset: f32,
+    added_height_above: f32,
+    maximum_offset: f32,
+) -> f32 {
+    if current_offset <= 1.0 {
+        current_offset
+    } else {
+        (current_offset + added_height_above.max(0.0)).clamp(0.0, maximum_offset.max(0.0))
+    }
+}
+
 fn paint_decoded_analyzer_messages(
     ui: &mut egui::Ui,
     analyzer: &ProtocolAnalyzerInstance,
@@ -2056,8 +2081,10 @@ fn paint_decoded_analyzer_messages(
     entries: &[DecodedPanelEntry],
     open_all: Option<bool>,
     sample_rate_hz: u64,
-) -> Option<(u64, u64)> {
-    let mut selected_range = None;
+    previous_newest_start_sample: Option<u64>,
+) -> DecodedMessagesPaintOutput {
+    let content_origin_y = ui.cursor().top();
+    let mut output = DecodedMessagesPaintOutput::default();
     if analyzer.data_format == ProtocolDataFormat::Ascii {
         if let Some(text) = uart_ascii_text(events) {
             ui.add_space(5.0);
@@ -2074,10 +2101,17 @@ fn paint_decoded_analyzer_messages(
     if entries.is_empty() {
         ui.add_space(4.0);
         ui.label(RichText::new("No decoded operations").color(TEXT_MUTED));
-        return None;
+        return output;
     }
     ui.add_space(6.0);
-    for entry in entries {
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let content_y = ui.cursor().top() - content_origin_y;
+        if entry_index == 0 {
+            output.newest_content_y = Some(content_y);
+        }
+        if previous_newest_start_sample == Some(entry.start_sample) {
+            output.previous_newest_content_y = Some(content_y);
+        }
         let card_width = ui.available_width();
         let entry_id = decoded_panel_entry_id(ui, analyzer, entry);
         let mut open = open_all
@@ -2137,11 +2171,11 @@ fn paint_decoded_analyzer_messages(
                 }
             });
         if card.inner {
-            selected_range = Some((entry.start_sample, entry.end_sample));
+            output.selected_range = Some((entry.start_sample, entry.end_sample));
         }
         ui.add_space(5.0);
     }
-    selected_range
+    output
 }
 
 fn paint_decoded_data_panel(
@@ -2215,8 +2249,15 @@ fn paint_decoded_data_panel(
                 });
                 let message_area_height =
                     (analyzer_height - header.response.rect.height()).max(24.0);
-                let clicked_range = egui::ScrollArea::vertical()
-                    .id_salt(("decoded_analyzer_messages", analyzer.instance_id))
+                let scroll_salt = ("decoded_analyzer_messages", analyzer.instance_id);
+                let scroll_id = ui.make_persistent_id(scroll_salt);
+                let anchor_id = scroll_id.with("newest_anchor");
+                let previous_anchor = ui.data(|data| {
+                    data.get_temp::<DecodedPanelScrollAnchor>(anchor_id)
+                        .unwrap_or_default()
+                });
+                let mut scroll_output = egui::ScrollArea::vertical()
+                    .id_salt(scroll_salt)
                     .max_height(message_area_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -2228,9 +2269,43 @@ fn paint_decoded_data_panel(
                             &entries,
                             open_all,
                             sample_rate_hz,
+                            previous_anchor.newest_start_sample,
                         )
-                    })
-                    .inner;
+                    });
+                let current_newest_start_sample = entries.first().map(|entry| entry.start_sample);
+                if previous_anchor.newest_start_sample.is_some()
+                    && previous_anchor.newest_start_sample != current_newest_start_sample
+                {
+                    if let Some(previous_newest_y) = scroll_output.inner.previous_newest_content_y {
+                        let added_height = previous_newest_y - previous_anchor.newest_content_y;
+                        let maximum_offset = (scroll_output.content_size.y
+                            - scroll_output.inner_rect.height())
+                        .max(0.0);
+                        let retained_offset = retained_decoded_scroll_offset(
+                            scroll_output.state.offset.y,
+                            added_height,
+                            maximum_offset,
+                        );
+                        if retained_offset != scroll_output.state.offset.y {
+                            scroll_output.state.offset.y = retained_offset;
+                            scroll_output.state.store(ui.ctx(), scroll_output.id);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                }
+                ui.data_mut(|data| {
+                    data.insert_temp(
+                        anchor_id,
+                        DecodedPanelScrollAnchor {
+                            newest_start_sample: current_newest_start_sample,
+                            newest_content_y: scroll_output
+                                .inner
+                                .newest_content_y
+                                .unwrap_or_default(),
+                        },
+                    );
+                });
+                let clicked_range = scroll_output.inner.selected_range;
                 if clicked_range.is_some() {
                     selected_range = clicked_range;
                 }
@@ -17778,6 +17853,14 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].start_sample, 30);
         assert_eq!(entries[1].start_sample, 10);
+    }
+
+    #[test]
+    fn decoded_panel_retains_older_view_when_new_messages_are_inserted_above() {
+        assert_eq!(retained_decoded_scroll_offset(0.0, 80.0, 500.0), 0.0);
+        assert_eq!(retained_decoded_scroll_offset(120.0, 80.0, 500.0), 200.0);
+        assert_eq!(retained_decoded_scroll_offset(470.0, 80.0, 500.0), 500.0);
+        assert_eq!(retained_decoded_scroll_offset(120.0, -20.0, 500.0), 120.0);
     }
 
     #[test]
