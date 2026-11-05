@@ -12,9 +12,11 @@ IQ into a bounded modulation-neutral output store. An expandable Signal
 Analyzer panel edits the tagged channel, modulation, and timing settings;
 the RF view renders bounded timed soft-symbol decisions or analog output with
 drop, discontinuity, and analyzer-error diagnostics.
-For binary FSK, the panel also edits a one-byte hexadecimal preamble value and
-an independent preamble length in bytes. After acquisition, the RF view shows
-the bounded raw message history including the matched preamble bytes.
+For binary FSK/GFSK, the panel selects raw discovery or fixed-length packet
+decoding. Raw discovery edits a repeated hexadecimal preamble. Packet mode
+edits an unwhitened sync word, packet length, and optional post-sync additive
+whitening LFSR. The RF view shows bounded raw-message or completed-packet
+history with source timing retained.
 New radio sessions default to a 2 MHz capture sample rate, 1.75 MHz HackRF
 baseband bandwidth, and a GFSK analyzer profile with a 19.2 kbit/s binary bit
 rate and 35 kHz frequency deviation. The analyzer remains opt-in.
@@ -579,6 +581,13 @@ validation. It produces timed packets and stable diagnostics identically across
 arbitrary input chunks. This is the UI/CLI boundary; callers do not coordinate
 the individual state machines.
 
+In fixed-packet mode the same view is labeled **PACKETS**. It lists each
+completed post-sync packet without a synthetic preamble section. Signal
+Analyzer settings expose whitening enablement, LFSR width, tap mask, seed,
+shift direction, output inversion, covered packet-bit range, and excluded-bit
+advancement. These settings are saved in capture profiles and recording
+metadata so replay uses the same packet transform.
+
 These operations are not application-field parsing. Their output is a
 `RadioPacket` containing timed bytes, source range, RSSI/power estimate,
 frequency-error estimate, confidence, and diagnostics. CRC failure does not
@@ -591,8 +600,9 @@ the preamble byte, repetition count, and bit order. Output includes the
 preamble bytes and then every following byte until the next configured
 preamble, discontinuity, or reset. Repeated preambles provide provisional
 message boundaries without assuming a length field, delimiter, sync word,
-whitening, or CRC. The initial GUI exposes this mode for binary FSK so users
-can inspect an unknown protocol before configuring a protocol-specific framer.
+whitening, or CRC. The GUI exposes this mode so users can inspect an unknown
+protocol before switching to the fixed-length packet framer and optional
+dewhitening.
 
 Packet framing is bounded by maximum preamble search, packet bits, retained
 partial bits, and emitted packets per input chunk. A carrier end or IQ gap

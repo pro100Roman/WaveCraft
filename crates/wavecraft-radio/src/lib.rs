@@ -2,7 +2,8 @@
 
 use wavecraft_core::IqBatch;
 use wavecraft_decode::{
-    RawRadioConfig, RawRadioDecoder, RawRadioOutput, SampleRange, TimedBit, TimedBitBatch,
+    RadioPacketPipeline, RadioPacketPipelineConfig, RadioPacketPipelineOutput, RawRadioConfig,
+    RawRadioDecoder, RawRadioOutput, SampleRange, TimedBit, TimedBitBatch,
 };
 use wavecraft_dsp::{
     DemodulatedBatch, DemodulatorRegistry, SignalAnalyzer, SignalAnalyzerProfile, SpectrumFrame,
@@ -30,6 +31,7 @@ pub struct RadioAnalyzerTelemetry {
 pub struct RadioAnalyzerOutput {
     pub demodulated: Option<DemodulatedBatch>,
     pub raw: RawRadioOutput,
+    pub packets: RadioPacketPipelineOutput,
     pub burst_ended: bool,
     pub telemetry: RadioAnalyzerTelemetry,
 }
@@ -39,11 +41,66 @@ pub struct RadioDspOutput {
     pub analyses: Vec<Result<RadioAnalyzerOutput, String>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RadioDataDecoderConfig {
+    Raw(RawRadioConfig),
+    Packets(RadioPacketPipelineConfig),
+}
+
+enum RadioDataDecoder {
+    Raw(RawRadioDecoder),
+    Packets(Box<RadioPacketPipeline>),
+}
+
+impl RadioDataDecoder {
+    fn new(config: RadioDataDecoderConfig) -> Result<Self, String> {
+        match config {
+            RadioDataDecoderConfig::Raw(config) => RawRadioDecoder::new(config)
+                .map(Self::Raw)
+                .map_err(|error| error.to_string()),
+            RadioDataDecoderConfig::Packets(config) => RadioPacketPipeline::new(config)
+                .map(Box::new)
+                .map(Self::Packets)
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Raw(decoder) => decoder.reset(),
+            Self::Packets(decoder) => decoder.reset(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        bits: &TimedBitBatch,
+    ) -> Result<(RawRadioOutput, RadioPacketPipelineOutput), String> {
+        match self {
+            Self::Raw(decoder) => decoder
+                .push(bits)
+                .map(|output| (output, RadioPacketPipelineOutput::default()))
+                .map_err(|error| error.to_string()),
+            Self::Packets(decoder) => decoder
+                .push(bits)
+                .map(|output| (RawRadioOutput::default(), output))
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    fn finish(&mut self) -> (RawRadioOutput, RadioPacketPipelineOutput) {
+        match self {
+            Self::Raw(decoder) => (decoder.finish(), RadioPacketPipelineOutput::default()),
+            Self::Packets(decoder) => (RawRadioOutput::default(), decoder.finish()),
+        }
+    }
+}
+
 /// Device-independent composition of channelization, FSK/GFSK demodulation,
-/// binary symbol decisions, and raw radio framing.
+/// binary symbol decisions, and raw or packet radio decoding.
 pub struct RadioAnalyzerRuntime {
     signal: SignalAnalyzer,
-    raw: RawRadioDecoder,
+    decoder: RadioDataDecoder,
     channel_frequency_offset_hz: i64,
     channel_bandwidth_hz: u64,
     burst_active: bool,
@@ -54,17 +111,20 @@ pub struct RadioAnalyzerRuntime {
 }
 
 impl RadioAnalyzerRuntime {
-    pub fn new(profile: SignalAnalyzerProfile, raw_config: RawRadioConfig) -> Result<Self, String> {
+    pub fn new(
+        profile: SignalAnalyzerProfile,
+        decoder_config: RadioDataDecoderConfig,
+    ) -> Result<Self, String> {
         let channel_frequency_offset_hz = profile.channel.frequency_offset_hz;
         let channel_bandwidth_hz = profile.channel.bandwidth_hz;
         let registry = DemodulatorRegistry::with_builtins()
             .map_err(|error| format!("failed to initialize demodulators: {error}"))?;
         let signal = SignalAnalyzer::new(profile, &registry)
             .map_err(|error| format!("invalid radio analyzer profile: {error}"))?;
-        let raw = RawRadioDecoder::new(raw_config).map_err(|error| error.to_string())?;
+        let decoder = RadioDataDecoder::new(decoder_config)?;
         Ok(Self {
             signal,
-            raw,
+            decoder,
             channel_frequency_offset_hz,
             channel_bandwidth_hz,
             burst_active: false,
@@ -114,7 +174,7 @@ impl RadioAnalyzerRuntime {
         if signal_present {
             if !self.burst_active {
                 self.signal.reset();
-                self.raw.reset();
+                self.decoder.reset();
             }
             self.burst_active = true;
             self.quiet_spectrum_frames = 0;
@@ -122,13 +182,14 @@ impl RadioAnalyzerRuntime {
             self.quiet_spectrum_frames = self.quiet_spectrum_frames.saturating_add(powers.len());
         }
         if self.burst_active && self.quiet_spectrum_frames >= SQUELCH_RELEASE_FRAMES {
-            let raw = self.raw.finish();
+            let (raw, packets) = self.decoder.finish();
             self.signal.reset();
             self.burst_active = false;
             self.quiet_spectrum_frames = 0;
             return Ok(RadioAnalyzerOutput {
                 demodulated: None,
                 raw,
+                packets,
                 burst_ended: true,
                 telemetry: self.telemetry(),
             });
@@ -137,6 +198,7 @@ impl RadioAnalyzerRuntime {
             return Ok(RadioAnalyzerOutput {
                 demodulated: None,
                 raw: RawRadioOutput::default(),
+                packets: RadioPacketPipelineOutput::default(),
                 burst_ended: false,
                 telemetry: self.telemetry(),
             });
@@ -146,10 +208,11 @@ impl RadioAnalyzerRuntime {
             return Err("raw radio bytes require digital soft-symbol output".to_owned());
         };
         let bits = soft_symbols_to_bits(symbols)?;
-        let raw = self.raw.push(&bits).map_err(|error| error.to_string())?;
+        let (raw, packets) = self.decoder.push(&bits)?;
         Ok(RadioAnalyzerOutput {
             demodulated: Some(demodulated),
             raw,
+            packets,
             burst_ended: false,
             telemetry: self.telemetry(),
         })
@@ -264,7 +327,9 @@ mod tests {
     use super::*;
     use std::f32::consts::TAU;
     use wavecraft_core::Iq8;
-    use wavecraft_decode::BitOrder;
+    use wavecraft_decode::{
+        BitOrder, BitTransformConfig, RadioPacketFramerConfig, RadioPacketLength, SyncWordConfig,
+    };
     use wavecraft_dsp::{
         BinaryFskProfile, ChannelizerConfig, DemodulationProfile, FskPolarity, FskTiming,
         SpectrumWindow, TimedSoftSymbol,
@@ -298,6 +363,49 @@ mod tests {
             minimum_bit_confidence_milli: 500,
             maximum_uncertain_bits: 0,
         }
+    }
+
+    #[test]
+    fn packet_decoder_mode_emits_completed_packets_separately_from_raw_data() {
+        let config = RadioPacketPipelineConfig {
+            bit_transform: BitTransformConfig::default(),
+            framing: RadioPacketFramerConfig {
+                sync: SyncWordConfig {
+                    bits: vec![true, false, true, false],
+                    max_bit_errors: 0,
+                },
+                whitening: None,
+                bit_order: BitOrder::MostSignificantFirst,
+                length: RadioPacketLength::Fixed { packet_bytes: 1 },
+                max_search_bits: 32,
+            },
+            crc: None,
+        };
+        let values = [
+            true, false, true, false, true, false, true, false, false, true, false, true,
+        ];
+        let bits = TimedBitBatch {
+            discontinuity: false,
+            bits: values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| TimedBit {
+                    value,
+                    confidence: 0.9,
+                    range: SampleRange {
+                        start: index as u64,
+                        end: index as u64 + 1,
+                    },
+                })
+                .collect(),
+        };
+        let mut decoder = RadioDataDecoder::new(RadioDataDecoderConfig::Packets(config)).unwrap();
+
+        let (raw, packets) = decoder.push(&bits).unwrap();
+
+        assert!(raw.bytes.is_empty());
+        assert_eq!(packets.packets.len(), 1);
+        assert_eq!(packets.packets[0].bytes[0].value, 0xA5);
     }
 
     #[test]
@@ -373,7 +481,10 @@ mod tests {
             samples,
         };
         let mut spectrum = SpectrumProcessor::new(fft_length, SpectrumWindow::Hann).unwrap();
-        let mut analyzer = Some(RadioAnalyzerRuntime::new(profile(), raw_config()).unwrap());
+        let mut analyzer = Some(
+            RadioAnalyzerRuntime::new(profile(), RadioDataDecoderConfig::Raw(raw_config()))
+                .unwrap(),
+        );
 
         let output = process_radio_iq(&mut spectrum, &mut analyzer, &input, -40.0);
 
@@ -385,27 +496,33 @@ mod tests {
 
     #[test]
     fn closes_a_synchronized_raw_message_below_the_channel_threshold() {
-        let mut runtime = RadioAnalyzerRuntime::new(profile(), raw_config()).unwrap();
+        let mut runtime =
+            RadioAnalyzerRuntime::new(profile(), RadioDataDecoderConfig::Raw(raw_config()))
+                .unwrap();
         let preamble = [true, false, true, false, true, false, true, false];
-        runtime
-            .raw
-            .push(&TimedBitBatch {
-                discontinuity: false,
-                bits: preamble
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, value)| TimedBit {
-                        value,
-                        confidence: 1.0,
-                        range: SampleRange {
-                            start: index as u64,
-                            end: index as u64 + 1,
-                        },
-                    })
-                    .collect(),
-            })
-            .unwrap();
-        assert!(runtime.raw.is_synchronized());
+        let RadioDataDecoder::Raw(raw) = &mut runtime.decoder else {
+            panic!("runtime should use raw decoding");
+        };
+        raw.push(&TimedBitBatch {
+            discontinuity: false,
+            bits: preamble
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| TimedBit {
+                    value,
+                    confidence: 1.0,
+                    range: SampleRange {
+                        start: index as u64,
+                        end: index as u64 + 1,
+                    },
+                })
+                .collect(),
+        })
+        .unwrap();
+        let RadioDataDecoder::Raw(raw) = &runtime.decoder else {
+            panic!("runtime should use raw decoding");
+        };
+        assert!(raw.is_synchronized());
         runtime.burst_active = true;
         let quiet_spectrum = SpectrumFrame {
             source_range: 0..8,
@@ -434,6 +551,9 @@ mod tests {
 
         assert!(output.burst_ended);
         assert!(output.demodulated.is_none());
-        assert!(!runtime.raw.is_synchronized());
+        let RadioDataDecoder::Raw(raw) = &runtime.decoder else {
+            panic!("runtime should use raw decoding");
+        };
+        assert!(!raw.is_synchronized());
     }
 }

@@ -4,7 +4,8 @@ use wavecraft_core::IqBatch;
 use wavecraft_dsp::SpectrumProcessor;
 
 pub use wavecraft_radio::{
-    process_radio_iq, RadioAnalyzerRuntime, RadioAnalyzerTelemetry, RadioDspOutput,
+    process_radio_iq, RadioAnalyzerRuntime, RadioAnalyzerTelemetry, RadioDataDecoderConfig,
+    RadioDspOutput,
 };
 
 const RADIO_DSP_INPUT_CAPACITY: usize = 8;

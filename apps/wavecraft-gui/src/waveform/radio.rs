@@ -1,7 +1,9 @@
 use crate::radio_analyzer::RadioAnalyzerTelemetry;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use std::collections::VecDeque;
-use wavecraft_decode::{DecodeDiagnostic, RawRadioMessageStart, RawRadioOutput, TimedByte};
+use wavecraft_decode::{
+    DecodeDiagnostic, RadioPacketPipelineOutput, RawRadioMessageStart, RawRadioOutput, TimedByte,
+};
 use wavecraft_dsp::{DemodulatedBatch, SpectrumFrame, TimedAnalogSample, TimedSoftSymbol};
 
 const DEFAULT_WATERFALL_CAPACITY: usize = 256;
@@ -201,6 +203,38 @@ impl RadioAnalysisStore {
         self.raw_bytes.drain(..excess);
         self.raw_dropped_bytes = self.raw_dropped_bytes.saturating_add(excess as u64);
         self.raw_diagnostics.extend(diagnostics);
+        let diagnostic_excess = self.raw_diagnostics.len().saturating_sub(32);
+        self.raw_diagnostics.drain(..diagnostic_excess);
+    }
+
+    pub fn ingest_packets(&mut self, output: RadioPacketPipelineOutput) {
+        if output.packets.is_empty() && output.diagnostics.is_empty() {
+            return;
+        }
+        self.raw_synchronized = false;
+        self.raw_diagnostics.extend(output.diagnostics);
+        for packet in output.packets {
+            let sample_index = packet
+                .bytes
+                .first()
+                .map_or(packet.range.start, |byte| byte.range.start);
+            self.start_raw_message(RawRadioMessageStart {
+                sample_index,
+                preamble_bytes: 0,
+                maximum_uncertain_bits: usize::MAX,
+            });
+            if let Some(message) = self.raw_messages.back_mut() {
+                message.bytes.extend(packet.bytes.iter().copied());
+                let excess = message.bytes.len().saturating_sub(self.capacity);
+                message.bytes.drain(..excess);
+            }
+            self.raw_bytes.extend(packet.bytes);
+            let excess = self.raw_bytes.len().saturating_sub(self.capacity);
+            self.raw_bytes.drain(..excess);
+            self.raw_dropped_bytes = self.raw_dropped_bytes.saturating_add(excess as u64);
+            self.raw_diagnostics.extend(packet.diagnostics);
+            self.finish_raw_message();
+        }
         let diagnostic_excess = self.raw_diagnostics.len().saturating_sub(32);
         self.raw_diagnostics.drain(..diagnostic_excess);
     }
@@ -440,6 +474,7 @@ impl Default for RadioViewState {
 
 pub struct RadioViewOptions<'a> {
     pub analysis_enabled: bool,
+    pub packet_mode: bool,
     pub trigger_level_dbfs_tenths: &'a mut i16,
     pub trigger_controls_enabled: bool,
 }
@@ -455,6 +490,7 @@ impl RadioViewState {
     ) {
         let RadioViewOptions {
             analysis_enabled,
+            packet_mode,
             trigger_level_dbfs_tenths,
             trigger_controls_enabled,
         } = options;
@@ -537,6 +573,7 @@ impl RadioViewState {
                 analysis_rect,
                 analysis,
                 analysis_enabled,
+                packet_mode,
                 &mut self.raw_message_scroll_rows,
                 &mut self.raw_message_newest_completed_sequence,
             );
@@ -703,6 +740,7 @@ fn paint_analysis(
     rect: Rect,
     store: &RadioAnalysisStore,
     analysis_enabled: bool,
+    packet_mode: bool,
     raw_message_scroll_rows: &mut usize,
     raw_message_newest_completed_sequence: &mut Option<u64>,
 ) {
@@ -716,7 +754,7 @@ fn paint_analysis(
         ui,
         title_rect,
         "raw_data_title",
-        "RAW DATA",
+        if packet_mode { "PACKETS" } else { "RAW DATA" },
         FontId::proportional(12.0),
         Color32::from_rgb(145, 160, 180),
         false,
@@ -753,7 +791,8 @@ fn paint_analysis(
         }
     } else if let Some(alphabet_size) = store.soft_symbol_alphabet_size() {
         format!(
-            "searching preamble · {} symbols · alphabet {} · {} rejected · {} gaps",
+            "searching {} · {} symbols · alphabet {} · {} rejected · {} gaps",
+            if packet_mode { "sync" } else { "preamble" },
             store.soft_symbols().len(),
             alphabet_size,
             store.raw_rejected_messages(),
@@ -815,6 +854,7 @@ fn paint_analysis(
             ui,
             plot,
             store,
+            packet_mode,
             raw_message_scroll_rows,
             raw_message_newest_completed_sequence,
         );
@@ -822,7 +862,11 @@ fn paint_analysis(
         ui.painter().text(
             plot.center(),
             egui::Align2::CENTER_CENTER,
-            "Searching for preamble",
+            if packet_mode {
+                "Searching for sync"
+            } else {
+                "Searching for preamble"
+            },
             FontId::proportional(12.0),
             Color32::from_rgb(105, 120, 140),
         );
@@ -847,6 +891,7 @@ fn paint_raw_messages(
     ui: &mut egui::Ui,
     plot: Rect,
     store: &RadioAnalysisStore,
+    packet_mode: bool,
     scroll_rows: &mut usize,
     newest_completed_sequence: &mut Option<u64>,
 ) {
@@ -932,51 +977,53 @@ fn paint_raw_messages(
         let mut x = row_rect.left() + SEQUENCE_WIDTH;
         let right_limit = row_rect.right() - LENGTH_WIDTH;
         let preamble_bytes = message.preamble_bytes();
-        let expansion_id = ui.id().with(("raw_preamble_expanded", message.sequence()));
-        let mut preamble_expanded =
-            ui.data(|data| data.get_temp::<bool>(expansion_id).unwrap_or(false));
-        let toggle_rect = Rect::from_min_size(
-            Pos2::new(x, row_rect.top()),
-            Vec2::new(PREAMBLE_TOGGLE_WIDTH, row_rect.height()),
-        );
-        let toggle = ui
-            .interact(toggle_rect, expansion_id, Sense::click())
-            .on_hover_text(if preamble_expanded {
-                "Collapse preamble bytes"
-            } else {
-                "Expand preamble bytes"
-            });
-        if toggle.clicked() {
-            preamble_expanded = !preamble_expanded;
-            ui.data_mut(|data| data.insert_temp(expansion_id, preamble_expanded));
-        }
-        paint_raw_section_label(
-            ui,
-            row_rect,
-            x,
-            &format!(
-                "[{}] PRE {}",
-                if preamble_expanded { "-" } else { "+" },
-                preamble_bytes
-            ),
-            if toggle.hovered() {
-                Color32::from_rgb(255, 205, 105)
-            } else {
-                Color32::from_rgb(235, 180, 80)
-            },
-        );
-        x += PREAMBLE_TOGGLE_WIDTH;
-        let displayed_preamble = displayed_raw_preamble(message, preamble_expanded);
-        if !displayed_preamble.is_empty() {
-            x = paint_raw_message_bytes(
+        if !packet_mode {
+            let expansion_id = ui.id().with(("raw_preamble_expanded", message.sequence()));
+            let mut preamble_expanded =
+                ui.data(|data| data.get_temp::<bool>(expansion_id).unwrap_or(false));
+            let toggle_rect = Rect::from_min_size(
+                Pos2::new(x, row_rect.top()),
+                Vec2::new(PREAMBLE_TOGGLE_WIDTH, row_rect.height()),
+            );
+            let toggle = ui
+                .interact(toggle_rect, expansion_id, Sense::click())
+                .on_hover_text(if preamble_expanded {
+                    "Collapse preamble bytes"
+                } else {
+                    "Expand preamble bytes"
+                });
+            if toggle.clicked() {
+                preamble_expanded = !preamble_expanded;
+                ui.data_mut(|data| data.insert_temp(expansion_id, preamble_expanded));
+            }
+            paint_raw_section_label(
                 ui,
                 row_rect,
                 x,
-                right_limit,
-                displayed_preamble,
-                BYTE_CELL_WIDTH,
-                Color32::from_rgb(245, 190, 90),
+                &format!(
+                    "[{}] PRE {}",
+                    if preamble_expanded { "-" } else { "+" },
+                    preamble_bytes
+                ),
+                if toggle.hovered() {
+                    Color32::from_rgb(255, 205, 105)
+                } else {
+                    Color32::from_rgb(235, 180, 80)
+                },
             );
+            x += PREAMBLE_TOGGLE_WIDTH;
+            let displayed_preamble = displayed_raw_preamble(message, preamble_expanded);
+            if !displayed_preamble.is_empty() {
+                x = paint_raw_message_bytes(
+                    ui,
+                    row_rect,
+                    x,
+                    right_limit,
+                    displayed_preamble,
+                    BYTE_CELL_WIDTH,
+                    Color32::from_rgb(245, 190, 90),
+                );
+            }
         }
         if x + SECTION_WIDTH < right_limit {
             paint_raw_section_label(ui, row_rect, x, "DATA", Color32::from_rgb(105, 150, 175));
@@ -1006,11 +1053,13 @@ fn paint_raw_messages(
             Sense::hover(),
         )
         .on_hover_ui(|ui| {
-            ui.label(
-                egui::RichText::new(format!("PRE  {preamble}"))
-                    .monospace()
-                    .color(Color32::from_rgb(245, 190, 90)),
-            );
+            if !packet_mode {
+                ui.label(
+                    egui::RichText::new(format!("PRE  {preamble}"))
+                        .monospace()
+                        .color(Color32::from_rgb(245, 190, 90)),
+                );
+            }
             ui.label(
                 egui::RichText::new(format!("DATA ({} B) {data}", message.data_len()))
                     .monospace()
@@ -1587,7 +1636,7 @@ fn format_compact_decimal(value: f64, precision: usize, unit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wavecraft_decode::{ByteStatus, SampleRange};
+    use wavecraft_decode::{ByteStatus, RadioPacket, SampleRange};
     use wavecraft_dsp::{TimedAnalogBatch, TimedSoftSymbolBatch};
 
     fn frame(index: u64, frequency: u64) -> SpectrumFrame {
@@ -1855,6 +1904,47 @@ mod tests {
     }
 
     #[test]
+    fn analysis_store_exposes_completed_packets_as_data_messages() {
+        let mut store = RadioAnalysisStore::new(32).unwrap();
+        store.ingest_packets(RadioPacketPipelineOutput {
+            packets: vec![RadioPacket {
+                bytes: [0x10, 0x20, 0x30]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| TimedByte {
+                        value,
+                        range: SampleRange {
+                            start: 100 + index as u64 * 8,
+                            end: 108 + index as u64 * 8,
+                        },
+                        status: ByteStatus::default(),
+                    })
+                    .collect(),
+                range: SampleRange {
+                    start: 84,
+                    end: 124,
+                },
+                confidence: 0.9,
+                diagnostics: vec![],
+            }],
+            diagnostics: vec![],
+        });
+
+        assert_eq!(store.completed_raw_message_count(), 1);
+        let message = store.raw_messages().back().unwrap();
+        assert!(message.is_complete());
+        assert_eq!(message.preamble_bytes(), 0);
+        assert_eq!(
+            message
+                .data_bytes()
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0x10, 0x20, 0x30]
+        );
+    }
+
+    #[test]
     fn analysis_store_lists_preamble_delimited_messages_newest_first() {
         let mut store = RadioAnalysisStore::new(32).unwrap();
         let timed_bytes = |values: &[u8], first_index: u64| {
@@ -1997,6 +2087,7 @@ mod tests {
                     &analysis,
                     RadioViewOptions {
                         analysis_enabled: true,
+                        packet_mode: false,
                         trigger_level_dbfs_tenths: &mut trigger_level,
                         trigger_controls_enabled: true,
                     },

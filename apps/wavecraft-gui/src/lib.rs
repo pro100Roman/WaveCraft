@@ -29,7 +29,9 @@ use protocol_analyzer::{
     ProtocolAnalyzerSettings, ProtocolCaptureDecoder, ProtocolDataFormat, ProtocolDecodeOutcome,
     ProtocolDecodeSnapshot, ProtocolDecodedEvent, ProtocolDecodedKind, PROTOCOLS,
 };
-use radio_analyzer::{process_radio_iq, RadioAnalyzerRuntime, RadioDspOutput, RadioDspWorker};
+use radio_analyzer::{
+    process_radio_iq, RadioAnalyzerRuntime, RadioDataDecoderConfig, RadioDspOutput, RadioDspWorker,
+};
 use radio_trigger::{RadioSingleTrigger, RadioSingleTriggerConfig};
 use recording::{
     choose_recording_save_path, choose_recording_to_open, choose_saleae_export_path,
@@ -56,7 +58,11 @@ use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
 };
-use wavecraft_decode::{BitOrder, RawRadioConfig};
+use wavecraft_decode::{
+    AdditiveWhiteningConfig, BitOrder, BitTransformConfig, RadioPacketFramerConfig,
+    RadioPacketLength, RadioPacketPipelineConfig, RawRadioConfig, SyncWordConfig,
+    WhiteningDirection,
+};
 use wavecraft_dsp::{
     BinaryFskProfile, BinaryGfskProfile, ChannelizerConfig, DemodulationProfile, FskPolarity,
     FskTiming, SignalAnalyzerProfile, SpectrumProcessor, SpectrumWindow,
@@ -3033,6 +3039,7 @@ fn ingest_radio_dsp_output(waveforms: &mut WaveformStore, output: RadioDspOutput
                 waveforms.radio_analysis.ingest(demodulated)?;
             }
             waveforms.radio_analysis.ingest_raw(output.raw);
+            waveforms.radio_analysis.ingest_packets(output.packets);
             if output.burst_ended {
                 waveforms.radio_analysis.finish_raw_capture();
             }
@@ -3195,7 +3202,7 @@ struct RadioCaptureRequest {
     provider_settings: RadioProviderSettings,
     iq_correction_enabled: bool,
     analyzer_profile: Option<SignalAnalyzerProfile>,
-    raw_config: RawRadioConfig,
+    decoder_config: RadioDataDecoderConfig,
 }
 
 #[derive(Clone)]
@@ -3301,6 +3308,12 @@ enum RadioDemodulation {
     BinaryGfsk,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RadioDataMode {
+    Raw,
+    Packets,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RadioAnalyzerSettings {
     enabled: bool,
@@ -3316,6 +3329,7 @@ struct RadioAnalyzerSettings {
     adaptive_timing: bool,
     timing_loop_bandwidth_milli: u32,
     max_clock_error_ppm: u32,
+    data_mode: RadioDataMode,
     preamble_byte: u8,
     preamble_bytes: usize,
     sync_word: u64,
@@ -3323,6 +3337,16 @@ struct RadioAnalyzerSettings {
     maximum_preamble_bit_errors: usize,
     minimum_bit_confidence_milli: u16,
     maximum_uncertain_bits: usize,
+    packet_bytes: usize,
+    whitening_enabled: bool,
+    whitening_width: u8,
+    whitening_polynomial: u64,
+    whitening_seed: u64,
+    whitening_direction: WhiteningDirection,
+    whitening_invert_output: bool,
+    whitening_start_bit: usize,
+    whitening_end_bit: Option<usize>,
+    whitening_advance_excluded_bits: bool,
 }
 
 impl Default for RadioAnalyzerSettings {
@@ -3343,6 +3367,7 @@ impl Default for RadioAnalyzerSettings {
             adaptive_timing: true,
             timing_loop_bandwidth_milli: 100,
             max_clock_error_ppm: 10_000,
+            data_mode: RadioDataMode::Raw,
             preamble_byte: 0xaa,
             preamble_bytes: 4,
             sync_word: 0,
@@ -3350,6 +3375,16 @@ impl Default for RadioAnalyzerSettings {
             maximum_preamble_bit_errors: 1,
             minimum_bit_confidence_milli: 0,
             maximum_uncertain_bits: 0,
+            packet_bytes: 16,
+            whitening_enabled: false,
+            whitening_width: 7,
+            whitening_polynomial: 0b100_0001,
+            whitening_seed: 0b101_1011,
+            whitening_direction: WhiteningDirection::ShiftRight,
+            whitening_invert_output: false,
+            whitening_start_bit: 0,
+            whitening_end_bit: None,
+            whitening_advance_excluded_bits: false,
         }
     }
 }
@@ -3365,6 +3400,64 @@ impl RadioAnalyzerSettings {
             bit_order: BitOrder::MostSignificantFirst,
             minimum_bit_confidence_milli: self.minimum_bit_confidence_milli,
             maximum_uncertain_bits: self.maximum_uncertain_bits,
+        }
+    }
+
+    fn decoder_config(&self) -> Result<RadioDataDecoderConfig, String> {
+        match self.data_mode {
+            RadioDataMode::Raw => {
+                let config = self.raw_config();
+                config.validate().map_err(|error| error.to_string())?;
+                Ok(RadioDataDecoderConfig::Raw(config))
+            }
+            RadioDataMode::Packets => {
+                if self.sync_word_bytes == 0 {
+                    return Err("packet decoding requires a sync word".to_owned());
+                }
+                let sync_bits = (0..self.sync_word_bytes)
+                    .flat_map(|byte_index| {
+                        let shift = u32::from(self.sync_word_bytes - byte_index - 1) * 8;
+                        let byte = ((self.sync_word >> shift) & 0xff) as u8;
+                        (0..8).map(move |bit_index| byte & (1 << (7 - bit_index)) != 0)
+                    })
+                    .collect();
+                let packet_bits = self.packet_bytes.saturating_mul(8);
+                if self.whitening_enabled && self.whitening_start_bit >= packet_bits {
+                    return Err("whitening start bit must lie inside the packet".to_owned());
+                }
+                if self.whitening_end_bit.is_some_and(|end| end > packet_bits) {
+                    return Err("whitening end bit must not exceed the packet length".to_owned());
+                }
+                let whitening = self.whitening_enabled.then_some(AdditiveWhiteningConfig {
+                    width: self.whitening_width,
+                    polynomial: self.whitening_polynomial,
+                    seed: self.whitening_seed,
+                    direction: self.whitening_direction,
+                    invert_output: self.whitening_invert_output,
+                    start_bit: self.whitening_start_bit,
+                    end_bit: self.whitening_end_bit,
+                    advance_excluded_bits: self.whitening_advance_excluded_bits,
+                });
+                let config = RadioPacketPipelineConfig {
+                    bit_transform: BitTransformConfig::default(),
+                    framing: RadioPacketFramerConfig {
+                        sync: SyncWordConfig {
+                            bits: sync_bits,
+                            max_bit_errors: self.maximum_preamble_bit_errors,
+                        },
+                        whitening,
+                        bit_order: BitOrder::MostSignificantFirst,
+                        length: RadioPacketLength::Fixed {
+                            packet_bytes: self.packet_bytes,
+                        },
+                        max_search_bits: 1_048_576,
+                    },
+                    crc: None,
+                };
+                wavecraft_decode::RadioPacketPipeline::new(config.clone())
+                    .map_err(|error| error.to_string())?;
+                Ok(RadioDataDecoderConfig::Packets(config))
+            }
         }
     }
 
@@ -3966,15 +4059,14 @@ impl WaveCraftApp {
             }
         };
         let analyzer_profile = self.radio_settings.analyzer.signal_profile()?;
-        let raw_config = self.radio_settings.analyzer.raw_config();
-        raw_config.validate().map_err(|error| error.to_string())?;
+        let decoder_config = self.radio_settings.analyzer.decoder_config()?;
         Ok(RadioCaptureRequest {
             device,
             settings,
             provider_settings,
             iq_correction_enabled: self.radio_settings.iq_correction_enabled,
             analyzer_profile,
-            raw_config,
+            decoder_config,
         })
     }
 
@@ -8859,48 +8951,81 @@ fn paint_radio_analyzer_configuration(
 
             paint_radio_parameter_label(
                 ui,
-                "Preamble value",
-                Some("One hexadecimal byte repeated at the start of the raw FSK data"),
+                "Data decoding",
+                Some("Raw mode discovers byte alignment from a repeated preamble; packet mode emits fixed-length post-sync packets and can dewhiten them"),
             );
             ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut settings.preamble_byte)
-                            .range(0..=u8::MAX)
-                            .speed(1)
-                            .hexadecimal(2, false, true),
-                    );
-                    ui.label("hex");
-                });
+                egui::ComboBox::from_id_salt("radio_analyzer_data_mode")
+                    .width(RADIO_VALUE_WIDTH)
+                    .selected_text(match settings.data_mode {
+                        RadioDataMode::Raw => "Raw discovery",
+                        RadioDataMode::Packets => "Fixed packets",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut settings.data_mode,
+                            RadioDataMode::Raw,
+                            "Raw discovery",
+                        );
+                        ui.selectable_value(
+                            &mut settings.data_mode,
+                            RadioDataMode::Packets,
+                            "Fixed packets",
+                        );
+                    });
             });
             ui.end_row();
 
-            paint_radio_parameter_label(
-                ui,
-                "Preamble length",
-                Some("Minimum consecutive preamble bytes required; additional matching bytes before sync remain part of the preamble"),
-            );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut settings.preamble_bytes)
-                            .range(1..=256)
-                            .speed(1),
-                    );
-                    ui.label("bytes");
+            if settings.data_mode == RadioDataMode::Raw {
+                paint_radio_parameter_label(
+                    ui,
+                    "Preamble value",
+                    Some("One hexadecimal byte repeated at the start of the raw FSK data"),
+                );
+                ui.add_enabled_ui(controls_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        add_left_aligned_sized(
+                            ui,
+                            egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                            egui::DragValue::new(&mut settings.preamble_byte)
+                                .range(0..=u8::MAX)
+                                .speed(1)
+                                .hexadecimal(2, false, true),
+                        );
+                        ui.label("hex");
+                    });
                 });
-            });
-            settings.preamble_bytes = settings.preamble_bytes.clamp(1, 256);
-            ui.end_row();
+                ui.end_row();
+
+                paint_radio_parameter_label(
+                    ui,
+                    "Preamble length",
+                    Some("Minimum consecutive preamble bytes required; additional matching bytes before sync remain part of the preamble"),
+                );
+                ui.add_enabled_ui(controls_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        add_left_aligned_sized(
+                            ui,
+                            egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                            egui::DragValue::new(&mut settings.preamble_bytes)
+                                .range(1..=256)
+                                .speed(1),
+                        );
+                        ui.label("bytes");
+                    });
+                });
+                settings.preamble_bytes = settings.preamble_bytes.clamp(1, 256);
+                ui.end_row();
+            }
 
             paint_radio_parameter_label(
                 ui,
                 "Sync word",
-                Some("Optional 1-to-8-byte word after the repeated preamble; unlike 0xAA, it establishes an unambiguous byte boundary"),
+                Some(if settings.data_mode == RadioDataMode::Packets {
+                    "Required 1-to-8-byte unwhitened word that establishes the packet and whitening boundary"
+                } else {
+                    "Optional 1-to-8-byte word after the repeated preamble; unlike 0xAA, it establishes an unambiguous byte boundary"
+                }),
             );
             ui.add_enabled_ui(controls_enabled, |ui| {
                 ui.horizontal(|ui| {
@@ -8920,7 +9045,11 @@ fn paint_radio_analyzer_configuration(
             paint_radio_parameter_label(
                 ui,
                 "Sync word length",
-                Some("Zero disables the separate sync word; bytes are taken big-endian from the value above"),
+                Some(if settings.data_mode == RadioDataMode::Packets {
+                    "Required in packet mode; bytes are taken big-endian from the value above"
+                } else {
+                    "Zero disables the separate sync word; bytes are taken big-endian from the value above"
+                }),
             );
             ui.add_enabled_ui(controls_enabled, |ui| {
                 ui.horizontal(|ui| {
@@ -8928,18 +9057,29 @@ fn paint_radio_analyzer_configuration(
                         ui,
                         egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
                         egui::DragValue::new(&mut settings.sync_word_bytes)
-                            .range(0..=8)
+                            .range(if settings.data_mode == RadioDataMode::Packets {
+                                1..=8
+                            } else {
+                                0..=8
+                            })
                             .speed(1),
                     );
                     ui.label("bytes");
                 });
             });
             settings.sync_word_bytes = settings.sync_word_bytes.min(8);
+            if settings.data_mode == RadioDataMode::Packets {
+                settings.sync_word_bytes = settings.sync_word_bytes.max(1);
+            }
             ui.end_row();
 
             paint_radio_parameter_label(
                 ui,
-                "Preamble bit errors",
+                if settings.data_mode == RadioDataMode::Packets {
+                    "Sync bit errors"
+                } else {
+                    "Preamble bit errors"
+                },
                 Some("Maximum hard-decision mismatches accepted in the sync word, or in the preamble when sync is disabled"),
             );
             ui.add_enabled_ui(controls_enabled, |ui| {
@@ -8964,49 +9104,225 @@ fn paint_radio_analyzer_configuration(
                 .min(acquisition_bits.saturating_sub(1));
             ui.end_row();
 
-            paint_radio_parameter_label(
-                ui,
-                "Minimum bit confidence",
-                Some("Bits below this 0-to-1 demodulator confidence count as uncertain; zero disables confidence filtering"),
-            );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                let mut confidence =
-                    f64::from(settings.minimum_bit_confidence_milli) / 1_000.0;
-                if add_left_aligned_sized(
+            if settings.data_mode == RadioDataMode::Raw {
+                paint_radio_parameter_label(
                     ui,
-                    egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                    egui::DragValue::new(&mut confidence)
-                        .range(0.0..=1.0)
-                        .speed(0.01)
-                        .min_decimals(2)
-                        .max_decimals(3),
-                )
-                .changed()
-                {
-                    settings.minimum_bit_confidence_milli =
-                        (confidence * 1_000.0).round() as u16;
-                }
-            });
-            ui.end_row();
-
-            paint_radio_parameter_label(
-                ui,
-                "Maximum uncertain bits",
-                Some("Rejects a completed RAW message when more bits fall below the confidence threshold"),
-            );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    add_left_aligned_sized(
+                    "Minimum bit confidence",
+                    Some("Bits below this 0-to-1 demodulator confidence count as uncertain; zero disables confidence filtering"),
+                );
+                ui.add_enabled_ui(controls_enabled, |ui| {
+                    let mut confidence =
+                        f64::from(settings.minimum_bit_confidence_milli) / 1_000.0;
+                    if add_left_aligned_sized(
                         ui,
                         egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut settings.maximum_uncertain_bits)
-                            .range(0..=1_000_000)
-                            .speed(1),
-                    );
-                    ui.label("bits");
+                        egui::DragValue::new(&mut confidence)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .min_decimals(2)
+                            .max_decimals(3),
+                    )
+                    .changed()
+                    {
+                        settings.minimum_bit_confidence_milli =
+                            (confidence * 1_000.0).round() as u16;
+                    }
                 });
-            });
-            ui.end_row();
+                ui.end_row();
+
+                paint_radio_parameter_label(
+                    ui,
+                    "Maximum uncertain bits",
+                    Some("Rejects a completed RAW message when more bits fall below the confidence threshold"),
+                );
+                ui.add_enabled_ui(controls_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        add_left_aligned_sized(
+                            ui,
+                            egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                            egui::DragValue::new(&mut settings.maximum_uncertain_bits)
+                                .range(0..=1_000_000)
+                                .speed(1),
+                        );
+                        ui.label("bits");
+                    });
+                });
+                ui.end_row();
+            } else {
+                paint_radio_parameter_label(
+                    ui,
+                    "Packet length",
+                    Some("Fixed number of dewhitened bytes following the sync word"),
+                );
+                ui.add_enabled_ui(controls_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        add_left_aligned_sized(
+                            ui,
+                            egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                            egui::DragValue::new(&mut settings.packet_bytes)
+                                .range(1..=1_048_576)
+                                .speed(1),
+                        );
+                        ui.label("bytes");
+                    });
+                });
+                settings.packet_bytes = settings.packet_bytes.clamp(1, 1_048_576);
+                let packet_bits = settings.packet_bytes.saturating_mul(8);
+                ui.end_row();
+
+                paint_radio_parameter_label(
+                    ui,
+                    "Data whitening",
+                    Some("XOR packet bits after sync with a reset additive LFSR sequence"),
+                );
+                ui.add_enabled(
+                    controls_enabled,
+                    egui::Checkbox::without_text(&mut settings.whitening_enabled),
+                );
+                ui.end_row();
+
+                if settings.whitening_enabled {
+                    let whitening_enabled = controls_enabled && settings.whitening_enabled;
+                    paint_radio_parameter_label(ui, "LFSR width", Some("Whitening register width"));
+                    ui.add_enabled_ui(whitening_enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            add_left_aligned_sized(
+                                ui,
+                                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                                egui::DragValue::new(&mut settings.whitening_width)
+                                    .range(1..=64)
+                                    .speed(1),
+                            );
+                            ui.label("bits");
+                        });
+                    });
+                    ui.end_row();
+
+                    for (label, help, value) in [
+                        (
+                            "LFSR tap mask",
+                            "Tap mask over the current LFSR state; tapped-bit parity becomes feedback",
+                            &mut settings.whitening_polynomial,
+                        ),
+                        (
+                            "LFSR seed",
+                            "Nonzero register state loaded immediately after sync",
+                            &mut settings.whitening_seed,
+                        ),
+                    ] {
+                        paint_radio_parameter_label(ui, label, Some(help));
+                        ui.add_enabled_ui(whitening_enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                add_left_aligned_sized(
+                                    ui,
+                                    egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                                    egui::DragValue::new(value)
+                                        .range(0..=u64::MAX)
+                                        .speed(1)
+                                        .hexadecimal(2, false, true),
+                                );
+                                ui.label("hex");
+                            });
+                        });
+                        ui.end_row();
+                    }
+
+                    paint_radio_parameter_label(
+                        ui,
+                        "LFSR direction",
+                        Some("Selects the emitted end and shift direction of the register"),
+                    );
+                    ui.add_enabled_ui(whitening_enabled, |ui| {
+                        egui::ComboBox::from_id_salt("radio_whitening_direction")
+                            .width(RADIO_VALUE_WIDTH)
+                            .selected_text(match settings.whitening_direction {
+                                WhiteningDirection::ShiftRight => "Right · emit LSB",
+                                WhiteningDirection::ShiftLeft => "Left · emit MSB",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut settings.whitening_direction,
+                                    WhiteningDirection::ShiftRight,
+                                    "Right · emit LSB",
+                                );
+                                ui.selectable_value(
+                                    &mut settings.whitening_direction,
+                                    WhiteningDirection::ShiftLeft,
+                                    "Left · emit MSB",
+                                );
+                            });
+                    });
+                    ui.end_row();
+
+                    paint_radio_parameter_label(
+                        ui,
+                        "Invert PN output",
+                        Some("Inverts every generated whitening bit before XOR"),
+                    );
+                    ui.add_enabled(
+                        whitening_enabled,
+                        egui::Checkbox::without_text(&mut settings.whitening_invert_output),
+                    );
+                    ui.end_row();
+
+                    paint_radio_parameter_label(
+                        ui,
+                        "Whitening start",
+                        Some("First covered packet bit relative to the end of sync"),
+                    );
+                    ui.add_enabled_ui(whitening_enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            add_left_aligned_sized(
+                                ui,
+                                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                                egui::DragValue::new(&mut settings.whitening_start_bit)
+                                    .range(0..=packet_bits.saturating_sub(1))
+                                    .speed(1),
+                            );
+                            ui.label("bit");
+                        });
+                    });
+                    ui.end_row();
+
+                    paint_radio_parameter_label(
+                        ui,
+                        "Whitening end",
+                        Some("Optional exclusive packet-bit end; disabled covers the packet tail"),
+                    );
+                    ui.add_enabled_ui(whitening_enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            let mut bounded = settings.whitening_end_bit.is_some();
+                            if ui.checkbox(&mut bounded, "Bounded").changed() {
+                                settings.whitening_end_bit = bounded.then_some(
+                                    settings.whitening_start_bit.saturating_add(1),
+                                );
+                            }
+                            if let Some(end) = &mut settings.whitening_end_bit {
+                                ui.add(
+                                    egui::DragValue::new(end)
+                                        .range(settings.whitening_start_bit.saturating_add(1)..=packet_bits)
+                                        .speed(1),
+                                );
+                                ui.label("bit");
+                            }
+                        });
+                    });
+                    ui.end_row();
+
+                    paint_radio_parameter_label(
+                        ui,
+                        "Advance outside range",
+                        Some("Advances the PN sequence over clear packet bits outside the covered range"),
+                    );
+                    ui.add_enabled(
+                        whitening_enabled,
+                        egui::Checkbox::without_text(
+                            &mut settings.whitening_advance_excluded_bits,
+                        ),
+                    );
+                    ui.end_row();
+                }
+            }
 
             if settings.demodulation == RadioDemodulation::BinaryGfsk {
                 paint_radio_parameter_label(
@@ -9113,14 +9429,10 @@ fn paint_radio_analyzer_configuration(
                 egui::Label::new(RichText::new(error).small().color(Color32::LIGHT_RED))
                     .selectable(true),
             );
-        } else if let Err(error) = settings.raw_config().validate() {
+        } else if let Err(error) = settings.decoder_config() {
             ui.add(
-                egui::Label::new(
-                    RichText::new(error.to_string())
-                        .small()
-                        .color(Color32::LIGHT_RED),
-                )
-                .selectable(true),
+                egui::Label::new(RichText::new(error).small().color(Color32::LIGHT_RED))
+                    .selectable(true),
             );
         }
     }
@@ -10856,6 +11168,8 @@ impl eframe::App for WaveCraftApp {
                                         &waveforms.radio_analysis,
                                         RadioViewOptions {
                                             analysis_enabled: self.radio_settings.analyzer.enabled,
+                                            packet_mode: self.radio_settings.analyzer.data_mode
+                                                == RadioDataMode::Packets,
                                             trigger_level_dbfs_tenths:
                                                 &mut radio_trigger_level_dbfs_tenths,
                                             trigger_controls_enabled:
@@ -11857,6 +12171,14 @@ fn saved_radio_settings_metadata(settings: &RadioSettings) -> BTreeMap<String, S
             settings.analyzer.max_clock_error_ppm.to_string(),
         ),
         (
+            "radio.analyzer.data_mode",
+            match settings.analyzer.data_mode {
+                RadioDataMode::Raw => "raw",
+                RadioDataMode::Packets => "packets",
+            }
+            .to_owned(),
+        ),
+        (
             "radio.analyzer.preamble_byte",
             settings.analyzer.preamble_byte.to_string(),
         ),
@@ -11883,6 +12205,56 @@ fn saved_radio_settings_metadata(settings: &RadioSettings) -> BTreeMap<String, S
         (
             "radio.analyzer.maximum_uncertain_bits",
             settings.analyzer.maximum_uncertain_bits.to_string(),
+        ),
+        (
+            "radio.analyzer.packet_bytes",
+            settings.analyzer.packet_bytes.to_string(),
+        ),
+        (
+            "radio.analyzer.whitening_enabled",
+            settings.analyzer.whitening_enabled.to_string(),
+        ),
+        (
+            "radio.analyzer.whitening_width",
+            settings.analyzer.whitening_width.to_string(),
+        ),
+        (
+            "radio.analyzer.whitening_polynomial",
+            settings.analyzer.whitening_polynomial.to_string(),
+        ),
+        (
+            "radio.analyzer.whitening_seed",
+            settings.analyzer.whitening_seed.to_string(),
+        ),
+        (
+            "radio.analyzer.whitening_direction",
+            match settings.analyzer.whitening_direction {
+                WhiteningDirection::ShiftRight => "right",
+                WhiteningDirection::ShiftLeft => "left",
+            }
+            .to_owned(),
+        ),
+        (
+            "radio.analyzer.whitening_invert_output",
+            settings.analyzer.whitening_invert_output.to_string(),
+        ),
+        (
+            "radio.analyzer.whitening_start_bit",
+            settings.analyzer.whitening_start_bit.to_string(),
+        ),
+        (
+            "radio.analyzer.whitening_end_bit",
+            settings
+                .analyzer
+                .whitening_end_bit
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        ),
+        (
+            "radio.analyzer.whitening_advance_excluded_bits",
+            settings
+                .analyzer
+                .whitening_advance_excluded_bits
+                .to_string(),
         ),
     ] {
         metadata.insert(key.to_owned(), value);
@@ -12051,6 +12423,14 @@ fn start_gui_recording(
             radio_settings.analyzer.max_clock_error_ppm.to_string(),
         ),
         (
+            "data_mode",
+            match radio_settings.analyzer.data_mode {
+                RadioDataMode::Raw => "raw",
+                RadioDataMode::Packets => "packets",
+            }
+            .to_owned(),
+        ),
+        (
             "preamble_byte",
             radio_settings.analyzer.preamble_byte.to_string(),
         ),
@@ -12080,6 +12460,56 @@ fn start_gui_recording(
         (
             "maximum_uncertain_bits",
             radio_settings.analyzer.maximum_uncertain_bits.to_string(),
+        ),
+        (
+            "packet_bytes",
+            radio_settings.analyzer.packet_bytes.to_string(),
+        ),
+        (
+            "whitening_enabled",
+            radio_settings.analyzer.whitening_enabled.to_string(),
+        ),
+        (
+            "whitening_width",
+            radio_settings.analyzer.whitening_width.to_string(),
+        ),
+        (
+            "whitening_polynomial",
+            radio_settings.analyzer.whitening_polynomial.to_string(),
+        ),
+        (
+            "whitening_seed",
+            radio_settings.analyzer.whitening_seed.to_string(),
+        ),
+        (
+            "whitening_direction",
+            match radio_settings.analyzer.whitening_direction {
+                WhiteningDirection::ShiftRight => "right",
+                WhiteningDirection::ShiftLeft => "left",
+            }
+            .to_owned(),
+        ),
+        (
+            "whitening_invert_output",
+            radio_settings.analyzer.whitening_invert_output.to_string(),
+        ),
+        (
+            "whitening_start_bit",
+            radio_settings.analyzer.whitening_start_bit.to_string(),
+        ),
+        (
+            "whitening_end_bit",
+            radio_settings
+                .analyzer
+                .whitening_end_bit
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        ),
+        (
+            "whitening_advance_excluded_bits",
+            radio_settings
+                .analyzer
+                .whitening_advance_excluded_bits
+                .to_string(),
         ),
     ] {
         metadata.insert(format!("radio.analyzer.{key}"), value);
@@ -12689,6 +13119,12 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.max_clock_error_ppm") {
         settings.analyzer.max_clock_error_ppm = value;
     }
+    if let Some(value) = metadata.get("radio.analyzer.data_mode") {
+        settings.analyzer.data_mode = match value.as_str() {
+            "packets" => RadioDataMode::Packets,
+            _ => RadioDataMode::Raw,
+        };
+    }
     if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.preamble_byte") {
         settings.analyzer.preamble_byte = value;
     }
@@ -12714,6 +13150,45 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.maximum_uncertain_bits")
     {
         settings.analyzer.maximum_uncertain_bits = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.packet_bytes") {
+        settings.analyzer.packet_bytes = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.whitening_enabled") {
+        settings.analyzer.whitening_enabled = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.whitening_width") {
+        settings.analyzer.whitening_width = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.whitening_polynomial") {
+        settings.analyzer.whitening_polynomial = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.whitening_seed") {
+        settings.analyzer.whitening_seed = value;
+    }
+    if let Some(value) = metadata.get("radio.analyzer.whitening_direction") {
+        settings.analyzer.whitening_direction = match value.as_str() {
+            "left" => WhiteningDirection::ShiftLeft,
+            _ => WhiteningDirection::ShiftRight,
+        };
+    }
+    if let Some(value) =
+        recording_metadata_value(metadata, "radio.analyzer.whitening_invert_output")
+    {
+        settings.analyzer.whitening_invert_output = value;
+    }
+    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.whitening_start_bit") {
+        settings.analyzer.whitening_start_bit = value;
+    }
+    if let Some(value) = metadata.get("radio.analyzer.whitening_end_bit") {
+        settings.analyzer.whitening_end_bit = (value != "none")
+            .then(|| value.parse::<usize>().ok())
+            .flatten();
+    }
+    if let Some(value) =
+        recording_metadata_value(metadata, "radio.analyzer.whitening_advance_excluded_bits")
+    {
+        settings.analyzer.whitening_advance_excluded_bits = value;
     }
     for (key, value) in metadata {
         let Some(id) = key
@@ -12768,7 +13243,10 @@ fn read_gui_recording_with_analyzers(
             .with_iq_correction(radio_settings.iq_correction_enabled);
     let mut radio_analyzer = match radio_settings.analyzer.signal_profile() {
         Ok(Some(profile)) => {
-            let analyzer = RadioAnalyzerRuntime::new(profile, radio_settings.analyzer.raw_config());
+            let analyzer = radio_settings
+                .analyzer
+                .decoder_config()
+                .and_then(|config| RadioAnalyzerRuntime::new(profile, config));
             match analyzer {
                 Ok(analyzer) => Some(analyzer),
                 Err(error) => {
@@ -13122,9 +13600,9 @@ fn start_capture(
             request
                 .analyzer_profile
                 .clone()
-                .map(|profile| (profile, request.raw_config))
+                .map(|profile| (profile, request.decoder_config.clone()))
         })
-        .map(|(profile, raw_config)| RadioAnalyzerRuntime::new(profile, raw_config))
+        .map(|(profile, decoder_config)| RadioAnalyzerRuntime::new(profile, decoder_config))
         .transpose()?;
     let mut sources = Vec::<Box<dyn CaptureSource>>::with_capacity(
         devices.len() + usize::from(radio_request.is_some()),
@@ -18141,6 +18619,17 @@ mod tests {
         settings.analyzer.channel_offset_hz = 125_000;
         settings.analyzer.sync_word = 0xd391;
         settings.analyzer.sync_word_bytes = 2;
+        settings.analyzer.data_mode = RadioDataMode::Packets;
+        settings.analyzer.packet_bytes = 24;
+        settings.analyzer.whitening_enabled = true;
+        settings.analyzer.whitening_width = 9;
+        settings.analyzer.whitening_polynomial = 0x11;
+        settings.analyzer.whitening_seed = 0x1ff;
+        settings.analyzer.whitening_direction = WhiteningDirection::ShiftLeft;
+        settings.analyzer.whitening_invert_output = true;
+        settings.analyzer.whitening_start_bit = 8;
+        settings.analyzer.whitening_end_bit = Some(160);
+        settings.analyzer.whitening_advance_excluded_bits = true;
 
         let metadata = saved_radio_settings_metadata(&settings);
 
@@ -18433,6 +18922,62 @@ mod tests {
     }
 
     #[test]
+    fn radio_analyzer_settings_build_a_post_sync_whitening_pipeline() {
+        let mut settings = RadioAnalyzerSettings {
+            data_mode: RadioDataMode::Packets,
+            sync_word: 0xd391,
+            sync_word_bytes: 2,
+            maximum_preamble_bit_errors: 1,
+            packet_bytes: 24,
+            whitening_enabled: true,
+            whitening_width: 9,
+            whitening_polynomial: 0x11,
+            whitening_seed: 0x1ff,
+            whitening_direction: WhiteningDirection::ShiftLeft,
+            whitening_invert_output: true,
+            whitening_start_bit: 8,
+            whitening_end_bit: Some(160),
+            whitening_advance_excluded_bits: true,
+            ..RadioAnalyzerSettings::default()
+        };
+
+        let RadioDataDecoderConfig::Packets(config) = settings.decoder_config().unwrap() else {
+            panic!("packet settings should build a packet decoder");
+        };
+        assert_eq!(
+            config.framing.sync.bits,
+            [
+                true, true, false, true, false, false, true, true, true, false, false, true, false,
+                false, false, true
+            ]
+        );
+        assert_eq!(config.framing.sync.max_bit_errors, 1);
+        assert_eq!(
+            config.framing.length,
+            RadioPacketLength::Fixed { packet_bytes: 24 }
+        );
+        assert_eq!(
+            config.framing.whitening,
+            Some(AdditiveWhiteningConfig {
+                width: 9,
+                polynomial: 0x11,
+                seed: 0x1ff,
+                direction: WhiteningDirection::ShiftLeft,
+                invert_output: true,
+                start_bit: 8,
+                end_bit: Some(160),
+                advance_excluded_bits: true,
+            })
+        );
+
+        settings.sync_word_bytes = 0;
+        assert_eq!(
+            settings.decoder_config().unwrap_err(),
+            "packet decoding requires a sync word"
+        );
+    }
+
+    #[test]
     fn radio_analyzer_settings_round_trip_from_recording_metadata() {
         let metadata = BTreeMap::from([
             ("radio.analyzer.enabled".to_owned(), "true".to_owned()),
@@ -18472,6 +19017,7 @@ mod tests {
                 "radio.analyzer.max_clock_error_ppm".to_owned(),
                 "20000".to_owned(),
             ),
+            ("radio.analyzer.data_mode".to_owned(), "packets".to_owned()),
             ("radio.analyzer.preamble_byte".to_owned(), "85".to_owned()),
             ("radio.analyzer.preamble_bytes".to_owned(), "12".to_owned()),
             ("radio.analyzer.sync_word".to_owned(), "11732".to_owned()),
@@ -18487,6 +19033,37 @@ mod tests {
             (
                 "radio.analyzer.maximum_uncertain_bits".to_owned(),
                 "3".to_owned(),
+            ),
+            ("radio.analyzer.packet_bytes".to_owned(), "24".to_owned()),
+            (
+                "radio.analyzer.whitening_enabled".to_owned(),
+                "true".to_owned(),
+            ),
+            ("radio.analyzer.whitening_width".to_owned(), "9".to_owned()),
+            (
+                "radio.analyzer.whitening_polynomial".to_owned(),
+                "17".to_owned(),
+            ),
+            ("radio.analyzer.whitening_seed".to_owned(), "511".to_owned()),
+            (
+                "radio.analyzer.whitening_direction".to_owned(),
+                "left".to_owned(),
+            ),
+            (
+                "radio.analyzer.whitening_invert_output".to_owned(),
+                "true".to_owned(),
+            ),
+            (
+                "radio.analyzer.whitening_start_bit".to_owned(),
+                "8".to_owned(),
+            ),
+            (
+                "radio.analyzer.whitening_end_bit".to_owned(),
+                "160".to_owned(),
+            ),
+            (
+                "radio.analyzer.whitening_advance_excluded_bits".to_owned(),
+                "true".to_owned(),
             ),
         ]);
 
@@ -18512,6 +19089,17 @@ mod tests {
         assert_eq!(settings.maximum_preamble_bit_errors, 2);
         assert_eq!(settings.minimum_bit_confidence_milli, 650);
         assert_eq!(settings.maximum_uncertain_bits, 3);
+        assert_eq!(settings.data_mode, RadioDataMode::Packets);
+        assert_eq!(settings.packet_bytes, 24);
+        assert!(settings.whitening_enabled);
+        assert_eq!(settings.whitening_width, 9);
+        assert_eq!(settings.whitening_polynomial, 0x11);
+        assert_eq!(settings.whitening_seed, 0x1ff);
+        assert_eq!(settings.whitening_direction, WhiteningDirection::ShiftLeft);
+        assert!(settings.whitening_invert_output);
+        assert_eq!(settings.whitening_start_bit, 8);
+        assert_eq!(settings.whitening_end_bit, Some(160));
+        assert!(settings.whitening_advance_excluded_bits);
     }
 
     #[test]
@@ -18529,7 +19117,8 @@ mod tests {
         };
         settings.demodulation = RadioDemodulation::BinaryFsk;
         let profile = settings.signal_profile().unwrap().unwrap();
-        let mut analyzer = Some(RadioAnalyzerRuntime::new(profile, settings.raw_config()).unwrap());
+        let mut analyzer =
+            Some(RadioAnalyzerRuntime::new(profile, settings.decoder_config().unwrap()).unwrap());
         // Keep the FFT shorter than this focused synthetic burst so the
         // analyzer's burst gate receives a channel-power observation.
         let mut spectrum = SpectrumProcessor::new(256, SpectrumWindow::Hann).unwrap();
@@ -19308,7 +19897,7 @@ mod tests {
             provider_settings: RadioProviderSettings::HackRf(HackRfSettings::default()),
             iq_correction_enabled: true,
             analyzer_profile: None,
-            raw_config: RawRadioConfig {
+            decoder_config: RadioDataDecoderConfig::Raw(RawRadioConfig {
                 preamble_byte: 0xaa,
                 preamble_bytes: 4,
                 sync_word: 0,
@@ -19317,7 +19906,7 @@ mod tests {
                 bit_order: BitOrder::MostSignificantFirst,
                 minimum_bit_confidence_milli: 500,
                 maximum_uncertain_bits: 0,
-            },
+            }),
         };
         let logic_config = LogicCaptureSettings::default().capture_config().unwrap();
         let scope_config = ScopeCaptureSettings::default().capture_config().unwrap();
@@ -19393,7 +19982,7 @@ mod tests {
             provider_settings: RadioProviderSettings::HackRf(HackRfSettings::default()),
             iq_correction_enabled: true,
             analyzer_profile: None,
-            raw_config: RawRadioConfig {
+            decoder_config: RadioDataDecoderConfig::Raw(RawRadioConfig {
                 preamble_byte: 0xaa,
                 preamble_bytes: 4,
                 sync_word: 0,
@@ -19402,7 +19991,7 @@ mod tests {
                 bit_order: BitOrder::MostSignificantFirst,
                 minimum_bit_confidence_milli: 500,
                 maximum_uncertain_bits: 0,
-            },
+            }),
         };
         let started = start_capture(
             Vec::new(),
