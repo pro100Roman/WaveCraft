@@ -21,9 +21,9 @@ use measurements::{
 use protocol_analyzer::{
     analyzer_channels, analyzer_decoder_chain, analyzer_long_name, analyzer_name,
     analyzer_transport_name, decode_protocol_samples, decode_transport_samples, matching_protocols,
-    protocol_stack, ProtocolAnalyzerInstance, ProtocolAnalyzerSettings, ProtocolCaptureDecoder,
-    ProtocolDataFormat, ProtocolDecodeOutcome, ProtocolDecodeSnapshot, ProtocolDecodedEvent,
-    ProtocolDecodedKind, PROTOCOLS,
+    protocol_stack, LogicDecodeOutput, LogicDecodeWorker, ProtocolAnalyzerInstance,
+    ProtocolAnalyzerSettings, ProtocolCaptureDecoder, ProtocolDataFormat, ProtocolDecodeOutcome,
+    ProtocolDecodeSnapshot, ProtocolDecodedEvent, ProtocolDecodedKind, PROTOCOLS,
 };
 use radio_analyzer::{RadioAnalyzerRuntime, RadioDspOutput, RadioDspWorker};
 use radio_trigger::{RadioSingleTrigger, RadioSingleTriggerConfig};
@@ -2950,13 +2950,8 @@ fn ingest_active_capture_frame(
     let CaptureEvent::Frame(frame) = event else {
         unreachable!("capture frame event changed variant");
     };
-    if let CaptureBatch::Logic(logic) = &frame.payload {
-        active.protocol_decode.ingest_logic_frame(
-            frame.device_id.as_str(),
-            frame.sequence,
-            &logic.samples,
-            logic.sample_rate_hz,
-        );
+    if matches!(&frame.payload, CaptureBatch::Logic(_)) {
+        return active.logic_decode.push(frame);
     }
     if let CaptureBatch::Iq(iq) = &frame.payload {
         active
@@ -2981,6 +2976,13 @@ fn ingest_active_capture_frame(
     Ok(())
 }
 
+fn ingest_logic_decode_output(active: &mut ActiveCapture, output: LogicDecodeOutput) {
+    active.protocol_decode_snapshot = output.snapshot;
+    if let Some(frame) = output.frame {
+        active.waveforms.ingest_frame(&frame, [false; 2]);
+    }
+}
+
 struct ActiveCapture {
     session: CaptureSession,
     mode: AcquisitionMode,
@@ -2992,7 +2994,9 @@ struct ActiveCapture {
     radio_runtime_control: Option<HackRfRuntimeControl>,
     stopped: HashSet<DeviceId>,
     waveforms: WaveformStore,
-    protocol_decode: ProtocolCaptureDecoder,
+    protocol_decode_snapshot: ProtocolDecodeSnapshot,
+    protocol_analyzers: Vec<ProtocolAnalyzerInstance>,
+    logic_decode: LogicDecodeWorker,
     radio_spectrum: SpectrumProcessor,
     radio_dsp: RadioDspWorker,
     radio_trigger: Option<RadioSingleTrigger>,
@@ -3001,6 +3005,24 @@ struct ActiveCapture {
     has_logic: bool,
     has_scope: bool,
     has_radio: bool,
+}
+
+fn finish_logic_decode(active: &mut ActiveCapture) -> (ProtocolCaptureDecoder, Option<String>) {
+    match active.logic_decode.finish() {
+        Ok((decoder, outputs)) => {
+            for output in outputs {
+                ingest_logic_decode_output(active, output);
+            }
+            active.protocol_decode_snapshot = decoder.snapshot();
+            (decoder, None)
+        }
+        Err(error) => {
+            let mut decoder = ProtocolCaptureDecoder::new(&active.protocol_analyzers);
+            decoder.retain_history_from(&active.protocol_decode_snapshot);
+            decoder.finish();
+            (decoder, Some(error))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4092,6 +4114,8 @@ impl WaveCraftApp {
             return;
         };
         self.status = "Stopping capture…".to_owned();
+        active.session.request_stop();
+        let (protocol_decode, logic_decode_error) = finish_logic_decode(&mut active);
         let stop_result = active.session.stop();
         let completion = if stop_result.is_ok() {
             CompletionStatus::Cancelled
@@ -4106,14 +4130,13 @@ impl WaveCraftApp {
         let has_logic = active.has_logic;
         let has_scope = active.has_scope;
         let has_radio = active.has_radio;
-        active.protocol_decode.finish();
         active.waveforms.radio_analysis.finish_raw_capture();
         if !active.preserve_display_until_complete {
             self.set_completed_capture_for_target(
                 active.target,
                 CompletedCapture {
                     waveforms: active.waveforms,
-                    protocol_decode: active.protocol_decode,
+                    protocol_decode,
                     has_logic,
                     has_scope,
                     has_radio,
@@ -4132,6 +4155,9 @@ impl WaveCraftApp {
             (Err(stop_error), Err(recording_error)) => self.set_error(format!(
                 "{stop_error}; additionally failed to finish recording: {recording_error}"
             )),
+        }
+        if let Some(error) = logic_decode_error {
+            self.set_error(error);
         }
     }
 
@@ -4364,6 +4390,9 @@ impl WaveCraftApp {
                     protocol_decode.retain_history_from(snapshot);
                 }
                 protocol_decode.reconfigure(&self.protocol_analyzer.analyzers);
+                let protocol_decode_snapshot = protocol_decode.snapshot();
+                let protocol_analyzers = self.protocol_analyzer.analyzers.clone();
+                let logic_decode = LogicDecodeWorker::start(protocol_decode);
                 if !continue_logic_loop {
                     waveforms.configure_logic_capture(logic_config.sample_count());
                 }
@@ -4380,7 +4409,9 @@ impl WaveCraftApp {
                     radio_runtime_control,
                     stopped: HashSet::new(),
                     waveforms,
-                    protocol_decode,
+                    protocol_decode_snapshot,
+                    protocol_analyzers,
+                    logic_decode,
                     radio_spectrum: *radio_spectrum,
                     radio_dsp: *radio_dsp,
                     radio_trigger,
@@ -4646,7 +4677,15 @@ impl WaveCraftApp {
             self.radio_settings.trigger_posttrigger_micros,
         );
         if let Some(active) = self.capture.as_mut() {
-            active.protocol_decode.reconfigure(&protocol_analyzers);
+            if active.protocol_analyzers != protocol_analyzers {
+                match active.logic_decode.reconfigure(protocol_analyzers.clone()) {
+                    Ok(()) => active.protocol_analyzers = protocol_analyzers.clone(),
+                    Err(error) => {
+                        active.session.request_stop();
+                        finish_status = Some((Err(error), CompletionStatus::Failed));
+                    }
+                }
+            }
             for _ in 0..MAX_CAPTURE_EVENTS_PER_POLL {
                 match active.session.try_recv() {
                     Ok(event) => match event {
@@ -4787,6 +4826,22 @@ impl WaveCraftApp {
                 }
             }
             loop {
+                match active.logic_decode.try_recv() {
+                    Ok(output) => ingest_logic_decode_output(active, output),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if finish_status.is_none() {
+                            active.session.request_stop();
+                            finish_status = Some((
+                                Err("logic decode worker disconnected".to_owned()),
+                                CompletionStatus::Failed,
+                            ));
+                        }
+                        break;
+                    }
+                }
+            }
+            loop {
                 match active.radio_dsp.try_recv() {
                     Ok(output) => ingest_radio_dsp_output(&mut active.waveforms, output),
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -4820,6 +4875,7 @@ impl WaveCraftApp {
                 let restart_for_frontend =
                     self.scope_capture_restart_requested && self.capture_run_requested;
                 self.scope_capture_restart_requested = false;
+                let (protocol_decode, logic_decode_error) = finish_logic_decode(&mut active);
                 let stop_result = active.session.stop();
                 let radio_dsp_error = match active.radio_dsp.finish() {
                     Ok(outputs) => {
@@ -4837,7 +4893,6 @@ impl WaveCraftApp {
                 };
                 let recording_result =
                     finish_gui_recording(&mut active.recorder, recording_completion);
-                active.protocol_decode.finish();
                 active.waveforms.radio_analysis.finish_raw_capture();
                 let mut error = result.as_ref().err().cloned();
                 if let Err(stop_error) = stop_result {
@@ -4845,6 +4900,9 @@ impl WaveCraftApp {
                 }
                 if let Some(dsp_error) = radio_dsp_error {
                     append_error(&mut error, dsp_error);
+                }
+                if let Some(decode_error) = logic_decode_error {
+                    append_error(&mut error, decode_error);
                 }
                 if let Err(recording_error) = recording_result {
                     append_error(
@@ -4862,7 +4920,7 @@ impl WaveCraftApp {
                         target,
                         CompletedCapture {
                             waveforms: active.waveforms,
-                            protocol_decode: active.protocol_decode,
+                            protocol_decode,
                             has_logic,
                             has_scope,
                             has_radio,
@@ -10010,7 +10068,7 @@ impl eframe::App for WaveCraftApp {
             .capture
             .as_ref()
             .filter(|active| !active.preserve_display_until_complete)
-            .map(|active| active.protocol_decode.snapshot())
+            .map(|active| active.protocol_decode_snapshot.clone())
             .or_else(|| {
                 (!self.calibration_active)
                     .then(|| self.displayed_completed_capture())

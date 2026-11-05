@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use wavecraft_core::{CaptureBatch, CaptureFrame};
 use wavecraft_decode::{
     decode_i2c_samples, decode_spi_samples, decode_uart_samples, load_protocol_schema,
     ByteStreamFramer, CustomProtocolDecoder, CustomProtocolRuntime, DecodeDiagnostic, DecodedField,
@@ -9,6 +12,8 @@ use wavecraft_decode::{
     SpiTransactionEnd, SpiTransfer, TimedByte, TransportKind, TransportPacket, TransportValue,
     UartConfig, UartDecode, UartDecoder,
 };
+
+const LOGIC_DECODE_INPUT_CAPACITY: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolDefinition {
@@ -519,6 +524,113 @@ impl ProtocolCaptureDecoder {
         self.runtimes = runtimes;
         self.outcomes = Arc::new(outcomes);
         self.waveform_outcomes = Arc::new(waveform_outcomes);
+    }
+}
+
+enum LogicDecodeInput {
+    Reconfigure(Vec<ProtocolAnalyzerInstance>),
+    Frame(CaptureFrame),
+}
+
+pub struct LogicDecodeOutput {
+    pub frame: Option<CaptureFrame>,
+    pub snapshot: ProtocolDecodeSnapshot,
+}
+
+/// Preserves ordered streaming protocol state while decoding LA frames away
+/// from the UI thread. The bounded input queue applies backpressure instead of
+/// silently dropping samples when protocol decoding cannot keep up.
+pub struct LogicDecodeWorker {
+    sender: Option<SyncSender<LogicDecodeInput>>,
+    receiver: Receiver<LogicDecodeOutput>,
+    worker: Option<JoinHandle<ProtocolCaptureDecoder>>,
+}
+
+impl LogicDecodeWorker {
+    pub fn start(mut decoder: ProtocolCaptureDecoder) -> Self {
+        let (input_sender, input_receiver) =
+            mpsc::sync_channel::<LogicDecodeInput>(LOGIC_DECODE_INPUT_CAPACITY);
+        let (output_sender, output_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            while let Ok(input) = input_receiver.recv() {
+                let frame = match input {
+                    LogicDecodeInput::Reconfigure(analyzers) => {
+                        decoder.reconfigure(&analyzers);
+                        None
+                    }
+                    LogicDecodeInput::Frame(frame) => {
+                        if let CaptureBatch::Logic(logic) = &frame.payload {
+                            decoder.ingest_logic_frame(
+                                frame.device_id.as_str(),
+                                frame.sequence,
+                                &logic.samples,
+                                logic.sample_rate_hz,
+                            );
+                        }
+                        Some(frame)
+                    }
+                };
+                if output_sender
+                    .send(LogicDecodeOutput {
+                        frame,
+                        snapshot: decoder.snapshot(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            decoder.finish();
+            decoder
+        });
+        Self {
+            sender: Some(input_sender),
+            receiver: output_receiver,
+            worker: Some(worker),
+        }
+    }
+
+    pub fn reconfigure(&self, analyzers: Vec<ProtocolAnalyzerInstance>) -> Result<(), String> {
+        self.send(LogicDecodeInput::Reconfigure(analyzers))
+    }
+
+    pub fn push(&self, frame: CaptureFrame) -> Result<(), String> {
+        if !matches!(&frame.payload, CaptureBatch::Logic(_)) {
+            return Err("logic decode worker requires a logic frame".to_owned());
+        }
+        self.send(LogicDecodeInput::Frame(frame))
+    }
+
+    pub fn try_recv(&self) -> Result<LogicDecodeOutput, TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    pub fn finish(&mut self) -> Result<(ProtocolCaptureDecoder, Vec<LogicDecodeOutput>), String> {
+        self.sender.take();
+        let decoder = self
+            .worker
+            .take()
+            .ok_or_else(|| "logic decode worker is already stopped".to_owned())?
+            .join()
+            .map_err(|_| "logic decode worker panicked".to_owned())?;
+        Ok((decoder, self.receiver.try_iter().collect()))
+    }
+
+    fn send(&self, input: LogicDecodeInput) -> Result<(), String> {
+        self.sender
+            .as_ref()
+            .ok_or_else(|| "logic decode worker is stopped".to_owned())?
+            .send(input)
+            .map_err(|_| "logic decode worker disconnected".to_owned())
+    }
+}
+
+impl Drop for LogicDecodeWorker {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -2666,6 +2778,8 @@ pub const PROTOCOLS: [ProtocolDefinition; 150] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use wavecraft_core::{DeviceId, LogicBatch};
 
     fn logic_word(clock: bool, data: bool, chip_select: bool) -> u32 {
         u32::from(clock)
@@ -2902,6 +3016,45 @@ mod tests {
         }
         streaming.finish();
         assert_eq!(streaming.outcomes(), std::slice::from_ref(&expected));
+    }
+
+    #[test]
+    fn logic_decode_worker_preserves_frame_order_and_drains_before_finish() {
+        let i2c = analyzer("1:i2c", vec![Some(0), Some(1)]);
+        let samples = i2c_transaction(&[(0xa0, true), (0x5a, true)]);
+        let expected = decode_protocol_samples(&i2c, &samples, 0, 1_000_000);
+        let mut worker =
+            LogicDecodeWorker::start(ProtocolCaptureDecoder::new(std::slice::from_ref(&i2c)));
+        let split = samples.len() / 2;
+        for (sequence, chunk) in [&samples[..split], &samples[split..]]
+            .into_iter()
+            .enumerate()
+        {
+            worker
+                .push(CaptureFrame {
+                    device_id: DeviceId::new("logic:test"),
+                    sequence: sequence as u64,
+                    captured_at: Duration::from_millis(sequence as u64),
+                    payload: CaptureBatch::Logic(LogicBatch {
+                        sample_rate_hz: 1_000_000,
+                        channel_count: 2,
+                        samples: chunk.to_vec(),
+                    }),
+                })
+                .unwrap();
+        }
+
+        let (decoder, outputs) = worker.finish().unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter_map(|output| output.frame.as_ref().map(|frame| frame.sequence))
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(decoder.outcomes(), std::slice::from_ref(&expected));
     }
 
     #[test]
