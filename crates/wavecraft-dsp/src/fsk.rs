@@ -16,6 +16,7 @@ const CARRIER_ACQUISITION_SYMBOLS: u64 = 4;
 const MIN_CARRIER_ACQUISITION_SAMPLES: usize = 32;
 const MAX_CARRIER_ACQUISITION_SAMPLES: usize = 4_096;
 const MIN_TONE_SEPARATION: f64 = 0.25;
+const MAX_TONE_SEPARATION: f64 = 4.0;
 const TONE_TRACKING_GAIN: f64 = 0.002;
 
 pub const BINARY_FSK_DEMODULATOR_ID: &str = "fsk2";
@@ -104,8 +105,8 @@ impl From<TimedSoftBit> for TimedSoftSymbol {
 /// Incremental binary-FSK discriminator with fixed or adaptive symbol timing.
 ///
 /// Adaptive timing follows GNU Radio's GFSK receive ordering: quadrature
-/// discriminator, Mueller-and-Muller clock recovery, then a zero slicer.
-/// Fixed timing retains the optional GFSK receive filter.
+/// discriminator, carrier-offset removal, Mueller-and-Muller clock recovery,
+/// then a zero slicer. Fixed timing retains the optional GFSK receive filter.
 pub struct FskDemodulator {
     config: FskConfig,
     previous_sample: Option<TimedComplexSample>,
@@ -120,6 +121,7 @@ pub struct FskDemodulator {
     symbol_range: Option<Range<u64>>,
     gaussian_filter: Vec<f64>,
     gaussian_history: VecDeque<DiscriminatorSample>,
+    carrier_acquisition: VecDeque<DiscriminatorSample>,
     timing_recovery: Option<MuellerMullerClockRecovery>,
     tone_tracker: ToneTracker,
 }
@@ -134,6 +136,9 @@ struct DiscriminatorSample {
 #[derive(Clone, Debug, Default)]
 struct ToneTracker {
     acquisition: VecDeque<f64>,
+    candidate_lower: Option<f64>,
+    candidate_upper: Option<f64>,
+    stable_candidate_samples: usize,
     lower: Option<f64>,
     upper: Option<f64>,
 }
@@ -141,6 +146,9 @@ struct ToneTracker {
 impl ToneTracker {
     fn reset(&mut self) {
         self.acquisition.clear();
+        self.candidate_lower = None;
+        self.candidate_upper = None;
+        self.stable_candidate_samples = 0;
         self.lower = None;
         self.upper = None;
     }
@@ -163,12 +171,42 @@ impl ToneTracker {
             let lower = sorted[..cluster_samples].iter().sum::<f64>() / cluster_samples as f64;
             let upper = sorted[sorted.len() - cluster_samples..].iter().sum::<f64>()
                 / cluster_samples as f64;
-            if upper - lower < MIN_TONE_SEPARATION {
+            let separation = upper - lower;
+            // Random phase in a quiet channel commonly spans most of the
+            // discriminator's Nyquist range. Do not mistake that wide spread
+            // for the two configured FSK tones.
+            if !(MIN_TONE_SEPARATION..=MAX_TONE_SEPARATION).contains(&separation) {
+                self.candidate_lower = None;
+                self.candidate_upper = None;
+                self.stable_candidate_samples = 0;
+                return None;
+            }
+            let stable_tolerance = separation * 0.1;
+            // A burst can start partway through the retained FFT window. Wait
+            // for the candidate centers to settle as noise leaves the rolling
+            // window before committing to carrier correction.
+            let stable = self.candidate_lower.zip(self.candidate_upper).is_some_and(
+                |(candidate_lower, candidate_upper)| {
+                    (lower - candidate_lower).abs() <= stable_tolerance
+                        && (upper - candidate_upper).abs() <= stable_tolerance
+                },
+            );
+            if stable {
+                self.stable_candidate_samples = self.stable_candidate_samples.saturating_add(1);
+            } else {
+                self.candidate_lower = Some(lower);
+                self.candidate_upper = Some(upper);
+                self.stable_candidate_samples = 1;
+            }
+            if self.stable_candidate_samples < (acquisition_samples / 2).max(4) {
                 return None;
             }
             self.lower = Some(lower);
             self.upper = Some(upper);
             self.acquisition.clear();
+            self.candidate_lower = None;
+            self.candidate_upper = None;
+            self.stable_candidate_samples = 0;
         }
 
         let mut lower = self.lower?;
@@ -186,6 +224,10 @@ impl ToneTracker {
             self.upper = Some(upper);
         }
         self.normalize_acquired(value)
+    }
+
+    fn is_acquired(&self) -> bool {
+        self.lower.is_some() && self.upper.is_some()
     }
 
     fn normalize_acquired(&self, value: f64) -> Option<f64> {
@@ -233,6 +275,7 @@ impl FskDemodulator {
             symbol_range: None,
             gaussian_filter: Vec::new(),
             gaussian_history: VecDeque::new(),
+            carrier_acquisition: VecDeque::new(),
             timing_recovery,
             tone_tracker: ToneTracker::default(),
         })
@@ -288,6 +331,7 @@ impl FskDemodulator {
         self.symbol_range = None;
         self.gaussian_filter.clear();
         self.gaussian_history.clear();
+        self.carrier_acquisition.clear();
         self.tone_tracker.reset();
         if let Some(timing_recovery) = &mut self.timing_recovery {
             timing_recovery.reset();
@@ -369,11 +413,43 @@ impl FskDemodulator {
                         batch.sample_rate_hz,
                         self.config.symbol_rate_hz,
                     );
-                    // Track tone telemetry without gating or renormalizing the
-                    // GNU Radio-compatible discriminator stream.
-                    let _ = self
+                    if !self.tone_tracker.is_acquired() {
+                        self.carrier_acquisition.push_back(discriminator);
+                        while self.carrier_acquisition.len() > acquisition_samples.saturating_mul(2)
+                        {
+                            self.carrier_acquisition.pop_front();
+                        }
+                        let Some(latest) = self.carrier_acquisition.back() else {
+                            continue;
+                        };
+                        if self
+                            .tone_tracker
+                            .normalize(latest.likelihood, acquisition_samples)
+                            .is_none()
+                        {
+                            continue;
+                        }
+                        for mut acquired in self.carrier_acquisition.drain(..) {
+                            acquired.likelihood = self
+                                .tone_tracker
+                                .normalize_acquired(acquired.likelihood)
+                                .ok_or_else(|| {
+                                    DspError::new("FSK tone acquisition lost its tone centres")
+                                })?;
+                            if self.config.polarity == FskPolarity::Inverted {
+                                acquired.likelihood = -acquired.likelihood;
+                            }
+                            timing_samples.push(TimedScalarSample {
+                                value: acquired.likelihood as f32,
+                                source_range: acquired.source_range,
+                            });
+                        }
+                        continue;
+                    }
+                    discriminator.likelihood = self
                         .tone_tracker
-                        .normalize(discriminator.likelihood, acquisition_samples);
+                        .normalize(discriminator.likelihood, acquisition_samples)
+                        .ok_or_else(|| DspError::new("FSK tone tracking lost its tone centres"))?;
                 }
                 if self.config.polarity == FskPolarity::Inverted {
                     discriminator.likelihood = -discriminator.likelihood;
@@ -730,13 +806,21 @@ mod tests {
     use super::*;
 
     fn fsk_samples(bits: &[bool], first_sample_index: u64) -> Vec<TimedComplexSample> {
+        fsk_samples_with_carrier_offset(bits, first_sample_index, 0.0)
+    }
+
+    fn fsk_samples_with_carrier_offset(
+        bits: &[bool],
+        first_sample_index: u64,
+        carrier_offset_hz: f64,
+    ) -> Vec<TimedComplexSample> {
         const SAMPLE_RATE_HZ: f64 = 8_000.0;
         const DEVIATION_HZ: f64 = 1_000.0;
         const SAMPLES_PER_SYMBOL: usize = 8;
         let mut phase: f64 = 0.0;
         let mut samples = Vec::new();
         for bit in bits {
-            let frequency = if *bit { DEVIATION_HZ } else { -DEVIATION_HZ };
+            let frequency = carrier_offset_hz + if *bit { DEVIATION_HZ } else { -DEVIATION_HZ };
             for _ in 0..SAMPLES_PER_SYMBOL {
                 let index = first_sample_index + samples.len() as u64;
                 samples.push(TimedComplexSample {
@@ -793,6 +877,15 @@ mod tests {
     }
 
     fn gfsk_samples(bits: &[bool], first_sample_index: u64, bt: f64) -> Vec<TimedComplexSample> {
+        gfsk_samples_with_carrier_offset(bits, first_sample_index, bt, 0.0)
+    }
+
+    fn gfsk_samples_with_carrier_offset(
+        bits: &[bool],
+        first_sample_index: u64,
+        bt: f64,
+        carrier_offset_hz: f64,
+    ) -> Vec<TimedComplexSample> {
         const SAMPLE_RATE_HZ: u64 = 8_000;
         const SYMBOL_RATE_HZ: u64 = 1_000;
         const DEVIATION_HZ: f64 = 1_000.0;
@@ -834,10 +927,30 @@ mod tests {
                 source_range: index..index + 1,
             });
             if let Some(level) = shaped.get(sample_index) {
-                phase += TAU * DEVIATION_HZ * level / SAMPLE_RATE_HZ as f64;
+                phase += TAU * (carrier_offset_hz + DEVIATION_HZ * level) / SAMPLE_RATE_HZ as f64;
             }
         }
         samples
+    }
+
+    fn noise_samples(sample_count: usize, first_sample_index: u64) -> Vec<TimedComplexSample> {
+        const SAMPLE_RATE_HZ: f64 = 8_000.0;
+        const FREQUENCIES_HZ: [f64; 8] = [
+            -3_900.0, -3_000.0, -2_500.0, -3_600.0, 1_000.0, -2_800.0, -3_400.0, 500.0,
+        ];
+        let mut phase: f64 = 0.0;
+        (0..sample_count)
+            .map(|sample_index| {
+                let index = first_sample_index + sample_index as u64;
+                let sample = TimedComplexSample {
+                    i: phase.cos() as f32,
+                    q: phase.sin() as f32,
+                    source_range: index..index + 1,
+                };
+                phase += TAU * FREQUENCIES_HZ[sample_index % FREQUENCIES_HZ.len()] / SAMPLE_RATE_HZ;
+                sample
+            })
+            .collect()
     }
 
     fn batch(
@@ -1149,6 +1262,108 @@ mod tests {
                 .windows(preamble.len())
                 .any(|window| window == preamble),
             "ten-byte preamble was not retained in {decisions:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_gfsk_removes_carrier_offset_before_timing_and_slicing() {
+        let preamble = (0..80).map(|index| index % 2 == 0).collect::<Vec<_>>();
+        let payload = [
+            true, true, false, false, true, false, false, false, true, false, true, true, false,
+            true, false, false,
+        ];
+        let expected = preamble.iter().copied().chain(payload).collect::<Vec<_>>();
+        // The residual offset is larger than the configured deviation, so a
+        // zero slicer without carrier/DC correction sees both tones as one.
+        let samples = gfsk_samples_with_carrier_offset(&expected, 0, 0.5, 1_200.0);
+        let mut demodulator = FskDemodulator::new(FskConfig {
+            symbol_rate_hz: 1_000,
+            deviation_hz: 1_000,
+            modulation: FskModulation::Gfsk { bt: 0.5 },
+            polarity: FskPolarity::Normal,
+            timing: FskTiming::Adaptive {
+                loop_bandwidth: 0.2,
+                max_clock_error_ppm: 10_000,
+            },
+        })
+        .unwrap();
+
+        let decisions = demodulator
+            .push(&batch(samples, true, 0))
+            .unwrap()
+            .into_iter()
+            .map(|bit| bit.likelihood.is_sign_positive())
+            .collect::<Vec<_>>();
+
+        assert!(
+            decisions
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "carrier-corrected packet was not retained in {decisions:?}"
+        );
+        assert!((demodulator.estimated_frequency_offset_hz().unwrap() - 1_200.0).abs() < 100.0);
+    }
+
+    #[test]
+    fn adaptive_fsk_removes_carrier_offset_before_timing_and_slicing() {
+        let expected = (0..80).map(|index| index % 2 == 0).collect::<Vec<_>>();
+        let samples = fsk_samples_with_carrier_offset(&expected, 0, 1_200.0);
+        let mut demodulator = FskDemodulator::new(FskConfig {
+            symbol_rate_hz: 1_000,
+            deviation_hz: 1_000,
+            modulation: FskModulation::Fsk,
+            polarity: FskPolarity::Normal,
+            timing: FskTiming::Adaptive {
+                loop_bandwidth: 0.2,
+                max_clock_error_ppm: 10_000,
+            },
+        })
+        .unwrap();
+
+        let decisions = demodulator
+            .push(&batch(samples, true, 0))
+            .unwrap()
+            .into_iter()
+            .map(|bit| bit.likelihood.is_sign_positive())
+            .collect::<Vec<_>>();
+
+        assert!(
+            decisions
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "carrier-corrected preamble was not retained in {decisions:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_gfsk_does_not_acquire_noise_before_the_preamble() {
+        let expected = (0..80).map(|index| index % 2 == 0).collect::<Vec<_>>();
+        let mut samples = noise_samples(64, 0);
+        samples.extend(gfsk_samples(&expected, samples.len() as u64, 0.5));
+        let mut demodulator = FskDemodulator::new(FskConfig {
+            symbol_rate_hz: 1_000,
+            deviation_hz: 1_000,
+            modulation: FskModulation::Gfsk { bt: 0.5 },
+            polarity: FskPolarity::Normal,
+            timing: FskTiming::Adaptive {
+                loop_bandwidth: 0.2,
+                max_clock_error_ppm: 10_000,
+            },
+        })
+        .unwrap();
+
+        let decisions = demodulator
+            .push(&batch(samples, true, 0))
+            .unwrap()
+            .into_iter()
+            .map(|bit| bit.likelihood.is_sign_positive())
+            .collect::<Vec<_>>();
+
+        assert!(
+            decisions
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "preamble after noise was not retained in {decisions:?}"
         );
     }
 }
