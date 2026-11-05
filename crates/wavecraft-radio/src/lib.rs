@@ -1,13 +1,14 @@
 //! Device-independent radio demodulation and raw-frame acquisition.
 
+use std::sync::Arc;
 use wavecraft_core::IqBatch;
 use wavecraft_decode::{
     RadioPacketPipeline, RadioPacketPipelineConfig, RadioPacketPipelineOutput, RawRadioConfig,
     RawRadioDecoder, RawRadioOutput, SampleRange, TimedBit, TimedBitBatch,
 };
 use wavecraft_dsp::{
-    DemodulatedBatch, DemodulatorRegistry, SignalAnalyzer, SignalAnalyzerProfile, SpectrumFrame,
-    SpectrumProcessor, TimedSoftSymbolBatch,
+    DemodulatedBatch, DemodulatorRegistry, PreparedIqBatch, SignalAnalyzer, SignalAnalyzerProfile,
+    SpectrumFrame, SpectrumProcessor, TimedSoftSymbolBatch, WidebandIqPreprocessor,
 };
 
 const SQUELCH_RELEASE_FRAMES: usize = 3;
@@ -29,6 +30,8 @@ pub struct RadioAnalyzerTelemetry {
 }
 
 pub struct RadioAnalyzerOutput {
+    pub channel_frequency_offset_hz: i64,
+    pub channel_name: Arc<str>,
     pub demodulated: Option<DemodulatedBatch>,
     pub raw: RawRadioOutput,
     pub packets: RadioPacketPipelineOutput,
@@ -39,6 +42,30 @@ pub struct RadioAnalyzerOutput {
 pub struct RadioDspOutput {
     pub spectrum: Vec<SpectrumFrame>,
     pub analyses: Vec<Result<RadioAnalyzerOutput, String>>,
+}
+
+/// Independent channel analyzers sharing the wideband IQ conversion and DC
+/// tracker that precede per-channel frequency translation and filtering.
+pub struct RadioAnalyzerBank {
+    analyzers: Vec<RadioAnalyzerRuntime>,
+    preprocessor: WidebandIqPreprocessor,
+}
+
+impl RadioAnalyzerBank {
+    pub fn new(analyzers: Vec<RadioAnalyzerRuntime>) -> Self {
+        Self {
+            analyzers,
+            preprocessor: WidebandIqPreprocessor::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.analyzers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.analyzers.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,6 +129,7 @@ pub struct RadioAnalyzerRuntime {
     signal: SignalAnalyzer,
     decoder: RadioDataDecoder,
     channel_frequency_offset_hz: i64,
+    channel_name: Arc<str>,
     channel_bandwidth_hz: u64,
     burst_active: bool,
     quiet_spectrum_frames: usize,
@@ -115,6 +143,15 @@ impl RadioAnalyzerRuntime {
         profile: SignalAnalyzerProfile,
         decoder_config: RadioDataDecoderConfig,
     ) -> Result<Self, String> {
+        let channel_name = format!("Channel {:+} Hz", profile.channel.frequency_offset_hz);
+        Self::new_named(profile, decoder_config, channel_name)
+    }
+
+    pub fn new_named(
+        profile: SignalAnalyzerProfile,
+        decoder_config: RadioDataDecoderConfig,
+        channel_name: impl Into<Arc<str>>,
+    ) -> Result<Self, String> {
         let channel_frequency_offset_hz = profile.channel.frequency_offset_hz;
         let channel_bandwidth_hz = profile.channel.bandwidth_hz;
         let registry = DemodulatorRegistry::with_builtins()
@@ -126,6 +163,7 @@ impl RadioAnalyzerRuntime {
             signal,
             decoder,
             channel_frequency_offset_hz,
+            channel_name: channel_name.into(),
             channel_bandwidth_hz,
             burst_active: false,
             quiet_spectrum_frames: 0,
@@ -141,6 +179,26 @@ impl RadioAnalyzerRuntime {
         spectrum: &[SpectrumFrame],
         squelch_threshold_dbfs: f32,
     ) -> Result<RadioAnalyzerOutput, String> {
+        if let Some(output) = self.begin_push(spectrum, squelch_threshold_dbfs) {
+            return Ok(output);
+        }
+        let demodulated = self.signal.push(input).map_err(|error| error.to_string())?;
+        self.finish_push(demodulated)
+    }
+
+    fn push_prepared(&mut self, input: &PreparedIqBatch) -> Result<RadioAnalyzerOutput, String> {
+        let demodulated = self
+            .signal
+            .push_prepared(input)
+            .map_err(|error| error.to_string())?;
+        self.finish_push(demodulated)
+    }
+
+    fn begin_push(
+        &mut self,
+        spectrum: &[SpectrumFrame],
+        squelch_threshold_dbfs: f32,
+    ) -> Option<RadioAnalyzerOutput> {
         let powers = spectrum
             .iter()
             .filter_map(|frame| {
@@ -186,7 +244,9 @@ impl RadioAnalyzerRuntime {
             self.signal.reset();
             self.burst_active = false;
             self.quiet_spectrum_frames = 0;
-            return Ok(RadioAnalyzerOutput {
+            return Some(RadioAnalyzerOutput {
+                channel_frequency_offset_hz: self.channel_frequency_offset_hz,
+                channel_name: Arc::clone(&self.channel_name),
                 demodulated: None,
                 raw,
                 packets,
@@ -195,7 +255,9 @@ impl RadioAnalyzerRuntime {
             });
         }
         if !self.burst_active {
-            return Ok(RadioAnalyzerOutput {
+            return Some(RadioAnalyzerOutput {
+                channel_frequency_offset_hz: self.channel_frequency_offset_hz,
+                channel_name: Arc::clone(&self.channel_name),
                 demodulated: None,
                 raw: RawRadioOutput::default(),
                 packets: RadioPacketPipelineOutput::default(),
@@ -203,13 +265,21 @@ impl RadioAnalyzerRuntime {
                 telemetry: self.telemetry(),
             });
         }
-        let demodulated = self.signal.push(input).map_err(|error| error.to_string())?;
+        None
+    }
+
+    fn finish_push(
+        &mut self,
+        demodulated: DemodulatedBatch,
+    ) -> Result<RadioAnalyzerOutput, String> {
         let DemodulatedBatch::SoftSymbols(symbols) = &demodulated else {
             return Err("raw radio bytes require digital soft-symbol output".to_owned());
         };
         let bits = soft_symbols_to_bits(symbols)?;
         let (raw, packets) = self.decoder.push(&bits)?;
         Ok(RadioAnalyzerOutput {
+            channel_frequency_offset_hz: self.channel_frequency_offset_hz,
+            channel_name: Arc::clone(&self.channel_name),
             demodulated: Some(demodulated),
             raw,
             packets,
@@ -237,7 +307,7 @@ impl RadioAnalyzerRuntime {
 /// Splits a capture batch at spectrum-window boundaries before burst detection.
 pub fn process_radio_iq(
     spectrum: &mut SpectrumProcessor,
-    analyzer: &mut Option<RadioAnalyzerRuntime>,
+    analyzer_bank: &mut RadioAnalyzerBank,
     input: &IqBatch,
     squelch_threshold_dbfs: f32,
 ) -> RadioDspOutput {
@@ -258,13 +328,39 @@ pub fn process_radio_iq(
             samples: samples.to_vec(),
         };
         let frames = spectrum.push(&chunk);
-        if let Some(runtime) = analyzer.as_mut() {
-            let analysis = runtime.push(&chunk, &frames, squelch_threshold_dbfs);
+        let preliminary = analyzer_bank
+            .analyzers
+            .iter_mut()
+            .map(|analyzer| analyzer.begin_push(&frames, squelch_threshold_dbfs))
+            .collect::<Vec<_>>();
+        let prepared = preliminary.iter().any(Option::is_none).then(|| {
+            analyzer_bank
+                .preprocessor
+                .push(&chunk)
+                .map_err(|error| error.to_string())
+        });
+        let mut analyzer_index = 0;
+        for preliminary in preliminary {
+            let analysis = match preliminary {
+                Some(output) => Ok(output),
+                None => match prepared.as_ref() {
+                    Some(Ok(prepared)) => {
+                        analyzer_bank.analyzers[analyzer_index].push_prepared(prepared)
+                    }
+                    Some(Err(error)) => Err(error.clone()),
+                    None => unreachable!("demodulation work requires prepared IQ"),
+                },
+            };
             let failed = analysis.is_err();
             output.analyses.push(analysis);
             if failed {
-                *analyzer = None;
+                analyzer_bank.analyzers.remove(analyzer_index);
+            } else {
+                analyzer_index += 1;
             }
+        }
+        if let Some(Ok(prepared)) = prepared {
+            analyzer_bank.preprocessor.recycle(prepared);
         }
         output.spectrum.extend(frames);
     }
@@ -284,16 +380,20 @@ fn channel_power_dbfs(
     let channel_center_hz = frame.center_frequency_hz as f64 + frequency_offset_hz as f64;
     let channel_half_width_hz = bandwidth_hz as f64 / 2.0;
     let bin_half_width_hz = frame.bin_width_hz / 2.0;
-    frame
-        .power_dbfs
+    let lower_hz = channel_center_hz - channel_half_width_hz - bin_half_width_hz;
+    let upper_hz = channel_center_hz + channel_half_width_hz + bin_half_width_hz;
+    let first_bin = ((lower_hz - first_bin_hz) / frame.bin_width_hz).ceil() as isize;
+    let last_bin = ((upper_hz - first_bin_hz) / frame.bin_width_hz).floor() as isize;
+    let start = first_bin.clamp(0, frame.power_dbfs.len() as isize) as usize;
+    let end = last_bin
+        .saturating_add(1)
+        .clamp(0, frame.power_dbfs.len() as isize) as usize;
+    if start >= end {
+        return None;
+    }
+    frame.power_dbfs[start..end]
         .iter()
         .copied()
-        .enumerate()
-        .filter(|(index, _)| {
-            let bin_hz = first_bin_hz + *index as f64 * frame.bin_width_hz;
-            (bin_hz - channel_center_hz).abs() <= channel_half_width_hz + bin_half_width_hz
-        })
-        .map(|(_, power)| power)
         .max_by(f32::total_cmp)
 }
 
@@ -460,6 +560,7 @@ mod tests {
         };
 
         assert_eq!(channel_power_dbfs(&frame, 1_000, 500), Some(-42.0));
+        assert_eq!(channel_power_dbfs(&frame, 20_000, 500), None);
     }
 
     #[test]
@@ -481,17 +582,39 @@ mod tests {
             samples,
         };
         let mut spectrum = SpectrumProcessor::new(fft_length, SpectrumWindow::Hann).unwrap();
-        let mut analyzer = Some(
-            RadioAnalyzerRuntime::new(profile(), RadioDataDecoderConfig::Raw(raw_config()))
+        let mut second_profile = profile();
+        second_profile.channel.frequency_offset_hz = -1_000;
+        let analyzers = vec![
+            RadioAnalyzerRuntime::new_named(
+                profile(),
+                RadioDataDecoderConfig::Raw(raw_config()),
+                "Primary",
+            )
+            .unwrap(),
+            RadioAnalyzerRuntime::new(second_profile, RadioDataDecoderConfig::Raw(raw_config()))
                 .unwrap(),
-        );
+        ];
+        let mut analyzers = RadioAnalyzerBank::new(analyzers);
 
-        let output = process_radio_iq(&mut spectrum, &mut analyzer, &input, -40.0);
+        let output = process_radio_iq(&mut spectrum, &mut analyzers, &input, -40.0);
 
         assert_eq!(output.spectrum.len(), 2);
-        assert_eq!(output.analyses.len(), 2);
+        assert_eq!(output.analyses.len(), 4);
         assert!(output.analyses[0].as_ref().unwrap().demodulated.is_none());
-        assert!(output.analyses[1].as_ref().unwrap().demodulated.is_some());
+        assert!(output.analyses[1].as_ref().unwrap().demodulated.is_none());
+        assert!(output.analyses[2].as_ref().unwrap().demodulated.is_some());
+        assert_eq!(
+            &*output.analyses[2].as_ref().unwrap().channel_name,
+            "Primary"
+        );
+        assert_eq!(
+            output
+                .analyses
+                .iter()
+                .map(|analysis| analysis.as_ref().unwrap().channel_frequency_offset_hz)
+                .collect::<Vec<_>>(),
+            [1_000, -1_000, 1_000, -1_000]
+        );
     }
 
     #[test]

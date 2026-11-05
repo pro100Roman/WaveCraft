@@ -30,7 +30,8 @@ use protocol_analyzer::{
     ProtocolDecodeSnapshot, ProtocolDecodedEvent, ProtocolDecodedKind, PROTOCOLS,
 };
 use radio_analyzer::{
-    process_radio_iq, RadioAnalyzerRuntime, RadioDataDecoderConfig, RadioDspOutput, RadioDspWorker,
+    process_radio_iq, RadioAnalyzerBank, RadioAnalyzerRuntime, RadioDataDecoderConfig,
+    RadioDspOutput, RadioDspWorker,
 };
 use radio_trigger::{RadioSingleTrigger, RadioSingleTriggerConfig};
 use recording::{
@@ -48,6 +49,7 @@ use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use theme::{
@@ -101,6 +103,7 @@ const BUILD_VERSION_LABEL: &str = concat!("Version: ", env!("WAVECRAFT_BUILD_VER
 const LOGIC_CHANNEL_COUNT: usize = 16;
 const RADIO_SPECTRUM_FFT_LENGTH: usize = 2_048;
 const RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS: u64 = 1_000_000;
+const MAX_RADIO_ANALYZER_CHANNELS: usize = 100;
 const MAX_CAPTURE_EVENTS_PER_POLL: usize = 8;
 // Bound logic display storage by activity-preserving buckets. The bucket stride
 // expands to cover the configured finite or Loop duration without limiting the
@@ -3020,11 +3023,11 @@ fn extend_bounded_to<T>(
 fn ingest_radio_iq(
     waveforms: &mut WaveformStore,
     spectrum: &mut SpectrumProcessor,
-    analyzer: &mut Option<RadioAnalyzerRuntime>,
+    analyzer_bank: &mut RadioAnalyzerBank,
     iq: &wavecraft_core::IqBatch,
     squelch_threshold_dbfs: f32,
 ) {
-    let output = process_radio_iq(spectrum, analyzer, iq, squelch_threshold_dbfs);
+    let output = process_radio_iq(spectrum, analyzer_bank, iq, squelch_threshold_dbfs);
     ingest_radio_dsp_output(waveforms, output);
 }
 
@@ -3034,14 +3037,28 @@ fn ingest_radio_dsp_output(waveforms: &mut WaveformStore, output: RadioDspOutput
     }
     for analysis in output.analyses {
         let analysis = analysis.and_then(|output| {
+            let channel_offset_hz = output.channel_frequency_offset_hz;
+            let channel_name = output.channel_name;
             waveforms.radio_analysis.set_telemetry(output.telemetry);
             if let Some(demodulated) = output.demodulated {
-                waveforms.radio_analysis.ingest(demodulated)?;
+                waveforms
+                    .radio_analysis
+                    .ingest(demodulated, channel_offset_hz)?;
             }
-            waveforms.radio_analysis.ingest_raw(output.raw);
-            waveforms.radio_analysis.ingest_packets(output.packets);
+            waveforms.radio_analysis.ingest_raw(
+                output.raw,
+                channel_offset_hz,
+                Arc::clone(&channel_name),
+            );
+            waveforms.radio_analysis.ingest_packets(
+                output.packets,
+                channel_offset_hz,
+                channel_name,
+            );
             if output.burst_ended {
-                waveforms.radio_analysis.finish_raw_capture();
+                waveforms
+                    .radio_analysis
+                    .finish_channel_capture(channel_offset_hz);
             }
             Ok(())
         });
@@ -3201,7 +3218,8 @@ struct RadioCaptureRequest {
     settings: RadioCaptureSettings,
     provider_settings: RadioProviderSettings,
     iq_correction_enabled: bool,
-    analyzer_profile: Option<SignalAnalyzerProfile>,
+    analyzer_profiles: Vec<SignalAnalyzerProfile>,
+    analyzer_channel_names: Vec<String>,
     decoder_config: RadioDataDecoderConfig,
 }
 
@@ -3315,10 +3333,25 @@ enum RadioDataMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RadioAnalyzerChannelSettings {
+    name: String,
+    frequency_offset_hz: i64,
+}
+
+impl RadioAnalyzerChannelSettings {
+    fn numbered(index: usize, frequency_offset_hz: i64) -> Self {
+        Self {
+            name: format!("Channel {}", index + 1),
+            frequency_offset_hz,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RadioAnalyzerSettings {
     enabled: bool,
     demodulation: RadioDemodulation,
-    channel_offset_hz: i64,
+    channels: Vec<RadioAnalyzerChannelSettings>,
     channel_bandwidth_hz: u64,
     output_sample_rate_hz: u64,
     filter_tap_count: usize,
@@ -3356,7 +3389,7 @@ impl Default for RadioAnalyzerSettings {
             demodulation: RadioDemodulation::BinaryGfsk,
             // Capture both observed 868.1/868.5 MHz channels around 868.3 MHz;
             // start with the 868.1 MHz channel selected for demodulation.
-            channel_offset_hz: -200_000,
+            channels: vec![RadioAnalyzerChannelSettings::numbered(0, -200_000)],
             channel_bandwidth_hz: 200_000,
             output_sample_rate_hz: 512_000,
             filter_tap_count: 257,
@@ -3390,6 +3423,15 @@ impl Default for RadioAnalyzerSettings {
 }
 
 impl RadioAnalyzerSettings {
+    fn channel_name(&self, index: usize) -> String {
+        self.channels
+            .get(index)
+            .map(|channel| channel.name.trim())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Channel {}", index + 1))
+    }
+
     fn raw_config(&self) -> RawRadioConfig {
         RawRadioConfig {
             preamble_byte: self.preamble_byte,
@@ -3461,9 +3503,22 @@ impl RadioAnalyzerSettings {
         }
     }
 
-    fn signal_profile(&self) -> Result<Option<SignalAnalyzerProfile>, String> {
+    fn signal_profiles(&self) -> Result<Vec<SignalAnalyzerProfile>, String> {
         if !self.enabled {
-            return Ok(None);
+            return Ok(Vec::new());
+        }
+        if self.channels.is_empty() || self.channels.len() > MAX_RADIO_ANALYZER_CHANNELS {
+            return Err(format!(
+                "signal analyzer requires between 1 and {MAX_RADIO_ANALYZER_CHANNELS} channels"
+            ));
+        }
+        let mut unique_offsets = HashSet::with_capacity(self.channels.len());
+        if self
+            .channels
+            .iter()
+            .any(|channel| !unique_offsets.insert(channel.frequency_offset_hz))
+        {
+            return Err("signal analyzer channel offsets must be unique".to_owned());
         }
         let timing = if self.adaptive_timing {
             FskTiming::Adaptive {
@@ -3493,17 +3548,22 @@ impl RadioAnalyzerSettings {
                 timing,
             }),
         };
-        let profile = SignalAnalyzerProfile {
-            channel: ChannelizerConfig {
-                frequency_offset_hz: self.channel_offset_hz,
-                bandwidth_hz: self.channel_bandwidth_hz,
-                output_sample_rate_hz: self.output_sample_rate_hz,
-                filter_tap_count: self.filter_tap_count,
-            },
-            demodulation,
-        };
-        profile.validate().map_err(|error| error.to_string())?;
-        Ok(Some(profile))
+        self.channels
+            .iter()
+            .map(|channel| {
+                let profile = SignalAnalyzerProfile {
+                    channel: ChannelizerConfig {
+                        frequency_offset_hz: channel.frequency_offset_hz,
+                        bandwidth_hz: self.channel_bandwidth_hz,
+                        output_sample_rate_hz: self.output_sample_rate_hz,
+                        filter_tap_count: self.filter_tap_count,
+                    },
+                    demodulation: demodulation.clone(),
+                };
+                profile.validate().map_err(|error| error.to_string())?;
+                Ok(profile)
+            })
+            .collect()
     }
 }
 
@@ -4058,14 +4118,31 @@ impl WaveCraftApp {
                 ));
             }
         };
-        let analyzer_profile = self.radio_settings.analyzer.signal_profile()?;
+        let analyzer_profiles = self.radio_settings.analyzer.signal_profiles()?;
+        let analyzer_channel_names = (0..analyzer_profiles.len())
+            .map(|index| self.radio_settings.analyzer.channel_name(index))
+            .collect();
+        let half_sample_rate_hz = settings.sample_rate_hz / 2;
+        if !analyzer_profiles.is_empty()
+            && self
+                .radio_settings
+                .analyzer
+                .channels
+                .iter()
+                .any(|channel| channel.frequency_offset_hz.unsigned_abs() > half_sample_rate_hz)
+        {
+            return Err(
+                "signal analyzer channel offset lies outside the captured RF span".to_owned(),
+            );
+        }
         let decoder_config = self.radio_settings.analyzer.decoder_config()?;
         Ok(RadioCaptureRequest {
             device,
             settings,
             provider_settings,
             iq_correction_enabled: self.radio_settings.iq_correction_enabled,
-            analyzer_profile,
+            analyzer_profiles,
+            analyzer_channel_names,
             decoder_config,
         })
     }
@@ -8728,6 +8805,18 @@ fn paint_radio_capture_settings(
                         enabled,
                     );
                 });
+            ui.separator();
+            egui::CollapsingHeader::new(RichText::new("Analyzer channels").strong())
+                .id_salt("radio_analyzer_channels_section")
+                .default_open(true)
+                .show(ui, |ui| {
+                    paint_radio_analyzer_channels(
+                        ui,
+                        &mut settings.analyzer,
+                        settings.capture.sample_rate_hz,
+                        enabled,
+                    );
+                });
             show_save_button
                 && paint_capture_settings_save_button(
                     ui,
@@ -8846,23 +8935,6 @@ fn paint_radio_analyzer_configuration(
                             "GFSK",
                         );
                     });
-            });
-            ui.end_row();
-
-            let half_span_mhz = capture_sample_rate_hz as f64 / 2_000_000.0;
-            paint_radio_parameter_label(
-                ui,
-                "Channel offset",
-                Some("Offset from the capture center frequency to the signal center"),
-            );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                paint_scaled_i64_value(
-                    ui,
-                    &mut settings.channel_offset_hz,
-                    1_000_000.0,
-                    -half_span_mhz..=half_span_mhz,
-                    "MHz",
-                );
             });
             ui.end_row();
 
@@ -9424,7 +9496,7 @@ fn paint_radio_analyzer_configuration(
         });
 
     if settings.enabled {
-        if let Err(error) = settings.signal_profile() {
+        if let Err(error) = settings.signal_profiles() {
             ui.add(
                 egui::Label::new(RichText::new(error).small().color(Color32::LIGHT_RED))
                     .selectable(true),
@@ -9436,6 +9508,120 @@ fn paint_radio_analyzer_configuration(
             );
         }
     }
+}
+
+fn paint_radio_analyzer_channels(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    capture_sample_rate_hz: u64,
+    enabled: bool,
+) {
+    let controls_enabled = enabled && settings.enabled;
+    let half_span_hz = i64::try_from(capture_sample_rate_hz / 2).unwrap_or(i64::MAX);
+    let half_span_mhz = capture_sample_rate_hz as f64 / 2_000_000.0;
+    let can_remove = settings.channels.len() > 1;
+    let mut remove_index = None;
+    egui::Grid::new("radio_analyzer_channels")
+        .num_columns(3)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            for (index, channel) in settings.channels.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label(format!("{}.", index + 1));
+                    ui.add_enabled_ui(controls_enabled, |ui| {
+                        ui.add_sized(
+                            [110.0 * 2.0 / 3.0, ui.spacing().interact_size.y],
+                            egui::TextEdit::singleline(&mut channel.name)
+                                .hint_text(format!("Channel {}", index + 1)),
+                        );
+                    });
+                });
+                ui.add_enabled_ui(controls_enabled, |ui| {
+                    paint_scaled_i64_value(
+                        ui,
+                        &mut channel.frequency_offset_hz,
+                        1_000_000.0,
+                        -half_span_mhz..=half_span_mhz,
+                        "MHz",
+                    );
+                });
+                if ui
+                    .add_enabled(
+                        controls_enabled && can_remove,
+                        egui::Button::new("×").small(),
+                    )
+                    .on_hover_text("Remove channel")
+                    .clicked()
+                {
+                    remove_index = Some(index);
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(index) = remove_index {
+        settings.channels.remove(index);
+    }
+    if ui
+        .add_enabled(
+            controls_enabled && settings.channels.len() < MAX_RADIO_ANALYZER_CHANNELS,
+            egui::Button::new(format!(
+                "+ Add channel ({}/{MAX_RADIO_ANALYZER_CHANNELS})",
+                settings.channels.len()
+            )),
+        )
+        .clicked()
+    {
+        let step_hz = i64::try_from(settings.channel_bandwidth_hz.max(1)).unwrap_or(i64::MAX);
+        let preferred = (0..MAX_RADIO_ANALYZER_CHANNELS)
+            .flat_map(|index| {
+                let distance = i64::try_from(index)
+                    .unwrap_or(i64::MAX)
+                    .saturating_mul(step_hz);
+                [distance, distance.saturating_neg()]
+            })
+            .find(|candidate| {
+                candidate.abs() <= half_span_hz
+                    && !settings
+                        .channels
+                        .iter()
+                        .any(|channel| channel.frequency_offset_hz == *candidate)
+            });
+        let candidate = preferred
+            .or_else(|| {
+                (0..MAX_RADIO_ANALYZER_CHANNELS)
+                    .flat_map(|index| {
+                        let distance = i64::try_from(index).unwrap_or(i64::MAX);
+                        [distance, distance.saturating_neg()]
+                    })
+                    .find(|candidate| {
+                        candidate.abs() <= half_span_hz
+                            && !settings
+                                .channels
+                                .iter()
+                                .any(|channel| channel.frequency_offset_hz == *candidate)
+                    })
+            })
+            .unwrap_or(0);
+        let name_index = (0..MAX_RADIO_ANALYZER_CHANNELS)
+            .find(|index| {
+                let name = format!("Channel {}", index + 1);
+                !settings.channels.iter().any(|channel| channel.name == name)
+            })
+            .unwrap_or(settings.channels.len());
+        settings
+            .channels
+            .push(RadioAnalyzerChannelSettings::numbered(
+                name_index, candidate,
+            ));
+    }
+    ui.label(
+        RichText::new(
+            "All modulation, framing, and whitening settings above are shared by every channel.",
+        )
+        .small()
+        .color(TEXT_MUTED),
+    );
 }
 
 fn paint_radio_receive_configuration(
@@ -12128,7 +12314,12 @@ fn saved_radio_settings_metadata(settings: &RadioSettings) -> BTreeMap<String, S
         ),
         (
             "radio.analyzer.channel_offset_hz",
-            settings.analyzer.channel_offset_hz.to_string(),
+            settings
+                .analyzer
+                .channels
+                .first()
+                .map_or(0, |channel| channel.frequency_offset_hz)
+                .to_string(),
         ),
         (
             "radio.analyzer.channel_bandwidth_hz",
@@ -12259,6 +12450,20 @@ fn saved_radio_settings_metadata(settings: &RadioSettings) -> BTreeMap<String, S
     ] {
         metadata.insert(key.to_owned(), value);
     }
+    metadata.insert(
+        "radio.analyzer.channel_count".to_owned(),
+        settings.analyzer.channels.len().to_string(),
+    );
+    for (index, channel) in settings.analyzer.channels.iter().enumerate() {
+        metadata.insert(
+            format!("radio.analyzer.channel.{index}.offset_hz"),
+            channel.frequency_offset_hz.to_string(),
+        );
+        metadata.insert(
+            format!("radio.analyzer.channel.{index}.name"),
+            channel.name.clone(),
+        );
+    }
     for (id, gain_db) in &settings.gains_db {
         metadata.insert(format!("radio.gain.{id}_db"), gain_db.to_string());
     }
@@ -12380,7 +12585,12 @@ fn start_gui_recording(
     for (key, value) in [
         (
             "channel_offset_hz",
-            radio_settings.analyzer.channel_offset_hz.to_string(),
+            radio_settings
+                .analyzer
+                .channels
+                .first()
+                .map_or(0, |channel| channel.frequency_offset_hz)
+                .to_string(),
         ),
         (
             "channel_bandwidth_hz",
@@ -12513,6 +12723,20 @@ fn start_gui_recording(
         ),
     ] {
         metadata.insert(format!("radio.analyzer.{key}"), value);
+    }
+    metadata.insert(
+        "radio.analyzer.channel_count".to_owned(),
+        radio_settings.analyzer.channels.len().to_string(),
+    );
+    for (index, channel) in radio_settings.analyzer.channels.iter().enumerate() {
+        metadata.insert(
+            format!("radio.analyzer.channel.{index}.offset_hz"),
+            channel.frequency_offset_hz.to_string(),
+        );
+        metadata.insert(
+            format!("radio.analyzer.channel.{index}.name"),
+            channel.name.clone(),
+        );
     }
     for (id, gain_db) in &radio_settings.gains_db {
         metadata.insert(format!("radio.gain.{id}_db"), gain_db.to_string());
@@ -13083,8 +13307,32 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
             _ => RadioDemodulation::BinaryFsk,
         };
     }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.channel_offset_hz") {
-        settings.analyzer.channel_offset_hz = value;
+    if let Some(channel_count) =
+        recording_metadata_value::<usize>(metadata, "radio.analyzer.channel_count")
+    {
+        let channels = (0..channel_count.min(MAX_RADIO_ANALYZER_CHANNELS))
+            .filter_map(|index| {
+                let frequency_offset_hz = recording_metadata_value(
+                    metadata,
+                    &format!("radio.analyzer.channel.{index}.offset_hz"),
+                )?;
+                let name = metadata
+                    .get(&format!("radio.analyzer.channel.{index}.name"))
+                    .cloned()
+                    .unwrap_or_else(|| format!("Channel {}", index + 1));
+                Some(RadioAnalyzerChannelSettings {
+                    name,
+                    frequency_offset_hz,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !channels.is_empty() {
+            settings.analyzer.channels = channels;
+        }
+    } else if let Some(value) =
+        recording_metadata_value(metadata, "radio.analyzer.channel_offset_hz")
+    {
+        settings.analyzer.channels = vec![RadioAnalyzerChannelSettings::numbered(0, value)];
     }
     if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.channel_bandwidth_hz") {
         settings.analyzer.channel_bandwidth_hz = value;
@@ -13241,26 +13489,38 @@ fn read_gui_recording_with_analyzers(
     let mut radio_spectrum =
         SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?
             .with_iq_correction(radio_settings.iq_correction_enabled);
-    let mut radio_analyzer = match radio_settings.analyzer.signal_profile() {
-        Ok(Some(profile)) => {
-            let analyzer = radio_settings
-                .analyzer
-                .decoder_config()
-                .and_then(|config| RadioAnalyzerRuntime::new(profile, config));
-            match analyzer {
-                Ok(analyzer) => Some(analyzer),
+    let radio_analyzers = match radio_settings.analyzer.signal_profiles() {
+        Ok(profiles) if profiles.is_empty() => Vec::new(),
+        Ok(profiles) => match radio_settings.analyzer.decoder_config() {
+            Ok(config) => match profiles
+                .into_iter()
+                .enumerate()
+                .map(|(index, profile)| {
+                    RadioAnalyzerRuntime::new_named(
+                        profile,
+                        config.clone(),
+                        radio_settings.analyzer.channel_name(index),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(analyzers) => analyzers,
                 Err(error) => {
                     waveforms.radio_analysis.set_error(error);
-                    None
+                    Vec::new()
                 }
+            },
+            Err(error) => {
+                waveforms.radio_analysis.set_error(error);
+                Vec::new()
             }
-        }
-        Ok(None) => None,
+        },
         Err(error) => {
             waveforms.radio_analysis.set_error(error);
-            None
+            Vec::new()
         }
     };
+    let mut radio_analyzers = RadioAnalyzerBank::new(radio_analyzers);
     let mut protocol_decode = ProtocolCaptureDecoder::new(analyzers);
     while let Some(event) = reader.read_event().map_err(|error| error.to_string())? {
         if let CaptureEvent::Frame(frame) = event {
@@ -13276,7 +13536,7 @@ fn read_gui_recording_with_analyzers(
                 ingest_radio_iq(
                     &mut waveforms,
                     &mut radio_spectrum,
-                    &mut radio_analyzer,
+                    &mut radio_analyzers,
                     iq,
                     f32::from(radio_settings.trigger_level_dbfs_tenths) / 10.0,
                 );
@@ -13594,16 +13854,25 @@ fn start_capture(
     let iq_correction_enabled = radio_request
         .as_ref()
         .is_some_and(|request| request.iq_correction_enabled);
-    let radio_analyzer = radio_request
+    let radio_analyzers = radio_request
         .as_ref()
-        .and_then(|request| {
+        .map(|request| {
             request
-                .analyzer_profile
-                .clone()
-                .map(|profile| (profile, request.decoder_config.clone()))
+                .analyzer_profiles
+                .iter()
+                .cloned()
+                .zip(request.analyzer_channel_names.iter())
+                .map(|(profile, name)| {
+                    RadioAnalyzerRuntime::new_named(
+                        profile,
+                        request.decoder_config.clone(),
+                        name.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
         })
-        .map(|(profile, decoder_config)| RadioAnalyzerRuntime::new(profile, decoder_config))
-        .transpose()?;
+        .transpose()?
+        .unwrap_or_default();
     let mut sources = Vec::<Box<dyn CaptureSource>>::with_capacity(
         devices.len() + usize::from(radio_request.is_some()),
     );
@@ -13673,7 +13942,7 @@ fn start_capture(
     let radio_dsp_spectrum =
         SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?
             .with_iq_correction(iq_correction_enabled);
-    let radio_dsp = RadioDspWorker::start(radio_dsp_spectrum, radio_analyzer);
+    let radio_dsp = RadioDspWorker::start(radio_dsp_spectrum, radio_analyzers);
     let session = CaptureCoordinator::start(sources).map_err(|error| error.to_string())?;
     Ok(StartedCapture {
         session,
@@ -18616,7 +18885,16 @@ mod tests {
         settings.gains_db.insert("vga".to_owned(), 20);
         settings.analyzer.enabled = true;
         settings.analyzer.demodulation = RadioDemodulation::BinaryFsk;
-        settings.analyzer.channel_offset_hz = 125_000;
+        settings.analyzer.channels = vec![
+            RadioAnalyzerChannelSettings {
+                name: "Weather".to_owned(),
+                frequency_offset_hz: 125_000,
+            },
+            RadioAnalyzerChannelSettings {
+                name: "Control".to_owned(),
+                frequency_offset_hz: -250_000,
+            },
+        ];
         settings.analyzer.sync_word = 0xd391;
         settings.analyzer.sync_word_bytes = 2;
         settings.analyzer.data_mode = RadioDataMode::Packets;
@@ -18792,7 +19070,8 @@ mod tests {
         );
         assert_eq!(settings.analyzer.symbol_rate_hz, 19_200);
         assert_eq!(settings.analyzer.deviation_hz, 35_000);
-        assert_eq!(settings.analyzer.channel_offset_hz, -200_000);
+        assert_eq!(settings.analyzer.channels[0].name, "Channel 1");
+        assert_eq!(settings.analyzer.channels[0].frequency_offset_hz, -200_000);
         assert_eq!(settings.analyzer.output_sample_rate_hz, 512_000);
         assert_eq!(settings.analyzer.filter_tap_count, 257);
         assert_eq!(settings.analyzer.maximum_preamble_bit_errors, 1);
@@ -18900,18 +19179,21 @@ mod tests {
     #[test]
     fn radio_analyzer_settings_build_a_tagged_signal_profile() {
         let mut settings = RadioAnalyzerSettings::default();
-        assert!(settings.signal_profile().unwrap().is_none());
+        assert!(settings.signal_profiles().unwrap().is_empty());
 
         settings.enabled = true;
         settings.demodulation = RadioDemodulation::BinaryGfsk;
-        settings.channel_offset_hz = 125_000;
+        settings.channels = vec![
+            RadioAnalyzerChannelSettings::numbered(0, 125_000),
+            RadioAnalyzerChannelSettings::numbered(1, -250_000),
+        ];
         settings.gfsk_bt_milli = 500;
-        let profile = settings
-            .signal_profile()
-            .unwrap()
-            .expect("enabled analyzer should build a profile");
+        let profiles = settings.signal_profiles().unwrap();
+        assert_eq!(profiles.len(), 2);
+        let profile = profiles[0].clone();
 
         assert_eq!(profile.channel.frequency_offset_hz, 125_000);
+        assert_eq!(profiles[1].channel.frequency_offset_hz, -250_000);
         let DemodulationProfile::BinaryGfsk(gfsk) = profile.demodulation else {
             panic!("GFSK settings should build the GFSK profile variant");
         };
@@ -18919,6 +19201,42 @@ mod tests {
         assert_eq!(gfsk.deviation_hz, 35_000);
         assert_eq!(gfsk.bt, 0.5);
         assert!(matches!(gfsk.timing, FskTiming::Adaptive { .. }));
+    }
+
+    #[test]
+    fn radio_analyzer_supports_up_to_one_hundred_unique_channels() {
+        let mut settings = RadioAnalyzerSettings {
+            enabled: true,
+            channels: (0..MAX_RADIO_ANALYZER_CHANNELS)
+                .map(|index| RadioAnalyzerChannelSettings::numbered(index, index as i64 * 1_000))
+                .collect(),
+            ..RadioAnalyzerSettings::default()
+        };
+
+        assert_eq!(
+            settings.signal_profiles().unwrap().len(),
+            MAX_RADIO_ANALYZER_CHANNELS
+        );
+
+        settings
+            .channels
+            .push(RadioAnalyzerChannelSettings::numbered(
+                MAX_RADIO_ANALYZER_CHANNELS,
+                200_000,
+            ));
+        assert!(settings
+            .signal_profiles()
+            .unwrap_err()
+            .contains("between 1 and 100"));
+
+        settings.channels = vec![
+            RadioAnalyzerChannelSettings::numbered(0, 100_000),
+            RadioAnalyzerChannelSettings::numbered(1, 100_000),
+        ];
+        assert!(settings
+            .signal_profiles()
+            .unwrap_err()
+            .contains("must be unique"));
     }
 
     #[test]
@@ -19071,7 +19389,8 @@ mod tests {
 
         assert!(settings.enabled);
         assert_eq!(settings.demodulation, RadioDemodulation::BinaryGfsk);
-        assert_eq!(settings.channel_offset_hz, -125_000);
+        assert_eq!(settings.channels[0].name, "Channel 1");
+        assert_eq!(settings.channels[0].frequency_offset_hz, -125_000);
         assert_eq!(settings.channel_bandwidth_hz, 250_000);
         assert_eq!(settings.output_sample_rate_hz, 1_000_000);
         assert_eq!(settings.filter_tap_count, 257);
@@ -19106,7 +19425,7 @@ mod tests {
     fn radio_iq_pipeline_runs_the_selected_analyzer() {
         let mut settings = RadioAnalyzerSettings {
             enabled: true,
-            channel_offset_hz: 10_000,
+            channels: vec![RadioAnalyzerChannelSettings::numbered(0, 10_000)],
             channel_bandwidth_hz: 4_000,
             output_sample_rate_hz: 8_000,
             filter_tap_count: 65,
@@ -19116,9 +19435,12 @@ mod tests {
             ..RadioAnalyzerSettings::default()
         };
         settings.demodulation = RadioDemodulation::BinaryFsk;
-        let profile = settings.signal_profile().unwrap().unwrap();
-        let mut analyzer =
-            Some(RadioAnalyzerRuntime::new(profile, settings.decoder_config().unwrap()).unwrap());
+        let profile = settings.signal_profiles().unwrap().remove(0);
+        let mut analyzers = RadioAnalyzerBank::new(vec![RadioAnalyzerRuntime::new(
+            profile,
+            settings.decoder_config().unwrap(),
+        )
+        .unwrap()]);
         // Keep the FFT shorter than this focused synthetic burst so the
         // analyzer's burst gate receives a channel-power observation.
         let mut spectrum = SpectrumProcessor::new(256, SpectrumWindow::Hann).unwrap();
@@ -19144,7 +19466,7 @@ mod tests {
         ingest_radio_iq(
             &mut waveforms,
             &mut spectrum,
-            &mut analyzer,
+            &mut analyzers,
             &IqBatch {
                 sample_rate_hz: 64_000,
                 center_frequency_hz: 100_000_000,
@@ -19155,7 +19477,7 @@ mod tests {
             -50.0,
         );
 
-        assert!(analyzer.is_some());
+        assert_eq!(analyzers.len(), 1);
         assert_eq!(
             waveforms.radio_analysis.soft_symbol_alphabet_size(),
             Some(2)
@@ -19896,7 +20218,8 @@ mod tests {
             },
             provider_settings: RadioProviderSettings::HackRf(HackRfSettings::default()),
             iq_correction_enabled: true,
-            analyzer_profile: None,
+            analyzer_profiles: Vec::new(),
+            analyzer_channel_names: Vec::new(),
             decoder_config: RadioDataDecoderConfig::Raw(RawRadioConfig {
                 preamble_byte: 0xaa,
                 preamble_bytes: 4,
@@ -19981,7 +20304,8 @@ mod tests {
             },
             provider_settings: RadioProviderSettings::HackRf(HackRfSettings::default()),
             iq_correction_enabled: true,
-            analyzer_profile: None,
+            analyzer_profiles: Vec::new(),
+            analyzer_channel_names: Vec::new(),
             decoder_config: RadioDataDecoderConfig::Raw(RawRadioConfig {
                 preamble_byte: 0xaa,
                 preamble_bytes: 4,

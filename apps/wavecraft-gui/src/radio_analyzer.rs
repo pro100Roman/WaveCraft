@@ -4,8 +4,8 @@ use wavecraft_core::IqBatch;
 use wavecraft_dsp::SpectrumProcessor;
 
 pub use wavecraft_radio::{
-    process_radio_iq, RadioAnalyzerRuntime, RadioAnalyzerTelemetry, RadioDataDecoderConfig,
-    RadioDspOutput,
+    process_radio_iq, RadioAnalyzerBank, RadioAnalyzerRuntime, RadioAnalyzerTelemetry,
+    RadioDataDecoderConfig, RadioDspOutput,
 };
 
 const RADIO_DSP_INPUT_CAPACITY: usize = 8;
@@ -23,10 +23,8 @@ pub struct RadioDspWorker {
 }
 
 impl RadioDspWorker {
-    pub fn start(
-        mut spectrum: SpectrumProcessor,
-        mut analyzer: Option<RadioAnalyzerRuntime>,
-    ) -> Self {
+    pub fn start(mut spectrum: SpectrumProcessor, analyzers: Vec<RadioAnalyzerRuntime>) -> Self {
+        let mut analyzer_bank = RadioAnalyzerBank::new(analyzers);
         let (input_sender, input_receiver) =
             mpsc::sync_channel::<RadioDspInput>(RADIO_DSP_INPUT_CAPACITY);
         let (output_sender, output_receiver) = mpsc::channel();
@@ -34,7 +32,7 @@ impl RadioDspWorker {
             while let Ok(input) = input_receiver.recv() {
                 let output = process_radio_iq(
                     &mut spectrum,
-                    &mut analyzer,
+                    &mut analyzer_bank,
                     &input.iq,
                     input.squelch_threshold_dbfs,
                 );
@@ -95,7 +93,7 @@ mod tests {
     #[test]
     fn radio_dsp_worker_processes_all_queued_iq_before_finishing() {
         let spectrum = SpectrumProcessor::new(8, wavecraft_dsp::SpectrumWindow::Hann).unwrap();
-        let mut worker = RadioDspWorker::start(spectrum, None);
+        let mut worker = RadioDspWorker::start(spectrum, Vec::new());
         for first_sample_index in [0, 8] {
             worker
                 .push(

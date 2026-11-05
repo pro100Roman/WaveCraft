@@ -1,6 +1,7 @@
 use crate::radio_analyzer::RadioAnalyzerTelemetry;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use wavecraft_decode::{
     DecodeDiagnostic, RadioPacketPipelineOutput, RawRadioMessageStart, RawRadioOutput, TimedByte,
 };
@@ -23,6 +24,8 @@ const WATERFALL_HISTORY_HINT: &str = "Rows are the newest spectrum snapshots ret
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawRadioMessage {
     sequence: u64,
+    channel_frequency_offset_hz: i64,
+    channel_name: Arc<str>,
     preamble_bytes: usize,
     maximum_uncertain_bits: usize,
     bytes: Vec<TimedByte>,
@@ -32,6 +35,14 @@ pub struct RawRadioMessage {
 impl RawRadioMessage {
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    pub fn channel_frequency_offset_hz(&self) -> i64 {
+        self.channel_frequency_offset_hz
+    }
+
+    pub fn channel_name(&self) -> &str {
+        &self.channel_name
     }
 
     pub fn preamble_bytes(&self) -> usize {
@@ -82,7 +93,7 @@ pub struct RadioAnalysisStore {
     next_raw_message_sequence: u64,
     raw_dropped_messages: u64,
     raw_rejected_messages: u64,
-    raw_synchronized: bool,
+    raw_synchronized_channels: HashSet<i64>,
     raw_dropped_bytes: u64,
     raw_diagnostics: VecDeque<DecodeDiagnostic>,
     telemetry: RadioAnalyzerTelemetry,
@@ -104,7 +115,7 @@ impl Default for RadioAnalysisStore {
             next_raw_message_sequence: 1,
             raw_dropped_messages: 0,
             raw_rejected_messages: 0,
-            raw_synchronized: false,
+            raw_synchronized_channels: HashSet::new(),
             raw_dropped_bytes: 0,
             raw_diagnostics: VecDeque::new(),
             telemetry: RadioAnalyzerTelemetry::default(),
@@ -123,14 +134,17 @@ impl RadioAnalysisStore {
         })
     }
 
-    pub fn ingest(&mut self, batch: DemodulatedBatch) -> Result<(), String> {
+    pub fn ingest(
+        &mut self,
+        batch: DemodulatedBatch,
+        channel_frequency_offset_hz: i64,
+    ) -> Result<(), String> {
         match batch {
             DemodulatedBatch::SoftSymbols(batch) => {
                 batch.validate().map_err(|error| error.to_string())?;
                 if batch.discontinuity {
                     self.discontinuities = self.discontinuities.saturating_add(1);
-                    self.finish_raw_message();
-                    self.raw_synchronized = false;
+                    self.finish_channel_capture(channel_frequency_offset_hz);
                 }
                 if self.soft_symbol_alphabet_size != Some(batch.alphabet_size) {
                     self.soft_symbols.clear();
@@ -154,7 +168,7 @@ impl RadioAnalysisStore {
                 self.soft_symbol_alphabet_size = None;
                 self.raw_bytes.clear();
                 self.raw_messages.clear();
-                self.raw_synchronized = false;
+                self.raw_synchronized_channels.clear();
                 self.analog_samples.extend(batch.samples);
                 self.trim_analog_samples();
             }
@@ -163,14 +177,25 @@ impl RadioAnalysisStore {
         Ok(())
     }
 
-    pub fn ingest_raw(&mut self, output: RawRadioOutput) {
+    pub fn ingest_raw(
+        &mut self,
+        output: RawRadioOutput,
+        channel_frequency_offset_hz: i64,
+        channel_name: Arc<str>,
+    ) {
         let RawRadioOutput {
             bytes,
             message_starts,
             diagnostics,
             synchronized,
         } = output;
-        self.raw_synchronized = synchronized;
+        if synchronized {
+            self.raw_synchronized_channels
+                .insert(channel_frequency_offset_hz);
+        } else {
+            self.raw_synchronized_channels
+                .remove(&channel_frequency_offset_hz);
+        }
         let mut message_starts = message_starts.into_iter().peekable();
         for byte in bytes.iter().copied() {
             while message_starts
@@ -180,23 +205,41 @@ impl RadioAnalysisStore {
                 let Some(start) = message_starts.next() else {
                     break;
                 };
-                self.start_raw_message(start);
+                self.start_raw_message(
+                    start,
+                    channel_frequency_offset_hz,
+                    Arc::clone(&channel_name),
+                );
             }
-            if self.raw_messages.is_empty() && synchronized {
-                self.start_raw_message(RawRadioMessageStart {
-                    sample_index: byte.range.start,
-                    preamble_bytes: 0,
-                    maximum_uncertain_bits: usize::MAX,
-                });
+            if self
+                .active_raw_message_index(channel_frequency_offset_hz)
+                .is_none()
+                && synchronized
+            {
+                self.start_raw_message(
+                    RawRadioMessageStart {
+                        sample_index: byte.range.start,
+                        preamble_bytes: 0,
+                        maximum_uncertain_bits: usize::MAX,
+                    },
+                    channel_frequency_offset_hz,
+                    Arc::clone(&channel_name),
+                );
             }
-            if let Some(message) = self.raw_messages.back_mut() {
+            if let Some(message_index) = self.active_raw_message_index(channel_frequency_offset_hz)
+            {
+                let message = &mut self.raw_messages[message_index];
                 message.bytes.push(byte);
                 let excess = message.bytes.len().saturating_sub(self.capacity);
                 message.bytes.drain(..excess);
             }
         }
         for start in message_starts {
-            self.start_raw_message(start);
+            self.start_raw_message(
+                start,
+                channel_frequency_offset_hz,
+                Arc::clone(&channel_name),
+            );
         }
         self.raw_bytes.extend(bytes);
         let excess = self.raw_bytes.len().saturating_sub(self.capacity);
@@ -207,23 +250,35 @@ impl RadioAnalysisStore {
         self.raw_diagnostics.drain(..diagnostic_excess);
     }
 
-    pub fn ingest_packets(&mut self, output: RadioPacketPipelineOutput) {
+    pub fn ingest_packets(
+        &mut self,
+        output: RadioPacketPipelineOutput,
+        channel_frequency_offset_hz: i64,
+        channel_name: Arc<str>,
+    ) {
         if output.packets.is_empty() && output.diagnostics.is_empty() {
             return;
         }
-        self.raw_synchronized = false;
+        self.raw_synchronized_channels
+            .remove(&channel_frequency_offset_hz);
         self.raw_diagnostics.extend(output.diagnostics);
         for packet in output.packets {
             let sample_index = packet
                 .bytes
                 .first()
                 .map_or(packet.range.start, |byte| byte.range.start);
-            self.start_raw_message(RawRadioMessageStart {
-                sample_index,
-                preamble_bytes: 0,
-                maximum_uncertain_bits: usize::MAX,
-            });
-            if let Some(message) = self.raw_messages.back_mut() {
+            self.start_raw_message(
+                RawRadioMessageStart {
+                    sample_index,
+                    preamble_bytes: 0,
+                    maximum_uncertain_bits: usize::MAX,
+                },
+                channel_frequency_offset_hz,
+                Arc::clone(&channel_name),
+            );
+            if let Some(message_index) = self.active_raw_message_index(channel_frequency_offset_hz)
+            {
+                let message = &mut self.raw_messages[message_index];
                 message.bytes.extend(packet.bytes.iter().copied());
                 let excess = message.bytes.len().saturating_sub(self.capacity);
                 message.bytes.drain(..excess);
@@ -233,7 +288,7 @@ impl RadioAnalysisStore {
             self.raw_bytes.drain(..excess);
             self.raw_dropped_bytes = self.raw_dropped_bytes.saturating_add(excess as u64);
             self.raw_diagnostics.extend(packet.diagnostics);
-            self.finish_raw_message();
+            self.finish_channel_capture(channel_frequency_offset_hz);
         }
         let diagnostic_excess = self.raw_diagnostics.len().saturating_sub(32);
         self.raw_diagnostics.drain(..diagnostic_excess);
@@ -284,7 +339,7 @@ impl RadioAnalysisStore {
     }
 
     pub fn raw_synchronized(&self) -> bool {
-        self.raw_synchronized
+        !self.raw_synchronized_channels.is_empty()
     }
 
     pub fn raw_messages(&self) -> &VecDeque<RawRadioMessage> {
@@ -300,8 +355,8 @@ impl RadioAnalysisStore {
 
     pub fn raw_message_in_progress(&self) -> bool {
         self.raw_messages
-            .back()
-            .is_some_and(|message| !message.is_complete())
+            .iter()
+            .any(|message| !message.is_complete())
     }
 
     pub fn raw_dropped_messages(&self) -> u64 {
@@ -321,8 +376,21 @@ impl RadioAnalysisStore {
     }
 
     pub fn finish_raw_capture(&mut self) {
-        self.finish_raw_message();
-        self.raw_synchronized = false;
+        for message in &mut self.raw_messages {
+            message.complete = true;
+        }
+        let before = self.raw_messages.len();
+        self.raw_messages.retain(RawRadioMessage::is_accepted);
+        self.raw_rejected_messages = self
+            .raw_rejected_messages
+            .saturating_add(before.saturating_sub(self.raw_messages.len()) as u64);
+        self.raw_synchronized_channels.clear();
+    }
+
+    pub fn finish_channel_capture(&mut self, channel_frequency_offset_hz: i64) {
+        self.finish_raw_message(channel_frequency_offset_hz);
+        self.raw_synchronized_channels
+            .remove(&channel_frequency_offset_hz);
     }
 
     fn trim_soft_symbols(&mut self) {
@@ -337,9 +405,21 @@ impl RadioAnalysisStore {
         self.dropped_items = self.dropped_items.saturating_add(excess as u64);
     }
 
-    fn start_raw_message(&mut self, start: RawRadioMessageStart) {
+    fn active_raw_message_index(&self, channel_frequency_offset_hz: i64) -> Option<usize> {
+        self.raw_messages.iter().rposition(|message| {
+            message.channel_frequency_offset_hz == channel_frequency_offset_hz && !message.complete
+        })
+    }
+
+    fn start_raw_message(
+        &mut self,
+        start: RawRadioMessageStart,
+        channel_frequency_offset_hz: i64,
+        channel_name: Arc<str>,
+    ) {
         let mut carried_bytes = Vec::new();
-        if let Some(current) = self.raw_messages.back_mut() {
+        if let Some(current_index) = self.active_raw_message_index(channel_frequency_offset_hz) {
+            let current = &mut self.raw_messages[current_index];
             if let Some(split) = current
                 .bytes
                 .iter()
@@ -348,9 +428,11 @@ impl RadioAnalysisStore {
                 carried_bytes = current.bytes.split_off(split);
             }
         }
-        self.finish_raw_message();
+        self.finish_raw_message(channel_frequency_offset_hz);
         self.raw_messages.push_back(RawRadioMessage {
             sequence: self.next_raw_message_sequence,
+            channel_frequency_offset_hz,
+            channel_name,
             preamble_bytes: start.preamble_bytes,
             maximum_uncertain_bits: start.maximum_uncertain_bits,
             bytes: carried_bytes,
@@ -364,13 +446,14 @@ impl RadioAnalysisStore {
         }
     }
 
-    fn finish_raw_message(&mut self) {
-        let rejected = self.raw_messages.back_mut().is_some_and(|message| {
-            message.complete = true;
-            !message.is_accepted()
-        });
-        if rejected {
-            self.raw_messages.pop_back();
+    fn finish_raw_message(&mut self, channel_frequency_offset_hz: i64) {
+        let Some(message_index) = self.active_raw_message_index(channel_frequency_offset_hz) else {
+            return;
+        };
+        let message = &mut self.raw_messages[message_index];
+        message.complete = true;
+        if !message.is_accepted() {
+            self.raw_messages.remove(message_index);
             self.raw_rejected_messages = self.raw_rejected_messages.saturating_add(1);
         }
     }
@@ -898,9 +981,10 @@ fn paint_raw_messages(
     const ROW_HEIGHT: f32 = 22.0;
     const BYTE_CELL_WIDTH: f32 = 24.0;
     const SEQUENCE_WIDTH: f32 = 48.0;
+    const CHANNEL_WIDTH: f32 = 60.0;
     const SECTION_WIDTH: f32 = 38.0;
-    const PREAMBLE_TOGGLE_WIDTH: f32 = 72.0;
-    const LENGTH_WIDTH: f32 = 76.0;
+    const PREAMBLE_TOGGLE_WIDTH: f32 = 30.0;
+    const LENGTH_WIDTH: f32 = 52.0;
     const SCROLLBAR_WIDTH: f32 = 7.0;
     const SCROLLBAR_GAP: f32 = 5.0;
     let visible_rows = (plot.height() / ROW_HEIGHT).floor().max(1.0) as usize;
@@ -976,6 +1060,15 @@ fn paint_raw_messages(
 
         let mut x = row_rect.left() + SEQUENCE_WIDTH;
         let right_limit = row_rect.right() - LENGTH_WIDTH;
+        paint_raw_section_label_clipped(
+            ui,
+            row_rect,
+            x,
+            CHANNEL_WIDTH - 4.0,
+            message.channel_name(),
+            Color32::from_rgb(125, 175, 145),
+        );
+        x += CHANNEL_WIDTH;
         let preamble_bytes = message.preamble_bytes();
         if !packet_mode {
             let expansion_id = ui.id().with(("raw_preamble_expanded", message.sequence()));
@@ -1000,11 +1093,7 @@ fn paint_raw_messages(
                 ui,
                 row_rect,
                 x,
-                &format!(
-                    "[{}] PRE {}",
-                    if preamble_expanded { "-" } else { "+" },
-                    preamble_bytes
-                ),
+                "PRE",
                 if toggle.hovered() {
                     Color32::from_rgb(255, 205, 105)
                 } else {
@@ -1041,7 +1130,7 @@ fn paint_raw_messages(
         ui.painter().text(
             row_rect.right_center() - Vec2::new(5.0, 0.0),
             egui::Align2::RIGHT_CENTER,
-            format!("LEN {} B", message.data_len()),
+            format!("{} B", message.data_len()),
             FontId::monospace(10.0),
             Color32::from_rgb(105, 150, 175),
         );
@@ -1053,6 +1142,15 @@ fn paint_raw_messages(
             Sense::hover(),
         )
         .on_hover_ui(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "CHANNEL {} ({})",
+                    message.channel_name(),
+                    format_channel_offset(message.channel_frequency_offset_hz())
+                ))
+                .monospace()
+                .color(Color32::from_rgb(125, 175, 145)),
+            );
             if !packet_mode {
                 ui.label(
                     egui::RichText::new(format!("PRE  {preamble}"))
@@ -1137,6 +1235,20 @@ fn paint_raw_messages(
     }
 }
 
+fn format_channel_offset(offset_hz: i64) -> String {
+    let sign = if offset_hz > 0 {
+        "+"
+    } else if offset_hz < 0 {
+        "−"
+    } else {
+        ""
+    };
+    format!(
+        "CH {sign}{}",
+        format_frequency(offset_hz.unsigned_abs() as f64)
+    )
+}
+
 fn retained_raw_message_scroll_rows<I>(
     scroll_rows: usize,
     previous_newest_sequence: Option<u64>,
@@ -1194,6 +1306,27 @@ fn format_raw_hex(bytes: &[TimedByte]) -> String {
 
 fn paint_raw_section_label(ui: &egui::Ui, row: Rect, x: f32, label: &str, color: Color32) {
     ui.painter().text(
+        Pos2::new(x, row.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::monospace(9.0),
+        color,
+    );
+}
+
+fn paint_raw_section_label_clipped(
+    ui: &egui::Ui,
+    row: Rect,
+    x: f32,
+    width: f32,
+    label: &str,
+    color: Color32,
+) {
+    let clip = Rect::from_min_max(
+        Pos2::new(x, row.top()),
+        Pos2::new((x + width).min(row.right()), row.bottom()),
+    );
+    ui.painter().with_clip_rect(clip).text(
         Pos2::new(x, row.center().y),
         egui::Align2::LEFT_CENTER,
         label,
@@ -1821,16 +1954,19 @@ mod tests {
     fn analysis_store_bounds_soft_symbols_and_preserves_diagnostics() {
         let mut store = RadioAnalysisStore::new(2).unwrap();
         store
-            .ingest(DemodulatedBatch::SoftSymbols(TimedSoftSymbolBatch {
-                alphabet_size: 2,
-                discontinuity: true,
-                symbols: (0..3)
-                    .map(|index| TimedSoftSymbol {
-                        likelihoods: vec![0.25, 0.75],
-                        source_range: index..index + 1,
-                    })
-                    .collect(),
-            }))
+            .ingest(
+                DemodulatedBatch::SoftSymbols(TimedSoftSymbolBatch {
+                    alphabet_size: 2,
+                    discontinuity: true,
+                    symbols: (0..3)
+                        .map(|index| TimedSoftSymbol {
+                            likelihoods: vec![0.25, 0.75],
+                            source_range: index..index + 1,
+                        })
+                        .collect(),
+                }),
+                0,
+            )
             .unwrap();
 
         assert_eq!(store.soft_symbols().len(), 2);
@@ -1844,24 +1980,30 @@ mod tests {
     fn analysis_store_switches_cleanly_between_output_families() {
         let mut store = RadioAnalysisStore::new(4).unwrap();
         store
-            .ingest(DemodulatedBatch::SoftSymbols(TimedSoftSymbolBatch {
-                alphabet_size: 2,
-                discontinuity: false,
-                symbols: vec![TimedSoftSymbol {
-                    likelihoods: vec![0.75, 0.25],
-                    source_range: 0..1,
-                }],
-            }))
+            .ingest(
+                DemodulatedBatch::SoftSymbols(TimedSoftSymbolBatch {
+                    alphabet_size: 2,
+                    discontinuity: false,
+                    symbols: vec![TimedSoftSymbol {
+                        likelihoods: vec![0.75, 0.25],
+                        source_range: 0..1,
+                    }],
+                }),
+                0,
+            )
             .unwrap();
         store
-            .ingest(DemodulatedBatch::Analog(TimedAnalogBatch {
-                sample_rate_hz: 48_000,
-                discontinuity: false,
-                samples: vec![TimedAnalogSample {
-                    value: 0.25,
-                    source_range: 1..2,
-                }],
-            }))
+            .ingest(
+                DemodulatedBatch::Analog(TimedAnalogBatch {
+                    sample_rate_hz: 48_000,
+                    discontinuity: false,
+                    samples: vec![TimedAnalogSample {
+                        value: 0.25,
+                        source_range: 1..2,
+                    }],
+                }),
+                0,
+            )
             .unwrap();
 
         assert!(store.soft_symbols().is_empty());
@@ -1873,23 +2015,27 @@ mod tests {
     #[test]
     fn analysis_store_bounds_synchronized_raw_bytes() {
         let mut store = RadioAnalysisStore::new(2).unwrap();
-        store.ingest_raw(RawRadioOutput {
-            bytes: [0xaa, 0xaa, 0x42]
-                .into_iter()
-                .enumerate()
-                .map(|(index, value)| TimedByte {
-                    value,
-                    range: SampleRange {
-                        start: index as u64 * 8,
-                        end: index as u64 * 8 + 8,
-                    },
-                    status: ByteStatus::default(),
-                })
-                .collect(),
-            message_starts: vec![],
-            diagnostics: vec![],
-            synchronized: true,
-        });
+        store.ingest_raw(
+            RawRadioOutput {
+                bytes: [0xaa, 0xaa, 0x42]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| TimedByte {
+                        value,
+                        range: SampleRange {
+                            start: index as u64 * 8,
+                            end: index as u64 * 8 + 8,
+                        },
+                        status: ByteStatus::default(),
+                    })
+                    .collect(),
+                message_starts: vec![],
+                diagnostics: vec![],
+                synchronized: true,
+            },
+            -200_000,
+            Arc::from("Weather"),
+        );
 
         assert!(store.raw_synchronized());
         assert_eq!(
@@ -1906,33 +2052,39 @@ mod tests {
     #[test]
     fn analysis_store_exposes_completed_packets_as_data_messages() {
         let mut store = RadioAnalysisStore::new(32).unwrap();
-        store.ingest_packets(RadioPacketPipelineOutput {
-            packets: vec![RadioPacket {
-                bytes: [0x10, 0x20, 0x30]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, value)| TimedByte {
-                        value,
-                        range: SampleRange {
-                            start: 100 + index as u64 * 8,
-                            end: 108 + index as u64 * 8,
-                        },
-                        status: ByteStatus::default(),
-                    })
-                    .collect(),
-                range: SampleRange {
-                    start: 84,
-                    end: 124,
-                },
-                confidence: 0.9,
+        store.ingest_packets(
+            RadioPacketPipelineOutput {
+                packets: vec![RadioPacket {
+                    bytes: [0x10, 0x20, 0x30]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, value)| TimedByte {
+                            value,
+                            range: SampleRange {
+                                start: 100 + index as u64 * 8,
+                                end: 108 + index as u64 * 8,
+                            },
+                            status: ByteStatus::default(),
+                        })
+                        .collect(),
+                    range: SampleRange {
+                        start: 84,
+                        end: 124,
+                    },
+                    confidence: 0.9,
+                    diagnostics: vec![],
+                }],
                 diagnostics: vec![],
-            }],
-            diagnostics: vec![],
-        });
+            },
+            200_000,
+            Arc::from("Packets"),
+        );
 
         assert_eq!(store.completed_raw_message_count(), 1);
         let message = store.raw_messages().back().unwrap();
         assert!(message.is_complete());
+        assert_eq!(message.channel_frequency_offset_hz(), 200_000);
+        assert_eq!(message.channel_name(), "Packets");
         assert_eq!(message.preamble_bytes(), 0);
         assert_eq!(
             message
@@ -1961,26 +2113,34 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        store.ingest_raw(RawRadioOutput {
-            bytes: timed_bytes(&[0xaa, 0xaa, 0x12, 0xaa], 0),
-            message_starts: vec![RawRadioMessageStart {
-                sample_index: 0,
-                preamble_bytes: 2,
-                maximum_uncertain_bits: 0,
-            }],
-            diagnostics: vec![],
-            synchronized: true,
-        });
-        store.ingest_raw(RawRadioOutput {
-            bytes: timed_bytes(&[0xaa, 0x34], 32),
-            message_starts: vec![RawRadioMessageStart {
-                sample_index: 24,
-                preamble_bytes: 2,
-                maximum_uncertain_bits: 0,
-            }],
-            diagnostics: vec![],
-            synchronized: true,
-        });
+        store.ingest_raw(
+            RawRadioOutput {
+                bytes: timed_bytes(&[0xaa, 0xaa, 0x12, 0xaa], 0),
+                message_starts: vec![RawRadioMessageStart {
+                    sample_index: 0,
+                    preamble_bytes: 2,
+                    maximum_uncertain_bits: 0,
+                }],
+                diagnostics: vec![],
+                synchronized: true,
+            },
+            -200_000,
+            Arc::from("Weather"),
+        );
+        store.ingest_raw(
+            RawRadioOutput {
+                bytes: timed_bytes(&[0xaa, 0x34], 32),
+                message_starts: vec![RawRadioMessageStart {
+                    sample_index: 24,
+                    preamble_bytes: 2,
+                    maximum_uncertain_bits: 0,
+                }],
+                diagnostics: vec![],
+                synchronized: true,
+            },
+            -200_000,
+            Arc::from("Weather"),
+        );
 
         let newest_first = store.raw_messages().iter().rev().collect::<Vec<_>>();
 
@@ -2019,33 +2179,82 @@ mod tests {
     }
 
     #[test]
+    fn analysis_store_keeps_channel_message_state_independent() {
+        let mut store = RadioAnalysisStore::new(32).unwrap();
+        let output = |sample_index| RawRadioOutput {
+            bytes: vec![TimedByte {
+                value: 0xaa,
+                range: SampleRange {
+                    start: sample_index,
+                    end: sample_index + 8,
+                },
+                status: ByteStatus::default(),
+            }],
+            message_starts: vec![RawRadioMessageStart {
+                sample_index,
+                preamble_bytes: 1,
+                maximum_uncertain_bits: 0,
+            }],
+            diagnostics: vec![],
+            synchronized: true,
+        };
+
+        store.ingest_raw(output(0), -200_000, Arc::from("Lower"));
+        store.ingest_raw(output(0), 200_000, Arc::from("Upper"));
+        store.ingest_raw(output(16), -200_000, Arc::from("Lower"));
+
+        assert_eq!(store.raw_messages().len(), 3);
+        assert_eq!(store.raw_messages()[0].channel_name(), "Lower");
+        assert_eq!(store.raw_messages()[1].channel_name(), "Upper");
+        assert_eq!(store.completed_raw_message_count(), 1);
+        assert_eq!(
+            store
+                .raw_messages()
+                .iter()
+                .filter(|message| !message.is_complete())
+                .map(RawRadioMessage::channel_frequency_offset_hz)
+                .collect::<HashSet<_>>(),
+            HashSet::from([-200_000, 200_000])
+        );
+
+        store.finish_channel_capture(200_000);
+
+        assert_eq!(store.completed_raw_message_count(), 2);
+        assert!(store.raw_message_in_progress());
+    }
+
+    #[test]
     fn analysis_store_rejects_messages_over_the_uncertain_bit_limit() {
         let mut store = RadioAnalysisStore::new(32).unwrap();
         let uncertain_status = ByteStatus {
             low_confidence_bits: 1,
             ..ByteStatus::default()
         };
-        store.ingest_raw(RawRadioOutput {
-            bytes: vec![
-                TimedByte {
-                    value: 0xaa,
-                    range: SampleRange { start: 0, end: 8 },
-                    status: ByteStatus::default(),
-                },
-                TimedByte {
-                    value: 0x12,
-                    range: SampleRange { start: 8, end: 16 },
-                    status: uncertain_status,
-                },
-            ],
-            message_starts: vec![RawRadioMessageStart {
-                sample_index: 0,
-                preamble_bytes: 1,
-                maximum_uncertain_bits: 0,
-            }],
-            diagnostics: vec![],
-            synchronized: true,
-        });
+        store.ingest_raw(
+            RawRadioOutput {
+                bytes: vec![
+                    TimedByte {
+                        value: 0xaa,
+                        range: SampleRange { start: 0, end: 8 },
+                        status: ByteStatus::default(),
+                    },
+                    TimedByte {
+                        value: 0x12,
+                        range: SampleRange { start: 8, end: 16 },
+                        status: uncertain_status,
+                    },
+                ],
+                message_starts: vec![RawRadioMessageStart {
+                    sample_index: 0,
+                    preamble_bytes: 1,
+                    maximum_uncertain_bits: 0,
+                }],
+                diagnostics: vec![],
+                synchronized: true,
+            },
+            0,
+            Arc::from("Channel 1"),
+        );
 
         store.finish_raw_capture();
 
@@ -2060,20 +2269,23 @@ mod tests {
         display.ingest(frame(0, 100_000_000));
         let mut analysis = RadioAnalysisStore::new(4).unwrap();
         analysis
-            .ingest(DemodulatedBatch::SoftSymbols(TimedSoftSymbolBatch {
-                alphabet_size: 2,
-                discontinuity: false,
-                symbols: vec![
-                    TimedSoftSymbol {
-                        likelihoods: vec![0.9, 0.1],
-                        source_range: 0..8,
-                    },
-                    TimedSoftSymbol {
-                        likelihoods: vec![0.1, 0.9],
-                        source_range: 8..16,
-                    },
-                ],
-            }))
+            .ingest(
+                DemodulatedBatch::SoftSymbols(TimedSoftSymbolBatch {
+                    alphabet_size: 2,
+                    discontinuity: false,
+                    symbols: vec![
+                        TimedSoftSymbol {
+                            likelihoods: vec![0.9, 0.1],
+                            source_range: 0..8,
+                        },
+                        TimedSoftSymbol {
+                            likelihoods: vec![0.1, 0.9],
+                            source_range: 8..16,
+                        },
+                    ],
+                }),
+                0,
+            )
             .unwrap();
         let mut view = RadioViewState::default();
         let mut trigger_level = -500;

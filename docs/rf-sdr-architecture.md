@@ -12,6 +12,14 @@ IQ into a bounded modulation-neutral output store. An expandable Signal
 Analyzer panel edits the tagged channel, modulation, and timing settings;
 the RF view renders bounded timed soft-symbol decisions or analog output with
 drop, discontinuity, and analyzer-error diagnostics.
+Analyzer modulation, timing, framing, and whitening settings are shared by a
+separate list of up to 100 channel offsets. Each configured offset owns an
+independent channelizer, demodulator, synchronization state, and packet/raw
+decoder while consuming the same captured IQ stream. The analyzer bank converts
+the wideband integer IQ stream and tracks DC once per input chunk, then fans the
+prepared samples out to the active per-channel mixers and FIR filters. Its shared
+spectrum FFT also gates inactive channels before channelization. Decoded rows
+retain and display their originating channel offset.
 For binary FSK/GFSK, the panel selects raw discovery or fixed-length packet
 decoding. Raw discovery edits a repeated hexadecimal preamble. Packet mode
 edits an unwhitened sync word, packet length, and optional post-sync additive
@@ -587,6 +595,12 @@ Analyzer settings expose whitening enablement, LFSR width, tap mask, seed,
 shift direction, output inversion, covered packet-bit range, and excluded-bit
 advancement. These settings are saved in capture profiles and recording
 metadata so replay uses the same packet transform.
+The **Analyzer channels** section follows the common **Signal analyzer**
+section and provides editable names plus add, remove, and offset controls.
+Capture profiles and recording metadata retain the bounded ordered channel
+list and its names; legacy recordings without names receive numbered defaults,
+and a legacy `channel_offset_hz` loads as a one-channel list. RAW DATA and
+PACKETS rows show the configured channel name and an unprefixed byte count.
 
 These operations are not application-field parsing. Their output is a
 `RadioPacket` containing timed bytes, source range, RSSI/power estimate,

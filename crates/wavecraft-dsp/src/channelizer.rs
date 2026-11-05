@@ -67,9 +67,97 @@ pub struct ChannelizedBatch {
     pub samples: Vec<TimedComplexSample>,
 }
 
+/// Wideband IQ with integer conversion and DC tracking applied once before
+/// fan-out to one or more channelizers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedIqBatch {
+    pub sample_rate_hz: u64,
+    pub center_frequency_hz: u64,
+    pub first_sample_index: u64,
+    pub discontinuity: bool,
+    samples: Vec<(f64, f64)>,
+}
+
+/// Stateful preprocessing shared by a bank of channelizers.
+#[derive(Default)]
+pub struct WidebandIqPreprocessor {
+    expected_next_index: Option<u64>,
+    sample_rate_hz: Option<u64>,
+    center_frequency_hz: Option<u64>,
+    dc_i: f64,
+    dc_q: f64,
+    dc_initialized: bool,
+    scratch_samples: Vec<(f64, f64)>,
+}
+
+impl WidebandIqPreprocessor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        let scratch_samples = std::mem::take(&mut self.scratch_samples);
+        *self = Self {
+            scratch_samples,
+            ..Self::default()
+        };
+    }
+
+    pub fn push(&mut self, batch: &IqBatch) -> Result<PreparedIqBatch, DspError> {
+        if batch.sample_rate_hz == 0 {
+            return Err(DspError::new("IQ sample rate must be nonzero"));
+        }
+        let discontinuity = batch.discontinuity
+            || self.expected_next_index != Some(batch.first_sample_index)
+            || self.sample_rate_hz != Some(batch.sample_rate_hz)
+            || self.center_frequency_hz != Some(batch.center_frequency_hz);
+        if discontinuity {
+            self.dc_i = 0.0;
+            self.dc_q = 0.0;
+            self.dc_initialized = false;
+        }
+
+        let mut samples = std::mem::take(&mut self.scratch_samples);
+        samples.clear();
+        samples.reserve(batch.samples.len().saturating_sub(samples.capacity()));
+        samples.extend(batch.samples.iter().map(|sample| {
+            let raw = (f64::from(sample.i) / 128.0, f64::from(sample.q) / 128.0);
+            if !self.dc_initialized {
+                self.dc_initialized = true;
+            } else {
+                self.dc_i += DC_TRACKING_GAIN * (raw.0 - self.dc_i);
+                self.dc_q += DC_TRACKING_GAIN * (raw.1 - self.dc_q);
+            }
+            (raw.0 - self.dc_i, raw.1 - self.dc_q)
+        }));
+
+        self.expected_next_index = Some(
+            batch
+                .first_sample_index
+                .saturating_add(batch.samples.len() as u64),
+        );
+        self.sample_rate_hz = Some(batch.sample_rate_hz);
+        self.center_frequency_hz = Some(batch.center_frequency_hz);
+        Ok(PreparedIqBatch {
+            sample_rate_hz: batch.sample_rate_hz,
+            center_frequency_hz: batch.center_frequency_hz,
+            first_sample_index: batch.first_sample_index,
+            discontinuity,
+            samples,
+        })
+    }
+
+    /// Returns a prepared batch's allocation for reuse by the next input.
+    pub fn recycle(&mut self, mut batch: PreparedIqBatch) {
+        batch.samples.clear();
+        self.scratch_samples = batch.samples;
+    }
+}
+
 /// Incremental frequency translator, low-pass filter, and rate reducer.
 pub struct Channelizer {
     config: ChannelizerConfig,
+    preprocessor: WidebandIqPreprocessor,
     filter: Vec<f64>,
     filter_sample_rate_hz: Option<u64>,
     history: VecDeque<(f64, f64, u64)>,
@@ -82,9 +170,6 @@ pub struct Channelizer {
     mixer_step_i: f64,
     mixer_step_q: f64,
     mixer_samples_since_normalize: u32,
-    dc_i: f64,
-    dc_q: f64,
-    dc_initialized: bool,
     resample_accumulator: u64,
     pending_discontinuity: bool,
 }
@@ -95,6 +180,7 @@ impl Channelizer {
         Ok(Self {
             history: VecDeque::with_capacity(config.filter_tap_count),
             config,
+            preprocessor: WidebandIqPreprocessor::new(),
             filter: Vec::new(),
             filter_sample_rate_hz: None,
             expected_next_index: None,
@@ -106,9 +192,6 @@ impl Channelizer {
             mixer_step_i: 1.0,
             mixer_step_q: 0.0,
             mixer_samples_since_normalize: 0,
-            dc_i: 0.0,
-            dc_q: 0.0,
-            dc_initialized: false,
             resample_accumulator: 0,
             pending_discontinuity: false,
         })
@@ -119,6 +202,7 @@ impl Channelizer {
     }
 
     pub fn reset(&mut self) {
+        self.preprocessor.reset();
         self.filter.clear();
         self.filter_sample_rate_hz = None;
         self.history.clear();
@@ -131,14 +215,18 @@ impl Channelizer {
         self.mixer_step_i = 1.0;
         self.mixer_step_q = 0.0;
         self.mixer_samples_since_normalize = 0;
-        self.dc_i = 0.0;
-        self.dc_q = 0.0;
-        self.dc_initialized = false;
         self.resample_accumulator = 0;
         self.pending_discontinuity = true;
     }
 
     pub fn push(&mut self, batch: &IqBatch) -> Result<ChannelizedBatch, DspError> {
+        let prepared = self.preprocessor.push(batch)?;
+        let output = self.push_prepared(&prepared);
+        self.preprocessor.recycle(prepared);
+        output
+    }
+
+    pub fn push_prepared(&mut self, batch: &PreparedIqBatch) -> Result<ChannelizedBatch, DspError> {
         self.validate_batch(batch)?;
         let reset = batch.discontinuity
             || self.expected_next_index != Some(batch.first_sample_index)
@@ -151,16 +239,8 @@ impl Channelizer {
         let selected_frequency =
             selected_frequency(batch.center_frequency_hz, self.config.frequency_offset_hz)?;
         let mut output = Vec::new();
-        for (offset, sample) in batch.samples.iter().enumerate() {
+        for (offset, input) in batch.samples.iter().enumerate() {
             let source_index = batch.first_sample_index.saturating_add(offset as u64);
-            let raw = (f64::from(sample.i) / 128.0, f64::from(sample.q) / 128.0);
-            if !self.dc_initialized {
-                self.dc_initialized = true;
-            } else {
-                self.dc_i += DC_TRACKING_GAIN * (raw.0 - self.dc_i);
-                self.dc_q += DC_TRACKING_GAIN * (raw.1 - self.dc_q);
-            }
-            let input = (raw.0 - self.dc_i, raw.1 - self.dc_q);
             let mixed = (
                 input.0 * self.mixer_i - input.1 * self.mixer_q,
                 input.0 * self.mixer_q + input.1 * self.mixer_i,
@@ -240,10 +320,7 @@ impl Channelizer {
         })
     }
 
-    fn validate_batch(&self, batch: &IqBatch) -> Result<(), DspError> {
-        if batch.sample_rate_hz == 0 {
-            return Err(DspError::new("IQ sample rate must be nonzero"));
-        }
+    fn validate_batch(&self, batch: &PreparedIqBatch) -> Result<(), DspError> {
         if self.config.output_sample_rate_hz > batch.sample_rate_hz {
             return Err(DspError::new(
                 "radio channel output rate must not exceed the IQ sample rate",
@@ -260,7 +337,7 @@ impl Channelizer {
         Ok(())
     }
 
-    fn reset_for_batch(&mut self, batch: &IqBatch) {
+    fn reset_for_batch(&mut self, batch: &PreparedIqBatch) {
         self.history.clear();
         if self.filter_sample_rate_hz != Some(batch.sample_rate_hz) {
             self.filter = design_low_pass(
@@ -283,9 +360,6 @@ impl Channelizer {
         self.mixer_i = mixer_phase.cos();
         self.mixer_q = mixer_phase.sin();
         self.mixer_samples_since_normalize = 0;
-        self.dc_i = 0.0;
-        self.dc_q = 0.0;
-        self.dc_initialized = false;
         self.resample_accumulator = 0;
         self.pending_discontinuity = true;
     }
@@ -440,5 +514,31 @@ mod tests {
 
         assert!(mean_magnitude(&desired) > 0.70);
         assert!(mean_magnitude(&rejected) < mean_magnitude(&desired) * 0.02);
+    }
+
+    #[test]
+    fn shared_preprocessing_matches_independent_channelizers() {
+        let input = tone_batch_at(0, 128, true, 1_000.0);
+        let mut second_config = config();
+        second_config.frequency_offset_hz = -1_000;
+
+        let expected_first = Channelizer::new(config()).unwrap().push(&input).unwrap();
+        let expected_second = Channelizer::new(second_config.clone())
+            .unwrap()
+            .push(&input)
+            .unwrap();
+
+        let prepared = WidebandIqPreprocessor::new().push(&input).unwrap();
+        let actual_first = Channelizer::new(config())
+            .unwrap()
+            .push_prepared(&prepared)
+            .unwrap();
+        let actual_second = Channelizer::new(second_config)
+            .unwrap()
+            .push_prepared(&prepared)
+            .unwrap();
+
+        assert_eq!(actual_first, expected_first);
+        assert_eq!(actual_second, expected_second);
     }
 }

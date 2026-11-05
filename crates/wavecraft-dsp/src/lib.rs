@@ -10,7 +10,10 @@ mod timing;
 pub use analyzer::{
     BinaryFskProfile, BinaryGfskProfile, DemodulationProfile, SignalAnalyzer, SignalAnalyzerProfile,
 };
-pub use channelizer::{ChannelizedBatch, Channelizer, ChannelizerConfig, TimedComplexSample};
+pub use channelizer::{
+    ChannelizedBatch, Channelizer, ChannelizerConfig, PreparedIqBatch, TimedComplexSample,
+    WidebandIqPreprocessor,
+};
 pub use demodulation::{
     DemodulatedBatch, Demodulator, DemodulatorTelemetry, TimedAnalogBatch, TimedAnalogSample,
     TimedSoftSymbol, TimedSoftSymbolBatch, MAX_SOFT_SYMBOL_ALPHABET_SIZE,
