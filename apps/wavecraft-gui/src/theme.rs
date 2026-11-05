@@ -5,6 +5,7 @@ pub(crate) const PANEL: Color32 = Color32::from_rgb(20, 27, 38);
 pub(crate) const GRID: Color32 = Color32::from_rgb(43, 55, 72);
 pub(crate) const TEXT_MUTED: Color32 = Color32::from_rgb(145, 160, 180);
 pub(crate) const ACCENT: Color32 = Color32::from_rgb(70, 210, 185);
+pub(crate) const ORANGE: Color32 = Color32::from_rgb(255, 145, 77);
 pub(crate) const SCOPE_COLORS: [Color32; 2] = [
     Color32::from_rgb(255, 204, 74),
     Color32::from_rgb(99, 179, 255),

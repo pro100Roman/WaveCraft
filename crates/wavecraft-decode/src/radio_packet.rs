@@ -21,6 +21,8 @@ pub struct SyncWordConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RadioPacketLength {
+    /// Collects post-sync bytes until the input stream ends or becomes discontinuous.
+    UntilEndOfStream,
     Fixed {
         packet_bytes: usize,
     },
@@ -69,6 +71,7 @@ impl RadioPacketFramerConfig {
             whitening.validate()?;
         }
         match self.length {
+            RadioPacketLength::UntilEndOfStream => {}
             RadioPacketLength::Fixed { packet_bytes } => {
                 validate_packet_limit(packet_bytes)?;
             }
@@ -331,6 +334,14 @@ impl RadioPacketFramer {
         if self.sync_range.is_none() || self.packet_bits.is_empty() {
             return;
         }
+        if self.config.length == RadioPacketLength::UntilEndOfStream
+            && self.packet_bits.len() % 8 == 0
+        {
+            if let Ok(packet) = self.take_packet() {
+                output.packets.push(packet);
+                return;
+            }
+        }
         output.diagnostics.push(packet_diagnostic(
             "radio.framing.incomplete_packet",
             format!(
@@ -365,6 +376,7 @@ fn validate_packet_limit(packet_bytes: usize) -> Result<(), DecodeError> {
 
 fn fixed_target_bits(length: RadioPacketLength) -> Option<usize> {
     match length {
+        RadioPacketLength::UntilEndOfStream => None,
         RadioPacketLength::Fixed { packet_bytes } => Some(packet_bytes.saturating_mul(8)),
         RadioPacketLength::LengthField { .. } => None,
     }
@@ -542,6 +554,30 @@ mod tests {
         );
         assert_eq!(second.packets[0].confidence, 0.75);
         assert!(second.packets[0].diagnostics.is_empty());
+    }
+
+    #[test]
+    fn until_end_of_stream_emits_all_post_sync_bytes_on_finish() {
+        let mut config = fixed_config(BitOrder::MostSignificantFirst);
+        config.length = RadioPacketLength::UntilEndOfStream;
+        let mut values = config.sync.bits.clone();
+        values.extend(byte_bits(0xA5, config.bit_order));
+        values.extend(byte_bits(0x3C, config.bit_order));
+        let mut framer = RadioPacketFramer::new(config).unwrap();
+
+        let pushed = framer.push(&timed_bits(&values, 0, false)).unwrap();
+        let finished = framer.finish();
+
+        assert!(pushed.packets.is_empty());
+        assert!(finished.diagnostics.is_empty());
+        assert_eq!(
+            finished.packets[0]
+                .bytes
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0xA5, 0x3C]
+        );
     }
 
     #[test]

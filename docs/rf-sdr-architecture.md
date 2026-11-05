@@ -589,12 +589,18 @@ validation. It produces timed packets and stable diagnostics identically across
 arbitrary input chunks. This is the UI/CLI boundary; callers do not coordinate
 the individual state machines.
 
-In fixed-packet mode the same view is labeled **PACKETS**. It lists each
-completed post-sync packet without a synthetic preamble section. Signal
-Analyzer settings expose whitening enablement, LFSR width, tap mask, seed,
-shift direction, output inversion, covered packet-bit range, and excluded-bit
-advancement. These settings are saved in capture profiles and recording
-metadata so replay uses the same packet transform.
+In fixed-decoding mode the same view is labeled **PACKETS**. Until configurable
+length-field framing is exposed, it collects post-sync bytes through the end of
+the stream or an input discontinuity instead of assuming a constant packet
+length. Signal Analyzer settings expose whitening enablement, LFSR width, tap
+mask, seed, shift direction, output inversion, covered data-bit range, and
+excluded-bit advancement. These settings are saved in capture profiles and
+recording metadata so replay uses the same packet transform.
+Whitening can use a **Custom** preset that exposes those individual fields or
+the fixed **PN9** preset used by standard SX127x FSK packet whitening. PN9 uses
+the x⁹ + x⁵ + 1 polynomial and resets to seed `0x1FF` after each sync word.
+Named presets hide the manual LFSR fields while retaining custom values for
+later reuse.
 The **Analyzer channels** section follows the common **Signal analyzer**
 section and provides editable names plus add, remove, and offset controls.
 Capture profiles and recording metadata retain the bounded ordered channel

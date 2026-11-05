@@ -1,4 +1,4 @@
-use crate::radio_analyzer::RadioAnalyzerTelemetry;
+use crate::{radio_analyzer::RadioAnalyzerTelemetry, theme::ORANGE};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -1429,7 +1429,7 @@ fn paint_spectrum(
     }
     ui.painter().line_segment(
         [plot.center_top(), plot.center_bottom()],
-        Stroke::new(1.5_f32, Color32::from_rgb(75, 145, 165)),
+        Stroke::new(1.5_f32, ORANGE),
     );
     for division in 0..=6 {
         let fraction = division as f32 / 6.0;
