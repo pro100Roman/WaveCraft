@@ -3052,6 +3052,8 @@ dependencies = [
  "eframe",
  "image",
  "rfd",
+ "serde",
+ "serde_json",
  "wavecraft-core",
  "wavecraft-decode",
  "wavecraft-dsp",

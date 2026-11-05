@@ -1,3 +1,4 @@
+mod capture_settings;
 mod devices;
 mod measurements;
 mod protocol_analyzer;
@@ -9,6 +10,9 @@ mod snapshot;
 mod theme;
 pub mod waveform;
 
+use capture_settings::{
+    CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository,
+};
 use devices::{
     capture_devices_for_target, first_device_id_for_role, first_radio_id, selected_device_for_role,
     selected_radio, usb_speed_warning, DeviceEntry, DeviceRole, UsbSpeedWarning,
@@ -1299,6 +1303,23 @@ struct ManualCalibrationEditor {
 enum CaptureSettingsTab {
     DsLogic,
     DsCope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SavedCaptureSettingsKind {
+    LogicAnalyzer,
+    Oscilloscope,
+    RadioFrequency,
+}
+
+impl SavedCaptureSettingsKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LogicAnalyzer => "LA",
+            Self::Oscilloscope => "OSC",
+            Self::RadioFrequency => "RF",
+        }
+    }
 }
 
 impl CaptureSettingsTab {
@@ -3442,6 +3463,8 @@ enum WorkerSuccess {
 type WorkerResult = Result<WorkerSuccess, String>;
 
 struct WaveCraftApp {
+    capture_settings_repository: Option<CaptureSettingsRepository>,
+    saved_capture_settings: CaptureSettingsDocument,
     resource_directory: String,
     settings_open: bool,
     auto_calibration_confirmation_open: bool,
@@ -3521,7 +3544,21 @@ fn default_scope_measurement_window_positions() -> [Vec2; 2] {
 impl WaveCraftApp {
     fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         configure_style(&creation_context.egui_ctx);
+        let (capture_settings_repository, saved_capture_settings, settings_load_error) =
+            match CaptureSettingsRepository::for_current_user() {
+                Ok(repository) => match repository.load() {
+                    Ok(settings) => (Some(repository), settings, None),
+                    Err(error) => (
+                        Some(repository),
+                        CaptureSettingsDocument::default(),
+                        Some(error),
+                    ),
+                },
+                Err(error) => (None, CaptureSettingsDocument::default(), Some(error)),
+            };
         let mut app = Self {
+            capture_settings_repository,
+            saved_capture_settings,
             resource_directory: default_resource_directory(),
             settings_open: false,
             auto_calibration_confirmation_open: false,
@@ -3596,8 +3633,135 @@ impl WaveCraftApp {
             status: "Ready".to_owned(),
             last_error: None,
         };
+        app.apply_saved_capture_settings();
+        app.save_active_logic_session_settings();
+        app.save_active_scope_session_settings();
+        app.combined_settings = app.current_combined_session_settings();
         app.begin_refresh();
+        if let Some(error) = settings_load_error {
+            app.last_error = Some(format!(
+                "Saved capture settings could not be loaded; using defaults: {error}"
+            ));
+        }
         app
+    }
+
+    fn active_saved_capture_settings_kind(&self) -> Option<SavedCaptureSettingsKind> {
+        match self.active_waveform_tab {
+            Some(WaveformTab::LogicAnalyzer) => Some(SavedCaptureSettingsKind::LogicAnalyzer),
+            Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
+                Some(SavedCaptureSettingsKind::Oscilloscope)
+            }
+            Some(WaveformTab::RadioReceiver) => Some(SavedCaptureSettingsKind::RadioFrequency),
+            Some(WaveformTab::Combined) => Some(match self.active_capture_settings_tab {
+                CaptureSettingsTab::DsLogic => SavedCaptureSettingsKind::LogicAnalyzer,
+                CaptureSettingsTab::DsCope => SavedCaptureSettingsKind::Oscilloscope,
+            }),
+            None => None,
+        }
+    }
+
+    fn apply_saved_capture_settings(&mut self) {
+        if let Some(profile) = self.saved_capture_settings.profiles.logic_analyzer.as_ref() {
+            self.logic_settings = logic_settings_from_recording_metadata(&profile.values);
+            self.logic_acquisition_mode = profile
+                .values
+                .get("logic.acquisition_mode")
+                .map(String::as_str)
+                .and_then(parse_logic_acquisition_mode)
+                .unwrap_or(AcquisitionMode::Single);
+            self.repetitive_interval_seconds =
+                recording_metadata_value(&profile.values, "logic.repetitive_interval_seconds")
+                    .filter(|value: &f32| value.is_finite())
+                    .unwrap_or(1.0)
+                    .clamp(0.1, 10.0);
+            self.logic_smart_timing_enabled =
+                recording_metadata_value(&profile.values, "logic.smart_timing_enabled")
+                    .unwrap_or(true);
+            let (logic_names, _) = channel_names_from_recording_metadata(&profile.values);
+            self.logic_channel_names = logic_names;
+        }
+        if let Some(profile) = self.saved_capture_settings.profiles.oscilloscope.as_ref() {
+            self.scope_settings = scope_settings_from_recording_metadata(&profile.values);
+            self.scope_auto_sample_rate =
+                recording_metadata_value(&profile.values, "scope.auto_sample_rate").unwrap_or(true);
+            self.scope_smart_timing_enabled =
+                recording_metadata_value(&profile.values, "scope.smart_timing_enabled")
+                    .unwrap_or(false);
+            let (_, scope_names) = channel_names_from_recording_metadata(&profile.values);
+            self.scope_channel_names = scope_names;
+            for (index, color) in self.scope_channel_colors.iter_mut().enumerate() {
+                if let Some(saved) = profile
+                    .values
+                    .get(&format!("scope.ch{index}.color"))
+                    .and_then(|value| parse_color(value))
+                {
+                    *color = saved;
+                }
+            }
+        }
+        if let Some(profile) = self
+            .saved_capture_settings
+            .profiles
+            .radio_frequency
+            .as_ref()
+        {
+            self.radio_settings = radio_settings_from_recording_metadata(&profile.values);
+        }
+    }
+
+    fn save_capture_settings(&mut self, kind: SavedCaptureSettingsKind) {
+        let mut document = self.saved_capture_settings.clone();
+        let profile = match kind {
+            SavedCaptureSettingsKind::LogicAnalyzer => {
+                CaptureSettingsProfile::new(saved_logic_settings_metadata(
+                    self.logic_settings,
+                    self.logic_acquisition_mode,
+                    self.repetitive_interval_seconds,
+                    self.logic_smart_timing_enabled,
+                    &self.logic_channel_names,
+                ))
+            }
+            SavedCaptureSettingsKind::Oscilloscope => {
+                CaptureSettingsProfile::new(saved_scope_settings_metadata(
+                    self.scope_settings,
+                    self.scope_auto_sample_rate,
+                    self.scope_smart_timing_enabled,
+                    &self.scope_channel_names,
+                    self.scope_channel_colors,
+                ))
+            }
+            SavedCaptureSettingsKind::RadioFrequency => {
+                CaptureSettingsProfile::new(saved_radio_settings_metadata(&self.radio_settings))
+            }
+        };
+        match kind {
+            SavedCaptureSettingsKind::LogicAnalyzer => {
+                document.profiles.logic_analyzer = Some(profile)
+            }
+            SavedCaptureSettingsKind::Oscilloscope => {
+                document.profiles.oscilloscope = Some(profile)
+            }
+            SavedCaptureSettingsKind::RadioFrequency => {
+                document.profiles.radio_frequency = Some(profile)
+            }
+        }
+
+        let Some(repository) = self.capture_settings_repository.as_ref() else {
+            self.set_error(
+                "Capture settings cannot be saved because the configuration directory is unavailable"
+                    .to_owned(),
+            );
+            return;
+        };
+        match repository.save(&document) {
+            Ok(()) => {
+                self.saved_capture_settings = document;
+                self.status = format!("{} settings saved", kind.label());
+                self.last_error = None;
+            }
+            Err(error) => self.set_error(error),
+        }
     }
 
     fn finish_pending_snapshot(&mut self, context: &egui::Context) {
@@ -9402,6 +9566,7 @@ impl eframe::App for WaveCraftApp {
         let mut start_request = None;
         let mut stop_clicked = false;
         let mut calibration_action = None;
+        let mut save_capture_settings_kind = None;
         let mut logic_device_selection_changed = false;
         let mut scope_device_selection_changed = false;
         let mut radio_device_selection_changed = false;
@@ -9670,9 +9835,17 @@ impl eframe::App for WaveCraftApp {
             )
             .show(context, |ui| {
                 let available_capture_settings_tabs = self.available_capture_settings_tabs();
+                let saved_settings_kind = self.active_saved_capture_settings_kind();
                 let content_width = ui.available_width();
+                let footer_height = if saved_settings_kind.is_some() {
+                    42.0
+                } else {
+                    0.0
+                };
+                let scroll_height = (ui.available_height() - footer_height).max(0.0);
                 egui::ScrollArea::vertical()
                     .max_width(content_width)
+                    .max_height(scroll_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(content_width);
@@ -9773,7 +9946,43 @@ impl eframe::App for WaveCraftApp {
                             );
                         }
                     });
+                if let Some(kind) = saved_settings_kind {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(content_width, footer_height),
+                        egui::Layout::bottom_up(egui::Align::Min),
+                        |ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(8.0);
+                                    if ui
+                                        .add_enabled(
+                                            capture_settings_enabled,
+                                            toolbar_action_button(
+                                                &format!("Save {} settings", kind.label()),
+                                                ACCENT,
+                                            )
+                                            .min_size(Vec2::new(136.0, 24.0)),
+                                        )
+                                        .on_hover_text(
+                                            "Replace the saved defaults for this instrument type",
+                                        )
+                                        .clicked()
+                                    {
+                                        save_capture_settings_kind = Some(kind);
+                                    }
+                                },
+                            );
+                            ui.add_space(6.0);
+                            ui.separator();
+                        },
+                    );
+                }
             });
+
+        if let Some(kind) = save_capture_settings_kind {
+            self.save_capture_settings(kind);
+        }
 
         paint_protocol_analyzer_modal(
             context,
@@ -11166,6 +11375,400 @@ fn insert_channel_name_metadata(
     }
 }
 
+fn parse_logic_acquisition_mode(value: &str) -> Option<AcquisitionMode> {
+    match value {
+        "single" => Some(AcquisitionMode::Single),
+        "repetitive" => Some(AcquisitionMode::Repetitive),
+        "loop" => Some(AcquisitionMode::Loop),
+        "run" => Some(AcquisitionMode::Run),
+        _ => None,
+    }
+}
+
+fn saved_logic_settings_metadata(
+    settings: LogicCaptureSettings,
+    acquisition_mode: AcquisitionMode,
+    repetitive_interval_seconds: f32,
+    smart_timing_enabled: bool,
+    channel_names: &[String; LOGIC_CHANNEL_COUNT],
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "logic.sample_rate_hz".to_owned(),
+        settings.sample_rate_hz.to_string(),
+    );
+    metadata.insert(
+        "logic.sample_count".to_owned(),
+        settings.sample_count.to_string(),
+    );
+    metadata.insert(
+        "logic.operation_mode".to_owned(),
+        match settings.operation_mode {
+            DsLogicOperationMode::Buffer => "buffer",
+            DsLogicOperationMode::Stream => "stream",
+            DsLogicOperationMode::InternalTest => "internal_test",
+        }
+        .to_owned(),
+    );
+    metadata.insert(
+        "logic.stop_option".to_owned(),
+        match settings.stop_option {
+            DsLogicStopOption::StopImmediately => "stop_immediately",
+            DsLogicStopOption::UploadCapturedData => "upload_captured_data",
+        }
+        .to_owned(),
+    );
+    metadata.insert(
+        "logic.threshold_voltage".to_owned(),
+        settings.threshold_voltage.to_string(),
+    );
+    metadata.insert(
+        "logic.input_filter".to_owned(),
+        match settings.input_filter {
+            DsLogicInputFilter::None => "none",
+            DsLogicInputFilter::OneSampleClock => "one_sample_clock",
+        }
+        .to_owned(),
+    );
+    for (key, value) in [
+        ("logic.rle_enabled", settings.rle_enabled),
+        ("logic.external_clock", settings.external_clock),
+        ("logic.falling_clock_edge", settings.falling_clock_edge),
+        ("logic.trigger.enabled", settings.trigger_enabled),
+        ("logic.smart_timing_enabled", smart_timing_enabled),
+    ] {
+        metadata.insert(key.to_owned(), value.to_string());
+    }
+    metadata.insert(
+        "logic.acquisition_mode".to_owned(),
+        match acquisition_mode {
+            AcquisitionMode::Single => "single",
+            AcquisitionMode::Repetitive => "repetitive",
+            AcquisitionMode::Loop => "loop",
+            AcquisitionMode::Run => "run",
+        }
+        .to_owned(),
+    );
+    metadata.insert(
+        "logic.repetitive_interval_seconds".to_owned(),
+        repetitive_interval_seconds.to_string(),
+    );
+    metadata.insert(
+        "logic.trigger.mode".to_owned(),
+        match settings.trigger_mode {
+            LogicTriggerMode::Simple => "simple",
+            LogicTriggerMode::Smart => "smart",
+        }
+        .to_owned(),
+    );
+    metadata.insert(
+        "logic.trigger.stage_count".to_owned(),
+        settings.smart_trigger_stage_count.to_string(),
+    );
+    for (channel, channel_name) in channel_names.iter().enumerate() {
+        metadata.insert(
+            format!("logic.ch{channel}.enabled"),
+            settings.enabled_channels[channel].to_string(),
+        );
+        metadata.insert(
+            format!("logic.ch{channel}.maximum_height"),
+            settings.maximum_heights[channel].to_string(),
+        );
+        metadata.insert(
+            format!("logic.ch{channel}.name"),
+            normalized_channel_name(channel_name),
+        );
+        if let Some(condition) = settings.trigger_conditions[channel] {
+            metadata.insert(
+                format!("logic.trigger.ch{channel}.condition"),
+                logic_trigger_condition_key(condition).to_owned(),
+            );
+        }
+        for stage in 0..DSLOGIC_TRIGGER_STAGE_COUNT {
+            if let Some(condition) = settings.smart_trigger_conditions[stage][channel] {
+                metadata.insert(
+                    format!("logic.trigger.stage{stage}.ch{channel}.condition"),
+                    logic_trigger_condition_key(condition).to_owned(),
+                );
+            }
+        }
+    }
+    metadata
+}
+
+fn saved_scope_settings_metadata(
+    settings: ScopeCaptureSettings,
+    auto_sample_rate: bool,
+    smart_timing_enabled: bool,
+    channel_names: &[String; 2],
+    channel_colors: [Color32; 2],
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "scope.sample_rate_hz".to_owned(),
+        settings.sample_rate_hz.to_string(),
+    );
+    metadata.insert(
+        "scope.sample_count".to_owned(),
+        settings.sample_count.to_string(),
+    );
+    metadata.insert(
+        "scope.auto_sample_rate".to_owned(),
+        auto_sample_rate.to_string(),
+    );
+    metadata.insert(
+        "scope.smart_timing_enabled".to_owned(),
+        smart_timing_enabled.to_string(),
+    );
+    metadata.insert(
+        "scope.operation_mode".to_owned(),
+        match settings.operation_mode {
+            DsCopeOperationMode::Normal => "normal",
+            DsCopeOperationMode::InternalTest => "internal_test",
+        }
+        .to_owned(),
+    );
+    metadata.insert(
+        "scope.bandwidth_limit".to_owned(),
+        match settings.bandwidth_limit {
+            DsCopeBandwidthLimit::Full => "full",
+            DsCopeBandwidthLimit::Mhz20 => "20_mhz",
+        }
+        .to_owned(),
+    );
+    let trigger = settings.trigger;
+    metadata.insert(
+        "scope.trigger.position_percent".to_owned(),
+        trigger.position_percent.to_string(),
+    );
+    metadata.insert(
+        "scope.trigger.source".to_owned(),
+        match trigger.source {
+            DsCopeTriggerSource::Auto => "auto",
+            DsCopeTriggerSource::ChannelZero => "ch0",
+            DsCopeTriggerSource::ChannelOne => "ch1",
+            DsCopeTriggerSource::ChannelZeroAndOne => "ch0_and_ch1",
+            DsCopeTriggerSource::ChannelZeroOrOne => "ch0_or_ch1",
+        }
+        .to_owned(),
+    );
+    metadata.insert(
+        "scope.trigger.auto_channel".to_owned(),
+        trigger.auto_channel.to_string(),
+    );
+    metadata.insert(
+        "scope.trigger.slope".to_owned(),
+        match trigger.slope {
+            DsCopeTriggerSlope::Rising => "rising",
+            DsCopeTriggerSlope::Falling => "falling",
+        }
+        .to_owned(),
+    );
+    metadata.insert(
+        "scope.trigger.holdoff_ns".to_owned(),
+        trigger.holdoff_ns.to_string(),
+    );
+    metadata.insert(
+        "scope.trigger.noise_sensitivity".to_owned(),
+        trigger.noise_sensitivity.to_string(),
+    );
+    for (index, channel) in settings.channels.iter().enumerate() {
+        metadata.insert(
+            format!("scope.ch{index}.enabled"),
+            channel.enabled.to_string(),
+        );
+        metadata.insert(
+            format!("scope.ch{index}.volts_per_div_mv"),
+            channel.volts_per_div_mv.to_string(),
+        );
+        metadata.insert(
+            format!("scope.ch{index}.coupling"),
+            coupling_label(channel.coupling).to_ascii_lowercase(),
+        );
+        metadata.insert(
+            format!("scope.ch{index}.probe_attenuation"),
+            channel.probe_attenuation.to_string(),
+        );
+        metadata.insert(
+            format!("scope.ch{index}.vertical_offset"),
+            channel.vertical_offset.to_string(),
+        );
+        metadata.insert(
+            format!("scope.trigger.ch{index}.level"),
+            trigger.levels[index].to_string(),
+        );
+        metadata.insert(
+            format!("scope.ch{index}.name"),
+            normalized_channel_name(&channel_names[index]),
+        );
+        metadata.insert(
+            format!("scope.ch{index}.color"),
+            color_string(channel_colors[index]),
+        );
+    }
+    metadata
+}
+
+fn saved_radio_settings_metadata(settings: &RadioSettings) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    for (key, value) in [
+        (
+            "radio.center_frequency_hz",
+            settings.capture.center_frequency_hz.to_string(),
+        ),
+        (
+            "radio.sample_rate_hz",
+            settings.capture.sample_rate_hz.to_string(),
+        ),
+        (
+            "radio.bandwidth_hz",
+            settings.capture.bandwidth_hz.to_string(),
+        ),
+        (
+            "radio.receive_channel",
+            settings.capture.receive_channel.to_string(),
+        ),
+        (
+            "radio.single_duration_millis",
+            settings.single_duration_millis.to_string(),
+        ),
+        (
+            "radio.trigger_enabled",
+            settings.trigger_enabled.to_string(),
+        ),
+        (
+            "radio.trigger_posttrigger_micros",
+            settings.trigger_posttrigger_micros.to_string(),
+        ),
+        (
+            "radio.trigger_level_dbfs_tenths",
+            settings.trigger_level_dbfs_tenths.to_string(),
+        ),
+        (
+            "radio.frequency_correction_milli_ppm",
+            settings.frequency_correction_milli_ppm.to_string(),
+        ),
+        (
+            "radio.iq_correction_enabled",
+            settings.iq_correction_enabled.to_string(),
+        ),
+        (
+            "radio.amplifier_enabled",
+            settings.amplifier_enabled.to_string(),
+        ),
+        (
+            "radio.antenna_power_enabled",
+            settings.antenna_power_enabled.to_string(),
+        ),
+        (
+            "radio.analyzer.enabled",
+            settings.analyzer.enabled.to_string(),
+        ),
+        (
+            "radio.analyzer.demodulation",
+            match settings.analyzer.demodulation {
+                RadioDemodulation::BinaryFsk => "fsk2",
+                RadioDemodulation::BinaryGfsk => "gfsk2",
+            }
+            .to_owned(),
+        ),
+        (
+            "radio.analyzer.channel_offset_hz",
+            settings.analyzer.channel_offset_hz.to_string(),
+        ),
+        (
+            "radio.analyzer.channel_bandwidth_hz",
+            settings.analyzer.channel_bandwidth_hz.to_string(),
+        ),
+        (
+            "radio.analyzer.output_sample_rate_hz",
+            settings.analyzer.output_sample_rate_hz.to_string(),
+        ),
+        (
+            "radio.analyzer.filter_tap_count",
+            settings.analyzer.filter_tap_count.to_string(),
+        ),
+        (
+            "radio.analyzer.symbol_rate_hz",
+            settings.analyzer.symbol_rate_hz.to_string(),
+        ),
+        (
+            "radio.analyzer.deviation_hz",
+            settings.analyzer.deviation_hz.to_string(),
+        ),
+        (
+            "radio.analyzer.gfsk_bt_milli",
+            settings.analyzer.gfsk_bt_milli.to_string(),
+        ),
+        (
+            "radio.analyzer.inverted",
+            settings.analyzer.inverted.to_string(),
+        ),
+        (
+            "radio.analyzer.adaptive_timing",
+            settings.analyzer.adaptive_timing.to_string(),
+        ),
+        (
+            "radio.analyzer.timing_loop_bandwidth_milli",
+            settings.analyzer.timing_loop_bandwidth_milli.to_string(),
+        ),
+        (
+            "radio.analyzer.max_clock_error_ppm",
+            settings.analyzer.max_clock_error_ppm.to_string(),
+        ),
+        (
+            "radio.analyzer.preamble_byte",
+            settings.analyzer.preamble_byte.to_string(),
+        ),
+        (
+            "radio.analyzer.preamble_bytes",
+            settings.analyzer.preamble_bytes.to_string(),
+        ),
+        (
+            "radio.analyzer.sync_word",
+            settings.analyzer.sync_word.to_string(),
+        ),
+        (
+            "radio.analyzer.sync_word_bytes",
+            settings.analyzer.sync_word_bytes.to_string(),
+        ),
+        (
+            "radio.analyzer.maximum_preamble_bit_errors",
+            settings.analyzer.maximum_preamble_bit_errors.to_string(),
+        ),
+        (
+            "radio.analyzer.minimum_bit_confidence_milli",
+            settings.analyzer.minimum_bit_confidence_milli.to_string(),
+        ),
+        (
+            "radio.analyzer.maximum_uncertain_bits",
+            settings.analyzer.maximum_uncertain_bits.to_string(),
+        ),
+    ] {
+        metadata.insert(key.to_owned(), value);
+    }
+    for (id, gain_db) in &settings.gains_db {
+        metadata.insert(format!("radio.gain.{id}_db"), gain_db.to_string());
+    }
+    metadata
+}
+
+fn color_string(color: Color32) -> String {
+    let [red, green, blue, alpha] = color.to_array();
+    format!("{red:02x}{green:02x}{blue:02x}{alpha:02x}")
+}
+
+fn parse_color(value: &str) -> Option<Color32> {
+    if value.len() != 8 {
+        return None;
+    }
+    let red = u8::from_str_radix(&value[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&value[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&value[4..6], 16).ok()?;
+    let alpha = u8::from_str_radix(&value[6..8], 16).ok()?;
+    Some(Color32::from_rgba_unmultiplied(red, green, blue, alpha))
+}
+
 struct GuiRecordingSettings<'a> {
     logic_config: DsLogicCaptureConfig,
     logic_settings: LogicCaptureSettings,
@@ -11710,6 +12313,27 @@ fn logic_settings_from_recording_metadata(
             }
         }
     }
+    if metadata.get("logic.trigger.mode").map(String::as_str) == Some("smart") {
+        settings.trigger_conditions = std::array::from_fn(|channel| {
+            metadata
+                .get(&format!("logic.trigger.ch{channel}.condition"))
+                .and_then(|value| parse_logic_trigger_condition(value))
+        });
+    } else {
+        if let Some(stage_count) =
+            recording_metadata_value::<u8>(metadata, "logic.trigger.stage_count")
+        {
+            settings.smart_trigger_stage_count =
+                stage_count.clamp(2, DSLOGIC_TRIGGER_STAGE_COUNT as u8);
+        }
+        settings.smart_trigger_conditions = std::array::from_fn(|stage| {
+            std::array::from_fn(|channel| {
+                metadata
+                    .get(&format!("logic.trigger.stage{stage}.ch{channel}.condition"))
+                    .and_then(|value| parse_logic_trigger_condition(value))
+            })
+        });
+    }
     settings
 }
 
@@ -11717,6 +12341,18 @@ fn scope_settings_from_recording_metadata(
     metadata: &BTreeMap<String, String>,
 ) -> ScopeCaptureSettings {
     let mut settings = ScopeCaptureSettings::default();
+    if let Some(operation_mode) = metadata.get("scope.operation_mode") {
+        settings.operation_mode = match operation_mode.as_str() {
+            "internal_test" => DsCopeOperationMode::InternalTest,
+            _ => DsCopeOperationMode::Normal,
+        };
+    }
+    if let Some(bandwidth_limit) = metadata.get("scope.bandwidth_limit") {
+        settings.bandwidth_limit = match bandwidth_limit.as_str() {
+            "20_mhz" => DsCopeBandwidthLimit::Mhz20,
+            _ => DsCopeBandwidthLimit::Full,
+        };
+    }
     if let Some(sample_rate_hz) = recording_metadata_value::<u64>(metadata, "scope.sample_rate_hz")
     {
         if DSCOPE_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
@@ -11800,6 +12436,13 @@ fn scope_settings_from_recording_metadata(
     if let Some(holdoff_ns) = recording_metadata_value::<u64>(metadata, "scope.trigger.holdoff_ns")
     {
         settings.trigger.holdoff_ns = holdoff_ns.min(DSCOPE_TRIGGER_HOLDOFF_MAX_NS);
+        settings.trigger.holdoff_unit = if settings.trigger.holdoff_ns >= 1_000_000_000 {
+            TriggerHoldoffUnit::Seconds
+        } else if settings.trigger.holdoff_ns >= 1_000_000 {
+            TriggerHoldoffUnit::Milliseconds
+        } else {
+            TriggerHoldoffUnit::Microseconds
+        };
     }
     if let Some(noise_sensitivity) =
         recording_metadata_value::<u8>(metadata, "scope.trigger.noise_sensitivity")
@@ -17243,6 +17886,123 @@ mod tests {
     use std::io::Cursor;
     use wavecraft_core::{Iq8, IqBatch, LogicBatch, ScopeBatch};
     use wavecraft_sdr::RadioProviderAdapter;
+
+    #[test]
+    fn saved_logic_settings_round_trip_independently() {
+        let mut settings = LogicCaptureSettings {
+            sample_rate_hz: 100_000_000,
+            sample_count: 2_000_000,
+            enabled_channels: std::array::from_fn(|channel| channel < 8),
+            maximum_heights: std::array::from_fn(|channel| (channel % 5 + 1) as u8),
+            operation_mode: DsLogicOperationMode::Buffer,
+            stop_option: DsLogicStopOption::StopImmediately,
+            threshold_voltage: 2.5,
+            input_filter: DsLogicInputFilter::OneSampleClock,
+            rle_enabled: true,
+            external_clock: true,
+            falling_clock_edge: true,
+            trigger_enabled: true,
+            trigger_mode: LogicTriggerMode::Smart,
+            trigger_conditions: [None; LOGIC_CHANNEL_COUNT],
+            smart_trigger_stage_count: 3,
+            smart_trigger_conditions: [[None; LOGIC_CHANNEL_COUNT]; DSLOGIC_TRIGGER_STAGE_COUNT],
+        };
+        settings.smart_trigger_conditions[0][0] = Some(DsLogicTriggerCondition::RisingEdge);
+        settings.smart_trigger_conditions[1][1] = Some(DsLogicTriggerCondition::High);
+        settings.smart_trigger_conditions[2][2] = Some(DsLogicTriggerCondition::FallingEdge);
+        let channel_names = std::array::from_fn(|channel| format!("L{channel}"));
+
+        let metadata = saved_logic_settings_metadata(
+            settings,
+            AcquisitionMode::Repetitive,
+            2.5,
+            false,
+            &channel_names,
+        );
+
+        assert_eq!(logic_settings_from_recording_metadata(&metadata), settings);
+        assert_eq!(metadata["logic.acquisition_mode"], "repetitive".to_owned());
+        assert_eq!(metadata["logic.repetitive_interval_seconds"], "2.5");
+        assert_eq!(metadata["logic.smart_timing_enabled"], "false");
+        assert_eq!(
+            channel_names_from_recording_metadata(&metadata).0,
+            channel_names
+        );
+    }
+
+    #[test]
+    fn saved_scope_settings_round_trip_independently() {
+        let settings = ScopeCaptureSettings {
+            sample_rate_hz: 500_000_000,
+            sample_count: 1_000_000,
+            channels: [
+                ScopeChannelSettings {
+                    enabled: true,
+                    volts_per_div_mv: 500,
+                    coupling: DsCopeCoupling::Ac,
+                    probe_attenuation: 10,
+                    vertical_offset: 120,
+                },
+                ScopeChannelSettings {
+                    enabled: true,
+                    volts_per_div_mv: 2_000,
+                    coupling: DsCopeCoupling::Dc,
+                    probe_attenuation: 100,
+                    vertical_offset: 140,
+                },
+            ],
+            trigger: ScopeTriggerSettings {
+                position_percent: 70,
+                source: DsCopeTriggerSource::ChannelZeroOrOne,
+                auto_channel: 1,
+                slope: DsCopeTriggerSlope::Falling,
+                holdoff_ns: 2_000_000,
+                holdoff_unit: TriggerHoldoffUnit::Milliseconds,
+                noise_sensitivity: 4,
+                levels: [100, 140],
+            },
+            operation_mode: DsCopeOperationMode::InternalTest,
+            bandwidth_limit: DsCopeBandwidthLimit::Mhz20,
+        };
+        let names = ["Input".to_owned(), "Reference".to_owned()];
+        let colors = [Color32::RED, Color32::BLUE];
+
+        let metadata = saved_scope_settings_metadata(settings, false, true, &names, colors);
+
+        assert_eq!(scope_settings_from_recording_metadata(&metadata), settings);
+        assert_eq!(metadata["scope.auto_sample_rate"], "false");
+        assert_eq!(metadata["scope.smart_timing_enabled"], "true");
+        assert_eq!(channel_names_from_recording_metadata(&metadata).1, names);
+        assert_eq!(parse_color(&metadata["scope.ch0.color"]), Some(colors[0]));
+        assert_eq!(parse_color(&metadata["scope.ch1.color"]), Some(colors[1]));
+    }
+
+    #[test]
+    fn saved_rf_settings_round_trip_independently() {
+        let mut settings = RadioSettings::default();
+        settings.capture.center_frequency_hz = 915_000_000;
+        settings.capture.sample_rate_hz = 10_000_000;
+        settings.capture.bandwidth_hz = 8_000_000;
+        settings.single_duration_millis = 2_500;
+        settings.trigger_enabled = true;
+        settings.trigger_posttrigger_micros = 25_000;
+        settings.trigger_level_dbfs_tenths = -350;
+        settings.frequency_correction_milli_ppm = 1_250;
+        settings.iq_correction_enabled = false;
+        settings.amplifier_enabled = true;
+        settings.antenna_power_enabled = true;
+        settings.gains_db.insert("lna".to_owned(), 24);
+        settings.gains_db.insert("vga".to_owned(), 20);
+        settings.analyzer.enabled = true;
+        settings.analyzer.demodulation = RadioDemodulation::BinaryFsk;
+        settings.analyzer.channel_offset_hz = 125_000;
+        settings.analyzer.sync_word = 0xd391;
+        settings.analyzer.sync_word_bytes = 2;
+
+        let metadata = saved_radio_settings_metadata(&settings);
+
+        assert_eq!(radio_settings_from_recording_metadata(&metadata), settings);
+    }
 
     #[test]
     fn motor_controller_example_recording_opens_and_decodes() {
