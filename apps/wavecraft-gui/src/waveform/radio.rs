@@ -14,6 +14,8 @@ const RADIO_PANE_DIVIDER_HEIGHT: f32 = 12.0;
 const MIN_SPECTRUM_HEIGHT: f32 = 120.0;
 const MIN_WATERFALL_HEIGHT: f32 = 80.0;
 const MIN_RAW_DATA_HEIGHT: f32 = 80.0;
+const RADIO_FREQUENCY_AXIS_LEFT_MARGIN: f32 = 48.0;
+const RADIO_FREQUENCY_AXIS_RIGHT_MARGIN: f32 = 10.0;
 const WATERFALL_HISTORY_HINT: &str = "Rows are the newest spectrum snapshots retained for the visible waterfall. Dropped counts older display rows discarded after this bounded history filled; it does not indicate lost HackRF or IQ samples.";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -564,10 +566,7 @@ impl RadioViewState {
             true,
         )
         .on_hover_text(WATERFALL_HISTORY_HINT);
-        let image_rect = Rect::from_min_max(
-            Pos2::new(rect.left() + 8.0, title_rect.bottom()),
-            Pos2::new(rect.right() - 8.0, rect.bottom() - 6.0),
-        );
+        let image_rect = radio_frequency_axis_rect(rect, title_rect.bottom(), rect.bottom() - 6.0);
         let Some(newest) = store.newest_spectrum() else {
             ui.painter().text(
                 image_rect.center(),
@@ -1175,10 +1174,7 @@ fn paint_spectrum(
 ) {
     ui.painter()
         .rect_filled(rect, 0.0, Color32::from_rgb(12, 16, 22));
-    let plot = Rect::from_min_max(
-        Pos2::new(rect.left() + 48.0, rect.top() + 10.0),
-        Pos2::new(rect.right() - 10.0, rect.bottom() - 24.0),
-    );
+    let plot = radio_frequency_axis_rect(rect, rect.top() + 10.0, rect.bottom() - 24.0);
     if plot.width() <= 1.0 || plot.height() <= 1.0 {
         return;
     }
@@ -1335,6 +1331,13 @@ fn paint_spectrum(
         trigger_level_dbfs_tenths,
         trigger_controls_enabled,
     );
+}
+
+fn radio_frequency_axis_rect(bounds: Rect, top: f32, bottom: f32) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(bounds.left() + RADIO_FREQUENCY_AXIS_LEFT_MARGIN, top),
+        Pos2::new(bounds.right() - RADIO_FREQUENCY_AXIS_RIGHT_MARGIN, bottom),
+    )
 }
 
 fn radio_trigger_level_y(plot: Rect, level_dbfs_tenths: i16) -> f32 {
@@ -1561,6 +1564,19 @@ mod tests {
         assert!(resized.0 > default.0);
         assert!(resized.2 > default.2);
         assert!(resized.1 < default.1);
+    }
+
+    #[test]
+    fn spectrum_and_waterfall_share_the_same_frequency_axis() {
+        let bounds = Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(800.0, 400.0));
+        let spectrum = radio_frequency_axis_rect(bounds, 40.0, 200.0);
+        let waterfall = radio_frequency_axis_rect(bounds, 230.0, 420.0);
+
+        assert_eq!(spectrum.left(), waterfall.left());
+        assert_eq!(spectrum.right(), waterfall.right());
+        assert_eq!(spectrum.width(), waterfall.width());
+        assert_eq!(spectrum.left(), bounds.left() + 48.0);
+        assert_eq!(spectrum.right(), bounds.right() - 10.0);
     }
 
     #[test]
