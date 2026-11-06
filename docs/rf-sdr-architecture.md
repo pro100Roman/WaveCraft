@@ -383,6 +383,13 @@ dynamically, and recordings/projects persist the tagged profile and component
 versions. Adding a modulation must not change the raw IQ, channelizer,
 recording, or RF-view contracts.
 
+The Signal Analyzer modulation selector includes **None**, which disables the
+analyzer and hides all analyzer parameters and the **Analyzer channels**
+section. Selecting a concrete modulation reveals only its shared and
+modulation-specific controls; for example, Gaussian BT is visible only for
+GFSK. Legacy saved settings with the former analyzer-enable flag disabled load
+as **None**.
+
 The implementation boundary is conceptually:
 
 ```rust
@@ -673,8 +680,9 @@ the fixed **PN9** preset used by standard SX127x FSK packet whitening. PN9 uses
 the x⁹ + x⁵ + 1 polynomial and resets to seed `0x1FF` after each sync word.
 Named presets hide the manual LFSR fields while retaining custom values for
 later reuse.
-The **Analyzer channels** section follows the common **Signal analyzer**
-section and provides editable names plus add, remove, and offset controls.
+When a modulation is selected, the **Analyzer channels** section follows the
+common **Signal analyzer** section and provides editable names plus add,
+remove, and offset controls.
 Capture profiles and recording metadata retain the bounded ordered channel
 list and its names; legacy recordings without names receive numbered defaults,
 and a legacy `channel_offset_hz` loads as a one-channel list. RAW DATA and

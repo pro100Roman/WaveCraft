@@ -3382,6 +3382,7 @@ struct RadioSettings {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RadioDemodulation {
+    None,
     BinaryFsk,
     BinaryGfsk,
 }
@@ -3438,7 +3439,6 @@ impl RadioAnalyzerChannelSettings {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RadioAnalyzerSettings {
-    enabled: bool,
     demodulation: RadioDemodulation,
     channels: Vec<RadioAnalyzerChannelSettings>,
     channel_bandwidth_hz: u64,
@@ -3474,10 +3474,9 @@ struct RadioAnalyzerSettings {
 impl Default for RadioAnalyzerSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
-            demodulation: RadioDemodulation::BinaryGfsk,
+            demodulation: RadioDemodulation::None,
             // Capture both observed 868.1/868.5 MHz channels around 868.3 MHz;
-            // start with the 868.1 MHz channel selected for demodulation.
+            // retain 868.1 MHz as the first channel if analysis is enabled.
             channels: vec![RadioAnalyzerChannelSettings::numbered(0, -200_000)],
             channel_bandwidth_hz: 200_000,
             output_sample_rate_hz: 512_000,
@@ -3512,6 +3511,10 @@ impl Default for RadioAnalyzerSettings {
 }
 
 impl RadioAnalyzerSettings {
+    fn is_enabled(&self) -> bool {
+        self.demodulation != RadioDemodulation::None
+    }
+
     fn channel_name(&self, index: usize) -> String {
         self.channels
             .get(index)
@@ -3608,7 +3611,7 @@ impl RadioAnalyzerSettings {
     }
 
     fn signal_profiles(&self) -> Result<Vec<SignalAnalyzerProfile>, String> {
-        if !self.enabled {
+        if !self.is_enabled() {
             return Ok(Vec::new());
         }
         if self.channels.is_empty() || self.channels.len() > MAX_RADIO_ANALYZER_CHANNELS {
@@ -3638,6 +3641,7 @@ impl RadioAnalyzerSettings {
             FskPolarity::Normal
         };
         let demodulation = match self.demodulation {
+            RadioDemodulation::None => return Ok(Vec::new()),
             RadioDemodulation::BinaryFsk => DemodulationProfile::BinaryFsk(BinaryFskProfile {
                 symbol_rate_hz: self.symbol_rate_hz,
                 deviation_hz: self.deviation_hz,
@@ -4271,7 +4275,11 @@ impl WaveCraftApp {
                 "signal analyzer channel offset lies outside the captured RF span".to_owned(),
             );
         }
-        let decoder_config = self.radio_settings.analyzer.decoder_config()?;
+        let decoder_config = if analyzer_profiles.is_empty() {
+            RadioDataDecoderConfig::Raw(self.radio_settings.analyzer.raw_config())
+        } else {
+            self.radio_settings.analyzer.decoder_config()?
+        };
         Ok(RadioCaptureRequest {
             device,
             settings,
@@ -9171,18 +9179,20 @@ fn paint_radio_capture_settings(
                         enabled,
                     );
                 });
-            ui.separator();
-            egui::CollapsingHeader::new(RichText::new("Analyzer channels").strong())
-                .id_salt("radio_analyzer_channels_section")
-                .default_open(true)
-                .show(ui, |ui| {
-                    paint_radio_analyzer_channels(
-                        ui,
-                        &mut settings.analyzer,
-                        settings.capture.sample_rate_hz,
-                        enabled,
-                    );
-                });
+            if settings.analyzer.is_enabled() {
+                ui.separator();
+                egui::CollapsingHeader::new(RichText::new("Analyzer channels").strong())
+                    .id_salt("radio_analyzer_channels_section")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        paint_radio_analyzer_channels(
+                            ui,
+                            &mut settings.analyzer,
+                            settings.capture.sample_rate_hz,
+                            enabled,
+                        );
+                    });
+            }
             show_save_button
                 && paint_capture_settings_save_button(
                     ui,
@@ -9267,29 +9277,23 @@ fn paint_radio_analyzer_configuration(
         .show(ui, |ui| {
             paint_radio_parameter_label(
                 ui,
-                "Enable analyzer",
-                Some("Channelize captured IQ and run the selected demodulator"),
-            );
-            ui.add_enabled(
-                enabled,
-                egui::Checkbox::without_text(&mut settings.enabled),
-            );
-            ui.end_row();
-
-            let controls_enabled = enabled && settings.enabled;
-            paint_radio_parameter_label(
-                ui,
                 "Modulation",
-                Some("Selects a modulation-specific profile; unrelated parameters remain hidden"),
+                Some("None disables signal analysis; each modulation shows only its applicable parameters"),
             );
-            ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.add_enabled_ui(enabled, |ui| {
                 egui::ComboBox::from_id_salt("radio_analyzer_modulation")
                     .width(RADIO_VALUE_WIDTH)
                     .selected_text(match settings.demodulation {
+                        RadioDemodulation::None => "None",
                         RadioDemodulation::BinaryFsk => "2-FSK",
                         RadioDemodulation::BinaryGfsk => "GFSK",
                     })
                     .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut settings.demodulation,
+                            RadioDemodulation::None,
+                            "None",
+                        );
                         ui.selectable_value(
                             &mut settings.demodulation,
                             RadioDemodulation::BinaryFsk,
@@ -9303,6 +9307,18 @@ fn paint_radio_analyzer_configuration(
                     });
             });
             ui.end_row();
+        });
+
+    if !settings.is_enabled() {
+        return;
+    }
+
+    let controls_enabled = enabled;
+    egui::Grid::new("radio_signal_analyzer_parameters")
+        .num_columns(2)
+        .max_col_width(126.0)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
 
             paint_radio_parameter_label(ui, "Polarity", Some("Swaps mark and space decisions"));
             ui.add_enabled_ui(controls_enabled, |ui| {
@@ -9878,7 +9894,7 @@ fn paint_radio_analyzer_configuration(
 
         });
 
-    if settings.enabled {
+    if settings.is_enabled() {
         if let Err(error) = settings.signal_profiles() {
             ui.add(
                 egui::Label::new(RichText::new(error).small().color(Color32::LIGHT_RED))
@@ -9899,7 +9915,7 @@ fn paint_radio_analyzer_channels(
     capture_sample_rate_hz: u64,
     enabled: bool,
 ) {
-    let controls_enabled = enabled && settings.enabled;
+    let controls_enabled = enabled && settings.is_enabled();
     let half_span_hz = i64::try_from(capture_sample_rate_hz / 2).unwrap_or(i64::MAX);
     let half_span_mhz = capture_sample_rate_hz as f64 / 2_000_000.0;
     let can_remove = settings.channels.len() > 1;
@@ -11778,7 +11794,10 @@ impl eframe::App for WaveCraftApp {
                                         &waveforms.radio,
                                         &waveforms.radio_analysis,
                                         RadioViewOptions {
-                                            analysis_enabled: self.radio_settings.analyzer.enabled,
+                                            analysis_enabled: self
+                                                .radio_settings
+                                                .analyzer
+                                                .is_enabled(),
                                             packet_mode: self.radio_settings.analyzer.data_mode
                                                 == RadioDataMode::Packets,
                                             trigger_level_dbfs_tenths:
@@ -12750,11 +12769,12 @@ fn saved_radio_settings_metadata(settings: &RadioSettings) -> BTreeMap<String, S
         ),
         (
             "radio.analyzer.enabled",
-            settings.analyzer.enabled.to_string(),
+            settings.analyzer.is_enabled().to_string(),
         ),
         (
             "radio.analyzer.demodulation",
             match settings.analyzer.demodulation {
+                RadioDemodulation::None => "none",
                 RadioDemodulation::BinaryFsk => "fsk2",
                 RadioDemodulation::BinaryGfsk => "gfsk2",
             }
@@ -13024,11 +13044,12 @@ fn start_gui_recording(
     );
     metadata.insert(
         "radio.analyzer.enabled".to_owned(),
-        radio_settings.analyzer.enabled.to_string(),
+        radio_settings.analyzer.is_enabled().to_string(),
     );
     metadata.insert(
         "radio.analyzer.demodulation".to_owned(),
         match radio_settings.analyzer.demodulation {
+            RadioDemodulation::None => "none",
             RadioDemodulation::BinaryFsk => "fsk2",
             RadioDemodulation::BinaryGfsk => "gfsk2",
         }
@@ -13781,15 +13802,21 @@ fn radio_settings_from_recording_metadata(metadata: &BTreeMap<String, String>) -
     if let Some(value) = recording_metadata_value(metadata, "radio.antenna_power_enabled") {
         settings.antenna_power_enabled = value;
     }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.enabled") {
-        settings.analyzer.enabled = value;
-    }
-    if let Some(value) = metadata.get("radio.analyzer.demodulation") {
-        settings.analyzer.demodulation = match value.as_str() {
+    let legacy_analyzer_enabled =
+        recording_metadata_value::<bool>(metadata, "radio.analyzer.enabled");
+    settings.analyzer.demodulation = if legacy_analyzer_enabled == Some(false) {
+        RadioDemodulation::None
+    } else if let Some(value) = metadata.get("radio.analyzer.demodulation") {
+        match value.as_str() {
+            "none" => RadioDemodulation::None,
             "gfsk2" => RadioDemodulation::BinaryGfsk,
             _ => RadioDemodulation::BinaryFsk,
-        };
-    }
+        }
+    } else if legacy_analyzer_enabled == Some(true) {
+        RadioDemodulation::BinaryGfsk
+    } else {
+        RadioDemodulation::None
+    };
     if let Some(channel_count) =
         recording_metadata_value::<usize>(metadata, "radio.analyzer.channel_count")
     {
@@ -14184,7 +14211,6 @@ fn read_gui_decoded_data(input: impl BufRead) -> Result<LoadedRecording, String>
     radio_settings.capture.center_frequency_hz = session.center_frequency_hz;
     radio_settings.capture.sample_rate_hz = session.sample_rate_hz;
     radio_settings.capture.bandwidth_hz = session.bandwidth_hz;
-    radio_settings.analyzer.enabled = true;
     radio_settings.analyzer.data_mode = session.data_mode;
     if !session.channels.is_empty() {
         radio_settings.analyzer.channels = session
@@ -19527,7 +19553,6 @@ mod tests {
         settings.antenna_power_enabled = true;
         settings.gains_db.insert("lna".to_owned(), 24);
         settings.gains_db.insert("vga".to_owned(), 20);
-        settings.analyzer.enabled = true;
         settings.analyzer.demodulation = RadioDemodulation::BinaryFsk;
         settings.analyzer.channels = vec![
             RadioAnalyzerChannelSettings {
@@ -19701,16 +19726,14 @@ mod tests {
     }
 
     #[test]
-    fn radio_defaults_match_the_initial_gfsk_profile() {
+    fn radio_defaults_start_with_signal_analysis_disabled() {
         let settings = RadioSettings::default();
 
         assert_eq!(settings.capture.center_frequency_hz, 868_300_000);
         assert_eq!(settings.capture.sample_rate_hz, 8_000_000);
         assert_eq!(settings.capture.bandwidth_hz, 1_750_000);
-        assert_eq!(
-            settings.analyzer.demodulation,
-            RadioDemodulation::BinaryGfsk
-        );
+        assert_eq!(settings.analyzer.demodulation, RadioDemodulation::None);
+        assert!(!settings.analyzer.is_enabled());
         assert_eq!(settings.analyzer.symbol_rate_hz, 19_200);
         assert_eq!(settings.analyzer.deviation_hz, 35_000);
         assert_eq!(settings.analyzer.channels[0].name, "Channel 1");
@@ -19731,7 +19754,7 @@ mod tests {
     fn analyzer_render_does_not_clamp_values_to_a_temporary_dependent_minimum() {
         let context = egui::Context::default();
         let mut settings = RadioAnalyzerSettings {
-            enabled: true,
+            demodulation: RadioDemodulation::BinaryGfsk,
             output_sample_rate_hz: 0,
             symbol_rate_hz: 19_200,
             deviation_hz: 35_000,
@@ -19824,7 +19847,6 @@ mod tests {
         let mut settings = RadioAnalyzerSettings::default();
         assert!(settings.signal_profiles().unwrap().is_empty());
 
-        settings.enabled = true;
         settings.demodulation = RadioDemodulation::BinaryGfsk;
         settings.channels = vec![
             RadioAnalyzerChannelSettings::numbered(0, 125_000),
@@ -19849,7 +19871,7 @@ mod tests {
     #[test]
     fn radio_analyzer_supports_up_to_one_hundred_unique_channels() {
         let mut settings = RadioAnalyzerSettings {
-            enabled: true,
+            demodulation: RadioDemodulation::BinaryGfsk,
             channels: (0..MAX_RADIO_ANALYZER_CHANNELS)
                 .map(|index| RadioAnalyzerChannelSettings::numbered(index, index as i64 * 1_000))
                 .collect(),
@@ -20071,7 +20093,7 @@ mod tests {
 
         let settings = radio_settings_from_recording_metadata(&metadata).analyzer;
 
-        assert!(settings.enabled);
+        assert!(settings.is_enabled());
         assert_eq!(settings.demodulation, RadioDemodulation::BinaryGfsk);
         assert_eq!(settings.channels[0].name, "Channel 1");
         assert_eq!(settings.channels[0].frequency_offset_hz, -125_000);
@@ -20106,9 +20128,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_disabled_radio_analyzer_loads_as_none() {
+        let metadata = BTreeMap::from([
+            ("radio.analyzer.enabled".to_owned(), "false".to_owned()),
+            ("radio.analyzer.demodulation".to_owned(), "gfsk2".to_owned()),
+        ]);
+
+        let settings = radio_settings_from_recording_metadata(&metadata).analyzer;
+
+        assert_eq!(settings.demodulation, RadioDemodulation::None);
+        assert!(!settings.is_enabled());
+        assert!(settings.signal_profiles().unwrap().is_empty());
+    }
+
+    #[test]
     fn radio_iq_pipeline_runs_the_selected_analyzer() {
-        let mut settings = RadioAnalyzerSettings {
-            enabled: true,
+        let settings = RadioAnalyzerSettings {
+            demodulation: RadioDemodulation::BinaryFsk,
             channels: vec![RadioAnalyzerChannelSettings::numbered(0, 10_000)],
             channel_bandwidth_hz: 4_000,
             output_sample_rate_hz: 8_000,
@@ -20118,7 +20154,6 @@ mod tests {
             adaptive_timing: false,
             ..RadioAnalyzerSettings::default()
         };
-        settings.demodulation = RadioDemodulation::BinaryFsk;
         let profile = settings.signal_profiles().unwrap().remove(0);
         let mut analyzers = RadioAnalyzerBank::new(vec![RadioAnalyzerRuntime::new(
             profile,
