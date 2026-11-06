@@ -99,6 +99,29 @@ use wavecraft_usb::{
 };
 use waveform::radio::{RadioAnalysisStore, RadioDisplayStore, RadioViewOptions, RadioViewState};
 
+pub(crate) trait SelectableHoverText {
+    fn on_hover_selectable_text(self, text: impl Into<egui::WidgetText>) -> Self;
+    fn on_disabled_hover_selectable_text(self, text: impl Into<egui::WidgetText>) -> Self;
+}
+
+impl SelectableHoverText for egui::Response {
+    fn on_hover_selectable_text(self, text: impl Into<egui::WidgetText>) -> Self {
+        let text = text.into();
+        self.on_hover_ui(move |ui| add_selectable_tooltip(ui, text))
+    }
+
+    fn on_disabled_hover_selectable_text(self, text: impl Into<egui::WidgetText>) -> Self {
+        let text = text.into();
+        self.on_disabled_hover_ui(move |ui| add_selectable_tooltip(ui, text))
+    }
+}
+
+fn add_selectable_tooltip(ui: &mut egui::Ui, text: egui::WidgetText) {
+    ui.set_max_width(ui.spacing().tooltip_width);
+    ui.style_mut().interaction.selectable_labels = true;
+    ui.add(egui::Label::new(text).selectable(true));
+}
+
 const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
 const BUILD_VERSION_LABEL: &str = concat!("Version: ", env!("WAVECRAFT_BUILD_VERSION"));
@@ -125,6 +148,47 @@ struct CpuLoadMonitor {
     last_wall_time: Instant,
     last_process_time: Option<Duration>,
     load_percent: Option<f64>,
+}
+
+#[derive(Debug)]
+struct MemoryUsageMonitor {
+    last_sample_time: Instant,
+    resident_bytes: Option<u64>,
+}
+
+impl MemoryUsageMonitor {
+    fn new() -> Self {
+        Self {
+            last_sample_time: Instant::now(),
+            resident_bytes: process_resident_memory_bytes(),
+        }
+    }
+
+    fn update(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_sample_time) < CPU_LOAD_SAMPLE_INTERVAL {
+            return;
+        }
+        self.resident_bytes = process_resident_memory_bytes();
+        self.last_sample_time = now;
+    }
+
+    fn label(&self) -> String {
+        const KIBIBYTE: f64 = 1024.0;
+        const MEBIBYTE: f64 = KIBIBYTE * 1024.0;
+        const GIBIBYTE: f64 = MEBIBYTE * 1024.0;
+
+        match self.resident_bytes {
+            Some(bytes) if bytes as f64 >= GIBIBYTE => {
+                format!("RAM {:.2} GiB", bytes as f64 / GIBIBYTE)
+            }
+            Some(bytes) if bytes as f64 >= MEBIBYTE => {
+                format!("RAM {:.1} MiB", bytes as f64 / MEBIBYTE)
+            }
+            Some(bytes) => format!("RAM {:.0} KiB", bytes as f64 / KIBIBYTE),
+            None => "RAM —".to_owned(),
+        }
+    }
 }
 
 impl CpuLoadMonitor {
@@ -213,6 +277,55 @@ fn process_cpu_time() -> Option<Duration> {
 fn process_cpu_time() -> Option<Duration> {
     None
 }
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc exposes the Mach task port without another platform dependency.
+fn process_resident_memory_bytes() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info_data_t>::zeroed();
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    let result = unsafe {
+        libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    if result != libc::KERN_SUCCESS {
+        return None;
+    }
+    Some(unsafe { info.assume_init() }.resident_size)
+}
+
+#[cfg(target_os = "linux")]
+fn process_resident_memory_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    resident_pages.checked_mul(page_size)
+}
+
+#[cfg(windows)]
+fn process_resident_memory_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>()).ok()?,
+        ..PROCESS_MEMORY_COUNTERS::default()
+    };
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) } == 0 {
+        return None;
+    }
+    u64::try_from(counters.WorkingSetSize).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn process_resident_memory_bytes() -> Option<u64> {
+    None
+}
 const SCOPE_ADC_VERTICAL_DIVISIONS: f32 = 10.0;
 const SCOPE_DOWNSAMPLE_MIN_SAMPLES_PER_PIXEL: usize = 4;
 const SCOPE_CONFIGURATION_DEBOUNCE: Duration = Duration::from_millis(350);
@@ -245,6 +358,21 @@ fn empty_scope_channel_names() -> [String; 2] {
 
 fn normalized_channel_name(name: &str) -> String {
     name.trim().chars().take(CHANNEL_NAME_MAX_CHARS).collect()
+}
+
+pub(crate) fn format_capture_timestamp(sample_index: u64, sample_rate_hz: u64) -> String {
+    if sample_rate_hz == 0 {
+        return "--:--:--.---".to_owned();
+    }
+    let total_milliseconds =
+        u128::from(sample_index).saturating_mul(1_000) / u128::from(sample_rate_hz);
+    let milliseconds = total_milliseconds % 1_000;
+    let total_seconds = total_milliseconds / 1_000;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}")
 }
 
 fn channel_label(prefix: &str, index: usize, name: &str) -> String {
@@ -2308,7 +2436,7 @@ fn paint_decoded_analyzer_messages(
                         entry_id.with("header"),
                         Sense::click(),
                     )
-                    .on_hover_text("Expand or collapse message data");
+                    .on_hover_selectable_text("Expand or collapse message data");
                 if header_response.clicked() {
                     open = !open;
                     ui.data_mut(|data| data.insert_temp(entry_id, open));
@@ -2320,7 +2448,7 @@ fn paint_decoded_analyzer_messages(
                             .wrap()
                             .sense(Sense::click()),
                     )
-                    .on_hover_text("Click to focus this message in the waveform")
+                    .on_hover_selectable_text("Click to focus this message in the waveform")
                     .clicked()
                 } else {
                     false
@@ -2393,7 +2521,7 @@ fn paint_decoded_data_panel(
                                 )
                             })
                             .inner
-                            .on_hover_text(if all_open {
+                            .on_hover_selectable_text(if all_open {
                                 "Collapse all messages for this analyzer"
                             } else {
                                 "Expand all messages for this analyzer"
@@ -3909,6 +4037,7 @@ struct WaveCraftApp {
     radio_capture: Option<CompletedCapture>,
     combined_settings: CombinedSessionSettings,
     cpu_load: CpuLoadMonitor,
+    memory_usage: MemoryUsageMonitor,
     status: String,
     last_error: Option<String>,
 }
@@ -4010,6 +4139,7 @@ impl WaveCraftApp {
                 ..CombinedSessionSettings::default()
             },
             cpu_load: CpuLoadMonitor::new(),
+            memory_usage: MemoryUsageMonitor::new(),
             status: "Ready".to_owned(),
             last_error: None,
         };
@@ -6343,7 +6473,7 @@ fn paint_scope_input_range_encoder(
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(58.0), Sense::click_and_drag());
         let response = response
             .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-            .on_hover_text(
+            .on_hover_selectable_text(
                 "Drag the knob vertically or scroll to rotate it · double-click to change color",
             );
         if response.clicked() {
@@ -6937,7 +7067,7 @@ fn paint_scope_marker_settings(
                                         |ui| {
                                             if ui
                                                 .small_button("×")
-                                                .on_hover_text("Remove marker")
+                                                .on_hover_selectable_text("Remove marker")
                                                 .clicked()
                                             {
                                                 remove = Some((kind, index));
@@ -7197,7 +7327,7 @@ fn paint_scope_channel_settings(
                 availability.channel_enable && can_toggle_enable,
                 enable_control,
             )
-            .on_hover_text("At least one oscilloscope channel must remain enabled");
+            .on_hover_selectable_text("At least one oscilloscope channel must remain enabled");
             ui.horizontal(|ui| {
                 ui.label("Name");
                 ui.add_enabled(
@@ -7485,7 +7615,7 @@ fn paint_capture_settings(
                         logic_smart_timing_enabled,
                         "Smart timing on waveform hover",
                     )
-                    .on_hover_text(
+                    .on_hover_selectable_text(
                         "Show edge width, rising-edge period, frequency, and duty cycle for the digital waveform under the mouse",
                     );
                     ui.add_space(8.0);
@@ -7669,7 +7799,7 @@ fn paint_capture_settings(
                                                         AcquisitionMode::Loop,
                                                         "Loop",
                                                     )
-                                                    .on_disabled_hover_text(
+                                                    .on_disabled_hover_selectable_text(
                                                         "Loop requires DSLogic Stream mode",
                                                     );
                                                 });
@@ -7749,7 +7879,7 @@ fn paint_capture_settings(
                                             &mut logic_settings.trigger_enabled,
                                         ),
                                     )
-                                    .on_hover_text(
+                                    .on_hover_selectable_text(
                                         "Arm the analyzer and wait for the configured hardware trigger",
                                     );
                                     if trigger_response.changed()
@@ -7786,7 +7916,7 @@ fn paint_capture_settings(
                                                         LogicTriggerMode::Simple,
                                                         "Simple",
                                                     )
-                                                    .on_hover_text(
+                                                    .on_hover_selectable_text(
                                                         "All channel conditions match at one sample",
                                                     );
                                                     let smart_available =
@@ -7802,10 +7932,10 @@ fn paint_capture_settings(
                                                                 "Smart (Buffer mode required)"
                                                             },
                                                         )
-                                                        .on_hover_text(
+                                                        .on_hover_selectable_text(
                                                             "Match two or more channel-condition stages in order",
                                                         )
-                                                        .on_disabled_hover_text(
+                                                        .on_disabled_hover_selectable_text(
                                                             "Smart trigger requires Buffer mode. Select Buffer under Capture mode to enable it.",
                                                         );
                                                     });
@@ -7884,7 +8014,7 @@ fn paint_capture_settings(
                                             == DsLogicOperationMode::Stream
                                         {
                                             ui.label(RichText::new("0.1 s").color(TEXT_MUTED))
-                                                .on_hover_text(
+                                                .on_hover_selectable_text(
                                                     "Stream-mode Repetitive uses the original fixed 0.1 s interval",
                                                 );
                                         } else {
@@ -7898,7 +8028,7 @@ fn paint_capture_settings(
                                                 .fixed_decimals(1)
                                                 .suffix(" s"),
                                             )
-                                            .on_hover_text("Delay between complete captures");
+                                            .on_hover_selectable_text("Delay between complete captures");
                                         }
                                         ui.end_row();
                                     }
@@ -8046,7 +8176,7 @@ fn paint_capture_settings(
                         scope_smart_timing_enabled,
                         "Smart timing on waveform hover",
                     )
-                    .on_hover_text(
+                    .on_hover_selectable_text(
                         "Show elapsed time from the trigger crossing and the voltage at the waveform point under the mouse",
                     );
                     ui.add_space(8.0);
@@ -8173,7 +8303,7 @@ fn paint_capture_settings_save_button(
                     .small()
                     .min_size(Vec2::new(136.0, 20.0)),
             )
-            .on_hover_text("Replace the saved defaults for this instrument type")
+            .on_hover_selectable_text("Replace the saved defaults for this instrument type")
             .clicked()
         },
     )
@@ -8201,7 +8331,7 @@ fn paint_logic_marker_settings(
                         has_waveform && settings.markers.len() < LOGIC_MARKER_LIMIT,
                         egui::Button::new("+ Add"),
                     )
-                    .on_disabled_hover_text(if has_waveform {
+                    .on_disabled_hover_selectable_text(if has_waveform {
                         "The maximum of 20 markers has been reached"
                     } else {
                         "Capture or open logic samples before adding a marker"
@@ -8218,7 +8348,7 @@ fn paint_logic_marker_settings(
                 if !settings.markers.is_empty()
                     && ui
                         .small_button("Clear")
-                        .on_hover_text("Remove all markers")
+                        .on_hover_selectable_text("Remove all markers")
                         .clicked()
                 {
                     settings.clear();
@@ -8252,12 +8382,12 @@ fn paint_logic_marker_settings(
                             .desired_width(105.0)
                             .hint_text("Name"),
                     )
-                    .on_hover_text("Optional marker name");
+                    .on_hover_selectable_text("Optional marker name");
                 });
                 ui.horizontal(|ui| {
                     ui.add_space(26.0);
                     ui.monospace(format_duration(marker.duration()))
-                        .on_hover_text(format!(
+                        .on_hover_selectable_text(format!(
                             "Samples {}–{} at {}",
                             marker.start_sample,
                             marker.end_sample,
@@ -8266,7 +8396,7 @@ fn paint_logic_marker_settings(
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .small_button("×")
-                            .on_hover_text("Remove marker")
+                            .on_hover_selectable_text("Remove marker")
                             .clicked()
                         {
                             remove = Some(index);
@@ -8333,7 +8463,7 @@ fn paint_protocol_analyzer_settings(
                                 for protocol in protocols {
                                     let response = ui
                                         .selectable_label(false, protocol.name)
-                                        .on_hover_text(format!(
+                                        .on_hover_selectable_text(format!(
                                             "{}\nDecoder ID: {}",
                                             protocol.long_name, protocol.id
                                         ));
@@ -8416,7 +8546,7 @@ fn paint_protocol_analyzer_settings(
                                 }
                                 if ui
                                     .small_button("×")
-                                    .on_hover_text("Remove analyzer")
+                                    .on_hover_selectable_text("Remove analyzer")
                                     .clicked()
                                 {
                                     remove = Some(analyzer_index);
@@ -8430,7 +8560,7 @@ fn paint_protocol_analyzer_settings(
                                         analyzer.custom_protocol.is_some(),
                                         egui::Button::new("Clear").small(),
                                     )
-                                    .on_hover_text("Clear the attached YAML protocol")
+                                    .on_hover_selectable_text("Clear the attached YAML protocol")
                                     .clicked()
                                 {
                                     clear_yaml = Some(analyzer_index);
@@ -8438,7 +8568,7 @@ fn paint_protocol_analyzer_settings(
                             });
                         })
                         .response
-                        .on_hover_text(format!(
+                        .on_hover_selectable_text(format!(
                             "Decoder chain: {}",
                             analyzer_decoder_chain(analyzer).join(" → ")
                         ));
@@ -8567,11 +8697,12 @@ fn paint_protocol_analyzer_modal(
                                 } else {
                                     channel.name.to_owned()
                                 };
-                                ui.label(label).on_hover_text(if channel.required {
-                                    "Required decoder input"
-                                } else {
-                                    "Optional decoder input"
-                                });
+                                ui.label(label)
+                                    .on_hover_selectable_text(if channel.required {
+                                        "Required decoder input"
+                                    } else {
+                                        "Optional decoder input"
+                                    });
                                 let selected_text = editor.analyzer.channel_mappings[channel_index]
                                     .map(|logic_channel| {
                                         channel_label(
@@ -8661,7 +8792,7 @@ fn paint_logic_marker_color_picker(ui: &mut egui::Ui, index: usize, color: &mut 
                 .fill(*color)
                 .min_size(Vec2::splat(18.0)),
         )
-        .on_hover_text("Change marker color");
+        .on_hover_selectable_text("Change marker color");
     if button.clicked() {
         ui.memory_mut(|memory| memory.toggle_popup(popup_id));
     }
@@ -8691,7 +8822,7 @@ fn paint_logic_marker_color_picker(ui: &mut egui::Ui, index: usize, color: &mut 
                                     ))
                                     .min_size(Vec2::splat(20.0)),
                             )
-                            .on_hover_text(format!("Color {}", palette_index + 1));
+                            .on_hover_selectable_text(format!("Color {}", palette_index + 1));
                         if response.clicked() {
                             *color = palette_color;
                             ui.memory_mut(egui::Memory::close_popup);
@@ -9127,7 +9258,7 @@ fn add_left_aligned_sized(
 fn paint_radio_parameter_label(ui: &mut egui::Ui, label: &str, help: Option<&str>) {
     let response = ui.add(egui::Label::new(label).selectable(true));
     if let Some(help) = help {
-        response.on_hover_text(help);
+        response.on_hover_selectable_text(help);
     }
 }
 
@@ -9833,12 +9964,12 @@ fn paint_radio_analyzer_configuration(
                                         preset.label(),
                                     );
                                     if let Some(description) = preset.description() {
-                                        response.on_hover_text(description);
+                                        response.on_hover_selectable_text(description);
                                     }
                                 }
                             });
                         if let Some(description) = settings.whitening_preset.description() {
-                            combo.response.on_hover_text(description);
+                            combo.response.on_hover_selectable_text(description);
                         }
                     });
                     ui.end_row();
@@ -10053,7 +10184,7 @@ fn paint_radio_analyzer_channels(
                         controls_enabled && can_remove,
                         egui::Button::new("×").small(),
                     )
-                    .on_hover_text("Remove channel")
+                    .on_hover_selectable_text("Remove channel")
                     .clicked()
                 {
                     remove_index = Some(index);
@@ -10370,7 +10501,7 @@ fn paint_radio_receive_configuration(
                     })
                     .inner;
                 if let Some(help) = &control.help {
-                    slider_response.on_hover_text(help);
+                    slider_response.on_hover_selectable_text(help);
                 }
                 *value = normalize_gain_value(
                     *value,
@@ -10388,7 +10519,7 @@ fn paint_radio_receive_configuration(
                     enabled,
                     egui::Checkbox::without_text(&mut settings.iq_correction_enabled),
                 )
-                .on_hover_text(iq_help);
+                .on_hover_selectable_text(iq_help);
                 ui.end_row();
 
                 let amplifier_help = "Adds roughly 11 dB of HackRF front-end gain. Leave disabled around strong signals to reduce overload and distortion.";
@@ -10397,7 +10528,7 @@ fn paint_radio_receive_configuration(
                     tuning_enabled,
                     egui::Checkbox::without_text(&mut settings.amplifier_enabled),
                 )
-                .on_hover_text(amplifier_help);
+                .on_hover_selectable_text(amplifier_help);
                 ui.end_row();
 
                 let antenna_help =
@@ -10407,7 +10538,7 @@ fn paint_radio_receive_configuration(
                     enabled,
                     egui::Checkbox::without_text(&mut settings.antenna_power_enabled),
                 )
-                .on_hover_text(antenna_help);
+                .on_hover_selectable_text(antenna_help);
                 ui.end_row();
             }
         });
@@ -10666,6 +10797,7 @@ fn paint_usb_speed_warning(context: &egui::Context, warning: &UsbSpeedWarning) -
 impl eframe::App for WaveCraftApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.cpu_load.update();
+        self.memory_usage.update();
         context.request_repaint_after(CPU_LOAD_SAMPLE_INTERVAL);
         self.poll_calibration_progress();
         self.poll_worker();
@@ -10824,7 +10956,7 @@ impl eframe::App for WaveCraftApp {
                             toolbar_action_button("⏺ Record", Color32::LIGHT_RED)
                                 .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
                         )
-                        .on_hover_text(if can_attach_run_capture_recording {
+                        .on_hover_selectable_text(if can_attach_run_capture_recording {
                             "Start recording the active Run acquisition to a .dsv file until Stop"
                         } else if control_target == Some(CaptureTarget::RadioReceiver) {
                             "Record continuous Run-mode raw IQ to a .dsv file until Stop"
@@ -10844,7 +10976,7 @@ impl eframe::App for WaveCraftApp {
                                 toolbar_action_button("⏺ Data", ORANGE)
                                     .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
                             )
-                            .on_hover_text(
+                            .on_hover_selectable_text(
                                 "Record decoded RAW messages or PACKETS in Run mode to JSON Lines until Stop",
                             )
                             .clicked()
@@ -10857,7 +10989,7 @@ impl eframe::App for WaveCraftApp {
                             toolbar_action_button("📂 Open", TEXT_MUTED)
                                 .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
                         )
-                        .on_hover_text("Open a saved .dsv capture")
+                        .on_hover_selectable_text("Open a saved .dsv capture")
                         .clicked()
                     {
                         open_recording_clicked = true;
@@ -10868,7 +11000,7 @@ impl eframe::App for WaveCraftApp {
                             toolbar_action_button("Export", TEXT_MUTED)
                                 .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
                         )
-                        .on_hover_text("Export the completed capture as a Saleae Logic 2 .sal file")
+                        .on_hover_selectable_text("Export the completed capture as a Saleae Logic 2 .sal file")
                         .clicked()
                     {
                         export_saleae_clicked = true;
@@ -10880,7 +11012,7 @@ impl eframe::App for WaveCraftApp {
                                 && self.pending_snapshot.is_none(),
                             toolbar_action_button("📷", TEXT_MUTED),
                         )
-                        .on_hover_text("Save the visible waveform plot as a PNG snapshot")
+                        .on_hover_selectable_text("Save the visible waveform plot as a PNG snapshot")
                         .clicked()
                     {
                         snapshot_clicked = true;
@@ -10914,7 +11046,7 @@ impl eframe::App for WaveCraftApp {
                                     toolbar_action_button("▶ Run", ACCENT)
                                 },
                             )
-                            .on_hover_text(if acquisition_active {
+                            .on_hover_selectable_text(if acquisition_active {
                                 "Stop the active acquisition"
                             } else if logic_only {
                                 match start_mode {
@@ -10947,7 +11079,7 @@ impl eframe::App for WaveCraftApp {
                                 }) && control_target_available,
                                 toolbar_action_button("▶ Single", SCOPE_COLORS[0]),
                             )
-                            .on_hover_text("Wait for one trigger, acquire once, then stop")
+                            .on_hover_selectable_text("Wait for one trigger, acquire once, then stop")
                             .clicked()
                         {
                             if let Some(target) = control_target {
@@ -11207,41 +11339,57 @@ impl eframe::App for WaveCraftApp {
                     .inner_margin(egui::Margin::same(9.0)),
             )
             .show(context, |ui| {
-                ui.horizontal(|ui| {
-                    let color = if self.last_error.is_some() {
-                        Color32::LIGHT_RED
-                    } else if self.is_busy() {
-                        ACCENT
-                    } else {
-                        TEXT_MUTED
-                    };
-                    ui.label(RichText::new("●").color(color));
-                    ui.add(egui::Label::new(&self.status).selectable(true));
-                    if let Some(error) = &self.last_error {
-                        ui.separator();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(BUILD_VERSION_LABEL)
+                            .small()
+                            .monospace()
+                            .color(TEXT_MUTED),
+                    )
+                    .on_hover_selectable_text("Build version");
+                    ui.separator();
+                    ui.label(
+                        RichText::new(self.memory_usage.label())
+                            .small()
+                            .monospace()
+                            .color(TEXT_MUTED),
+                    )
+                    .on_hover_selectable_text("Current resident memory used by the WaveCraft process");
+                    ui.separator();
+                    ui.label(
+                        RichText::new(self.cpu_load.label())
+                            .small()
+                            .monospace()
+                            .color(TEXT_MUTED),
+                    )
+                    .on_hover_selectable_text(
+                        "WaveCraft process CPU usage; 100% equals one fully utilized logical CPU, so multi-threaded processing can exceed 100%",
+                    );
+
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let color = if self.last_error.is_some() {
+                            Color32::LIGHT_RED
+                        } else if self.is_busy() {
+                            ACCENT
+                        } else {
+                            TEXT_MUTED
+                        };
+                        ui.label(RichText::new("●").color(color));
                         ui.add(
-                            egui::Label::new(RichText::new(error).color(Color32::LIGHT_RED))
-                                .selectable(true),
-                        );
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(BUILD_VERSION_LABEL)
-                                .small()
-                                .monospace()
-                                .color(TEXT_MUTED),
+                            egui::Label::new(&self.status)
+                                .selectable(true)
+                                .truncate(),
                         )
-                        .on_hover_text("Build version");
-                        ui.separator();
-                        ui.label(
-                            RichText::new(self.cpu_load.label())
-                                .small()
-                                .monospace()
-                                .color(TEXT_MUTED),
-                        )
-                        .on_hover_text(
-                            "WaveCraft process CPU usage; 100% equals one fully utilized logical CPU, so multi-threaded processing can exceed 100%",
-                        );
+                        .on_hover_selectable_text(&self.status);
+                        if let Some(error) = &self.last_error {
+                            ui.separator();
+                            ui.add(
+                                egui::Label::new(RichText::new(error).color(Color32::LIGHT_RED))
+                                    .selectable(true)
+                                    .truncate(),
+                            )
+                            .on_hover_selectable_text(error);
+                        }
                     });
                 });
             });
@@ -11317,7 +11465,7 @@ impl eframe::App for WaveCraftApp {
                                                         name,
                                                     ),
                                                 )
-                                                .on_hover_text(if sessions_enabled {
+                                                .on_hover_selectable_text(if sessions_enabled {
                                                     "Show this session · double-click to rename"
                                                 } else {
                                                     "Stop the active acquisition before changing sessions"
@@ -11340,7 +11488,7 @@ impl eframe::App for WaveCraftApp {
                                                 close_enabled,
                                                 egui::Button::new("×").small().frame(false),
                                             )
-                                            .on_hover_text(if !sessions_enabled {
+                                            .on_hover_selectable_text(if !sessions_enabled {
                                                 "Stop the active acquisition before closing a session"
                                             } else if tab_count <= 1 {
                                                 "At least one session must remain open"
@@ -11357,7 +11505,7 @@ impl eframe::App for WaveCraftApp {
                                 let add_enabled = sessions_enabled && tab_count < MAX_SESSION_TABS;
                                 if ui
                                     .add_enabled(add_enabled, egui::Button::new("+").small())
-                                    .on_hover_text(if tab_count >= MAX_SESSION_TABS {
+                                    .on_hover_selectable_text(if tab_count >= MAX_SESSION_TABS {
                                         "The 10-session limit has been reached"
                                     } else if !sessions_enabled {
                                         "Stop the active acquisition before adding a session"
@@ -11740,7 +11888,7 @@ impl eframe::App for WaveCraftApp {
                                                                         "▶", ACCENT,
                                                                     ),
                                                                 )
-                                                                .on_hover_text(
+                                                                .on_hover_selectable_text(
                                                                     "Collapse decoded data",
                                                                 )
                                                                 .clicked()
@@ -11791,7 +11939,7 @@ impl eframe::App for WaveCraftApp {
                                                         DECODED_PANEL_ACTION_BUTTON_SIZE,
                                                         toolbar_action_button("◀", ACCENT),
                                                     )
-                                                    .on_hover_text("Expand decoded data")
+                                                    .on_hover_selectable_text("Expand decoded data")
                                                     .clicked()
                                                 {
                                                     decoded_data_panel_open = true;
@@ -11915,6 +12063,10 @@ impl eframe::App for WaveCraftApp {
                                                 .is_enabled(),
                                             packet_mode: self.radio_settings.analyzer.data_mode
                                                 == RadioDataMode::Packets,
+                                            sample_rate_hz: self
+                                                .radio_settings
+                                                .capture
+                                                .sample_rate_hz,
                                             trigger_level_dbfs_tenths:
                                                 &mut radio_trigger_level_dbfs_tenths,
                                             trigger_controls_enabled:
@@ -16590,7 +16742,7 @@ fn paint_logic_protocol_lanes(
                         )),
                         Sense::hover(),
                     )
-                    .on_hover_text(format!(
+                    .on_hover_selectable_text(format!(
                         "{}\nSamples {}–{}",
                         event.detail, event.start_sample, event.end_sample
                     ));
@@ -16750,7 +16902,7 @@ fn paint_logic(
                 Sense::click(),
             )
             .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(format!("Click to edit {channel_label} settings"));
+            .on_hover_selectable_text(format!("Click to edit {channel_label} settings"));
 
         let popup_id = ui.make_persistent_id(("logic_channel_settings_popup", channel));
         if marker_response.clicked() {
@@ -17099,7 +17251,7 @@ fn paint_scope_offset_arrows(ui: &egui::Ui, plot: Rect, options: ScopeOffsetArro
     let response = if let Some(channel) = hovered_channel {
         response
             .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-            .on_hover_text(format!(
+            .on_hover_selectable_text(format!(
                 "{} vertical offset: {:+.2} div\nDrag to move · double-click to center",
                 scope_channel_label(channel, channel_names),
                 scope_vertical_offset_divisions(plot, vertical_offsets[channel])
@@ -17746,7 +17898,7 @@ fn paint_scope_trigger_position(
     } else {
         response
     }
-    .on_hover_text(format!("{}%", settings.position_percent));
+    .on_hover_selectable_text(format!("{}%", settings.position_percent));
 
     if controls_enabled {
         let old_position = settings.position_percent;
@@ -17844,7 +17996,7 @@ fn paint_scope_trigger_level(
         } else {
             response
         }
-        .on_hover_text(format!(
+        .on_hover_selectable_text(format!(
             "Trigger level: {}",
             format_trigger_voltage(trigger_voltage)
         ));
@@ -17962,7 +18114,7 @@ fn paint_scope_measurements(
                 Sense::drag(),
             )
             .on_hover_cursor(egui::CursorIcon::Grab)
-            .on_hover_text(format!(
+            .on_hover_selectable_text(format!(
                 "Drag the {} measurement window",
                 scope_channel_label(channel, channel_names)
             ));
@@ -18123,7 +18275,7 @@ fn paint_scope_markers(
                         Sense::drag(),
                     )
                     .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
-                    .on_hover_text(format!(
+                    .on_hover_selectable_text(format!(
                         "Drag {} T{} horizontally",
                         scope_channel_label(channel, channel_names),
                         index + 1
@@ -18222,7 +18374,7 @@ fn paint_scope_markers(
                     Sense::drag(),
                 )
                 .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-                .on_hover_text(format!(
+                .on_hover_selectable_text(format!(
                     "Drag {} V{} vertically",
                     scope_channel_label(channel, channel_names),
                     index + 1
@@ -18879,7 +19031,7 @@ fn paint_scope_fft(
             ],
             Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.75)),
         );
-        response.on_hover_text(format!(
+        response.on_hover_selectable_text(format!(
             "Frequency: {}\nMagnitude: {magnitude_dbv:.2} dBV\nScroll to zoom · drag to pan · double-click to reset",
             format_frequency(frequency),
         ));
@@ -19587,6 +19739,16 @@ mod tests {
 
         assert_eq!(monitor.load_percent, Some(125.0));
         assert_eq!(monitor.label(), "CPU 125%");
+    }
+
+    #[test]
+    fn memory_usage_monitor_formats_resident_memory() {
+        let monitor = MemoryUsageMonitor {
+            last_sample_time: Instant::now(),
+            resident_bytes: Some(384 * 1024 * 1024),
+        };
+
+        assert_eq!(monitor.label(), "RAM 384.0 MiB");
     }
 
     #[test]

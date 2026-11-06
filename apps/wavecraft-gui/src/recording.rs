@@ -1,4 +1,6 @@
-use crate::{waveform::radio::RawRadioMessage, RadioDataMode, RadioSettings};
+use crate::{
+    format_capture_timestamp, waveform::radio::RawRadioMessage, RadioDataMode, RadioSettings,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::fs::{File, OpenOptions};
@@ -99,6 +101,7 @@ pub(crate) fn choose_decoded_data_save_path(current_path: &str) -> Option<PathBu
 pub(crate) struct DecodedDataRecorder<W: Write> {
     output: W,
     data_mode: RadioDataMode,
+    sample_rate_hz: u64,
     record_count: u64,
     last_raw_message_sequence: u64,
     finished: bool,
@@ -137,6 +140,7 @@ impl<W: Write> DecodedDataRecorder<W> {
         Ok(Self {
             output,
             data_mode: settings.analyzer.data_mode,
+            sample_rate_hz: settings.capture.sample_rate_hz,
             record_count: 0,
             last_raw_message_sequence: 0,
             finished: false,
@@ -184,6 +188,11 @@ impl<W: Write> DecodedDataRecorder<W> {
             .chain(&packet.bytes)
             .map(|byte| u64::from(byte.status.low_confidence_bits))
             .sum::<u64>();
+        let sample_start = packet
+            .preamble
+            .first()
+            .or_else(|| packet.bytes.first())
+            .map_or(packet.range.start, |byte| byte.range.start);
         write_json_line(
             &mut self.output,
             &json!({
@@ -191,7 +200,8 @@ impl<W: Write> DecodedDataRecorder<W> {
                 "sequence": sequence,
                 "channel_name": channel_name,
                 "channel_frequency_offset_hz": channel_frequency_offset_hz,
-                "sample_start": packet.range.start,
+                "timestamp": format_capture_timestamp(sample_start, self.sample_rate_hz),
+                "sample_start": sample_start,
                 "sample_end": packet.range.end,
                 "confidence": packet.confidence,
                 "uncertain_bits": uncertain_bits,
@@ -223,7 +233,6 @@ impl<W: Write> DecodedDataRecorder<W> {
             .iter()
             .map(|byte| byte.value)
             .collect::<Vec<_>>();
-        let sample_start = message.bytes().first().map(|byte| byte.range.start);
         let sample_end = message.bytes().last().map(|byte| byte.range.end);
         write_json_line(
             &mut self.output,
@@ -233,7 +242,8 @@ impl<W: Write> DecodedDataRecorder<W> {
                 "capture_sequence": message.sequence(),
                 "channel_name": message.channel_name(),
                 "channel_frequency_offset_hz": message.channel_frequency_offset_hz(),
-                "sample_start": sample_start,
+                "timestamp": format_capture_timestamp(message.start_sample(), self.sample_rate_hz),
+                "sample_start": message.start_sample(),
                 "sample_end": sample_end,
                 "uncertain_bits": message.uncertain_bits(),
                 "preamble": preamble,
@@ -657,6 +667,7 @@ mod tests {
         assert_eq!(records[0]["type"], "session");
         assert_eq!(records[1]["type"], "packet");
         assert_eq!(records[1]["channel_name"], "Weather");
+        assert_eq!(records[1]["timestamp"], "00:00:00.000");
         assert_eq!(records[1]["data"], json!([0x12, 0x34]));
         assert_eq!(records[2]["type"], "footer");
         assert_eq!(records[2]["record_count"], 1);
@@ -665,7 +676,8 @@ mod tests {
 
     #[test]
     fn decoded_data_recorder_streams_completed_raw_messages() {
-        let settings = RadioSettings::default();
+        let mut settings = RadioSettings::default();
+        settings.capture.sample_rate_hz = 8;
         let mut store = RadioAnalysisStore::new(32).unwrap();
         store.ingest_raw(
             RawRadioOutput {
@@ -717,8 +729,12 @@ mod tests {
 
         assert_eq!(records.len(), 4);
         assert_eq!(records[1]["type"], "raw_message");
+        assert_eq!(records[1]["timestamp"], "00:00:00.000");
+        assert_eq!(records[1]["sample_start"], 0);
         assert_eq!(records[1]["preamble"], json!([0xaa]));
         assert_eq!(records[1]["data"], json!([0x12]));
+        assert_eq!(records[2]["sample_start"], 16);
+        assert_eq!(records[2]["timestamp"], "00:00:02.000");
         assert_eq!(records[2]["data"], json!([0x34]));
         assert_eq!(records[3]["record_count"], 2);
     }

@@ -72,9 +72,10 @@ Run in either RAW or PACKETS mode. This is a separate newline-delimited JSON
 (`.jsonl`) stream, not a native `.dsv` capture. Its first record describes the
 RF session and analyzer channels. RAW records contain completed messages;
 PACKETS records contain accepted framed packets with confidence. Both include
-the channel, source-sample range, preamble bytes, and decoded data bytes. The
-final record reports completion status and record count. It does not contain
-IQ, spectrum, waterfall, or enough information to re-run demodulation.
+the channel, a capture-relative `timestamp` in `HH:MM:SS.mmm` form, the exact
+source-sample range, preamble bytes, and decoded data bytes. The final record
+reports completion status and record count. It does not contain IQ, spectrum,
+waterfall, or enough information to re-run demodulation.
 
 The existing **Open** action accepts `.jsonl` while the RF view is current and
 loads its bounded decoded history directly into RAW DATA or PACKETS according

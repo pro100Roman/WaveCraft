@@ -1,4 +1,7 @@
-use crate::{radio_analyzer::RadioAnalyzerTelemetry, theme::ORANGE};
+use crate::{
+    format_capture_timestamp, radio_analyzer::RadioAnalyzerTelemetry, theme::ORANGE,
+    SelectableHoverText,
+};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -26,6 +29,7 @@ const WATERFALL_HISTORY_HINT: &str = "Rows are the newest spectrum snapshots ret
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawRadioMessage {
     sequence: u64,
+    start_sample: u64,
     channel_frequency_offset_hz: i64,
     channel_name: Arc<str>,
     preamble_bytes: usize,
@@ -37,6 +41,10 @@ pub struct RawRadioMessage {
 impl RawRadioMessage {
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    pub fn start_sample(&self) -> u64 {
+        self.start_sample
     }
 
     pub fn channel_frequency_offset_hz(&self) -> i64 {
@@ -476,6 +484,7 @@ impl RadioAnalysisStore {
         self.finish_raw_message(channel_frequency_offset_hz);
         self.raw_messages.push_back(RawRadioMessage {
             sequence: self.next_raw_message_sequence,
+            start_sample: start.sample_index,
             channel_frequency_offset_hz,
             channel_name,
             preamble_bytes: start.preamble_bytes,
@@ -603,8 +612,16 @@ impl Default for RadioViewState {
 pub struct RadioViewOptions<'a> {
     pub analysis_enabled: bool,
     pub packet_mode: bool,
+    pub sample_rate_hz: u64,
     pub trigger_level_dbfs_tenths: &'a mut i16,
     pub trigger_controls_enabled: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RadioAnalysisViewOptions {
+    analysis_enabled: bool,
+    packet_mode: bool,
+    sample_rate_hz: u64,
 }
 
 impl RadioViewState {
@@ -619,6 +636,7 @@ impl RadioViewState {
         let RadioViewOptions {
             analysis_enabled,
             packet_mode,
+            sample_rate_hz,
             trigger_level_dbfs_tenths,
             trigger_controls_enabled,
         } = options;
@@ -701,8 +719,11 @@ impl RadioViewState {
                 ui,
                 analysis_rect,
                 analysis,
-                analysis_enabled,
-                packet_mode,
+                RadioAnalysisViewOptions {
+                    analysis_enabled,
+                    packet_mode,
+                    sample_rate_hz,
+                },
                 &mut self.raw_message_scroll_rows,
                 &mut self.raw_message_newest_completed_sequence,
             );
@@ -738,7 +759,7 @@ impl RadioViewState {
             Color32::from_rgb(105, 120, 140),
             true,
         )
-        .on_hover_text(WATERFALL_HISTORY_HINT);
+        .on_hover_selectable_text(WATERFALL_HISTORY_HINT);
         let image_rect = radio_frequency_axis_rect(rect, title_rect.bottom(), rect.bottom() - 6.0);
         let Some(newest) = store.newest_spectrum() else {
             ui.painter().text(
@@ -868,11 +889,15 @@ fn paint_analysis(
     ui: &mut egui::Ui,
     rect: Rect,
     store: &RadioAnalysisStore,
-    analysis_enabled: bool,
-    packet_mode: bool,
+    options: RadioAnalysisViewOptions,
     raw_message_scroll_rows: &mut usize,
     raw_message_newest_completed_sequence: &mut Option<u64>,
 ) {
+    let RadioAnalysisViewOptions {
+        analysis_enabled,
+        packet_mode,
+        sample_rate_hz,
+    } = options;
     if rect.width() <= 1.0 || rect.height() <= 1.0 {
         return;
     }
@@ -992,6 +1017,7 @@ fn paint_analysis(
             plot,
             rect,
             store,
+            sample_rate_hz,
             raw_message_scroll_rows,
             raw_message_newest_completed_sequence,
         );
@@ -1037,12 +1063,13 @@ fn paint_raw_messages(
     plot: Rect,
     scroll_rect: Rect,
     store: &RadioAnalysisStore,
+    sample_rate_hz: u64,
     scroll_rows: &mut usize,
     newest_completed_sequence: &mut Option<u64>,
 ) {
     const ROW_HEIGHT: f32 = 22.0;
     const BYTE_CELL_WIDTH: f32 = 24.0;
-    const SEQUENCE_WIDTH: f32 = 48.0;
+    const TIMESTAMP_WIDTH: f32 = 84.0;
     const CHANNEL_WIDTH: f32 = 60.0;
     const SECTION_WIDTH: f32 = 38.0;
     const PREAMBLE_WIDTH: f32 = 30.0;
@@ -1114,12 +1141,12 @@ fn paint_raw_messages(
         ui.painter().text(
             row_rect.left_center() + Vec2::new(5.0, 0.0),
             egui::Align2::LEFT_CENTER,
-            format!("#{}", message.sequence()),
-            FontId::monospace(10.0),
+            format_capture_timestamp(message.start_sample(), sample_rate_hz),
+            FontId::monospace(9.0),
             Color32::from_rgb(105, 120, 140),
         );
 
-        let mut x = row_rect.left() + SEQUENCE_WIDTH;
+        let mut x = row_rect.left() + TIMESTAMP_WIDTH;
         let right_limit = row_rect.right() - LENGTH_WIDTH;
         let channel_rect = Rect::from_min_max(
             Pos2::new(x, row_rect.top()),
@@ -1796,7 +1823,7 @@ fn paint_radio_trigger_level(
     } else {
         response
     }
-    .on_hover_text(format!(
+    .on_hover_selectable_text(format!(
         "RF trigger level: {:.1} dBFS",
         f32::from(*level_dbfs_tenths) / 10.0
     ));
@@ -2000,6 +2027,13 @@ mod tests {
             retained_raw_message_scroll_rows(4, Some(5), [7, 6, 5, 4, 3], 2),
             3
         );
+    }
+
+    #[test]
+    fn raw_message_timestamp_uses_capture_samples_and_milliseconds() {
+        assert_eq!(format_capture_timestamp(0, 1_000_000), "00:00:00.000");
+        assert_eq!(format_capture_timestamp(3_726_789, 1_000), "01:02:06.789");
+        assert_eq!(format_capture_timestamp(100, 0), "--:--:--.---");
     }
 
     #[test]
@@ -2287,6 +2321,7 @@ mod tests {
         assert_eq!(store.completed_raw_message_count(), 1);
         let message = store.raw_messages().back().unwrap();
         assert!(message.is_complete());
+        assert_eq!(message.start_sample(), 84);
         assert_eq!(message.channel_frequency_offset_hz(), 200_000);
         assert_eq!(message.channel_name(), "Packets");
         assert_eq!(message.preamble_bytes(), 1);
@@ -2527,6 +2562,7 @@ mod tests {
                     RadioViewOptions {
                         analysis_enabled: true,
                         packet_mode: false,
+                        sample_rate_hz: 1_000_000,
                         trigger_level_dbfs_tenths: &mut trigger_level,
                         trigger_controls_enabled: true,
                     },
