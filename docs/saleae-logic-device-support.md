@@ -50,6 +50,22 @@ capture, save `.sal` files, and export digital samples. This makes an
 automation-backed WaveCraft adapter practical without understanding Saleae's
 private USB protocol.
 
+#### Logic 2 application requirement
+
+The gRPC automation server is hosted by the Logic 2 application, so Logic 2
+must be installed and running while WaveCraft uses a Saleae device. WaveCraft
+could either connect to an instance that the user opened with its automation
+server enabled, or launch Logic 2 itself with the automation interface enabled
+and then connect to the default local endpoint at `127.0.0.1:10430`. Automatic
+launch can hide most of this lifecycle from the user, but a Logic 2 process
+still runs in the background, owns the USB device, and performs the capture.
+This is therefore not standalone Saleae hardware access.
+
+Saleae does not officially support running Logic 2 headlessly on Linux. Its
+[automation documentation](https://saleae.github.io/logic2-automation/getting_started.html#headless-on-linux)
+describes Xvfb as a possible workaround, so unattended Linux operation should
+be treated as a deployment limitation and tested separately.
+
 The adapter would:
 
 1. connect to the local Logic 2 gRPC server;
