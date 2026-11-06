@@ -990,6 +990,7 @@ fn paint_analysis(
         paint_raw_messages(
             ui,
             plot,
+            rect,
             store,
             raw_message_scroll_rows,
             raw_message_newest_completed_sequence,
@@ -1034,6 +1035,7 @@ fn paint_analysis(
 fn paint_raw_messages(
     ui: &mut egui::Ui,
     plot: Rect,
+    scroll_rect: Rect,
     store: &RadioAnalysisStore,
     scroll_rows: &mut usize,
     newest_completed_sequence: &mut Option<u64>,
@@ -1066,13 +1068,12 @@ fn paint_raw_messages(
     *newest_completed_sequence = completed_newest_first()
         .next()
         .map(RawRadioMessage::sequence);
-    let list_response = ui.interact(
-        plot,
-        ui.id().with("raw_message_list_scroll"),
-        Sense::hover(),
-    );
-    if list_response.hovered() {
-        let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
+    if ui.rect_contains_pointer(scroll_rect) {
+        let scroll_delta = ui.input_mut(|input| {
+            let delta = input.raw_scroll_delta.y;
+            input.raw_scroll_delta.y = 0.0;
+            delta
+        });
         if scroll_delta < 0.0 {
             *scroll_rows = scroll_rows.saturating_add(1).min(maximum_scroll);
         } else if scroll_delta > 0.0 {
