@@ -9701,7 +9701,7 @@ fn paint_radio_analyzer_configuration(
             paint_radio_parameter_label(
                 ui,
                 "Preamble length",
-                Some("Minimum consecutive preamble bytes required; additional matching bytes before sync remain part of the preamble"),
+                Some("Minimum consecutive preamble bytes required; in raw mode zero treats the preamble as data and starts from sync or the first recovered FSK/GFSK bit"),
             );
             ui.add_enabled_ui(controls_enabled, |ui| {
                 ui.horizontal(|ui| {
@@ -9709,13 +9709,13 @@ fn paint_radio_analyzer_configuration(
                         ui,
                         egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
                         egui::DragValue::new(&mut settings.preamble_bytes)
-                            .range(1..=256)
+                            .range(0..=256)
                             .speed(1),
                     );
                     ui.label("bytes");
                 });
             });
-            settings.preamble_bytes = settings.preamble_bytes.clamp(1, 256);
+            settings.preamble_bytes = settings.preamble_bytes.min(256);
             ui.end_row();
 
             paint_radio_parameter_label(
@@ -20062,6 +20062,9 @@ mod tests {
             output_sample_rate_hz: 0,
             symbol_rate_hz: 19_200,
             deviation_hz: 35_000,
+            preamble_bytes: 0,
+            sync_word: 0xd391,
+            sync_word_bytes: 2,
             ..RadioAnalyzerSettings::default()
         };
 
@@ -20073,6 +20076,7 @@ mod tests {
 
         assert_eq!(settings.symbol_rate_hz, 19_200);
         assert_eq!(settings.deviation_hz, 35_000);
+        assert_eq!(settings.preamble_bytes, 0);
     }
 
     #[test]
@@ -20262,6 +20266,53 @@ mod tests {
             settings.decoder_config().unwrap_err(),
             "packet decoding requires a sync word"
         );
+    }
+
+    #[test]
+    fn radio_analyzer_allows_zero_preamble_length() {
+        let raw = RadioAnalyzerSettings {
+            data_mode: RadioDataMode::Raw,
+            preamble_bytes: 0,
+            sync_word: 0xd391,
+            sync_word_bytes: 2,
+            ..RadioAnalyzerSettings::default()
+        };
+        assert!(matches!(
+            raw.decoder_config().unwrap(),
+            RadioDataDecoderConfig::Raw(RawRadioConfig {
+                preamble_bytes: 0,
+                sync_word: 0xd391,
+                sync_word_bytes: 2,
+                ..
+            })
+        ));
+
+        let packets = RadioAnalyzerSettings {
+            data_mode: RadioDataMode::Packets,
+            preamble_bytes: 0,
+            sync_word: 0xd391,
+            sync_word_bytes: 2,
+            ..RadioAnalyzerSettings::default()
+        };
+        let RadioDataDecoderConfig::Packets(config) = packets.decoder_config().unwrap() else {
+            panic!("packet settings should build a packet decoder");
+        };
+        assert!(config.framing.preamble.is_empty());
+
+        let raw_without_sync = RadioAnalyzerSettings {
+            data_mode: RadioDataMode::Raw,
+            preamble_bytes: 0,
+            sync_word_bytes: 0,
+            ..RadioAnalyzerSettings::default()
+        };
+        assert!(matches!(
+            raw_without_sync.decoder_config().unwrap(),
+            RadioDataDecoderConfig::Raw(RawRadioConfig {
+                preamble_bytes: 0,
+                sync_word_bytes: 0,
+                ..
+            })
+        ));
     }
 
     #[test]
