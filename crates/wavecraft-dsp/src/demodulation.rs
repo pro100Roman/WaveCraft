@@ -1,7 +1,10 @@
 use crate::{ChannelizedBatch, DspError};
+use std::collections::HashSet;
 use std::ops::Range;
 
 pub const MAX_SOFT_SYMBOL_ALPHABET_SIZE: u16 = 256;
+pub const MAX_SPARSE_SYMBOL_ALPHABET_SIZE: u32 = 1_048_576;
+pub const MAX_SPARSE_SYMBOL_ALTERNATIVES: usize = 8;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TimedSoftSymbol {
@@ -101,6 +104,110 @@ impl TimedSoftSymbolBatch {
     }
 }
 
+/// One bounded alternative to a sparse hard symbol decision.
+///
+/// Sparse decisions avoid allocating one likelihood per alphabet entry for
+/// modulation families such as LoRa, whose SF12 alphabet contains 4,096
+/// possible symbols.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SparseSymbolAlternative {
+    pub value: u32,
+    pub relative_likelihood: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimedSparseSymbol {
+    pub value: u32,
+    /// Normalized confidence in the selected value, from zero to one.
+    pub confidence: f32,
+    /// Optional runner-up decisions, bounded independently of alphabet size.
+    pub alternatives: Vec<SparseSymbolAlternative>,
+    /// Marks the first recovered payload symbol after physical-layer sync.
+    pub frame_start: bool,
+    /// Half-open range in the original IQ source-sample domain.
+    pub source_range: Range<u64>,
+}
+
+impl TimedSparseSymbol {
+    pub fn validate(&self, alphabet_size: u32) -> Result<(), DspError> {
+        validate_sparse_alphabet_size(alphabet_size)?;
+        if self.value >= alphabet_size {
+            return Err(DspError::new(
+                "sparse symbol decision lies outside its alphabet",
+            ));
+        }
+        if !self.confidence.is_finite() || !(0.0..=1.0).contains(&self.confidence) {
+            return Err(DspError::new(
+                "sparse symbol confidence must be finite and between zero and one",
+            ));
+        }
+        if self.source_range.is_empty() {
+            return Err(DspError::new("sparse symbol has an empty source range"));
+        }
+        if self.alternatives.len() > MAX_SPARSE_SYMBOL_ALTERNATIVES {
+            return Err(DspError::new(format!(
+                "sparse symbol may retain at most {MAX_SPARSE_SYMBOL_ALTERNATIVES} alternatives"
+            )));
+        }
+        let mut values = HashSet::with_capacity(self.alternatives.len() + 1);
+        values.insert(self.value);
+        for alternative in &self.alternatives {
+            if alternative.value >= alphabet_size {
+                return Err(DspError::new(
+                    "sparse symbol alternative lies outside its alphabet",
+                ));
+            }
+            if !alternative.relative_likelihood.is_finite() || alternative.relative_likelihood < 0.0
+            {
+                return Err(DspError::new(
+                    "sparse symbol alternative likelihood must be finite and nonnegative",
+                ));
+            }
+            if !values.insert(alternative.value) {
+                return Err(DspError::new(
+                    "sparse symbol decisions and alternatives must be unique",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimedSparseSymbolBatch {
+    pub alphabet_size: u32,
+    pub discontinuity: bool,
+    pub symbols: Vec<TimedSparseSymbol>,
+}
+
+impl TimedSparseSymbolBatch {
+    pub fn validate(&self) -> Result<(), DspError> {
+        validate_sparse_alphabet_size(self.alphabet_size)?;
+        for symbol in &self.symbols {
+            symbol.validate(self.alphabet_size)?;
+        }
+        if self
+            .symbols
+            .windows(2)
+            .any(|symbols| symbols[0].source_range.start > symbols[1].source_range.start)
+        {
+            return Err(DspError::new(
+                "sparse symbols are not ordered by source range",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_sparse_alphabet_size(alphabet_size: u32) -> Result<(), DspError> {
+    if !(2..=MAX_SPARSE_SYMBOL_ALPHABET_SIZE).contains(&alphabet_size) {
+        return Err(DspError::new(format!(
+            "sparse-symbol alphabet size must be between 2 and {MAX_SPARSE_SYMBOL_ALPHABET_SIZE}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TimedAnalogSample {
     pub value: f32,
@@ -150,6 +257,7 @@ impl TimedAnalogBatch {
 #[derive(Clone, Debug, PartialEq)]
 pub enum DemodulatedBatch {
     SoftSymbols(TimedSoftSymbolBatch),
+    SparseSymbols(TimedSparseSymbolBatch),
     Analog(TimedAnalogBatch),
 }
 
@@ -212,6 +320,50 @@ mod tests {
         };
 
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn sparse_symbols_support_large_alphabets_with_bounded_alternatives() {
+        let batch = TimedSparseSymbolBatch {
+            alphabet_size: 4_096,
+            discontinuity: false,
+            symbols: vec![TimedSparseSymbol {
+                value: 3_000,
+                confidence: 0.8,
+                alternatives: vec![SparseSymbolAlternative {
+                    value: 3_001,
+                    relative_likelihood: 0.2,
+                }],
+                frame_start: true,
+                source_range: 100..200,
+            }],
+        };
+
+        assert!(batch.validate().is_ok());
+    }
+
+    #[test]
+    fn sparse_symbols_reject_duplicate_or_out_of_alphabet_values() {
+        let duplicate = TimedSparseSymbol {
+            value: 7,
+            confidence: 0.5,
+            alternatives: vec![SparseSymbolAlternative {
+                value: 7,
+                relative_likelihood: 0.5,
+            }],
+            frame_start: false,
+            source_range: 0..1,
+        };
+        assert!(duplicate.validate(128).is_err());
+
+        let outside = TimedSparseSymbol {
+            value: 128,
+            confidence: 0.5,
+            alternatives: Vec::new(),
+            frame_start: false,
+            source_range: 0..1,
+        };
+        assert!(outside.validate(128).is_err());
     }
 
     #[test]

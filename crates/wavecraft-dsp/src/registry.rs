@@ -1,10 +1,13 @@
-use crate::{Demodulator, DspError, MAX_SOFT_SYMBOL_ALPHABET_SIZE};
+use crate::{
+    Demodulator, DspError, MAX_SOFT_SYMBOL_ALPHABET_SIZE, MAX_SPARSE_SYMBOL_ALPHABET_SIZE,
+};
 use std::any::Any;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DemodulatorOutputKind {
     SoftSymbols { alphabet_size: u16 },
+    SparseSymbols { maximum_alphabet_size: u32 },
     Analog,
 }
 
@@ -34,12 +37,24 @@ impl DemodulatorDescriptor {
                 "demodulator display name must contain 1 to 128 characters",
             ));
         }
-        if let DemodulatorOutputKind::SoftSymbols { alphabet_size } = self.output {
-            if !(2..=MAX_SOFT_SYMBOL_ALPHABET_SIZE).contains(&alphabet_size) {
-                return Err(DspError::new(
-                    "demodulator soft-symbol alphabet size must be between 2 and 256",
-                ));
+        match self.output {
+            DemodulatorOutputKind::SoftSymbols { alphabet_size } => {
+                if !(2..=MAX_SOFT_SYMBOL_ALPHABET_SIZE).contains(&alphabet_size) {
+                    return Err(DspError::new(
+                        "demodulator soft-symbol alphabet size must be between 2 and 256",
+                    ));
+                }
             }
+            DemodulatorOutputKind::SparseSymbols {
+                maximum_alphabet_size,
+            } => {
+                if !(2..=MAX_SPARSE_SYMBOL_ALPHABET_SIZE).contains(&maximum_alphabet_size) {
+                    return Err(DspError::new(format!(
+                        "demodulator sparse-symbol alphabet limit must be between 2 and {MAX_SPARSE_SYMBOL_ALPHABET_SIZE}"
+                    )));
+                }
+            }
+            DemodulatorOutputKind::Analog => {}
         }
         Ok(())
     }
@@ -165,5 +180,18 @@ mod tests {
             registry.descriptor("fsk2").unwrap().display_name,
             "Binary FSK"
         );
+    }
+
+    #[test]
+    fn sparse_symbol_descriptors_support_lora_sized_alphabets() {
+        let descriptor = DemodulatorDescriptor {
+            id: "lora".to_owned(),
+            display_name: "LoRa".to_owned(),
+            output: DemodulatorOutputKind::SparseSymbols {
+                maximum_alphabet_size: 4_096,
+            },
+        };
+
+        assert!(descriptor.validate().is_ok());
     }
 }

@@ -99,7 +99,26 @@ impl RadioDataDecoder {
         }
     }
 
-    fn push(
+    fn push_demodulated(
+        &mut self,
+        demodulated: &DemodulatedBatch,
+    ) -> Result<(RawRadioOutput, RadioPacketPipelineOutput), String> {
+        match demodulated {
+            DemodulatedBatch::SoftSymbols(symbols) => {
+                let bits = soft_symbols_to_bits(symbols)?;
+                self.push_bits(&bits)
+            }
+            DemodulatedBatch::SparseSymbols(_) => Err(
+                "the selected radio data decoder does not accept sparse-symbol output".to_owned(),
+            ),
+            DemodulatedBatch::Analog(_) => Err(
+                "the selected radio data decoder does not accept analog demodulator output"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    fn push_bits(
         &mut self,
         bits: &TimedBitBatch,
     ) -> Result<(RawRadioOutput, RadioPacketPipelineOutput), String> {
@@ -272,11 +291,7 @@ impl RadioAnalyzerRuntime {
         &mut self,
         demodulated: DemodulatedBatch,
     ) -> Result<RadioAnalyzerOutput, String> {
-        let DemodulatedBatch::SoftSymbols(symbols) = &demodulated else {
-            return Err("raw radio bytes require digital soft-symbol output".to_owned());
-        };
-        let bits = soft_symbols_to_bits(symbols)?;
-        let (raw, packets) = self.decoder.push(&bits)?;
+        let (raw, packets) = self.decoder.push_demodulated(&demodulated)?;
         Ok(RadioAnalyzerOutput {
             channel_frequency_offset_hz: self.channel_frequency_offset_hz,
             channel_name: Arc::clone(&self.channel_name),
@@ -432,7 +447,7 @@ mod tests {
     };
     use wavecraft_dsp::{
         BinaryFskProfile, ChannelizerConfig, DemodulationProfile, FskPolarity, FskTiming,
-        SpectrumWindow, TimedSoftSymbol,
+        SpectrumWindow, TimedSoftSymbol, TimedSparseSymbolBatch,
     };
 
     fn profile() -> SignalAnalyzerProfile {
@@ -502,7 +517,7 @@ mod tests {
         };
         let mut decoder = RadioDataDecoder::new(RadioDataDecoderConfig::Packets(config)).unwrap();
 
-        let (raw, packets) = decoder.push(&bits).unwrap();
+        let (raw, packets) = decoder.push_bits(&bits).unwrap();
 
         assert!(raw.bytes.is_empty());
         assert_eq!(packets.packets.len(), 1);
@@ -546,6 +561,20 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("two-symbol alphabet"));
+    }
+
+    #[test]
+    fn binary_data_decoders_reject_sparse_symbol_output_at_the_typed_boundary() {
+        let mut decoder = RadioDataDecoder::new(RadioDataDecoderConfig::Raw(raw_config())).unwrap();
+        let output = DemodulatedBatch::SparseSymbols(TimedSparseSymbolBatch {
+            alphabet_size: 4_096,
+            discontinuity: false,
+            symbols: Vec::new(),
+        });
+
+        let error = decoder.push_demodulated(&output).unwrap_err();
+
+        assert!(error.contains("does not accept sparse-symbol output"));
     }
 
     #[test]

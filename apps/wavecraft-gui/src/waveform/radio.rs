@@ -5,7 +5,9 @@ use std::sync::Arc;
 use wavecraft_decode::{
     DecodeDiagnostic, RadioPacketPipelineOutput, RawRadioMessageStart, RawRadioOutput, TimedByte,
 };
-use wavecraft_dsp::{DemodulatedBatch, SpectrumFrame, TimedAnalogSample, TimedSoftSymbol};
+use wavecraft_dsp::{
+    DemodulatedBatch, SpectrumFrame, TimedAnalogSample, TimedSoftSymbol, TimedSparseSymbol,
+};
 
 const DEFAULT_WATERFALL_CAPACITY: usize = 256;
 const DEFAULT_ANALYSIS_CAPACITY: usize = 100_000;
@@ -82,6 +84,8 @@ impl RawRadioMessage {
 pub struct RadioAnalysisStore {
     soft_symbols: VecDeque<TimedSoftSymbol>,
     soft_symbol_alphabet_size: Option<u16>,
+    sparse_symbols: VecDeque<TimedSparseSymbol>,
+    sparse_symbol_alphabet_size: Option<u32>,
     analog_samples: VecDeque<TimedAnalogSample>,
     analog_sample_rate_hz: Option<u64>,
     capacity: usize,
@@ -104,6 +108,8 @@ impl Default for RadioAnalysisStore {
         Self {
             soft_symbols: VecDeque::with_capacity(DEFAULT_ANALYSIS_CAPACITY),
             soft_symbol_alphabet_size: None,
+            sparse_symbols: VecDeque::new(),
+            sparse_symbol_alphabet_size: None,
             analog_samples: VecDeque::new(),
             analog_sample_rate_hz: None,
             capacity: DEFAULT_ANALYSIS_CAPACITY,
@@ -150,10 +156,29 @@ impl RadioAnalysisStore {
                     self.soft_symbols.clear();
                     self.soft_symbol_alphabet_size = Some(batch.alphabet_size);
                 }
+                self.sparse_symbols.clear();
+                self.sparse_symbol_alphabet_size = None;
                 self.analog_samples.clear();
                 self.analog_sample_rate_hz = None;
                 self.soft_symbols.extend(batch.symbols);
                 self.trim_soft_symbols();
+            }
+            DemodulatedBatch::SparseSymbols(batch) => {
+                batch.validate().map_err(|error| error.to_string())?;
+                if batch.discontinuity {
+                    self.discontinuities = self.discontinuities.saturating_add(1);
+                    self.finish_channel_capture(channel_frequency_offset_hz);
+                }
+                if self.sparse_symbol_alphabet_size != Some(batch.alphabet_size) {
+                    self.sparse_symbols.clear();
+                    self.sparse_symbol_alphabet_size = Some(batch.alphabet_size);
+                }
+                self.soft_symbols.clear();
+                self.soft_symbol_alphabet_size = None;
+                self.analog_samples.clear();
+                self.analog_sample_rate_hz = None;
+                self.sparse_symbols.extend(batch.symbols);
+                self.trim_sparse_symbols();
             }
             DemodulatedBatch::Analog(batch) => {
                 batch.validate().map_err(|error| error.to_string())?;
@@ -166,6 +191,8 @@ impl RadioAnalysisStore {
                 }
                 self.soft_symbols.clear();
                 self.soft_symbol_alphabet_size = None;
+                self.sparse_symbols.clear();
+                self.sparse_symbol_alphabet_size = None;
                 self.raw_bytes.clear();
                 self.raw_messages.clear();
                 self.raw_synchronized_channels.clear();
@@ -318,6 +345,14 @@ impl RadioAnalysisStore {
         self.soft_symbol_alphabet_size
     }
 
+    pub fn sparse_symbols(&self) -> &VecDeque<TimedSparseSymbol> {
+        &self.sparse_symbols
+    }
+
+    pub fn sparse_symbol_alphabet_size(&self) -> Option<u32> {
+        self.sparse_symbol_alphabet_size
+    }
+
     pub fn analog_samples(&self) -> &VecDeque<TimedAnalogSample> {
         &self.analog_samples
     }
@@ -400,6 +435,12 @@ impl RadioAnalysisStore {
     fn trim_soft_symbols(&mut self) {
         let excess = self.soft_symbols.len().saturating_sub(self.capacity);
         self.soft_symbols.drain(..excess);
+        self.dropped_items = self.dropped_items.saturating_add(excess as u64);
+    }
+
+    fn trim_sparse_symbols(&mut self) {
+        let excess = self.sparse_symbols.len().saturating_sub(self.capacity);
+        self.sparse_symbols.drain(..excess);
         self.dropped_items = self.dropped_items.saturating_add(excess as u64);
     }
 
@@ -586,6 +627,7 @@ impl RadioViewState {
         let show_analysis = analysis_enabled
             || analysis.error().is_some()
             || !analysis.soft_symbols().is_empty()
+            || !analysis.sparse_symbols().is_empty()
             || !analysis.analog_samples().is_empty()
             || !analysis.raw_messages().is_empty();
         if analysis.raw_messages().is_empty() {
@@ -885,6 +927,14 @@ fn paint_analysis(
             store.raw_rejected_messages(),
             store.discontinuities()
         )
+    } else if let Some(alphabet_size) = store.sparse_symbol_alphabet_size() {
+        format!(
+            "{} sparse symbols · alphabet {} · {} dropped · {} gaps",
+            store.sparse_symbols().len(),
+            alphabet_size,
+            store.dropped_items(),
+            store.discontinuities()
+        )
     } else if let Some(sample_rate_hz) = store.analog_sample_rate_hz() {
         format!(
             "{} samples · {} Hz · {} dropped · {} gaps",
@@ -953,6 +1003,14 @@ fn paint_analysis(
             } else {
                 "Searching for preamble"
             },
+            FontId::proportional(12.0),
+            Color32::from_rgb(105, 120, 140),
+        );
+    } else if !store.sparse_symbols().is_empty() {
+        ui.painter().text(
+            plot.center(),
+            egui::Align2::CENTER_CENTER,
+            "Waiting for packet decoder",
             FontId::proportional(12.0),
             Color32::from_rgb(105, 120, 140),
         );
@@ -1881,7 +1939,7 @@ fn format_compact_decimal(value: f64, precision: usize, unit: &str) -> String {
 mod tests {
     use super::*;
     use wavecraft_decode::{ByteStatus, RadioPacket, SampleRange};
-    use wavecraft_dsp::{TimedAnalogBatch, TimedSoftSymbolBatch};
+    use wavecraft_dsp::{TimedAnalogBatch, TimedSoftSymbolBatch, TimedSparseSymbolBatch};
 
     fn frame(index: u64, frequency: u64) -> SpectrumFrame {
         SpectrumFrame {
@@ -2083,6 +2141,35 @@ mod tests {
         assert_eq!(store.soft_symbols().len(), 2);
         assert_eq!(store.soft_symbols()[0].source_range, 1..2);
         assert_eq!(store.soft_symbol_alphabet_size(), Some(2));
+        assert_eq!(store.dropped_items(), 1);
+        assert_eq!(store.discontinuities(), 1);
+    }
+
+    #[test]
+    fn analysis_store_bounds_sparse_symbols_for_large_alphabets() {
+        let mut store = RadioAnalysisStore::new(2).unwrap();
+        store
+            .ingest(
+                DemodulatedBatch::SparseSymbols(TimedSparseSymbolBatch {
+                    alphabet_size: 4_096,
+                    discontinuity: true,
+                    symbols: (0..3)
+                        .map(|index| TimedSparseSymbol {
+                            value: 1_000 + index as u32,
+                            confidence: 0.75,
+                            alternatives: Vec::new(),
+                            frame_start: index == 0,
+                            source_range: index..index + 1,
+                        })
+                        .collect(),
+                }),
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(store.sparse_symbols().len(), 2);
+        assert_eq!(store.sparse_symbols()[0].value, 1_001);
+        assert_eq!(store.sparse_symbol_alphabet_size(), Some(4_096));
         assert_eq!(store.dropped_items(), 1);
         assert_eq!(store.discontinuities(), 1);
     }

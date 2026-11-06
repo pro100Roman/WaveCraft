@@ -13,6 +13,18 @@ pub struct BinaryFskProfile {
     pub timing: FskTiming,
 }
 
+impl BinaryFskProfile {
+    fn demodulator_config(&self) -> FskConfig {
+        FskConfig {
+            symbol_rate_hz: self.symbol_rate_hz,
+            deviation_hz: self.deviation_hz,
+            modulation: crate::FskModulation::Fsk,
+            polarity: self.polarity,
+            timing: self.timing,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BinaryGfskProfile {
     pub symbol_rate_hz: u64,
@@ -20,6 +32,18 @@ pub struct BinaryGfskProfile {
     pub bt: f64,
     pub polarity: FskPolarity,
     pub timing: FskTiming,
+}
+
+impl BinaryGfskProfile {
+    fn demodulator_config(&self) -> FskConfig {
+        FskConfig {
+            symbol_rate_hz: self.symbol_rate_hz,
+            deviation_hz: self.deviation_hz,
+            modulation: crate::FskModulation::Gfsk { bt: self.bt },
+            polarity: self.polarity,
+            timing: self.timing,
+        }
+    }
 }
 
 /// Built-in, modulation-tagged analyzer configuration.
@@ -41,25 +65,23 @@ impl DemodulationProfile {
     }
 
     pub fn validate(&self) -> Result<(), DspError> {
-        self.fsk_config().validate()
+        match self {
+            Self::BinaryFsk(profile) => profile.demodulator_config().validate(),
+            Self::BinaryGfsk(profile) => profile.demodulator_config().validate(),
+        }
     }
 
-    fn fsk_config(&self) -> FskConfig {
+    fn create_demodulator(
+        &self,
+        registry: &DemodulatorRegistry,
+    ) -> Result<Box<dyn Demodulator>, DspError> {
         match self {
-            Self::BinaryFsk(profile) => FskConfig {
-                symbol_rate_hz: profile.symbol_rate_hz,
-                deviation_hz: profile.deviation_hz,
-                modulation: crate::FskModulation::Fsk,
-                polarity: profile.polarity,
-                timing: profile.timing,
-            },
-            Self::BinaryGfsk(profile) => FskConfig {
-                symbol_rate_hz: profile.symbol_rate_hz,
-                deviation_hz: profile.deviation_hz,
-                modulation: crate::FskModulation::Gfsk { bt: profile.bt },
-                polarity: profile.polarity,
-                timing: profile.timing,
-            },
+            Self::BinaryFsk(profile) => {
+                registry.create(BINARY_FSK_DEMODULATOR_ID, &profile.demodulator_config())
+            }
+            Self::BinaryGfsk(profile) => {
+                registry.create(BINARY_GFSK_DEMODULATOR_ID, &profile.demodulator_config())
+            }
         }
     }
 }
@@ -91,9 +113,7 @@ impl SignalAnalyzer {
     ) -> Result<Self, DspError> {
         profile.validate()?;
         let channelizer = Channelizer::new(profile.channel.clone())?;
-        let demodulator_config = profile.demodulation.fsk_config();
-        let demodulator =
-            registry.create(profile.demodulation.demodulator_id(), &demodulator_config)?;
+        let demodulator = profile.demodulation.create_demodulator(registry)?;
         Ok(Self {
             profile,
             channelizer,

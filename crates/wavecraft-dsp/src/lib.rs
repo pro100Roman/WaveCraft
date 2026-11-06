@@ -15,8 +15,10 @@ pub use channelizer::{
     WidebandIqPreprocessor,
 };
 pub use demodulation::{
-    DemodulatedBatch, Demodulator, DemodulatorTelemetry, TimedAnalogBatch, TimedAnalogSample,
-    TimedSoftSymbol, TimedSoftSymbolBatch, MAX_SOFT_SYMBOL_ALPHABET_SIZE,
+    DemodulatedBatch, Demodulator, DemodulatorTelemetry, SparseSymbolAlternative, TimedAnalogBatch,
+    TimedAnalogSample, TimedSoftSymbol, TimedSoftSymbolBatch, TimedSparseSymbol,
+    TimedSparseSymbolBatch, MAX_SOFT_SYMBOL_ALPHABET_SIZE, MAX_SPARSE_SYMBOL_ALPHABET_SIZE,
+    MAX_SPARSE_SYMBOL_ALTERNATIVES,
 };
 pub use fsk::{
     FskConfig, FskDemodulator, FskModulation, FskPolarity, FskTiming, TimedSoftBit,

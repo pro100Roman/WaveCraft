@@ -362,7 +362,7 @@ families:
 - a digital demodulator emits timed soft symbols with a symbol alphabet,
   per-symbol likelihoods or confidence, source-sample ranges, and lock
   diagnostics;
-- a chirp or spread-spectrum demodulator emits timed sparse symbol decisions,
+- a large-alphabet demodulator emits timed sparse symbol decisions,
   frame-boundary events, source-sample ranges, and synchronization diagnostics;
   or
 - an analog demodulator emits a bounded real-valued sample stream with its
@@ -383,12 +383,12 @@ dynamically, and recordings/projects persist the tagged profile and component
 versions. Adding a modulation must not change the raw IQ, channelizer,
 recording, or RF-view contracts.
 
-The target implementation boundary is conceptually:
+The implementation boundary is conceptually:
 
 ```rust
 pub enum DemodulatedBatch {
     SoftSymbols(TimedSoftSymbolBatch),
-    ChirpSymbols(TimedChirpSymbolBatch),
+    SparseSymbols(TimedSparseSymbolBatch),
     Analog(TimedAnalogBatch),
 }
 
@@ -407,7 +407,7 @@ An in-process registry selects factories by stable IDs such as `fsk2` and
 `gfsk2`. Each descriptor declares its output family and alphabet size, while
 the factory accepts only its modulation-specific typed configuration. Duplicate
 IDs and mismatched configuration types are rejected. Additional soft-symbol,
-chirp-symbol, or analog factories can register without changing the channelized
+sparse-symbol, or analog factories can register without changing the channelized
 input contract.
 
 ### LoRa and chirp spread-spectrum integration
@@ -448,20 +448,22 @@ belong in the DSP demodulator.
 
 `wavecraft-radio` composes those stages and owns their burst lifecycle. The
 runtime dispatches `SoftSymbols` to the existing binary raw/packet decoders and
-`ChirpSymbols` to a LoRa PHY decoder instead of unconditionally converting all
+`SparseSymbols` to a LoRa PHY decoder instead of unconditionally converting all
 digital output to `TimedBitBatch`. The data-decoder configuration therefore
 gains a LoRa variant alongside the existing raw and generic packet variants.
 
-Adding this path requires the following focused contract extensions:
+The shared DSP contract provides bounded `SparseSymbols`, and
+`SignalAnalyzer` delegates factory configuration to each tagged modulation
+profile instead of assuming every profile becomes an `FskConfig`. The radio
+composition boundary rejects sparse symbols explicitly until a compatible PHY
+decoder is selected, rather than silently coercing them to binary bits.
+
+Adding a concrete LoRa path still requires the following focused extensions:
 
 - add `DemodulationProfile::LoRa` with spreading factor, bandwidth, and chirp
   synchronization settings owned by that profile;
-- add `DemodulatorOutputKind::ChirpSymbols` and a stable LoRa demodulator ID;
-- remove the `SignalAnalyzer` construction path's assumption that every
-  profile becomes an `FskConfig`, allowing each tagged profile to supply its
-  modulation-specific factory configuration;
-- add `DemodulatedBatch::ChirpSymbols` with bounded state, discontinuity, frame
-  boundary, confidence, and original source-range information; and
+- register a stable LoRa demodulator ID whose descriptor declares sparse-symbol
+  output and whose factory consumes the LoRa-specific configuration;
 - make `RadioAnalyzerRuntime` dispatch on the typed demodulator output and add a
   LoRa PHY decoder variant whose configuration owns coding rate, header mode,
   payload bounds, and CRC policy.
