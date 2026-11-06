@@ -76,6 +76,11 @@ the channel, source-sample range, preamble bytes, and decoded data bytes. The
 final record reports completion status and record count. It does not contain
 IQ, spectrum, waterfall, or enough information to re-run demodulation.
 
+The existing **Open** action accepts `.jsonl` while the RF view is current and
+loads its bounded decoded history directly into RAW DATA or PACKETS according
+to the session record. Routing is based only on the selected file extension and
+the current view; native `.dsv` and `.sal` loading is unchanged.
+
 ## Saleae Logic 2 interoperability
 
 The recording crate can import and export the ZIP-based `.sal` container used

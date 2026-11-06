@@ -37,7 +37,7 @@ use radio_trigger::{RadioSingleTrigger, RadioSingleTriggerConfig};
 use recording::{
     choose_decoded_data_save_path, choose_recording_save_path, choose_recording_to_open,
     choose_saleae_export_path, create_decoded_data_recorder, create_saleae_export_file,
-    FileDecodedDataRecorder,
+    read_decoded_data, DecodedDataRecord, FileDecodedDataRecorder,
 };
 use sessions::{SessionTabs, MAX_SESSION_TABS, SESSION_NAME_MAX_CHARS};
 use snapshot::{crop_snapshot_image, save_snapshot_image, PendingSnapshot};
@@ -45,7 +45,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek};
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,9 +62,10 @@ use wavecraft_core::{
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
 };
 use wavecraft_decode::{
-    AdditiveWhiteningConfig, BitOrder, BitTransformConfig, RadioPacketFramerConfig,
-    RadioPacketLength, RadioPacketPipelineConfig, RawRadioConfig, SyncWordConfig,
-    WhiteningDirection,
+    AdditiveWhiteningConfig, BitOrder, BitTransformConfig, ByteStatus, RadioPacket,
+    RadioPacketFramerConfig, RadioPacketLength, RadioPacketPipelineConfig,
+    RadioPacketPipelineOutput, RawRadioConfig, RawRadioMessageStart, RawRadioOutput, SampleRange,
+    SyncWordConfig, TimedByte, WhiteningDirection,
 };
 use wavecraft_dsp::{
     BinaryFskProfile, BinaryGfskProfile, ChannelizerConfig, DemodulationProfile, FskPolarity,
@@ -3386,7 +3387,7 @@ enum RadioDemodulation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RadioDataMode {
+pub(crate) enum RadioDataMode {
     Raw,
     Packets,
 }
@@ -4090,6 +4091,34 @@ impl WaveCraftApp {
             });
             let _ = sender.send(result);
         });
+    }
+
+    fn begin_open_decoded_data(&mut self, path: PathBuf) {
+        if self.pending.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.pending = Some(receiver);
+        self.requested_capture_target = None;
+        self.scope_configuration_due = None;
+        self.status = format!("Opening decoded RF data {}…", path.display());
+        self.last_error = None;
+        thread::spawn(move || {
+            let result =
+                load_gui_decoded_data(&path).map(|recording| WorkerSuccess::RecordingLoaded {
+                    path,
+                    recording: Box::new(recording),
+                });
+            let _ = sender.send(result);
+        });
+    }
+
+    fn open_selected_recording(&mut self, path: PathBuf) {
+        match decoded_data_open_request(&path, self.active_waveform_tab) {
+            Ok(true) => self.begin_open_decoded_data(path),
+            Ok(false) => self.begin_open_recording(path),
+            Err(error) => self.set_error(error),
+        }
     }
 
     fn begin_export_saleae(&mut self, path: PathBuf) {
@@ -12163,7 +12192,7 @@ impl eframe::App for WaveCraftApp {
         }
         if open_recording_clicked {
             if let Some(path) = choose_recording_to_open() {
-                self.begin_open_recording(path);
+                self.open_selected_recording(path);
             }
         }
         if export_saleae_clicked {
@@ -13381,6 +13410,23 @@ fn recording_metadata_value<T: std::str::FromStr>(
     metadata.get(key)?.parse().ok()
 }
 
+fn decoded_data_open_request(
+    path: &Path,
+    current_view: Option<WaveformTab>,
+) -> Result<bool, String> {
+    let is_jsonl = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"));
+    if !is_jsonl {
+        return Ok(false);
+    }
+    if current_view != Some(WaveformTab::RadioReceiver) {
+        return Err("Select the RF view before opening decoded .jsonl data".to_owned());
+    }
+    Ok(true)
+}
+
 fn channel_names_from_recording_metadata(
     metadata: &BTreeMap<String, String>,
 ) -> ([String; LOGIC_CHANNEL_COUNT], [String; 2]) {
@@ -14051,6 +14097,164 @@ fn load_gui_recording(
         read_gui_recording_with_analyzers(BufReader::new(file), analyzers)
     };
     result.map_err(|error| format!("failed to read recording {}: {error}", path.display()))
+}
+
+fn load_gui_decoded_data(path: &Path) -> Result<LoadedRecording, String> {
+    let file = File::open(path)
+        .map_err(|error| format!("failed to open decoded data {}: {error}", path.display()))?;
+    read_gui_decoded_data(BufReader::new(file))
+        .map_err(|error| format!("failed to read decoded data {}: {error}", path.display()))
+}
+
+fn read_gui_decoded_data(input: impl BufRead) -> Result<LoadedRecording, String> {
+    let mut analysis = RadioAnalysisStore::default();
+    let mut fallback_sample_index = 0_u64;
+    let (session, completion) = read_decoded_data(input, |record| {
+        match record {
+            DecodedDataRecord::RawMessage {
+                channel_name,
+                channel_frequency_offset_hz,
+                sample_start,
+                sample_end,
+                uncertain_bits,
+                preamble,
+                data,
+            } => {
+                let preamble_bytes = preamble.len();
+                let mut values = preamble;
+                values.extend(data);
+                let start = sample_start.unwrap_or(fallback_sample_index);
+                let end = decoded_record_end(start, sample_end, values.len());
+                fallback_sample_index = end;
+                analysis.ingest_raw(
+                    RawRadioOutput {
+                        bytes: timed_decoded_bytes(values, start, end, uncertain_bits),
+                        message_starts: vec![RawRadioMessageStart {
+                            sample_index: start,
+                            preamble_bytes,
+                            maximum_uncertain_bits: usize::MAX,
+                        }],
+                        diagnostics: Vec::new(),
+                        synchronized: true,
+                    },
+                    channel_frequency_offset_hz,
+                    Arc::from(channel_name),
+                );
+                analysis.finish_channel_capture(channel_frequency_offset_hz);
+            }
+            DecodedDataRecord::Packet {
+                channel_name,
+                channel_frequency_offset_hz,
+                sample_start,
+                sample_end,
+                confidence,
+                uncertain_bits,
+                preamble,
+                data,
+            } => {
+                let preamble_bytes = preamble.len();
+                let mut values = preamble;
+                values.extend(data);
+                let end = decoded_record_end(sample_start, Some(sample_end), values.len());
+                fallback_sample_index = fallback_sample_index.max(end);
+                let timed = timed_decoded_bytes(values, sample_start, end, uncertain_bits);
+                analysis.ingest_packets(
+                    RadioPacketPipelineOutput {
+                        packets: vec![RadioPacket {
+                            preamble: timed[..preamble_bytes].to_vec(),
+                            bytes: timed[preamble_bytes..].to_vec(),
+                            range: SampleRange {
+                                start: sample_start,
+                                end,
+                            },
+                            confidence,
+                            diagnostics: Vec::new(),
+                        }],
+                        diagnostics: Vec::new(),
+                    },
+                    channel_frequency_offset_hz,
+                    Arc::from(channel_name),
+                );
+            }
+        }
+        Ok(())
+    })?;
+    analysis.finish_raw_capture();
+    let mut radio_settings = RadioSettings::default();
+    radio_settings.capture.center_frequency_hz = session.center_frequency_hz;
+    radio_settings.capture.sample_rate_hz = session.sample_rate_hz;
+    radio_settings.capture.bandwidth_hz = session.bandwidth_hz;
+    radio_settings.analyzer.enabled = true;
+    radio_settings.analyzer.data_mode = session.data_mode;
+    if !session.channels.is_empty() {
+        radio_settings.analyzer.channels = session
+            .channels
+            .into_iter()
+            .map(|channel| RadioAnalyzerChannelSettings {
+                name: channel.name,
+                frequency_offset_hz: channel.frequency_offset_hz,
+            })
+            .collect();
+    }
+    let waveforms = WaveformStore {
+        radio_analysis: analysis,
+        ..WaveformStore::default()
+    };
+    Ok(LoadedRecording {
+        capture: CompletedCapture {
+            waveforms,
+            protocol_decode: ProtocolCaptureDecoder::new(&[]),
+            has_logic: false,
+            has_scope: false,
+            has_radio: true,
+        },
+        logic_settings: None,
+        scope_settings: None,
+        radio_settings: Some(radio_settings),
+        logic_channel_names: empty_logic_channel_names(),
+        scope_channel_names: empty_scope_channel_names(),
+        completion,
+    })
+}
+
+fn decoded_record_end(start: u64, end: Option<u64>, byte_count: usize) -> u64 {
+    let minimum_span = u64::try_from(byte_count.max(1)).unwrap_or(u64::MAX);
+    end.filter(|end| *end > start)
+        .unwrap_or_else(|| start.saturating_add(minimum_span))
+}
+
+fn timed_decoded_bytes(
+    values: Vec<u8>,
+    start: u64,
+    end: u64,
+    mut uncertain_bits: u64,
+) -> Vec<TimedByte> {
+    let count = values.len() as u64;
+    let span = end.saturating_sub(start).max(count);
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let index = index as u64;
+            let range_start = start.saturating_add(span.saturating_mul(index) / count.max(1));
+            let range_end = start
+                .saturating_add(span.saturating_mul(index.saturating_add(1)) / count.max(1))
+                .max(range_start.saturating_add(1));
+            let low_confidence_bits = uncertain_bits.min(8) as u8;
+            uncertain_bits = uncertain_bits.saturating_sub(u64::from(low_confidence_bits));
+            TimedByte {
+                value,
+                range: SampleRange {
+                    start: range_start,
+                    end: range_end,
+                },
+                status: ByteStatus {
+                    low_confidence_bits,
+                    ..ByteStatus::default()
+                },
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -20675,6 +20879,61 @@ mod tests {
         assert!(!settings.iq_correction_enabled);
         assert!(settings.amplifier_enabled);
         assert!(settings.antenna_power_enabled);
+    }
+
+    #[test]
+    fn decoded_jsonl_opens_packets_in_the_rf_view() {
+        let jsonl = concat!(
+            "{\"type\":\"session\",\"format\":\"wavecraft-decoded-radio\",\"format_version\":1,\"center_frequency_hz\":433920000,\"sample_rate_hz\":2000000,\"bandwidth_hz\":1750000,\"data_mode\":\"packets\",\"channels\":[{\"name\":\"Weather\",\"frequency_offset_hz\":125000}]}\n",
+            "{\"type\":\"packet\",\"sequence\":1,\"channel_name\":\"Weather\",\"channel_frequency_offset_hz\":125000,\"sample_start\":100,\"sample_end\":124,\"confidence\":0.9,\"uncertain_bits\":0,\"preamble\":[170],\"data\":[18,52]}\n",
+            "{\"type\":\"footer\",\"status\":\"complete\",\"record_count\":1}\n",
+        );
+
+        let loaded = read_gui_decoded_data(Cursor::new(jsonl)).unwrap();
+
+        assert!(loaded.capture.has_radio);
+        assert!(!loaded.capture.has_logic);
+        assert!(!loaded.capture.has_scope);
+        assert_eq!(
+            loaded.capture.waveforms.radio_analysis.raw_messages().len(),
+            1
+        );
+        let message = loaded
+            .capture
+            .waveforms
+            .radio_analysis
+            .raw_messages()
+            .front()
+            .unwrap();
+        assert_eq!(message.channel_name(), "Weather");
+        assert_eq!(message.preamble_bytes(), 1);
+        assert_eq!(
+            message
+                .data_bytes()
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0x12, 0x34]
+        );
+        let settings = loaded.radio_settings.unwrap();
+        assert_eq!(settings.analyzer.data_mode, RadioDataMode::Packets);
+        assert_eq!(settings.capture.center_frequency_hz, 433_920_000);
+        assert_eq!(loaded.completion, CompletionStatus::Complete);
+    }
+
+    #[test]
+    fn decoded_jsonl_open_requires_the_rf_view() {
+        let path = Path::new("decoded-data.JSONL");
+
+        assert_eq!(
+            decoded_data_open_request(path, Some(WaveformTab::RadioReceiver)),
+            Ok(true)
+        );
+        assert!(decoded_data_open_request(path, Some(WaveformTab::Oscilloscope)).is_err());
+        assert_eq!(
+            decoded_data_open_request(Path::new("capture.dsv"), Some(WaveformTab::Oscilloscope)),
+            Ok(false)
+        );
     }
 
     #[test]

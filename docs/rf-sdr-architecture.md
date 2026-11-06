@@ -702,6 +702,11 @@ different demodulator configuration. Both native IQ recording and decoded-data
 recording can attach to an active Run session and are finalized when the
 operator stops acquisition.
 
+Decoded-data JSON Lines files can be reopened from the existing Open action
+when RF is the current view. The loader restores session/channel metadata and
+streams the retained records into the bounded RAW DATA or PACKETS history; it
+does not synthesize IQ, spectrum, or waterfall content.
+
 IQ size is made explicit before capture. The UI estimates bytes per second,
 expected file size, and available duration from the selected sample rate. Long
 or unlimited capture requires an explicit recording destination and surfaces

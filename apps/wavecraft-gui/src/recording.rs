@@ -1,7 +1,8 @@
 use crate::{waveform::radio::RawRadioMessage, RadioDataMode, RadioSettings};
+use serde::Deserialize;
 use serde_json::json;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use wavecraft_decode::RadioPacket;
 use wavecraft_recording::CompletionStatus;
@@ -296,12 +297,241 @@ pub(crate) fn create_decoded_data_recorder(
     DecodedDataRecorder::new(BufWriter::new(file), settings)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedDataChannel {
+    pub name: String,
+    pub frequency_offset_hz: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedDataSession {
+    pub center_frequency_hz: u64,
+    pub sample_rate_hz: u64,
+    pub bandwidth_hz: u64,
+    pub data_mode: RadioDataMode,
+    pub channels: Vec<DecodedDataChannel>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DecodedDataRecord {
+    RawMessage {
+        channel_name: String,
+        channel_frequency_offset_hz: i64,
+        sample_start: Option<u64>,
+        sample_end: Option<u64>,
+        uncertain_bits: u64,
+        preamble: Vec<u8>,
+        data: Vec<u8>,
+    },
+    Packet {
+        channel_name: String,
+        channel_frequency_offset_hz: i64,
+        sample_start: u64,
+        sample_end: u64,
+        confidence: f32,
+        uncertain_bits: u64,
+        preamble: Vec<u8>,
+        data: Vec<u8>,
+    },
+}
+
+#[derive(Deserialize)]
+struct DecodedDataSessionLine {
+    #[serde(rename = "type")]
+    kind: String,
+    format: String,
+    format_version: u64,
+    center_frequency_hz: u64,
+    sample_rate_hz: u64,
+    bandwidth_hz: u64,
+    data_mode: String,
+    channels: Vec<DecodedDataChannelLine>,
+}
+
+#[derive(Deserialize)]
+struct DecodedDataChannelLine {
+    name: String,
+    frequency_offset_hz: i64,
+}
+
+#[derive(Deserialize)]
+struct DecodedRawMessageLine {
+    channel_name: String,
+    channel_frequency_offset_hz: i64,
+    sample_start: Option<u64>,
+    sample_end: Option<u64>,
+    #[serde(default)]
+    uncertain_bits: u64,
+    preamble: Vec<u8>,
+    data: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct DecodedPacketLine {
+    channel_name: String,
+    channel_frequency_offset_hz: i64,
+    sample_start: u64,
+    sample_end: u64,
+    confidence: f32,
+    #[serde(default)]
+    uncertain_bits: u64,
+    preamble: Vec<u8>,
+    data: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct DecodedDataFooterLine {
+    status: String,
+    record_count: u64,
+}
+
+pub(crate) fn read_decoded_data(
+    input: impl BufRead,
+    mut ingest: impl FnMut(DecodedDataRecord) -> Result<(), String>,
+) -> Result<(DecodedDataSession, CompletionStatus), String> {
+    let mut lines = input.lines().enumerate();
+    let (session_line_number, session_text) =
+        next_nonempty_line(&mut lines)?.ok_or_else(|| "decoded data file is empty".to_owned())?;
+    let session_line: DecodedDataSessionLine = serde_json::from_str(&session_text)
+        .map_err(|error| json_line_error(session_line_number, error))?;
+    if session_line.kind != "session"
+        || session_line.format != "wavecraft-decoded-radio"
+        || session_line.format_version != 1
+    {
+        return Err("decoded data session header is unsupported".to_owned());
+    }
+    let data_mode = match session_line.data_mode.as_str() {
+        "raw" => RadioDataMode::Raw,
+        "packets" => RadioDataMode::Packets,
+        mode => return Err(format!("decoded data mode {mode:?} is unsupported")),
+    };
+    let session = DecodedDataSession {
+        center_frequency_hz: session_line.center_frequency_hz,
+        sample_rate_hz: session_line.sample_rate_hz,
+        bandwidth_hz: session_line.bandwidth_hz,
+        data_mode,
+        channels: session_line
+            .channels
+            .into_iter()
+            .map(|channel| DecodedDataChannel {
+                name: channel.name,
+                frequency_offset_hz: channel.frequency_offset_hz,
+            })
+            .collect(),
+    };
+    let mut record_count = 0_u64;
+    let mut completion = None;
+    while let Some((line_number, text)) = next_nonempty_line(&mut lines)? {
+        if completion.is_some() {
+            return Err(format!(
+                "decoded data line {} appears after the footer",
+                line_number + 1
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| json_line_error(line_number, error))?;
+        let kind = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("decoded data line {} has no type", line_number + 1))?;
+        let record = match kind {
+            "raw_message" => {
+                let line: DecodedRawMessageLine = serde_json::from_value(value)
+                    .map_err(|error| json_line_error(line_number, error))?;
+                Some(DecodedDataRecord::RawMessage {
+                    channel_name: line.channel_name,
+                    channel_frequency_offset_hz: line.channel_frequency_offset_hz,
+                    sample_start: line.sample_start,
+                    sample_end: line.sample_end,
+                    uncertain_bits: line.uncertain_bits,
+                    preamble: line.preamble,
+                    data: line.data,
+                })
+            }
+            "packet" => {
+                let line: DecodedPacketLine = serde_json::from_value(value)
+                    .map_err(|error| json_line_error(line_number, error))?;
+                Some(DecodedDataRecord::Packet {
+                    channel_name: line.channel_name,
+                    channel_frequency_offset_hz: line.channel_frequency_offset_hz,
+                    sample_start: line.sample_start,
+                    sample_end: line.sample_end,
+                    confidence: line.confidence,
+                    uncertain_bits: line.uncertain_bits,
+                    preamble: line.preamble,
+                    data: line.data,
+                })
+            }
+            "footer" => {
+                let line: DecodedDataFooterLine = serde_json::from_value(value)
+                    .map_err(|error| json_line_error(line_number, error))?;
+                if line.record_count != record_count {
+                    return Err(format!(
+                        "decoded data footer reports {} records but {record_count} were read",
+                        line.record_count
+                    ));
+                }
+                completion = Some(match line.status.as_str() {
+                    "complete" => CompletionStatus::Complete,
+                    "cancelled" => CompletionStatus::Cancelled,
+                    "failed" => CompletionStatus::Failed,
+                    status => {
+                        return Err(format!(
+                            "decoded data completion status {status:?} is unsupported"
+                        ))
+                    }
+                });
+                None
+            }
+            other => {
+                return Err(format!(
+                    "decoded data line {} has unsupported type {other:?}",
+                    line_number + 1
+                ))
+            }
+        };
+        if let Some(record) = record {
+            ingest(record)?;
+            record_count = record_count
+                .checked_add(1)
+                .ok_or_else(|| "decoded data record count overflowed".to_owned())?;
+        }
+    }
+    let completion = completion.ok_or_else(|| "decoded data file has no footer".to_owned())?;
+    Ok((session, completion))
+}
+
+fn next_nonempty_line(
+    lines: &mut impl Iterator<Item = (usize, std::io::Result<String>)>,
+) -> Result<Option<(usize, String)>, String> {
+    for (line_number, line) in lines {
+        let line = line.map_err(|error| {
+            format!(
+                "failed to read decoded data line {}: {error}",
+                line_number + 1
+            )
+        })?;
+        if !line.trim().is_empty() {
+            return Ok(Some((line_number, line)));
+        }
+    }
+    Ok(None)
+}
+
+fn json_line_error(line_number: usize, error: serde_json::Error) -> String {
+    format!(
+        "decoded data line {} is invalid JSON: {error}",
+        line_number + 1
+    )
+}
+
 pub(crate) fn choose_recording_to_open() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("Open capture")
-        .add_filter("Supported captures", &["dsv", "sal"])
+        .add_filter("Supported captures", &["dsv", "sal", "jsonl"])
         .add_filter("WaveCraft capture", &["dsv"])
         .add_filter("Saleae Logic 2 capture", &["sal"])
+        .add_filter("WaveCraft decoded RF data", &["jsonl"])
         .pick_file()
 }
 
