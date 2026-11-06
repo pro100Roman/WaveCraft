@@ -61,6 +61,21 @@ remain reproducible derived data rather than authoritative recording content.
 The complete design is in
 [RF/SDR capture and signal-decoding architecture](rf-sdr-architecture.md).
 
+The **Record** action can attach to an existing Logic Analyzer Loop or active
+Oscilloscope/RF Run acquisition and stream native `.dsv` frames until the
+operator stops. Starting Record from an idle RF view also starts Run mode.
+Because Run has no predetermined duration, RF file size grows at approximately
+two bytes per IQ sample plus record framing.
+
+WaveCraft also offers a decoded-data recording that can start or attach during
+Run in either RAW or PACKETS mode. This is a separate newline-delimited JSON
+(`.jsonl`) stream, not a native `.dsv` capture. Its first record describes the
+RF session and analyzer channels. RAW records contain completed messages;
+PACKETS records contain accepted framed packets with confidence. Both include
+the channel, source-sample range, preamble bytes, and decoded data bytes. The
+final record reports completion status and record count. It does not contain
+IQ, spectrum, waterfall, or enough information to re-run demodulation.
+
 ## Saleae Logic 2 interoperability
 
 The recording crate can import and export the ZIP-based `.sal` container used

@@ -318,15 +318,15 @@ bits after the last complete byte. This expected tail is discarded silently;
 an incomplete byte caused by an input discontinuity remains a visible warning.
 
 The FSK/GFSK raw view groups the synchronized byte stream into messages at
-each repeated configured preamble. It retains a bounded message history,
-renders the newest completed message first, and distinguishes preamble bytes
-from data bytes. Each row reports the decoded data length in bytes, excluding
-the configured preamble. Preamble bytes are collapsed by default in each row
-and can be expanded independently from its `PRE` control; the row tooltip always
-retains the full preamble. An in-progress raw stream is reported as receiving but
-is not inserted into the stable message list until the next preamble or capture
-stop closes it. The list can be scrolled to older retained messages, and
-hovering a row shows its full retained hexadecimal contents. A repeated
+each repeated configured preamble. It retains up to 10,000 messages, renders
+the newest completed message first, and distinguishes preamble bytes from data
+bytes. Each row reports the decoded data length in bytes, excluding the
+configured preamble. Preamble bytes are collapsed by default in each row and
+can be expanded independently from its `PRE` control; the row tooltip always
+retains the full preamble. An in-progress raw stream is reported as receiving
+but is not inserted into the stable message list until the next preamble or
+capture stop closes it. The list can be scrolled to older retained messages,
+and hovering a row shows its full retained hexadecimal contents. A repeated
 preamble may span arbitrary IQ and demodulator batches.
 
 Raw acquisition also has a normalized minimum bit-confidence threshold and a
@@ -692,6 +692,15 @@ version 1 unchanged; the writer emits version 2 once IQ support lands. Existing
 v1 recordings are never rewritten merely because a newer application opens
 them. Spectrum, waterfall, bits, and decoded packets are not required recording
 records because they are reproducible derived data.
+
+For long-running monitoring where retaining wideband IQ is unnecessary, the RF
+GUI can instead stream completed RAW messages or accepted PACKETS to a
+newline-delimited JSON file. This derived-data export is intentionally separate
+from native `.dsv`: it records channel identity, source-sample ranges, preamble,
+and decoded bytes, plus packet confidence when available, but cannot reproduce a
+different demodulator configuration. Both native IQ recording and decoded-data
+recording can attach to an active Run session and are finalized when the
+operator stops acquisition.
 
 IQ size is made explicit before capture. The UI estimates bytes per second,
 expected file size, and available duration from the selected sample rate. Long

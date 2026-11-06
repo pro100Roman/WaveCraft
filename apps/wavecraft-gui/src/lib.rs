@@ -35,8 +35,9 @@ use radio_analyzer::{
 };
 use radio_trigger::{RadioSingleTrigger, RadioSingleTriggerConfig};
 use recording::{
-    choose_recording_save_path, choose_recording_to_open, choose_saleae_export_path,
-    create_saleae_export_file,
+    choose_decoded_data_save_path, choose_recording_save_path, choose_recording_to_open,
+    choose_saleae_export_path, create_decoded_data_recorder, create_saleae_export_file,
+    FileDecodedDataRecorder,
 };
 use sessions::{SessionTabs, MAX_SESSION_TABS, SESSION_NAME_MAX_CHARS};
 use snapshot::{crop_snapshot_image, save_snapshot_image, PendingSnapshot};
@@ -2417,6 +2418,21 @@ fn should_rearm_acquisition(
         && !failed
 }
 
+fn capture_recording_is_supported(mode: AcquisitionMode) -> bool {
+    matches!(mode, AcquisitionMode::Single | AcquisitionMode::Run)
+}
+
+fn active_continuous_capture_accepts_recording(
+    mode: AcquisitionMode,
+    recording_active: bool,
+) -> bool {
+    matches!(mode, AcquisitionMode::Loop | AcquisitionMode::Run) && !recording_active
+}
+
+fn decoded_data_recording_is_supported(mode: AcquisitionMode, target: CaptureTarget) -> bool {
+    mode == AcquisitionMode::Run && target == CaptureTarget::RadioReceiver
+}
+
 fn uses_rolling_scope_buffer(
     _mode: AcquisitionMode,
     _has_scope: bool,
@@ -3068,6 +3084,47 @@ fn ingest_radio_dsp_output(waveforms: &mut WaveformStore, output: RadioDspOutput
     }
 }
 
+fn record_decoded_radio_packets(
+    recorder: &mut Option<FileDecodedDataRecorder>,
+    output: &RadioDspOutput,
+) -> Result<(), String> {
+    let Some(recorder) = recorder
+        .as_mut()
+        .filter(|recorder| recorder.records_packets())
+    else {
+        return Ok(());
+    };
+    for analysis in &output.analyses {
+        let analysis = analysis
+            .as_ref()
+            .map_err(|error| format!("failed to decode packet data for recording: {error}"))?;
+        for packet in &analysis.packets.packets {
+            recorder.write_packet(
+                analysis.channel_frequency_offset_hz,
+                &analysis.channel_name,
+                packet,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn record_decoded_raw_messages(
+    recorder: &mut Option<FileDecodedDataRecorder>,
+    analysis: &RadioAnalysisStore,
+) -> Result<(), String> {
+    let Some(recorder) = recorder
+        .as_mut()
+        .filter(|recorder| recorder.records_raw_messages())
+    else {
+        return Ok(());
+    };
+    for message in analysis.raw_messages() {
+        recorder.write_raw_message(message)?;
+    }
+    Ok(())
+}
+
 fn ingest_active_capture_frame(
     active: &mut ActiveCapture,
     frame: CaptureFrame,
@@ -3134,6 +3191,8 @@ struct ActiveCapture {
     radio_trigger: Option<RadioSingleTrigger>,
     recorder: Option<FileRecorder>,
     recording_path: Option<PathBuf>,
+    decoded_data_recorder: Option<FileDecodedDataRecorder>,
+    decoded_data_path: Option<PathBuf>,
     has_logic: bool,
     has_scope: bool,
     has_radio: bool,
@@ -3680,6 +3739,8 @@ struct WaveCraftApp {
     manual_calibration_save_requested: Option<DsCopeCalibrationValues>,
     record_capture: bool,
     recording_path: String,
+    record_decoded_data: bool,
+    decoded_data_path: String,
     capture_requests: HashSet<CaptureTarget>,
     requested_capture_target: Option<CaptureTarget>,
     logic_acquisition_mode: AcquisitionMode,
@@ -3775,6 +3836,8 @@ impl WaveCraftApp {
             manual_calibration_save_requested: None,
             record_capture: false,
             recording_path: "capture.dsv".to_owned(),
+            record_decoded_data: false,
+            decoded_data_path: "decoded-data.jsonl".to_owned(),
             capture_requests: HashSet::new(),
             requested_capture_target: None,
             logic_acquisition_mode: AcquisitionMode::Single,
@@ -4206,10 +4269,17 @@ impl WaveCraftApp {
             self.logic_marker_settings.clear();
         }
         self.scheduled_repetitive_capture = None;
-        if self.record_capture && mode.runs_continuously() {
+        if self.record_capture && !capture_recording_is_supported(mode) {
             self.record_capture = false;
+            self.record_decoded_data = false;
             self.last_error =
-                Some("Complete-capture recording is available in Single mode only".to_owned());
+                Some("Capture recording is available in Single and Run modes only".to_owned());
+            return;
+        }
+        if self.record_decoded_data && !decoded_data_recording_is_supported(mode, target) {
+            self.record_capture = false;
+            self.record_decoded_data = false;
+            self.last_error = Some("Decoded data recording requires RF Run mode".to_owned());
             return;
         }
         let devices = match capture_devices_for_target(
@@ -4221,6 +4291,7 @@ impl WaveCraftApp {
             Ok(devices) => devices,
             Err(error) => {
                 self.record_capture = false;
+                self.record_decoded_data = false;
                 self.last_error = Some(error);
                 return;
             }
@@ -4232,6 +4303,7 @@ impl WaveCraftApp {
                 Ok(request) => Some(request),
                 Err(error) => {
                     self.record_capture = false;
+                    self.record_decoded_data = false;
                     self.last_error = Some(error);
                     return;
                 }
@@ -4241,13 +4313,21 @@ impl WaveCraftApp {
         };
         if self.record_capture && self.recording_path.trim().is_empty() {
             self.record_capture = false;
+            self.record_decoded_data = false;
             self.last_error = Some("Enter a recording file path".to_owned());
+            return;
+        }
+        if self.record_decoded_data && self.decoded_data_path.trim().is_empty() {
+            self.record_capture = false;
+            self.record_decoded_data = false;
+            self.last_error = Some("Enter a decoded data recording file path".to_owned());
             return;
         }
         let scope_config = match self.scope_settings.capture_config() {
             Ok(config) => config,
             Err(error) => {
                 self.record_capture = false;
+                self.record_decoded_data = false;
                 self.last_error = Some(error);
                 return;
             }
@@ -4256,6 +4336,7 @@ impl WaveCraftApp {
             Ok(config) => config,
             Err(error) => {
                 self.record_capture = false;
+                self.record_decoded_data = false;
                 self.last_error = Some(error);
                 return;
             }
@@ -4265,6 +4346,7 @@ impl WaveCraftApp {
             && target != CaptureTarget::LogicAnalyzer
         {
             self.record_capture = false;
+            self.record_decoded_data = false;
             self.last_error = Some(
                 "Repetitive and Loop modes are available for Logic Analyzer capture only"
                     .to_owned(),
@@ -4275,6 +4357,7 @@ impl WaveCraftApp {
             && logic_config.operation_mode() != DsLogicOperationMode::Stream
         {
             self.record_capture = false;
+            self.record_decoded_data = false;
             self.last_error = Some("Loop mode requires DSLogic Stream mode".to_owned());
             return;
         }
@@ -4550,6 +4633,102 @@ impl WaveCraftApp {
         }
     }
 
+    fn attach_run_capture_recording(&mut self, target: CaptureTarget, path: PathBuf) {
+        let logic_config = match self.logic_settings.capture_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
+        };
+        let recorder = {
+            let Some(active) = self.capture_for_target(target) else {
+                self.set_error(format!("{} Run capture is not active", target.label()));
+                return;
+            };
+            if !matches!(active.mode, AcquisitionMode::Loop | AcquisitionMode::Run) {
+                self.set_error(
+                    "Recording can only attach to an active Run or Loop acquisition".to_owned(),
+                );
+                return;
+            }
+            if active.recorder.is_some() {
+                self.set_error("Capture recording is already active".to_owned());
+                return;
+            }
+            match start_gui_recording(
+                &path,
+                active.session.descriptors(),
+                GuiRecordingSettings {
+                    logic_config,
+                    logic_settings: self.logic_settings,
+                    scope_config: active.scope_config,
+                    scope_settings: self.scope_settings,
+                    radio_settings: &self.radio_settings,
+                    logic_channel_names: &self.logic_channel_names,
+                    scope_channel_names: &self.scope_channel_names,
+                },
+            ) {
+                Ok(recorder) => recorder,
+                Err(error) => {
+                    self.set_error(error);
+                    return;
+                }
+            }
+        };
+        let Some(active) = self.capture_for_target_mut(target) else {
+            self.set_error("Run capture ended before recording could start".to_owned());
+            return;
+        };
+        active.recorder = Some(recorder);
+        active.recording_path = Some(path.clone());
+        self.status = format!(
+            "{} continuous acquisition · recording to {}",
+            target.label(),
+            path.display()
+        );
+        self.last_error = None;
+    }
+
+    fn attach_run_decoded_data_recording(&mut self, path: PathBuf) {
+        let last_raw_message_sequence = {
+            let Some(active) = self.capture_for_target(CaptureTarget::RadioReceiver) else {
+                self.set_error("RF Run capture is not active".to_owned());
+                return;
+            };
+            if active.mode != AcquisitionMode::Run || !active.has_radio {
+                self.set_error("Decoded data recording can only attach to RF Run mode".to_owned());
+                return;
+            }
+            if active.decoded_data_recorder.is_some() {
+                self.set_error("Decoded data recording is already active".to_owned());
+                return;
+            }
+            active
+                .waveforms
+                .radio_analysis
+                .raw_messages()
+                .back()
+                .map_or(0, |message| message.sequence())
+        };
+        let mut recorder = match create_decoded_data_recorder(&path, &self.radio_settings) {
+            Ok(recorder) => recorder,
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
+        };
+        recorder.skip_raw_messages_through(last_raw_message_sequence);
+        let Some(active) = self.capture_for_target_mut(CaptureTarget::RadioReceiver) else {
+            self.set_error("RF Run capture ended before recording could start".to_owned());
+            return;
+        };
+        active.decoded_data_recorder = Some(recorder);
+        active.decoded_data_path = Some(path.clone());
+        self.status = format!("RF Run · recording decoded data to {}", path.display());
+        self.last_error = None;
+    }
+
     fn stop_capture(&mut self, target: CaptureTarget) {
         let Some(index) = self
             .captures
@@ -4572,20 +4751,57 @@ impl WaveCraftApp {
         active.session.request_stop();
         let (protocol_decode, logic_decode_error) = finish_logic_decode(&mut active);
         let stop_result = active.session.stop();
-        let completion = if stop_result.is_ok() {
+        let radio_dsp_result = active.radio_dsp.finish();
+        let mut error = stop_result.as_ref().err().map(ToString::to_string);
+        match radio_dsp_result {
+            Ok(outputs) => {
+                for output in outputs {
+                    if let Err(recording_error) =
+                        record_decoded_radio_packets(&mut active.decoded_data_recorder, &output)
+                    {
+                        append_error(&mut error, recording_error);
+                    }
+                    ingest_radio_dsp_output(&mut active.waveforms, output);
+                    if let Err(recording_error) = record_decoded_raw_messages(
+                        &mut active.decoded_data_recorder,
+                        &active.waveforms.radio_analysis,
+                    ) {
+                        append_error(&mut error, recording_error);
+                    }
+                }
+            }
+            Err(dsp_error) => append_error(&mut error, dsp_error),
+        }
+        if let Some(logic_decode_error) = logic_decode_error {
+            append_error(&mut error, logic_decode_error);
+        }
+        active.waveforms.radio_analysis.finish_raw_capture();
+        if let Err(recording_error) = record_decoded_raw_messages(
+            &mut active.decoded_data_recorder,
+            &active.waveforms.radio_analysis,
+        ) {
+            append_error(&mut error, recording_error);
+        }
+        let completion = if stop_result.is_ok() && error.is_none() {
             CompletionStatus::Cancelled
         } else {
             CompletionStatus::Failed
         };
-        let recording_result = finish_gui_recording(&mut active.recorder, completion);
-        let recording_path = active.recording_path.take();
-        if recording_path.is_some() {
-            self.record_capture = false;
+        if let Err(recording_error) = finish_gui_recording(&mut active.recorder, completion) {
+            append_error(&mut error, recording_error);
         }
+        if let Err(recording_error) =
+            finish_decoded_data_recording(&mut active.decoded_data_recorder, completion)
+        {
+            append_error(&mut error, recording_error);
+        }
+        let recording_path = active.recording_path.take();
+        let decoded_data_path = active.decoded_data_path.take();
+        self.record_capture = false;
+        self.record_decoded_data = false;
         let has_logic = active.has_logic;
         let has_scope = active.has_scope;
         let has_radio = active.has_radio;
-        active.waveforms.radio_analysis.finish_raw_capture();
         if !active.preserve_display_until_complete {
             self.set_completed_capture_for_target(
                 active.target,
@@ -4598,21 +4814,15 @@ impl WaveCraftApp {
                 },
             );
         }
-        match (stop_result, recording_result) {
-            (Ok(()), Ok(())) => {
-                self.status = recording_path.map_or_else(
+        match error {
+            Some(error) => self.set_error(error),
+            None => {
+                let saved_path = decoded_data_path.or(recording_path);
+                self.status = saved_path.map_or_else(
                     || "Capture stopped".to_owned(),
                     |path| format!("Capture stopped · recording saved to {}", path.display()),
                 );
             }
-            (Err(error), Ok(())) => self.set_error(error.to_string()),
-            (Ok(()), Err(error)) => self.set_error(error),
-            (Err(stop_error), Err(recording_error)) => self.set_error(format!(
-                "{stop_error}; additionally failed to finish recording: {recording_error}"
-            )),
-        }
-        if let Some(error) = logic_decode_error {
-            self.set_error(error);
         }
     }
 
@@ -4661,6 +4871,8 @@ impl WaveCraftApp {
                 let logic_config = *logic_config;
                 if !self.capture_is_requested(target) {
                     self.requested_capture_target = None;
+                    self.record_capture = false;
+                    self.record_decoded_data = false;
                     match session.stop() {
                         Ok(()) => self.status = "Acquisition stopped".to_owned(),
                         Err(error) => self.set_error(error.to_string()),
@@ -4725,7 +4937,7 @@ impl WaveCraftApp {
                 let recording_path = self
                     .record_capture
                     .then(|| PathBuf::from(self.recording_path.trim()));
-                let recorder = match recording_path.as_deref() {
+                let mut recorder = match recording_path.as_deref() {
                     Some(path) => {
                         match start_gui_recording(
                             path,
@@ -4753,6 +4965,26 @@ impl WaveCraftApp {
                             }
                         }
                     }
+                    None => None,
+                };
+                let decoded_data_path = self
+                    .record_decoded_data
+                    .then(|| PathBuf::from(self.decoded_data_path.trim()));
+                let decoded_data_recorder = match decoded_data_path.as_deref() {
+                    Some(path) => match create_decoded_data_recorder(path, &self.radio_settings) {
+                        Ok(recorder) => Some(recorder),
+                        Err(error) => {
+                            let _ = finish_gui_recording(&mut recorder, CompletionStatus::Failed);
+                            let cleanup = session.stop().err();
+                            self.set_error(match cleanup {
+                                Some(cleanup) => {
+                                    format!("{error}; additionally failed to stop: {cleanup}")
+                                }
+                                None => error,
+                            });
+                            return;
+                        }
+                    },
                     None => None,
                 };
                 let has_logic = session
@@ -4872,13 +5104,16 @@ impl WaveCraftApp {
                     radio_trigger,
                     recorder,
                     recording_path: recording_path.clone(),
+                    decoded_data_recorder,
+                    decoded_data_path: decoded_data_path.clone(),
                     has_logic,
                     has_scope,
                     has_radio,
                 });
                 self.requested_capture_target = None;
                 self.record_capture = false;
-                self.status = match (mode, recording_path) {
+                self.record_decoded_data = false;
+                self.status = match (mode, recording_path.as_ref()) {
                     (AcquisitionMode::Single, Some(path)) if waiting_for_radio_trigger => format!(
                         "Single · waiting for RF trigger at {:.1} dBFS; recording to {}",
                         f32::from(self.radio_settings.trigger_level_dbfs_tenths) / 10.0,
@@ -4922,7 +5157,12 @@ impl WaveCraftApp {
                         "{} Loop acquisition from {count} instrument(s)",
                         target.label()
                     ),
-                    (AcquisitionMode::Run, _) => {
+                    (AcquisitionMode::Run, Some(path)) => format!(
+                        "{} Run acquisition from {count} instrument(s) · recording to {}",
+                        target.label(),
+                        path.display()
+                    ),
+                    (AcquisitionMode::Run, None) => {
                         if has_scope_trigger
                             && scope_config.trigger().source() == DsCopeTriggerSource::Auto
                         {
@@ -4937,6 +5177,12 @@ impl WaveCraftApp {
                         }
                     }
                 };
+                if let Some(path) = decoded_data_path {
+                    self.status = format!(
+                        "RF Run acquisition from {count} instrument(s) · decoded data to {}",
+                        path.display()
+                    );
+                }
             }
             Ok(WorkerSuccess::RecordingLoaded { path, recording }) => {
                 if let Some(active) = self.active_waveform_tab {
@@ -4974,6 +5220,7 @@ impl WaveCraftApp {
                 self.logic_channel_names = logic_channel_names;
                 self.scope_channel_names = scope_channel_names;
                 self.record_capture = false;
+                self.record_decoded_data = false;
                 self.logic_viewport.reset();
                 self.scope_viewport.reset();
                 self.combined_viewport.reset();
@@ -5059,7 +5306,11 @@ impl WaveCraftApp {
                     }
                 }
             }
-            Err(error) => self.set_error(error),
+            Err(error) => {
+                self.record_capture = false;
+                self.record_decoded_data = false;
+                self.set_error(error);
+            }
         }
     }
 
@@ -5325,7 +5576,24 @@ impl WaveCraftApp {
             }
             loop {
                 match active.radio_dsp.try_recv() {
-                    Ok(output) => ingest_radio_dsp_output(&mut active.waveforms, output),
+                    Ok(output) => {
+                        if let Err(error) =
+                            record_decoded_radio_packets(&mut active.decoded_data_recorder, &output)
+                        {
+                            active.session.request_stop();
+                            finish_status = Some((Err(error), CompletionStatus::Failed));
+                            break;
+                        }
+                        ingest_radio_dsp_output(&mut active.waveforms, output);
+                        if let Err(error) = record_decoded_raw_messages(
+                            &mut active.decoded_data_recorder,
+                            &active.waveforms.radio_analysis,
+                        ) {
+                            active.session.request_stop();
+                            finish_status = Some((Err(error), CompletionStatus::Failed));
+                            break;
+                        }
+                    }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         if finish_status.is_none() {
@@ -5354,6 +5622,7 @@ impl WaveCraftApp {
             let target = active.target;
             let preserve_display_until_complete = active.preserve_display_until_complete;
             let recording_path = active.recording_path.take();
+            let decoded_data_path = active.decoded_data_path.take();
             let has_logic = active.has_logic;
             let has_scope = active.has_scope;
             let has_radio = active.has_radio;
@@ -5363,36 +5632,59 @@ impl WaveCraftApp {
             self.scope_capture_restart_requested = false;
             let (protocol_decode, logic_decode_error) = finish_logic_decode(&mut active);
             let stop_result = active.session.stop();
-            let radio_dsp_error = match active.radio_dsp.finish() {
+            let mut error = result.as_ref().err().cloned();
+            if let Err(stop_error) = &stop_result {
+                append_error(&mut error, format!("failed to stop capture: {stop_error}"));
+            }
+            match active.radio_dsp.finish() {
                 Ok(outputs) => {
                     for output in outputs {
+                        if let Err(recording_error) =
+                            record_decoded_radio_packets(&mut active.decoded_data_recorder, &output)
+                        {
+                            append_error(&mut error, recording_error);
+                        }
                         ingest_radio_dsp_output(&mut active.waveforms, output);
+                        if let Err(recording_error) = record_decoded_raw_messages(
+                            &mut active.decoded_data_recorder,
+                            &active.waveforms.radio_analysis,
+                        ) {
+                            append_error(&mut error, recording_error);
+                        }
                     }
-                    None
                 }
-                Err(error) => Some(error),
-            };
-            let recording_completion = if stop_result.is_ok() {
+                Err(dsp_error) => append_error(&mut error, dsp_error),
+            }
+            if let Some(decode_error) = logic_decode_error {
+                append_error(&mut error, decode_error);
+            }
+            active.waveforms.radio_analysis.finish_raw_capture();
+            if let Err(recording_error) = record_decoded_raw_messages(
+                &mut active.decoded_data_recorder,
+                &active.waveforms.radio_analysis,
+            ) {
+                append_error(&mut error, recording_error);
+            }
+            let recording_completion = if stop_result.is_ok() && error.is_none() {
                 completion
             } else {
                 CompletionStatus::Failed
             };
             let recording_result = finish_gui_recording(&mut active.recorder, recording_completion);
-            active.waveforms.radio_analysis.finish_raw_capture();
-            let mut error = result.as_ref().err().cloned();
-            if let Err(stop_error) = stop_result {
-                append_error(&mut error, format!("failed to stop capture: {stop_error}"));
-            }
-            if let Some(dsp_error) = radio_dsp_error {
-                append_error(&mut error, dsp_error);
-            }
-            if let Some(decode_error) = logic_decode_error {
-                append_error(&mut error, decode_error);
-            }
+            let decoded_recording_result = finish_decoded_data_recording(
+                &mut active.decoded_data_recorder,
+                recording_completion,
+            );
             if let Err(recording_error) = recording_result {
                 append_error(
                     &mut error,
                     format!("failed to finish recording: {recording_error}"),
+                );
+            }
+            if let Err(recording_error) = decoded_recording_result {
+                append_error(
+                    &mut error,
+                    format!("failed to finish decoded data recording: {recording_error}"),
                 );
             }
             let update_completed_capture = if restart_for_frontend {
@@ -5434,9 +5726,8 @@ impl WaveCraftApp {
             if !repeat {
                 self.capture_requests.remove(&target);
             }
-            if recording_path.is_some() {
-                self.record_capture = false;
-            }
+            self.record_capture = false;
+            self.record_decoded_data = false;
             match error {
                 Some(error) => self.set_error(error),
                 None if restart_for_frontend => {
@@ -5445,9 +5736,11 @@ impl WaveCraftApp {
                 None => {
                     let capture_status =
                         result.ok().unwrap_or_else(|| "Capture complete".to_owned());
-                    self.status = recording_path.map_or(capture_status.clone(), |path| {
-                        format!("{capture_status} · recording saved to {}", path.display())
-                    });
+                    self.status = decoded_data_path
+                        .or(recording_path)
+                        .map_or(capture_status.clone(), |path| {
+                            format!("{capture_status} · recording saved to {}", path.display())
+                        });
                 }
             }
             if repeat {
@@ -10238,6 +10531,7 @@ impl eframe::App for WaveCraftApp {
         let mut refresh_clicked = false;
         let mut snapshot_clicked = false;
         let mut record_now_clicked = false;
+        let mut record_decoded_data_clicked = false;
         let mut open_recording_clicked = false;
         let mut export_saleae_clicked = false;
         let mut start_request = None;
@@ -10258,6 +10552,22 @@ impl eframe::App for WaveCraftApp {
                     && active.has_radio
                     && active.radio_runtime_control.is_some()
             });
+        let can_attach_run_capture_recording = control_target
+            .and_then(|target| self.capture_for_target(target))
+            .is_some_and(|active| {
+                active_continuous_capture_accepts_recording(active.mode, active.recorder.is_some())
+            });
+        let active_radio_run_recorders = self
+            .capture_for_target(CaptureTarget::RadioReceiver)
+            .filter(|active| active.mode == AcquisitionMode::Run && active.has_radio)
+            .map(|active| {
+                (
+                    active.recorder.is_some(),
+                    active.decoded_data_recorder.is_some(),
+                )
+            });
+        let can_attach_run_decoded_recording =
+            active_radio_run_recorders.is_some_and(|(_, decoded_active)| !decoded_active);
         let radio_trigger_runtime_controls_enabled = self
             .capture_for_target(CaptureTarget::RadioReceiver)
             .is_some_and(|active| {
@@ -10320,7 +10630,8 @@ impl eframe::App for WaveCraftApp {
             self.pending.is_some(),
             scope_capture_requested,
             selected_scope_device,
-        ) && !(self.record_capture && self.pending.is_some());
+        ) && !((self.record_capture || self.record_decoded_data)
+            && self.pending.is_some());
         let scope_settings_before_ui = self.scope_settings;
         let scope_auto_sample_rate_before_ui = self.scope_auto_sample_rate;
         let manual_calibration_before_ui =
@@ -10356,16 +10667,39 @@ impl eframe::App for WaveCraftApp {
                     ui.separator();
                     if ui
                         .add_enabled(
-                            control_target.is_some_and(|target| {
+                            (control_target.is_some_and(|target| {
                                 self.capture_target_can_start(target)
-                            }) && control_target_available,
+                            }) && control_target_available)
+                                || can_attach_run_capture_recording,
                             toolbar_action_button("⏺ Record", Color32::LIGHT_RED)
                                 .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
                         )
-                        .on_hover_text("Record a complete Single capture to a .dsv file")
+                        .on_hover_text(if can_attach_run_capture_recording {
+                            "Start recording the active Run acquisition to a .dsv file until Stop"
+                        } else if control_target == Some(CaptureTarget::RadioReceiver) {
+                            "Record continuous Run-mode raw IQ to a .dsv file until Stop"
+                        } else {
+                            "Record a complete Single capture to a .dsv file"
+                        })
                         .clicked()
                     {
                         record_now_clicked = true;
+                    }
+                    if control_target == Some(CaptureTarget::RadioReceiver)
+                        && ui
+                            .add_enabled(
+                                (self.capture_target_can_start(CaptureTarget::RadioReceiver)
+                                    && control_target_available)
+                                    || can_attach_run_decoded_recording,
+                                toolbar_action_button("⏺ Data", ORANGE)
+                                    .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
+                            )
+                            .on_hover_text(
+                                "Record decoded RAW messages or PACKETS in Run mode to JSON Lines until Stop",
+                            )
+                            .clicked()
+                    {
+                        record_decoded_data_clicked = true;
                     }
                     if ui
                         .add_enabled(
@@ -10422,7 +10756,8 @@ impl eframe::App for WaveCraftApp {
                                         self.capture_target_can_start(target)
                                     })
                                         && control_target_available
-                                        && !self.record_capture),
+                                        && !self.record_capture
+                                        && !self.record_decoded_data),
                                 if acquisition_active {
                                     toolbar_action_button("■ Stop", Color32::LIGHT_RED)
                                 } else {
@@ -11795,11 +12130,34 @@ impl eframe::App for WaveCraftApp {
 
         if record_now_clicked {
             self.record_capture = false;
+            self.record_decoded_data = false;
             if let Some(path) = choose_recording_save_path(&self.recording_path) {
                 self.recording_path = path.to_string_lossy().into_owned();
-                self.record_capture = true;
-                if let Some(target) = control_target {
-                    start_request = Some((AcquisitionMode::Single, target));
+                if can_attach_run_capture_recording {
+                    if let Some(target) = control_target {
+                        self.attach_run_capture_recording(target, path);
+                    }
+                } else if let Some(target) = control_target {
+                    self.record_capture = true;
+                    let mode = if target == CaptureTarget::RadioReceiver {
+                        AcquisitionMode::Run
+                    } else {
+                        AcquisitionMode::Single
+                    };
+                    start_request = Some((mode, target));
+                }
+            }
+        }
+        if record_decoded_data_clicked {
+            self.record_capture = false;
+            self.record_decoded_data = false;
+            if let Some(path) = choose_decoded_data_save_path(&self.decoded_data_path) {
+                self.decoded_data_path = path.to_string_lossy().into_owned();
+                if can_attach_run_decoded_recording {
+                    self.attach_run_decoded_data_recording(path);
+                } else if control_target == Some(CaptureTarget::RadioReceiver) {
+                    self.record_decoded_data = true;
+                    start_request = Some((AcquisitionMode::Run, CaptureTarget::RadioReceiver));
                 }
             }
         }
@@ -13002,6 +13360,16 @@ fn finish_gui_recording(
 ) -> Result<(), String> {
     if let Some(recorder) = recorder {
         recorder.finish(status).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn finish_decoded_data_recording(
+    recorder: &mut Option<FileDecodedDataRecorder>,
+    status: CompletionStatus,
+) -> Result<(), String> {
+    if let Some(recorder) = recorder {
+        recorder.finish(status)?;
     }
     Ok(())
 }
@@ -20585,6 +20953,54 @@ mod tests {
             true,
             CompletionStatus::Complete,
             false,
+        ));
+    }
+
+    #[test]
+    fn capture_recording_supports_single_and_run_modes() {
+        assert!(capture_recording_is_supported(AcquisitionMode::Single));
+        assert!(capture_recording_is_supported(AcquisitionMode::Run));
+        assert!(!capture_recording_is_supported(AcquisitionMode::Repetitive));
+        assert!(!capture_recording_is_supported(AcquisitionMode::Loop));
+    }
+
+    #[test]
+    fn active_continuous_capture_accepts_a_new_recording() {
+        assert!(active_continuous_capture_accepts_recording(
+            AcquisitionMode::Run,
+            false
+        ));
+        assert!(active_continuous_capture_accepts_recording(
+            AcquisitionMode::Loop,
+            false
+        ));
+        assert!(!active_continuous_capture_accepts_recording(
+            AcquisitionMode::Run,
+            true
+        ));
+        assert!(!active_continuous_capture_accepts_recording(
+            AcquisitionMode::Single,
+            false
+        ));
+        assert!(!active_continuous_capture_accepts_recording(
+            AcquisitionMode::Repetitive,
+            false
+        ));
+    }
+
+    #[test]
+    fn decoded_data_recording_requires_rf_run_mode() {
+        assert!(decoded_data_recording_is_supported(
+            AcquisitionMode::Run,
+            CaptureTarget::RadioReceiver,
+        ));
+        assert!(!decoded_data_recording_is_supported(
+            AcquisitionMode::Single,
+            CaptureTarget::RadioReceiver,
+        ));
+        assert!(!decoded_data_recording_is_supported(
+            AcquisitionMode::Run,
+            CaptureTarget::LogicAnalyzer,
         ));
     }
 

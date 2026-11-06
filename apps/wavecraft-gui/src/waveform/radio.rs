@@ -9,7 +9,7 @@ use wavecraft_dsp::{DemodulatedBatch, SpectrumFrame, TimedAnalogSample, TimedSof
 
 const DEFAULT_WATERFALL_CAPACITY: usize = 256;
 const DEFAULT_ANALYSIS_CAPACITY: usize = 100_000;
-const MAX_RAW_MESSAGE_COUNT: usize = 256;
+const MAX_RAW_MESSAGE_COUNT: usize = 10_000;
 const MAX_WATERFALL_TEXTURE_WIDTH: usize = 512;
 const MIN_POWER_DBFS: f32 = -120.0;
 const MAX_POWER_DBFS: f32 = 0.0;
@@ -2098,6 +2098,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0x10, 0x20, 0x30]
         );
+    }
+
+    #[test]
+    fn analysis_store_retains_up_to_ten_thousand_raw_messages() {
+        let mut store = RadioAnalysisStore::new(MAX_RAW_MESSAGE_COUNT + 1).unwrap();
+        let channel_name: Arc<str> = Arc::from("Packets");
+
+        for sample_index in 0..=MAX_RAW_MESSAGE_COUNT as u64 {
+            store.start_raw_message(
+                RawRadioMessageStart {
+                    sample_index,
+                    preamble_bytes: 0,
+                    maximum_uncertain_bits: usize::MAX,
+                },
+                0,
+                Arc::clone(&channel_name),
+            );
+        }
+        store.finish_raw_capture();
+
+        assert_eq!(store.raw_messages().len(), MAX_RAW_MESSAGE_COUNT);
+        assert_eq!(store.raw_messages().front().unwrap().sequence(), 2);
+        assert_eq!(store.raw_messages().back().unwrap().sequence(), 10_001);
+        assert_eq!(store.raw_dropped_messages(), 1);
     }
 
     #[test]
