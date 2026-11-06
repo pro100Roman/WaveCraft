@@ -3,6 +3,7 @@
 *.swp
 *.swo
 *.dsv
+*.jsonl
 !docs/examples/*.dsv
 *.sal
 __pycache__/
