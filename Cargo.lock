@@ -3051,6 +3051,7 @@ version = "0.6.1"
 dependencies = [
  "eframe",
  "image",
+ "libc",
  "rfd",
  "serde",
  "serde_json",
@@ -3062,6 +3063,7 @@ dependencies = [
  "wavecraft-recording",
  "wavecraft-sdr",
  "wavecraft-usb",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -102,6 +102,7 @@ use waveform::radio::{RadioAnalysisStore, RadioDisplayStore, RadioViewOptions, R
 const SAMPLE_RATE_HZ: u64 = 1_000_000;
 const SAMPLE_COUNT: u64 = 1_000_000;
 const BUILD_VERSION_LABEL: &str = concat!("Version: ", env!("WAVECRAFT_BUILD_VERSION"));
+const CPU_LOAD_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const LOGIC_CHANNEL_COUNT: usize = 16;
 const RADIO_SPECTRUM_FFT_LENGTH: usize = 2_048;
 const RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS: u64 = 1_000_000;
@@ -118,6 +119,100 @@ const WAVEFORM_STATUS_HEIGHT: f32 = 20.0;
 const TIME_RULER_HEIGHT: f32 = 24.0;
 const SCOPE_HORIZONTAL_DIVISIONS: usize = 10;
 const SCOPE_VERTICAL_DIVISIONS: usize = 8;
+
+#[derive(Debug)]
+struct CpuLoadMonitor {
+    last_wall_time: Instant,
+    last_process_time: Option<Duration>,
+    load_percent: Option<f64>,
+}
+
+impl CpuLoadMonitor {
+    fn new() -> Self {
+        Self {
+            last_wall_time: Instant::now(),
+            last_process_time: process_cpu_time(),
+            load_percent: None,
+        }
+    }
+
+    fn update(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_wall_time) < CPU_LOAD_SAMPLE_INTERVAL {
+            return;
+        }
+        self.update_at(now, process_cpu_time());
+    }
+
+    fn update_at(&mut self, now: Instant, process_time: Option<Duration>) {
+        let wall_delta = now.duration_since(self.last_wall_time);
+        self.load_percent = self
+            .last_process_time
+            .zip(process_time)
+            .and_then(|(previous, current)| current.checked_sub(previous))
+            .filter(|_| !wall_delta.is_zero())
+            .map(|cpu_delta| cpu_delta.as_secs_f64() / wall_delta.as_secs_f64() * 100.0);
+        self.last_wall_time = now;
+        self.last_process_time = process_time;
+    }
+
+    fn label(&self) -> String {
+        match self.load_percent {
+            Some(percent) if percent >= 100.0 => format!("CPU {percent:.0}%"),
+            Some(percent) => format!("CPU {percent:.1}%"),
+            None => "CPU —".to_owned(),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_cpu_time() -> Option<Duration> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let timeval_duration = |timeval: libc::timeval| {
+        let seconds = u64::try_from(timeval.tv_sec).ok()?;
+        let microseconds = u64::try_from(timeval.tv_usec).ok()?;
+        Duration::from_secs(seconds).checked_add(Duration::from_micros(microseconds))
+    };
+    timeval_duration(usage.ru_utime)?.checked_add(timeval_duration(usage.ru_stime)?)
+}
+
+#[cfg(windows)]
+fn process_cpu_time() -> Option<Duration> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    if unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return None;
+    }
+    let ticks =
+        |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    let hundred_nanoseconds = ticks(kernel).checked_add(ticks(user))?;
+    Some(Duration::from_nanos(
+        hundred_nanoseconds.saturating_mul(100),
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_cpu_time() -> Option<Duration> {
+    None
+}
 const SCOPE_ADC_VERTICAL_DIVISIONS: f32 = 10.0;
 const SCOPE_DOWNSAMPLE_MIN_SAMPLES_PER_PIXEL: usize = 4;
 const SCOPE_CONFIGURATION_DEBOUNCE: Duration = Duration::from_millis(350);
@@ -3807,6 +3902,7 @@ struct WaveCraftApp {
     combined_capture: Option<CompletedCapture>,
     radio_capture: Option<CompletedCapture>,
     combined_settings: CombinedSessionSettings,
+    cpu_load: CpuLoadMonitor,
     status: String,
     last_error: Option<String>,
 }
@@ -3907,6 +4003,7 @@ impl WaveCraftApp {
                 logic_ratio: 0.55,
                 ..CombinedSessionSettings::default()
             },
+            cpu_load: CpuLoadMonitor::new(),
             status: "Ready".to_owned(),
             last_error: None,
         };
@@ -10562,6 +10659,8 @@ fn paint_usb_speed_warning(context: &egui::Context, warning: &UsbSpeedWarning) -
 
 impl eframe::App for WaveCraftApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.cpu_load.update();
+        context.request_repaint_after(CPU_LOAD_SAMPLE_INTERVAL);
         self.poll_calibration_progress();
         self.poll_worker();
         self.reconcile_capture_settings_tab();
@@ -11127,6 +11226,16 @@ impl eframe::App for WaveCraftApp {
                                 .color(TEXT_MUTED),
                         )
                         .on_hover_text("Build version");
+                        ui.separator();
+                        ui.label(
+                            RichText::new(self.cpu_load.label())
+                                .small()
+                                .monospace()
+                                .color(TEXT_MUTED),
+                        )
+                        .on_hover_text(
+                            "WaveCraft process CPU usage; 100% equals one fully utilized logical CPU, so multi-threaded processing can exceed 100%",
+                        );
                     });
                 });
             });
@@ -19446,6 +19555,24 @@ mod tests {
     use std::io::Cursor;
     use wavecraft_core::{Iq8, IqBatch, LogicBatch, ScopeBatch};
     use wavecraft_sdr::RadioProviderAdapter;
+
+    #[test]
+    fn cpu_load_monitor_compares_process_time_with_wall_time() {
+        let start = Instant::now();
+        let mut monitor = CpuLoadMonitor {
+            last_wall_time: start,
+            last_process_time: Some(Duration::from_secs(1)),
+            load_percent: None,
+        };
+
+        monitor.update_at(
+            start + Duration::from_secs(2),
+            Some(Duration::from_millis(3_500)),
+        );
+
+        assert_eq!(monitor.load_percent, Some(125.0));
+        assert_eq!(monitor.label(), "CPU 125%");
+    }
 
     #[test]
     fn saved_logic_settings_round_trip_independently() {
