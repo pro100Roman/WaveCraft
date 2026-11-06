@@ -356,12 +356,15 @@ with the platform clipboard shortcut.
 FSK/GFSK is the first implemented demodulator family, not the architecture's
 top-level abstraction. Channel selection, rate conversion, AGC, squelch, AFC,
 carrier recovery, and symbol timing are reusable DSP blocks. A selected
-demodulator consumes a channelized stream and produces one of two typed output
+demodulator consumes a channelized stream and produces one of three typed output
 families:
 
 - a digital demodulator emits timed soft symbols with a symbol alphabet,
   per-symbol likelihoods or confidence, source-sample ranges, and lock
-  diagnostics; or
+  diagnostics;
+- a chirp or spread-spectrum demodulator emits timed sparse symbol decisions,
+  frame-boundary events, source-sample ranges, and synchronization diagnostics;
+  or
 - an analog demodulator emits a bounded real-valued sample stream with its
   sample rate, source-sample mapping, and lock/squelch diagnostics.
 
@@ -380,11 +383,12 @@ dynamically, and recordings/projects persist the tagged profile and component
 versions. Adding a modulation must not change the raw IQ, channelizer,
 recording, or RF-view contracts.
 
-The implementation boundary is conceptually:
+The target implementation boundary is conceptually:
 
 ```rust
 pub enum DemodulatedBatch {
     SoftSymbols(TimedSoftSymbolBatch),
+    ChirpSymbols(TimedChirpSymbolBatch),
     Analog(TimedAnalogBatch),
 }
 
@@ -402,9 +406,72 @@ multi-symbol modulation into binary bits.
 An in-process registry selects factories by stable IDs such as `fsk2` and
 `gfsk2`. Each descriptor declares its output family and alphabet size, while
 the factory accepts only its modulation-specific typed configuration. Duplicate
-IDs and mismatched configuration types are rejected. Additional digital or
-analog factories can register without changing the channelized input or
-demodulated output contracts.
+IDs and mismatched configuration types are rejected. Additional soft-symbol,
+chirp-symbol, or analog factories can register without changing the channelized
+input contract.
+
+### LoRa and chirp spread-spectrum integration
+
+LoRa follows the same crate layering as FSK/GFSK, but it does not pass through
+the generic binary `TimedBitBatch` packet pipeline. A LoRa symbol has `2^SF`
+possible values, or as many as 4,096 values at SF12, and LoRa applies
+interleaving and forward-error correction before payload bytes exist. Raising
+the dense soft-symbol likelihood limit and treating each LoRa symbol as a group
+of independent bits would waste memory and discard information needed by the
+PHY decoder.
+
+The intended processing stack is:
+
+```text
+channelized IQ
+  `-- LoRa chirp demodulator (wavecraft-dsp)
+        `-- timed sparse LoRa symbols and frame boundaries
+              `-- LoRa PHY decoder (wavecraft-decode)
+                    `-- RadioPacket
+                          `-- LoRaWAN or application decoder
+```
+
+`wavecraft-dsp` owns dechirping, FFT-based symbol recovery, preamble and chirp
+synchronization, carrier and sampling-offset correction, symbol confidence,
+and source-sample mapping. Its LoRa output carries the selected symbol and a
+bounded confidence representation, with optional bounded alternate candidates;
+it must not allocate a dense 4,096-entry likelihood vector for every SF12
+symbol.
+
+`wavecraft-decode` owns LoRa PHY operations after symbol recovery: Gray
+decoding, diagonal deinterleaving, Hamming error correction, dewhitening,
+explicit or implicit header processing, payload extraction, and PHY CRC
+validation. It emits the common `RadioPacket` representation so recording,
+display, export, and later application decoding can share the existing packet
+path. LoRaWAN interpretation is a layer above the LoRa PHY decoder and does not
+belong in the DSP demodulator.
+
+`wavecraft-radio` composes those stages and owns their burst lifecycle. The
+runtime dispatches `SoftSymbols` to the existing binary raw/packet decoders and
+`ChirpSymbols` to a LoRa PHY decoder instead of unconditionally converting all
+digital output to `TimedBitBatch`. The data-decoder configuration therefore
+gains a LoRa variant alongside the existing raw and generic packet variants.
+
+Adding this path requires the following focused contract extensions:
+
+- add `DemodulationProfile::LoRa` with spreading factor, bandwidth, and chirp
+  synchronization settings owned by that profile;
+- add `DemodulatorOutputKind::ChirpSymbols` and a stable LoRa demodulator ID;
+- remove the `SignalAnalyzer` construction path's assumption that every
+  profile becomes an `FskConfig`, allowing each tagged profile to supply its
+  modulation-specific factory configuration;
+- add `DemodulatedBatch::ChirpSymbols` with bounded state, discontinuity, frame
+  boundary, confidence, and original source-range information; and
+- make `RadioAnalyzerRuntime` dispatch on the typed demodulator output and add a
+  LoRa PHY decoder variant whose configuration owns coding rate, header mode,
+  payload bounds, and CRC policy.
+
+This extension does not change `IqBatch`, device or USB backends, wideband IQ
+preprocessing, the channelizer, raw-IQ recording, source-range tracking, the
+analyzer-bank model, or the generic `RadioPacket` concept. The existing
+`RadioPacketPipeline` remains the modulation-independent path for protocols
+that naturally produce binary timed decisions; it is not expanded with
+LoRa-specific interleaving or FEC behavior.
 
 ### Reusable signal profiles
 
