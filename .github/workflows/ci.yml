@@ -142,11 +142,14 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          app_executable=target/release/bundle/osx/WaveCraft.app/Contents/MacOS/WaveCraft
+          app_binary=target/release/bundle/osx/WaveCraft.app/Contents/MacOS/WaveCraft-bin
+          shim_library=target/release/bundle/osx/WaveCraft.app/Contents/Frameworks/libwavecraft-libusb-no-detach.dylib
           lipo target/release/wavecraft-cli -verify_arch arm64
           lipo target/release/wavecraft-cli -verify_arch x86_64
-          lipo "$app_executable" -verify_arch arm64
-          lipo "$app_executable" -verify_arch x86_64
+          lipo "$app_binary" -verify_arch arm64
+          lipo "$app_binary" -verify_arch x86_64
+          lipo "$shim_library" -verify_arch arm64
+          lipo "$shim_library" -verify_arch x86_64
 
       - name: Package macOS release
         if: runner.os == 'macOS'
