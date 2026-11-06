@@ -276,11 +276,17 @@ fn choose_custom_protocol_to_open() -> Option<PathBuf> {
         .pick_file()
 }
 
+fn wavecraft_app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/wavecraft-icon.png"))
+        .expect("embedded WaveCraft app icon must be a valid PNG")
+}
+
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([920.0, 620.0]),
+            .with_min_inner_size([920.0, 620.0])
+            .with_icon(wavecraft_app_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -19555,6 +19561,15 @@ mod tests {
     use std::io::Cursor;
     use wavecraft_core::{Iq8, IqBatch, LogicBatch, ScopeBatch};
     use wavecraft_sdr::RadioProviderAdapter;
+
+    #[test]
+    fn embedded_wavecraft_app_icon_is_valid() {
+        let icon = wavecraft_app_icon();
+
+        assert_eq!((icon.width, icon.height), (512, 512));
+        assert_eq!(icon.rgba.len(), 512 * 512 * 4);
+        assert_eq!(icon.rgba[3], 0);
+    }
 
     #[test]
     fn cpu_load_monitor_compares_process_time_with_wall_time() {
