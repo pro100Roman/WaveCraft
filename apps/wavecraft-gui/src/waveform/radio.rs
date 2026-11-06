@@ -985,7 +985,7 @@ fn paint_raw_messages(
     const SEQUENCE_WIDTH: f32 = 48.0;
     const CHANNEL_WIDTH: f32 = 60.0;
     const SECTION_WIDTH: f32 = 38.0;
-    const PREAMBLE_TOGGLE_WIDTH: f32 = 30.0;
+    const PREAMBLE_WIDTH: f32 = 30.0;
     const LENGTH_WIDTH: f32 = 52.0;
     const SCROLLBAR_WIDTH: f32 = 7.0;
     const SCROLLBAR_GAP: f32 = 5.0;
@@ -1062,6 +1062,25 @@ fn paint_raw_messages(
 
         let mut x = row_rect.left() + SEQUENCE_WIDTH;
         let right_limit = row_rect.right() - LENGTH_WIDTH;
+        let channel_rect = Rect::from_min_max(
+            Pos2::new(x, row_rect.top()),
+            Pos2::new(
+                (x + CHANNEL_WIDTH - 4.0).min(right_limit).max(x),
+                row_rect.bottom(),
+            ),
+        );
+        let channel_hint_id = ui.id().with(("raw_channel_hint", message.sequence()));
+        let channel_response = ui
+            .interact(
+                channel_rect,
+                ui.id()
+                    .with(("raw_channel_hint_target", message.sequence())),
+                Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if channel_response.clicked() {
+            ui.memory_mut(|memory| memory.toggle_popup(channel_hint_id));
+        }
         paint_raw_section_label_clipped(
             ui,
             row_rect,
@@ -1072,49 +1091,52 @@ fn paint_raw_messages(
         );
         x += CHANNEL_WIDTH;
         let preamble_bytes = message.preamble_bytes();
-        let expansion_id = ui.id().with(("raw_preamble_expanded", message.sequence()));
-        let mut preamble_expanded =
-            ui.data(|data| data.get_temp::<bool>(expansion_id).unwrap_or(false));
-        let toggle_rect = Rect::from_min_size(
+        let preamble_hint_id = ui.id().with(("raw_preamble_hint", message.sequence()));
+        let preamble_rect = Rect::from_min_size(
             Pos2::new(x, row_rect.top()),
-            Vec2::new(PREAMBLE_TOGGLE_WIDTH, row_rect.height()),
+            Vec2::new(PREAMBLE_WIDTH, row_rect.height()),
         );
-        let toggle = ui
-            .interact(toggle_rect, expansion_id, Sense::click())
-            .on_hover_text(if preamble_expanded {
-                "Collapse preamble bytes"
-            } else {
-                "Expand preamble bytes"
-            });
-        if toggle.clicked() {
-            preamble_expanded = !preamble_expanded;
-            ui.data_mut(|data| data.insert_temp(expansion_id, preamble_expanded));
+        let preamble_response = ui
+            .interact(
+                preamble_rect,
+                ui.id()
+                    .with(("raw_preamble_hint_target", message.sequence())),
+                Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if preamble_response.clicked() {
+            ui.memory_mut(|memory| memory.toggle_popup(preamble_hint_id));
         }
         paint_raw_section_label(
             ui,
             row_rect,
             x,
             "PRE",
-            if toggle.hovered() {
+            if preamble_response.hovered() {
                 Color32::from_rgb(255, 205, 105)
             } else {
                 Color32::from_rgb(235, 180, 80)
             },
         );
-        x += PREAMBLE_TOGGLE_WIDTH;
-        let displayed_preamble = displayed_raw_preamble(message, preamble_expanded);
-        if !displayed_preamble.is_empty() {
-            x = paint_raw_message_bytes(
-                ui,
-                row_rect,
-                x,
-                right_limit,
-                displayed_preamble,
-                BYTE_CELL_WIDTH,
-                Color32::from_rgb(245, 190, 90),
-            );
-        }
+        x += PREAMBLE_WIDTH;
+        let mut data_response = None;
+        let mut data_hint_id = None;
         if x + SECTION_WIDTH < right_limit {
+            let data_rect = Rect::from_min_max(
+                Pos2::new(x, row_rect.top()),
+                Pos2::new(right_limit, row_rect.bottom()),
+            );
+            let hint_id = ui.id().with(("raw_data_hint", message.sequence()));
+            let response = ui
+                .interact(
+                    data_rect,
+                    ui.id().with(("raw_data_hint_target", message.sequence())),
+                    Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.clicked() {
+                ui.memory_mut(|memory| memory.toggle_popup(hint_id));
+            }
             paint_raw_section_label(ui, row_rect, x, "DATA", Color32::from_rgb(105, 150, 175));
             x += SECTION_WIDTH;
             let _ = paint_raw_message_bytes(
@@ -1126,6 +1148,8 @@ fn paint_raw_messages(
                 BYTE_CELL_WIDTH,
                 Color32::from_rgb(150, 220, 255),
             );
+            data_response = Some(response);
+            data_hint_id = Some(hint_id);
         }
         ui.painter().text(
             row_rect.right_center() - Vec2::new(5.0, 0.0),
@@ -1134,39 +1158,124 @@ fn paint_raw_messages(
             FontId::monospace(10.0),
             Color32::from_rgb(105, 150, 175),
         );
-        let preamble = format_raw_hex(&message.bytes()[..preamble_bytes]);
         let data = format_raw_hex(message.data_bytes());
-        ui.interact(
-            row_rect,
-            ui.id().with(("raw_message", message.sequence())),
-            Sense::hover(),
-        )
-        .on_hover_ui(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "CHANNEL {} ({})",
-                    message.channel_name(),
-                    format_channel_offset(message.channel_frequency_offset_hz())
-                ))
-                .monospace()
-                .color(Color32::from_rgb(125, 175, 145)),
+        egui::popup::popup_below_widget(
+            ui,
+            channel_hint_id,
+            &channel_response,
+            egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+            |popup_ui| {
+                popup_ui.set_min_width(240.0);
+                popup_ui.set_max_width(320.0);
+                popup_ui.label(
+                    egui::RichText::new("CHANNEL")
+                        .small()
+                        .strong()
+                        .color(Color32::from_rgb(125, 175, 145)),
+                );
+                popup_ui.separator();
+                egui::Grid::new(("raw_channel_hint_grid", message.sequence()))
+                    .num_columns(2)
+                    .spacing(Vec2::new(16.0, 6.0))
+                    .show(popup_ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Name")
+                                .small()
+                                .color(Color32::from_rgb(105, 120, 140)),
+                        );
+                        ui.label(
+                            egui::RichText::new(message.channel_name())
+                                .monospace()
+                                .strong()
+                                .color(Color32::from_rgb(165, 215, 185)),
+                        );
+                        ui.end_row();
+                        ui.label(
+                            egui::RichText::new("Frequency offset")
+                                .small()
+                                .color(Color32::from_rgb(105, 120, 140)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format_channel_offset(
+                                message.channel_frequency_offset_hz(),
+                            ))
+                            .monospace()
+                            .color(Color32::from_rgb(165, 215, 185)),
+                        );
+                        ui.end_row();
+                    });
+            },
+        );
+        egui::popup::popup_below_widget(
+            ui,
+            preamble_hint_id,
+            &preamble_response,
+            egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+            |popup_ui| {
+                popup_ui.set_min_width(360.0);
+                popup_ui.set_max_width(440.0);
+                popup_ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("PREAMBLE")
+                            .small()
+                            .strong()
+                            .color(Color32::from_rgb(245, 190, 90)),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{preamble_bytes} B"))
+                            .small()
+                            .monospace()
+                            .color(Color32::from_rgb(145, 130, 100)),
+                    );
+                });
+                popup_ui.separator();
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(15, 22, 31))
+                    .rounding(egui::Rounding::same(4.0))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(popup_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format_raw_hex_block(
+                                            &message.bytes()[..preamble_bytes],
+                                            16,
+                                        ))
+                                        .monospace()
+                                        .color(Color32::from_rgb(255, 205, 105)),
+                                    )
+                                    .selectable(true),
+                                );
+                            });
+                    });
+            },
+        );
+        if let (Some(hint_id), Some(response)) = (data_hint_id, data_response) {
+            egui::popup::popup_below_widget(
+                ui,
+                hint_id,
+                &response,
+                egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+                |popup_ui| {
+                    popup_ui.label(
+                        egui::RichText::new(format!("DATA ({} B) {data}", message.data_len()))
+                            .monospace()
+                            .color(Color32::from_rgb(150, 220, 255)),
+                    );
+                    popup_ui.label(
+                        egui::RichText::new(format!(
+                            "UNCERTAIN {} bit(s)",
+                            message.uncertain_bits()
+                        ))
+                        .monospace()
+                        .color(Color32::from_rgb(105, 150, 175)),
+                    );
+                },
             );
-            ui.label(
-                egui::RichText::new(format!("PRE  {preamble}"))
-                    .monospace()
-                    .color(Color32::from_rgb(245, 190, 90)),
-            );
-            ui.label(
-                egui::RichText::new(format!("DATA ({} B) {data}", message.data_len()))
-                    .monospace()
-                    .color(Color32::from_rgb(150, 220, 255)),
-            );
-            ui.label(
-                egui::RichText::new(format!("UNCERTAIN {} bit(s)", message.uncertain_bits()))
-                    .monospace()
-                    .color(Color32::from_rgb(105, 150, 175)),
-            );
-        });
+        }
     }
     if show_scrollbar {
         let track = Rect::from_min_max(
@@ -1277,24 +1386,28 @@ where
     }
 }
 
-fn displayed_raw_preamble(message: &RawRadioMessage, expanded: bool) -> &[TimedByte] {
-    if expanded {
-        &message.bytes()[..message.preamble_bytes()]
-    } else {
-        &[]
-    }
+fn format_raw_hex(bytes: &[TimedByte]) -> String {
+    format_raw_hex_block(bytes, 512)
 }
 
-fn format_raw_hex(bytes: &[TimedByte]) -> String {
+fn format_raw_hex_block(bytes: &[TimedByte], bytes_per_line: usize) -> String {
     const TOOLTIP_BYTE_LIMIT: usize = 512;
-    let mut text = bytes
-        .iter()
-        .take(TOOLTIP_BYTE_LIMIT)
-        .map(|byte| format!("{:02X}", byte.value))
+    let displayed = bytes.len().min(TOOLTIP_BYTE_LIMIT);
+    let mut text = bytes[..displayed]
+        .chunks(bytes_per_line.max(1))
+        .map(|line| {
+            line.iter()
+                .map(|byte| format!("{:02X}", byte.value))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
         .collect::<Vec<_>>()
-        .join(" ");
+        .join("\n");
     if bytes.len() > TOOLTIP_BYTE_LIMIT {
-        text.push_str(&format!(" … (+{} B)", bytes.len() - TOOLTIP_BYTE_LIMIT));
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("… (+{} B)", bytes.len() - TOOLTIP_BYTE_LIMIT));
     }
     if text.is_empty() {
         text.push('—');
@@ -2178,8 +2291,6 @@ mod tests {
         assert_eq!(newest_first[0].sequence(), 2);
         assert_eq!(newest_first[0].preamble_bytes(), 2);
         assert_eq!(newest_first[0].data_len(), 1);
-        assert!(displayed_raw_preamble(newest_first[0], false).is_empty());
-        assert_eq!(displayed_raw_preamble(newest_first[0], true).len(), 2);
         assert_eq!(
             newest_first[0]
                 .bytes()
