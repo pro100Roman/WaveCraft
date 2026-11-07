@@ -9,6 +9,7 @@ pub mod dialogs;
 pub mod frame_actions;
 pub mod protocol_analyzer_dialog;
 pub mod radio_settings;
+pub mod scope_frontend_changes;
 pub mod scope_settings;
 pub mod scope_tools_panel;
 pub mod session_tabs;
