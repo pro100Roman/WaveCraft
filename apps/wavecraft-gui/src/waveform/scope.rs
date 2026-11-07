@@ -1664,36 +1664,21 @@ pub(crate) fn scope_plot_rect(area: Rect, square_grid_cells: bool) -> Rect {
     }
 }
 
-pub(crate) fn paint_scope_time_domain(
-    ui: &egui::Ui,
-    rect: Rect,
+/// How many samples the scope view spans and how fast they were taken.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScopeDisplayExtent {
+    /// Samples held by the shortest enabled channel.
+    sample_count: usize,
+    /// Samples the horizontal axis is divided into; this is the capture size
+    /// until the first samples arrive, and the ring capacity while rolling.
+    display_sample_count: usize,
+    display_sample_rate_hz: u64,
+}
+
+fn scope_display_extent(
     waveforms: &WaveformStore,
-    viewport: &mut WaveformViewport,
-    square_grid_cells: bool,
-    scope_options: ScopeWaveformOptions<'_>,
-) {
-    let ScopeWaveformOptions {
-        mut settings,
-        auto_sample_rate,
-        smart_timing_enabled,
-        function_settings,
-        channel_names,
-        measurement_caches,
-        measurement_window_positions,
-        marker_settings,
-        quick_time_measurement,
-        channel_colors,
-        vertical_offsets,
-        trigger_settings,
-        time_per_division_seconds,
-        timebase_changed,
-        offset_controls_enabled,
-        trigger_controls_enabled,
-        time_axis,
-    } = scope_options;
-    for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
-        channel.vertical_offset = vertical_offset;
-    }
+    settings: ScopeCaptureSettings,
+) -> ScopeDisplayExtent {
     let sample_count = waveforms
         .scope_channels
         .iter()
@@ -1715,7 +1700,70 @@ pub(crate) fn paint_scope_time_domain(
     } else {
         waveforms.scope_rate_hz
     };
-    if let Some(selected_timebase) = *time_per_division_seconds {
+    ScopeDisplayExtent {
+        sample_count,
+        display_sample_count,
+        display_sample_rate_hz,
+    }
+}
+
+/// Where the trigger sits in the sample domain and on screen, as fractions.
+fn scope_trigger_fractions(
+    waveforms: &WaveformStore,
+    settings: ScopeCaptureSettings,
+    trigger_crossing: Option<ScopeTriggerCrossing>,
+    trigger_settings: ScopeTriggerSettings,
+    display_sample_count: usize,
+) -> (f32, f32) {
+    let trigger_sample_fraction = trigger_crossing
+        .map(|crossing| crossing.sample)
+        .or_else(|| {
+            waveforms
+                .scope_trigger_sample_index
+                .map(|sample| sample as f64)
+        })
+        .map(|sample| {
+            scope_sample_fraction(sample, waveforms.scope_sample_offset, display_sample_count)
+        })
+        .unwrap_or_else(|| f32::from(settings.trigger.position_percent) / 100.0);
+    let trigger_screen_fraction = f32::from(trigger_settings.position_percent) / 100.0;
+    (trigger_sample_fraction, trigger_screen_fraction)
+}
+
+/// Geometry and sample extent shared by the parts of the time-domain view.
+#[derive(Clone, Copy)]
+struct ScopeTimeDomainView {
+    plot: Rect,
+    time_ruler: Rect,
+    status_bar: Rect,
+    extent: ScopeDisplayExtent,
+    viewport: WaveformViewport,
+}
+
+pub(crate) fn paint_scope_time_domain(
+    ui: &egui::Ui,
+    rect: Rect,
+    waveforms: &WaveformStore,
+    viewport: &mut WaveformViewport,
+    square_grid_cells: bool,
+    scope_options: ScopeWaveformOptions<'_>,
+) {
+    let mut options = scope_options;
+    for (channel, vertical_offset) in options
+        .settings
+        .channels
+        .iter_mut()
+        .zip(*options.vertical_offsets)
+    {
+        channel.vertical_offset = vertical_offset;
+    }
+    let extent = scope_display_extent(waveforms, options.settings);
+    let ScopeDisplayExtent {
+        sample_count,
+        display_sample_count,
+        display_sample_rate_hz,
+    } = extent;
+    if let Some(selected_timebase) = *options.time_per_division_seconds {
         apply_time_per_division(
             viewport,
             display_sample_count,
@@ -1730,19 +1778,15 @@ pub(crate) fn paint_scope_time_domain(
     let (status_bar, time_ruler) = align_waveform_chrome(status_area, ruler_area, plot);
     let scope_painter = painter.with_clip_rect(plot);
     paint_scope_graticule(&scope_painter, plot);
-    let trigger_crossing = scope_trigger_crossing_sample(waveforms, settings, *trigger_settings);
-    let trigger_sample_fraction = trigger_crossing
-        .map(|crossing| crossing.sample)
-        .or_else(|| {
-            waveforms
-                .scope_trigger_sample_index
-                .map(|sample| sample as f64)
-        })
-        .map(|sample| {
-            scope_sample_fraction(sample, waveforms.scope_sample_offset, display_sample_count)
-        })
-        .unwrap_or_else(|| f32::from(settings.trigger.position_percent) / 100.0);
-    let trigger_screen_fraction = f32::from(trigger_settings.position_percent) / 100.0;
+    let trigger_crossing =
+        scope_trigger_crossing_sample(waveforms, options.settings, *options.trigger_settings);
+    let (trigger_sample_fraction, trigger_screen_fraction) = scope_trigger_fractions(
+        waveforms,
+        options.settings,
+        trigger_crossing,
+        *options.trigger_settings,
+        display_sample_count,
+    );
     if should_align_scope_trigger(
         viewport.anchor_locked,
         waveforms.scope_rolling,
@@ -1750,6 +1794,101 @@ pub(crate) fn paint_scope_time_domain(
     ) {
         viewport.align_trigger_to_screen(trigger_sample_fraction, trigger_screen_fraction);
     }
+    update_scope_viewport(
+        ui,
+        plot,
+        waveforms,
+        extent,
+        (trigger_sample_fraction, trigger_screen_fraction),
+        &mut options,
+        viewport,
+    );
+    for (channel, vertical_offset) in options
+        .settings
+        .channels
+        .iter_mut()
+        .zip(*options.vertical_offsets)
+    {
+        channel.vertical_offset = vertical_offset;
+    }
+    options.settings.trigger = *options.trigger_settings;
+
+    let visible_range = viewport.sample_range_in_domain(sample_count, display_sample_count);
+    let visible_count = visible_range.len();
+    let view = ScopeTimeDomainView {
+        plot,
+        time_ruler,
+        status_bar,
+        extent,
+        viewport: *viewport,
+    };
+    if visible_count == 0 {
+        paint_empty(&scope_painter, plot, "Waiting for oscilloscope samples");
+        paint_scope_references(ui, &scope_painter, &view, &mut options);
+        paint_scope_footer(ui, painter, &view, waveforms, &mut options, viewport);
+        return;
+    }
+
+    let step = (visible_count as f32 / plot.width().max(1.0))
+        .floor()
+        .max(1.0) as usize;
+
+    paint_scope_traces(
+        &scope_painter,
+        waveforms,
+        &view,
+        &options,
+        &visible_range,
+        step,
+        trigger_crossing,
+    );
+
+    paint_scope_math_trace(
+        &scope_painter,
+        plot,
+        waveforms,
+        ScopeMathPaintOptions {
+            viewport: *viewport,
+            sample_count: display_sample_count,
+            visible_range: visible_range.clone(),
+            step,
+            settings: options.function_settings.math,
+            channel_names: options.channel_names,
+        },
+    );
+
+    // Keep channel and trigger references in the foreground so dense or bright
+    // waveforms never obscure their arrows, labels, or dotted level lines.
+    paint_scope_references(ui, &scope_painter, &view, &mut options);
+    paint_scope_analysis_overlays(
+        ui,
+        &scope_painter,
+        waveforms,
+        &view,
+        &mut options,
+        visible_range,
+        trigger_crossing,
+    );
+    paint_scope_footer(ui, painter, &view, waveforms, &mut options, viewport);
+}
+
+/// Applies pointer and wheel input to the scope viewport and the quick time
+/// measurement, and settles the displayed timebase.
+fn update_scope_viewport(
+    ui: &egui::Ui,
+    plot: Rect,
+    waveforms: &WaveformStore,
+    extent: ScopeDisplayExtent,
+    trigger_fractions: (f32, f32),
+    options: &mut ScopeWaveformOptions<'_>,
+    viewport: &mut WaveformViewport,
+) {
+    let (trigger_sample_fraction, trigger_screen_fraction) = trigger_fractions;
+    let ScopeDisplayExtent {
+        display_sample_count,
+        display_sample_rate_hz,
+        ..
+    } = extent;
     let (viewport_panned, viewport_timebase_changed, waveform_click, requested_timebase) =
         update_waveform_viewport(
             ui,
@@ -1765,7 +1904,7 @@ pub(crate) fn paint_scope_time_domain(
                     domain_fraction: trigger_sample_fraction,
                     screen_fraction: trigger_screen_fraction,
                 },
-                timebase_basis: *time_per_division_seconds,
+                timebase_basis: *options.time_per_division_seconds,
             },
         );
     if let Some(click) = waveform_click {
@@ -1773,110 +1912,53 @@ pub(crate) fn paint_scope_time_domain(
             WaveformPlotClick::Primary {
                 double_clicked: true,
                 position,
-            } => quick_time_measurement
+            } => options
+                .quick_time_measurement
                 .start(viewport.domain_fraction_at_screen(position).clamp(0.0, 1.0)),
             WaveformPlotClick::Primary {
                 double_clicked: false,
                 position,
-            } => quick_time_measurement
+            } => options
+                .quick_time_measurement
                 .finish(viewport.domain_fraction_at_screen(position).clamp(0.0, 1.0)),
-            WaveformPlotClick::Secondary => quick_time_measurement.clear(),
+            WaveformPlotClick::Secondary => options.quick_time_measurement.clear(),
         }
     }
-    *timebase_changed |= viewport_timebase_changed || requested_timebase.is_some();
+    *options.timebase_changed |= viewport_timebase_changed || requested_timebase.is_some();
     if viewport_panned && !waveforms.scope_rolling {
-        finish_scope_viewport_pan(trigger_sample_fraction, viewport, trigger_settings);
+        finish_scope_viewport_pan(trigger_sample_fraction, viewport, options.trigger_settings);
     }
     let displayed_timebase =
         viewport.time_per_division(display_sample_count, display_sample_rate_hz);
-    *time_per_division_seconds = resolve_scope_timebase(
-        *time_per_division_seconds,
+    *options.time_per_division_seconds = resolve_scope_timebase(
+        *options.time_per_division_seconds,
         displayed_timebase,
         requested_timebase,
         viewport.span,
-        auto_sample_rate,
+        options.auto_sample_rate,
     );
-    for (channel, vertical_offset) in settings.channels.iter_mut().zip(*vertical_offsets) {
-        channel.vertical_offset = vertical_offset;
-    }
-    settings.trigger = *trigger_settings;
+}
 
-    let visible_range = viewport.sample_range_in_domain(sample_count, display_sample_count);
-    let visible_count = visible_range.len();
-    if visible_count == 0 {
-        paint_empty(&scope_painter, plot, "Waiting for oscilloscope samples");
-        paint_scope_offset_arrows(
-            ui,
-            plot,
-            ScopeOffsetArrowOptions {
-                settings,
-                channel_colors,
-                channel_names,
-                vertical_offsets,
-                controls_enabled: offset_controls_enabled,
-            },
-        );
-        paint_scope_trigger_level(
-            ui,
-            plot,
-            settings,
-            trigger_settings,
-            channel_colors,
-            vertical_offsets,
-            trigger_controls_enabled,
-        );
-        paint_scope_markers(
-            ui,
-            &scope_painter,
-            plot,
-            ScopeMarkerPaintOptions {
-                settings: marker_settings,
-                scope_settings: settings,
-                channel_names,
-                sample_count: display_sample_count,
-                sample_rate_hz: display_sample_rate_hz,
-                viewport: *viewport,
-            },
-        );
-        paint_scope_quick_time_measurement(
-            &scope_painter,
-            plot,
-            *quick_time_measurement,
-            display_sample_count,
-            display_sample_rate_hz,
-            *viewport,
-        );
-        paint_waveform_time_scale(
-            painter,
-            time_ruler,
-            display_sample_count,
-            display_sample_rate_hz,
-            waveforms.scope_sample_offset,
-            *viewport,
-            time_axis,
-        );
-        paint_waveform_status(
-            painter,
-            status_bar,
-            display_sample_count,
-            display_sample_rate_hz,
-            *viewport,
-        );
-        paint_scope_trigger_position(
-            ui,
-            time_ruler,
-            plot,
-            trigger_settings,
-            trigger_controls_enabled,
-            viewport,
-        );
-        return;
-    }
-
-    let step = (visible_count as f32 / plot.width().max(1.0))
-        .floor()
-        .max(1.0) as usize;
-
+/// The channel traces: min/max columns when many samples share a pixel,
+/// otherwise a glowing polyline per capture segment.
+fn paint_scope_traces(
+    scope_painter: &egui::Painter,
+    waveforms: &WaveformStore,
+    view: &ScopeTimeDomainView,
+    options: &ScopeWaveformOptions<'_>,
+    visible_range: &Range<usize>,
+    step: usize,
+    trigger_crossing: Option<ScopeTriggerCrossing>,
+) {
+    let ScopeTimeDomainView {
+        plot,
+        extent,
+        viewport,
+        ..
+    } = *view;
+    let display_sample_count = extent.display_sample_count;
+    let settings = options.settings;
+    let channel_colors = options.channel_colors;
     for (channel_index, channel) in waveforms.scope_channels.iter().enumerate() {
         let Some(channel_settings) = settings.channels.get(channel_index).copied() else {
             continue;
@@ -1894,11 +1976,11 @@ pub(crate) fn paint_scope_time_domain(
                 &waveforms.scope_capture_boundaries,
             );
             paint_scope_downsampled_segments(
-                &scope_painter,
+                scope_painter,
                 plot,
                 &segments,
                 channel_settings,
-                *viewport,
+                viewport,
                 display_sample_count,
                 color,
             );
@@ -1916,7 +1998,7 @@ pub(crate) fn paint_scope_time_domain(
             let points = segment
                 .into_iter()
                 .map(|index| {
-                    let x = waveform_sample_x(plot, *viewport, index as f64, display_sample_count);
+                    let x = waveform_sample_x(plot, viewport, index as f64, display_sample_count);
                     let y = scope_sample_y(plot, channel_settings, channel[index]);
                     Pos2::new(x, y)
                 })
@@ -1930,81 +2012,112 @@ pub(crate) fn paint_scope_time_domain(
             }
         }
     }
+}
 
-    paint_scope_math_trace(
-        &scope_painter,
+/// The offset arrows, trigger level, markers, and quick time measurement
+/// that refer to the channels and the trigger.
+fn paint_scope_references(
+    ui: &egui::Ui,
+    scope_painter: &egui::Painter,
+    view: &ScopeTimeDomainView,
+    options: &mut ScopeWaveformOptions<'_>,
+) {
+    let ScopeTimeDomainView {
         plot,
-        waveforms,
-        ScopeMathPaintOptions {
-            viewport: *viewport,
-            sample_count: display_sample_count,
-            visible_range: visible_range.clone(),
-            step,
-            settings: function_settings.math,
-            channel_names,
-        },
-    );
-
-    // Keep channel and trigger references in the foreground so dense or bright
-    // waveforms never obscure their arrows, labels, or dotted level lines.
+        extent,
+        viewport,
+        ..
+    } = *view;
+    let ScopeDisplayExtent {
+        display_sample_count,
+        display_sample_rate_hz,
+        ..
+    } = extent;
     paint_scope_offset_arrows(
         ui,
         plot,
         ScopeOffsetArrowOptions {
-            settings,
-            channel_colors,
-            channel_names,
-            vertical_offsets,
-            controls_enabled: offset_controls_enabled,
+            settings: options.settings,
+            channel_colors: options.channel_colors,
+            channel_names: options.channel_names,
+            vertical_offsets: options.vertical_offsets,
+            controls_enabled: options.offset_controls_enabled,
         },
     );
     paint_scope_trigger_level(
         ui,
         plot,
-        settings,
-        trigger_settings,
-        channel_colors,
-        vertical_offsets,
-        trigger_controls_enabled,
+        options.settings,
+        options.trigger_settings,
+        options.channel_colors,
+        options.vertical_offsets,
+        options.trigger_controls_enabled,
     );
     paint_scope_markers(
         ui,
-        &scope_painter,
+        scope_painter,
         plot,
         ScopeMarkerPaintOptions {
-            settings: marker_settings,
-            scope_settings: settings,
-            channel_names,
+            settings: options.marker_settings,
+            scope_settings: options.settings,
+            channel_names: options.channel_names,
             sample_count: display_sample_count,
             sample_rate_hz: display_sample_rate_hz,
-            viewport: *viewport,
+            viewport,
         },
     );
     paint_scope_quick_time_measurement(
-        &scope_painter,
+        scope_painter,
         plot,
-        *quick_time_measurement,
+        *options.quick_time_measurement,
         display_sample_count,
         display_sample_rate_hz,
-        *viewport,
+        viewport,
     );
+}
+
+/// The automatic measurements and, when the pointer is near a trigger edge,
+/// the smart timing hint.
+fn paint_scope_analysis_overlays(
+    ui: &egui::Ui,
+    scope_painter: &egui::Painter,
+    waveforms: &WaveformStore,
+    view: &ScopeTimeDomainView,
+    options: &mut ScopeWaveformOptions<'_>,
+    visible_range: Range<usize>,
+    trigger_crossing: Option<ScopeTriggerCrossing>,
+) {
+    let ScopeTimeDomainView {
+        plot,
+        extent,
+        viewport,
+        ..
+    } = *view;
+    let ScopeDisplayExtent {
+        display_sample_count,
+        display_sample_rate_hz,
+        ..
+    } = extent;
+    let settings = options.settings;
+    let channel_colors = options.channel_colors;
     paint_scope_measurements(
         ui,
-        &scope_painter,
+        scope_painter,
         plot,
         waveforms,
         ScopeMeasurementPaintOptions {
             visible_range,
             sample_rate_hz: display_sample_rate_hz,
-            settings: function_settings,
+            settings: options.function_settings,
             enabled_channels: settings.channels.map(|channel| channel.enabled),
             channel_colors,
-            channel_names,
-            caches: measurement_caches,
-            window_positions: measurement_window_positions,
+            channel_names: options.channel_names,
+            caches: options.measurement_caches,
+            window_positions: options.measurement_window_positions,
         },
     );
-    let smart_timing = smart_timing_enabled
+    let smart_timing = options
+        .smart_timing_enabled
         .then(|| ui.input(|input| input.pointer.hover_pos()))
         .flatten()
         .zip(
@@ -2016,26 +2129,49 @@ pub(crate) fn paint_scope_time_domain(
                 waveforms,
                 crossing,
                 plot,
-                *viewport,
+                viewport,
                 display_sample_count,
                 pointer,
             )
         });
     if let Some(measurement) = smart_timing {
         paint_scope_timing_hint(
-            &scope_painter,
+            scope_painter,
             plot,
             waveforms,
             measurement,
             ScopeSmartTimingPaintOptions {
                 settings,
-                viewport: *viewport,
+                viewport,
                 display_sample_count,
                 sample_rate_hz: display_sample_rate_hz,
                 color: channel_colors[measurement.channel_index],
             },
         );
     }
+}
+
+/// The time ruler, the status line, and the trigger position handle.
+fn paint_scope_footer(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    view: &ScopeTimeDomainView,
+    waveforms: &WaveformStore,
+    options: &mut ScopeWaveformOptions<'_>,
+    viewport: &mut WaveformViewport,
+) {
+    let ScopeTimeDomainView {
+        plot,
+        time_ruler,
+        status_bar,
+        extent,
+        ..
+    } = *view;
+    let ScopeDisplayExtent {
+        display_sample_count,
+        display_sample_rate_hz,
+        ..
+    } = extent;
     paint_waveform_time_scale(
         painter,
         time_ruler,
@@ -2043,7 +2179,7 @@ pub(crate) fn paint_scope_time_domain(
         display_sample_rate_hz,
         waveforms.scope_sample_offset,
         *viewport,
-        time_axis,
+        options.time_axis,
     );
     paint_waveform_status(
         painter,
@@ -2056,8 +2192,8 @@ pub(crate) fn paint_scope_time_domain(
         ui,
         time_ruler,
         plot,
-        trigger_settings,
-        trigger_controls_enabled,
+        options.trigger_settings,
+        options.trigger_controls_enabled,
         viewport,
     );
 }
@@ -2067,6 +2203,118 @@ mod tests {
     use super::*;
 
     use crate::*;
+
+    fn scope_channels(lengths: [usize; 2]) -> Vec<VecDeque<f32>> {
+        lengths
+            .iter()
+            .map(|length| VecDeque::from(vec![0.0; *length]))
+            .collect()
+    }
+
+    fn capture_settings(enabled: [bool; 2]) -> ScopeCaptureSettings {
+        let mut settings = ScopeCaptureSettings {
+            sample_count: 10_000,
+            sample_rate_hz: 1_000_000,
+            ..ScopeCaptureSettings::default()
+        };
+        for (channel, enabled) in settings.channels.iter_mut().zip(enabled) {
+            channel.enabled = enabled;
+        }
+        settings
+    }
+
+    #[test]
+    fn the_display_extent_follows_the_shortest_enabled_channel() {
+        let waveforms = WaveformStore {
+            scope_channels: scope_channels([500, 300]),
+            scope_rate_hz: 2_000_000,
+            ..WaveformStore::default()
+        };
+
+        assert_eq!(
+            scope_display_extent(&waveforms, capture_settings([true, true])),
+            ScopeDisplayExtent {
+                sample_count: 300,
+                display_sample_count: 300,
+                display_sample_rate_hz: 2_000_000,
+            }
+        );
+        // A disabled channel does not shorten the view.
+        let extent = scope_display_extent(&waveforms, capture_settings([true, false]));
+        assert_eq!(extent.sample_count, 500);
+        assert_eq!(extent.display_sample_count, 500);
+    }
+
+    #[test]
+    fn without_samples_the_display_extent_is_the_configured_capture() {
+        let extent =
+            scope_display_extent(&WaveformStore::default(), capture_settings([true, true]));
+
+        assert_eq!(
+            extent,
+            ScopeDisplayExtent {
+                sample_count: 0,
+                display_sample_count: 10_000,
+                display_sample_rate_hz: 1_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn a_rolling_display_spans_the_ring_capacity() {
+        let waveforms = WaveformStore {
+            scope_channels: scope_channels([500, 500]),
+            scope_rolling: true,
+            scope_capacity: 4_096,
+            ..WaveformStore::default()
+        };
+
+        let extent = scope_display_extent(&waveforms, capture_settings([true, true]));
+
+        assert_eq!(extent.sample_count, 500);
+        assert_eq!(extent.display_sample_count, 4_096);
+    }
+
+    #[test]
+    fn the_trigger_fraction_prefers_the_found_crossing_then_the_reported_sample_then_the_setting() {
+        let mut settings = capture_settings([true, true]);
+        settings.trigger.position_percent = 40;
+        let editing_trigger = ScopeTriggerSettings {
+            position_percent: 25,
+            ..ScopeTriggerSettings::default()
+        };
+        let waveforms = WaveformStore {
+            scope_trigger_sample_index: Some(2_000),
+            scope_sample_offset: 1_000,
+            ..WaveformStore::default()
+        };
+        let crossing = ScopeTriggerCrossing {
+            sample: 5_000.0,
+            channel_index: 0,
+        };
+
+        let (found, screen) = scope_trigger_fractions(
+            &waveforms,
+            settings,
+            Some(crossing),
+            editing_trigger,
+            10_001,
+        );
+        assert!((found - 0.4).abs() < 1e-6, "{found}");
+        assert_eq!(screen, 0.25);
+
+        let (reported, _) =
+            scope_trigger_fractions(&waveforms, settings, None, editing_trigger, 10_001);
+        assert!((reported - 0.1).abs() < 1e-6, "{reported}");
+
+        let without_index = WaveformStore {
+            scope_trigger_sample_index: None,
+            ..waveforms
+        };
+        let (configured, _) =
+            scope_trigger_fractions(&without_index, settings, None, editing_trigger, 10_001);
+        assert_eq!(configured, 0.4);
+    }
 
     #[test]
     fn scope_plot_segments_do_not_join_independent_captures() {
