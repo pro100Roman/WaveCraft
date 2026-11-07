@@ -625,6 +625,13 @@ struct RadioAnalysisViewOptions {
 }
 
 impl RadioViewState {
+    pub fn clear_capture(&mut self) {
+        self.waterfall_texture = None;
+        self.waterfall_signature = None;
+        self.raw_message_scroll_rows = 0;
+        self.raw_message_newest_completed_sequence = None;
+    }
+
     pub fn paint(
         &mut self,
         ui: &mut egui::Ui,

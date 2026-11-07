@@ -2653,6 +2653,14 @@ fn capture_recording_is_supported(mode: AcquisitionMode) -> bool {
     matches!(mode, AcquisitionMode::Single | AcquisitionMode::Run)
 }
 
+fn clears_completed_capture_on_start(mode: AcquisitionMode, continuing_request: bool) -> bool {
+    match mode {
+        AcquisitionMode::Single => true,
+        AcquisitionMode::Run | AcquisitionMode::Loop => !continuing_request,
+        AcquisitionMode::Repetitive => false,
+    }
+}
+
 fn active_continuous_capture_accepts_recording(
     mode: AcquisitionMode,
     recording_active: bool,
@@ -4635,7 +4643,6 @@ impl WaveCraftApp {
         let calibration_values = self.manual_calibration.as_ref().map(|editor| editor.values);
 
         let retain_protocol_history = mode == AcquisitionMode::Repetitive && continuing_request;
-        let continuing_loop = mode == AcquisitionMode::Loop && continuing_request;
         self.capture_requests.insert(target);
         self.queued_capture_rearms
             .retain(|(_, queued_target)| *queued_target != target);
@@ -4644,7 +4651,7 @@ impl WaveCraftApp {
         let (sender, receiver) = mpsc::channel();
         self.scope_configuration_due = None;
         self.pending = Some(receiver);
-        if mode == AcquisitionMode::Single || (mode == AcquisitionMode::Loop && !continuing_loop) {
+        if clears_completed_capture_on_start(mode, continuing_request) {
             self.clear_completed_capture_for_target(target);
         }
         self.status = match mode {
@@ -6101,6 +6108,15 @@ impl WaveCraftApp {
             CaptureTarget::Oscilloscope => self.scope_sessions.clear_active(),
             CaptureTarget::RadioReceiver => self.radio_capture = None,
             CaptureTarget::Combined => self.combined_capture = None,
+        }
+        if target.includes_logic_analyzer() {
+            self.protocol_decode_cache = ProtocolDecodeCache::default();
+        }
+        if target.includes_oscilloscope() {
+            self.scope_measurement_caches = [ScopeMeasurementCache::default(); 2];
+        }
+        if target.includes_radio_receiver() {
+            self.radio_view.borrow_mut().clear_capture();
         }
     }
 
@@ -21614,6 +21630,38 @@ mod tests {
         assert!(capture_recording_is_supported(AcquisitionMode::Run));
         assert!(!capture_recording_is_supported(AcquisitionMode::Repetitive));
         assert!(!capture_recording_is_supported(AcquisitionMode::Loop));
+    }
+
+    #[test]
+    fn new_single_run_and_loop_captures_release_the_previous_capture() {
+        for mode in [
+            AcquisitionMode::Single,
+            AcquisitionMode::Run,
+            AcquisitionMode::Loop,
+        ] {
+            assert!(clears_completed_capture_on_start(mode, false));
+        }
+        assert!(!clears_completed_capture_on_start(
+            AcquisitionMode::Repetitive,
+            false,
+        ));
+
+        assert!(clears_completed_capture_on_start(
+            AcquisitionMode::Single,
+            true,
+        ));
+        assert!(!clears_completed_capture_on_start(
+            AcquisitionMode::Run,
+            true,
+        ));
+        assert!(!clears_completed_capture_on_start(
+            AcquisitionMode::Loop,
+            true,
+        ));
+        assert!(!clears_completed_capture_on_start(
+            AcquisitionMode::Repetitive,
+            true,
+        ));
     }
 
     #[test]
