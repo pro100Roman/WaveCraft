@@ -144,6 +144,11 @@ impl From<TimedSoftBit> for TimedSoftSymbol {
 pub struct FskDemodulator {
     config: FskConfig,
     previous_sample: Option<TimedComplexSample>,
+    /// Phase step between the last two samples, as the unnormalized product of
+    /// the newer sample and the conjugate of the older one.
+    last_rotation: Option<(f64, f64)>,
+    /// Stream description of the latest batch, without its samples.
+    last_header: Option<ChannelizedBatch>,
     source_sample_rate_hz: Option<u64>,
     sample_rate_hz: Option<u64>,
     center_frequency_hz: Option<u64>,
@@ -438,6 +443,8 @@ impl FskDemodulator {
         Ok(Self {
             config,
             previous_sample: None,
+            last_rotation: None,
+            last_header: None,
             source_sample_rate_hz: None,
             sample_rate_hz: None,
             center_frequency_hz: None,
@@ -513,6 +520,8 @@ impl FskDemodulator {
 
     pub fn reset(&mut self) {
         self.previous_sample = None;
+        self.last_rotation = None;
+        self.last_header = None;
         self.source_sample_rate_hz = None;
         self.sample_rate_hz = None;
         self.center_frequency_hz = None;
@@ -556,6 +565,7 @@ impl FskDemodulator {
         self.sample_rate_hz = Some(batch.sample_rate_hz);
         self.center_frequency_hz = Some(batch.center_frequency_hz);
         self.segment_start_sample_index = Some(batch.segment_start_sample_index);
+        self.last_header = Some(batch.clone_header());
         if self.receive_filter.is_empty() {
             self.receive_filter = design_receive_filter(
                 batch.sample_rate_hz,
@@ -597,6 +607,7 @@ impl FskDemodulator {
                 + f64::from(sample.q) * f64::from(previous.q);
             let imaginary = f64::from(sample.q) * f64::from(previous.i)
                 - f64::from(sample.i) * f64::from(previous.q);
+            self.last_rotation = Some((real, imaginary));
             let frequency_hz = imaginary.atan2(real) * batch.sample_rate_hz as f64 / TAU;
             let normalized_frequency = frequency_hz / self.config.deviation_hz as f64;
             let discriminator = DiscriminatorSample {
@@ -723,6 +734,61 @@ impl FskDemodulator {
             }
         }
         Ok(bits)
+    }
+
+    /// Ends the current burst: returns the symbols the receive filter still
+    /// holds back, then resets the demodulator.
+    ///
+    /// The filter output lags its input by half a filter span, so the last
+    /// symbols of a burst only come out once that many further samples have
+    /// arrived. When the burst stops, nothing follows, so the carrier is
+    /// continued at its last frequency for that span instead. Without this a
+    /// burst cut short, because another one follows or because the carrier
+    /// ended, would lose its final bits.
+    pub fn finish(&mut self) -> Result<Vec<TimedSoftBit>, DspError> {
+        let continuation = self.carrier_continuation();
+        let bits = match continuation {
+            Some(batch) => self.push(&batch),
+            None => Ok(Vec::new()),
+        };
+        self.reset();
+        bits
+    }
+
+    /// Samples that carry on the burst's last sample at its last frequency,
+    /// enough to push everything out of the receive filter.
+    fn carrier_continuation(&self) -> Option<ChannelizedBatch> {
+        let header = self.last_header.as_ref()?;
+        let last = self.previous_sample.as_ref()?;
+        let (real, imaginary) = self.last_rotation?;
+        let norm = real.hypot(imaginary);
+        if self.receive_filter.is_empty() || norm <= 0.0 || !norm.is_finite() {
+            return None;
+        }
+        let (rotation_real, rotation_imaginary) = (real / norm, imaginary / norm);
+        let spacing = (header.source_sample_rate_hz as f64 / header.sample_rate_hz as f64)
+            .round()
+            .max(1.0) as u64;
+        let length = last.source_range.end - last.source_range.start;
+        let count = self.receive_filter.len() / 2 + 1;
+        let (mut i, mut q) = (f64::from(last.i), f64::from(last.q));
+        let mut samples = Vec::with_capacity(count);
+        for step in 1..=count as u64 {
+            (i, q) = (
+                i * rotation_real - q * rotation_imaginary,
+                i * rotation_imaginary + q * rotation_real,
+            );
+            let start = last.source_range.start + step * spacing;
+            samples.push(TimedComplexSample {
+                i: i as f32,
+                q: q as f32,
+                source_range: start..start + length,
+            });
+        }
+        Some(ChannelizedBatch {
+            samples,
+            ..header.clone()
+        })
     }
 
     fn push_fixed_sample(
@@ -1002,6 +1068,18 @@ impl Demodulator for FskDemodulator {
             discontinuity: input.discontinuity,
             symbols,
         }))
+    }
+
+    fn finish(&mut self) -> Result<Option<DemodulatedBatch>, DspError> {
+        let symbols = FskDemodulator::finish(self)?
+            .into_iter()
+            .map(TimedSoftSymbol::from)
+            .collect();
+        Ok(Some(DemodulatedBatch::SoftSymbols(TimedSoftSymbolBatch {
+            alphabet_size: 2,
+            discontinuity: false,
+            symbols,
+        })))
     }
 
     fn telemetry(&self) -> DemodulatorTelemetry {
@@ -1722,6 +1800,61 @@ mod tests {
                 .any(|window| window == preamble),
             "ten-byte preamble was not retained in {decisions:?}"
         );
+    }
+
+    fn adaptive_gfsk_demodulator() -> FskDemodulator {
+        FskDemodulator::new(FskConfig {
+            symbol_rate_hz: 1_000,
+            deviation_hz: 1_000,
+            modulation: FskModulation::Gfsk { bt: 0.5 },
+            polarity: FskPolarity::Normal,
+            timing: FskTiming::Adaptive {
+                loop_bandwidth: 0.2,
+                max_clock_error_ppm: 10_000,
+            },
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn finishing_a_burst_delivers_the_symbols_the_receive_filter_still_holds() {
+        let preamble = (0..80).map(|index| index % 2 == 0).collect::<Vec<_>>();
+        let payload = [
+            false, false, true, false, true, true, false, true, true, false, false, true, false,
+            true, true, false,
+        ];
+        let transmitted = preamble.iter().copied().chain(payload).collect::<Vec<_>>();
+        let mut demodulator = adaptive_gfsk_demodulator();
+
+        let pushed = demodulator
+            .push(&batch(gfsk_samples(&transmitted, 0, 0.5), true, 0))
+            .unwrap();
+        let finished = demodulator.finish().unwrap();
+
+        let decide = |bits: &[TimedSoftBit]| {
+            bits.iter()
+                .map(|bit| bit.likelihood.is_sign_positive())
+                .collect::<Vec<_>>()
+        };
+        let before = decide(&pushed);
+        let all = decide(&[pushed, finished].concat());
+        assert!(
+            !before.ends_with(&payload),
+            "without finishing, the filter keeps the last symbols back"
+        );
+        assert!(
+            all.ends_with(&payload),
+            "the last payload bits are missing from {all:?}"
+        );
+        assert!(
+            !demodulator.timing_locked(),
+            "finishing resets the demodulator"
+        );
+    }
+
+    #[test]
+    fn finishing_before_any_sample_delivers_nothing() {
+        assert!(adaptive_gfsk_demodulator().finish().unwrap().is_empty());
     }
 
     #[test]

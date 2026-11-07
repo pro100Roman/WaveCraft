@@ -1,7 +1,7 @@
 use crate::{
-    Channelizer, ChannelizerConfig, DemodulatedBatch, Demodulator, DemodulatorRegistry,
-    DemodulatorTelemetry, DspError, FskConfig, FskPolarity, FskTiming, PreparedIqBatch,
-    BINARY_FSK_DEMODULATOR_ID, BINARY_GFSK_DEMODULATOR_ID,
+    ChannelizedBatch, Channelizer, ChannelizerConfig, DemodulatedBatch, Demodulator,
+    DemodulatorRegistry, DemodulatorTelemetry, DspError, FskConfig, FskPolarity, FskTiming,
+    PreparedIqBatch, BINARY_FSK_DEMODULATOR_ID, BINARY_GFSK_DEMODULATOR_ID,
 };
 use wavecraft_core::IqBatch;
 
@@ -61,6 +61,13 @@ impl DemodulationProfile {
         match self {
             Self::BinaryFsk(_) => BINARY_FSK_DEMODULATOR_ID,
             Self::BinaryGfsk(_) => BINARY_GFSK_DEMODULATOR_ID,
+        }
+    }
+
+    pub fn symbol_rate_hz(&self) -> u64 {
+        match self {
+            Self::BinaryFsk(profile) => profile.symbol_rate_hz,
+            Self::BinaryGfsk(profile) => profile.symbol_rate_hz,
         }
     }
 
@@ -138,8 +145,35 @@ impl SignalAnalyzer {
     /// Demodulates IQ already converted and DC-corrected by a shared
     /// [`crate::WidebandIqPreprocessor`].
     pub fn push_prepared(&mut self, input: &PreparedIqBatch) -> Result<DemodulatedBatch, DspError> {
-        let channelized = self.channelizer.push_prepared(input)?;
-        self.demodulator.push(&channelized)
+        let channelized = self.channel_prepared(input)?;
+        self.demodulate(&channelized)
+    }
+
+    /// Only the channelization half of [`Self::push`], for callers that look
+    /// at the channel before it is demodulated.
+    pub fn channel(&mut self, input: &IqBatch) -> Result<ChannelizedBatch, DspError> {
+        self.channelizer.push(input)
+    }
+
+    /// Only the channelization half of [`Self::push_prepared`], for callers
+    /// that look at the channel before it is demodulated.
+    pub fn channel_prepared(
+        &mut self,
+        input: &PreparedIqBatch,
+    ) -> Result<ChannelizedBatch, DspError> {
+        self.channelizer.push_prepared(input)
+    }
+
+    /// Only the demodulation half of [`Self::push_prepared`].
+    pub fn demodulate(&mut self, input: &ChannelizedBatch) -> Result<DemodulatedBatch, DspError> {
+        self.demodulator.push(input)
+    }
+
+    /// Ends the current burst in the demodulator alone: returns the symbols it
+    /// still holds back and resets it. The channel filter keeps running, so
+    /// the signal that follows is not disturbed.
+    pub fn finish_demodulation(&mut self) -> Result<Option<DemodulatedBatch>, DspError> {
+        self.demodulator.finish()
     }
 
     pub fn telemetry(&self) -> DemodulatorTelemetry {

@@ -120,6 +120,17 @@ pub struct ChannelizedBatch {
     pub samples: Vec<TimedComplexSample>,
 }
 
+impl ChannelizedBatch {
+    /// The stream description without the samples or the gap flag.
+    pub(crate) fn clone_header(&self) -> ChannelizedBatch {
+        ChannelizedBatch {
+            discontinuity: false,
+            samples: Vec::new(),
+            ..*self
+        }
+    }
+}
+
 /// Wideband IQ with integer conversion and DC tracking applied once before
 /// fan-out to one or more channelizers.
 #[derive(Clone, Debug, PartialEq)]
