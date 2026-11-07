@@ -1303,6 +1303,23 @@ pub(crate) fn paint_logic_protocol_lanes(
     }
 }
 
+/// The number of samples and the sample rate the logic plot is laid out for:
+/// the capture's own, or a default until the first samples arrive.
+fn logic_display_extent(waveforms: &WaveformStore) -> (usize, u64) {
+    let sample_count = waveforms.logic_sample_count;
+    let display_sample_count = if sample_count == 0 {
+        SAMPLE_COUNT as usize
+    } else {
+        sample_count
+    };
+    let display_sample_rate_hz = if waveforms.logic_rate_hz == 0 {
+        SAMPLE_RATE_HZ
+    } else {
+        waveforms.logic_rate_hz
+    };
+    (display_sample_count, display_sample_rate_hz)
+}
+
 pub(crate) fn paint_logic(
     ui: &egui::Ui,
     rect: Rect,
@@ -1326,25 +1343,13 @@ pub(crate) fn paint_logic(
     } = options;
     paint_plot_background(ui, rect);
     let painter = ui.painter();
-    let waveform_area = rect;
-    let (status_area, ruler_area, plot_area) = split_waveform_chrome(waveform_area);
-    let plot = plot_area;
+    let (status_area, ruler_area, plot) = split_waveform_chrome(rect);
     let (status_bar, time_ruler) = align_waveform_chrome(status_area, ruler_area, plot);
     paint_plot_grid(ui, plot);
     let sample_count = waveforms.logic_sample_count;
-    let display_sample_count = if sample_count == 0 {
-        SAMPLE_COUNT as usize
-    } else {
-        sample_count
-    };
-    let display_sample_rate_hz = if waveforms.logic_rate_hz == 0 {
-        SAMPLE_RATE_HZ
-    } else {
-        waveforms.logic_rate_hz
-    };
+    let (display_sample_count, display_sample_rate_hz) = logic_display_extent(waveforms);
     let (signal_layout, protocol_lanes) =
         logic_protocol_lane_layout(plot, maximum_heights, &protocol_analyzer.analyzers);
-    let signal_plot = plot;
     let _ = update_waveform_viewport(
         ui,
         plot,
@@ -1361,27 +1366,14 @@ pub(crate) fn paint_logic(
     );
     update_logic_marker_gesture(
         ui,
-        signal_plot,
+        plot,
         waveforms,
         viewport,
         &signal_layout.levels,
         enabled_channels,
         marker_settings,
     );
-    for channel in 0..LOGIC_CHANNEL_COUNT {
-        let lane_top = if channel == 0 {
-            signal_plot.top()
-        } else {
-            (signal_layout.levels[channel - 1].1 + signal_layout.levels[channel].0) * 0.5
-        };
-        painter.line_segment(
-            [
-                Pos2::new(signal_plot.left(), lane_top),
-                Pos2::new(signal_plot.right(), lane_top),
-            ],
-            Stroke::new(0.6_f32, GRID.gamma_multiply(0.45)),
-        );
-    }
+    paint_logic_lane_separators(painter, plot, &signal_layout.levels);
     let visible_range = viewport.sample_range(sample_count);
     let visible_count = visible_range.len();
     let mut waveform_points = logic_waveform_points(
@@ -1391,142 +1383,30 @@ pub(crate) fn paint_logic(
             sample_stride: waveforms.logic_sample_stride,
         },
         visible_range.clone(),
-        signal_plot,
+        plot,
         *viewport,
         &signal_layout.levels,
         enabled_channels,
     );
-    let marker_lane_height = signal_layout.base_height * LOGIC_SIGNAL_DEFAULT_STEPS_PER_LANE as f32;
-    for channel in 0..LOGIC_CHANNEL_COUNT {
-        if !enabled_channels[channel] {
-            continue;
-        }
-        let channel_color = &mut channel_colors[channel];
-        let channel_marker_opacity = &mut channel_marker_opacities[channel];
-        let channel_name = &mut channel_names[channel];
-        let channel_label = channel_label("D", channel, channel_name);
-        let marker_text = logic_channel_marker_text(channel, channel_name);
-        let (_, low) = signal_layout.levels[channel];
-        paint_logic_zero_reference(painter, signal_plot, low, *channel_color);
-        let marker_rect =
-            logic_channel_marker_rect(signal_plot, low, marker_lane_height, &marker_text);
-        let marker_response = ui
-            .interact(
-                marker_rect.expand(3.0),
-                ui.make_persistent_id(("logic_channel_marker", channel)),
-                Sense::click(),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_selectable_text(format!("Click to edit {channel_label} settings"));
-
-        let popup_id = ui.make_persistent_id(("logic_channel_settings_popup", channel));
-        if marker_response.clicked() {
-            channel_settings_drafts[channel] = LogicChannelSettingsDraft {
-                enabled: enabled_channels[channel],
-                maximum_height: maximum_heights[channel],
-                name: channel_name.clone(),
-                color: *channel_color,
-                marker_opacity: *channel_marker_opacity,
-            };
-            ui.memory_mut(|memory| memory.toggle_popup(popup_id));
-        }
-        egui::popup::popup_below_widget(
-            ui,
-            popup_id,
-            &marker_response,
-            egui::popup::PopupCloseBehavior::CloseOnClickOutside,
-            |popup_ui| {
-                let draft = &mut channel_settings_drafts[channel];
-                let mut save_requested = false;
-                let mut cancel_requested = false;
-                popup_ui.set_min_width(280.0);
-                popup_ui.label(RichText::new(format!("D{channel} settings")).strong());
-                popup_ui.checkbox(&mut draft.enabled, "Enabled");
-                popup_ui.horizontal(|ui| {
-                    ui.label("Max height");
-                    ui.add(
-                        egui::Slider::new(&mut draft.maximum_height, 1..=5)
-                            .integer()
-                            .suffix("×"),
-                    );
-                });
-                popup_ui.separator();
-                popup_ui.horizontal(|ui| {
-                    ui.label("Name");
-                    let name_edit = ui.add(
-                        egui::TextEdit::singleline(&mut draft.name)
-                            .char_limit(LOGIC_CHANNEL_NAME_MAX_CHARS)
-                            .desired_width(190.0)
-                            .hint_text("Optional name"),
-                    );
-                    if name_edit.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                    {
-                        save_requested = true;
-                    }
-                });
-                popup_ui.separator();
-                popup_ui.label("Color");
-                egui::color_picker::color_picker_color32(
-                    popup_ui,
-                    &mut draft.color,
-                    egui::color_picker::Alpha::Opaque,
-                );
-                if popup_ui.button("Reset color").clicked() {
-                    draft.color = default_logic_channel_colors()[channel];
-                }
-                popup_ui.separator();
-                popup_ui.horizontal(|ui| {
-                    ui.label("Opacity");
-                    let mut opacity_percent = f32::from(draft.marker_opacity) / 255.0 * 100.0;
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut opacity_percent, 10.0..=100.0)
-                                .fixed_decimals(0)
-                                .suffix("%"),
-                        )
-                        .changed()
-                    {
-                        draft.marker_opacity = (opacity_percent / 100.0 * 255.0).round() as u8;
-                    }
-                });
-                popup_ui.separator();
-                popup_ui.horizontal(|ui| {
-                    save_requested |= ui.button("Save").clicked();
-                    cancel_requested |= ui.button("Cancel").clicked();
-                });
-                if save_requested {
-                    enabled_channels[channel] = draft.enabled;
-                    maximum_heights[channel] = draft.maximum_height;
-                    *channel_name = draft.name.clone();
-                    *channel_color = draft.color;
-                    *channel_marker_opacity = draft.marker_opacity;
-                    popup_ui.memory_mut(egui::Memory::close_popup);
-                } else if cancel_requested {
-                    popup_ui.memory_mut(egui::Memory::close_popup);
-                }
-            },
-        );
-
-        if visible_count != 0 {
-            let points = std::mem::take(&mut waveform_points[channel]);
-            if points.len() > 1 {
-                painter.add(egui::Shape::line(
-                    points,
-                    Stroke::new(1.2_f32, *channel_color),
-                ));
-            }
-        }
-        paint_logic_channel_marker(
-            painter,
-            signal_plot,
-            low,
-            marker_lane_height,
-            &marker_text,
-            *channel_color,
-            *channel_marker_opacity,
-        );
-    }
+    paint_logic_channels(
+        ui,
+        &LogicChannelLanes {
+            plot,
+            levels: &signal_layout.levels,
+            marker_lane_height: signal_layout.base_height
+                * LOGIC_SIGNAL_DEFAULT_STEPS_PER_LANE as f32,
+            has_samples: visible_count != 0,
+        },
+        &mut LogicChannelEdits {
+            colors: channel_colors,
+            marker_opacities: channel_marker_opacities,
+            names: channel_names,
+            settings_drafts: channel_settings_drafts,
+            maximum_heights,
+            enabled: enabled_channels,
+        },
+        &mut waveform_points,
+    );
     paint_logic_protocol_lanes(
         ui,
         &protocol_lanes,
@@ -1538,27 +1418,22 @@ pub(crate) fn paint_logic(
     );
     paint_logic_markers(ui, plot, waveforms, *viewport, marker_settings);
     let smart_timing = smart_timing_enabled
-        .then(|| ui.input(|input| input.pointer.hover_pos()))
-        .flatten()
-        .filter(|pointer| {
-            signal_plot.contains(*pointer)
-                && !protocol_lanes.iter().any(|lane| lane.contains(*pointer))
-        })
-        .and_then(|pointer| {
-            let channel = logic_channel_at_y(&signal_layout.levels, enabled_channels, pointer.y)?;
-            let sample = logic_sample_at_x(
-                signal_plot,
+        .then(|| {
+            hovered_logic_smart_timing(
+                ui,
+                plot,
+                &protocol_lanes,
+                &signal_layout.levels,
+                enabled_channels,
+                waveforms,
                 *viewport,
-                waveforms.logic_sample_offset,
-                waveforms.logic_sample_count,
-                pointer.x,
-            )?;
-            logic_smart_timing_measurement(waveforms, channel, sample)
-        });
+            )
+        })
+        .flatten();
     if let Some(measurement) = smart_timing {
         paint_logic_timing_hint(
             painter,
-            signal_plot,
+            plot,
             waveforms,
             *viewport,
             measurement,
@@ -1566,7 +1441,7 @@ pub(crate) fn paint_logic(
         );
     }
     if visible_count == 0 {
-        paint_empty(painter, signal_plot, "Waiting for logic samples");
+        paint_empty(painter, plot, "Waiting for logic samples");
     }
     paint_waveform_time_scale(
         painter,
@@ -1584,6 +1459,284 @@ pub(crate) fn paint_logic(
         display_sample_rate_hz,
         *viewport,
     );
+}
+
+/// The thin line above each channel's lane (the first one is the plot's top).
+fn paint_logic_lane_separators(
+    painter: &egui::Painter,
+    plot: Rect,
+    levels: &[(f32, f32); LOGIC_CHANNEL_COUNT],
+) {
+    for channel in 0..LOGIC_CHANNEL_COUNT {
+        let lane_top = if channel == 0 {
+            plot.top()
+        } else {
+            (levels[channel - 1].1 + levels[channel].0) * 0.5
+        };
+        painter.line_segment(
+            [
+                Pos2::new(plot.left(), lane_top),
+                Pos2::new(plot.right(), lane_top),
+            ],
+            Stroke::new(0.6_f32, GRID.gamma_multiply(0.45)),
+        );
+    }
+}
+
+/// The channel under the pointer and the edge or cycle around the sample
+/// there, unless the pointer is over a protocol lane or outside the plot.
+fn hovered_logic_smart_timing(
+    ui: &egui::Ui,
+    plot: Rect,
+    protocol_lanes: &[Rect],
+    levels: &[(f32, f32); LOGIC_CHANNEL_COUNT],
+    enabled_channels: &[bool; LOGIC_CHANNEL_COUNT],
+    waveforms: &WaveformStore,
+    viewport: WaveformViewport,
+) -> Option<LogicSmartTimingMeasurement> {
+    ui.input(|input| input.pointer.hover_pos())
+        .filter(|pointer| {
+            plot.contains(*pointer) && !protocol_lanes.iter().any(|lane| lane.contains(*pointer))
+        })
+        .and_then(|pointer| {
+            let channel = logic_channel_at_y(levels, enabled_channels, pointer.y)?;
+            let sample = logic_sample_at_x(
+                plot,
+                viewport,
+                waveforms.logic_sample_offset,
+                waveforms.logic_sample_count,
+                pointer.x,
+            )?;
+            logic_smart_timing_measurement(waveforms, channel, sample)
+        })
+}
+
+/// Where the channels are drawn and whether there is anything to draw.
+struct LogicChannelLanes<'a> {
+    plot: Rect,
+    levels: &'a [(f32, f32); LOGIC_CHANNEL_COUNT],
+    marker_lane_height: f32,
+    has_samples: bool,
+}
+
+/// The per-channel settings the user can change from a channel's marker.
+struct LogicChannelEdits<'a> {
+    colors: &'a mut [Color32; LOGIC_CHANNEL_COUNT],
+    marker_opacities: &'a mut [u8; LOGIC_CHANNEL_COUNT],
+    names: &'a mut [String; LOGIC_CHANNEL_COUNT],
+    settings_drafts: &'a mut [LogicChannelSettingsDraft; LOGIC_CHANNEL_COUNT],
+    maximum_heights: &'a mut [u8; LOGIC_CHANNEL_COUNT],
+    enabled: &'a mut [bool; LOGIC_CHANNEL_COUNT],
+}
+
+impl LogicChannelEdits<'_> {
+    fn slot(&mut self, channel: usize) -> LogicChannelSlot<'_> {
+        LogicChannelSlot {
+            enabled: &mut self.enabled[channel],
+            maximum_height: &mut self.maximum_heights[channel],
+            name: &mut self.names[channel],
+            color: &mut self.colors[channel],
+            marker_opacity: &mut self.marker_opacities[channel],
+            draft: &mut self.settings_drafts[channel],
+        }
+    }
+}
+
+/// One channel's settings and the draft its popup edits. The draft only
+/// replaces the settings when the popup is saved.
+struct LogicChannelSlot<'a> {
+    enabled: &'a mut bool,
+    maximum_height: &'a mut u8,
+    name: &'a mut String,
+    color: &'a mut Color32,
+    marker_opacity: &'a mut u8,
+    draft: &'a mut LogicChannelSettingsDraft,
+}
+
+impl LogicChannelSlot<'_> {
+    /// Starts a new edit from the current settings.
+    fn begin_edit(&mut self) {
+        *self.draft = LogicChannelSettingsDraft {
+            enabled: *self.enabled,
+            maximum_height: *self.maximum_height,
+            name: self.name.clone(),
+            color: *self.color,
+            marker_opacity: *self.marker_opacity,
+        };
+    }
+
+    fn apply_draft(&mut self) {
+        *self.enabled = self.draft.enabled;
+        *self.maximum_height = self.draft.maximum_height;
+        *self.name = self.draft.name.clone();
+        *self.color = self.draft.color;
+        *self.marker_opacity = self.draft.marker_opacity;
+    }
+}
+
+fn paint_logic_channels(
+    ui: &egui::Ui,
+    lanes: &LogicChannelLanes<'_>,
+    edits: &mut LogicChannelEdits<'_>,
+    waveform_points: &mut [Vec<Pos2>; LOGIC_CHANNEL_COUNT],
+) {
+    for (channel, points) in waveform_points.iter_mut().enumerate() {
+        if !edits.enabled[channel] {
+            continue;
+        }
+        paint_logic_channel(ui, channel, lanes, &mut edits.slot(channel), points);
+    }
+}
+
+/// One enabled channel: its zero line, the clickable marker with the settings
+/// popup, the waveform, and the marker itself.
+fn paint_logic_channel(
+    ui: &egui::Ui,
+    channel: usize,
+    lanes: &LogicChannelLanes<'_>,
+    slot: &mut LogicChannelSlot<'_>,
+    points: &mut Vec<Pos2>,
+) {
+    let painter = ui.painter();
+    let channel_label = channel_label("D", channel, slot.name);
+    let marker_text = logic_channel_marker_text(channel, slot.name);
+    let (_, low) = lanes.levels[channel];
+    paint_logic_zero_reference(painter, lanes.plot, low, *slot.color);
+    let marker_rect =
+        logic_channel_marker_rect(lanes.plot, low, lanes.marker_lane_height, &marker_text);
+    let marker_response = ui
+        .interact(
+            marker_rect.expand(3.0),
+            ui.make_persistent_id(("logic_channel_marker", channel)),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_selectable_text(format!("Click to edit {channel_label} settings"));
+
+    paint_logic_channel_settings_popup(ui, channel, &marker_response, slot);
+
+    if lanes.has_samples {
+        let points = std::mem::take(points);
+        if points.len() > 1 {
+            painter.add(egui::Shape::line(points, Stroke::new(1.2_f32, *slot.color)));
+        }
+    }
+    paint_logic_channel_marker(
+        painter,
+        lanes.plot,
+        low,
+        lanes.marker_lane_height,
+        &marker_text,
+        *slot.color,
+        *slot.marker_opacity,
+    );
+}
+
+fn paint_logic_channel_settings_popup(
+    ui: &egui::Ui,
+    channel: usize,
+    marker_response: &egui::Response,
+    slot: &mut LogicChannelSlot<'_>,
+) {
+    let popup_id = ui.make_persistent_id(("logic_channel_settings_popup", channel));
+    if marker_response.clicked() {
+        slot.begin_edit();
+        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+    }
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        marker_response,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |popup_ui| match paint_logic_channel_settings_form(popup_ui, channel, slot.draft) {
+            LogicChannelSettingsAction::Save => {
+                slot.apply_draft();
+                popup_ui.memory_mut(egui::Memory::close_popup);
+            }
+            LogicChannelSettingsAction::Cancel => {
+                popup_ui.memory_mut(egui::Memory::close_popup);
+            }
+            LogicChannelSettingsAction::Keep => {}
+        },
+    );
+}
+
+/// What the user decided in a channel's settings popup this frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogicChannelSettingsAction {
+    Keep,
+    Save,
+    Cancel,
+}
+
+fn paint_logic_channel_settings_form(
+    popup_ui: &mut egui::Ui,
+    channel: usize,
+    draft: &mut LogicChannelSettingsDraft,
+) -> LogicChannelSettingsAction {
+    let mut save_requested = false;
+    let mut cancel_requested = false;
+    popup_ui.set_min_width(280.0);
+    popup_ui.label(RichText::new(format!("D{channel} settings")).strong());
+    popup_ui.checkbox(&mut draft.enabled, "Enabled");
+    popup_ui.horizontal(|ui| {
+        ui.label("Max height");
+        ui.add(
+            egui::Slider::new(&mut draft.maximum_height, 1..=5)
+                .integer()
+                .suffix("×"),
+        );
+    });
+    popup_ui.separator();
+    popup_ui.horizontal(|ui| {
+        ui.label("Name");
+        let name_edit = ui.add(
+            egui::TextEdit::singleline(&mut draft.name)
+                .char_limit(LOGIC_CHANNEL_NAME_MAX_CHARS)
+                .desired_width(190.0)
+                .hint_text("Optional name"),
+        );
+        if name_edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            save_requested = true;
+        }
+    });
+    popup_ui.separator();
+    popup_ui.label("Color");
+    egui::color_picker::color_picker_color32(
+        popup_ui,
+        &mut draft.color,
+        egui::color_picker::Alpha::Opaque,
+    );
+    if popup_ui.button("Reset color").clicked() {
+        draft.color = default_logic_channel_colors()[channel];
+    }
+    popup_ui.separator();
+    popup_ui.horizontal(|ui| {
+        ui.label("Opacity");
+        let mut opacity_percent = f32::from(draft.marker_opacity) / 255.0 * 100.0;
+        if ui
+            .add(
+                egui::Slider::new(&mut opacity_percent, 10.0..=100.0)
+                    .fixed_decimals(0)
+                    .suffix("%"),
+            )
+            .changed()
+        {
+            draft.marker_opacity = (opacity_percent / 100.0 * 255.0).round() as u8;
+        }
+    });
+    popup_ui.separator();
+    popup_ui.horizontal(|ui| {
+        save_requested |= ui.button("Save").clicked();
+        cancel_requested |= ui.button("Cancel").clicked();
+    });
+    if save_requested {
+        LogicChannelSettingsAction::Save
+    } else if cancel_requested {
+        LogicChannelSettingsAction::Cancel
+    } else {
+        LogicChannelSettingsAction::Keep
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1832,5 +1985,413 @@ mod tests {
         assert!(settings.adding);
         assert!(settings.markers.is_empty());
         assert!(settings.draft.is_none());
+    }
+
+    #[test]
+    fn the_display_extent_is_the_capture_or_a_default_before_the_first_samples() {
+        let mut waveforms = WaveformStore::default();
+        assert_eq!(
+            logic_display_extent(&waveforms),
+            (SAMPLE_COUNT as usize, SAMPLE_RATE_HZ)
+        );
+
+        waveforms.logic_sample_count = 250;
+        assert_eq!(
+            logic_display_extent(&waveforms),
+            (250, SAMPLE_RATE_HZ),
+            "the rate is still unknown"
+        );
+
+        waveforms.logic_rate_hz = 24_000_000;
+        assert_eq!(logic_display_extent(&waveforms), (250, 24_000_000));
+    }
+
+    /// The settings of every logic channel, as the waveform view holds them.
+    struct ChannelSettings {
+        colors: [Color32; LOGIC_CHANNEL_COUNT],
+        marker_opacities: [u8; LOGIC_CHANNEL_COUNT],
+        names: [String; LOGIC_CHANNEL_COUNT],
+        drafts: [LogicChannelSettingsDraft; LOGIC_CHANNEL_COUNT],
+        maximum_heights: [u8; LOGIC_CHANNEL_COUNT],
+        enabled: [bool; LOGIC_CHANNEL_COUNT],
+    }
+
+    impl ChannelSettings {
+        fn new() -> Self {
+            Self {
+                colors: default_logic_channel_colors(),
+                marker_opacities: default_logic_channel_marker_opacities(),
+                names: std::array::from_fn(|_| String::new()),
+                drafts: default_logic_channel_settings_drafts(),
+                maximum_heights: [1; LOGIC_CHANNEL_COUNT],
+                enabled: [true; LOGIC_CHANNEL_COUNT],
+            }
+        }
+
+        fn edits(&mut self) -> LogicChannelEdits<'_> {
+            LogicChannelEdits {
+                colors: &mut self.colors,
+                marker_opacities: &mut self.marker_opacities,
+                names: &mut self.names,
+                settings_drafts: &mut self.drafts,
+                maximum_heights: &mut self.maximum_heights,
+                enabled: &mut self.enabled,
+            }
+        }
+    }
+
+    #[test]
+    fn a_channel_edit_starts_from_the_settings_of_that_channel() {
+        let mut settings = ChannelSettings::new();
+        settings.enabled[5] = false;
+        settings.maximum_heights[5] = 4;
+        settings.names[5] = "CLK".to_owned();
+        settings.colors[5] = Color32::RED;
+        settings.marker_opacities[5] = 77;
+
+        settings.edits().slot(5).begin_edit();
+
+        assert_eq!(
+            settings.drafts[5],
+            LogicChannelSettingsDraft {
+                enabled: false,
+                maximum_height: 4,
+                name: "CLK".to_owned(),
+                color: Color32::RED,
+                marker_opacity: 77,
+            }
+        );
+        assert_eq!(
+            settings.drafts[4],
+            default_logic_channel_settings_drafts()[4],
+            "the other drafts are left alone"
+        );
+    }
+
+    #[test]
+    fn saving_a_draft_changes_only_its_channel() {
+        let mut settings = ChannelSettings::new();
+        settings.drafts[2] = LogicChannelSettingsDraft {
+            enabled: false,
+            maximum_height: 3,
+            name: "MOSI".to_owned(),
+            color: Color32::GREEN,
+            marker_opacity: 99,
+        };
+        let before = ChannelSettings::new();
+
+        settings.edits().slot(2).apply_draft();
+
+        assert!(!settings.enabled[2]);
+        assert_eq!(settings.maximum_heights[2], 3);
+        assert_eq!(settings.names[2], "MOSI");
+        assert_eq!(settings.colors[2], Color32::GREEN);
+        assert_eq!(settings.marker_opacities[2], 99);
+        for channel in (0..LOGIC_CHANNEL_COUNT).filter(|channel| *channel != 2) {
+            assert_eq!(settings.enabled[channel], before.enabled[channel]);
+            assert_eq!(
+                settings.maximum_heights[channel],
+                before.maximum_heights[channel]
+            );
+            assert_eq!(settings.names[channel], before.names[channel]);
+            assert_eq!(settings.colors[channel], before.colors[channel]);
+            assert_eq!(
+                settings.marker_opacities[channel],
+                before.marker_opacities[channel]
+            );
+        }
+    }
+
+    /// A logic waveform painted frame after frame, with its channel markers
+    /// and the settings popup they open.
+    struct LogicView {
+        context: egui::Context,
+        waveforms: WaveformStore,
+        settings: ChannelSettings,
+        marker_settings: LogicMarkerSettings,
+        protocol_analyzer: ProtocolAnalyzerSettings,
+        protocol_decode_cache: ProtocolDecodeCache,
+        viewport: WaveformViewport,
+        smart_timing_enabled: bool,
+        frames: u32,
+    }
+
+    struct PaintedLogic {
+        texts: Vec<(String, Pos2)>,
+        squares: Vec<Pos2>,
+        shape_count: usize,
+    }
+
+    impl PaintedLogic {
+        fn new(shapes: &[egui::epaint::ClippedShape]) -> Self {
+            fn collect(shape: &egui::Shape, painted: &mut PaintedLogic) {
+                if !matches!(shape, egui::Shape::Vec(_)) {
+                    painted.shape_count += 1;
+                }
+                match shape {
+                    egui::Shape::Vec(shapes) => {
+                        shapes.iter().for_each(|shape| collect(shape, painted));
+                    }
+                    egui::Shape::Text(text) => painted.texts.push((
+                        text.galley.text().to_owned(),
+                        text.visual_bounding_rect().center(),
+                    )),
+                    egui::Shape::Rect(rect) => {
+                        let size = rect.rect.size();
+                        if (size.x - size.y).abs() < 1.0 && (10.0..24.0).contains(&size.x) {
+                            painted.squares.push(rect.rect.center());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut painted = Self {
+                texts: Vec::new(),
+                squares: Vec::new(),
+                shape_count: 0,
+            };
+            for clipped in shapes {
+                collect(&clipped.shape, &mut painted);
+            }
+            painted
+        }
+
+        fn has(&self, text: &str) -> bool {
+            self.texts.iter().any(|(painted, _)| painted == text)
+        }
+
+        fn center_of(&self, text: &str) -> Pos2 {
+            let matches = self
+                .texts
+                .iter()
+                .filter(|(painted, _)| painted == text)
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "expected exactly one {text:?}");
+            matches[0].1
+        }
+
+        /// The check box painted to the left of `label`.
+        fn checkbox_before(&self, label: &str) -> Pos2 {
+            let row = self.center_of(label);
+            let matches = self
+                .squares
+                .iter()
+                .filter(|square| (square.y - row.y).abs() < 6.0 && square.x < row.x)
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "expected one check box before {label:?}");
+            *matches[0]
+        }
+    }
+
+    impl LogicView {
+        fn new() -> Self {
+            let mut waveforms = WaveformStore {
+                logic_rate_hz: 1_000_000,
+                ..WaveformStore::default()
+            };
+            waveforms.configure_logic_capture(1_000);
+            let samples = (0..1_000u32)
+                .map(|index| index & 0xffff)
+                .collect::<Vec<_>>();
+            waveforms.ingest_logic_samples(&samples);
+            let mut settings = ChannelSettings::new();
+            settings.names[0] = "CLK".to_owned();
+            settings.names[3] = "SCK".to_owned();
+            let mut view = Self {
+                context: egui::Context::default(),
+                waveforms,
+                settings,
+                marker_settings: LogicMarkerSettings::default(),
+                protocol_analyzer: ProtocolAnalyzerSettings::default(),
+                protocol_decode_cache: ProtocolDecodeCache::default(),
+                viewport: WaveformViewport {
+                    start: 0.0,
+                    span: 1.0,
+                    anchor_locked: false,
+                },
+                smart_timing_enabled: false,
+                frames: 0,
+            };
+            view.frame(Vec::new());
+            view
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> PaintedLogic {
+            self.frames += 1;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0))),
+                time: Some(f64::from(self.frames) / 60.0),
+                events,
+                ..egui::RawInput::default()
+            };
+            let rect = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(880.0, 640.0));
+            let output = self.context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    paint_logic(
+                        ui,
+                        rect,
+                        &self.waveforms,
+                        LogicWaveformOptions {
+                            channel_colors: &mut self.settings.colors,
+                            channel_marker_opacities: &mut self.settings.marker_opacities,
+                            channel_names: &mut self.settings.names,
+                            channel_settings_drafts: &mut self.settings.drafts,
+                            smart_timing_enabled: self.smart_timing_enabled,
+                            marker_settings: &mut self.marker_settings,
+                            maximum_heights: &mut self.settings.maximum_heights,
+                            enabled_channels: &mut self.settings.enabled,
+                            protocol_analyzer: &self.protocol_analyzer,
+                            protocol_decode_cache: &mut self.protocol_decode_cache,
+                            protocol_stream: None,
+                            time_axis: None,
+                        },
+                        &mut self.viewport,
+                    );
+                });
+            });
+            PaintedLogic::new(&output.shapes)
+        }
+
+        fn click(&mut self, position: Pos2) {
+            let button = |pressed| egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            self.frame(vec![egui::Event::PointerMoved(position), button(true)]);
+            self.frame(vec![button(false)]);
+            self.frame(Vec::new());
+        }
+
+        fn click_text(&mut self, text: &str) {
+            let position = self.frame(Vec::new()).center_of(text);
+            self.click(position);
+        }
+
+        fn key(&mut self, key: egui::Key) {
+            self.frame(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }]);
+        }
+    }
+
+    #[test]
+    fn saving_the_channel_popup_applies_what_was_changed_in_it() {
+        let mut view = LogicView::new();
+        view.settings.colors[3] = Color32::RED;
+
+        view.click_text("SCK");
+        assert!(view.frame(Vec::new()).has("D3 settings"));
+        let checkbox = view.frame(Vec::new()).checkbox_before("Enabled");
+        view.click(checkbox);
+        view.click_text("Reset color");
+        assert!(
+            view.settings.enabled[3],
+            "nothing is applied before the popup is saved"
+        );
+        assert_eq!(view.settings.colors[3], Color32::RED);
+        view.click_text("Save");
+
+        assert!(!view.settings.enabled[3]);
+        assert_eq!(view.settings.colors[3], default_logic_channel_colors()[3]);
+        assert!(
+            !view.frame(Vec::new()).has("D3 settings"),
+            "saving closes the popup"
+        );
+    }
+
+    #[test]
+    fn only_enabled_channels_get_a_marker() {
+        let mut view = LogicView::new();
+        view.settings.names[5] = "OFF".to_owned();
+        assert!(view.frame(Vec::new()).has("OFF"));
+
+        view.settings.enabled[5] = false;
+
+        assert!(!view.frame(Vec::new()).has("OFF"));
+        assert!(view.frame(Vec::new()).has("SCK"));
+    }
+
+    #[test]
+    fn cancelling_the_channel_popup_keeps_the_settings() {
+        let mut view = LogicView::new();
+
+        view.click_text("SCK");
+        let checkbox = view.frame(Vec::new()).checkbox_before("Enabled");
+        view.click(checkbox);
+        view.click_text("Cancel");
+
+        assert!(view.settings.enabled[3]);
+        assert!(!view.frame(Vec::new()).has("D3 settings"));
+    }
+
+    #[test]
+    fn reopening_the_channel_popup_discards_an_earlier_unsaved_edit() {
+        let mut view = LogicView::new();
+
+        view.click_text("SCK");
+        let checkbox = view.frame(Vec::new()).checkbox_before("Enabled");
+        view.click(checkbox);
+        view.click_text("Cancel");
+        view.click_text("SCK");
+        view.click_text("Save");
+
+        assert!(view.settings.enabled[3]);
+        assert!(
+            !view.frame(Vec::new()).has("D3 settings"),
+            "saving closes the popup"
+        );
+    }
+
+    #[test]
+    fn a_channel_name_is_saved_with_enter() {
+        let mut view = LogicView::new();
+
+        view.click_text("SCK");
+        // The marker and the name field both show the name; the field is the
+        // lower one.
+        let painted = view.frame(Vec::new());
+        let name_field = painted
+            .texts
+            .iter()
+            .filter(|(text, _)| text == "SCK")
+            .map(|(_, position)| *position)
+            .max_by(|a, b| a.y.total_cmp(&b.y))
+            .unwrap();
+        view.click(name_field);
+        view.frame(vec![egui::Event::Text("1".to_owned())]);
+        view.key(egui::Key::Enter);
+        view.frame(Vec::new());
+
+        assert_eq!(
+            view.settings.names[3], "1",
+            "focusing the field selects the old name, so typing replaces it"
+        );
+        assert!(!view.frame(Vec::new()).has("D3 settings"));
+    }
+
+    #[test]
+    fn the_timing_hint_follows_the_pointer_only_when_smart_timing_is_on() {
+        let mut view = LogicView::new();
+        let lane = view.frame(Vec::new()).center_of("CLK");
+        let over_the_lane = Pos2::new(450.0, lane.y);
+        let hover = |view: &mut LogicView| {
+            view.frame(vec![egui::Event::PointerMoved(over_the_lane)]);
+            view.frame(Vec::new()).shape_count
+        };
+
+        let without_hint = hover(&mut view);
+        view.smart_timing_enabled = true;
+        let with_hint = hover(&mut view);
+
+        assert!(
+            with_hint > without_hint,
+            "{with_hint} shapes with smart timing, {without_hint} without"
+        );
     }
 }
