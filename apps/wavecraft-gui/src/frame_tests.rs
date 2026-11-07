@@ -113,6 +113,40 @@ fn every_waveform_tab_paints_with_every_instrument_connected() {
 }
 
 #[test]
+fn the_scope_tools_paint_inside_the_central_area_in_both_states() {
+    let mut app = app_with_every_instrument();
+    let context = context();
+    for tab in [WaveformTab::Oscilloscope, WaveformTab::LogicAnalyzer] {
+        app.select_waveform_tab(tab);
+        for open in [true, false, true] {
+            app.scope_tools_panel_open = open;
+            run_frames(&mut app, &context, 3);
+            assert_eq!(app.active_waveform_tab, Some(tab));
+            assert_eq!(app.scope_tools_panel_open, open);
+            // The tools are part of the central area, not a window-level panel.
+            assert!(egui::containers::panel::PanelState::load(
+                &context,
+                egui::Id::new("scope_tools_fixed")
+            )
+            .is_none());
+        }
+    }
+}
+
+#[test]
+fn the_collapsed_scope_tools_state_survives_a_tab_change() {
+    let mut app = app_with_every_instrument();
+    let context = context();
+    app.select_waveform_tab(WaveformTab::Oscilloscope);
+    app.scope_tools_panel_open = false;
+    app.select_waveform_tab(WaveformTab::LogicAnalyzer);
+    run_frames(&mut app, &context, 2);
+    app.select_waveform_tab(WaveformTab::Oscilloscope);
+    run_frames(&mut app, &context, 2);
+    assert!(!app.scope_tools_panel_open);
+}
+
+#[test]
 fn the_first_available_view_is_chosen_when_none_is_active() {
     let mut app = app_with_every_instrument();
     let context = context();

@@ -336,6 +336,7 @@ struct WaveCraftApp {
     protocol_decode_cache: ProtocolDecodeCache,
     decoded_data_panel_open: bool,
     decoded_data_panel_width: f32,
+    scope_tools_panel_open: bool,
     scope_channel_colors: [Color32; 2],
     logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
     scope_channel_names: [String; 2],
@@ -451,6 +452,7 @@ impl WaveCraftApp {
             protocol_decode_cache: ProtocolDecodeCache::default(),
             decoded_data_panel_open: false,
             decoded_data_panel_width: 360.0,
+            scope_tools_panel_open: true,
             scope_channel_colors: SCOPE_COLORS,
             logic_channel_names: empty_logic_channel_names(),
             scope_channel_names: empty_scope_channel_names(),
@@ -568,8 +570,6 @@ impl WaveCraftApp {
         {
             self.logic_acquisition_mode = AcquisitionMode::Single;
         }
-
-        self.paint_scope_tools_panel(context, frame.trigger_controls_enabled);
 
         self.paint_status_bar(context);
 

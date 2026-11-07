@@ -3,7 +3,8 @@
 use crate::{
     combined_waveform_cards, egui, focus_logic_sample_range, format_radio_value,
     paint_decoded_data_panel, paint_logic, paint_scope, paint_scope_lissajous, scope_channel_label,
-    scope_channels_subtitle, toolbar_action_button, ui::frame_state::FrameState,
+    scope_channels_subtitle, scope_tools_panel_is_visible, toolbar_action_button,
+    ui::{frame_state::FrameState, scope_tools_panel::scope_tools_layout},
     waveform_card_fill, Color32, CombinedWaveformViewports, LogicChannelSettingsDraft,
     LogicMarkerSettings, LogicWaveformOptions, PendingSnapshot, ProtocolAnalyzerSettings,
     ProtocolDecodeCache, ProtocolDecodeOutcome, ProtocolDecodeSnapshot, RadioDataMode,
@@ -118,8 +119,9 @@ impl WaveformViewEdits {
 }
 
 impl WaveCraftApp {
-    /// Paints the waveform views, their decoded-data side panel, and the
-    /// empty-state messages, then starts a pending snapshot if requested.
+    /// Paints the waveform views with their side panels (decoded data, scope
+    /// tools) and the empty-state messages, then starts a pending snapshot if
+    /// requested.
     pub(crate) fn paint_central_panel(
         &mut self,
         context: &egui::Context,
@@ -150,20 +152,56 @@ impl WaveCraftApp {
         }
     }
 
-    /// Paints the view of the active waveform tab, or a hint when no instrument
-    /// is available, then writes back what the view edited.
+    /// Paints the view of the active waveform tab, with the scope tools beside
+    /// it when that tab uses them, or a hint when no instrument is available.
     fn paint_waveform_views(
         &mut self,
         ui: &mut egui::Ui,
         frame: &FrameState,
         state: &mut PanelState,
     ) {
-        let available_tabs = self.available_waveform_tabs();
-        if available_tabs.is_empty() {
+        if self.available_waveform_tabs().is_empty() {
             paint_connect_instrument_message(ui);
             return;
         }
+        if !scope_tools_panel_is_visible(self.active_waveform_tab) {
+            self.paint_active_waveform_view(ui, frame, state);
+            return;
+        }
 
+        let available = ui.available_rect_before_wrap();
+        let layout = scope_tools_layout(
+            available,
+            self.scope_tools_panel_open,
+            ui.spacing().item_spacing.x,
+        );
+        ui.advance_cursor_after_rect(available);
+        // The tools edit the scope settings the view copies when it starts
+        // painting, so they go first.
+        let mut tools_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("scope_tools")
+                .max_rect(layout.tools)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        self.paint_scope_tools_panel(&mut tools_ui, frame.trigger_controls_enabled);
+        let mut view_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("scope_view")
+                .max_rect(layout.views)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        self.paint_active_waveform_view(&mut view_ui, frame, state);
+    }
+
+    /// Paints the view of the active waveform tab, then writes back what the
+    /// view edited.
+    fn paint_active_waveform_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &FrameState,
+        state: &mut PanelState,
+    ) {
         let empty_waveforms = WaveformStore::default();
         let waveforms = self
             .active_capture_for_view()
