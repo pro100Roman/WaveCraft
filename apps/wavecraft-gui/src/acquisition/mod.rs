@@ -2,4 +2,5 @@
 //! they are painted.
 
 pub mod logic;
+pub mod radio;
 pub mod scope;
