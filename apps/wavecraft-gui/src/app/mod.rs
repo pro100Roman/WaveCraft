@@ -5,5 +5,7 @@ pub mod calibration;
 pub mod captures;
 pub mod devices;
 pub mod files;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod view_state;
 pub mod worker;

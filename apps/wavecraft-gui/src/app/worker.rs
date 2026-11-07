@@ -643,104 +643,11 @@ mod tests {
     use super::*;
     use crate::*;
 
+    use crate::app::test_support::{
+        app, completed_capture, ready, ready_with, request, scratch_directory,
+    };
     use std::sync::mpsc;
-    use std::time::Duration;
-    use wavecraft_core::{CaptureContext, CaptureError, DeviceDescriptor, DeviceId};
     use wavecraft_usb::{DeviceLocation, DSLOGIC_U3PRO16};
-
-    fn app() -> WaveCraftApp {
-        WaveCraftApp::with_settings(None, CaptureSettingsDocument::default())
-    }
-
-    /// A capture source that produces nothing and runs until it is stopped, so a
-    /// real `CaptureSession` can be built without hardware.
-    struct IdleSource {
-        descriptor: DeviceDescriptor,
-        /// Makes stopping the session fail, as a crashed capture worker would.
-        panic_when_stopped: bool,
-    }
-
-    impl CaptureSource for IdleSource {
-        fn descriptor(&self) -> DeviceDescriptor {
-            self.descriptor.clone()
-        }
-
-        fn run(self: Box<Self>, context: CaptureContext) -> Result<(), CaptureError> {
-            context.synchronize_start()?;
-            while !context.is_cancelled() {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            if self.panic_when_stopped {
-                panic!("the idle source was told to fail when stopped");
-            }
-            Ok(())
-        }
-    }
-
-    /// A started capture of one idle instrument of the given kind, as the
-    /// background thread would hand it to the UI.
-    fn ready(
-        app: &WaveCraftApp,
-        kind: InstrumentKind,
-        mode: AcquisitionMode,
-        target: CaptureTarget,
-    ) -> CaptureReady {
-        ready_with(app, &[kind], false, mode, target)
-    }
-
-    /// Like `ready`, with one idle instrument per kind; `panic_when_stopped`
-    /// makes stopping the session fail.
-    fn ready_with(
-        app: &WaveCraftApp,
-        kinds: &[InstrumentKind],
-        panic_when_stopped: bool,
-        mode: AcquisitionMode,
-        target: CaptureTarget,
-    ) -> CaptureReady {
-        let sources = kinds
-            .iter()
-            .enumerate()
-            .map(|(index, kind)| {
-                Box::new(IdleSource {
-                    descriptor: DeviceDescriptor {
-                        id: DeviceId::new(format!("fake:{index}")),
-                        name: format!("Fake instrument {index}"),
-                        kind: *kind,
-                    },
-                    panic_when_stopped,
-                }) as Box<dyn CaptureSource>
-            })
-            .collect();
-        let spectrum = || {
-            SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)
-                .expect("the spectrum processor accepts the GUI FFT length")
-        };
-        CaptureReady {
-            session: CaptureCoordinator::start(sources).expect("the idle sources start"),
-            mode,
-            target,
-            retain_protocol_history: false,
-            logic_config: app
-                .logic_settings
-                .capture_config()
-                .expect("the default logic settings are valid"),
-            scope_config: app
-                .scope_settings
-                .capture_config()
-                .expect("the default scope settings are valid"),
-            scope_trigger_controls: Vec::new(),
-            scope_calibration_controls: Vec::new(),
-            radio_runtime_control: None,
-            radio_spectrum: spectrum(),
-            radio_dsp: RadioDspWorker::start(spectrum(), Vec::new()),
-        }
-    }
-
-    /// Marks `target` as requested the way pressing Run/Single does.
-    fn request(app: &mut WaveCraftApp, target: CaptureTarget) {
-        app.capture_requests.insert(target);
-        app.requested_capture_target = Some(target);
-    }
 
     /// Queues `result` as the finished background operation and polls it.
     fn deliver(app: &mut WaveCraftApp, result: WorkerResult) {
@@ -748,29 +655,6 @@ mod tests {
         sender.send(result).unwrap();
         app.pending = Some(receiver);
         app.poll_worker();
-    }
-
-    fn scratch_directory(name: &str) -> PathBuf {
-        let directory =
-            std::env::temp_dir().join(format!("wavecraft-worker-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
-        directory
-    }
-
-    fn completed_capture(
-        app: &WaveCraftApp,
-        has_logic: bool,
-        has_scope: bool,
-        has_radio: bool,
-    ) -> CompletedCapture {
-        CompletedCapture {
-            waveforms: WaveformStore::default(),
-            protocol_decode: ProtocolCaptureDecoder::new(&app.protocol_analyzer.analyzers),
-            has_logic,
-            has_scope,
-            has_radio,
-        }
     }
 
     fn loaded_recording(

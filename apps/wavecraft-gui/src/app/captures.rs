@@ -882,3 +882,861 @@ impl WaveCraftApp {
             .and_then(|target| self.capture_for_target(target))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_support::{
+        app, poll_until, poll_until_finished, ready_scripted, request, scratch_directory, Script,
+        SourceEnding,
+    };
+    use crate::*;
+
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use wavecraft_core::{Iq8, IqBatch, LogicBatch};
+
+    fn logic_batch(app: &WaveCraftApp, samples: Vec<u32>) -> CaptureBatch {
+        let sample_rate_hz = app
+            .logic_settings
+            .capture_config()
+            .expect("the default logic settings are valid")
+            .sample_rate_hz();
+        CaptureBatch::Logic(LogicBatch {
+            sample_rate_hz,
+            channel_count: 16,
+            samples,
+        })
+    }
+
+    /// Starts a capture of one fake logic analyzer that follows `script`.
+    fn start_logic_capture(app: &mut WaveCraftApp, mode: AcquisitionMode, script: Script) {
+        request(app, CaptureTarget::LogicAnalyzer);
+        let started = ready_scripted(
+            app,
+            vec![(InstrumentKind::LogicAnalyzer, script)],
+            mode,
+            CaptureTarget::LogicAnalyzer,
+        );
+        app.handle_capture_ready(started);
+        assert_eq!(app.captures.len(), 1, "{:?}", app.last_error);
+    }
+
+    fn finishing_with(app: &WaveCraftApp, samples: Vec<u32>) -> Script {
+        Script::sending(vec![logic_batch(app, samples)], SourceEnding::Finish)
+    }
+
+    fn failing_with(message: &str) -> Script {
+        Script::sending(Vec::new(), SourceEnding::Fail(message.to_owned()))
+    }
+
+    fn record_to(app: &mut WaveCraftApp, path: &Path) {
+        app.record_capture = true;
+        app.recording_path = path.to_string_lossy().into_owned();
+    }
+
+    fn recorded_completion(app: &WaveCraftApp, path: &Path) -> CompletionStatus {
+        load_gui_recording(path, &app.protocol_analyzer.analyzers)
+            .expect("the recording was finished")
+            .completion
+    }
+
+    #[test]
+    fn a_capture_whose_source_finishes_is_completed_and_stored() {
+        let mut app = app();
+        let script = finishing_with(&app, vec![0, 1, 2, 3]);
+        start_logic_capture(&mut app, AcquisitionMode::Single, script);
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(app.status, "Capture complete");
+        assert!(app.last_error.is_none());
+        let completed = app
+            .completed_capture_for_target(CaptureTarget::LogicAnalyzer)
+            .expect("the finished capture is kept for display");
+        assert!(completed.has_logic && !completed.has_scope && !completed.has_radio);
+        assert_eq!(completed.waveforms.logic_sample_count, 4);
+        assert!(!app.capture_is_requested(CaptureTarget::LogicAnalyzer));
+        assert!(app.queued_capture_rearms.is_empty());
+        assert!(app.scheduled_repetitive_capture.is_none());
+    }
+
+    #[test]
+    fn a_running_capture_stays_active_between_polls() {
+        let mut app = app();
+        start_logic_capture(&mut app, AcquisitionMode::Run, Script::idle());
+        let status = app.status.clone();
+
+        for _ in 0..5 {
+            app.poll_capture_target(CaptureTarget::LogicAnalyzer);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(app.captures.len(), 1);
+        assert!(app.captures[0].stopped.is_empty());
+        assert_eq!(app.status, status);
+    }
+
+    #[test]
+    fn polling_a_target_without_a_capture_does_nothing() {
+        let mut app = app();
+        let status = app.status.clone();
+
+        app.poll_capture_target(CaptureTarget::Oscilloscope);
+        app.poll_capture();
+
+        assert_eq!(app.status, status);
+        assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn poll_capture_polls_every_running_capture() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::LogicAnalyzer);
+        let logic = ready_scripted(
+            &app,
+            vec![(
+                InstrumentKind::LogicAnalyzer,
+                finishing_with(&app, vec![1, 2]),
+            )],
+            AcquisitionMode::Single,
+            CaptureTarget::LogicAnalyzer,
+        );
+        app.handle_capture_ready(logic);
+        request(&mut app, CaptureTarget::Oscilloscope);
+        let scope = ready_scripted(
+            &app,
+            vec![(
+                InstrumentKind::Oscilloscope,
+                Script::sending(Vec::new(), SourceEnding::Finish),
+            )],
+            AcquisitionMode::Single,
+            CaptureTarget::Oscilloscope,
+        );
+        app.handle_capture_ready(scope);
+        assert_eq!(app.captures.len(), 2);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.captures.is_empty() {
+            assert!(Instant::now() < deadline, "{:?}", app.status);
+            app.poll_capture();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(app
+            .completed_capture_for_target(CaptureTarget::LogicAnalyzer)
+            .is_some());
+        assert!(app
+            .completed_capture_for_target(CaptureTarget::Oscilloscope)
+            .is_some());
+    }
+
+    #[test]
+    fn a_run_capture_that_finishes_starts_the_next_one() {
+        let mut app = app();
+        let script = finishing_with(&app, vec![1]);
+        start_logic_capture(&mut app, AcquisitionMode::Run, script);
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        // The next start goes through begin_capture, which needs a selected
+        // DSLogic and so reports that none is connected here.
+        assert!(app
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("DSLogic")));
+        assert!(app.capture_is_requested(CaptureTarget::LogicAnalyzer));
+    }
+
+    #[test]
+    fn a_run_capture_that_finishes_while_a_worker_is_busy_queues_the_next_start_once() {
+        let mut app = app();
+        let (_sender, receiver) = mpsc::channel::<WorkerResult>();
+        app.pending = Some(receiver);
+        let script = finishing_with(&app, vec![1]);
+        start_logic_capture(&mut app, AcquisitionMode::Run, script);
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(
+            app.queued_capture_rearms,
+            vec![(AcquisitionMode::Run, CaptureTarget::LogicAnalyzer)]
+        );
+        assert!(app.last_error.is_none());
+
+        // A start that is already queued for the target is not queued twice.
+        let mut app = crate::app::test_support::app();
+        let (_sender, receiver) = mpsc::channel::<WorkerResult>();
+        app.pending = Some(receiver);
+        app.queued_capture_rearms
+            .push((AcquisitionMode::Run, CaptureTarget::LogicAnalyzer));
+        let script = finishing_with(&app, vec![1]);
+        start_logic_capture(&mut app, AcquisitionMode::Run, script);
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(app.queued_capture_rearms.len(), 1);
+    }
+
+    #[test]
+    fn a_single_capture_that_finishes_is_not_started_again() {
+        let mut app = app();
+        app.pending = None;
+        let script = finishing_with(&app, vec![1]);
+        start_logic_capture(&mut app, AcquisitionMode::Single, script);
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        assert!(app.last_error.is_none());
+        assert!(app.queued_capture_rearms.is_empty());
+        assert!(!app.capture_is_requested(CaptureTarget::LogicAnalyzer));
+    }
+
+    #[test]
+    fn a_repetitive_capture_schedules_the_next_acquisition_after_the_interval() {
+        for (operation_mode, expected) in [
+            (
+                DsLogicOperationMode::Buffer,
+                "Repetitive · next acquisition in 2.0 s",
+            ),
+            (
+                DsLogicOperationMode::Stream,
+                "Repetitive · next acquisition in 0.1 s",
+            ),
+        ] {
+            let mut app = app();
+            app.logic_settings.operation_mode = operation_mode;
+            app.repetitive_interval_seconds = 2.0;
+            let script = finishing_with(&app, vec![1]);
+            start_logic_capture(&mut app, AcquisitionMode::Repetitive, script);
+
+            poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+            assert_eq!(app.status, expected, "{operation_mode:?}");
+            let scheduled = app
+                .scheduled_repetitive_capture
+                .expect("the next start is scheduled");
+            assert_eq!(scheduled.target, CaptureTarget::LogicAnalyzer);
+            assert!(scheduled.due > Instant::now());
+            assert!(app.last_error.is_none());
+        }
+    }
+
+    #[test]
+    fn a_failing_source_ends_the_capture_with_its_error_and_no_restart() {
+        let mut app = app();
+        start_logic_capture(&mut app, AcquisitionMode::Run, failing_with("boom"));
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(app.last_error.as_deref(), Some("fake:0: boom"));
+        assert!(app.queued_capture_rearms.is_empty());
+        assert!(!app.capture_is_requested(CaptureTarget::LogicAnalyzer));
+        assert!(app
+            .completed_capture_for_target(CaptureTarget::LogicAnalyzer)
+            .is_some());
+    }
+
+    #[test]
+    fn a_finished_capture_names_the_file_it_was_recorded_to() {
+        let directory = scratch_directory("poll-recorded");
+        let path = directory.join("capture.dsv");
+        let mut app = app();
+        record_to(&mut app, &path);
+        let script = finishing_with(&app, vec![5, 6, 7]);
+        start_logic_capture(&mut app, AcquisitionMode::Single, script);
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(
+            app.status,
+            format!("Capture complete · recording saved to {}", path.display())
+        );
+        assert_eq!(recorded_completion(&app, &path), CompletionStatus::Complete);
+        assert!(!app.record_capture);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_failing_source_marks_the_recording_as_failed() {
+        let directory = scratch_directory("poll-failed-recording");
+        let path = directory.join("capture.dsv");
+        let mut app = app();
+        record_to(&mut app, &path);
+        start_logic_capture(&mut app, AcquisitionMode::Single, failing_with("boom"));
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(app.last_error.as_deref(), Some("fake:0: boom"));
+        assert_eq!(recorded_completion(&app, &path), CompletionStatus::Failed);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_capture_is_complete_only_when_every_instrument_has_stopped() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::Combined);
+        let started = ready_scripted(
+            &app,
+            vec![
+                (InstrumentKind::LogicAnalyzer, finishing_with(&app, vec![1])),
+                (InstrumentKind::Oscilloscope, Script::idle()),
+            ],
+            AcquisitionMode::Single,
+            CaptureTarget::Combined,
+        );
+        app.handle_capture_ready(started);
+
+        poll_until(&mut app, CaptureTarget::Combined, |app| {
+            app.captures
+                .first()
+                .is_some_and(|capture| capture.stopped.len() == 1)
+        });
+        for _ in 0..3 {
+            app.poll_capture_target(CaptureTarget::Combined);
+        }
+
+        assert_eq!(app.captures.len(), 1, "one instrument is still running");
+
+        // With both instruments stopping, the capture completes.
+        let mut app = crate::app::test_support::app();
+        request(&mut app, CaptureTarget::Combined);
+        let started = ready_scripted(
+            &app,
+            vec![
+                (InstrumentKind::LogicAnalyzer, finishing_with(&app, vec![1])),
+                (
+                    InstrumentKind::Oscilloscope,
+                    Script::sending(Vec::new(), SourceEnding::Finish),
+                ),
+            ],
+            AcquisitionMode::Single,
+            CaptureTarget::Combined,
+        );
+        app.handle_capture_ready(started);
+
+        poll_until_finished(&mut app, CaptureTarget::Combined);
+
+        assert_eq!(app.status, "Capture complete");
+        let completed = app
+            .completed_capture_for_target(CaptureTarget::Combined)
+            .expect("the combined capture is kept");
+        assert!(completed.has_logic && completed.has_scope);
+    }
+
+    #[test]
+    fn a_capture_is_read_in_bounded_batches_of_events() {
+        let mut app = app();
+        let batches = (0..20)
+            .map(|index| logic_batch(&app, vec![index]))
+            .collect();
+        start_logic_capture(
+            &mut app,
+            AcquisitionMode::Single,
+            Script::sending(batches, SourceEnding::Finish),
+        );
+        // Let the source send all of its events before the first poll.
+        std::thread::sleep(Duration::from_millis(100));
+
+        app.poll_capture_target(CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(
+            app.captures.len(),
+            1,
+            "{MAX_CAPTURE_EVENTS_PER_POLL} events per poll cannot reach the end of 21 events"
+        );
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        let completed = app
+            .completed_capture_for_target(CaptureTarget::LogicAnalyzer)
+            .unwrap();
+        assert_eq!(completed.waveforms.logic_sample_count, 20);
+    }
+
+    #[test]
+    fn a_display_kept_until_complete_is_replaced_only_by_a_capture_that_completes() {
+        // (mode, how the source ends, whether the finished capture replaces the
+        // one on display)
+        for (mode, fails, replaced) in [
+            (AcquisitionMode::Run, false, true),
+            (AcquisitionMode::Run, true, false),
+            (AcquisitionMode::Single, true, true),
+        ] {
+            let mut app = app();
+            let mut displayed = completed_capture_with_samples(&app, 42);
+            displayed.has_logic = true;
+            app.set_completed_capture_for_target(CaptureTarget::LogicAnalyzer, displayed);
+            let script = if fails {
+                failing_with("boom")
+            } else {
+                finishing_with(&app, vec![1, 2, 3, 4])
+            };
+            start_logic_capture(&mut app, mode, script);
+
+            poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+            let count = app
+                .completed_capture_for_target(CaptureTarget::LogicAnalyzer)
+                .map(|capture| capture.waveforms.logic_sample_count);
+            let expected = if replaced {
+                if fails {
+                    Some(0)
+                } else {
+                    Some(4)
+                }
+            } else {
+                Some(42)
+            };
+            assert_eq!(count, expected, "{mode:?}, fails = {fails}");
+        }
+    }
+
+    fn completed_capture_with_samples(app: &WaveCraftApp, samples: usize) -> CompletedCapture {
+        let mut capture = crate::app::test_support::completed_capture(app, true, false, false);
+        capture.waveforms.logic_sample_count = samples as _;
+        capture
+    }
+
+    #[test]
+    fn a_scope_frontend_change_restarts_the_finished_capture() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::Oscilloscope);
+        let started = ready_scripted(
+            &app,
+            vec![(
+                InstrumentKind::Oscilloscope,
+                Script::sending(Vec::new(), SourceEnding::Finish),
+            )],
+            AcquisitionMode::Run,
+            CaptureTarget::Oscilloscope,
+        );
+        app.handle_capture_ready(started);
+        app.scope_capture_restart_requested = true;
+
+        poll_until_finished(&mut app, CaptureTarget::Oscilloscope);
+
+        assert!(!app.scope_capture_restart_requested);
+        assert_eq!(app.status, "Reconfiguring oscilloscope frontend…");
+        // The restart goes through begin_capture, which needs a selected DSCope
+        // and so reports that none is connected here.
+        assert!(app
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("DSCope")));
+        assert!(app.capture_is_requested(CaptureTarget::Oscilloscope));
+    }
+
+    #[test]
+    fn a_scope_frontend_change_does_not_restart_a_capture_nobody_requested() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::LogicAnalyzer);
+        let script = finishing_with(&app, vec![1]);
+        let started = ready_scripted(
+            &app,
+            vec![(InstrumentKind::LogicAnalyzer, script)],
+            AcquisitionMode::Single,
+            CaptureTarget::LogicAnalyzer,
+        );
+        app.handle_capture_ready(started);
+        app.scope_capture_restart_requested = true;
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        // The flag is consumed, but a logic capture is not restarted for it.
+        assert!(!app.scope_capture_restart_requested);
+        assert_eq!(app.status, "Capture complete");
+    }
+
+    #[test]
+    fn a_requested_manual_calibration_load_starts_after_the_capture_finishes() {
+        let mut app = app();
+        app.manual_calibration_load_requested = true;
+        let script = finishing_with(&app, vec![1]);
+        start_logic_capture(&mut app, AcquisitionMode::Single, script);
+        let status_while_running = app.status.clone();
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        assert!(!app.manual_calibration_load_requested);
+        // The calibration load takes over from the capture-complete message (it
+        // does nothing here without a DSCope), and the request is left as is.
+        assert_eq!(app.status, status_while_running);
+        assert!(app.capture_is_requested(CaptureTarget::LogicAnalyzer));
+    }
+
+    #[test]
+    fn a_failed_capture_drops_the_requested_manual_calibration_load() {
+        let mut app = app();
+        app.manual_calibration_load_requested = true;
+        start_logic_capture(&mut app, AcquisitionMode::Single, failing_with("boom"));
+
+        poll_until_finished(&mut app, CaptureTarget::LogicAnalyzer);
+
+        assert!(!app.manual_calibration_load_requested);
+        assert_eq!(app.last_error.as_deref(), Some("fake:0: boom"));
+        assert_eq!(app.status, "Operation failed");
+    }
+
+    #[test]
+    fn protocol_analyzers_edited_during_a_capture_reach_its_decoder() {
+        let mut app = app();
+        start_logic_capture(&mut app, AcquisitionMode::Run, Script::idle());
+        assert!(app.captures[0].protocol_analyzers.is_empty());
+        let analyzers = vec![ProtocolAnalyzerInstance {
+            instance_id: 1,
+            protocol_id: "1:uart",
+            channel_mappings: vec![Some(0)],
+            data_format: ProtocolDataFormat::Ascii,
+            custom_protocol: None,
+        }];
+        app.protocol_analyzer.analyzers = analyzers.clone();
+
+        app.poll_capture_target(CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(app.captures[0].protocol_analyzers, analyzers);
+        assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn an_rf_trigger_that_cannot_be_updated_ends_the_capture_with_an_error() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::RadioReceiver);
+        app.radio_settings.trigger_enabled = true;
+        let batch = CaptureBatch::Iq(IqBatch {
+            sample_rate_hz: app.radio_settings.capture.sample_rate_hz,
+            center_frequency_hz: app.radio_settings.capture.center_frequency_hz,
+            first_sample_index: 0,
+            discontinuity: false,
+            samples: vec![Iq8 { i: 1, q: 1 }; 16],
+        });
+        let started = ready_scripted(
+            &app,
+            vec![(
+                InstrumentKind::RadioReceiver,
+                Script::sending(vec![batch], SourceEnding::Idle),
+            )],
+            AcquisitionMode::Single,
+            CaptureTarget::RadioReceiver,
+        );
+        app.handle_capture_ready(started);
+        assert!(app.captures[0].radio_trigger.is_some());
+        // The user edits the sample rate into something the trigger rejects.
+        app.radio_settings.capture.sample_rate_hz = 0;
+
+        poll_until_finished(&mut app, CaptureTarget::RadioReceiver);
+
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some("RF trigger update failed: RF sample rate must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn an_rf_trigger_that_fires_completes_the_capture_with_the_triggered_samples() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::RadioReceiver);
+        app.radio_settings.trigger_enabled = true;
+        app.radio_settings.trigger_level_dbfs_tenths = -1_000;
+        app.radio_settings.trigger_posttrigger_micros = 1;
+        // A tone at a quarter of the sample rate, far above the -100 dBFS level.
+        let tone = (0..2 * RADIO_SPECTRUM_FFT_LENGTH)
+            .map(|index| match index % 4 {
+                0 => Iq8 { i: 100, q: 0 },
+                1 => Iq8 { i: 0, q: 100 },
+                2 => Iq8 { i: -100, q: 0 },
+                _ => Iq8 { i: 0, q: -100 },
+            })
+            .collect();
+        let batch = CaptureBatch::Iq(IqBatch {
+            sample_rate_hz: app.radio_settings.capture.sample_rate_hz,
+            center_frequency_hz: app.radio_settings.capture.center_frequency_hz,
+            first_sample_index: 0,
+            discontinuity: false,
+            samples: tone,
+        });
+        let started = ready_scripted(
+            &app,
+            vec![(
+                InstrumentKind::RadioReceiver,
+                Script::sending(vec![batch], SourceEnding::Idle),
+            )],
+            AcquisitionMode::Single,
+            CaptureTarget::RadioReceiver,
+        );
+        app.handle_capture_ready(started);
+        assert!(app.captures[0].radio_trigger.is_some());
+
+        poll_until_finished(&mut app, CaptureTarget::RadioReceiver);
+
+        assert_eq!(app.status, "RF triggered capture complete");
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+        let completed = app
+            .completed_capture_for_target(CaptureTarget::RadioReceiver)
+            .expect("the triggered capture is kept");
+        assert!(completed.has_radio);
+        assert!(
+            completed.waveforms.radio.newest_spectrum().is_some(),
+            "the spectrum seen while the trigger was armed is displayed"
+        );
+    }
+
+    #[test]
+    fn an_armed_rf_trigger_shows_the_spectrum_while_it_waits() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::RadioReceiver);
+        app.radio_settings.trigger_enabled = true;
+        app.radio_settings.trigger_level_dbfs_tenths = 0;
+        // Silence stays below a 0 dBFS trigger level.
+        let silence = CaptureBatch::Iq(IqBatch {
+            sample_rate_hz: app.radio_settings.capture.sample_rate_hz,
+            center_frequency_hz: app.radio_settings.capture.center_frequency_hz,
+            first_sample_index: 0,
+            discontinuity: false,
+            samples: vec![Iq8 { i: 0, q: 0 }; 2 * RADIO_SPECTRUM_FFT_LENGTH],
+        });
+        let started = ready_scripted(
+            &app,
+            vec![(
+                InstrumentKind::RadioReceiver,
+                Script::sending(vec![silence], SourceEnding::Idle),
+            )],
+            AcquisitionMode::Single,
+            CaptureTarget::RadioReceiver,
+        );
+        app.handle_capture_ready(started);
+
+        poll_until(&mut app, CaptureTarget::RadioReceiver, |app| {
+            app.captures[0].waveforms.radio.newest_spectrum().is_some()
+        });
+
+        assert_eq!(app.captures.len(), 1, "the trigger is still waiting");
+        assert!(app.captures[0]
+            .radio_trigger
+            .as_ref()
+            .is_some_and(RadioSingleTrigger::is_armed));
+    }
+
+    #[test]
+    fn a_capture_that_also_fails_to_stop_reports_both_errors() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::Combined);
+        let started = ready_scripted(
+            &app,
+            vec![
+                (InstrumentKind::LogicAnalyzer, failing_with("boom")),
+                (
+                    InstrumentKind::Oscilloscope,
+                    Script {
+                        panic_when_stopped: true,
+                        ..Script::idle()
+                    },
+                ),
+            ],
+            AcquisitionMode::Single,
+            CaptureTarget::Combined,
+        );
+        app.handle_capture_ready(started);
+
+        poll_until_finished(&mut app, CaptureTarget::Combined);
+
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some("fake:0: boom; failed to stop capture: a capture worker panicked")
+        );
+    }
+
+    /// Starts a capture of one fake oscilloscope that finishes at once, with a
+    /// scope frontend change waiting to be applied.
+    fn start_scope_capture_awaiting_restart(
+        app: &mut WaveCraftApp,
+        mode: AcquisitionMode,
+        script: Script,
+    ) {
+        request(app, CaptureTarget::Oscilloscope);
+        let started = ready_scripted(
+            app,
+            vec![(InstrumentKind::Oscilloscope, script)],
+            mode,
+            CaptureTarget::Oscilloscope,
+        );
+        app.handle_capture_ready(started);
+        app.scope_capture_restart_requested = true;
+    }
+
+    #[test]
+    fn a_scope_frontend_restart_keeps_a_display_that_was_to_be_kept_until_complete() {
+        for (displayed, kept) in [(true, true), (false, false)] {
+            let mut app = app();
+            if displayed {
+                app.set_completed_capture_for_target(
+                    CaptureTarget::Oscilloscope,
+                    completed_capture_with_samples(&app, 42),
+                );
+            }
+            start_scope_capture_awaiting_restart(
+                &mut app,
+                AcquisitionMode::Run,
+                Script::sending(Vec::new(), SourceEnding::Finish),
+            );
+
+            poll_until_finished(&mut app, CaptureTarget::Oscilloscope);
+
+            let count = app
+                .completed_capture_for_target(CaptureTarget::Oscilloscope)
+                .map(|capture| capture.waveforms.logic_sample_count);
+            assert_eq!(
+                count,
+                Some(if kept { 42 } else { 0 }),
+                "displayed = {displayed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_capture_is_not_restarted_for_a_scope_frontend_change() {
+        let mut app = app();
+        start_scope_capture_awaiting_restart(&mut app, AcquisitionMode::Run, failing_with("boom"));
+
+        poll_until_finished(&mut app, CaptureTarget::Oscilloscope);
+
+        // A restart would have gone through begin_capture and replaced the error
+        // with the missing-DSCope message.
+        assert_eq!(app.last_error.as_deref(), Some("fake:0: boom"));
+    }
+
+    #[test]
+    fn a_repetitive_capture_restarts_at_once_for_a_scope_frontend_change() {
+        let mut app = app();
+        start_scope_capture_awaiting_restart(
+            &mut app,
+            AcquisitionMode::Repetitive,
+            Script::sending(Vec::new(), SourceEnding::Finish),
+        );
+
+        poll_until_finished(&mut app, CaptureTarget::Oscilloscope);
+
+        assert!(app.scheduled_repetitive_capture.is_none());
+        assert_eq!(app.status, "Reconfiguring oscilloscope frontend…");
+        assert!(app
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("DSCope")));
+    }
+
+    #[test]
+    fn stopping_a_capture_stores_it_and_names_the_recording() {
+        let directory = scratch_directory("stop-recorded");
+        let path = directory.join("capture.dsv");
+        let mut app = app();
+        record_to(&mut app, &path);
+        let script = Script::sending(vec![logic_batch(&app, vec![9, 9])], SourceEnding::Idle);
+        start_logic_capture(&mut app, AcquisitionMode::Run, script);
+
+        app.stop_capture(CaptureTarget::LogicAnalyzer);
+
+        assert!(app.captures.is_empty());
+        assert_eq!(
+            app.status,
+            format!("Capture stopped · recording saved to {}", path.display())
+        );
+        assert!(app.last_error.is_none());
+        assert!(!app.capture_is_requested(CaptureTarget::LogicAnalyzer));
+        assert!(app
+            .completed_capture_for_target(CaptureTarget::LogicAnalyzer)
+            .is_some());
+        assert_eq!(
+            recorded_completion(&app, &path),
+            CompletionStatus::Cancelled
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stopping_a_capture_without_a_recording_says_only_that_it_stopped() {
+        let mut app = app();
+        start_logic_capture(&mut app, AcquisitionMode::Run, Script::idle());
+
+        app.stop_capture(CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(app.status, "Capture stopped");
+        assert!(!app.record_capture && !app.record_decoded_data);
+    }
+
+    #[test]
+    fn stopping_a_capture_that_fails_to_stop_reports_the_error_and_fails_the_recording() {
+        let directory = scratch_directory("stop-failure");
+        let path = directory.join("capture.dsv");
+        let mut app = app();
+        record_to(&mut app, &path);
+        request(&mut app, CaptureTarget::LogicAnalyzer);
+        let started = ready_scripted(
+            &app,
+            vec![(
+                InstrumentKind::LogicAnalyzer,
+                Script {
+                    panic_when_stopped: true,
+                    ..Script::idle()
+                },
+            )],
+            AcquisitionMode::Run,
+            CaptureTarget::LogicAnalyzer,
+        );
+        app.handle_capture_ready(started);
+
+        app.stop_capture(CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(app.last_error.as_deref(), Some("a capture worker panicked"));
+        assert_eq!(recorded_completion(&app, &path), CompletionStatus::Failed);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stopping_a_capture_cancels_its_queued_and_scheduled_restarts() {
+        let mut app = app();
+        start_logic_capture(&mut app, AcquisitionMode::Run, Script::idle());
+        app.queued_capture_rearms
+            .push((AcquisitionMode::Run, CaptureTarget::LogicAnalyzer));
+        app.queued_capture_rearms
+            .push((AcquisitionMode::Run, CaptureTarget::Oscilloscope));
+        app.scheduled_repetitive_capture = Some(ScheduledRepetitiveCapture {
+            due: Instant::now(),
+            target: CaptureTarget::LogicAnalyzer,
+        });
+
+        app.stop_capture(CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(
+            app.queued_capture_rearms,
+            vec![(AcquisitionMode::Run, CaptureTarget::Oscilloscope)]
+        );
+        assert!(app.scheduled_repetitive_capture.is_none());
+    }
+
+    #[test]
+    fn stopping_keeps_the_displayed_capture_when_the_new_one_had_not_replaced_it_yet() {
+        let mut app = app();
+        app.set_completed_capture_for_target(
+            CaptureTarget::LogicAnalyzer,
+            completed_capture_with_samples(&app, 42),
+        );
+        start_logic_capture(&mut app, AcquisitionMode::Run, Script::idle());
+
+        app.stop_capture(CaptureTarget::LogicAnalyzer);
+
+        let displayed = app
+            .completed_capture_for_target(CaptureTarget::LogicAnalyzer)
+            .unwrap();
+        assert_eq!(displayed.waveforms.logic_sample_count, 42);
+    }
+
+    #[test]
+    fn stopping_a_target_that_is_not_running_changes_nothing() {
+        let mut app = app();
+        app.status = "unchanged".to_owned();
+
+        app.stop_capture(CaptureTarget::LogicAnalyzer);
+
+        assert_eq!(app.status, "unchanged");
+    }
+}
