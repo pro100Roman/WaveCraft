@@ -1,3 +1,6 @@
+// Integration tests may unwrap; the library lint exists for production code.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::time::{Duration, Instant};
 use wavecraft_core::{CaptureBatch, CaptureCoordinator, CaptureEvent};
 use wavecraft_hackrf::{HackRfAdapter, HackRfRuntimeSettings};
