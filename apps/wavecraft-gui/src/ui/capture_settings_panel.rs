@@ -1075,7 +1075,7 @@ pub(crate) fn paint_logic_marker_settings(
                 } else if ui
                     .add_enabled(
                         has_waveform && settings.markers.len() < LOGIC_MARKER_LIMIT,
-                        egui::Button::new("+ Add"),
+                        egui::Button::new("Add"),
                     )
                     .on_disabled_hover_selectable_text(if has_waveform {
                         "The maximum of 20 markers has been reached"

@@ -21,7 +21,7 @@ pub(crate) fn paint_protocol_analyzer_settings(
                 let add_label = if settings.picker_open {
                     "Close list"
                 } else {
-                    "+ Add protocol"
+                    "Add"
                 };
                 if ui.button(add_label).clicked() {
                     settings.picker_open = !settings.picker_open;

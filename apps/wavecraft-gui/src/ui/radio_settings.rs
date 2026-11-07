@@ -1197,10 +1197,7 @@ pub(crate) fn paint_radio_analyzer_channels(
     if ui
         .add_enabled(
             controls_enabled && settings.channels.len() < MAX_RADIO_ANALYZER_CHANNELS,
-            egui::Button::new(format!(
-                "+ Add channel ({}/{MAX_RADIO_ANALYZER_CHANNELS})",
-                settings.channels.len()
-            )),
+            egui::Button::new("Add"),
         )
         .clicked()
     {
