@@ -1,9 +1,12 @@
 use crate::ds_driver_util::{
     capture_error, combine_results, push_u16, push_u32, read_u16, read_u32,
 };
-use crate::transport::{QueuedBulkRead, QueuedBulkReadOutcome};
+use crate::queued_reads::{
+    abandon_reads, abandon_reads_after_error, require_queued_data, service_usb_events,
+    with_queued_reads, QueuedReads,
+};
+use crate::transport::QueuedBulkReadOutcome;
 use crate::{DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbSpeedClass, DSCOPE_U3P100};
-use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 use wavecraft_core::{
@@ -2019,54 +2022,41 @@ fn read_calibration_measurement(
     on_frame: &mut dyn FnMut(DsCopeCalibrationFrame),
 ) -> Result<ScopeMeasurement, CaptureError> {
     let payload_bytes = calibration_payload_bytes(config);
-    let mut header_read = session
+    let header_read = session
         .queue_bulk_read(TRIGGER_HEADER_BYTES)
         .map_err(capture_error)?;
-    let mut payload_read = match session.queue_bulk_read(payload_bytes) {
+    let payload_read = match session.queue_bulk_read(payload_bytes) {
         Ok(read) => read,
         Err(error) => {
-            let _ = header_read.cancel();
-            while !header_read.is_complete() {
-                session
-                    .handle_usb_events(Duration::from_millis(5))
-                    .map_err(capture_error)?;
-            }
-            let _ = header_read.finish();
-            return Err(capture_error(error));
+            return Err(abandon_reads_after_error(
+                session,
+                capture_error(error),
+                vec![header_read],
+            ));
         }
     };
     if let Err(error) = session.start_capture() {
-        let _ = header_read.cancel();
-        let _ = payload_read.cancel();
-        drain_reads(session, &header_read, &payload_read)?;
-        let _ = header_read.finish();
-        let _ = payload_read.finish();
-        return Err(capture_error(error));
+        return Err(abandon_reads_after_error(
+            session,
+            capture_error(error),
+            vec![header_read, payload_read],
+        ));
     }
     let mut deadline = Instant::now() + CAPTURE_COMPLETION_GRACE;
     while !header_read.is_complete() || !payload_read.is_complete() {
         if Instant::now() >= deadline {
             let _ = session.force_capture_ready();
-            let _ = header_read.cancel();
-            let _ = payload_read.cancel();
-            while !header_read.is_complete() || !payload_read.is_complete() {
-                session
-                    .handle_usb_events(Duration::from_millis(5))
-                    .map_err(capture_error)?;
-            }
-            let _ = header_read.finish();
-            let _ = payload_read.finish();
-            return Err(CaptureError::new(
-                "timed out waiting for a DSCope auto-calibration capture",
+            return Err(abandon_reads_after_error(
+                session,
+                CaptureError::new("timed out waiting for a DSCope auto-calibration capture"),
+                vec![header_read, payload_read],
             ));
         }
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
+        service_usb_events(session)?;
     }
     let header = require_queued_data(
         header_read.finish().map_err(capture_error)?,
-        "trigger header",
+        "DSCope trigger header",
     )?;
     let mut payload =
         require_scope_payload(payload_read.finish().map_err(capture_error)?, payload_bytes)?;
@@ -2104,26 +2094,21 @@ fn read_calibration_measurement(
             ));
         }
 
-        let mut next_payload_read = session
+        let next_payload_read = session
             .queue_bulk_read(payload_bytes)
             .map_err(capture_error)?;
         while !next_payload_read.is_complete() {
             if Instant::now() >= deadline {
                 let _ = session.force_capture_ready();
-                next_payload_read.cancel().map_err(capture_error)?;
-                while !next_payload_read.is_complete() {
-                    session
-                        .handle_usb_events(Duration::from_millis(5))
-                        .map_err(capture_error)?;
-                }
-                let _ = next_payload_read.finish();
-                return Err(CaptureError::new(
-                    "timed out waiting for a valid DSCope auto-calibration frame",
+                return Err(abandon_reads_after_error(
+                    session,
+                    CaptureError::new(
+                        "timed out waiting for a valid DSCope auto-calibration frame",
+                    ),
+                    vec![next_payload_read],
                 ));
             }
-            session
-                .handle_usb_events(Duration::from_millis(5))
-                .map_err(capture_error)?;
+            service_usb_events(session)?;
         }
         payload = require_scope_payload(
             next_payload_read.finish().map_err(capture_error)?,
@@ -2270,27 +2255,19 @@ fn read_continuous_capture(
     runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
     runtime_calibration_receiver: Option<&Receiver<DsCopeCalibrationValues>>,
 ) -> Result<(), CaptureError> {
-    let mut header_read = None;
-    let mut payload_reads = VecDeque::new();
-    let capture_result = read_continuous_capture_inner(
-        session,
-        config,
-        calibration,
-        context,
-        runtime_trigger_receiver,
-        runtime_calibration_receiver,
-        &mut header_read,
-        &mut payload_reads,
-    );
-    let cleanup_result = cancel_pending_scope_reads(session, &mut header_read, &mut payload_reads);
-    combine_results(
-        capture_result,
-        cleanup_result,
-        "cancel queued continuous scope reads",
-    )
+    with_queued_reads(session, "cancel queued continuous scope reads", |reads| {
+        read_continuous_capture_inner(
+            session,
+            config,
+            calibration,
+            context,
+            runtime_trigger_receiver,
+            runtime_calibration_receiver,
+            reads,
+        )
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn read_continuous_capture_inner(
     session: &UsbDeviceSession,
     config: &mut DsCopeCaptureConfig,
@@ -2298,20 +2275,20 @@ fn read_continuous_capture_inner(
     context: &CaptureContext,
     runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
     runtime_calibration_receiver: Option<&Receiver<DsCopeCalibrationValues>>,
-    header_read: &mut Option<QueuedBulkRead>,
-    payload_reads: &mut VecDeque<QueuedBulkRead>,
+    reads: &mut QueuedReads<()>,
 ) -> Result<(), CaptureError> {
     let payload_bytes = scope_payload_bytes(*config)?;
-    *header_read = Some(
+    reads.set_header(
         session
             .queue_bulk_read(TRIGGER_HEADER_BYTES)
             .map_err(capture_error)?,
     );
     for _ in 0..CONTINUOUS_QUEUED_FRAMES {
-        payload_reads.push_back(
+        reads.push_payload(
             session
                 .queue_bulk_read(payload_bytes)
                 .map_err(capture_error)?,
+            (),
         );
     }
 
@@ -2332,40 +2309,28 @@ fn read_continuous_capture_inner(
             return Ok(());
         }
 
-        if header_read
-            .as_ref()
-            .is_some_and(QueuedBulkRead::is_complete)
-        {
-            let completed = header_read.take().ok_or_else(|| {
-                CaptureError::new("the completed continuous scope header read is missing")
-            })?;
-            let header = require_queued_data(
-                completed.finish().map_err(capture_error)?,
-                "continuous trigger header",
-            )?;
+        if let Some(header) = reads.take_completed_header("DSCope continuous trigger header")? {
             validate_trigger_header(&header)?;
             trigger_header = Some(header);
         }
 
         let mut completed_payloads = Vec::with_capacity(CONTINUOUS_QUEUED_FRAMES);
-        while trigger_header.is_some()
-            && payload_reads
-                .front()
-                .is_some_and(QueuedBulkRead::is_complete)
-        {
-            let completed = payload_reads.pop_front().ok_or_else(|| {
-                CaptureError::new("the completed continuous scope payload read is missing")
-            })?;
-            let payload =
-                require_scope_payload(completed.finish().map_err(capture_error)?, payload_bytes)?;
+        if trigger_header.is_some() {
+            while let Some((payload, ())) =
+                reads.take_completed_payload("DSCope capture payload")?
+            {
+                let payload = check_scope_payload_length(payload, payload_bytes)?;
 
-            // Replenish the USB queue before decoding and publishing the frame.
-            payload_reads.push_back(
-                session
-                    .queue_bulk_read(payload_bytes)
-                    .map_err(capture_error)?,
-            );
-            completed_payloads.push(payload);
+                // Replenish the USB queue before decoding and publishing the
+                // frame.
+                reads.push_payload(
+                    session
+                        .queue_bulk_read(payload_bytes)
+                        .map_err(capture_error)?,
+                    (),
+                );
+                completed_payloads.push(payload);
+            }
         }
 
         for payload in completed_payloads {
@@ -2397,41 +2362,8 @@ fn read_continuous_capture_inner(
             frame_index += 1;
         }
 
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
+        service_usb_events(session)?;
     }
-}
-
-fn cancel_pending_scope_reads(
-    session: &UsbDeviceSession,
-    header_read: &mut Option<QueuedBulkRead>,
-    payload_reads: &mut VecDeque<QueuedBulkRead>,
-) -> Result<(), CaptureError> {
-    if header_read.is_none() && payload_reads.is_empty() {
-        return Ok(());
-    }
-    let _ = session.force_capture_ready();
-    if let Some(header_read) = header_read.as_mut() {
-        header_read.cancel().map_err(capture_error)?;
-    }
-    for payload_read in payload_reads.iter_mut() {
-        payload_read.cancel().map_err(capture_error)?;
-    }
-    while header_read.as_ref().is_some_and(|read| !read.is_complete())
-        || payload_reads.iter().any(|read| !read.is_complete())
-    {
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
-    }
-    if let Some(header_read) = header_read.take() {
-        let _ = header_read.finish();
-    }
-    while let Some(payload_read) = payload_reads.pop_front() {
-        let _ = payload_read.finish();
-    }
-    Ok(())
 }
 
 fn scope_payload_bytes(config: DsCopeCaptureConfig) -> Result<usize, CaptureError> {
@@ -2457,26 +2389,22 @@ fn read_prequeued_capture(
     let mut payload_read = match session.queue_bulk_read(payload_bytes) {
         Ok(read) => read,
         Err(error) => {
-            header_read.cancel().map_err(capture_error)?;
-            while !header_read.is_complete() {
-                session
-                    .handle_usb_events(Duration::from_millis(5))
-                    .map_err(capture_error)?;
-            }
-            let _ = header_read.finish();
-            return Err(capture_error(error));
+            return Err(abandon_reads_after_error(
+                session,
+                capture_error(error),
+                vec![header_read],
+            ));
         }
     };
 
     context.synchronize_start()?;
     let capture_origin = context.elapsed();
     if let Err(error) = session.start_capture() {
-        let _ = header_read.cancel();
-        let _ = payload_read.cancel();
-        drain_reads(session, &header_read, &payload_read)?;
-        let _ = header_read.finish();
-        let _ = payload_read.finish();
-        return Err(capture_error(error));
+        return Err(abandon_reads_after_error(
+            session,
+            capture_error(error),
+            vec![header_read, payload_read],
+        ));
     }
 
     let mut cancelled = false;
@@ -2494,9 +2422,7 @@ fn read_prequeued_capture(
             header_read.cancel().map_err(capture_error)?;
             payload_read.cancel().map_err(capture_error)?;
         }
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
+        service_usb_events(session)?;
     }
 
     let header_result = header_read.finish().map_err(capture_error);
@@ -2504,7 +2430,7 @@ fn read_prequeued_capture(
     if cancelled {
         return Ok(None);
     }
-    let trigger_header = require_queued_data(header_result?, "trigger header")?;
+    let trigger_header = require_queued_data(header_result?, "DSCope trigger header")?;
     if trigger_header.len() != TRIGGER_HEADER_BYTES {
         return Err(CaptureError::new(format!(
             "short DSCope trigger header: received {} of {TRIGGER_HEADER_BYTES} bytes",
@@ -2541,7 +2467,7 @@ fn read_prequeued_capture(
             let _ = session.force_capture_ready();
             return Ok(None);
         }
-        let mut next_payload_read = session
+        let next_payload_read = session
             .queue_bulk_read(payload_bytes)
             .map_err(capture_error)?;
         while !next_payload_read.is_complete() {
@@ -2554,18 +2480,10 @@ fn read_prequeued_capture(
             )?;
             if context.is_cancelled() {
                 let _ = session.force_capture_ready();
-                next_payload_read.cancel().map_err(capture_error)?;
-                while !next_payload_read.is_complete() {
-                    session
-                        .handle_usb_events(Duration::from_millis(5))
-                        .map_err(capture_error)?;
-                }
-                let _ = next_payload_read.finish();
+                abandon_reads(session, vec![next_payload_read])?;
                 return Ok(None);
             }
-            session
-                .handle_usb_events(Duration::from_millis(5))
-                .map_err(capture_error)?;
+            service_usb_events(session)?;
         }
         payload = require_scope_payload(
             next_payload_read.finish().map_err(capture_error)?,
@@ -2651,7 +2569,16 @@ fn require_scope_payload(
     outcome: QueuedBulkReadOutcome,
     payload_bytes: usize,
 ) -> Result<Vec<u8>, CaptureError> {
-    let payload = require_queued_data(outcome, "capture payload")?;
+    check_scope_payload_length(
+        require_queued_data(outcome, "DSCope capture payload")?,
+        payload_bytes,
+    )
+}
+
+fn check_scope_payload_length(
+    payload: Vec<u8>,
+    payload_bytes: usize,
+) -> Result<Vec<u8>, CaptureError> {
     if payload.len() != payload_bytes {
         return Err(CaptureError::new(format!(
             "short DSCope payload: received {} of {payload_bytes} bytes",
@@ -2659,31 +2586,6 @@ fn require_scope_payload(
         )));
     }
     Ok(payload)
-}
-
-fn drain_reads(
-    session: &UsbDeviceSession,
-    header_read: &crate::transport::QueuedBulkRead,
-    payload_read: &crate::transport::QueuedBulkRead,
-) -> Result<(), CaptureError> {
-    while !header_read.is_complete() || !payload_read.is_complete() {
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
-    }
-    Ok(())
-}
-
-fn require_queued_data(
-    outcome: QueuedBulkReadOutcome,
-    phase: &str,
-) -> Result<Vec<u8>, CaptureError> {
-    match outcome {
-        QueuedBulkReadOutcome::Data(data) => Ok(data),
-        QueuedBulkReadOutcome::Cancelled => Err(CaptureError::new(format!(
-            "DSCope {phase} transfer was unexpectedly cancelled"
-        ))),
-    }
 }
 
 fn decode_capture(

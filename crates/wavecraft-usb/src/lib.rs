@@ -13,6 +13,7 @@ mod dscope;
 mod dslogic;
 mod prepare;
 mod probe;
+mod queued_reads;
 mod transport;
 
 pub use dscope::{

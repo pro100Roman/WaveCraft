@@ -1,11 +1,13 @@
 #[cfg(test)]
 use crate::ds_driver_util::read_u16;
 use crate::ds_driver_util::{capture_error, combine_results, push_u16, push_u32, read_u32};
-use crate::transport::{QueuedBulkRead, QueuedBulkReadOutcome};
+use crate::queued_reads::{
+    abandon_reads_after_error, require_queued_data, service_usb_events, with_queued_reads,
+    QueuedReads,
+};
 use crate::{
     BulkReadOutcome, DeviceModel, DeviceProfile, DiscoveredDevice, UsbDeviceSession, UsbSpeedClass,
 };
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use wavecraft_core::{
     CaptureBatch, CaptureContext, CaptureError, CaptureSource, DeviceDescriptor, DeviceId,
@@ -1007,23 +1009,22 @@ fn run_capture(
     combine_results(capture_result, stop_result, "stop the capture engine")
 }
 
-struct PendingStreamRead {
-    transfer: QueuedBulkRead,
-    valid_bytes: usize,
-}
-
+/// Queues one payload read that is expected to hold `valid_bytes` of capture
+/// data, rounded up to the USB transfer alignment.
 fn queue_stream_payload_read(
     session: &UsbDeviceSession,
+    reads: &mut QueuedReads<usize>,
     valid_bytes: usize,
     config: DsLogicCaptureConfig,
-) -> Result<PendingStreamRead, CaptureError> {
+) -> Result<(), CaptureError> {
     let usb_request_bytes = aligned_transfer_bytes(valid_bytes, config);
-    Ok(PendingStreamRead {
-        transfer: session
+    reads.push_payload(
+        session
             .queue_bulk_read(usb_request_bytes)
             .map_err(capture_error)?,
         valid_bytes,
-    })
+    );
+    Ok(())
 }
 
 fn read_stream_capture(
@@ -1033,19 +1034,9 @@ fn read_stream_capture(
     trigger_header_bytes: usize,
     context: &CaptureContext,
 ) -> Result<(), CaptureError> {
-    let mut header_read = None;
-    let mut payload_reads = VecDeque::new();
-    let capture_result = read_stream_capture_inner(
-        session,
-        config,
-        speed,
-        trigger_header_bytes,
-        context,
-        &mut header_read,
-        &mut payload_reads,
-    );
-    let cleanup_result = cancel_pending_stream_reads(session, &mut header_read, &mut payload_reads);
-    combine_results(capture_result, cleanup_result, "cancel queued stream reads")
+    with_queued_reads(session, "cancel queued stream reads", |reads| {
+        read_stream_capture_inner(session, config, speed, trigger_header_bytes, context, reads)
+    })
 }
 
 fn read_loop_stream_capture(
@@ -1055,23 +1046,9 @@ fn read_loop_stream_capture(
     trigger_header_bytes: usize,
     context: &CaptureContext,
 ) -> Result<(), CaptureError> {
-    let mut header_read = None;
-    let mut payload_reads = VecDeque::new();
-    let capture_result = read_loop_stream_capture_inner(
-        session,
-        config,
-        speed,
-        trigger_header_bytes,
-        context,
-        &mut header_read,
-        &mut payload_reads,
-    );
-    let cleanup_result = cancel_pending_stream_reads(session, &mut header_read, &mut payload_reads);
-    combine_results(
-        capture_result,
-        cleanup_result,
-        "cancel queued loop-stream reads",
-    )
+    with_queued_reads(session, "cancel queued loop-stream reads", |reads| {
+        read_loop_stream_capture_inner(session, config, speed, trigger_header_bytes, context, reads)
+    })
 }
 
 fn read_loop_stream_capture_inner(
@@ -1080,17 +1057,16 @@ fn read_loop_stream_capture_inner(
     speed: UsbSpeedClass,
     trigger_header_bytes: usize,
     context: &CaptureContext,
-    header_read: &mut Option<QueuedBulkRead>,
-    payload_reads: &mut VecDeque<PendingStreamRead>,
+    reads: &mut QueuedReads<usize>,
 ) -> Result<(), CaptureError> {
     let (transfer_bytes, queued_transfer_count) = stream_transfer_plan(speed, config);
-    *header_read = Some(
+    reads.set_header(
         session
             .queue_bulk_read(trigger_header_bytes)
             .map_err(capture_error)?,
     );
-    while payload_reads.len() < queued_transfer_count {
-        payload_reads.push_back(queue_stream_payload_read(session, transfer_bytes, config)?);
+    while reads.payload_count() < queued_transfer_count {
+        queue_stream_payload_read(session, reads, transfer_bytes, config)?;
     }
 
     context.synchronize_start()?;
@@ -1105,53 +1081,29 @@ fn read_loop_stream_capture_inner(
             return Ok(());
         }
 
-        if header_read
-            .as_ref()
-            .is_some_and(QueuedBulkRead::is_complete)
-        {
-            let completed = header_read.take().ok_or_else(|| {
-                CaptureError::new("the completed loop-stream header read is missing")
-            })?;
-            let header = match completed.finish().map_err(capture_error)? {
-                QueuedBulkReadOutcome::Data(data) => data,
-                QueuedBulkReadOutcome::Cancelled => {
-                    return Err(CaptureError::new(
-                        "DSLogic loop-stream trigger-header transfer was unexpectedly cancelled",
-                    ));
-                }
-            };
+        if let Some(header) = reads.take_completed_header("DSLogic loop-stream trigger-header")? {
             TriggerPosition::decode(&header, trigger_header_bytes)?;
             header_complete = true;
         }
 
         let mut completed_payloads = Vec::with_capacity(queued_transfer_count);
-        while header_complete
-            && payload_reads
-                .front()
-                .is_some_and(|pending| pending.transfer.is_complete())
-        {
-            let pending = payload_reads.pop_front().ok_or_else(|| {
-                CaptureError::new("the completed loop-stream payload read is missing")
-            })?;
-            let payload = match pending.transfer.finish().map_err(capture_error)? {
-                QueuedBulkReadOutcome::Data(data) => data,
-                QueuedBulkReadOutcome::Cancelled => {
+        if header_complete {
+            while let Some((payload, _)) =
+                reads.take_completed_payload("DSLogic loop-stream payload")?
+            {
+                if payload.is_empty() {
                     return Err(CaptureError::new(
-                        "DSLogic loop-stream payload transfer was unexpectedly cancelled",
+                        "the DSLogic loop-stream endpoint returned an empty transfer",
                     ));
                 }
-            };
-            if payload.is_empty() {
-                return Err(CaptureError::new(
-                    "the DSLogic loop-stream endpoint returned an empty transfer",
-                ));
-            }
 
-            // Keep the host-side queue full before decoding or publishing the
-            // completed payload. Those operations can block long enough for a
-            // continuously streaming device to overflow if no read is pending.
-            payload_reads.push_back(queue_stream_payload_read(session, transfer_bytes, config)?);
-            completed_payloads.push(payload);
+                // Keep the host-side queue full before decoding or publishing
+                // the completed payload. Those operations can block long
+                // enough for a continuously streaming device to overflow if no
+                // read is pending.
+                queue_stream_payload_read(session, reads, transfer_bytes, config)?;
+                completed_payloads.push(payload);
+            }
         }
 
         for payload in completed_payloads {
@@ -1165,9 +1117,7 @@ fn read_loop_stream_capture_inner(
             )?;
         }
 
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
+        service_usb_events(session)?;
     }
 }
 
@@ -1177,8 +1127,7 @@ fn read_stream_capture_inner(
     speed: UsbSpeedClass,
     trigger_header_bytes: usize,
     context: &CaptureContext,
-    header_read: &mut Option<QueuedBulkRead>,
-    payload_reads: &mut VecDeque<PendingStreamRead>,
+    reads: &mut QueuedReads<usize>,
 ) -> Result<(), CaptureError> {
     let total_bytes = usize::try_from(config.sample_count & !(SAMPLE_ALIGNMENT - 1))
         .ok()
@@ -1186,16 +1135,16 @@ fn read_stream_capture_inner(
         .map(|bits| bits / 8)
         .ok_or_else(|| CaptureError::new("requested DSLogic stream payload is too large"))?;
     let (transfer_bytes, queued_transfer_count) = stream_transfer_plan(speed, config);
-    *header_read = Some(
+    reads.set_header(
         session
             .queue_bulk_read(trigger_header_bytes)
             .map_err(capture_error)?,
     );
 
     let mut reserved_bytes = 0_usize;
-    while payload_reads.len() < queued_transfer_count && reserved_bytes < total_bytes {
+    while reads.payload_count() < queued_transfer_count && reserved_bytes < total_bytes {
         let valid_bytes = transfer_bytes.min(total_bytes - reserved_bytes);
-        payload_reads.push_back(queue_stream_payload_read(session, valid_bytes, config)?);
+        queue_stream_payload_read(session, reads, valid_bytes, config)?;
         reserved_bytes += valid_bytes;
     }
 
@@ -1224,39 +1173,14 @@ fn read_stream_capture_inner(
             return Err(capture_timeout_error(session, "stream capture transfers"));
         }
 
-        if header_read
-            .as_ref()
-            .is_some_and(QueuedBulkRead::is_complete)
-        {
-            let completed = header_read
-                .take()
-                .ok_or_else(|| CaptureError::new("the completed stream header read is missing"))?;
-            header = Some(match completed.finish().map_err(capture_error)? {
-                QueuedBulkReadOutcome::Data(data) => data,
-                QueuedBulkReadOutcome::Cancelled => {
-                    return Err(CaptureError::new(
-                        "DSLogic stream trigger-header transfer was unexpectedly cancelled",
-                    ));
-                }
-            });
+        if let Some(data) = reads.take_completed_header("DSLogic stream trigger-header")? {
+            header = Some(data);
         }
 
-        while payload_reads
-            .front()
-            .is_some_and(|pending| pending.transfer.is_complete())
+        while let Some((mut payload, valid_bytes)) =
+            reads.take_completed_payload("DSLogic stream payload")?
         {
-            let pending = payload_reads
-                .pop_front()
-                .ok_or_else(|| CaptureError::new("the completed stream payload read is missing"))?;
-            reserved_bytes -= pending.valid_bytes;
-            let mut payload = match pending.transfer.finish().map_err(capture_error)? {
-                QueuedBulkReadOutcome::Data(data) => data,
-                QueuedBulkReadOutcome::Cancelled => {
-                    return Err(CaptureError::new(
-                        "DSLogic stream payload transfer was unexpectedly cancelled",
-                    ));
-                }
-            };
+            reserved_bytes -= valid_bytes;
             if payload.is_empty() {
                 return Err(CaptureError::new(
                     "the DSLogic stream endpoint returned an empty transfer",
@@ -1264,13 +1188,13 @@ fn read_stream_capture_inner(
             }
             // The FPGA pads the final wire block to a complete USB packet.
             // Keep only the logical capture bytes reserved for this transfer.
-            payload.truncate(pending.valid_bytes);
+            payload.truncate(valid_bytes);
 
             let received_after_payload = received_bytes + payload.len();
             let unreserved_bytes = total_bytes - received_after_payload - reserved_bytes;
             if unreserved_bytes > 0 {
                 let valid_bytes = transfer_bytes.min(unreserved_bytes);
-                payload_reads.push_back(queue_stream_payload_read(session, valid_bytes, config)?);
+                queue_stream_payload_read(session, reads, valid_bytes, config)?;
                 reserved_bytes += valid_bytes;
             }
 
@@ -1286,9 +1210,7 @@ fn read_stream_capture_inner(
         }
 
         if header.is_none() || received_bytes < total_bytes {
-            session
-                .handle_usb_events(Duration::from_millis(5))
-                .map_err(capture_error)?;
+            service_usb_events(session)?;
         }
     }
 
@@ -1319,42 +1241,6 @@ fn stream_transfer_plan(speed: UsbSpeedClass, config: DsLogicCaptureConfig) -> (
         aligned_transfer_bytes(target, config),
         queued_transfer_count,
     )
-}
-
-fn cancel_pending_stream_reads(
-    session: &UsbDeviceSession,
-    header_read: &mut Option<QueuedBulkRead>,
-    payload_reads: &mut VecDeque<PendingStreamRead>,
-) -> Result<(), CaptureError> {
-    if header_read.is_none() && payload_reads.is_empty() {
-        return Ok(());
-    }
-
-    let _ = session.force_capture_ready();
-    if let Some(header_read) = header_read.as_mut() {
-        header_read.cancel().map_err(capture_error)?;
-    }
-    for pending in payload_reads.iter_mut() {
-        pending.transfer.cancel().map_err(capture_error)?;
-    }
-
-    while header_read.as_ref().is_some_and(|read| !read.is_complete())
-        || payload_reads
-            .iter()
-            .any(|pending| !pending.transfer.is_complete())
-    {
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
-    }
-
-    if let Some(header_read) = header_read.take() {
-        let _ = header_read.finish();
-    }
-    while let Some(pending) = payload_reads.pop_front() {
-        let _ = pending.transfer.finish();
-    }
-    Ok(())
 }
 
 fn validate_device_ready(
@@ -1522,30 +1408,22 @@ fn read_prequeued_capture(
     let mut payload_read = match session.queue_bulk_read(payload.len()) {
         Ok(read) => read,
         Err(error) => {
-            header_read.cancel().map_err(capture_error)?;
-            while !header_read.is_complete() {
-                session
-                    .handle_usb_events(Duration::from_millis(5))
-                    .map_err(capture_error)?;
-            }
-            let _ = header_read.finish();
-            return Err(capture_error(error));
+            return Err(abandon_reads_after_error(
+                session,
+                capture_error(error),
+                vec![header_read],
+            ));
         }
     };
 
     context.synchronize_start()?;
     let capture_origin = context.elapsed();
     if let Err(error) = session.start_capture() {
-        let _ = header_read.cancel();
-        let _ = payload_read.cancel();
-        while !header_read.is_complete() || !payload_read.is_complete() {
-            session
-                .handle_usb_events(Duration::from_millis(5))
-                .map_err(capture_error)?;
-        }
-        let _ = header_read.finish();
-        let _ = payload_read.finish();
-        return Err(capture_error(error));
+        return Err(abandon_reads_after_error(
+            session,
+            capture_error(error),
+            vec![header_read, payload_read],
+        ));
     }
 
     let mut cancelled = false;
@@ -1574,9 +1452,7 @@ fn read_prequeued_capture(
             header_read.cancel().map_err(capture_error)?;
             payload_read.cancel().map_err(capture_error)?;
         }
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
+        service_usb_events(session)?;
     }
 
     let header_result = header_read.finish().map_err(capture_error);
@@ -1587,14 +1463,7 @@ fn read_prequeued_capture(
     if let Some(error) = timeout_error {
         return Err(error);
     }
-    let header_data = match header_result? {
-        QueuedBulkReadOutcome::Data(data) => data,
-        QueuedBulkReadOutcome::Cancelled => {
-            return Err(CaptureError::new(
-                "DSLogic trigger-header transfer was unexpectedly cancelled",
-            ));
-        }
-    };
+    let header_data = require_queued_data(header_result?, "DSLogic trigger-header")?;
     if header_data.len() != trigger_header_bytes {
         return Err(CaptureError::new(format!(
             "short DSLogic trigger header: received {} of {trigger_header_bytes} bytes",
@@ -1602,14 +1471,7 @@ fn read_prequeued_capture(
         )));
     }
     header.copy_from_slice(&header_data);
-    payload = match payload_result? {
-        QueuedBulkReadOutcome::Data(data) => data,
-        QueuedBulkReadOutcome::Cancelled => {
-            return Err(CaptureError::new(
-                "DSLogic payload transfer was unexpectedly cancelled",
-            ));
-        }
-    };
+    payload = require_queued_data(payload_result?, "DSLogic payload")?;
     Ok(Some(PrequeuedCapture {
         header,
         payload,
