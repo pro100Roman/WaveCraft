@@ -36,7 +36,7 @@ Python client tests, and `cargo +1.79.0 check --workspace --locked`.
 
 | Item | State |
 | ---- | ----- |
-| 1. Per-frame analyzer copies | Done. Custom protocols are shared through `Arc`; the decode cache compares its key in place and shares outcomes through `Arc`. Not profiled: frame time was not measured before or after. |
+| 1. Per-frame analyzer copies | Done and measured; see [Measurements](#measurements-for-item-1). Custom protocols are shared through `Arc`; the decode cache compares its key in place and shares outcomes through `Arc`. The measured saving is small: under 0.1 ms per frame except with about 10,000 or more decoded events in the cache path. |
 | 2. Large `lib.rs` | Started. The recording-metadata mapping moved to `recording_metadata.rs` (about 1,000 lines). `update` and the other long functions remain, along with migration steps 5-8 in [GUI modularization](gui-modularization.md). |
 | 3. Hand-written metadata mapping | Done for the one-key-per-setting fields. `recording_metadata.rs` now describes each such setting once, in a `MetadataField` or `ChannelField` table entry that drives both saving and loading (logic, scope and radio). Still hand-written, and marked as such in the file: the logic trigger (mode, stage count and per-stage conditions depend on each other), the radio analyzer channel list and gains, and the legacy radio analyzer keys. The file is not shorter (about 1,100 lines, up from 1,040, because rustfmt expands the table entries). Checked against the old code by saving and loading about 19,000 cases (every key removed, set to 34 odd values, plus legacy-key combinations) and comparing the output byte for byte; that harness was temporary and is not in the repository. A new test checks that table keys are unique. |
 | 4. Copied USB helpers | Done for the six identical helpers (`ds_driver_util.rs`). The queued-read bookkeeping in the two drivers was not compared or merged. |
@@ -47,6 +47,49 @@ Two fixes could not be fully covered by tests. The USB driver changes only conve
 unreachable states into errors, so no test drives those states, and the
 `discover_for_selector` retry loop in `wavecraft-automation` has no direct test;
 its behavior (number of discovery calls and sleeps) was checked by reading.
+
+## Measurements for item 1
+
+A temporary release-mode micro-benchmark (not in the repository) replayed the
+protocol-analyzer work that `update()` does on every frame while the logic tab
+is shown, once against the code before the fix (`7225710`) and once against the
+code after it. It ran on one machine (macOS, Apple M5 Pro), single threaded, 1.5 s per case.
+
+Per-frame cost of cloning the analyzer settings and the decode snapshot, matching
+them, and looking up the outcomes. Event counts are the streamed events; the
+analyzers were two UART analyzers and one I²C analyzer:
+
+| Custom schemas attached | Snapshot matches analyzers (before → after) | Decoders edited after capture (before → after) |
+| ----------------------- | ------------------------------------------- | ---------------------------------------------- |
+| none | 0.15 → 0.10 µs | 0.5–1.5 → 0.11 µs |
+| motor controller (1 KB YAML) | 1.1 → 0.10 µs | 2.0–2.7 → 0.12 µs |
+| motor controller + BNO08x (39 KB YAML) | 31 → 0.10 µs | 54–56 → 0.12 µs |
+
+Cost of the outcome copy the old code made every frame when the displayed
+analyzers differed from the streamed snapshot (`Vec<ProtocolDecodeOutcome>::to_vec()`),
+against sharing the list through an `Arc`, for one analyzer's events:
+
+| Decoded events | `to_vec()` (before) | `Arc::clone` (after) |
+| -------------- | ------------------- | -------------------- |
+| 100 | 1.7 µs | 0.02 µs |
+| 1,000 | 18 µs | 0.02 µs |
+| 10,000 | 206 µs | 0.02 µs |
+| 50,000 | 1,038 µs | 0.02 µs |
+
+A frame at 60 Hz is 16,667 µs, so the worst measured saving (50,000 events) is
+about 6% of a frame and the schema-clone saving (39 KB of YAML) is about 0.3%.
+In practice the fix removes a real but small cost.
+
+Limits of this measurement:
+
+- It times only the operations listed, not `update()` or a real frame; no
+  whole-application profile was taken.
+- The synthetic capture (UART bytes) produced only 44-66 events through the
+  one-shot decode path that the cache uses, so the large `to_vec()` rows come from
+  copying hand-built event lists of the stated size, not from a decoded capture.
+  Whether a real capture reaches 10,000 events in that path was not checked. The
+  streamed path is capped at 10,000 events per analyzer.
+- The old and new code were compared on the same synthetic data only.
 
 ## Improvements
 
