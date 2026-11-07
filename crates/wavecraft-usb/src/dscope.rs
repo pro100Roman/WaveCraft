@@ -527,11 +527,16 @@ impl DsCopeChannelConfig {
         self.vertical_offset
     }
 
-    fn calibration_index(self) -> usize {
+    fn calibration_index(self) -> Result<usize, CaptureError> {
         DSCOPE_VOLTS_PER_DIV_MV
             .iter()
             .position(|candidate| *candidate == self.volts_per_div_mv)
-            .expect("validated volts/div value is present")
+            .ok_or_else(|| {
+                CaptureError::new(format!(
+                    "DSCope {} mV/div has no calibration entry",
+                    self.volts_per_div_mv
+                ))
+            })
     }
 }
 
@@ -546,6 +551,15 @@ pub struct DsCopeCaptureConfig {
 }
 
 impl DsCopeCaptureConfig {
+    /// Calibration table index of each channel's volts/div setting.
+    fn calibration_ranges(self) -> Result<[usize; CHANNEL_COUNT], CaptureError> {
+        let mut ranges = [0; CHANNEL_COUNT];
+        for (range, channel) in ranges.iter_mut().zip(self.channels) {
+            *range = channel.calibration_index()?;
+        }
+        Ok(ranges)
+    }
+
     pub fn new(sample_rate_hz: u64, sample_count: u64) -> Result<Self, CaptureError> {
         Self::with_channel_configs(
             sample_rate_hz,
@@ -1267,11 +1281,11 @@ fn center_calibration_ranges(
                     continue;
                 }
                 let adjustment = calibration_integer_adjustment(margin);
-                let current = i32::from(
-                    values
-                        .preoffset(channel, range)
-                        .expect("calibration range is valid"),
-                );
+                let current = i32::from(values.preoffset(channel, range).ok_or_else(|| {
+                    CaptureError::new(format!(
+                        "DSCope calibration range {range} is invalid for CH{channel}"
+                    ))
+                })?);
                 let adjusted = (current + adjustment).clamp(0, 1_023) as u16;
                 if adjusted == current as u16 {
                     return Err(CaptureError::new(format!(
@@ -1540,12 +1554,21 @@ fn read_calibration_values(
     Ok(values)
 }
 
+/// First flash page of a channel's calibration records.
+fn calibration_flash_page(channel: usize) -> Result<u16, CaptureError> {
+    u16::try_from(channel)
+        .ok()
+        .and_then(|channel| channel.checked_mul(CALIBRATION_FLASH_PAGE_STRIDE))
+        .ok_or_else(|| {
+            CaptureError::new(format!("DSCope channel {channel} has no calibration page"))
+        })
+}
+
 fn read_calibration_records(
     session: &UsbDeviceSession,
     channel: usize,
 ) -> Result<([u8; CALIBRATION_ZERO_BYTES], [u8; CALIBRATION_VGA_BYTES]), CaptureError> {
-    let page =
-        u16::try_from(channel).expect("channel index fits u16") * CALIBRATION_FLASH_PAGE_STRIDE;
+    let page = calibration_flash_page(channel)?;
     let mut zero_record = [0_u8; CALIBRATION_ZERO_BYTES];
     let mut vga_record = [0_u8; CALIBRATION_VGA_BYTES];
     session
@@ -1573,8 +1596,7 @@ fn write_calibration_values(
         .map_err(capture_error)?;
     let write_result = (|| {
         for (channel, (zero_record, vga_record)) in records.iter().enumerate() {
-            let page = u16::try_from(channel).expect("channel index fits u16")
-                * CALIBRATION_FLASH_PAGE_STRIDE;
+            let page = calibration_flash_page(channel)?;
             session
                 .write_dscope_nvm(page, zero_record)
                 .map_err(capture_error)?;
@@ -1764,10 +1786,7 @@ fn configure_frontend(
         .set_dscope_bandwidth_limit(config.bandwidth_limit)
         .map_err(capture_error)?;
     let calibration = match calibration_values {
-        Some(values) => DsCopeCalibration::from_values(
-            values,
-            config.channels.map(DsCopeChannelConfig::calibration_index),
-        ),
+        Some(values) => DsCopeCalibration::from_values(values, config.calibration_ranges()?),
         None => DsCopeCalibration::load(session, config)?,
     };
     configure_adc_fine_gains(session, config, calibration)?;
@@ -1934,8 +1953,7 @@ impl DsCopeCalibration {
             comb_fine_gain_codes: [0; 4],
         }; CHANNEL_COUNT];
         for (channel, calibration) in channels.iter_mut().enumerate() {
-            let page = u16::try_from(channel).expect("channel index fits u16")
-                * CALIBRATION_FLASH_PAGE_STRIDE;
+            let page = calibration_flash_page(channel)?;
             let mut zero_record = [0_u8; CALIBRATION_ZERO_BYTES];
             let mut vga_record = [0_u8; CALIBRATION_VGA_BYTES];
             session
@@ -1946,7 +1964,7 @@ impl DsCopeCalibration {
                 .map_err(capture_error)?;
             *calibration = parse_channel_calibration(
                 channel,
-                config.channels[channel].calibration_index(),
+                config.channels[channel].calibration_index()?,
                 &zero_record,
                 &vga_record,
             )?;
@@ -2114,9 +2132,18 @@ fn read_calibration_measurement(
 }
 
 fn calibration_payload_bytes(config: DsCopeCaptureConfig) -> usize {
-    usize::try_from(config.armed_sample_count()).expect("calibration sample count fits usize")
-        * config.enabled_channel_count()
-        + MEASUREMENT_FOOTER_BYTES
+    // Sample counts are validated well below usize::MAX; saturating keeps an
+    // impossible overflow from panicking and lets the transfer fail instead.
+    usize::try_from(config.armed_sample_count())
+        .unwrap_or(usize::MAX)
+        .saturating_mul(config.enabled_channel_count())
+        .saturating_add(MEASUREMENT_FOOTER_BYTES)
+}
+
+fn checked_usize(value: impl TryInto<usize>, what: &str) -> Result<usize, CaptureError> {
+    value
+        .try_into()
+        .map_err(|_| CaptureError::new(format!("DSCope {what} does not fit in memory")))
 }
 
 fn decode_calibration_frame(
@@ -2126,11 +2153,10 @@ fn decode_calibration_frame(
 ) -> Result<DsCopeCalibrationFrame, CaptureError> {
     let enabled_channel_count = config.enabled_channel_count();
     let enabled_channel_indices = config.enabled_channel_indices().collect::<Vec<_>>();
-    let measurement_offset = usize::try_from(config.armed_sample_count())
-        .expect("validated sample count fits usize")
-        * enabled_channel_count;
-    let sample_count = usize::try_from(measurement.sample_count)
-        .expect("32-bit measurement sample count fits usize");
+    let measurement_offset = checked_usize(config.armed_sample_count(), "sample count")?
+        .checked_mul(enabled_channel_count)
+        .ok_or_else(|| CaptureError::new("DSCope calibration measurement offset overflowed"))?;
+    let sample_count = checked_usize(measurement.sample_count, "measurement sample count")?;
     let data_start = usize::from(measurement.trigger_offset) * CHANNEL_COUNT;
     let data_end = sample_count
         .checked_mul(enabled_channel_count)
@@ -2197,14 +2223,16 @@ fn parse_channel_calibration(
     let vga_gain = u32::from(read_u16(vga_record, table_offset)) << 8;
     let vpos_trans = read_u16(zero_record, CALIBRATION_VPOS_TRANS_OFFSET);
     let comb_comp = zero_record[CALIBRATION_COMB_COMP_OFFSET] as i8;
-    let fine_gain_codes = zero_record
+    let fine_gain_codes: [u8; 4] = zero_record
         [CALIBRATION_FINE_GAIN_OFFSET..CALIBRATION_COMB_FINE_GAIN_OFFSET]
         .try_into()
-        .expect("factory fine-gain calibration contains four bytes");
-    let comb_fine_gain_codes = zero_record
+        .map_err(|_| CaptureError::new("factory fine-gain calibration is not four bytes"))?;
+    let comb_fine_gain_codes: [u8; 4] = zero_record
         [CALIBRATION_COMB_FINE_GAIN_OFFSET..CALIBRATION_ZERO_BYTES]
         .try_into()
-        .expect("factory interleaving fine-gain calibration contains four bytes");
+        .map_err(|_| {
+            CaptureError::new("factory interleaving fine-gain calibration is not four bytes")
+        })?;
     if preoffset > 1_023
         || vga_gain == 0
         || vga_gain > 0x001f_ff00
@@ -2306,9 +2334,9 @@ fn read_continuous_capture_inner(
             .as_ref()
             .is_some_and(QueuedBulkRead::is_complete)
         {
-            let completed = header_read
-                .take()
-                .expect("the completed continuous scope header read is present");
+            let completed = header_read.take().ok_or_else(|| {
+                CaptureError::new("the completed continuous scope header read is missing")
+            })?;
             let header = require_queued_data(
                 completed.finish().map_err(capture_error)?,
                 "continuous trigger header",
@@ -2323,9 +2351,9 @@ fn read_continuous_capture_inner(
                 .front()
                 .is_some_and(QueuedBulkRead::is_complete)
         {
-            let completed = payload_reads
-                .pop_front()
-                .expect("the completed continuous scope payload read is present");
+            let completed = payload_reads.pop_front().ok_or_else(|| {
+                CaptureError::new("the completed continuous scope payload read is missing")
+            })?;
             let payload =
                 require_scope_payload(completed.finish().map_err(capture_error)?, payload_bytes)?;
 
@@ -2353,7 +2381,9 @@ fn read_continuous_capture_inner(
                 RawScopeCapture {
                     trigger_header: trigger_header
                         .as_ref()
-                        .expect("continuous payloads require a trigger header")
+                        .ok_or_else(|| {
+                            CaptureError::new("continuous payloads require a trigger header")
+                        })?
                         .clone(),
                     payload,
                     capture_origin,
@@ -2585,7 +2615,7 @@ fn apply_runtime_calibration(
     config: DsCopeCaptureConfig,
     values: DsCopeCalibrationValues,
 ) -> Result<DsCopeCalibration, CaptureError> {
-    let ranges = config.channels.map(DsCopeChannelConfig::calibration_index);
+    let ranges = config.calibration_ranges()?;
     for (channel, range) in ranges.into_iter().enumerate() {
         values.settable_value(channel, range)?;
     }
@@ -2662,16 +2692,15 @@ fn decode_capture(
 ) -> Result<(), CaptureError> {
     let enabled_channel_count = config.enabled_channel_count();
     let enabled_channel_indices = config.enabled_channel_indices().collect::<Vec<_>>();
-    let measurement_offset = usize::try_from(config.armed_sample_count())
-        .expect("validated sample count fits usize")
-        * enabled_channel_count;
+    let measurement_offset = checked_usize(config.armed_sample_count(), "sample count")?
+        .checked_mul(enabled_channel_count)
+        .ok_or_else(|| CaptureError::new("DSCope measurement offset overflowed"))?;
     let measurement = ScopeMeasurement::decode(&capture.payload[measurement_offset..], config)?;
     let trigger_sample_index = measurement
         .triggered
         .then(|| decode_trigger_sample_index(&capture.trigger_header, config))
         .transpose()?;
-    let sample_count = usize::try_from(measurement.sample_count)
-        .expect("32-bit measurement sample count fits usize");
+    let sample_count = checked_usize(measurement.sample_count, "measurement sample count")?;
     // The hardware trigger offset is expressed in two-byte ADC words even in
     // single-channel interleaved mode.
     let data_start = usize::from(measurement.trigger_offset) * CHANNEL_COUNT;
@@ -2870,6 +2899,16 @@ mod tests {
     use super::*;
 
     const MAX_DUAL_CHANNEL_SAMPLE_COUNT: u64 = MAX_TOTAL_SAMPLE_COUNT / 2;
+
+    #[test]
+    fn calibration_flash_pages_follow_the_channel_stride() {
+        assert_eq!(calibration_flash_page(0).unwrap(), 0);
+        assert_eq!(
+            calibration_flash_page(1).unwrap(),
+            CALIBRATION_FLASH_PAGE_STRIDE
+        );
+        assert!(calibration_flash_page(usize::MAX).is_err());
+    }
 
     #[test]
     fn runtime_trigger_queue_coalesces_to_the_latest_settings() {

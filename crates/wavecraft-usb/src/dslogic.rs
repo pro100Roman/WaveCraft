@@ -479,9 +479,9 @@ impl DsLogicCaptureConfig {
     }
 
     pub fn enabled_channels(self) -> [bool; LEGACY_CHANNEL_COUNT] {
-        self.enabled_channels[..LEGACY_CHANNEL_COUNT]
-            .try_into()
-            .expect("the DSLogic legacy channel range is fixed")
+        let mut legacy_channels = [false; LEGACY_CHANNEL_COUNT];
+        legacy_channels.copy_from_slice(&self.enabled_channels[..LEGACY_CHANNEL_COUNT]);
+        legacy_channels
     }
 
     pub fn enabled_channels_32(self) -> [bool; CHANNEL_COUNT as usize] {
@@ -1109,9 +1109,9 @@ fn read_loop_stream_capture_inner(
             .as_ref()
             .is_some_and(QueuedBulkRead::is_complete)
         {
-            let completed = header_read
-                .take()
-                .expect("the completed loop-stream header read is present");
+            let completed = header_read.take().ok_or_else(|| {
+                CaptureError::new("the completed loop-stream header read is missing")
+            })?;
             let header = match completed.finish().map_err(capture_error)? {
                 QueuedBulkReadOutcome::Data(data) => data,
                 QueuedBulkReadOutcome::Cancelled => {
@@ -1130,9 +1130,9 @@ fn read_loop_stream_capture_inner(
                 .front()
                 .is_some_and(|pending| pending.transfer.is_complete())
         {
-            let pending = payload_reads
-                .pop_front()
-                .expect("the completed loop-stream payload read is present");
+            let pending = payload_reads.pop_front().ok_or_else(|| {
+                CaptureError::new("the completed loop-stream payload read is missing")
+            })?;
             let payload = match pending.transfer.finish().map_err(capture_error)? {
                 QueuedBulkReadOutcome::Data(data) => data,
                 QueuedBulkReadOutcome::Cancelled => {
@@ -1230,7 +1230,7 @@ fn read_stream_capture_inner(
         {
             let completed = header_read
                 .take()
-                .expect("the completed stream header read is present");
+                .ok_or_else(|| CaptureError::new("the completed stream header read is missing"))?;
             header = Some(match completed.finish().map_err(capture_error)? {
                 QueuedBulkReadOutcome::Data(data) => data,
                 QueuedBulkReadOutcome::Cancelled => {
@@ -1247,7 +1247,7 @@ fn read_stream_capture_inner(
         {
             let pending = payload_reads
                 .pop_front()
-                .expect("the completed stream payload read is present");
+                .ok_or_else(|| CaptureError::new("the completed stream payload read is missing"))?;
             reserved_bytes -= pending.valid_bytes;
             let mut payload = match pending.transfer.finish().map_err(capture_error)? {
                 QueuedBulkReadOutcome::Data(data) => data,
@@ -1292,7 +1292,9 @@ fn read_stream_capture_inner(
         }
     }
 
-    let header = header.expect("the stream header completed before the loop exited");
+    let header = header.ok_or_else(|| {
+        CaptureError::new("DSLogic stream ended before its trigger header completed")
+    })?;
     TriggerPosition::decode(&header, trigger_header_bytes)?;
     Ok(())
 }
@@ -1733,7 +1735,9 @@ fn decode_cross_samples(
             .filter_map(|(channel, enabled)| enabled.then_some(channel))
             .zip(block.chunks_exact(BYTES_PER_CHANNEL_BLOCK))
         {
-            channels[channel] = u64::from_le_bytes(word.try_into().expect("chunk size is fixed"));
+            let mut word_bytes = [0_u8; BYTES_PER_CHANNEL_BLOCK];
+            word_bytes.copy_from_slice(word);
+            channels[channel] = u64::from_le_bytes(word_bytes);
         }
         for bit in 0..ATOMIC_SAMPLES {
             let mut sample = 0_u32;

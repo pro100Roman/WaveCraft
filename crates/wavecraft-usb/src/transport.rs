@@ -158,9 +158,12 @@ impl QueuedBulkRead {
         if self.state.completed {
             return Ok(());
         }
-        let transfer = self
-            .transfer
-            .expect("a queued bulk read owns its libusb transfer");
+        let transfer = self.transfer.ok_or_else(|| {
+            UsbError::new(format!(
+                "queued capture read for {} has no libusb transfer to cancel",
+                self.device_id
+            ))
+        })?;
         // SAFETY: transfer remains allocated until finish or Drop.
         let result = unsafe { rusb::ffi::libusb_cancel_transfer(transfer.as_ptr()) };
         if result == rusb::constants::LIBUSB_SUCCESS
@@ -182,10 +185,12 @@ impl QueuedBulkRead {
                 self.device_id
             )));
         }
-        let transfer = self
-            .transfer
-            .take()
-            .expect("a queued bulk read owns its libusb transfer");
+        let Some(transfer) = self.transfer.take() else {
+            return Err(UsbError::new(format!(
+                "queued capture read for {} has no libusb transfer to finish",
+                self.device_id
+            )));
+        };
         // SAFETY: the transfer completed and no callback can access it again.
         unsafe { rusb::ffi::libusb_free_transfer(transfer.as_ptr()) };
 
