@@ -446,5 +446,6 @@ same method, live status/progress callbacks, and structured exceptions. See
 - `docs/recording-format.md`: native `.dsv` framing and Saleae interoperability.
 - `docs/automation-and-mcp.md`: proposed CLI, service, SCPI, Saleae API, and MCP automation architecture.
 - `docs/saleae-logic-device-support.md`: feasibility and integration paths for Saleae Logic devices (excluding Logic MSO).
+- `docs/code-health-review.md`: ranked code-health findings and improvement backlog.
 
 The project is licensed under GPL-3.0-or-later to remain compatible with the original DSView codebase.
