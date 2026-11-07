@@ -2,9 +2,9 @@
 
 Status: the file split (migration steps 1-3 and 5-7) is done and `lib.rs` is
 down to 688 lines; the RF/SDR integration for HackRF One is implemented. What
-remains most of the long functions inside the moved code (`poll_worker` is
-split), narrowing what the panels can reach, and the LimeSDR and AntSDR
-adapters. See
+remains most of the long functions inside the moved code (`poll_worker` and
+`poll_capture_target` are split), narrowing what the panels can reach, and the
+LimeSDR and AntSDR adapters. See
 [Current status](#current-status) and the [Migration sequence](#migration-sequence).
 
 This document describes a behavior-preserving split of the GUI application
@@ -61,11 +61,11 @@ moved into these modules, mostly unchanged apart from `pub(crate)` visibility:
 Moving code did not shorten the long functions inside it. The longest ones now
 are `paint_capture_settings` (815 lines), `paint_radio_analyzer_configuration`
 (647), `paint_central_panel` (511, moved verbatim out of `update`),
-`start_gui_recording` (435), `paint_scope_time_domain` (397), and
-`poll_capture_target` (383). They are in the right module but still need to be
-split.
+`start_gui_recording` (435), and `paint_scope_time_domain` (397). They are in
+the right module but still need to be split. After them comes `begin_capture`
+(163).
 
-`poll_worker` (487 lines) is the one that has been split. It is now a 40-line
+Two have been split. `poll_worker` (487 lines) is now a 40-line
 dispatcher over `WorkerSuccess` plus one `handle_*` method per result that does
 real work (devices found, capture ready, recording loaded, and the four DSCope
 calibration results). The largest of them, `handle_capture_ready` (323 lines), is
@@ -75,12 +75,23 @@ a sequence of named steps of at most about 70 lines each: `discard_capture_nobod
 payload is a `CaptureReady` struct (boxed in `WorkerSuccess::Capture`) instead of
 eleven loose fields.
 
+`poll_capture_target` (383 lines) is now 29 lines, in `app/captures.rs`. The reading
+of a running capture no longer touches the app: `poll_running_capture` calls
+`reconfigure_logic_decoder`, `handle_capture_event` (and
+`handle_capture_frame` for the RF trigger and the displays), `drain_logic_decode`,
+and `drain_radio_dsp`, and returns a `CapturePoll` that says whether the
+capture ended. Ending one is `finish_capture` (77 lines), which uses
+`shut_down_capture` (stop the workers, close the files),
+`completed_capture_replaces_display` (a pure function), and
+`start_next_acquisition` (schedule, start, or queue the next one).
+`finish_decoding`, which was written out twice, is shared with `stop_capture`.
+
 Tests: 116 of the 157 tests that were in `lib.rs` moved next to the single
 module they cover. The other 41 cover more than one module or only the
 application root, and are in `src/tests.rs`. The test names were unchanged by the
 move (255 listed, 253 run, 2 ignored). `src/frame_tests.rs` adds 15 headless tests
-(see below). `app/worker.rs` has 38 tests of its own, so the crate now lists 293
-tests (291 run, 2 ignored).
+(see below). `app/worker.rs` has 38 tests of its own and `app/captures.rs` has 35,
+so the crate now lists 328 tests (326 run, 2 ignored).
 
 | Step | State | Notes |
 | ---- | ----- | ----- |
@@ -145,6 +156,18 @@ Verification of the split, and its limits:
   `DsCopeCalibrationValues` has no public constructor (it can only be read from
   a device), and the trigger that reaches a running DSCope source cannot be
   observed because the source's receiving end is private.
+- `app/captures.rs` tests drive `poll_capture_target` and `stop_capture` with
+  scripted fake sources that send batches and then finish, fail, crash, or keep
+  running (`app/test_support.rs`). They cover completion (every instrument must
+  stop), Run, Repetitive, and queued restarts, a scope frontend restart, a display
+  kept until the next capture completes, failures and recordings marked failed,
+  the bounded number of events per poll, analyzers edited mid-capture, the RF
+  trigger (armed, fired, and rejected updates), and `stop_capture`. They were
+  written before the function was split and passed unchanged after it. Changing
+  each step made them fail, except for what no fake source can reach: the logic
+  decoder or radio DSP worker disconnecting, the DSP output collected when a
+  capture ends, resetting the spectrum when the trigger fires, and a completed
+  capture whose session then fails to stop.
 - The tests do not click anything, so button and drag handling inside the
   panels is not covered. Hardware tests exercise the drivers, not the GUI.
 - The app was also started by hand for 10 seconds after the larger steps and
@@ -184,6 +207,7 @@ apps/wavecraft-gui/src/
 │   ├── devices.rs                # refresh, device and radio selection
 │   ├── captures.rs               # begin/stop/poll captures, completed captures
 │   ├── worker.rs                 # poll_worker and the handler for each result
+│   ├── test_support.rs           # test-only app fixture and scripted fake sources
 │   ├── calibration.rs            # DSCope calibration and idle configuration
 │   ├── files.rs                  # open/export/attach recordings, snapshots
 │   └── view_state.rs             # saved settings, session settings, active tabs
@@ -553,9 +577,10 @@ and should not change behavior:
     change each: `paint_capture_settings` (815 lines),
     `paint_radio_analyzer_configuration` (647), `paint_central_panel` (511),
     `start_gui_recording` (435), `paint_scope_time_domain` (397), and
-    `poll_capture_target` (383). Where a piece turns out to be pure logic,
-    give it a unit test. *(partial: `poll_worker` (487, one handler per
-    `WorkerSuccess` variant) is done; the others are not.)*
+    `begin_capture` (163). Where a piece turns out to be pure logic, give it a
+    unit test. *(partial: `poll_worker` (487, one handler per `WorkerSuccess`
+    variant) and `poll_capture_target` (383, polling separate from finishing)
+    are done; the others are not.)*
 14. Narrow what the panels can reach. Group the 77 fields of `WaveCraftApp`
     into per-area state structs (for example logic, scope, radio, capture,
     dialogs) and make each panel take the group it edits, plus `&FrameState`
