@@ -62,8 +62,9 @@ Moving code did not shorten the long functions inside it. The longest ones now
 are `paint_capture_settings` (815 lines), `paint_radio_analyzer_configuration`
 (647), `paint_central_panel` (511, moved verbatim out of `update`),
 `start_gui_recording` (435), and `paint_scope_time_domain` (397). They are in
-the right module but still need to be split. After them comes `begin_capture`
-(163).
+the right module but still need to be split. Next come `paint_raw_messages`
+(369), `paint_radio_receive_configuration` (293), `paint_logic` (282), and
+`paint_session_tabs` (272); `begin_capture` is 163.
 
 Two have been split. `poll_worker` (487 lines) is now a 40-line
 dispatcher over `WorkerSuccess` plus one `handle_*` method per result that does
@@ -576,9 +577,11 @@ and should not change behavior:
 13. Split the long functions inside the moved code, one behavior-preserving
     change each: `paint_capture_settings` (815 lines),
     `paint_radio_analyzer_configuration` (647), `paint_central_panel` (511),
-    `start_gui_recording` (435), `paint_scope_time_domain` (397), and
-    `begin_capture` (163). Where a piece turns out to be pure logic, give it a
-    unit test. *(partial: `poll_worker` (487, one handler per `WorkerSuccess`
+    `start_gui_recording` (435), `paint_scope_time_domain` (397),
+    `paint_raw_messages` (369), `paint_radio_receive_configuration` (293),
+    `paint_logic` (282), and `paint_session_tabs` (272), then `begin_capture`
+    (163) and the other long functions. Where a piece turns out to be pure logic,
+    give it a unit test. *(partial: `poll_worker` (487, one handler per `WorkerSuccess`
     variant) and `poll_capture_target` (383, polling separate from finishing)
     are done; the others are not.)*
 14. Narrow what the panels can reach. Group the 77 fields of `WaveCraftApp`
