@@ -61,25 +61,22 @@ pub(crate) fn crop_snapshot_image(
     })
 }
 
-fn available_snapshot_path(directory: &Path) -> PathBuf {
+fn available_snapshot_path(directory: &Path) -> Option<PathBuf> {
     let default_path = directory.join("wavecraft-snapshot.png");
     if !default_path.exists() {
-        return default_path;
+        return Some(default_path);
     }
-    for index in 2_u32.. {
-        let path = directory.join(format!("wavecraft-snapshot-{index}.png"));
-        if !path.exists() {
-            return path;
-        }
-    }
-    unreachable!("the snapshot file suffix cannot be exhausted")
+    (2_u32..=u32::MAX)
+        .map(|index| directory.join(format!("wavecraft-snapshot-{index}.png")))
+        .find(|path| !path.exists())
 }
 
 pub(crate) fn save_snapshot_image(
     directory: &Path,
     snapshot: &SnapshotImage,
 ) -> Result<PathBuf, String> {
-    let path = available_snapshot_path(directory);
+    let path = available_snapshot_path(directory)
+        .ok_or_else(|| format!("no free snapshot file name in {}", directory.display()))?;
     image::save_buffer_with_format(
         &path,
         &snapshot.rgba,
@@ -122,6 +119,31 @@ mod tests {
             red_values,
             vec![10, 11, 12, 13, 18, 19, 20, 21, 26, 27, 28, 29, 34, 35, 36, 37]
         );
+    }
+
+    #[test]
+    fn snapshot_paths_skip_names_that_already_exist() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "wavecraft-snapshot-paths-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        assert_eq!(
+            available_snapshot_path(&directory),
+            Some(directory.join("wavecraft-snapshot.png"))
+        );
+        std::fs::write(directory.join("wavecraft-snapshot.png"), b"x").unwrap();
+        assert_eq!(
+            available_snapshot_path(&directory),
+            Some(directory.join("wavecraft-snapshot-2.png"))
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

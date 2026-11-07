@@ -2015,7 +2015,9 @@ fn spi_transfers_to_decoded(
                 ),
                 (Some(mosi), None) => format_protocol_byte(mosi, analyzer.data_format),
                 (None, Some(miso)) => format_protocol_byte(miso, analyzer.data_format),
-                (None, None) => unreachable!("SPI configuration requires a data channel"),
+                // The SPI configuration requires a data channel, so a transfer
+                // always carries MOSI or MISO; show a placeholder if not.
+                (None, None) => "(no data)".to_owned(),
             };
             ProtocolDecodedEvent {
                 start_sample: transfer.range.start,

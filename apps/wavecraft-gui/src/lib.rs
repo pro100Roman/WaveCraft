@@ -412,17 +412,21 @@ fn choose_custom_protocol_to_open() -> Option<PathBuf> {
         .pick_file()
 }
 
-fn wavecraft_app_icon() -> egui::IconData {
-    eframe::icon_data::from_png_bytes(include_bytes!("../assets/wavecraft-icon.png"))
-        .expect("embedded WaveCraft app icon must be a valid PNG")
+fn wavecraft_app_icon() -> Option<egui::IconData> {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/wavecraft-icon.png")).ok()
 }
 
 pub fn run() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([920.0, 620.0]);
+    // The icon is embedded at build time; if it ever fails to decode the window
+    // simply opens with the platform's default icon.
+    if let Some(icon) = wavecraft_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([920.0, 620.0])
-            .with_icon(wavecraft_app_icon()),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -1203,20 +1207,32 @@ impl LogicCaptureSettings {
         if !enabled_channels.iter().any(|enabled| *enabled) {
             enabled_channels[0] = true;
         }
-        DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)
-            .expect("default logic capture configuration is valid")
-            .with_operation_mode(self.operation_mode)
-            .with_enabled_channels(enabled_channels)
-            .expect("at least one logic channel is enabled")
-            .maximum_sample_rate_hz(speed)
+        default_logic_capture_config()
+            .and_then(|config| {
+                config
+                    .with_operation_mode(self.operation_mode)
+                    .with_enabled_channels(enabled_channels)
+                    .ok()
+            })
+            .map_or(SAMPLE_RATE_HZ, |config| {
+                config.maximum_sample_rate_hz(speed)
+            })
     }
 
     fn maximum_sample_count(self) -> u64 {
-        DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT)
-            .expect("default logic capture configuration is valid")
-            .with_operation_mode(self.operation_mode)
-            .maximum_sample_count()
+        default_logic_capture_config().map_or(SAMPLE_COUNT, |config| {
+            config
+                .with_operation_mode(self.operation_mode)
+                .maximum_sample_count()
+        })
     }
+}
+
+/// The capture configuration the logic limits are derived from. The default
+/// rate and count are valid constants, so `None` is not expected; callers fall
+/// back to the default rate and count instead of panicking if it ever happens.
+fn default_logic_capture_config() -> Option<DsLogicCaptureConfig> {
+    DsLogicCaptureConfig::new(SAMPLE_RATE_HZ, SAMPLE_COUNT).ok()
 }
 
 fn configured_logic_trigger_conditions(
@@ -1253,9 +1269,9 @@ fn simple_logic_trigger(
 ) -> Result<DsLogicSimpleTrigger, String> {
     let mut configured =
         configured_logic_trigger_conditions(conditions, enabled_channels, None)?.into_iter();
-    let (first_channel, first_condition) = configured
-        .next()
-        .expect("configured trigger conditions are non-empty");
+    let Some((first_channel, first_condition)) = configured.next() else {
+        return Err("Configure at least one logic trigger condition".to_owned());
+    };
     let mut trigger = DsLogicSimpleTrigger::new(first_channel as u8, first_condition)
         .map_err(|error| error.to_string())?;
     for (channel, condition) in configured {
@@ -1274,9 +1290,12 @@ fn logic_trigger_stage(
     let mut configured =
         configured_logic_trigger_conditions(conditions, enabled_channels, Some(stage_index))?
             .into_iter();
-    let (first_channel, first_condition) = configured
-        .next()
-        .expect("configured trigger stage is non-empty");
+    let Some((first_channel, first_condition)) = configured.next() else {
+        return Err(format!(
+            "Configure at least one condition in smart trigger stage {}",
+            stage_index + 1
+        ));
+    };
     let mut stage = DsLogicTriggerStage::new(first_channel as u8, first_condition)
         .map_err(|error| error.to_string())?;
     for (channel, condition) in configured {
@@ -3422,7 +3441,7 @@ fn ingest_active_capture_frame(
             .map_err(|error| format!("failed to write recording: {error}"))?;
     }
     let CaptureEvent::Frame(frame) = event else {
-        unreachable!("capture frame event changed variant");
+        return Err("capture frame event changed variant".to_owned());
     };
     if matches!(&frame.payload, CaptureBatch::Logic(_)) {
         return active.logic_decode.push(frame);
@@ -3545,6 +3564,22 @@ struct CalibrationProgressModal {
 enum CalibrationModalAction {
     Close,
     Save(DsCopeCalibrationValues),
+}
+
+/// The view that can display a recording with these instruments, or `None`
+/// when the combination is not supported (for example logic with radio).
+fn recording_capture_target(
+    has_logic: bool,
+    has_scope: bool,
+    has_radio: bool,
+) -> Option<CaptureTarget> {
+    match (has_logic, has_scope, has_radio) {
+        (true, true, true) | (true, true, false) => Some(CaptureTarget::Combined),
+        (true, false, false) => Some(CaptureTarget::LogicAnalyzer),
+        (false, true, false) => Some(CaptureTarget::Oscilloscope),
+        (false, false, true) => Some(CaptureTarget::RadioReceiver),
+        _ => None,
+    }
 }
 
 struct LoadedRecording {
@@ -4327,10 +4362,9 @@ impl WaveCraftApp {
         let Some(screenshot) = screenshot else {
             return;
         };
-        let pending = self
-            .pending_snapshot
-            .take()
-            .expect("pending snapshot was checked above");
+        let Some(pending) = self.pending_snapshot.take() else {
+            return;
+        };
         let snapshot = match crop_snapshot_image(
             screenshot.as_ref(),
             pending.plot_rect,
@@ -5521,6 +5555,14 @@ impl WaveCraftApp {
                     scope_channel_names,
                     completion,
                 } = *recording;
+                let Some(target) = recording_capture_target(
+                    capture.has_logic,
+                    capture.has_scope,
+                    capture.has_radio,
+                ) else {
+                    self.set_error("recording does not contain a supported capture".to_owned());
+                    return;
+                };
                 if let Some(logic_settings) = logic_settings {
                     self.logic_settings = logic_settings;
                 }
@@ -5531,14 +5573,6 @@ impl WaveCraftApp {
                 if let Some(radio_settings) = radio_settings {
                     self.radio_settings = radio_settings;
                 }
-                let target = match (capture.has_logic, capture.has_scope, capture.has_radio) {
-                    (true, true, true) => CaptureTarget::Combined,
-                    (true, true, false) => CaptureTarget::Combined,
-                    (true, false, false) => CaptureTarget::LogicAnalyzer,
-                    (false, true, false) => CaptureTarget::Oscilloscope,
-                    (false, false, true) => CaptureTarget::RadioReceiver,
-                    _ => unreachable!("recordings contain one supported capture target"),
-                };
                 self.set_completed_capture_for_target(target, capture);
                 self.logic_marker_settings.clear();
                 self.logic_channel_names = logic_channel_names;
@@ -7101,9 +7135,11 @@ fn paint_scope_marker_settings(
                         for kind in [ScopeMarkerKind::Time, ScopeMarkerKind::Voltage] {
                             let count = settings.channels[channel].count(kind);
                             for index in 0..count {
-                                let (_, comparison, color) = settings.channels[channel]
-                                    .marker(kind, index)
-                                    .expect("marker index is active");
+                                let Some((_, comparison, color)) =
+                                    settings.channels[channel].marker(kind, index)
+                                else {
+                                    continue;
+                                };
                                 ui.horizontal(|ui| {
                                     ui.colored_label(
                                         color,
@@ -11698,9 +11734,8 @@ impl eframe::App for WaveCraftApp {
                         }
                     }
                 }
-                CaptureTarget::RadioReceiver | CaptureTarget::Combined => {
-                    unreachable!("radio and combined views have no session tabs")
-                }
+                // Radio and combined views have no session tabs.
+                CaptureTarget::RadioReceiver | CaptureTarget::Combined => false,
             };
             if changed {
                 match action {
@@ -11712,9 +11747,7 @@ impl eframe::App for WaveCraftApp {
                             CaptureTarget::Oscilloscope => {
                                 self.scope_sessions.name(self.scope_sessions.active_index())
                             }
-                            CaptureTarget::RadioReceiver | CaptureTarget::Combined => {
-                                unreachable!("radio and combined views have no session tabs")
-                            }
+                            CaptureTarget::RadioReceiver | CaptureTarget::Combined => None,
                         }
                         .unwrap_or("session");
                         self.status = format!("Added {} {active_name}", target.label());
@@ -12407,10 +12440,10 @@ impl eframe::App for WaveCraftApp {
                     for channel in 0..2 {
                         ui.group(|ui| {
                             ui.label(RichText::new(format!("CH{channel}")).strong());
-                            let mut gain = editor
-                                .values
-                                .vga_gain(channel, editor.range)
-                                .expect("manual calibration selection is valid");
+                            let Some(mut gain) = editor.values.vga_gain(channel, editor.range)
+                            else {
+                                return;
+                            };
                             ui.horizontal(|ui| {
                                 ui.label("VGAIN");
                                 ui.add(
@@ -12421,22 +12454,21 @@ impl eframe::App for WaveCraftApp {
                             });
                             let _ = editor.values.set_vga_gain(channel, editor.range, gain);
 
-                            let mut offset = editor
-                                .values
-                                .preoffset(channel, editor.range)
-                                .expect("manual calibration selection is valid");
+                            let Some(mut offset) =
+                                editor.values.preoffset(channel, editor.range)
+                            else {
+                                return;
+                            };
                             ui.horizontal(|ui| {
                                 ui.label("VOFF");
                                 ui.add(egui::Slider::new(&mut offset, 0..=1_023));
                             });
                             let _ = editor.values.set_preoffset(channel, editor.range, offset);
 
-                            let mut comb = i16::from(
-                                editor
-                                    .values
-                                    .comb_comp(channel)
-                                    .expect("manual calibration channel is valid"),
-                            );
+                            let Some(comb_value) = editor.values.comb_comp(channel) else {
+                                return;
+                            };
+                            let mut comb = i16::from(comb_value);
                             ui.horizontal(|ui| {
                                 ui.label("VCOMB");
                                 ui.add(egui::Slider::new(&mut comb, -127..=127));
@@ -13388,6 +13420,9 @@ fn read_gui_recording_with_analyzers(
     }
     if !has_logic && !has_scope && !has_radio {
         return Err("recording does not contain a supported capture".to_owned());
+    }
+    if recording_capture_target(has_logic, has_scope, has_radio).is_none() {
+        return Err("recording combines instruments that cannot be shown together".to_owned());
     }
     Ok(LoadedRecording {
         capture: CompletedCapture {
@@ -16487,7 +16522,10 @@ fn scope_trigger_crossing_sample(
             // hardware-triggered frame. Only free-run when no edge exists.
             (0, samples.len() - 1)
         } else {
-            let sample = hardware_trigger.expect("non-auto trigger requires a hardware position");
+            // A non-auto trigger without a hardware position returned above.
+            let Some(sample) = hardware_trigger else {
+                continue;
+            };
             (
                 sample.saturating_sub(TRIGGER_SEARCH_RADIUS),
                 sample
@@ -18747,11 +18785,41 @@ mod tests {
 
     #[test]
     fn embedded_wavecraft_app_icon_is_valid() {
-        let icon = wavecraft_app_icon();
+        let icon = wavecraft_app_icon().expect("embedded icon decodes");
 
         assert_eq!((icon.width, icon.height), (512, 512));
         assert_eq!(icon.rgba.len(), 512 * 512 * 4);
         assert_eq!(icon.rgba[3], 0);
+    }
+
+    #[test]
+    fn default_logic_capture_config_is_valid() {
+        // The limit helpers fall back to the default rate and count when this
+        // configuration cannot be built, so it must stay buildable.
+        assert!(default_logic_capture_config().is_some());
+    }
+
+    #[test]
+    fn recording_capture_target_covers_every_instrument_combination() {
+        let expected = [
+            ((false, false, false), None),
+            ((true, false, false), Some(CaptureTarget::LogicAnalyzer)),
+            ((false, true, false), Some(CaptureTarget::Oscilloscope)),
+            ((false, false, true), Some(CaptureTarget::RadioReceiver)),
+            ((true, true, false), Some(CaptureTarget::Combined)),
+            ((true, true, true), Some(CaptureTarget::Combined)),
+            // Combinations that include radio but not both wired instruments
+            // cannot be shown together and must be rejected, not panic.
+            ((true, false, true), None),
+            ((false, true, true), None),
+        ];
+        for ((logic, scope, radio), target) in expected {
+            assert_eq!(
+                recording_capture_target(logic, scope, radio),
+                target,
+                "logic={logic} scope={scope} radio={radio}"
+            );
+        }
     }
 
     #[test]

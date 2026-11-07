@@ -21,22 +21,20 @@ fn normalize_recording_path(mut path: PathBuf) -> PathBuf {
     path
 }
 
-fn available_recording_path(path: PathBuf) -> PathBuf {
+/// Returns `path` if it is free, otherwise the first free `stem-N.dsv`
+/// sibling. `None` only if every numbered name is taken.
+fn available_recording_path(path: PathBuf) -> Option<PathBuf> {
     if !path.exists() {
-        return path;
+        return Some(path);
     }
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
     let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("capture");
-    for index in 2_u32.. {
-        let candidate = parent.join(format!("{stem}-{index}.dsv"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    unreachable!("the recording file suffix cannot be exhausted")
+    (2_u32..=u32::MAX)
+        .map(|index| parent.join(format!("{stem}-{index}.dsv")))
+        .find(|candidate| !candidate.exists())
 }
 
 pub(crate) fn choose_recording_save_path(current_path: &str) -> Option<PathBuf> {
@@ -51,7 +49,7 @@ pub(crate) fn choose_recording_save_path(current_path: &str) -> Option<PathBuf> 
         .set_file_name(default_name)
         .save_file()
         .map(normalize_recording_path)
-        .map(available_recording_path)
+        .and_then(available_recording_path)
 }
 
 fn normalize_decoded_data_path(mut path: PathBuf) -> PathBuf {
@@ -65,22 +63,20 @@ fn normalize_decoded_data_path(mut path: PathBuf) -> PathBuf {
     path
 }
 
-fn available_decoded_data_path(path: PathBuf) -> PathBuf {
+/// Returns `path` if it is free, otherwise the first free `stem-N.jsonl`
+/// sibling. `None` only if every numbered name is taken.
+fn available_decoded_data_path(path: PathBuf) -> Option<PathBuf> {
     if !path.exists() {
-        return path;
+        return Some(path);
     }
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
     let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("decoded-data");
-    for index in 2_u32.. {
-        let candidate = parent.join(format!("{stem}-{index}.jsonl"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    unreachable!("the decoded data file suffix cannot be exhausted")
+    (2_u32..=u32::MAX)
+        .map(|index| parent.join(format!("{stem}-{index}.jsonl")))
+        .find(|candidate| !candidate.exists())
 }
 
 pub(crate) fn choose_decoded_data_save_path(current_path: &str) -> Option<PathBuf> {
@@ -95,7 +91,7 @@ pub(crate) fn choose_decoded_data_save_path(current_path: &str) -> Option<PathBu
         .set_file_name(default_name)
         .save_file()
         .map(normalize_decoded_data_path)
-        .map(available_decoded_data_path)
+        .and_then(available_decoded_data_path)
 }
 
 pub(crate) struct DecodedDataRecorder<W: Write> {
@@ -737,6 +733,48 @@ mod tests {
         assert_eq!(records[2]["timestamp"], "00:00:02.000");
         assert_eq!(records[2]["data"], json!([0x34]));
         assert_eq!(records[3]["record_count"], 2);
+    }
+
+    #[test]
+    fn available_paths_skip_names_that_already_exist() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "wavecraft-available-paths-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let capture = directory.join("capture.dsv");
+        assert_eq!(
+            available_recording_path(capture.clone()),
+            Some(capture.clone())
+        );
+        std::fs::write(&capture, b"x").unwrap();
+        assert_eq!(
+            available_recording_path(capture.clone()),
+            Some(directory.join("capture-2.dsv"))
+        );
+        std::fs::write(directory.join("capture-2.dsv"), b"x").unwrap();
+        assert_eq!(
+            available_recording_path(capture),
+            Some(directory.join("capture-3.dsv"))
+        );
+
+        let decoded = directory.join("decoded.jsonl");
+        assert_eq!(
+            available_decoded_data_path(decoded.clone()),
+            Some(decoded.clone())
+        );
+        std::fs::write(&decoded, b"x").unwrap();
+        assert_eq!(
+            available_decoded_data_path(decoded),
+            Some(directory.join("decoded-2.jsonl"))
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
