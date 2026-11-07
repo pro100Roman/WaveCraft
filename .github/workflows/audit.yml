@@ -1,0 +1,35 @@
+name: Dependency audit
+
+# Checks Cargo.lock against the RustSec advisory database. This is a separate
+# workflow so that a newly published advisory for a transitive dependency does
+# not block unrelated pull requests or releases; it runs when dependencies
+# change and once a week.
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - .github/workflows/audit.yml
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - .github/workflows/audit.yml
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: RustSec advisories
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

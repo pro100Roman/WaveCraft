@@ -1,8 +1,12 @@
-use crate::transport::{QueuedBulkRead, QueuedBulkReadOutcome};
-use crate::{
-    DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbError, UsbSpeedClass, DSCOPE_U3P100,
+use crate::ds_driver_util::{
+    capture_error, combine_results, push_u16, push_u32, read_u16, read_u32,
 };
-use std::collections::VecDeque;
+use crate::queued_reads::{
+    abandon_reads, abandon_reads_after_error, require_queued_data, service_usb_events,
+    with_queued_reads, QueuedReads,
+};
+use crate::transport::QueuedBulkReadOutcome;
+use crate::{DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbSpeedClass, DSCOPE_U3P100};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 use wavecraft_core::{
@@ -528,11 +532,16 @@ impl DsCopeChannelConfig {
         self.vertical_offset
     }
 
-    fn calibration_index(self) -> usize {
+    fn calibration_index(self) -> Result<usize, CaptureError> {
         DSCOPE_VOLTS_PER_DIV_MV
             .iter()
             .position(|candidate| *candidate == self.volts_per_div_mv)
-            .expect("validated volts/div value is present")
+            .ok_or_else(|| {
+                CaptureError::new(format!(
+                    "DSCope {} mV/div has no calibration entry",
+                    self.volts_per_div_mv
+                ))
+            })
     }
 }
 
@@ -547,6 +556,15 @@ pub struct DsCopeCaptureConfig {
 }
 
 impl DsCopeCaptureConfig {
+    /// Calibration table index of each channel's volts/div setting.
+    fn calibration_ranges(self) -> Result<[usize; CHANNEL_COUNT], CaptureError> {
+        let mut ranges = [0; CHANNEL_COUNT];
+        for (range, channel) in ranges.iter_mut().zip(self.channels) {
+            *range = channel.calibration_index()?;
+        }
+        Ok(ranges)
+    }
+
     pub fn new(sample_rate_hz: u64, sample_count: u64) -> Result<Self, CaptureError> {
         Self::with_channel_configs(
             sample_rate_hz,
@@ -1268,11 +1286,11 @@ fn center_calibration_ranges(
                     continue;
                 }
                 let adjustment = calibration_integer_adjustment(margin);
-                let current = i32::from(
-                    values
-                        .preoffset(channel, range)
-                        .expect("calibration range is valid"),
-                );
+                let current = i32::from(values.preoffset(channel, range).ok_or_else(|| {
+                    CaptureError::new(format!(
+                        "DSCope calibration range {range} is invalid for CH{channel}"
+                    ))
+                })?);
                 let adjusted = (current + adjustment).clamp(0, 1_023) as u16;
                 if adjusted == current as u16 {
                     return Err(CaptureError::new(format!(
@@ -1541,12 +1559,21 @@ fn read_calibration_values(
     Ok(values)
 }
 
+/// First flash page of a channel's calibration records.
+fn calibration_flash_page(channel: usize) -> Result<u16, CaptureError> {
+    u16::try_from(channel)
+        .ok()
+        .and_then(|channel| channel.checked_mul(CALIBRATION_FLASH_PAGE_STRIDE))
+        .ok_or_else(|| {
+            CaptureError::new(format!("DSCope channel {channel} has no calibration page"))
+        })
+}
+
 fn read_calibration_records(
     session: &UsbDeviceSession,
     channel: usize,
 ) -> Result<([u8; CALIBRATION_ZERO_BYTES], [u8; CALIBRATION_VGA_BYTES]), CaptureError> {
-    let page =
-        u16::try_from(channel).expect("channel index fits u16") * CALIBRATION_FLASH_PAGE_STRIDE;
+    let page = calibration_flash_page(channel)?;
     let mut zero_record = [0_u8; CALIBRATION_ZERO_BYTES];
     let mut vga_record = [0_u8; CALIBRATION_VGA_BYTES];
     session
@@ -1574,8 +1601,7 @@ fn write_calibration_values(
         .map_err(capture_error)?;
     let write_result = (|| {
         for (channel, (zero_record, vga_record)) in records.iter().enumerate() {
-            let page = u16::try_from(channel).expect("channel index fits u16")
-                * CALIBRATION_FLASH_PAGE_STRIDE;
+            let page = calibration_flash_page(channel)?;
             session
                 .write_dscope_nvm(page, zero_record)
                 .map_err(capture_error)?;
@@ -1765,10 +1791,7 @@ fn configure_frontend(
         .set_dscope_bandwidth_limit(config.bandwidth_limit)
         .map_err(capture_error)?;
     let calibration = match calibration_values {
-        Some(values) => DsCopeCalibration::from_values(
-            values,
-            config.channels.map(DsCopeChannelConfig::calibration_index),
-        ),
+        Some(values) => DsCopeCalibration::from_values(values, config.calibration_ranges()?),
         None => DsCopeCalibration::load(session, config)?,
     };
     configure_adc_fine_gains(session, config, calibration)?;
@@ -1935,8 +1958,7 @@ impl DsCopeCalibration {
             comb_fine_gain_codes: [0; 4],
         }; CHANNEL_COUNT];
         for (channel, calibration) in channels.iter_mut().enumerate() {
-            let page = u16::try_from(channel).expect("channel index fits u16")
-                * CALIBRATION_FLASH_PAGE_STRIDE;
+            let page = calibration_flash_page(channel)?;
             let mut zero_record = [0_u8; CALIBRATION_ZERO_BYTES];
             let mut vga_record = [0_u8; CALIBRATION_VGA_BYTES];
             session
@@ -1947,7 +1969,7 @@ impl DsCopeCalibration {
                 .map_err(capture_error)?;
             *calibration = parse_channel_calibration(
                 channel,
-                config.channels[channel].calibration_index(),
+                config.channels[channel].calibration_index()?,
                 &zero_record,
                 &vga_record,
             )?;
@@ -2000,54 +2022,41 @@ fn read_calibration_measurement(
     on_frame: &mut dyn FnMut(DsCopeCalibrationFrame),
 ) -> Result<ScopeMeasurement, CaptureError> {
     let payload_bytes = calibration_payload_bytes(config);
-    let mut header_read = session
+    let header_read = session
         .queue_bulk_read(TRIGGER_HEADER_BYTES)
         .map_err(capture_error)?;
-    let mut payload_read = match session.queue_bulk_read(payload_bytes) {
+    let payload_read = match session.queue_bulk_read(payload_bytes) {
         Ok(read) => read,
         Err(error) => {
-            let _ = header_read.cancel();
-            while !header_read.is_complete() {
-                session
-                    .handle_usb_events(Duration::from_millis(5))
-                    .map_err(capture_error)?;
-            }
-            let _ = header_read.finish();
-            return Err(capture_error(error));
+            return Err(abandon_reads_after_error(
+                session,
+                capture_error(error),
+                vec![header_read],
+            ));
         }
     };
     if let Err(error) = session.start_capture() {
-        let _ = header_read.cancel();
-        let _ = payload_read.cancel();
-        drain_reads(session, &header_read, &payload_read)?;
-        let _ = header_read.finish();
-        let _ = payload_read.finish();
-        return Err(capture_error(error));
+        return Err(abandon_reads_after_error(
+            session,
+            capture_error(error),
+            vec![header_read, payload_read],
+        ));
     }
     let mut deadline = Instant::now() + CAPTURE_COMPLETION_GRACE;
     while !header_read.is_complete() || !payload_read.is_complete() {
         if Instant::now() >= deadline {
             let _ = session.force_capture_ready();
-            let _ = header_read.cancel();
-            let _ = payload_read.cancel();
-            while !header_read.is_complete() || !payload_read.is_complete() {
-                session
-                    .handle_usb_events(Duration::from_millis(5))
-                    .map_err(capture_error)?;
-            }
-            let _ = header_read.finish();
-            let _ = payload_read.finish();
-            return Err(CaptureError::new(
-                "timed out waiting for a DSCope auto-calibration capture",
+            return Err(abandon_reads_after_error(
+                session,
+                CaptureError::new("timed out waiting for a DSCope auto-calibration capture"),
+                vec![header_read, payload_read],
             ));
         }
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
+        service_usb_events(session)?;
     }
     let header = require_queued_data(
         header_read.finish().map_err(capture_error)?,
-        "trigger header",
+        "DSCope trigger header",
     )?;
     let mut payload =
         require_scope_payload(payload_read.finish().map_err(capture_error)?, payload_bytes)?;
@@ -2085,26 +2094,21 @@ fn read_calibration_measurement(
             ));
         }
 
-        let mut next_payload_read = session
+        let next_payload_read = session
             .queue_bulk_read(payload_bytes)
             .map_err(capture_error)?;
         while !next_payload_read.is_complete() {
             if Instant::now() >= deadline {
                 let _ = session.force_capture_ready();
-                next_payload_read.cancel().map_err(capture_error)?;
-                while !next_payload_read.is_complete() {
-                    session
-                        .handle_usb_events(Duration::from_millis(5))
-                        .map_err(capture_error)?;
-                }
-                let _ = next_payload_read.finish();
-                return Err(CaptureError::new(
-                    "timed out waiting for a valid DSCope auto-calibration frame",
+                return Err(abandon_reads_after_error(
+                    session,
+                    CaptureError::new(
+                        "timed out waiting for a valid DSCope auto-calibration frame",
+                    ),
+                    vec![next_payload_read],
                 ));
             }
-            session
-                .handle_usb_events(Duration::from_millis(5))
-                .map_err(capture_error)?;
+            service_usb_events(session)?;
         }
         payload = require_scope_payload(
             next_payload_read.finish().map_err(capture_error)?,
@@ -2115,9 +2119,18 @@ fn read_calibration_measurement(
 }
 
 fn calibration_payload_bytes(config: DsCopeCaptureConfig) -> usize {
-    usize::try_from(config.armed_sample_count()).expect("calibration sample count fits usize")
-        * config.enabled_channel_count()
-        + MEASUREMENT_FOOTER_BYTES
+    // Sample counts are validated well below usize::MAX; saturating keeps an
+    // impossible overflow from panicking and lets the transfer fail instead.
+    usize::try_from(config.armed_sample_count())
+        .unwrap_or(usize::MAX)
+        .saturating_mul(config.enabled_channel_count())
+        .saturating_add(MEASUREMENT_FOOTER_BYTES)
+}
+
+fn checked_usize(value: impl TryInto<usize>, what: &str) -> Result<usize, CaptureError> {
+    value
+        .try_into()
+        .map_err(|_| CaptureError::new(format!("DSCope {what} does not fit in memory")))
 }
 
 fn decode_calibration_frame(
@@ -2127,11 +2140,10 @@ fn decode_calibration_frame(
 ) -> Result<DsCopeCalibrationFrame, CaptureError> {
     let enabled_channel_count = config.enabled_channel_count();
     let enabled_channel_indices = config.enabled_channel_indices().collect::<Vec<_>>();
-    let measurement_offset = usize::try_from(config.armed_sample_count())
-        .expect("validated sample count fits usize")
-        * enabled_channel_count;
-    let sample_count = usize::try_from(measurement.sample_count)
-        .expect("32-bit measurement sample count fits usize");
+    let measurement_offset = checked_usize(config.armed_sample_count(), "sample count")?
+        .checked_mul(enabled_channel_count)
+        .ok_or_else(|| CaptureError::new("DSCope calibration measurement offset overflowed"))?;
+    let sample_count = checked_usize(measurement.sample_count, "measurement sample count")?;
     let data_start = usize::from(measurement.trigger_offset) * CHANNEL_COUNT;
     let data_end = sample_count
         .checked_mul(enabled_channel_count)
@@ -2198,14 +2210,16 @@ fn parse_channel_calibration(
     let vga_gain = u32::from(read_u16(vga_record, table_offset)) << 8;
     let vpos_trans = read_u16(zero_record, CALIBRATION_VPOS_TRANS_OFFSET);
     let comb_comp = zero_record[CALIBRATION_COMB_COMP_OFFSET] as i8;
-    let fine_gain_codes = zero_record
+    let fine_gain_codes: [u8; 4] = zero_record
         [CALIBRATION_FINE_GAIN_OFFSET..CALIBRATION_COMB_FINE_GAIN_OFFSET]
         .try_into()
-        .expect("factory fine-gain calibration contains four bytes");
-    let comb_fine_gain_codes = zero_record
+        .map_err(|_| CaptureError::new("factory fine-gain calibration is not four bytes"))?;
+    let comb_fine_gain_codes: [u8; 4] = zero_record
         [CALIBRATION_COMB_FINE_GAIN_OFFSET..CALIBRATION_ZERO_BYTES]
         .try_into()
-        .expect("factory interleaving fine-gain calibration contains four bytes");
+        .map_err(|_| {
+            CaptureError::new("factory interleaving fine-gain calibration is not four bytes")
+        })?;
     if preoffset > 1_023
         || vga_gain == 0
         || vga_gain > 0x001f_ff00
@@ -2241,27 +2255,19 @@ fn read_continuous_capture(
     runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
     runtime_calibration_receiver: Option<&Receiver<DsCopeCalibrationValues>>,
 ) -> Result<(), CaptureError> {
-    let mut header_read = None;
-    let mut payload_reads = VecDeque::new();
-    let capture_result = read_continuous_capture_inner(
-        session,
-        config,
-        calibration,
-        context,
-        runtime_trigger_receiver,
-        runtime_calibration_receiver,
-        &mut header_read,
-        &mut payload_reads,
-    );
-    let cleanup_result = cancel_pending_scope_reads(session, &mut header_read, &mut payload_reads);
-    combine_results(
-        capture_result,
-        cleanup_result,
-        "cancel queued continuous scope reads",
-    )
+    with_queued_reads(session, "cancel queued continuous scope reads", |reads| {
+        read_continuous_capture_inner(
+            session,
+            config,
+            calibration,
+            context,
+            runtime_trigger_receiver,
+            runtime_calibration_receiver,
+            reads,
+        )
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn read_continuous_capture_inner(
     session: &UsbDeviceSession,
     config: &mut DsCopeCaptureConfig,
@@ -2269,20 +2275,20 @@ fn read_continuous_capture_inner(
     context: &CaptureContext,
     runtime_trigger_receiver: Option<&Receiver<DsCopeTriggerConfig>>,
     runtime_calibration_receiver: Option<&Receiver<DsCopeCalibrationValues>>,
-    header_read: &mut Option<QueuedBulkRead>,
-    payload_reads: &mut VecDeque<QueuedBulkRead>,
+    reads: &mut QueuedReads<()>,
 ) -> Result<(), CaptureError> {
     let payload_bytes = scope_payload_bytes(*config)?;
-    *header_read = Some(
+    reads.set_header(
         session
             .queue_bulk_read(TRIGGER_HEADER_BYTES)
             .map_err(capture_error)?,
     );
     for _ in 0..CONTINUOUS_QUEUED_FRAMES {
-        payload_reads.push_back(
+        reads.push_payload(
             session
                 .queue_bulk_read(payload_bytes)
                 .map_err(capture_error)?,
+            (),
         );
     }
 
@@ -2303,40 +2309,28 @@ fn read_continuous_capture_inner(
             return Ok(());
         }
 
-        if header_read
-            .as_ref()
-            .is_some_and(QueuedBulkRead::is_complete)
-        {
-            let completed = header_read
-                .take()
-                .expect("the completed continuous scope header read is present");
-            let header = require_queued_data(
-                completed.finish().map_err(capture_error)?,
-                "continuous trigger header",
-            )?;
+        if let Some(header) = reads.take_completed_header("DSCope continuous trigger header")? {
             validate_trigger_header(&header)?;
             trigger_header = Some(header);
         }
 
         let mut completed_payloads = Vec::with_capacity(CONTINUOUS_QUEUED_FRAMES);
-        while trigger_header.is_some()
-            && payload_reads
-                .front()
-                .is_some_and(QueuedBulkRead::is_complete)
-        {
-            let completed = payload_reads
-                .pop_front()
-                .expect("the completed continuous scope payload read is present");
-            let payload =
-                require_scope_payload(completed.finish().map_err(capture_error)?, payload_bytes)?;
+        if trigger_header.is_some() {
+            while let Some((payload, ())) =
+                reads.take_completed_payload("DSCope capture payload")?
+            {
+                let payload = check_scope_payload_length(payload, payload_bytes)?;
 
-            // Replenish the USB queue before decoding and publishing the frame.
-            payload_reads.push_back(
-                session
-                    .queue_bulk_read(payload_bytes)
-                    .map_err(capture_error)?,
-            );
-            completed_payloads.push(payload);
+                // Replenish the USB queue before decoding and publishing the
+                // frame.
+                reads.push_payload(
+                    session
+                        .queue_bulk_read(payload_bytes)
+                        .map_err(capture_error)?,
+                    (),
+                );
+                completed_payloads.push(payload);
+            }
         }
 
         for payload in completed_payloads {
@@ -2354,7 +2348,9 @@ fn read_continuous_capture_inner(
                 RawScopeCapture {
                     trigger_header: trigger_header
                         .as_ref()
-                        .expect("continuous payloads require a trigger header")
+                        .ok_or_else(|| {
+                            CaptureError::new("continuous payloads require a trigger header")
+                        })?
                         .clone(),
                     payload,
                     capture_origin,
@@ -2366,41 +2362,8 @@ fn read_continuous_capture_inner(
             frame_index += 1;
         }
 
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
+        service_usb_events(session)?;
     }
-}
-
-fn cancel_pending_scope_reads(
-    session: &UsbDeviceSession,
-    header_read: &mut Option<QueuedBulkRead>,
-    payload_reads: &mut VecDeque<QueuedBulkRead>,
-) -> Result<(), CaptureError> {
-    if header_read.is_none() && payload_reads.is_empty() {
-        return Ok(());
-    }
-    let _ = session.force_capture_ready();
-    if let Some(header_read) = header_read.as_mut() {
-        header_read.cancel().map_err(capture_error)?;
-    }
-    for payload_read in payload_reads.iter_mut() {
-        payload_read.cancel().map_err(capture_error)?;
-    }
-    while header_read.as_ref().is_some_and(|read| !read.is_complete())
-        || payload_reads.iter().any(|read| !read.is_complete())
-    {
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
-    }
-    if let Some(header_read) = header_read.take() {
-        let _ = header_read.finish();
-    }
-    while let Some(payload_read) = payload_reads.pop_front() {
-        let _ = payload_read.finish();
-    }
-    Ok(())
 }
 
 fn scope_payload_bytes(config: DsCopeCaptureConfig) -> Result<usize, CaptureError> {
@@ -2426,26 +2389,22 @@ fn read_prequeued_capture(
     let mut payload_read = match session.queue_bulk_read(payload_bytes) {
         Ok(read) => read,
         Err(error) => {
-            header_read.cancel().map_err(capture_error)?;
-            while !header_read.is_complete() {
-                session
-                    .handle_usb_events(Duration::from_millis(5))
-                    .map_err(capture_error)?;
-            }
-            let _ = header_read.finish();
-            return Err(capture_error(error));
+            return Err(abandon_reads_after_error(
+                session,
+                capture_error(error),
+                vec![header_read],
+            ));
         }
     };
 
     context.synchronize_start()?;
     let capture_origin = context.elapsed();
     if let Err(error) = session.start_capture() {
-        let _ = header_read.cancel();
-        let _ = payload_read.cancel();
-        drain_reads(session, &header_read, &payload_read)?;
-        let _ = header_read.finish();
-        let _ = payload_read.finish();
-        return Err(capture_error(error));
+        return Err(abandon_reads_after_error(
+            session,
+            capture_error(error),
+            vec![header_read, payload_read],
+        ));
     }
 
     let mut cancelled = false;
@@ -2463,9 +2422,7 @@ fn read_prequeued_capture(
             header_read.cancel().map_err(capture_error)?;
             payload_read.cancel().map_err(capture_error)?;
         }
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
+        service_usb_events(session)?;
     }
 
     let header_result = header_read.finish().map_err(capture_error);
@@ -2473,7 +2430,7 @@ fn read_prequeued_capture(
     if cancelled {
         return Ok(None);
     }
-    let trigger_header = require_queued_data(header_result?, "trigger header")?;
+    let trigger_header = require_queued_data(header_result?, "DSCope trigger header")?;
     if trigger_header.len() != TRIGGER_HEADER_BYTES {
         return Err(CaptureError::new(format!(
             "short DSCope trigger header: received {} of {TRIGGER_HEADER_BYTES} bytes",
@@ -2510,7 +2467,7 @@ fn read_prequeued_capture(
             let _ = session.force_capture_ready();
             return Ok(None);
         }
-        let mut next_payload_read = session
+        let next_payload_read = session
             .queue_bulk_read(payload_bytes)
             .map_err(capture_error)?;
         while !next_payload_read.is_complete() {
@@ -2523,18 +2480,10 @@ fn read_prequeued_capture(
             )?;
             if context.is_cancelled() {
                 let _ = session.force_capture_ready();
-                next_payload_read.cancel().map_err(capture_error)?;
-                while !next_payload_read.is_complete() {
-                    session
-                        .handle_usb_events(Duration::from_millis(5))
-                        .map_err(capture_error)?;
-                }
-                let _ = next_payload_read.finish();
+                abandon_reads(session, vec![next_payload_read])?;
                 return Ok(None);
             }
-            session
-                .handle_usb_events(Duration::from_millis(5))
-                .map_err(capture_error)?;
+            service_usb_events(session)?;
         }
         payload = require_scope_payload(
             next_payload_read.finish().map_err(capture_error)?,
@@ -2586,7 +2535,7 @@ fn apply_runtime_calibration(
     config: DsCopeCaptureConfig,
     values: DsCopeCalibrationValues,
 ) -> Result<DsCopeCalibration, CaptureError> {
-    let ranges = config.channels.map(DsCopeChannelConfig::calibration_index);
+    let ranges = config.calibration_ranges()?;
     for (channel, range) in ranges.into_iter().enumerate() {
         values.settable_value(channel, range)?;
     }
@@ -2620,7 +2569,16 @@ fn require_scope_payload(
     outcome: QueuedBulkReadOutcome,
     payload_bytes: usize,
 ) -> Result<Vec<u8>, CaptureError> {
-    let payload = require_queued_data(outcome, "capture payload")?;
+    check_scope_payload_length(
+        require_queued_data(outcome, "DSCope capture payload")?,
+        payload_bytes,
+    )
+}
+
+fn check_scope_payload_length(
+    payload: Vec<u8>,
+    payload_bytes: usize,
+) -> Result<Vec<u8>, CaptureError> {
     if payload.len() != payload_bytes {
         return Err(CaptureError::new(format!(
             "short DSCope payload: received {} of {payload_bytes} bytes",
@@ -2628,31 +2586,6 @@ fn require_scope_payload(
         )));
     }
     Ok(payload)
-}
-
-fn drain_reads(
-    session: &UsbDeviceSession,
-    header_read: &crate::transport::QueuedBulkRead,
-    payload_read: &crate::transport::QueuedBulkRead,
-) -> Result<(), CaptureError> {
-    while !header_read.is_complete() || !payload_read.is_complete() {
-        session
-            .handle_usb_events(Duration::from_millis(5))
-            .map_err(capture_error)?;
-    }
-    Ok(())
-}
-
-fn require_queued_data(
-    outcome: QueuedBulkReadOutcome,
-    phase: &str,
-) -> Result<Vec<u8>, CaptureError> {
-    match outcome {
-        QueuedBulkReadOutcome::Data(data) => Ok(data),
-        QueuedBulkReadOutcome::Cancelled => Err(CaptureError::new(format!(
-            "DSCope {phase} transfer was unexpectedly cancelled"
-        ))),
-    }
 }
 
 fn decode_capture(
@@ -2663,16 +2596,15 @@ fn decode_capture(
 ) -> Result<(), CaptureError> {
     let enabled_channel_count = config.enabled_channel_count();
     let enabled_channel_indices = config.enabled_channel_indices().collect::<Vec<_>>();
-    let measurement_offset = usize::try_from(config.armed_sample_count())
-        .expect("validated sample count fits usize")
-        * enabled_channel_count;
+    let measurement_offset = checked_usize(config.armed_sample_count(), "sample count")?
+        .checked_mul(enabled_channel_count)
+        .ok_or_else(|| CaptureError::new("DSCope measurement offset overflowed"))?;
     let measurement = ScopeMeasurement::decode(&capture.payload[measurement_offset..], config)?;
     let trigger_sample_index = measurement
         .triggered
         .then(|| decode_trigger_sample_index(&capture.trigger_header, config))
         .transpose()?;
-    let sample_count = usize::try_from(measurement.sample_count)
-        .expect("32-bit measurement sample count fits usize");
+    let sample_count = checked_usize(measurement.sample_count, "measurement sample count")?;
     // The hardware trigger offset is expressed in two-byte ADC words even in
     // single-channel interleaved mode.
     let data_start = usize::from(measurement.trigger_offset) * CHANNEL_COUNT;
@@ -2866,54 +2798,21 @@ fn raw_to_volts(raw: u8, hardware_offset: u8, channel: DsCopeChannelConfig) -> f
         * f32::from(channel.probe_attenuation)
 }
 
-fn combine_results(
-    primary: Result<(), CaptureError>,
-    cleanup: Result<(), CaptureError>,
-    cleanup_action: &str,
-) -> Result<(), CaptureError> {
-    match (primary, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(primary), Err(cleanup)) => Err(CaptureError::new(format!(
-            "{primary}; additionally failed to {cleanup_action}: {cleanup}"
-        ))),
-    }
-}
-
-fn capture_error(error: UsbError) -> CaptureError {
-    CaptureError::new(error.to_string())
-}
-
-fn push_u16(bytes: &mut Vec<u8>, value: u16) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(
-        bytes[offset..offset + 2]
-            .try_into()
-            .expect("fixed field size"),
-    )
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("fixed field size"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const MAX_DUAL_CHANNEL_SAMPLE_COUNT: u64 = MAX_TOTAL_SAMPLE_COUNT / 2;
+
+    #[test]
+    fn calibration_flash_pages_follow_the_channel_stride() {
+        assert_eq!(calibration_flash_page(0).unwrap(), 0);
+        assert_eq!(
+            calibration_flash_page(1).unwrap(),
+            CALIBRATION_FLASH_PAGE_STRIDE
+        );
+        assert!(calibration_flash_page(usize::MAX).is_err());
+    }
 
     #[test]
     fn runtime_trigger_queue_coalesces_to_the_latest_settings() {

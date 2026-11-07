@@ -547,6 +547,7 @@ fn format_count(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::*;
 
     fn value(results: ScopeMeasurementResults, kind: ScopeMeasurementKind) -> f64 {
         results.get(kind).unwrap()
@@ -657,5 +658,44 @@ mod tests {
         assert_eq!(results.get(ScopeMeasurementKind::PeakToPeak), Some(0.0));
         assert_eq!(results.get(ScopeMeasurementKind::Frequency), None);
         assert_eq!(results.get(ScopeMeasurementKind::Amplitude), None);
+    }
+
+    #[test]
+    fn scope_function_sources_follow_enabled_channels() {
+        let mut settings = ScopeFunctionSettings {
+            math: ScopeMathSettings {
+                enabled: true,
+                operation: ScopeMathOperation::Subtract,
+                left_channel: 0,
+                right_channel: 0,
+            },
+            fft: ScopeFftSettings {
+                enabled: true,
+                channel: 0,
+                length: 4_096,
+                window: ScopeFftWindow::Blackman,
+            },
+            lissajous: ScopeLissajousSettings {
+                enabled: true,
+                x_channel: 0,
+                y_channel: 0,
+            },
+            measurements: ScopeMeasurementSettings::default(),
+        };
+
+        settings.clamp_to_channels([false, true]);
+
+        assert_eq!(settings.math.left_channel, 1);
+        assert_eq!(settings.math.right_channel, 1);
+        assert_eq!(settings.fft.channel, 1);
+        assert_eq!(settings.fft.window, ScopeFftWindow::Blackman);
+        assert_eq!(settings.lissajous.x_channel, 1);
+        assert_eq!(settings.lissajous.y_channel, 1);
+        assert!(!settings.lissajous.enabled);
+        assert!(settings
+            .measurements
+            .channels
+            .iter()
+            .all(|channel| channel.enabled));
     }
 }

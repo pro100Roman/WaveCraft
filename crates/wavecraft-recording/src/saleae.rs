@@ -281,7 +281,11 @@ pub fn read_saleae<R: Read + Seek>(input: R) -> Result<SaleaeCapture, SaleaeErro
                     maximum_voltage: maximum,
                 });
             }
-            _ => unreachable!("bin_entries only returns channel entries"),
+            other => {
+                return Err(SaleaeError::invalid(format!(
+                    "unexpected channel entry type {other}"
+                )));
+            }
         }
         if total_values > MAX_TOTAL_SAMPLE_VALUES {
             return Err(SaleaeError::invalid(format!(
@@ -360,14 +364,11 @@ pub fn write_saleae<W: Write + Seek>(
         }
     }
     for channel in &capture.analog {
+        let analog_rate = capture
+            .analog_sample_rate_hz
+            .ok_or_else(|| SaleaeError::invalid("analog channels require an analog sample rate"))?;
         archive.start_file(format!("analog-{}.bin", channel.index), options)?;
-        write_analog_bin(
-            &mut archive,
-            channel,
-            capture
-                .analog_sample_rate_hz
-                .expect("validation requires an analog sample rate"),
-        )?;
+        write_analog_bin(&mut archive, channel, analog_rate)?;
     }
     archive.start_file("trigger-store.bin", options)?;
     archive.write_all(&TRIGGER_STORE)?;
@@ -874,30 +875,38 @@ fn write_analog_bin(
     Ok(())
 }
 
-fn write_pyramid(output: &mut impl Write, samples: &[i16]) -> Result<(), SaleaeError> {
+/// Builds the min/max pyramid: level 0 summarizes groups of 16 samples and each
+/// later level halves the previous one until a single pair remains. The result
+/// always has at least one level, which is empty when there are no samples.
+fn pyramid_levels(samples: &[i16]) -> Vec<Vec<(i16, i16)>> {
     let first = samples
         .chunks(16)
         .map(|group| {
-            let minimum = *group
+            group
                 .iter()
-                .min()
-                .expect("analog pyramid group is non-empty");
-            let maximum = *group
-                .iter()
-                .max()
-                .expect("analog pyramid group is non-empty");
-            (minimum, maximum)
+                .fold((i16::MAX, i16::MIN), |(minimum, maximum), &sample| {
+                    (minimum.min(sample), maximum.max(sample))
+                })
         })
         .collect::<Vec<_>>();
     let mut levels = vec![first];
-    while levels.last().map_or(0, Vec::len) > 1 {
-        let previous = levels.last().expect("pyramid has a first level");
-        let next = previous
-            .chunks_exact(2)
-            .map(|pair| (pair[0].0.min(pair[1].0), pair[0].1.max(pair[1].1)))
-            .collect::<Vec<_>>();
+    while let Some(next) = levels
+        .last()
+        .filter(|previous| previous.len() > 1)
+        .map(|previous| {
+            previous
+                .chunks_exact(2)
+                .map(|pair| (pair[0].0.min(pair[1].0), pair[0].1.max(pair[1].1)))
+                .collect::<Vec<_>>()
+        })
+    {
         levels.push(next);
     }
+    levels
+}
+
+fn write_pyramid(output: &mut impl Write, samples: &[i16]) -> Result<(), SaleaeError> {
+    let levels = pyramid_levels(samples);
     let append_empty = levels[0].len() == 1;
     let level_count = levels.len() + usize::from(append_empty);
     let pair_count = levels.iter().map(Vec::len).sum::<usize>();
@@ -1051,6 +1060,14 @@ pub fn import_saleae_recording<R: Read + Seek, W: Write>(
     output: W,
 ) -> Result<(), SaleaeConversionError> {
     let capture = read_saleae(input)?;
+    let analog_rate =
+        if capture.analog.is_empty() {
+            None
+        } else {
+            Some(capture.analog_sample_rate_hz.ok_or_else(|| {
+                SaleaeConversionError::invalid("analog channels have no sample rate")
+            })?)
+        };
     let mut devices = Vec::new();
     let mut metadata = BTreeMap::new();
     metadata.insert("import.format".to_owned(), "saleae.sal".to_owned());
@@ -1079,15 +1096,12 @@ pub fn import_saleae_recording<R: Read + Seek, W: Write>(
             );
         }
     }
-    if !capture.analog.is_empty() {
+    if let Some(rate) = analog_rate {
         devices.push(DeviceDescriptor {
             id: DeviceId::new("saleae-analog"),
             name: "Saleae analog capture".to_owned(),
             kind: InstrumentKind::Oscilloscope,
         });
-        let rate = capture
-            .analog_sample_rate_hz
-            .expect("parsed analog channels have a sample rate");
         metadata.insert("scope.sample_rate_hz".to_owned(), rate.to_string());
         metadata.insert(
             "scope.sample_count".to_owned(),
@@ -1123,10 +1137,7 @@ pub fn import_saleae_recording<R: Read + Seek, W: Write>(
             }),
         }))?;
     }
-    if !capture.analog.is_empty() {
-        let rate = capture
-            .analog_sample_rate_hz
-            .expect("parsed analog channels have a sample rate");
+    if let Some(rate) = analog_rate {
         writer.write_event(&CaptureEvent::Frame(CaptureFrame {
             device_id: DeviceId::new("saleae-analog"),
             sequence: 0,
@@ -1355,6 +1366,42 @@ mod tests {
                 maximum_voltage: 3.3,
             }],
         }
+    }
+
+    #[test]
+    fn pyramid_levels_match_a_direct_min_max_reduction() {
+        for length in [0, 1, 15, 16, 17, 31, 32, 33, 255, 256, 257, 1_000] {
+            let samples = (0..length)
+                .map(|index| ((index * 7919) % 4_001) as i16 - 2_000)
+                .collect::<Vec<_>>();
+
+            let mut expected = vec![samples
+                .chunks(16)
+                .map(|group| (*group.iter().min().unwrap(), *group.iter().max().unwrap()))
+                .collect::<Vec<_>>()];
+            while expected.last().unwrap().len() > 1 {
+                let next = expected
+                    .last()
+                    .unwrap()
+                    .chunks_exact(2)
+                    .map(|pair| (pair[0].0.min(pair[1].0), pair[0].1.max(pair[1].1)))
+                    .collect();
+                expected.push(next);
+            }
+
+            assert_eq!(pyramid_levels(&samples), expected, "{length} samples");
+            let mut written = Vec::new();
+            write_pyramid(&mut written, &samples).unwrap();
+            assert!(!written.is_empty(), "{length} samples");
+        }
+    }
+
+    #[test]
+    fn analog_capture_without_a_sample_rate_is_rejected_instead_of_panicking() {
+        let mut capture = example_capture();
+        capture.analog_sample_rate_hz = None;
+
+        assert!(write_saleae(Cursor::new(Vec::new()), &capture).is_err());
     }
 
     #[test]

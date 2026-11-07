@@ -151,7 +151,10 @@ fn trim_frame(mut frame: CaptureFrame, keep: Range<u64>) -> Option<CaptureFrame>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::*;
+
     use wavecraft_core::{DeviceId, Iq8, IqBatch};
+    use wavecraft_sdr::RadioProviderAdapter;
 
     const SAMPLE_RATE_HZ: u64 = 8_000;
     const CENTER_FREQUENCY_HZ: u64 = 868_500_000;
@@ -262,5 +265,90 @@ mod tests {
 
         assert!(output.complete);
         assert_eq!(range(&output.frames[0]), 0..8);
+    }
+
+    #[test]
+    #[ignore = "requires a connected HackRF One and installed libhackrf"]
+    fn gui_hackrf_trigger_gate_stops_an_unbounded_single_capture() {
+        let adapter = wavecraft_hackrf::HackRfAdapter::new();
+        let device = adapter
+            .discover()
+            .expect("GUI HackRF discovery should succeed")
+            .into_iter()
+            .next()
+            .expect("a HackRF One should be connected");
+        let request = RadioCaptureRequest {
+            device,
+            settings: RadioCaptureSettings {
+                center_frequency_hz: 100_000_000,
+                sample_rate_hz: 2_000_000,
+                bandwidth_hz: 1_750_000,
+                receive_channel: 0,
+                sample_limit: None,
+            },
+            provider_settings: RadioProviderSettings::HackRf(
+                wavecraft_sdr::HackRfSettings::default(),
+            ),
+            iq_correction_enabled: true,
+            analyzer_profiles: Vec::new(),
+            analyzer_channel_names: Vec::new(),
+            decoder_config: RadioDataDecoderConfig::Raw(RawRadioConfig {
+                preamble_byte: 0xaa,
+                preamble_bytes: 4,
+                sync_word: 0,
+                sync_word_bytes: 0,
+                maximum_preamble_bit_errors: 0,
+                bit_order: BitOrder::MostSignificantFirst,
+                minimum_bit_confidence_milli: 500,
+                maximum_uncertain_bits: 0,
+            }),
+        };
+        let started = start_capture(
+            Vec::new(),
+            Some(request),
+            Path::new("."),
+            LogicCaptureSettings::default().capture_config().unwrap(),
+            ScopeCaptureSettings::default().capture_config().unwrap(),
+            None,
+        )
+        .expect("GUI radio capture should start");
+        let mut trigger = RadioSingleTrigger::new(RadioSingleTriggerConfig {
+            threshold_dbfs: -120.0,
+            posttrigger_samples: RADIO_SPECTRUM_FFT_LENGTH as u64,
+            fft_length: RADIO_SPECTRUM_FFT_LENGTH,
+            iq_correction_enabled: true,
+        })
+        .unwrap();
+        let session = started.session;
+        let mut retained_samples = 0;
+        loop {
+            match session
+                .recv_timeout(Duration::from_secs(5))
+                .expect("triggered HackRF capture should produce an event")
+            {
+                CaptureEvent::Frame(frame) => {
+                    let output = trigger.push(frame).expect("IQ trigger gate should run");
+                    retained_samples += output
+                        .frames
+                        .iter()
+                        .map(|frame| frame.payload.sample_count())
+                        .sum::<usize>();
+                    if output.complete {
+                        break;
+                    }
+                }
+                CaptureEvent::SourceFailed { error, .. } => {
+                    panic!("GUI HackRF capture failed: {error}")
+                }
+                CaptureEvent::SourceStopped { .. } => {
+                    panic!("unbounded HackRF capture stopped before the RF trigger completed")
+                }
+            }
+        }
+
+        session
+            .stop()
+            .expect("triggered HackRF capture should stop");
+        assert_eq!(retained_samples, RADIO_SPECTRUM_FFT_LENGTH * 2);
     }
 }

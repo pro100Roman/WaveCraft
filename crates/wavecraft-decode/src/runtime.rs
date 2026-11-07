@@ -190,13 +190,26 @@ impl CustomProtocolRuntime {
         ) {
             None
         } else {
-            Some(
-                ByteStreamFramer::new(self.schema.framing.clone())
-                    .expect("validated framing remains valid"),
-            )
+            // `new` built a framer from this same schema and returned its error,
+            // so rebuilding it cannot fail; without a framer nothing is decoded.
+            ByteStreamFramer::new(self.schema.framing.clone()).ok()
         };
         self.previous_byte_end = None;
         self.pending_segment = None;
+    }
+
+    fn missing_stream_output(&self) -> ProtocolRuntimeOutput {
+        ProtocolRuntimeOutput {
+            messages: Vec::new(),
+            diagnostics: vec![runtime_diagnostic(
+                "protocol.missing_stream",
+                format!(
+                    "transport packet does not contain stream {:?}",
+                    self.schema.input.stream
+                ),
+                None,
+            )],
+        }
     }
 
     fn push_segmented_packet(
@@ -206,17 +219,7 @@ impl CustomProtocolRuntime {
         segmentation: &SegmentedTransactionSchema,
     ) -> ProtocolRuntimeOutput {
         let Some(bytes) = packet.streams.get(&self.schema.input.stream) else {
-            return ProtocolRuntimeOutput {
-                messages: Vec::new(),
-                diagnostics: vec![runtime_diagnostic(
-                    "protocol.missing_stream",
-                    format!(
-                        "transport packet does not contain stream {:?}",
-                        self.schema.input.stream
-                    ),
-                    None,
-                )],
-            };
+            return self.missing_stream_output();
         };
         if bytes.len() < segmentation.header_bytes {
             let mut output = ProtocolRuntimeOutput::default();
@@ -249,6 +252,7 @@ impl CustomProtocolRuntime {
         if is_continuation {
             return self.continue_segmented_packet(
                 packet,
+                bytes,
                 declared_bytes,
                 channel,
                 sequence,
@@ -273,11 +277,9 @@ impl CustomProtocolRuntime {
 
         let transferred_bytes = bytes.len().min(declared_bytes);
         let mut first_packet = packet.clone();
-        first_packet
-            .streams
-            .get_mut(&self.schema.input.stream)
-            .expect("input stream was checked")
-            .truncate(transferred_bytes);
+        if let Some(first_bytes) = first_packet.streams.get_mut(&self.schema.input.stream) {
+            first_bytes.truncate(transferred_bytes);
+        }
         if transferred_bytes == declared_bytes {
             self.decode_packet(
                 &first_packet,
@@ -298,6 +300,7 @@ impl CustomProtocolRuntime {
     fn continue_segmented_packet(
         &mut self,
         packet: &TransportPacket,
+        continuation_bytes: &[TimedByte],
         declared_bytes: usize,
         channel: u8,
         sequence: u8,
@@ -351,16 +354,11 @@ impl CustomProtocolRuntime {
             return output;
         }
 
-        let continuation_bytes = packet
-            .streams
-            .get(&self.schema.input.stream)
-            .expect("input stream was checked");
         let payload_end = continuation_bytes.len().min(declared_bytes);
-        pending
-            .packet
-            .streams
-            .get_mut(&self.schema.input.stream)
-            .expect("pending input stream exists")
+        let Some(pending_bytes) = pending.packet.streams.get_mut(&self.schema.input.stream) else {
+            return self.missing_stream_output();
+        };
+        pending_bytes
             .extend_from_slice(&continuation_bytes[segmentation.header_bytes..payload_end]);
         pending.next_sequence = sequence.wrapping_add(1);
 
@@ -375,12 +373,10 @@ impl CustomProtocolRuntime {
             return ProtocolRuntimeOutput::default();
         }
 
-        pending
-            .packet
-            .streams
-            .get_mut(&self.schema.input.stream)
-            .expect("pending input stream exists")
-            .truncate(pending.expected_bytes);
+        let Some(pending_bytes) = pending.packet.streams.get_mut(&self.schema.input.stream) else {
+            return self.missing_stream_output();
+        };
+        pending_bytes.truncate(pending.expected_bytes);
         let mut output = ProtocolRuntimeOutput::default();
         self.decode_packet(
             &pending.packet,
@@ -484,10 +480,10 @@ impl CustomProtocolRuntime {
         segmentation: &SegmentedTransactionSchema,
         records: &RecordStreamSchema,
     ) {
-        let bytes = packet
-            .streams
-            .get(&self.schema.input.stream)
-            .expect("record-stream input was checked");
+        // `decode_packet` only routes packets here after finding this stream.
+        let Some(bytes) = packet.streams.get(&self.schema.input.stream) else {
+            return;
+        };
         let mut cursor = segmentation.header_bytes;
         let mut prefix: Option<&[TimedByte]> = None;
 

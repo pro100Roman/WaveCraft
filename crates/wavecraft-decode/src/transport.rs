@@ -557,13 +557,18 @@ impl FixedUartDecoder {
             let sample_index = sample_offset + local_index as u64;
             let high = channel_is_high(sample, self.config.data_channel);
             let falling = self.previous_high == Some(true) && !high;
-            if let Some(pending) = &mut self.pending {
-                pending.observe(sample_index, high, self.samples_per_bit);
-                if sample_index >= pending.end_sample(self.samples_per_bit) {
-                    let pending = self.pending.take().expect("pending UART frame exists");
-                    if let Some(byte) = pending.complete(self.samples_per_bit) {
-                        bytes.push(byte);
-                    }
+            let samples_per_bit = self.samples_per_bit;
+            let frame_ended = self.pending.as_mut().is_some_and(|pending| {
+                pending.observe(sample_index, high, samples_per_bit);
+                sample_index >= pending.end_sample(samples_per_bit)
+            });
+            if frame_ended {
+                if let Some(byte) = self
+                    .pending
+                    .take()
+                    .and_then(|pending| pending.complete(samples_per_bit))
+                {
+                    bytes.push(byte);
                 }
             }
             if self.pending.is_none() && falling {

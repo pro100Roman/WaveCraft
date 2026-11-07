@@ -1,3 +1,6 @@
+// Integration tests may unwrap; the library lint exists for production code.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::f64::consts::TAU;
 use wavecraft_core::{Iq8, IqBatch};
 use wavecraft_dsp::{

@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 yaml-rust2 = { version = "0.11.0", default-features = false }

@@ -71,7 +71,11 @@ impl ByteStreamFramer {
             } => Ok(self.enforce_gap_limit(max_frame_bytes)),
             FramingSchema::TransportTransaction { .. }
             | FramingSchema::SegmentedTransportTransaction { .. } => {
-                unreachable!("rejected by constructor")
+                // `new` rejects these strategies, so this is only reachable if
+                // that check is bypassed; report it instead of panicking.
+                Err(DecodeError::new(
+                    "transport transaction framing consumes complete transport packets",
+                ))
             }
         }
     }

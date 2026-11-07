@@ -588,14 +588,22 @@ fn render_summary(message: &MessageSchema, fields: &[DecodedField]) -> String {
     while let Some(start) = remaining.find('{') {
         output.push_str(&remaining[..start]);
         let after_start = &remaining[start + 1..];
-        let end = after_start
-            .find('}')
-            .expect("summary placeholders were validated with the schema");
+        // Schema validation rejects unterminated placeholders and unknown
+        // fields. If a schema built by hand still contains one, keep the
+        // template text instead of panicking while decoding captured data.
+        let Some(end) = after_start.find('}') else {
+            output.push_str(&remaining[start..]);
+            return output;
+        };
         let name = &after_start[..end];
-        let field = fields
-            .get(name)
-            .expect("summary field references were validated with the schema");
-        output.push_str(&display_value(field));
+        match fields.get(name) {
+            Some(field) => output.push_str(&display_value(field)),
+            None => {
+                output.push('{');
+                output.push_str(name);
+                output.push('}');
+            }
+        }
         remaining = &after_start[end + 1..];
     }
     output.push_str(remaining);
@@ -703,6 +711,53 @@ messages:
             attributes: BTreeMap::new(),
             completeness: PacketCompleteness::Complete,
         }
+    }
+
+    fn summary_message(summary: &str) -> MessageSchema {
+        MessageSchema {
+            id: "test".to_owned(),
+            name: "Test message".to_owned(),
+            matches: Vec::new(),
+            is_default: false,
+            fields: Vec::new(),
+            checksums: Vec::new(),
+            summary: Some(summary.to_owned()),
+        }
+    }
+
+    fn summary_field(name: &str, value: i64) -> DecodedField {
+        DecodedField {
+            name: name.to_owned(),
+            value: DecodedValue::Integer(value),
+            display: None,
+            range: SampleRange { start: 0, end: 1 },
+            children: Vec::new(),
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn render_summary_substitutes_known_fields() {
+        let fields = [summary_field("speed", 2000)];
+
+        assert_eq!(
+            render_summary(&summary_message("Speed {speed} rpm"), &fields),
+            "Speed 2000 rpm"
+        );
+    }
+
+    #[test]
+    fn render_summary_keeps_text_for_unknown_or_unterminated_placeholders() {
+        let fields = [summary_field("speed", 2000)];
+
+        assert_eq!(
+            render_summary(&summary_message("{speed} / {missing}"), &fields),
+            "2000 / {missing}"
+        );
+        assert_eq!(
+            render_summary(&summary_message("{speed} / {oops"), &fields),
+            "2000 / {oops"
+        );
     }
 
     #[test]

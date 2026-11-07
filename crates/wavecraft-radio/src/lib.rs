@@ -23,7 +23,11 @@ pub struct RadioAnalyzerTelemetry {
     pub noise_floor_dbfs: Option<f32>,
     pub effective_squelch_dbfs: Option<f32>,
     pub timing_locked: bool,
+    /// Eye opening at the decision instants, from zero to one.
     pub timing_lock_quality: f32,
+    /// Signal-to-noise ratio of the decision variable, once enough symbols
+    /// were decided.
+    pub decision_snr_db: Option<f32>,
     pub estimated_symbol_rate_hz: Option<f64>,
     pub estimated_frequency_offset_hz: Option<f64>,
     pub estimated_tone_separation_hz: Option<f64>,
@@ -312,6 +316,7 @@ impl RadioAnalyzerRuntime {
             effective_squelch_dbfs: self.effective_squelch_dbfs,
             timing_locked: demodulator.timing_locked,
             timing_lock_quality: demodulator.timing_lock_quality,
+            decision_snr_db: demodulator.decision_snr_db,
             estimated_symbol_rate_hz: demodulator.estimated_symbol_rate_hz,
             estimated_frequency_offset_hz: demodulator.estimated_frequency_offset_hz,
             estimated_tone_separation_hz: demodulator.estimated_tone_separation_hz,
@@ -363,7 +368,9 @@ pub fn process_radio_iq(
                         analyzer_bank.analyzers[analyzer_index].push_prepared(prepared)
                     }
                     Some(Err(error)) => Err(error.clone()),
-                    None => unreachable!("demodulation work requires prepared IQ"),
+                    // Preprocessing runs whenever any analyzer needs it, so this
+                    // is only reachable if that condition changes.
+                    None => Err("demodulation preprocessing did not run".to_owned()),
                 },
             };
             let failed = analysis.is_err();

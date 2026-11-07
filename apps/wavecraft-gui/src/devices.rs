@@ -1,3 +1,5 @@
+use crate::{Path, PathBuf, REQUIRED_RESOURCE_FILES};
+
 use crate::CaptureTarget;
 use wavecraft_sdr::DiscoveredRadio;
 use wavecraft_usb::{DeviceModel, DiscoveredDevice, LinkStatus};
@@ -109,10 +111,53 @@ pub(crate) fn usb_speed_warning(devices: &[DiscoveredDevice]) -> Option<UsbSpeed
     (!devices.is_empty()).then_some(UsbSpeedWarning { devices })
 }
 
+pub(crate) fn default_resource_directory() -> String {
+    let mut candidates = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(executable_directory) = executable.parent() {
+            #[cfg(target_os = "macos")]
+            if executable_directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("MacOS")
+            {
+                if let Some(contents_directory) = executable_directory.parent() {
+                    candidates.push(contents_directory.join("Resources/fpga"));
+                }
+            }
+            candidates.push(executable_directory.join("resources/fpga"));
+        }
+    }
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("resources/fpga"),
+    );
+    candidates.push(PathBuf::from("resources/fpga"));
+    let selected = candidates
+        .into_iter()
+        .find(|candidate| has_required_fpga_resources(candidate))
+        .unwrap_or_else(|| PathBuf::from("resources/fpga"));
+    selected
+        .canonicalize()
+        .unwrap_or(selected)
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub(crate) fn has_required_fpga_resources(directory: &Path) -> bool {
+    REQUIRED_RESOURCE_FILES
+        .iter()
+        .all(|name| directory.join(name).is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::*;
+
     use wavecraft_core::{DeviceDescriptor, DeviceId, InstrumentKind};
+
     use wavecraft_sdr::{
         ConnectionBackend, RadioCapabilities, RadioModel, RadioProvider, ValueDomain,
     };
@@ -241,5 +286,11 @@ mod tests {
         assert_eq!(warning.devices.len(), 1);
         assert_eq!(warning.devices[0].speed, UsbSpeedClass::HighSpeed);
         assert!(usb_speed_warning(&devices[1..2]).is_none());
+    }
+
+    #[test]
+    fn default_resource_directory_contains_complete_upstream_resource_set() {
+        let directory = PathBuf::from(default_resource_directory());
+        assert!(has_required_fpga_resources(&directory));
     }
 }

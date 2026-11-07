@@ -1,5 +1,4 @@
 use crate::DspError;
-use std::collections::VecDeque;
 use std::f64::consts::{PI, TAU};
 use std::ops::Range;
 use wavecraft_core::IqBatch;
@@ -7,15 +6,34 @@ use wavecraft_core::IqBatch;
 const DC_TRACKING_GAIN: f64 = 1.0 / 16_384.0;
 const MIXER_RENORMALIZE_INTERVAL: u32 = 4_096;
 
+/// Longest channel filter the channelizer builds or accepts.
+pub const MAX_FILTER_TAP_COUNT: usize = 4_095;
+const MIN_AUTOMATIC_TAP_COUNT: usize = 15;
+/// Stopband attenuation the Kaiser window is shaped for.
+const STOPBAND_ATTENUATION_DB: f64 = 60.0;
+/// Width of the automatic design's transition band, centred on the channel
+/// edge, as a fraction of the channel bandwidth.
+const TRANSITION_BANDWIDTH_FRACTION: f64 = 0.25;
+/// Most fractional-delay filters kept for one channel. Ratios whose reduced
+/// denominator is at most this are resampled exactly; anything else snaps the
+/// output instant to the nearest 1/64 of an input sample.
+const MAX_FRACTIONAL_PHASES: u64 = 64;
+/// Independent accumulators in the FIR dot product. Floating-point addition is
+/// not associative, so the compiler only vectorizes the reduction when the
+/// lanes are explicit.
+const DOT_LANES: usize = 8;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChannelizerConfig {
     /// Signed channel offset from the input batch center frequency.
     pub frequency_offset_hz: i64,
-    /// Full complex channel bandwidth.
+    /// Full complex channel bandwidth (the -6 dB width of the channel filter).
     pub bandwidth_hz: u64,
     /// Rate after bounded rational downsampling. Upsampling is not supported.
     pub output_sample_rate_hz: u64,
-    /// Odd windowed-sinc FIR length.
+    /// Odd Kaiser-windowed-sinc FIR length, or 0 to size the filter from the
+    /// input sample rate and the channel bandwidth (see
+    /// [`automatic_filter_tap_count`]).
     pub filter_tap_count: usize,
 }
 
@@ -34,16 +52,49 @@ impl ChannelizerConfig {
                 "radio channel bandwidth must not exceed its output sample rate",
             ));
         }
-        if self.filter_tap_count < 3
-            || self.filter_tap_count % 2 == 0
-            || self.filter_tap_count > 4_095
+        if self.filter_tap_count != 0
+            && (self.filter_tap_count < 3
+                || self.filter_tap_count % 2 == 0
+                || self.filter_tap_count > MAX_FILTER_TAP_COUNT)
         {
             return Err(DspError::new(
-                "radio channel filter must have an odd tap count between 3 and 4095",
+                "radio channel filter must have an odd tap count between 3 and 4095, or 0 for automatic",
             ));
         }
         Ok(())
     }
+
+    /// FIR length used for an input stream at `input_sample_rate_hz`: the
+    /// configured length, or the automatic design when it is 0.
+    pub fn resolved_filter_tap_count(&self, input_sample_rate_hz: u64) -> usize {
+        if self.filter_tap_count == 0 {
+            automatic_filter_tap_count(input_sample_rate_hz, self.bandwidth_hz)
+        } else {
+            self.filter_tap_count
+        }
+    }
+}
+
+/// Odd FIR length whose Kaiser-windowed-sinc low pass has a transition band
+/// of a quarter of `bandwidth_hz` (centred on the channel edge) and 60 dB of
+/// stopband attenuation at `input_sample_rate_hz`.
+///
+/// The length grows in proportion to the input rate: a fixed 257-tap filter
+/// that cuts a 200 kHz channel cleanly out of a 2 MS/s capture leaves an
+/// adjacent channel only about 29 dB down at 20 MS/s. The result is clamped to
+/// [`MAX_FILTER_TAP_COUNT`], so very wide captures of narrow channels get a
+/// wider transition band instead of a longer filter.
+pub fn automatic_filter_tap_count(input_sample_rate_hz: u64, bandwidth_hz: u64) -> usize {
+    let transition_hz = (bandwidth_hz as f64 * TRANSITION_BANDWIDTH_FRACTION).max(1.0);
+    let normalized_width = TAU * transition_hz / input_sample_rate_hz.max(1) as f64;
+    // Kaiser's estimate: N = (A - 7.95) / (2.285 * delta_omega) + 1.
+    let estimate = (STOPBAND_ATTENUATION_DB - 7.95) / (2.285 * normalized_width) + 1.0;
+    let taps = if estimate.is_finite() {
+        estimate.ceil().min(MAX_FILTER_TAP_COUNT as f64) as usize
+    } else {
+        MAX_FILTER_TAP_COUNT
+    };
+    (taps | 1).clamp(MIN_AUTOMATIC_TAP_COUNT, MAX_FILTER_TAP_COUNT)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,13 +205,89 @@ impl WidebandIqPreprocessor {
     }
 }
 
+/// Low-pass filter evaluated at a set of fractional output instants.
+///
+/// Row `p` holds the Kaiser-windowed sinc centred `p / phase_count` of an
+/// input sample after the middle tap, so an output can be produced at any
+/// rational point of the input timeline instead of being snapped to the
+/// nearest input sample. With a rational ratio `P/Q` the fractional offsets are
+/// multiples of `1/Q`, which the bank reproduces exactly while `Q` stays within
+/// [`MAX_FRACTIONAL_PHASES`].
+struct FilterBank {
+    tap_count: usize,
+    phase_count: usize,
+    /// Output-rate units per phase when the bank is exact.
+    exact_phase_step: Option<u64>,
+    output_rate_hz: u64,
+    taps: Vec<f32>,
+}
+
+impl FilterBank {
+    fn design(
+        input_rate_hz: u64,
+        output_rate_hz: u64,
+        bandwidth_hz: u64,
+        tap_count: usize,
+    ) -> Self {
+        let divisor = gcd(input_rate_hz, output_rate_hz);
+        let denominator = output_rate_hz / divisor;
+        let exact = denominator <= MAX_FRACTIONAL_PHASES;
+        let phase_count = denominator.min(MAX_FRACTIONAL_PHASES) as usize;
+        let cutoff = bandwidth_hz as f64 / (2.0 * input_rate_hz as f64);
+        let mut taps = Vec::with_capacity(phase_count * tap_count);
+        for phase in 0..phase_count {
+            let delay = phase as f64 / phase_count as f64;
+            taps.extend(design_low_pass_phase(cutoff, tap_count, delay));
+        }
+        Self {
+            tap_count,
+            phase_count,
+            exact_phase_step: exact.then_some(divisor),
+            output_rate_hz,
+            taps,
+        }
+    }
+
+    /// Filter row for an output instant `remainder / output_rate` of an input
+    /// sample after its integer position, plus the number of whole input
+    /// samples the window moves when rounding reaches the next sample.
+    fn locate(&self, remainder: u64) -> (usize, u64) {
+        if let Some(step) = self.exact_phase_step {
+            return ((remainder / step) as usize, 0);
+        }
+        let phases = self.phase_count as u64;
+        let row = (remainder * phases + self.output_rate_hz / 2) / self.output_rate_hz;
+        if row == phases {
+            (0, 1)
+        } else {
+            (row as usize, 0)
+        }
+    }
+
+    fn row(&self, row: usize) -> &[f32] {
+        &self.taps[row * self.tap_count..(row + 1) * self.tap_count]
+    }
+}
+
 /// Incremental frequency translator, low-pass filter, and rate reducer.
+///
+/// The input is mixed to baseband into a flat buffer, and every output is one
+/// dot product over a contiguous window of it, so the work per output is
+/// `tap_count` multiply-adds regardless of how the input was batched.
 pub struct Channelizer {
     config: ChannelizerConfig,
     preprocessor: WidebandIqPreprocessor,
-    filter: Vec<f64>,
-    filter_sample_rate_hz: Option<u64>,
-    history: VecDeque<(f64, f64, u64)>,
+    bank: Option<FilterBank>,
+    bank_input_rate_hz: Option<u64>,
+    mixed_i: Vec<f32>,
+    mixed_q: Vec<f32>,
+    /// Source index of `mixed_i[0]`.
+    buffer_start_index: u64,
+    /// Source index of the input sample the next output is centred on, before
+    /// its fractional offset.
+    next_centre_index: u64,
+    /// Fractional offset of the next output, in output-rate units.
+    next_fraction: u64,
     expected_next_index: Option<u64>,
     input_sample_rate_hz: Option<u64>,
     input_center_frequency_hz: Option<u64>,
@@ -170,7 +297,6 @@ pub struct Channelizer {
     mixer_step_i: f64,
     mixer_step_q: f64,
     mixer_samples_since_normalize: u32,
-    resample_accumulator: u64,
     pending_discontinuity: bool,
 }
 
@@ -178,11 +304,15 @@ impl Channelizer {
     pub fn new(config: ChannelizerConfig) -> Result<Self, DspError> {
         config.validate()?;
         Ok(Self {
-            history: VecDeque::with_capacity(config.filter_tap_count),
             config,
             preprocessor: WidebandIqPreprocessor::new(),
-            filter: Vec::new(),
-            filter_sample_rate_hz: None,
+            bank: None,
+            bank_input_rate_hz: None,
+            mixed_i: Vec::new(),
+            mixed_q: Vec::new(),
+            buffer_start_index: 0,
+            next_centre_index: 0,
+            next_fraction: 0,
             expected_next_index: None,
             input_sample_rate_hz: None,
             input_center_frequency_hz: None,
@@ -192,7 +322,6 @@ impl Channelizer {
             mixer_step_i: 1.0,
             mixer_step_q: 0.0,
             mixer_samples_since_normalize: 0,
-            resample_accumulator: 0,
             pending_discontinuity: false,
         })
     }
@@ -203,9 +332,13 @@ impl Channelizer {
 
     pub fn reset(&mut self) {
         self.preprocessor.reset();
-        self.filter.clear();
-        self.filter_sample_rate_hz = None;
-        self.history.clear();
+        self.bank = None;
+        self.bank_input_rate_hz = None;
+        self.mixed_i.clear();
+        self.mixed_q.clear();
+        self.buffer_start_index = 0;
+        self.next_centre_index = 0;
+        self.next_fraction = 0;
         self.expected_next_index = None;
         self.input_sample_rate_hz = None;
         self.input_center_frequency_hz = None;
@@ -215,7 +348,6 @@ impl Channelizer {
         self.mixer_step_i = 1.0;
         self.mixer_step_q = 0.0;
         self.mixer_samples_since_normalize = 0;
-        self.resample_accumulator = 0;
         self.pending_discontinuity = true;
     }
 
@@ -238,65 +370,8 @@ impl Channelizer {
 
         let selected_frequency =
             selected_frequency(batch.center_frequency_hz, self.config.frequency_offset_hz)?;
-        let mut output = Vec::new();
-        for (offset, input) in batch.samples.iter().enumerate() {
-            let source_index = batch.first_sample_index.saturating_add(offset as u64);
-            let mixed = (
-                input.0 * self.mixer_i - input.1 * self.mixer_q,
-                input.0 * self.mixer_q + input.1 * self.mixer_i,
-            );
-            let next_i = self.mixer_i * self.mixer_step_i - self.mixer_q * self.mixer_step_q;
-            let next_q = self.mixer_i * self.mixer_step_q + self.mixer_q * self.mixer_step_i;
-            self.mixer_i = next_i;
-            self.mixer_q = next_q;
-            self.mixer_samples_since_normalize += 1;
-            if self.mixer_samples_since_normalize == MIXER_RENORMALIZE_INTERVAL {
-                let magnitude = self.mixer_i.hypot(self.mixer_q);
-                if magnitude > f64::EPSILON {
-                    self.mixer_i /= magnitude;
-                    self.mixer_q /= magnitude;
-                }
-                self.mixer_samples_since_normalize = 0;
-            }
-
-            self.history.push_back((mixed.0, mixed.1, source_index));
-            if self.history.len() > self.config.filter_tap_count {
-                self.history.pop_front();
-            }
-            if self.history.len() != self.config.filter_tap_count {
-                continue;
-            }
-
-            self.resample_accumulator = self
-                .resample_accumulator
-                .saturating_add(self.config.output_sample_rate_hz);
-            if self.resample_accumulator < batch.sample_rate_hz {
-                continue;
-            }
-            self.resample_accumulator -= batch.sample_rate_hz;
-
-            let (i, q) = self.history.iter().zip(&self.filter).fold(
-                (0.0, 0.0),
-                |sum, (sample, coefficient)| {
-                    (
-                        sum.0 + sample.0 * coefficient,
-                        sum.1 + sample.1 * coefficient,
-                    )
-                },
-            );
-            let first = self.history.front().map_or(source_index, |sample| sample.2);
-            let end = self
-                .history
-                .back()
-                .map_or(source_index.saturating_add(1), |sample| {
-                    sample.2.saturating_add(1)
-                });
-            output.push(TimedComplexSample {
-                i: i as f32,
-                q: q as f32,
-                source_range: first..end,
-            });
-        }
+        self.mix(&batch.samples);
+        let (output, filter_delay_input_samples) = self.filter(batch.sample_rate_hz);
 
         self.expected_next_index = Some(
             batch
@@ -314,7 +389,7 @@ impl Channelizer {
             segment_start_sample_index: self
                 .segment_start_sample_index
                 .unwrap_or(batch.first_sample_index),
-            filter_delay_input_samples: (self.config.filter_tap_count / 2) as u64,
+            filter_delay_input_samples,
             discontinuity,
             samples: output,
         })
@@ -338,15 +413,22 @@ impl Channelizer {
     }
 
     fn reset_for_batch(&mut self, batch: &PreparedIqBatch) {
-        self.history.clear();
-        if self.filter_sample_rate_hz != Some(batch.sample_rate_hz) {
-            self.filter = design_low_pass(
+        if self.bank_input_rate_hz != Some(batch.sample_rate_hz) {
+            self.bank = Some(FilterBank::design(
                 batch.sample_rate_hz,
+                self.config.output_sample_rate_hz,
                 self.config.bandwidth_hz,
-                self.config.filter_tap_count,
-            );
-            self.filter_sample_rate_hz = Some(batch.sample_rate_hz);
+                self.config.resolved_filter_tap_count(batch.sample_rate_hz),
+            ));
+            self.bank_input_rate_hz = Some(batch.sample_rate_hz);
         }
+        let half = self.bank.as_ref().map_or(0, |bank| bank.tap_count / 2) as u64;
+        self.mixed_i.clear();
+        self.mixed_q.clear();
+        self.buffer_start_index = batch.first_sample_index;
+        // The first output is centred on the middle of the first full window.
+        self.next_centre_index = batch.first_sample_index.saturating_add(half);
+        self.next_fraction = 0;
         self.expected_next_index = None;
         self.input_sample_rate_hz = Some(batch.sample_rate_hz);
         self.input_center_frequency_hz = Some(batch.center_frequency_hz);
@@ -360,9 +442,136 @@ impl Channelizer {
         self.mixer_i = mixer_phase.cos();
         self.mixer_q = mixer_phase.sin();
         self.mixer_samples_since_normalize = 0;
-        self.resample_accumulator = 0;
         self.pending_discontinuity = true;
     }
+
+    /// Translates `samples` to baseband and appends them to the filter buffer.
+    fn mix(&mut self, samples: &[(f64, f64)]) {
+        let old_length = self.mixed_i.len();
+        self.mixed_i.resize(old_length + samples.len(), 0.0);
+        self.mixed_q.resize(old_length + samples.len(), 0.0);
+        let mut destination_i = &mut self.mixed_i[old_length..];
+        let mut destination_q = &mut self.mixed_q[old_length..];
+        let (mut mixer_i, mut mixer_q) = (self.mixer_i, self.mixer_q);
+        let (step_i, step_q) = (self.mixer_step_i, self.mixer_step_q);
+        let mut remaining = samples;
+        while !remaining.is_empty() {
+            let until_normalize =
+                (MIXER_RENORMALIZE_INTERVAL - self.mixer_samples_since_normalize) as usize;
+            let block = remaining.len().min(until_normalize);
+            let (input, rest) = remaining.split_at(block);
+            let (block_i, rest_i) = destination_i.split_at_mut(block);
+            let (block_q, rest_q) = destination_q.split_at_mut(block);
+            for ((&(x, y), out_i), out_q) in
+                input.iter().zip(block_i.iter_mut()).zip(block_q.iter_mut())
+            {
+                *out_i = (x * mixer_i - y * mixer_q) as f32;
+                *out_q = (x * mixer_q + y * mixer_i) as f32;
+                let next_i = mixer_i * step_i - mixer_q * step_q;
+                let next_q = mixer_i * step_q + mixer_q * step_i;
+                mixer_i = next_i;
+                mixer_q = next_q;
+            }
+            self.mixer_samples_since_normalize += block as u32;
+            if self.mixer_samples_since_normalize == MIXER_RENORMALIZE_INTERVAL {
+                let magnitude = mixer_i.hypot(mixer_q);
+                if magnitude > f64::EPSILON {
+                    mixer_i /= magnitude;
+                    mixer_q /= magnitude;
+                }
+                self.mixer_samples_since_normalize = 0;
+            }
+            remaining = rest;
+            destination_i = rest_i;
+            destination_q = rest_q;
+        }
+        self.mixer_i = mixer_i;
+        self.mixer_q = mixer_q;
+    }
+
+    /// Produces every output whose window is fully buffered, then drops the
+    /// samples no later window needs.
+    fn filter(&mut self, input_rate_hz: u64) -> (Vec<TimedComplexSample>, u64) {
+        let Some(bank) = self.bank.as_ref() else {
+            return (Vec::new(), 0);
+        };
+        let tap_count = bank.tap_count;
+        let half = (tap_count / 2) as u64;
+        let output_rate_hz = self.config.output_sample_rate_hz;
+        let whole_step = input_rate_hz / output_rate_hz;
+        let fraction_step = input_rate_hz % output_rate_hz;
+        let buffer_end = self.buffer_start_index + self.mixed_i.len() as u64;
+
+        let available = buffer_end.saturating_sub(self.next_centre_index.saturating_sub(half));
+        let mut output =
+            Vec::with_capacity((available / whole_step.max(1)).saturating_add(1) as usize);
+        loop {
+            let (row, carry) = bank.locate(self.next_fraction);
+            let start = self.next_centre_index - half + carry;
+            let end = start + tap_count as u64;
+            if end > buffer_end {
+                break;
+            }
+            let offset = (start - self.buffer_start_index) as usize;
+            let (i, q) = dot_pair(
+                &self.mixed_i[offset..offset + tap_count],
+                &self.mixed_q[offset..offset + tap_count],
+                bank.row(row),
+            );
+            output.push(TimedComplexSample {
+                i,
+                q,
+                source_range: start..end,
+            });
+
+            self.next_centre_index += whole_step;
+            self.next_fraction += fraction_step;
+            if self.next_fraction >= output_rate_hz {
+                self.next_fraction -= output_rate_hz;
+                self.next_centre_index += 1;
+            }
+        }
+
+        let keep_from = self.next_centre_index - half;
+        let consumed = keep_from
+            .saturating_sub(self.buffer_start_index)
+            .min(self.mixed_i.len() as u64) as usize;
+        self.mixed_i.drain(..consumed);
+        self.mixed_q.drain(..consumed);
+        self.buffer_start_index += consumed as u64;
+        (output, half)
+    }
+}
+
+/// Inner products of two sample windows with one set of taps.
+fn dot_pair(window_i: &[f32], window_q: &[f32], taps: &[f32]) -> (f32, f32) {
+    let mut accumulator_i = [0.0_f32; DOT_LANES];
+    let mut accumulator_q = [0.0_f32; DOT_LANES];
+    let mut chunks_i = window_i.chunks_exact(DOT_LANES);
+    let mut chunks_q = window_q.chunks_exact(DOT_LANES);
+    let mut chunks_taps = taps.chunks_exact(DOT_LANES);
+    for ((chunk_i, chunk_q), chunk_taps) in chunks_i
+        .by_ref()
+        .zip(chunks_q.by_ref())
+        .zip(chunks_taps.by_ref())
+    {
+        for lane in 0..DOT_LANES {
+            accumulator_i[lane] += chunk_i[lane] * chunk_taps[lane];
+            accumulator_q[lane] += chunk_q[lane] * chunk_taps[lane];
+        }
+    }
+    let mut sum_i = accumulator_i.iter().sum::<f32>();
+    let mut sum_q = accumulator_q.iter().sum::<f32>();
+    for ((&i, &q), &tap) in chunks_i
+        .remainder()
+        .iter()
+        .zip(chunks_q.remainder())
+        .zip(chunks_taps.remainder())
+    {
+        sum_i += i * tap;
+        sum_q += q * tap;
+    }
+    (sum_i, sum_q)
 }
 
 fn selected_frequency(center_frequency_hz: u64, offset_hz: i64) -> Result<u64, DspError> {
@@ -375,26 +584,58 @@ fn wrap_phase(phase: f64) -> f64 {
     (phase + PI).rem_euclid(TAU) - PI
 }
 
-fn design_low_pass(sample_rate_hz: u64, bandwidth_hz: u64, tap_count: usize) -> Vec<f64> {
-    let cutoff = bandwidth_hz as f64 / (2.0 * sample_rate_hz as f64);
-    let midpoint = (tap_count / 2) as isize;
+fn gcd(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left.max(1)
+}
+
+/// Zeroth-order modified Bessel function of the first kind.
+fn bessel_i0(x: f64) -> f64 {
+    let quarter_square = x * x / 4.0;
+    let mut term = 1.0;
+    let mut sum = 1.0;
+    for k in 1..80 {
+        term *= quarter_square / (k * k) as f64;
+        sum += term;
+        if term < sum * 1e-17 {
+            break;
+        }
+    }
+    sum
+}
+
+/// Kaiser-windowed sinc, sampled so its centre sits `delay` input samples
+/// after the middle tap, normalized to unit gain at DC.
+///
+/// `cutoff` is the -6 dB frequency in cycles per input sample.
+fn design_low_pass_phase(cutoff: f64, tap_count: usize, delay: f64) -> Vec<f32> {
+    let beta = 0.1102 * (STOPBAND_ATTENUATION_DB - 8.7);
+    let window_norm = bessel_i0(beta);
+    let middle = (tap_count / 2) as f64;
+    // One sample wider than the filter so a delayed window still reaches zero
+    // inside the last tap.
+    let half_width = middle + 1.0;
     let mut taps = (0..tap_count)
         .map(|index| {
-            let offset = index as isize - midpoint;
-            let sinc = if offset == 0 {
-                2.0 * cutoff
+            let position = index as f64 - middle - delay;
+            let argument = 2.0 * cutoff * position;
+            let sinc = if argument.abs() < 1e-12 {
+                1.0
             } else {
-                (2.0 * PI * cutoff * offset as f64).sin() / (PI * offset as f64)
+                (PI * argument).sin() / (PI * argument)
             };
-            let window = 0.54 - 0.46 * (TAU * index as f64 / (tap_count - 1) as f64).cos();
-            sinc * window
+            let ratio = position / half_width;
+            let window = bessel_i0(beta * (1.0 - ratio * ratio).max(0.0).sqrt()) / window_norm;
+            2.0 * cutoff * sinc * window
         })
         .collect::<Vec<_>>();
     let sum = taps.iter().sum::<f64>();
     for tap in &mut taps {
         *tap /= sum;
     }
-    taps
+    taps.into_iter().map(|tap| tap as f32).collect()
 }
 
 #[cfg(test)]
@@ -514,6 +755,122 @@ mod tests {
 
         assert!(mean_magnitude(&desired) > 0.70);
         assert!(mean_magnitude(&rejected) < mean_magnitude(&desired) * 0.02);
+    }
+
+    /// Phase advance per output sample of a channelized tone.
+    fn phase_steps(batch: &ChannelizedBatch) -> Vec<f64> {
+        batch
+            .samples
+            .windows(2)
+            .map(|pair| {
+                let (previous, next) = (&pair[0], &pair[1]);
+                let real = f64::from(next.i * previous.i + next.q * previous.q);
+                let imaginary = f64::from(next.q * previous.i - next.i * previous.q);
+                imaginary.atan2(real)
+            })
+            .collect()
+    }
+
+    fn assert_constant_phase_steps(output_rate_hz: u64, tolerance_rad: f64) {
+        let mut channelizer = Channelizer::new(ChannelizerConfig {
+            frequency_offset_hz: 1_000,
+            bandwidth_hz: 1_000,
+            output_sample_rate_hz: output_rate_hz,
+            filter_tap_count: 65,
+        })
+        .unwrap();
+        // 1.3 kHz is 300 Hz above the channel centre.
+        let output = channelizer
+            .push(&tone_batch_at(0, 4_000, false, 1_300.0))
+            .unwrap();
+        let expected = TAU * 300.0 / output_rate_hz as f64;
+        let steps = phase_steps(&output);
+        assert!(steps.len() > 100);
+        for (index, step) in steps.iter().enumerate().skip(4) {
+            assert!(
+                (step - expected).abs() < tolerance_rad,
+                "output {index}: phase step {step} differs from {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_integer_decimation_keeps_the_output_instants_uniform() {
+        // 8000 / 2500 = 3.2 input samples per output. Snapping each output to
+        // the nearest input sample would move it by up to 0.1 rad of tone phase
+        // at 300 Hz; the fractional-delay bank is exact because the ratio has
+        // a small denominator.
+        assert_constant_phase_steps(2_500, 0.02);
+    }
+
+    #[test]
+    fn ratios_beyond_the_exact_phase_count_stay_within_a_fraction_of_a_sample() {
+        // 8000 / 2999 reduces to a denominator far above 64 phases, so each
+        // output is placed at the nearest 1/64 of an input sample.
+        assert_constant_phase_steps(2_999, 0.02);
+    }
+
+    #[test]
+    fn automatic_filter_length_tracks_the_input_rate_and_stays_odd() {
+        let slow = automatic_filter_tap_count(2_000_000, 200_000);
+        let fast = automatic_filter_tap_count(20_000_000, 200_000);
+        assert_eq!(slow % 2, 1);
+        assert_eq!(fast % 2, 1);
+        assert!((140..=160).contains(&slow), "{slow}");
+        // Ten times the rate needs ten times the taps for the same transition.
+        assert!((1_400..=1_500).contains(&fast), "{fast}");
+        assert_eq!(
+            automatic_filter_tap_count(1_000_000_000, 1_000),
+            MAX_FILTER_TAP_COUNT
+        );
+        assert!(automatic_filter_tap_count(8_000, 4_000) >= 15);
+    }
+
+    #[test]
+    fn automatic_filter_keeps_adjacent_channel_rejection_at_any_input_rate() {
+        let rejection_db = |input_rate_hz: u64, tone_offset_hz: f64| {
+            let config = ChannelizerConfig {
+                frequency_offset_hz: 0,
+                bandwidth_hz: 2_000,
+                output_sample_rate_hz: 5_000,
+                filter_tap_count: 0,
+            };
+            let power = |frequency_hz: f64, config: &ChannelizerConfig| {
+                let mut channelizer = Channelizer::new(config.clone()).unwrap();
+                let samples = (0..40_000)
+                    .map(|index| {
+                        let phase = TAU * frequency_hz * index as f64 / input_rate_hz as f64;
+                        Iq8 {
+                            i: (100.0 * phase.cos()).round() as i8,
+                            q: (100.0 * phase.sin()).round() as i8,
+                        }
+                    })
+                    .collect();
+                let output = channelizer
+                    .push(&IqBatch {
+                        sample_rate_hz: input_rate_hz,
+                        center_frequency_hz: 100_000_000,
+                        first_sample_index: 0,
+                        discontinuity: true,
+                        samples,
+                    })
+                    .unwrap();
+                let skip = output.samples.len() / 2;
+                output.samples[skip..]
+                    .iter()
+                    .map(|sample| f64::from(sample.i).powi(2) + f64::from(sample.q).powi(2))
+                    .sum::<f64>()
+                    / (output.samples.len() - skip) as f64
+            };
+            10.0 * (power(tone_offset_hz, &config) / power(500.0, &config)).log10()
+        };
+        // A tone 1.5x the bandwidth from the centre must be well down whether
+        // the capture runs at 40 kS/s or 400 kS/s; a fixed tap count would
+        // lose that selectivity at the higher rate.
+        for input_rate_hz in [40_000, 400_000] {
+            let rejection = rejection_db(input_rate_hz, 3_000.0);
+            assert!(rejection < -50.0, "{input_rate_hz} S/s: {rejection:.1} dB");
+        }
     }
 
     #[test]

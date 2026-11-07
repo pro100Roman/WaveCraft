@@ -993,9 +993,12 @@ fn paint_analysis(
         }
         if telemetry.timing_locked {
             status.push_str(&format!(
-                " · timing {:.0}%",
+                " · eye {:.0}%",
                 telemetry.timing_lock_quality * 100.0
             ));
+            if let Some(snr) = telemetry.decision_snr_db {
+                status.push_str(&format!(" · SNR {snr:.0} dB"));
+            }
         }
     }
     selectable_overlay_label(
@@ -1065,6 +1068,16 @@ fn paint_analysis(
     }
 }
 
+const RAW_MESSAGE_ROW_HEIGHT: f32 = 22.0;
+const RAW_MESSAGE_BYTE_CELL_WIDTH: f32 = 24.0;
+const RAW_MESSAGE_TIMESTAMP_WIDTH: f32 = 84.0;
+const RAW_MESSAGE_CHANNEL_WIDTH: f32 = 60.0;
+const RAW_MESSAGE_SECTION_WIDTH: f32 = 38.0;
+const RAW_MESSAGE_PREAMBLE_WIDTH: f32 = 30.0;
+const RAW_MESSAGE_LENGTH_WIDTH: f32 = 52.0;
+const RAW_MESSAGE_SCROLLBAR_WIDTH: f32 = 7.0;
+const RAW_MESSAGE_SCROLLBAR_GAP: f32 = 5.0;
+
 fn paint_raw_messages(
     ui: &mut egui::Ui,
     plot: Rect,
@@ -1074,18 +1087,69 @@ fn paint_raw_messages(
     scroll_rows: &mut usize,
     newest_completed_sequence: &mut Option<u64>,
 ) {
-    const ROW_HEIGHT: f32 = 22.0;
-    const BYTE_CELL_WIDTH: f32 = 24.0;
-    const TIMESTAMP_WIDTH: f32 = 84.0;
-    const CHANNEL_WIDTH: f32 = 60.0;
-    const SECTION_WIDTH: f32 = 38.0;
-    const PREAMBLE_WIDTH: f32 = 30.0;
-    const LENGTH_WIDTH: f32 = 52.0;
-    const SCROLLBAR_WIDTH: f32 = 7.0;
-    const SCROLLBAR_GAP: f32 = 5.0;
-    let visible_rows = (plot.height() / ROW_HEIGHT).floor().max(1.0) as usize;
+    let visible_rows = (plot.height() / RAW_MESSAGE_ROW_HEIGHT).floor().max(1.0) as usize;
     let completed_messages = store.completed_raw_message_count();
     let maximum_scroll = completed_messages.saturating_sub(visible_rows);
+    update_raw_message_scroll(
+        ui,
+        scroll_rect,
+        store,
+        visible_rows,
+        maximum_scroll,
+        scroll_rows,
+        newest_completed_sequence,
+    );
+    let show_scrollbar = maximum_scroll > 0;
+    let content_right = if show_scrollbar {
+        plot.right() - RAW_MESSAGE_SCROLLBAR_WIDTH - RAW_MESSAGE_SCROLLBAR_GAP
+    } else {
+        plot.right()
+    };
+    for (row, message) in store
+        .raw_messages()
+        .iter()
+        .rev()
+        .filter(|message| message.is_complete())
+        .skip(*scroll_rows)
+        .take(visible_rows)
+        .enumerate()
+    {
+        let row_rect = Rect::from_min_max(
+            Pos2::new(
+                plot.left(),
+                plot.top() + row as f32 * RAW_MESSAGE_ROW_HEIGHT,
+            ),
+            Pos2::new(
+                content_right,
+                (plot.top() + (row + 1) as f32 * RAW_MESSAGE_ROW_HEIGHT).min(plot.bottom()),
+            ),
+        );
+        paint_raw_message_row(ui, row_rect, row, message, sample_rate_hz);
+    }
+    if show_scrollbar {
+        paint_raw_message_scrollbar(
+            ui,
+            plot,
+            visible_rows,
+            completed_messages,
+            maximum_scroll,
+            scroll_rows,
+        );
+    }
+    paint_raw_message_notice(ui, plot, content_right, completed_messages, store);
+}
+
+/// Keeps the scrolled-to messages in place while newer ones arrive, then
+/// applies the mouse wheel.
+fn update_raw_message_scroll(
+    ui: &mut egui::Ui,
+    scroll_rect: Rect,
+    store: &RadioAnalysisStore,
+    visible_rows: usize,
+    maximum_scroll: usize,
+    scroll_rows: &mut usize,
+    newest_completed_sequence: &mut Option<u64>,
+) {
     let completed_newest_first = || {
         store
             .raw_messages()
@@ -1114,302 +1178,368 @@ fn paint_raw_messages(
             *scroll_rows = scroll_rows.saturating_sub(1);
         }
     }
-    let show_scrollbar = maximum_scroll > 0;
-    let content_right = if show_scrollbar {
-        plot.right() - SCROLLBAR_WIDTH - SCROLLBAR_GAP
-    } else {
-        plot.right()
-    };
-    for (row, message) in store
-        .raw_messages()
-        .iter()
-        .rev()
-        .filter(|message| message.is_complete())
-        .skip(*scroll_rows)
-        .take(visible_rows)
-        .enumerate()
-    {
-        let row_rect = Rect::from_min_max(
-            Pos2::new(plot.left(), plot.top() + row as f32 * ROW_HEIGHT),
-            Pos2::new(
-                content_right,
-                (plot.top() + (row + 1) as f32 * ROW_HEIGHT).min(plot.bottom()),
-            ),
-        );
-        ui.painter().rect_filled(
-            row_rect,
-            2.0,
-            if row % 2 == 0 {
-                Color32::from_rgb(15, 22, 31)
-            } else {
-                Color32::from_rgb(11, 17, 25)
-            },
-        );
-        ui.painter().text(
-            row_rect.left_center() + Vec2::new(5.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            format_capture_timestamp(message.start_sample(), sample_rate_hz),
-            FontId::monospace(9.0),
-            Color32::from_rgb(105, 120, 140),
-        );
+}
 
-        let mut x = row_rect.left() + TIMESTAMP_WIDTH;
-        let right_limit = row_rect.right() - LENGTH_WIDTH;
-        let channel_rect = Rect::from_min_max(
-            Pos2::new(x, row_rect.top()),
-            Pos2::new(
-                (x + CHANNEL_WIDTH - 4.0).min(right_limit).max(x),
-                row_rect.bottom(),
-            ),
-        );
-        let channel_hint_id = ui.id().with(("raw_channel_hint", message.sequence()));
-        let channel_response = ui
-            .interact(
-                channel_rect,
-                ui.id()
-                    .with(("raw_channel_hint_target", message.sequence())),
-                Sense::click(),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        if channel_response.clicked() {
-            ui.memory_mut(|memory| memory.toggle_popup(channel_hint_id));
-        }
-        paint_raw_section_label_clipped(
-            ui,
-            row_rect,
-            x,
-            CHANNEL_WIDTH - 4.0,
-            message.channel_name(),
-            Color32::from_rgb(125, 175, 145),
-        );
-        x += CHANNEL_WIDTH;
-        let preamble_bytes = message.preamble_bytes();
-        let preamble_hint_id = ui.id().with(("raw_preamble_hint", message.sequence()));
-        let preamble_rect = Rect::from_min_size(
-            Pos2::new(x, row_rect.top()),
-            Vec2::new(PREAMBLE_WIDTH, row_rect.height()),
-        );
-        let preamble_response = ui
-            .interact(
-                preamble_rect,
-                ui.id()
-                    .with(("raw_preamble_hint_target", message.sequence())),
-                Sense::click(),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        if preamble_response.clicked() {
-            ui.memory_mut(|memory| memory.toggle_popup(preamble_hint_id));
-        }
-        paint_raw_section_label(
-            ui,
-            row_rect,
-            x,
-            "PRE",
-            if preamble_response.hovered() {
-                Color32::from_rgb(255, 205, 105)
-            } else {
-                Color32::from_rgb(235, 180, 80)
-            },
-        );
-        x += PREAMBLE_WIDTH;
-        let mut data_response = None;
-        let mut data_hint_id = None;
-        if x + SECTION_WIDTH < right_limit {
-            let data_rect = Rect::from_min_max(
-                Pos2::new(x, row_rect.top()),
-                Pos2::new(right_limit, row_rect.bottom()),
-            );
-            let hint_id = ui.id().with(("raw_data_hint", message.sequence()));
-            let response = ui
-                .interact(
-                    data_rect,
-                    ui.id().with(("raw_data_hint_target", message.sequence())),
-                    Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            if response.clicked() {
-                ui.memory_mut(|memory| memory.toggle_popup(hint_id));
-            }
-            paint_raw_section_label(ui, row_rect, x, "DATA", Color32::from_rgb(105, 150, 175));
-            x += SECTION_WIDTH;
-            let _ = paint_raw_message_bytes(
-                ui,
-                row_rect,
-                x,
-                right_limit,
-                message.data_bytes(),
-                BYTE_CELL_WIDTH,
-                Color32::from_rgb(150, 220, 255),
-            );
-            data_response = Some(response);
-            data_hint_id = Some(hint_id);
-        }
-        ui.painter().text(
-            row_rect.right_center() - Vec2::new(5.0, 0.0),
-            egui::Align2::RIGHT_CENTER,
-            format!("{} B", message.data_len()),
-            FontId::monospace(10.0),
-            Color32::from_rgb(105, 150, 175),
-        );
-        let data = format_raw_hex(message.data_bytes());
-        egui::popup::popup_below_widget(
-            ui,
-            channel_hint_id,
-            &channel_response,
-            egui::popup::PopupCloseBehavior::CloseOnClickOutside,
-            |popup_ui| {
-                popup_ui.set_min_width(240.0);
-                popup_ui.set_max_width(320.0);
-                popup_ui.label(
-                    egui::RichText::new("CHANNEL")
-                        .small()
-                        .strong()
-                        .color(Color32::from_rgb(125, 175, 145)),
-                );
-                popup_ui.separator();
-                egui::Grid::new(("raw_channel_hint_grid", message.sequence()))
-                    .num_columns(2)
-                    .spacing(Vec2::new(16.0, 6.0))
-                    .show(popup_ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("Name")
-                                .small()
-                                .color(Color32::from_rgb(105, 120, 140)),
-                        );
-                        ui.label(
-                            egui::RichText::new(message.channel_name())
-                                .monospace()
-                                .strong()
-                                .color(Color32::from_rgb(165, 215, 185)),
-                        );
-                        ui.end_row();
-                        ui.label(
-                            egui::RichText::new("Frequency offset")
-                                .small()
-                                .color(Color32::from_rgb(105, 120, 140)),
-                        );
-                        ui.label(
-                            egui::RichText::new(format_channel_offset(
-                                message.channel_frequency_offset_hz(),
-                            ))
-                            .monospace()
-                            .color(Color32::from_rgb(165, 215, 185)),
-                        );
-                        ui.end_row();
-                    });
-            },
-        );
-        egui::popup::popup_below_widget(
-            ui,
-            preamble_hint_id,
-            &preamble_response,
-            egui::popup::PopupCloseBehavior::CloseOnClickOutside,
-            |popup_ui| {
-                popup_ui.set_min_width(360.0);
-                popup_ui.set_max_width(440.0);
-                popup_ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("PREAMBLE")
-                            .small()
-                            .strong()
-                            .color(Color32::from_rgb(245, 190, 90)),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("{preamble_bytes} B"))
-                            .small()
-                            .monospace()
-                            .color(Color32::from_rgb(145, 130, 100)),
-                    );
-                });
-                popup_ui.separator();
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(15, 22, 31))
-                    .rounding(egui::Rounding::same(4.0))
-                    .inner_margin(egui::Margin::same(8.0))
-                    .show(popup_ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(220.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(format_raw_hex_block(
-                                            &message.bytes()[..preamble_bytes],
-                                            16,
-                                        ))
-                                        .monospace()
-                                        .color(Color32::from_rgb(255, 205, 105)),
-                                    )
-                                    .selectable(true),
-                                );
-                            });
-                    });
-            },
-        );
-        if let (Some(hint_id), Some(response)) = (data_hint_id, data_response) {
-            egui::popup::popup_below_widget(
-                ui,
-                hint_id,
-                &response,
-                egui::popup::PopupCloseBehavior::CloseOnClickOutside,
-                |popup_ui| {
-                    popup_ui.label(
-                        egui::RichText::new(format!("DATA ({} B) {data}", message.data_len()))
-                            .monospace()
-                            .color(Color32::from_rgb(150, 220, 255)),
-                    );
-                    popup_ui.label(
-                        egui::RichText::new(format!(
-                            "UNCERTAIN {} bit(s)",
-                            message.uncertain_bits()
-                        ))
-                        .monospace()
-                        .color(Color32::from_rgb(105, 150, 175)),
-                    );
-                },
-            );
-        }
+/// One completed message: timestamp, channel, preamble and data cells, the
+/// length, and the hint popups that the cells open.
+fn paint_raw_message_row(
+    ui: &mut egui::Ui,
+    row_rect: Rect,
+    row: usize,
+    message: &RawRadioMessage,
+    sample_rate_hz: u64,
+) {
+    ui.painter().rect_filled(
+        row_rect,
+        2.0,
+        if row % 2 == 0 {
+            Color32::from_rgb(15, 22, 31)
+        } else {
+            Color32::from_rgb(11, 17, 25)
+        },
+    );
+    ui.painter().text(
+        row_rect.left_center() + Vec2::new(5.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        format_capture_timestamp(message.start_sample(), sample_rate_hz),
+        FontId::monospace(9.0),
+        Color32::from_rgb(105, 120, 140),
+    );
+
+    let mut x = row_rect.left() + RAW_MESSAGE_TIMESTAMP_WIDTH;
+    let right_limit = row_rect.right() - RAW_MESSAGE_LENGTH_WIDTH;
+    let (channel_response, channel_hint_id) =
+        paint_raw_channel_cell(ui, row_rect, x, right_limit, message);
+    x += RAW_MESSAGE_CHANNEL_WIDTH;
+    let (preamble_response, preamble_hint_id) = paint_raw_preamble_cell(ui, row_rect, x, message);
+    x += RAW_MESSAGE_PREAMBLE_WIDTH;
+    let data_cell = paint_raw_data_cell(ui, row_rect, x, right_limit, message);
+    ui.painter().text(
+        row_rect.right_center() - Vec2::new(5.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        format!("{} B", message.data_len()),
+        FontId::monospace(10.0),
+        Color32::from_rgb(105, 150, 175),
+    );
+    show_raw_channel_hint(ui, channel_hint_id, &channel_response, message);
+    show_raw_preamble_hint(ui, preamble_hint_id, &preamble_response, message);
+    if let Some((data_response, data_hint_id)) = data_cell {
+        show_raw_data_hint(ui, data_hint_id, &data_response, message);
     }
-    if show_scrollbar {
-        let track = Rect::from_min_max(
-            Pos2::new(plot.right() - SCROLLBAR_WIDTH, plot.top()),
-            plot.right_bottom(),
+}
+
+fn paint_raw_channel_cell(
+    ui: &mut egui::Ui,
+    row_rect: Rect,
+    x: f32,
+    right_limit: f32,
+    message: &RawRadioMessage,
+) -> (egui::Response, egui::Id) {
+    let channel_rect = Rect::from_min_max(
+        Pos2::new(x, row_rect.top()),
+        Pos2::new(
+            (x + RAW_MESSAGE_CHANNEL_WIDTH - 4.0)
+                .min(right_limit)
+                .max(x),
+            row_rect.bottom(),
+        ),
+    );
+    let channel_hint_id = ui.id().with(("raw_channel_hint", message.sequence()));
+    let channel_response = ui
+        .interact(
+            channel_rect,
+            ui.id()
+                .with(("raw_channel_hint_target", message.sequence())),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if channel_response.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(channel_hint_id));
+    }
+    paint_raw_section_label_clipped(
+        ui,
+        row_rect,
+        x,
+        RAW_MESSAGE_CHANNEL_WIDTH - 4.0,
+        message.channel_name(),
+        Color32::from_rgb(125, 175, 145),
+    );
+    (channel_response, channel_hint_id)
+}
+
+fn paint_raw_preamble_cell(
+    ui: &mut egui::Ui,
+    row_rect: Rect,
+    x: f32,
+    message: &RawRadioMessage,
+) -> (egui::Response, egui::Id) {
+    let preamble_hint_id = ui.id().with(("raw_preamble_hint", message.sequence()));
+    let preamble_rect = Rect::from_min_size(
+        Pos2::new(x, row_rect.top()),
+        Vec2::new(RAW_MESSAGE_PREAMBLE_WIDTH, row_rect.height()),
+    );
+    let preamble_response = ui
+        .interact(
+            preamble_rect,
+            ui.id()
+                .with(("raw_preamble_hint_target", message.sequence())),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if preamble_response.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(preamble_hint_id));
+    }
+    paint_raw_section_label(
+        ui,
+        row_rect,
+        x,
+        "PRE",
+        if preamble_response.hovered() {
+            Color32::from_rgb(255, 205, 105)
+        } else {
+            Color32::from_rgb(235, 180, 80)
+        },
+    );
+    (preamble_response, preamble_hint_id)
+}
+
+fn paint_raw_data_cell(
+    ui: &mut egui::Ui,
+    row_rect: Rect,
+    mut x: f32,
+    right_limit: f32,
+    message: &RawRadioMessage,
+) -> Option<(egui::Response, egui::Id)> {
+    let mut data_response = None;
+    let mut data_hint_id = None;
+    if x + RAW_MESSAGE_SECTION_WIDTH < right_limit {
+        let data_rect = Rect::from_min_max(
+            Pos2::new(x, row_rect.top()),
+            Pos2::new(right_limit, row_rect.bottom()),
         );
-        let thumb_height = (track.height() * visible_rows as f32 / completed_messages as f32)
-            .clamp(20.0_f32.min(track.height()), track.height());
-        let travel = (track.height() - thumb_height).max(0.0);
-        let thumb_top = track.top()
-            + travel * (*scroll_rows as f32 / maximum_scroll.max(1) as f32).clamp(0.0, 1.0);
-        let thumb = Rect::from_min_size(
-            Pos2::new(track.left(), thumb_top),
-            Vec2::new(track.width(), thumb_height),
-        );
+        let hint_id = ui.id().with(("raw_data_hint", message.sequence()));
         let response = ui
             .interact(
-                track,
-                ui.id().with("raw_message_scrollbar"),
-                Sense::click_and_drag(),
+                data_rect,
+                ui.id().with(("raw_data_hint_target", message.sequence())),
+                Sense::click(),
             )
-            .on_hover_cursor(egui::CursorIcon::ResizeVertical);
-        if response.clicked() || response.dragged() {
-            if let Some(pointer) = response.interact_pointer_pos().filter(|_| travel > 0.0) {
-                let fraction =
-                    ((pointer.y - track.top() - thumb_height / 2.0) / travel).clamp(0.0, 1.0);
-                *scroll_rows = (fraction * maximum_scroll as f32).round() as usize;
-            }
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.clicked() {
+            ui.memory_mut(|memory| memory.toggle_popup(hint_id));
         }
-        ui.painter()
-            .rect_filled(track, 3.5, Color32::from_rgb(18, 26, 36));
-        ui.painter().rect_filled(
-            thumb,
-            3.5,
-            if response.hovered() || response.dragged() {
-                Color32::from_rgb(105, 130, 160)
-            } else {
-                Color32::from_rgb(65, 82, 105)
-            },
+        paint_raw_section_label(ui, row_rect, x, "DATA", Color32::from_rgb(105, 150, 175));
+        x += RAW_MESSAGE_SECTION_WIDTH;
+        let _ = paint_raw_message_bytes(
+            ui,
+            row_rect,
+            x,
+            right_limit,
+            message.data_bytes(),
+            RAW_MESSAGE_BYTE_CELL_WIDTH,
+            Color32::from_rgb(150, 220, 255),
         );
+        data_response = Some(response);
+        data_hint_id = Some(hint_id);
     }
+    data_response.zip(data_hint_id)
+}
+
+fn show_raw_channel_hint(
+    ui: &mut egui::Ui,
+    channel_hint_id: egui::Id,
+    channel_response: &egui::Response,
+    message: &RawRadioMessage,
+) {
+    egui::popup::popup_below_widget(
+        ui,
+        channel_hint_id,
+        channel_response,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |popup_ui| {
+            popup_ui.set_min_width(240.0);
+            popup_ui.set_max_width(320.0);
+            popup_ui.label(
+                egui::RichText::new("CHANNEL")
+                    .small()
+                    .strong()
+                    .color(Color32::from_rgb(125, 175, 145)),
+            );
+            popup_ui.separator();
+            egui::Grid::new(("raw_channel_hint_grid", message.sequence()))
+                .num_columns(2)
+                .spacing(Vec2::new(16.0, 6.0))
+                .show(popup_ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Name")
+                            .small()
+                            .color(Color32::from_rgb(105, 120, 140)),
+                    );
+                    ui.label(
+                        egui::RichText::new(message.channel_name())
+                            .monospace()
+                            .strong()
+                            .color(Color32::from_rgb(165, 215, 185)),
+                    );
+                    ui.end_row();
+                    ui.label(
+                        egui::RichText::new("Frequency offset")
+                            .small()
+                            .color(Color32::from_rgb(105, 120, 140)),
+                    );
+                    ui.label(
+                        egui::RichText::new(format_channel_offset(
+                            message.channel_frequency_offset_hz(),
+                        ))
+                        .monospace()
+                        .color(Color32::from_rgb(165, 215, 185)),
+                    );
+                    ui.end_row();
+                });
+        },
+    );
+}
+
+fn show_raw_preamble_hint(
+    ui: &mut egui::Ui,
+    preamble_hint_id: egui::Id,
+    preamble_response: &egui::Response,
+    message: &RawRadioMessage,
+) {
+    let preamble_bytes = message.preamble_bytes();
+    egui::popup::popup_below_widget(
+        ui,
+        preamble_hint_id,
+        preamble_response,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |popup_ui| {
+            popup_ui.set_min_width(360.0);
+            popup_ui.set_max_width(440.0);
+            popup_ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("PREAMBLE")
+                        .small()
+                        .strong()
+                        .color(Color32::from_rgb(245, 190, 90)),
+                );
+                ui.label(
+                    egui::RichText::new(format!("{preamble_bytes} B"))
+                        .small()
+                        .monospace()
+                        .color(Color32::from_rgb(145, 130, 100)),
+                );
+            });
+            popup_ui.separator();
+            egui::Frame::none()
+                .fill(Color32::from_rgb(15, 22, 31))
+                .rounding(egui::Rounding::same(4.0))
+                .inner_margin(egui::Margin::same(8.0))
+                .show(popup_ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format_raw_hex_block(
+                                        &message.bytes()[..preamble_bytes],
+                                        16,
+                                    ))
+                                    .monospace()
+                                    .color(Color32::from_rgb(255, 205, 105)),
+                                )
+                                .selectable(true),
+                            );
+                        });
+                });
+        },
+    );
+}
+
+fn show_raw_data_hint(
+    ui: &mut egui::Ui,
+    hint_id: egui::Id,
+    response: &egui::Response,
+    message: &RawRadioMessage,
+) {
+    let data = format_raw_hex(message.data_bytes());
+    egui::popup::popup_below_widget(
+        ui,
+        hint_id,
+        response,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |popup_ui| {
+            popup_ui.label(
+                egui::RichText::new(format!("DATA ({} B) {data}", message.data_len()))
+                    .monospace()
+                    .color(Color32::from_rgb(150, 220, 255)),
+            );
+            popup_ui.label(
+                egui::RichText::new(format!("UNCERTAIN {} bit(s)", message.uncertain_bits()))
+                    .monospace()
+                    .color(Color32::from_rgb(105, 150, 175)),
+            );
+        },
+    );
+}
+
+fn paint_raw_message_scrollbar(
+    ui: &mut egui::Ui,
+    plot: Rect,
+    visible_rows: usize,
+    completed_messages: usize,
+    maximum_scroll: usize,
+    scroll_rows: &mut usize,
+) {
+    let track = Rect::from_min_max(
+        Pos2::new(plot.right() - RAW_MESSAGE_SCROLLBAR_WIDTH, plot.top()),
+        plot.right_bottom(),
+    );
+    let thumb_height = (track.height() * visible_rows as f32 / completed_messages as f32)
+        .clamp(20.0_f32.min(track.height()), track.height());
+    let travel = (track.height() - thumb_height).max(0.0);
+    let thumb_top =
+        track.top() + travel * (*scroll_rows as f32 / maximum_scroll.max(1) as f32).clamp(0.0, 1.0);
+    let thumb = Rect::from_min_size(
+        Pos2::new(track.left(), thumb_top),
+        Vec2::new(track.width(), thumb_height),
+    );
+    let response = ui
+        .interact(
+            track,
+            ui.id().with("raw_message_scrollbar"),
+            Sense::click_and_drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    if response.clicked() || response.dragged() {
+        if let Some(pointer) = response.interact_pointer_pos().filter(|_| travel > 0.0) {
+            let fraction =
+                ((pointer.y - track.top() - thumb_height / 2.0) / travel).clamp(0.0, 1.0);
+            *scroll_rows = (fraction * maximum_scroll as f32).round() as usize;
+        }
+    }
+    ui.painter()
+        .rect_filled(track, 3.5, Color32::from_rgb(18, 26, 36));
+    ui.painter().rect_filled(
+        thumb,
+        3.5,
+        if response.hovered() || response.dragged() {
+            Color32::from_rgb(105, 130, 160)
+        } else {
+            Color32::from_rgb(65, 82, 105)
+        },
+    );
+}
+
+/// The newest decoder diagnostic, or a hint while the first message is still
+/// being received.
+fn paint_raw_message_notice(
+    ui: &mut egui::Ui,
+    plot: Rect,
+    content_right: f32,
+    completed_messages: usize,
+    store: &RadioAnalysisStore,
+) {
     if let Some(diagnostic) = store.raw_diagnostics().back() {
         let diagnostic_rect = Rect::from_min_max(
             Pos2::new(plot.left(), (plot.bottom() - 18.0).max(plot.top())),
@@ -1975,6 +2105,152 @@ mod tests {
     use super::*;
     use wavecraft_decode::{ByteStatus, RadioPacket, SampleRange};
     use wavecraft_dsp::{TimedAnalogBatch, TimedSoftSymbolBatch, TimedSparseSymbolBatch};
+
+    fn completed_message_output(index: u64) -> RawRadioOutput {
+        let start = index * 100;
+        RawRadioOutput {
+            bytes: vec![TimedByte {
+                value: 0x42,
+                range: SampleRange {
+                    start,
+                    end: start + 8,
+                },
+                status: ByteStatus::default(),
+            }],
+            message_starts: vec![RawRadioMessageStart {
+                sample_index: start,
+                preamble_bytes: 0,
+                maximum_uncertain_bits: usize::MAX,
+            }],
+            diagnostics: vec![],
+            synchronized: false,
+        }
+    }
+
+    fn add_completed_messages(store: &mut RadioAnalysisStore, indexes: std::ops::Range<u64>) {
+        for index in indexes {
+            store.ingest_raw(completed_message_output(index), 0, Arc::from("Channel 1"));
+            store.finish_channel_capture(0);
+        }
+    }
+
+    fn store_with_completed_messages(count: u64) -> RadioAnalysisStore {
+        let mut store = RadioAnalysisStore::new(10_000).unwrap();
+        add_completed_messages(&mut store, 0..count);
+        store
+    }
+
+    /// The raw message list as the user scrolls it.
+    struct RawListView {
+        context: egui::Context,
+        scroll_rows: usize,
+        newest_completed_sequence: Option<u64>,
+    }
+
+    impl RawListView {
+        fn new() -> Self {
+            Self {
+                context: egui::Context::default(),
+                scroll_rows: 0,
+                newest_completed_sequence: None,
+            }
+        }
+
+        /// Paints one frame with the pointer over the pane and, when `wheel` is
+        /// not zero, a mouse wheel movement (negative scrolls down).
+        fn paint(&mut self, store: &RadioAnalysisStore, wheel: f32) {
+            // A 200 px pane leaves 168 px for the list: seven 22 px rows.
+            let rect = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(600.0, 200.0));
+            let mut events = vec![egui::Event::PointerMoved(rect.center())];
+            if wheel != 0.0 {
+                events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, wheel),
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 400.0))),
+                events,
+                ..egui::RawInput::default()
+            };
+            let _ = self.context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    paint_analysis(
+                        ui,
+                        rect,
+                        store,
+                        RadioAnalysisViewOptions {
+                            analysis_enabled: true,
+                            packet_mode: false,
+                            sample_rate_hz: 1_000_000,
+                        },
+                        &mut self.scroll_rows,
+                        &mut self.newest_completed_sequence,
+                    );
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn the_mouse_wheel_scrolls_the_raw_message_list_one_row_at_a_time_and_stops_at_the_ends() {
+        let store = store_with_completed_messages(40);
+        let mut view = RawListView::new();
+
+        view.paint(&store, 0.0);
+        assert_eq!(view.scroll_rows, 0);
+        view.paint(&store, -40.0);
+        assert_eq!(view.scroll_rows, 1);
+        view.paint(&store, -40.0);
+        assert_eq!(view.scroll_rows, 2);
+        view.paint(&store, 40.0);
+        assert_eq!(view.scroll_rows, 1);
+
+        view.paint(&store, 40.0);
+        view.paint(&store, 40.0);
+        assert_eq!(
+            view.scroll_rows, 0,
+            "the list cannot scroll above its newest message"
+        );
+
+        for _ in 0..60 {
+            view.paint(&store, -40.0);
+        }
+        assert_eq!(
+            view.scroll_rows,
+            40 - 7,
+            "the last page stays fully visible"
+        );
+    }
+
+    #[test]
+    fn a_scrolled_raw_message_list_keeps_showing_the_same_messages_when_new_ones_arrive() {
+        let mut store = store_with_completed_messages(40);
+        let mut view = RawListView::new();
+        view.paint(&store, 0.0);
+        for _ in 0..3 {
+            view.paint(&store, -40.0);
+        }
+        assert_eq!(view.scroll_rows, 3);
+
+        add_completed_messages(&mut store, 40..42);
+        view.paint(&store, 0.0);
+
+        assert_eq!(view.scroll_rows, 5);
+    }
+
+    #[test]
+    fn a_raw_message_list_at_the_top_keeps_following_the_newest_messages() {
+        let mut store = store_with_completed_messages(40);
+        let mut view = RawListView::new();
+        view.paint(&store, 0.0);
+
+        add_completed_messages(&mut store, 40..42);
+        view.paint(&store, 0.0);
+
+        assert_eq!(view.scroll_rows, 0);
+    }
 
     fn frame(index: u64, frequency: u64) -> SpectrumFrame {
         SpectrumFrame {

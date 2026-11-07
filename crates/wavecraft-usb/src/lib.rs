@@ -8,10 +8,12 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use wavecraft_core::InstrumentKind;
 
+mod ds_driver_util;
 mod dscope;
 mod dslogic;
 mod prepare;
 mod probe;
+mod queued_reads;
 mod transport;
 
 pub use dscope::{

@@ -1,0 +1,35 @@
+# cargo-deny configuration. Only the advisories check runs in CI (see
+# .github/workflows/audit.yml).
+#
+# Every ignore below needs a reason and a condition for removing it. Re-check
+# the list whenever the minimum supported Rust version or the pinned egui/rfd
+# versions change.
+
+[advisories]
+ignore = [
+    # Fixed only by zip >= 9.0.0, which needs Rust 1.88; the workspace
+    # supports Rust 1.79. All four advisories concern archive *extraction*
+    # (`ZipArchive::extract` and the stream extractor: SUID/SGID bits,
+    # symlink targets, a symlink allocation abort). wavecraft-recording never
+    # extracts: it reads single entries with `by_name`/`by_index` and writes
+    # with `ZipWriter`. Remove when the minimum Rust version allows zip 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip: SUID/SGID bits on extract(); extract() is never called, fix needs Rust 1.88" },
+    { id = "RUSTSEC-2026-0368", reason = "zip: symlink targets on extract(); extract() is never called, fix needs Rust 1.88" },
+    { id = "RUSTSEC-2026-0369", reason = "zip: permissions through symlinks on extract(); extract() is never called, fix needs Rust 1.88" },
+    { id = "RUSTSEC-2026-0429", reason = "zip: symlink allocation abort on extract(); extract() is never called, fix needs Rust 1.88" },
+
+    # Fixed by webbrowser >= 1.2.2, which needs Rust 1.85. It is only reached
+    # through egui-winit's URL opening, and the GUI never opens a URL (no
+    # hyperlinks or `open_url` calls). Remove when the minimum Rust version
+    # allows it.
+    { id = "RUSTSEC-2026-0257", reason = "webbrowser BROWSER argument injection; the GUI never opens URLs, fix needs Rust 1.85" },
+
+    # Unmaintained, with no fixed version to upgrade to. They come from the
+    # pinned egui/eframe 0.29.1 (ttf-parser) and rfd 0.15.0 (the zbus family,
+    # used for the Linux file-dialog portal). Remove when egui and rfd are
+    # upgraded to versions that no longer depend on them.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained; pulled in by egui 0.29.1, no replacement available" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant is unmaintained; pulled in by rfd 0.15.0 via zbus 4" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names is unmaintained; pulled in by rfd 0.15.0 via zbus 4" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is unmaintained; pulled in by rfd 0.15.0 via zbus 4" },
+]

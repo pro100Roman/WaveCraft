@@ -1,3 +1,5 @@
+use crate::{CaptureTarget, LogicSessionSettings, ScopeSessionSettings, WaveformViewport};
+
 pub(crate) const MAX_SESSION_TABS: usize = 10;
 pub(crate) const SESSION_NAME_MAX_CHARS: usize = 48;
 
@@ -137,9 +139,33 @@ impl<T, S> SessionTabs<T, S> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionTabAction {
+    Select(usize),
+    Add,
+    Close(usize),
+    BeginRename(usize),
+}
+
+pub(crate) struct SessionNameEditor {
+    pub(crate) target: CaptureTarget,
+    pub(crate) index: usize,
+    pub(crate) draft: String,
+    pub(crate) request_focus: bool,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CombinedSessionSettings {
+    pub(crate) logic: LogicSessionSettings,
+    pub(crate) scope: ScopeSessionSettings,
+    pub(crate) logic_ratio: f32,
+    pub(crate) viewport: WaveformViewport,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::*;
 
     #[test]
     fn session_tabs_preserve_each_tabs_capture_and_settings() {
@@ -234,5 +260,29 @@ mod tests {
         assert!(sessions.close(0));
         assert_eq!(sessions.names(), ["SPI boot", "Session 3"]);
         assert_eq!(sessions.name(0), Some("SPI boot"));
+    }
+
+    #[test]
+    fn session_tabs_preserve_selected_device_ids() {
+        let first = LogicSessionSettings {
+            device_id: Some("usb-logic-a".to_owned()),
+            ..LogicSessionSettings::default()
+        };
+        let mut sessions = SessionTabs::<(), _>::new(first);
+        let second = LogicSessionSettings {
+            device_id: Some("usb-logic-b".to_owned()),
+            ..LogicSessionSettings::default()
+        };
+
+        assert!(sessions.add(second));
+        assert_eq!(
+            sessions.active_settings().device_id.as_deref(),
+            Some("usb-logic-b")
+        );
+        assert!(sessions.select(0));
+        assert_eq!(
+            sessions.active_settings().device_id.as_deref(),
+            Some("usb-logic-a")
+        );
     }
 }
