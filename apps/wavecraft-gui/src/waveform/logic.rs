@@ -6,14 +6,13 @@ use crate::{
     egui, format_duration, format_frequency, marker_text_color, paint_empty, paint_plot_background,
     paint_plot_grid, paint_waveform_status, paint_waveform_time_scale, protocol_stack,
     scope_marker_color, split_waveform_chrome, update_waveform_viewport, waveform_sample_x,
-    Color32, Duration, FontId, LogicChannelSettingsDraft, LogicMarker, LogicMarkerSettings,
-    LogicSampleBucket, LogicTimingMeasurement, LogicWaveformOptions, Pos2,
-    ProtocolAnalyzerInstance, ProtocolAnalyzerSettings, ProtocolDecodeCache, ProtocolDecodeOutcome,
-    ProtocolDecodeSnapshot, Range, Rect, RichText, SelectableHoverText, Sense, Stroke, Vec2,
-    VecDeque, WaveformStore, WaveformViewport, WaveformViewportOptions, WaveformZoomAnchor, ACCENT,
-    BACKGROUND, GRID, LOGIC_CHANNEL_COUNT, LOGIC_CHANNEL_NAME_MAX_CHARS,
-    LOGIC_MARKER_EDGE_SNAP_DISTANCE, LOGIC_MARKER_LIMIT, PANEL, SAMPLE_COUNT, SAMPLE_RATE_HZ,
-    TEXT_MUTED,
+    Color32, Duration, FontId, LogicChannelSettingsDraft, LogicSampleBucket, LogicWaveformOptions,
+    Pos2, ProtocolAnalyzerInstance, ProtocolAnalyzerSettings, ProtocolDecodeCache,
+    ProtocolDecodeOutcome, ProtocolDecodeSnapshot, Range, Rect, RichText, SelectableHoverText,
+    Sense, Stroke, Vec2, VecDeque, WaveformStore, WaveformViewport, WaveformViewportOptions,
+    WaveformZoomAnchor, ACCENT, BACKGROUND, GRID, LOGIC_CHANNEL_COUNT,
+    LOGIC_CHANNEL_NAME_MAX_CHARS, LOGIC_MARKER_EDGE_SNAP_DISTANCE, LOGIC_MARKER_LIMIT, PANEL,
+    SAMPLE_COUNT, SAMPLE_RATE_HZ, TEXT_MUTED,
 };
 
 pub(crate) fn paint_logic_zero_reference(
@@ -1585,6 +1584,136 @@ pub(crate) fn paint_logic(
         display_sample_rate_hz,
         *viewport,
     );
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LogicMarker {
+    pub(crate) name: String,
+    pub(crate) color: Color32,
+    pub(crate) start_sample: u64,
+    pub(crate) end_sample: u64,
+    pub(crate) sample_rate_hz: u64,
+}
+
+impl LogicMarker {
+    pub(crate) fn new(
+        first_sample: u64,
+        second_sample: u64,
+        sample_rate_hz: u64,
+        color: Color32,
+    ) -> Option<Self> {
+        let (start_sample, end_sample) = if first_sample <= second_sample {
+            (first_sample, second_sample)
+        } else {
+            (second_sample, first_sample)
+        };
+        (start_sample != end_sample && sample_rate_hz != 0).then_some(Self {
+            name: String::new(),
+            color,
+            start_sample,
+            end_sample,
+            sample_rate_hz,
+        })
+    }
+
+    pub(crate) fn duration(&self) -> Duration {
+        Duration::from_secs_f64(
+            self.end_sample.saturating_sub(self.start_sample) as f64 / self.sample_rate_hz as f64,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LogicTimingMeasurement {
+    pub(crate) channel: usize,
+    pub(crate) period_start_sample: u64,
+    pub(crate) period_end_sample: u64,
+    pub(crate) period_samples: u64,
+    pub(crate) high_samples: u64,
+}
+
+impl LogicTimingMeasurement {
+    pub(crate) fn period(self, sample_rate_hz: u64) -> Duration {
+        Duration::from_secs_f64(self.period_samples as f64 / sample_rate_hz as f64)
+    }
+
+    pub(crate) fn frequency_hz(self, sample_rate_hz: u64) -> f64 {
+        sample_rate_hz as f64 / self.period_samples as f64
+    }
+
+    pub(crate) fn duty_cycle_percent(self) -> f64 {
+        self.high_samples as f64 / self.period_samples as f64 * 100.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LogicMarkerDraft {
+    pub(crate) start_sample: u64,
+    pub(crate) end_sample: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LogicMarkerSettings {
+    pub(crate) markers: Vec<LogicMarker>,
+    pub(crate) adding: bool,
+    pub(crate) draft: Option<LogicMarkerDraft>,
+}
+
+impl LogicMarkerSettings {
+    pub(crate) fn arm(&mut self) -> bool {
+        if self.markers.len() >= LOGIC_MARKER_LIMIT {
+            return false;
+        }
+        self.adding = true;
+        self.draft = None;
+        true
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.adding = false;
+        self.draft = None;
+    }
+
+    pub(crate) fn start(&mut self, sample: u64) {
+        if self.adding && self.markers.len() < LOGIC_MARKER_LIMIT {
+            self.draft = Some(LogicMarkerDraft {
+                start_sample: sample,
+                end_sample: sample,
+            });
+        }
+    }
+
+    pub(crate) fn update(&mut self, sample: u64) {
+        if let Some(draft) = &mut self.draft {
+            draft.end_sample = sample;
+        }
+    }
+
+    pub(crate) fn finish(&mut self, sample_rate_hz: u64) -> bool {
+        let Some(draft) = self.draft.take() else {
+            return false;
+        };
+        let Some(marker) = LogicMarker::new(
+            draft.start_sample,
+            draft.end_sample,
+            sample_rate_hz,
+            logic_marker_color(self.markers.len()),
+        ) else {
+            return false;
+        };
+        if self.markers.len() >= LOGIC_MARKER_LIMIT {
+            self.cancel();
+            return false;
+        }
+        self.markers.push(marker);
+        self.adding = false;
+        true
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.markers.clear();
+        self.cancel();
+    }
 }
 
 #[cfg(test)]
