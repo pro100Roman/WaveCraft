@@ -2,6 +2,7 @@
 
 pub mod app_windows;
 pub mod capture_settings_panel;
+pub mod central_panel;
 pub mod decoded_panel;
 pub mod dialogs;
 pub mod protocol_analyzer_dialog;
