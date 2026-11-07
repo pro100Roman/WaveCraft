@@ -109,26 +109,11 @@ pub(crate) fn paint_capture_settings(
     availability: CaptureSettingsAvailability,
     calibration_action: &mut Option<ScopeCalibrationAction>,
 ) -> bool {
-    let LogicCaptureSettingsEditor {
-        settings: logic_settings,
-        speed: logic_speed,
-        acquisition_mode: logic_acquisition_mode,
-        repetitive_interval_seconds,
-        smart_timing_enabled: logic_smart_timing_enabled,
-        marker_settings: logic_marker_settings,
-        protocol_analyzer,
-        displayed_sample_count: displayed_logic_sample_count,
-        displayed_sample_rate_hz: displayed_logic_sample_rate_hz,
-    } = logic_editor;
     let ScopeCaptureSettingsEditor {
         settings: scope_settings,
         auto_sample_rate: scope_auto_sample_rate,
         smart_timing_enabled: scope_smart_timing_enabled,
     } = scope_editor;
-    let ScopeVisualizationSettingsEditor {
-        channel_colors: scope_channel_colors,
-        scope_channel_names,
-    } = visualization_editor;
     let card_width = ui.available_width();
     let save_clicked = egui::Frame::none()
         .fill(BACKGROUND)
@@ -148,394 +133,528 @@ pub(crate) fn paint_capture_settings(
             ui.add_space(6.0);
             match tab {
                 CaptureSettingsTab::DsLogic => {
-                    if logic_settings.operation_mode == DsLogicOperationMode::InternalTest {
-                        logic_settings.enabled_channels = [true; LOGIC_CHANNEL_COUNT];
-                        logic_settings.trigger_enabled = false;
-                        set_logic_sample_rate_preserving_duration(
-                            logic_settings,
-                            100_000_000,
-                        );
-                    }
-                    if *logic_acquisition_mode == AcquisitionMode::Loop {
-                        logic_settings.trigger_enabled = false;
-                    }
-                    if logic_settings.operation_mode != DsLogicOperationMode::Buffer
-                        && logic_settings.trigger_mode == LogicTriggerMode::Smart
-                    {
-                        logic_settings.trigger_mode = LogicTriggerMode::Simple;
-                    }
-                    for channel in 0..LOGIC_CHANNEL_COUNT {
-                        if !logic_settings.enabled_channels[channel] {
-                            logic_settings.trigger_conditions[channel] = None;
-                            for stage in &mut logic_settings.smart_trigger_conditions {
-                                stage[channel] = None;
-                            }
-                        }
-                    }
-                    if logic_settings.trigger_enabled
-                        && logic_settings.trigger_mode == LogicTriggerMode::Simple
-                        && !logic_settings.trigger_conditions.iter().any(Option::is_some)
-                    {
-                        if let Some(channel) = logic_settings
-                            .enabled_channels
-                            .iter()
-                            .position(|enabled| *enabled)
-                        {
-                            logic_settings.trigger_conditions[channel] =
-                                Some(DsLogicTriggerCondition::RisingEdge);
-                        }
-                    }
-                    if logic_settings.trigger_enabled
-                        && logic_settings.trigger_mode == LogicTriggerMode::Smart
-                    {
-                        let default_channel = logic_settings
-                            .enabled_channels
-                            .iter()
-                            .position(|enabled| *enabled);
-                        for stage_index in
-                            0..usize::from(logic_settings.smart_trigger_stage_count)
-                        {
-                            if !logic_settings.smart_trigger_conditions[stage_index]
-                                .iter()
-                                .any(Option::is_some)
-                            {
-                                if let Some(channel) = default_channel {
-                                    logic_settings.smart_trigger_conditions[stage_index][channel] =
-                                        Some(if stage_index % 2 == 0 {
-                                            DsLogicTriggerCondition::RisingEdge
-                                        } else {
-                                            DsLogicTriggerCondition::FallingEdge
-                                        });
-                                }
-                            }
-                        }
-                    }
-                    let maximum_sample_rate_hz =
-                        logic_settings.maximum_sample_rate_hz(logic_speed);
-                    if logic_settings.sample_rate_hz > maximum_sample_rate_hz {
-                        let sample_rate_hz = DSLOGIC_SAMPLE_RATES_HZ
-                            .iter()
-                            .rev()
-                            .copied()
-                            .find(|rate| *rate <= maximum_sample_rate_hz)
-                            .unwrap_or(SAMPLE_RATE_HZ);
-                        set_logic_sample_rate_preserving_duration(
-                            logic_settings,
-                            sample_rate_hz,
-                        );
-                    }
-                    let enabled_channel_count = logic_settings
-                        .enabled_channels
-                        .iter()
-                        .filter(|enabled| **enabled)
-                        .count();
-                    egui::Grid::new("dslogic_capture_settings")
-                        .num_columns(2)
-                        .min_col_width(90.0)
-                        .max_col_width(((content_width - 12.0) * 0.5).max(90.0))
-                        .spacing([12.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Samples");
-                            ui.monospace(format_sample_count(logic_settings.sample_count));
-                            ui.end_row();
-                            ui.label("Maximum");
-                            ui.monospace(format_sample_rate(maximum_sample_rate_hz));
-                            ui.end_row();
+                    paint_logic_capture_settings(ui, logic_editor, availability, content_width);
+                }
+                CaptureSettingsTab::DsCope => {
+                    paint_scope_capture_settings(
+                        ui,
+                        scope_settings,
+                        scope_auto_sample_rate,
+                        scope_smart_timing_enabled,
+                        visualization_editor,
+                        availability,
+                        calibration_action,
+                    );
+                }
+            }
+            paint_capture_settings_save_button(
+                ui,
+                match tab {
+                    CaptureSettingsTab::DsLogic => SavedCaptureSettingsKind::LogicAnalyzer,
+                    CaptureSettingsTab::DsCope => SavedCaptureSettingsKind::Oscilloscope,
+                },
+                availability.capture,
+            )
+        })
+        .inner;
+    scope_settings.clamp_to_channel_limits();
+    save_clicked
+}
+
+fn paint_logic_capture_settings(
+    ui: &mut egui::Ui,
+    logic_editor: LogicCaptureSettingsEditor<'_>,
+    availability: CaptureSettingsAvailability,
+    content_width: f32,
+) {
+    let LogicCaptureSettingsEditor {
+        settings: logic_settings,
+        speed: logic_speed,
+        acquisition_mode: logic_acquisition_mode,
+        repetitive_interval_seconds,
+        smart_timing_enabled: logic_smart_timing_enabled,
+        marker_settings: logic_marker_settings,
+        protocol_analyzer,
+        displayed_sample_count: displayed_logic_sample_count,
+        displayed_sample_rate_hz: displayed_logic_sample_rate_hz,
+    } = logic_editor;
+    let maximum_sample_rate_hz =
+        normalize_logic_capture_settings(logic_settings, *logic_acquisition_mode, logic_speed);
+    let enabled_channel_count = logic_settings
+        .enabled_channels
+        .iter()
+        .filter(|enabled| **enabled)
+        .count();
+    paint_logic_capture_summary(
+        ui,
+        logic_settings,
+        maximum_sample_rate_hz,
+        content_width,
+        logic_smart_timing_enabled,
+    );
+    ui.add_space(8.0);
+    paint_logic_options(ui, logic_settings, availability);
+    ui.add_space(8.0);
+    paint_logic_capture_section(
+        ui,
+        logic_settings,
+        logic_acquisition_mode,
+        repetitive_interval_seconds,
+        availability,
+        maximum_sample_rate_hz,
+    );
+    ui.add_space(8.0);
+    paint_logic_channels(ui, logic_settings, availability, enabled_channel_count);
+    ui.add_space(8.0);
+    paint_logic_marker_settings(
+        ui,
+        logic_marker_settings,
+        displayed_logic_sample_count,
+        displayed_logic_sample_rate_hz,
+    );
+    ui.add_space(8.0);
+    paint_protocol_analyzer_settings(ui, protocol_analyzer, &logic_settings.enabled_channels);
+}
+
+/// Brings the logic settings into a state the panel can show: internal test
+/// mode and Loop acquisition drop the hardware trigger, Smart triggers need
+/// Buffer mode, disabled channels lose their trigger conditions, an armed
+/// trigger with no condition gets a default one, and the sample rate is limited
+/// to what the USB link allows. Returns that maximum sample rate.
+fn normalize_logic_capture_settings(
+    logic_settings: &mut LogicCaptureSettings,
+    acquisition_mode: AcquisitionMode,
+    logic_speed: UsbSpeedClass,
+) -> u64 {
+    if logic_settings.operation_mode == DsLogicOperationMode::InternalTest {
+        logic_settings.enabled_channels = [true; LOGIC_CHANNEL_COUNT];
+        logic_settings.trigger_enabled = false;
+        set_logic_sample_rate_preserving_duration(logic_settings, 100_000_000);
+    }
+    if acquisition_mode == AcquisitionMode::Loop {
+        logic_settings.trigger_enabled = false;
+    }
+    if logic_settings.operation_mode != DsLogicOperationMode::Buffer
+        && logic_settings.trigger_mode == LogicTriggerMode::Smart
+    {
+        logic_settings.trigger_mode = LogicTriggerMode::Simple;
+    }
+    for channel in 0..LOGIC_CHANNEL_COUNT {
+        if !logic_settings.enabled_channels[channel] {
+            logic_settings.trigger_conditions[channel] = None;
+            for stage in &mut logic_settings.smart_trigger_conditions {
+                stage[channel] = None;
+            }
+        }
+    }
+    if logic_settings.trigger_enabled
+        && logic_settings.trigger_mode == LogicTriggerMode::Simple
+        && !logic_settings
+            .trigger_conditions
+            .iter()
+            .any(Option::is_some)
+    {
+        if let Some(channel) = logic_settings
+            .enabled_channels
+            .iter()
+            .position(|enabled| *enabled)
+        {
+            logic_settings.trigger_conditions[channel] = Some(DsLogicTriggerCondition::RisingEdge);
+        }
+    }
+    if logic_settings.trigger_enabled && logic_settings.trigger_mode == LogicTriggerMode::Smart {
+        let default_channel = logic_settings
+            .enabled_channels
+            .iter()
+            .position(|enabled| *enabled);
+        for stage_index in 0..usize::from(logic_settings.smart_trigger_stage_count) {
+            if !logic_settings.smart_trigger_conditions[stage_index]
+                .iter()
+                .any(Option::is_some)
+            {
+                if let Some(channel) = default_channel {
+                    logic_settings.smart_trigger_conditions[stage_index][channel] =
+                        Some(if stage_index % 2 == 0 {
+                            DsLogicTriggerCondition::RisingEdge
+                        } else {
+                            DsLogicTriggerCondition::FallingEdge
                         });
-                    ui.add_space(8.0);
-                    ui.checkbox(
+                }
+            }
+        }
+    }
+    let maximum_sample_rate_hz = logic_settings.maximum_sample_rate_hz(logic_speed);
+    if logic_settings.sample_rate_hz > maximum_sample_rate_hz {
+        let sample_rate_hz = DSLOGIC_SAMPLE_RATES_HZ
+            .iter()
+            .rev()
+            .copied()
+            .find(|rate| *rate <= maximum_sample_rate_hz)
+            .unwrap_or(SAMPLE_RATE_HZ);
+        set_logic_sample_rate_preserving_duration(logic_settings, sample_rate_hz);
+    }
+    maximum_sample_rate_hz
+}
+
+/// The sample count and maximum rate, and the smart-timing option.
+fn paint_logic_capture_summary(
+    ui: &mut egui::Ui,
+    logic_settings: &mut LogicCaptureSettings,
+    maximum_sample_rate_hz: u64,
+    content_width: f32,
+    logic_smart_timing_enabled: &mut bool,
+) {
+    egui::Grid::new("dslogic_capture_settings")
+        .num_columns(2)
+        .min_col_width(90.0)
+        .max_col_width(((content_width - 12.0) * 0.5).max(90.0))
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Samples");
+            ui.monospace(format_sample_count(logic_settings.sample_count));
+            ui.end_row();
+            ui.label("Maximum");
+            ui.monospace(format_sample_rate(maximum_sample_rate_hz));
+            ui.end_row();
+        });
+    ui.add_space(8.0);
+    ui.checkbox(
                         logic_smart_timing_enabled,
                         "Smart timing on waveform hover",
                     )
                     .on_hover_selectable_text(
                         "Show edge width, rising-edge period, frequency, and duty cycle for the digital waveform under the mouse",
                     );
-                    ui.add_space(8.0);
-                    egui::CollapsingHeader::new(RichText::new("Options").strong())
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            const CONTROL_WIDTH: f32 = 100.0;
-                            ui.set_max_width(ui.available_width());
-                            ui.add_enabled_ui(availability.capture, |ui| {
-                                egui::Grid::new("dslogic_options")
-                                    .num_columns(2)
-                                    .max_col_width(126.0)
-                                    .spacing([8.0, 6.0])
-                                    .show(ui, |ui| {
-                                        ui.label("Operation mode");
-                                        let previous_operation_mode =
-                                            logic_settings.operation_mode;
-                                        egui::ComboBox::from_id_salt("logic_operation_mode")
-                                            .width(CONTROL_WIDTH)
-                                            .selected_text(match logic_settings.operation_mode {
-                                                DsLogicOperationMode::Buffer => "Buffer mode",
-                                                DsLogicOperationMode::Stream => "Stream mode",
-                                                DsLogicOperationMode::InternalTest => {
-                                                    "Internal test"
-                                                }
-                                            })
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    &mut logic_settings.operation_mode,
-                                                    DsLogicOperationMode::Buffer,
-                                                    "Buffer mode",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut logic_settings.operation_mode,
-                                                    DsLogicOperationMode::Stream,
-                                                    "Stream mode",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut logic_settings.operation_mode,
-                                                    DsLogicOperationMode::InternalTest,
-                                                    "Internal test",
-                                                );
-                                            });
-                                        if logic_settings.operation_mode
-                                            != previous_operation_mode
-                                        {
-                                            let selected_operation_mode =
-                                                logic_settings.operation_mode;
-                                            logic_settings.operation_mode =
-                                                previous_operation_mode;
-                                            set_logic_operation_mode_preserving_duration(
-                                                logic_settings,
-                                                selected_operation_mode,
-                                            );
-                                        }
-                                        ui.end_row();
+}
 
-                                        ui.label("Stop options");
-                                        ui.add_enabled_ui(
-                                            logic_settings.operation_mode
-                                                != DsLogicOperationMode::Stream,
-                                            |ui| {
-                                                egui::ComboBox::from_id_salt("logic_stop_option")
-                                                    .width(CONTROL_WIDTH)
-                                                    .selected_text(match logic_settings.stop_option {
-                                                        DsLogicStopOption::StopImmediately => {
-                                                            "Stop immediately"
-                                                        }
-                                                        DsLogicStopOption::UploadCapturedData => {
-                                                            "Upload data"
-                                                        }
-                                                    })
-                                                    .show_ui(ui, |ui| {
-                                                        ui.selectable_value(
-                                                            &mut logic_settings.stop_option,
-                                                            DsLogicStopOption::StopImmediately,
-                                                            "Stop immediately",
-                                                        );
-                                                        ui.selectable_value(
-                                                            &mut logic_settings.stop_option,
-                                                            DsLogicStopOption::UploadCapturedData,
-                                                            "Upload data",
-                                                        );
-                                                    });
-                                            },
-                                        );
-                                        ui.end_row();
+/// The collapsible DSLogic options: operation mode, stop option, threshold,
+/// input filter, RLE, and clock settings.
+const LOGIC_OPTION_CONTROL_WIDTH: f32 = 100.0;
 
-                                        ui.label("Threshold level");
-                                        ui.add(
-                                            egui::DragValue::new(
-                                                &mut logic_settings.threshold_voltage,
-                                            )
-                                            .range(0.0..=5.0)
-                                            .speed(0.1)
-                                            .fixed_decimals(1)
-                                            .suffix(" V"),
-                                        );
-                                        ui.end_row();
+fn paint_logic_options(
+    ui: &mut egui::Ui,
+    logic_settings: &mut LogicCaptureSettings,
+    availability: CaptureSettingsAvailability,
+) {
+    egui::CollapsingHeader::new(RichText::new("Options").strong())
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.set_max_width(ui.available_width());
+            ui.add_enabled_ui(availability.capture, |ui| {
+                egui::Grid::new("dslogic_options")
+                    .num_columns(2)
+                    .max_col_width(126.0)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        paint_logic_operation_mode_row(ui, logic_settings);
+                        paint_logic_stop_option_row(ui, logic_settings);
+                        ui.label("Threshold level");
+                        ui.add(
+                            egui::DragValue::new(&mut logic_settings.threshold_voltage)
+                                .range(0.0..=5.0)
+                                .speed(0.1)
+                                .fixed_decimals(1)
+                                .suffix(" V"),
+                        );
+                        ui.end_row();
 
-                                        ui.label("Filter targets");
-                                        egui::ComboBox::from_id_salt("logic_input_filter")
-                                            .width(CONTROL_WIDTH)
-                                            .selected_text(match logic_settings.input_filter {
-                                                DsLogicInputFilter::None => "None",
-                                                DsLogicInputFilter::OneSampleClock => {
-                                                    "1 sample clock"
-                                                }
-                                            })
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    &mut logic_settings.input_filter,
-                                                    DsLogicInputFilter::None,
-                                                    "None",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut logic_settings.input_filter,
-                                                    DsLogicInputFilter::OneSampleClock,
-                                                    "1 sample clock",
-                                                );
-                                            });
-                                        ui.end_row();
+                        paint_logic_input_filter_row(ui, logic_settings);
+                        ui.label("Enable RLE compress");
+                        ui.add_enabled(
+                            logic_settings.operation_mode != DsLogicOperationMode::Stream,
+                            egui::Checkbox::without_text(&mut logic_settings.rle_enabled),
+                        );
+                        ui.end_row();
 
-                                        ui.label("Enable RLE compress");
-                                        ui.add_enabled(
-                                            logic_settings.operation_mode
-                                                != DsLogicOperationMode::Stream,
-                                            egui::Checkbox::without_text(
-                                                &mut logic_settings.rle_enabled,
-                                            ),
-                                        );
-                                        ui.end_row();
+                        ui.label("Using external clock");
+                        ui.checkbox(&mut logic_settings.external_clock, "");
+                        ui.end_row();
 
-                                        ui.label("Using external clock");
-                                        ui.checkbox(&mut logic_settings.external_clock, "");
-                                        ui.end_row();
+                        ui.label("Using clock negedge");
+                        ui.checkbox(&mut logic_settings.falling_clock_edge, "");
+                        ui.end_row();
+                    });
+            });
+        });
+}
 
-                                        ui.label("Using clock negedge");
-                                        ui.checkbox(&mut logic_settings.falling_clock_edge, "");
-                                        ui.end_row();
-                                    });
-                            });
-                        });
-                    ui.add_space(8.0);
-                    let capture_summary = format!(
-                        "Capture · {} @ {}",
-                        logic_capture_duration_label(*logic_settings),
-                        format_sample_rate(logic_settings.sample_rate_hz)
+fn paint_logic_operation_mode_row(ui: &mut egui::Ui, logic_settings: &mut LogicCaptureSettings) {
+    ui.label("Operation mode");
+    let previous_operation_mode = logic_settings.operation_mode;
+    egui::ComboBox::from_id_salt("logic_operation_mode")
+        .width(LOGIC_OPTION_CONTROL_WIDTH)
+        .selected_text(match logic_settings.operation_mode {
+            DsLogicOperationMode::Buffer => "Buffer mode",
+            DsLogicOperationMode::Stream => "Stream mode",
+            DsLogicOperationMode::InternalTest => "Internal test",
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut logic_settings.operation_mode,
+                DsLogicOperationMode::Buffer,
+                "Buffer mode",
+            );
+            ui.selectable_value(
+                &mut logic_settings.operation_mode,
+                DsLogicOperationMode::Stream,
+                "Stream mode",
+            );
+            ui.selectable_value(
+                &mut logic_settings.operation_mode,
+                DsLogicOperationMode::InternalTest,
+                "Internal test",
+            );
+        });
+    if logic_settings.operation_mode != previous_operation_mode {
+        let selected_operation_mode = logic_settings.operation_mode;
+        logic_settings.operation_mode = previous_operation_mode;
+        set_logic_operation_mode_preserving_duration(logic_settings, selected_operation_mode);
+    }
+    ui.end_row();
+}
+
+fn paint_logic_stop_option_row(ui: &mut egui::Ui, logic_settings: &mut LogicCaptureSettings) {
+    ui.label("Stop options");
+    ui.add_enabled_ui(
+        logic_settings.operation_mode != DsLogicOperationMode::Stream,
+        |ui| {
+            egui::ComboBox::from_id_salt("logic_stop_option")
+                .width(LOGIC_OPTION_CONTROL_WIDTH)
+                .selected_text(match logic_settings.stop_option {
+                    DsLogicStopOption::StopImmediately => "Stop immediately",
+                    DsLogicStopOption::UploadCapturedData => "Upload data",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut logic_settings.stop_option,
+                        DsLogicStopOption::StopImmediately,
+                        "Stop immediately",
                     );
-                    egui::CollapsingHeader::new(RichText::new(capture_summary).strong())
-                        .id_salt("dslogic_capture_section")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.set_max_width(ui.available_width());
-                            egui::Grid::new("dslogic_capture_menu")
-                                .num_columns(2)
-                                .max_col_width(126.0)
-                                .spacing([8.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label("Mode");
-                                    ui.add_enabled_ui(availability.capture, |ui| {
-                                        let loop_available = logic_settings.operation_mode
-                                            == DsLogicOperationMode::Stream;
-                                        egui::ComboBox::from_id_salt("logic_acquisition_mode")
-                                            .width(100.0)
-                                            .selected_text(logic_acquisition_mode.logic_label())
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    logic_acquisition_mode,
-                                                    AcquisitionMode::Single,
-                                                    "Single",
-                                                );
-                                                ui.selectable_value(
-                                                    logic_acquisition_mode,
-                                                    AcquisitionMode::Repetitive,
-                                                    "Repetitive",
-                                                );
-                                                ui.add_enabled_ui(loop_available, |ui| {
-                                                    ui.selectable_value(
-                                                        logic_acquisition_mode,
-                                                        AcquisitionMode::Loop,
-                                                        "Loop",
-                                                    )
-                                                    .on_disabled_hover_selectable_text(
-                                                        "Loop requires DSLogic Stream mode",
-                                                    );
-                                                });
-                                            });
-                                    });
-                                    ui.end_row();
+                    ui.selectable_value(
+                        &mut logic_settings.stop_option,
+                        DsLogicStopOption::UploadCapturedData,
+                        "Upload data",
+                    );
+                });
+        },
+    );
+    ui.end_row();
+}
 
-                                    ui.label("Duration");
-                                    ui.add_enabled_ui(availability.capture, |ui| {
-                                        egui::ComboBox::from_id_salt("logic_capture_duration")
-                                            .width(100.0)
-                                            .selected_text(logic_capture_duration_label(
-                                                *logic_settings,
-                                            ))
-                                            .show_ui(ui, |ui| {
-                                                for (duration_seconds, sample_count) in
-                                                    logic_capture_duration_options(*logic_settings)
-                                                {
-                                                    ui.selectable_value(
-                                                        &mut logic_settings.sample_count,
-                                                        sample_count,
-                                                        format_duration(Duration::from_secs_f64(
-                                                            duration_seconds,
-                                                        )),
-                                                    );
-                                                }
-                                            });
-                                    });
-                                    ui.end_row();
+fn paint_logic_input_filter_row(ui: &mut egui::Ui, logic_settings: &mut LogicCaptureSettings) {
+    ui.label("Filter targets");
+    egui::ComboBox::from_id_salt("logic_input_filter")
+        .width(LOGIC_OPTION_CONTROL_WIDTH)
+        .selected_text(match logic_settings.input_filter {
+            DsLogicInputFilter::None => "None",
+            DsLogicInputFilter::OneSampleClock => "1 sample clock",
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut logic_settings.input_filter,
+                DsLogicInputFilter::None,
+                "None",
+            );
+            ui.selectable_value(
+                &mut logic_settings.input_filter,
+                DsLogicInputFilter::OneSampleClock,
+                "1 sample clock",
+            );
+        });
+    ui.end_row();
+}
 
-                                    ui.label("Sample rate");
-                                    ui.add_enabled_ui(
-                                        availability.capture
-                                            && logic_settings.operation_mode
-                                                != DsLogicOperationMode::InternalTest,
-                                        |ui| {
-                                            let previous_rate = logic_settings.sample_rate_hz;
-                                            egui::ComboBox::from_id_salt("logic_sample_rate")
-                                                .width(100.0)
-                                                .selected_text(format_sample_rate(
-                                                    logic_settings.sample_rate_hz,
-                                                ))
-                                                .show_ui(ui, |ui| {
-                                                    for rate in DSLOGIC_SAMPLE_RATES_HZ
-                                                        .iter()
-                                                        .copied()
-                                                        .filter(|rate| {
-                                                            *rate <= maximum_sample_rate_hz
-                                                        })
-                                                    {
-                                                        ui.selectable_value(
-                                                            &mut logic_settings.sample_rate_hz,
-                                                            rate,
-                                                            format_sample_rate(rate),
-                                                        );
-                                                    }
-                                                });
-                                            if logic_settings.sample_rate_hz != previous_rate {
-                                                let selected_rate = logic_settings.sample_rate_hz;
-                                                logic_settings.sample_rate_hz = previous_rate;
-                                                set_logic_sample_rate_preserving_duration(
-                                                    logic_settings,
-                                                    selected_rate,
-                                                );
-                                            }
-                                        },
-                                    );
-                                    ui.end_row();
+/// The collapsible capture section: acquisition mode, duration, sample rate,
+/// the hardware trigger, and the repeat interval.
+fn paint_logic_capture_section(
+    ui: &mut egui::Ui,
+    logic_settings: &mut LogicCaptureSettings,
+    logic_acquisition_mode: &mut AcquisitionMode,
+    repetitive_interval_seconds: &mut f32,
+    availability: CaptureSettingsAvailability,
+    maximum_sample_rate_hz: u64,
+) {
+    let capture_summary = format!(
+        "Capture · {} @ {}",
+        logic_capture_duration_label(*logic_settings),
+        format_sample_rate(logic_settings.sample_rate_hz)
+    );
+    egui::CollapsingHeader::new(RichText::new(capture_summary).strong())
+        .id_salt("dslogic_capture_section")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.set_max_width(ui.available_width());
+            egui::Grid::new("dslogic_capture_menu")
+                .num_columns(2)
+                .max_col_width(126.0)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    paint_logic_acquisition_mode_row(
+                        ui,
+                        logic_settings,
+                        logic_acquisition_mode,
+                        availability,
+                    );
+                    paint_logic_duration_row(ui, logic_settings, availability);
+                    paint_logic_sample_rate_row(
+                        ui,
+                        logic_settings,
+                        availability,
+                        maximum_sample_rate_hz,
+                    );
+                    paint_logic_hardware_trigger_row(
+                        ui,
+                        logic_settings,
+                        logic_acquisition_mode,
+                        availability,
+                    );
+                    if logic_settings.trigger_enabled {
+                        paint_logic_trigger_mode_row(ui, logic_settings, availability);
+                        paint_logic_trigger_conditions_row(ui, logic_settings, availability);
+                    }
+                    if *logic_acquisition_mode == AcquisitionMode::Repetitive {
+                        paint_logic_repeat_interval_row(
+                            ui,
+                            logic_settings,
+                            repetitive_interval_seconds,
+                            availability,
+                        );
+                    }
+                });
+        });
+}
 
-                                    ui.label("Hardware trigger");
-                                    let trigger_response = ui.add_enabled(
-                                        availability.capture
-                                            && logic_settings.operation_mode
-                                                != DsLogicOperationMode::InternalTest
-                                            && *logic_acquisition_mode != AcquisitionMode::Loop,
-                                        egui::Checkbox::without_text(
-                                            &mut logic_settings.trigger_enabled,
-                                        ),
-                                    )
-                                    .on_hover_selectable_text(
-                                        "Arm the analyzer and wait for the configured hardware trigger",
-                                    );
-                                    if trigger_response.changed()
-                                        && logic_settings.trigger_enabled
-                                        && logic_settings.trigger_mode == LogicTriggerMode::Simple
-                                        && !logic_settings
-                                            .trigger_conditions
-                                            .iter()
-                                            .any(Option::is_some)
-                                    {
-                                        if let Some(channel) = logic_settings
-                                            .enabled_channels
-                                            .iter()
-                                            .position(|enabled| *enabled)
-                                        {
-                                            logic_settings.trigger_conditions[channel] =
-                                                Some(DsLogicTriggerCondition::RisingEdge);
-                                        }
-                                    }
-                                    ui.end_row();
+fn paint_logic_acquisition_mode_row(
+    ui: &mut egui::Ui,
+    logic_settings: &mut LogicCaptureSettings,
+    logic_acquisition_mode: &mut AcquisitionMode,
+    availability: CaptureSettingsAvailability,
+) {
+    ui.label("Mode");
+    ui.add_enabled_ui(availability.capture, |ui| {
+        let loop_available = logic_settings.operation_mode == DsLogicOperationMode::Stream;
+        egui::ComboBox::from_id_salt("logic_acquisition_mode")
+            .width(100.0)
+            .selected_text(logic_acquisition_mode.logic_label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(logic_acquisition_mode, AcquisitionMode::Single, "Single");
+                ui.selectable_value(
+                    logic_acquisition_mode,
+                    AcquisitionMode::Repetitive,
+                    "Repetitive",
+                );
+                ui.add_enabled_ui(loop_available, |ui| {
+                    ui.selectable_value(logic_acquisition_mode, AcquisitionMode::Loop, "Loop")
+                        .on_disabled_hover_selectable_text("Loop requires DSLogic Stream mode");
+                });
+            });
+    });
+    ui.end_row();
+}
 
-                                    if logic_settings.trigger_enabled {
-                                        ui.label("Trigger mode");
-                                        ui.add_enabled_ui(availability.capture, |ui| {
+fn paint_logic_duration_row(
+    ui: &mut egui::Ui,
+    logic_settings: &mut LogicCaptureSettings,
+    availability: CaptureSettingsAvailability,
+) {
+    ui.label("Duration");
+    ui.add_enabled_ui(availability.capture, |ui| {
+        egui::ComboBox::from_id_salt("logic_capture_duration")
+            .width(100.0)
+            .selected_text(logic_capture_duration_label(*logic_settings))
+            .show_ui(ui, |ui| {
+                for (duration_seconds, sample_count) in
+                    logic_capture_duration_options(*logic_settings)
+                {
+                    ui.selectable_value(
+                        &mut logic_settings.sample_count,
+                        sample_count,
+                        format_duration(Duration::from_secs_f64(duration_seconds)),
+                    );
+                }
+            });
+    });
+    ui.end_row();
+}
+
+fn paint_logic_sample_rate_row(
+    ui: &mut egui::Ui,
+    logic_settings: &mut LogicCaptureSettings,
+    availability: CaptureSettingsAvailability,
+    maximum_sample_rate_hz: u64,
+) {
+    ui.label("Sample rate");
+    ui.add_enabled_ui(
+        availability.capture && logic_settings.operation_mode != DsLogicOperationMode::InternalTest,
+        |ui| {
+            let previous_rate = logic_settings.sample_rate_hz;
+            egui::ComboBox::from_id_salt("logic_sample_rate")
+                .width(100.0)
+                .selected_text(format_sample_rate(logic_settings.sample_rate_hz))
+                .show_ui(ui, |ui| {
+                    for rate in DSLOGIC_SAMPLE_RATES_HZ
+                        .iter()
+                        .copied()
+                        .filter(|rate| *rate <= maximum_sample_rate_hz)
+                    {
+                        ui.selectable_value(
+                            &mut logic_settings.sample_rate_hz,
+                            rate,
+                            format_sample_rate(rate),
+                        );
+                    }
+                });
+            if logic_settings.sample_rate_hz != previous_rate {
+                let selected_rate = logic_settings.sample_rate_hz;
+                logic_settings.sample_rate_hz = previous_rate;
+                set_logic_sample_rate_preserving_duration(logic_settings, selected_rate);
+            }
+        },
+    );
+    ui.end_row();
+}
+
+fn paint_logic_hardware_trigger_row(
+    ui: &mut egui::Ui,
+    logic_settings: &mut LogicCaptureSettings,
+    logic_acquisition_mode: &AcquisitionMode,
+    availability: CaptureSettingsAvailability,
+) {
+    ui.label("Hardware trigger");
+    let trigger_response = ui
+        .add_enabled(
+            availability.capture
+                && logic_settings.operation_mode != DsLogicOperationMode::InternalTest
+                && *logic_acquisition_mode != AcquisitionMode::Loop,
+            egui::Checkbox::without_text(&mut logic_settings.trigger_enabled),
+        )
+        .on_hover_selectable_text("Arm the analyzer and wait for the configured hardware trigger");
+    if trigger_response.changed()
+        && logic_settings.trigger_enabled
+        && logic_settings.trigger_mode == LogicTriggerMode::Simple
+        && !logic_settings
+            .trigger_conditions
+            .iter()
+            .any(Option::is_some)
+    {
+        if let Some(channel) = logic_settings
+            .enabled_channels
+            .iter()
+            .position(|enabled| *enabled)
+        {
+            logic_settings.trigger_conditions[channel] = Some(DsLogicTriggerCondition::RisingEdge);
+        }
+    }
+    ui.end_row();
+}
+
+fn paint_logic_trigger_mode_row(
+    ui: &mut egui::Ui,
+    logic_settings: &mut LogicCaptureSettings,
+    availability: CaptureSettingsAvailability,
+) {
+    ui.label("Trigger mode");
+    ui.add_enabled_ui(availability.capture, |ui| {
                                             egui::ComboBox::from_id_salt("logic_trigger_mode")
                                                 .width(92.0)
                                                 .selected_text(match logic_settings.trigger_mode {
@@ -573,347 +692,342 @@ pub(crate) fn paint_capture_settings(
                                                     });
                                                 });
                                         });
-                                        ui.end_row();
+    ui.end_row();
+}
 
-                                        match logic_settings.trigger_mode {
-                                            LogicTriggerMode::Simple => {
-                                                ui.label("Conditions");
-                                                ui.add_enabled_ui(availability.capture, |ui| {
-                                                    paint_logic_trigger_conditions(
-                                                        ui,
-                                                        logic_settings.enabled_channels,
-                                                        &mut logic_settings.trigger_conditions,
-                                                        "logic_simple_trigger",
-                                                    );
-                                                });
-                                                ui.end_row();
-                                            }
-                                            LogicTriggerMode::Smart => {
-                                                ui.label("Smart stages");
-                                                ui.add_enabled_ui(availability.capture, |ui| {
-                                                    ui.vertical(|ui| {
-                                                        ui.horizontal(|ui| {
-                                                            ui.label("Stages");
-                                                            ui.add(
-                                                                egui::DragValue::new(
-                                                                    &mut logic_settings
-                                                                        .smart_trigger_stage_count,
-                                                                )
-                                                                .range(
-                                                                    2..=DSLOGIC_TRIGGER_STAGE_COUNT
-                                                                        as u8,
-                                                                ),
-                                                            );
-                                                        });
-                                                        ui.small(
-                                                            RichText::new(
-                                                                "Each stage matches its channels together; stages match in order",
-                                                            )
-                                                            .color(TEXT_MUTED),
-                                                        );
-                                                        for stage_index in 0..usize::from(
-                                                            logic_settings.smart_trigger_stage_count,
-                                                        ) {
-                                                            egui::CollapsingHeader::new(format!(
-                                                                "Stage {}",
-                                                                stage_index + 1
-                                                            ))
-                                                            .default_open(stage_index < 2)
-                                                            .show(ui, |ui| {
-                                                                paint_logic_trigger_conditions(
-                                                                    ui,
-                                                                    logic_settings.enabled_channels,
-                                                                    &mut logic_settings
-                                                                        .smart_trigger_conditions
-                                                                        [stage_index],
-                                                                    (
-                                                                        "logic_smart_trigger",
-                                                                        stage_index,
-                                                                    ),
-                                                                );
-                                                            });
-                                                        }
-                                                    });
-                                                });
-                                                ui.end_row();
-                                            }
-                                        }
-                                    }
-
-                                    if *logic_acquisition_mode == AcquisitionMode::Repetitive {
-                                        ui.label("Repeat interval");
-                                        if logic_settings.operation_mode
-                                            == DsLogicOperationMode::Stream
-                                        {
-                                            ui.label(RichText::new("0.1 s").color(TEXT_MUTED))
-                                                .on_hover_selectable_text(
-                                                    "Stream-mode Repetitive uses the original fixed 0.1 s interval",
-                                                );
-                                        } else {
-                                            ui.add_enabled(
-                                                availability.capture,
-                                                egui::DragValue::new(
-                                                    repetitive_interval_seconds,
-                                                )
-                                                .range(0.1..=10.0)
-                                                .speed(0.1)
-                                                .fixed_decimals(1)
-                                                .suffix(" s"),
-                                            )
-                                            .on_hover_selectable_text("Delay between complete captures");
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                    ui.add_space(8.0);
-                    egui::CollapsingHeader::new(
-                        RichText::new(format!(
-                            "Channels ({enabled_channel_count}/{LOGIC_CHANNEL_COUNT} enabled)"
-                        ))
-                        .strong(),
-                    )
-                    .id_salt("dslogic_channels_section")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                            let channel_controls_enabled = availability.capture
-                                && logic_settings.operation_mode
-                                    != DsLogicOperationMode::InternalTest;
-                            ui.add_enabled_ui(channel_controls_enabled, |ui| {
-                                egui::Grid::new("dslogic_channels")
-                                    .num_columns(8)
-                                    .min_col_width(20.0)
-                                    .max_col_width(24.0)
-                                    .spacing([5.0, 4.0])
-                                    .show(ui, |ui| {
-                                        for (channel, enabled) in logic_settings
-                                            .enabled_channels
-                                            .iter_mut()
-                                            .enumerate()
-                                        {
-                                            ui.vertical_centered(|ui| {
-                                                ui.small(channel.to_string());
-                                                ui.add(egui::Checkbox::without_text(enabled));
-                                            });
-                                            if channel % 8 == 7 {
-                                                ui.end_row();
-                                            }
-                                        }
-                                    });
-                                ui.horizontal(|ui| {
-                                    if ui.small_button("Enable all").clicked() {
-                                        logic_settings.enabled_channels =
-                                            [true; LOGIC_CHANNEL_COUNT];
-                                    }
-                                    if ui.small_button("Disable all").clicked() {
-                                        logic_settings.enabled_channels =
-                                            [false; LOGIC_CHANNEL_COUNT];
-                                    }
-                                });
-                            });
-                            if !logic_settings
-                                .enabled_channels
-                                .iter()
-                                .any(|enabled| *enabled)
-                            {
-                                ui.small(
-                                    RichText::new("Enable at least one channel")
-                                        .color(Color32::LIGHT_RED),
+/// The simple trigger's per-channel conditions, or the smart trigger's stages.
+fn paint_logic_trigger_conditions_row(
+    ui: &mut egui::Ui,
+    logic_settings: &mut LogicCaptureSettings,
+    availability: CaptureSettingsAvailability,
+) {
+    match logic_settings.trigger_mode {
+        LogicTriggerMode::Simple => {
+            ui.label("Conditions");
+            ui.add_enabled_ui(availability.capture, |ui| {
+                paint_logic_trigger_conditions(
+                    ui,
+                    logic_settings.enabled_channels,
+                    &mut logic_settings.trigger_conditions,
+                    "logic_simple_trigger",
+                );
+            });
+            ui.end_row();
+        }
+        LogicTriggerMode::Smart => {
+            ui.label("Smart stages");
+            ui.add_enabled_ui(availability.capture, |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Stages");
+                        ui.add(
+                            egui::DragValue::new(&mut logic_settings.smart_trigger_stage_count)
+                                .range(2..=DSLOGIC_TRIGGER_STAGE_COUNT as u8),
+                        );
+                    });
+                    ui.small(
+                        RichText::new(
+                            "Each stage matches its channels together; stages match in order",
+                        )
+                        .color(TEXT_MUTED),
+                    );
+                    for stage_index in 0..usize::from(logic_settings.smart_trigger_stage_count) {
+                        egui::CollapsingHeader::new(format!("Stage {}", stage_index + 1))
+                            .default_open(stage_index < 2)
+                            .show(ui, |ui| {
+                                paint_logic_trigger_conditions(
+                                    ui,
+                                    logic_settings.enabled_channels,
+                                    &mut logic_settings.smart_trigger_conditions[stage_index],
+                                    ("logic_smart_trigger", stage_index),
                                 );
-                            }
+                            });
+                    }
+                });
+            });
+            ui.end_row();
+        }
+    }
+}
+
+fn paint_logic_repeat_interval_row(
+    ui: &mut egui::Ui,
+    logic_settings: &mut LogicCaptureSettings,
+    repetitive_interval_seconds: &mut f32,
+    availability: CaptureSettingsAvailability,
+) {
+    ui.label("Repeat interval");
+    if logic_settings.operation_mode == DsLogicOperationMode::Stream {
+        ui.label(RichText::new("0.1 s").color(TEXT_MUTED))
+            .on_hover_selectable_text(
+                "Stream-mode Repetitive uses the original fixed 0.1 s interval",
+            );
+    } else {
+        ui.add_enabled(
+            availability.capture,
+            egui::DragValue::new(repetitive_interval_seconds)
+                .range(0.1..=10.0)
+                .speed(0.1)
+                .fixed_decimals(1)
+                .suffix(" s"),
+        )
+        .on_hover_selectable_text("Delay between complete captures");
+    }
+    ui.end_row();
+}
+
+fn paint_logic_channels(
+    ui: &mut egui::Ui,
+    logic_settings: &mut LogicCaptureSettings,
+    availability: CaptureSettingsAvailability,
+    enabled_channel_count: usize,
+) {
+    egui::CollapsingHeader::new(
+        RichText::new(format!(
+            "Channels ({enabled_channel_count}/{LOGIC_CHANNEL_COUNT} enabled)"
+        ))
+        .strong(),
+    )
+    .id_salt("dslogic_channels_section")
+    .default_open(true)
+    .show(ui, |ui| {
+        let channel_controls_enabled = availability.capture
+            && logic_settings.operation_mode != DsLogicOperationMode::InternalTest;
+        ui.add_enabled_ui(channel_controls_enabled, |ui| {
+            egui::Grid::new("dslogic_channels")
+                .num_columns(8)
+                .min_col_width(20.0)
+                .max_col_width(24.0)
+                .spacing([5.0, 4.0])
+                .show(ui, |ui| {
+                    for (channel, enabled) in logic_settings.enabled_channels.iter_mut().enumerate()
+                    {
+                        ui.vertical_centered(|ui| {
+                            ui.small(channel.to_string());
+                            ui.add(egui::Checkbox::without_text(enabled));
                         });
-                    ui.add_space(8.0);
-                    paint_logic_marker_settings(
-                        ui,
-                        logic_marker_settings,
-                        displayed_logic_sample_count,
-                        displayed_logic_sample_rate_hz,
-                    );
-                    ui.add_space(8.0);
-                    paint_protocol_analyzer_settings(
-                        ui,
-                        protocol_analyzer,
-                        &logic_settings.enabled_channels,
-                    );
+                        if channel % 8 == 7 {
+                            ui.end_row();
+                        }
+                    }
+                });
+            ui.horizontal(|ui| {
+                if ui.small_button("Enable all").clicked() {
+                    logic_settings.enabled_channels = [true; LOGIC_CHANNEL_COUNT];
                 }
-                CaptureSettingsTab::DsCope => {
-                    let maximum_sample_rate_hz = scope_settings.maximum_sample_rate_hz();
-                    let maximum_sample_count = scope_settings.maximum_sample_count();
-                    if scope_settings.sample_rate_hz > maximum_sample_rate_hz {
-                        scope_settings.sample_rate_hz = maximum_sample_rate_hz;
-                    }
-                    if scope_settings.sample_count > maximum_sample_count {
-                        scope_settings.sample_count = maximum_sample_count;
-                    }
-                    egui::Grid::new("dscope_common_capture_settings")
-                        .num_columns(2)
-                        .spacing([8.0, 5.0])
-                        .show(ui, |ui| {
-                            ui.label("Sample rate");
-                            ui.horizontal(|ui| {
-                                ui.add_enabled_ui(
-                                    availability.sample_rate && !*scope_auto_sample_rate,
-                                    |ui| {
-                                        egui::ComboBox::from_id_salt("scope_sample_rate")
-                                            .width(100.0)
-                                            .selected_text(format_sample_rate(
-                                                scope_settings.sample_rate_hz,
-                                            ))
-                                            .show_ui(ui, |ui| {
-                                                for rate in DSCOPE_SAMPLE_RATES_HZ
-                                                    .into_iter()
-                                                    .filter(|rate| *rate <= maximum_sample_rate_hz)
-                                                {
-                                                    ui.selectable_value(
-                                                        &mut scope_settings.sample_rate_hz,
-                                                        rate,
-                                                        format_sample_rate(rate),
-                                                    );
-                                                }
-                                            });
-                                    },
-                                );
-                                ui.add_enabled(
-                                    availability.sample_rate,
-                                    egui::Checkbox::new(scope_auto_sample_rate, "Auto"),
-                                );
-                            });
-                            ui.end_row();
+                if ui.small_button("Disable all").clicked() {
+                    logic_settings.enabled_channels = [false; LOGIC_CHANNEL_COUNT];
+                }
+            });
+        });
+        if !logic_settings
+            .enabled_channels
+            .iter()
+            .any(|enabled| *enabled)
+        {
+            ui.small(RichText::new("Enable at least one channel").color(Color32::LIGHT_RED));
+        }
+    });
+}
 
-                            ui.label("Buffer");
-                            ui.add_enabled_ui(availability.capture, |ui| {
-                                egui::ComboBox::from_id_salt("scope_sample_count")
-                                    .selected_text(format_sample_count(scope_settings.sample_count))
-                                    .show_ui(ui, |ui| {
-                                        for count in DSCOPE_SAMPLE_COUNTS
-                                            .into_iter()
-                                            .filter(|count| *count <= maximum_sample_count)
-                                        {
-                                            ui.selectable_value(
-                                                &mut scope_settings.sample_count,
-                                                count,
-                                                format_sample_count(count),
-                                            );
-                                        }
-                                    });
-                            });
-                            ui.end_row();
-
-                            ui.label("Maximum");
-                            ui.monospace(format_sample_rate(maximum_sample_rate_hz));
-                            ui.end_row();
-                        });
-                    ui.add_space(8.0);
-                    ui.checkbox(
+fn paint_scope_capture_settings(
+    ui: &mut egui::Ui,
+    scope_settings: &mut ScopeCaptureSettings,
+    scope_auto_sample_rate: &mut bool,
+    scope_smart_timing_enabled: &mut bool,
+    visualization_editor: ScopeVisualizationSettingsEditor<'_>,
+    availability: CaptureSettingsAvailability,
+    calibration_action: &mut Option<ScopeCalibrationAction>,
+) {
+    let ScopeVisualizationSettingsEditor {
+        channel_colors: scope_channel_colors,
+        scope_channel_names,
+    } = visualization_editor;
+    let maximum_sample_rate_hz = scope_settings.maximum_sample_rate_hz();
+    let maximum_sample_count = scope_settings.maximum_sample_count();
+    if scope_settings.sample_rate_hz > maximum_sample_rate_hz {
+        scope_settings.sample_rate_hz = maximum_sample_rate_hz;
+    }
+    if scope_settings.sample_count > maximum_sample_count {
+        scope_settings.sample_count = maximum_sample_count;
+    }
+    paint_scope_common_settings(
+        ui,
+        scope_settings,
+        scope_auto_sample_rate,
+        availability,
+        maximum_sample_rate_hz,
+        maximum_sample_count,
+    );
+    ui.add_space(8.0);
+    ui.checkbox(
                         scope_smart_timing_enabled,
                         "Smart timing on waveform hover",
                     )
                     .on_hover_selectable_text(
                         "Show elapsed time from the trigger crossing and the voltage at the waveform point under the mouse",
                     );
-                    ui.add_space(8.0);
-                    egui::CollapsingHeader::new(RichText::new("Options").strong())
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.add_enabled_ui(availability.capture, |ui| {
-                                egui::Grid::new("dscope_options")
-                                    .num_columns(2)
-                                    .spacing([8.0, 6.0])
-                                    .show(ui, |ui| {
-                                        ui.label("Operating mode");
-                                        egui::ComboBox::from_id_salt("scope_operation_mode")
-                                            .selected_text(match scope_settings.operation_mode {
-                                                DsCopeOperationMode::Normal => "Normal",
-                                                DsCopeOperationMode::InternalTest => {
-                                                    "Internal test"
-                                                }
-                                            })
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    &mut scope_settings.operation_mode,
-                                                    DsCopeOperationMode::Normal,
-                                                    "Normal",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut scope_settings.operation_mode,
-                                                    DsCopeOperationMode::InternalTest,
-                                                    "Internal test",
-                                                );
-                                            });
-                                        ui.end_row();
+    ui.add_space(8.0);
+    paint_scope_options(ui, scope_settings, availability, calibration_action);
+    ui.add_space(8.0);
+    let channel_count = scope_settings.channels.len();
+    let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
+    for (index, channel) in scope_settings.channels.iter_mut().enumerate() {
+        paint_scope_channel_settings(
+            ui,
+            index,
+            channel,
+            &mut scope_channel_colors[index],
+            &mut scope_channel_names[index],
+            channel_enabled[1 - index],
+            availability,
+        );
+        if index + 1 < channel_count {
+            ui.add_space(6.0);
+        }
+    }
+}
 
-                                        ui.label("Bandwidth");
-                                        egui::ComboBox::from_id_salt("scope_bandwidth_limit")
-                                            .selected_text(match scope_settings.bandwidth_limit {
-                                                DsCopeBandwidthLimit::Full => "Full",
-                                                DsCopeBandwidthLimit::Mhz20 => "20 MHz",
-                                            })
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    &mut scope_settings.bandwidth_limit,
-                                                    DsCopeBandwidthLimit::Full,
-                                                    "Full",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut scope_settings.bandwidth_limit,
-                                                    DsCopeBandwidthLimit::Mhz20,
-                                                    "20 MHz",
-                                                );
-                                            });
-                                        ui.end_row();
-                                    });
-                            });
-                            ui.add_space(6.0);
-                            ui.label(RichText::new("Calibration").color(TEXT_MUTED));
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(availability.capture, egui::Button::new("Auto…"))
-                                    .clicked()
-                                {
-                                    *calibration_action = Some(ScopeCalibrationAction::Auto);
-                                }
-                                if ui
-                                    .add_enabled(
-                                        availability.manual_calibration,
-                                        egui::Button::new("Manual…"),
-                                    )
-                                    .clicked()
-                                {
-                                    *calibration_action = Some(ScopeCalibrationAction::Manual);
-                                }
-                            });
+/// The sample rate (with Auto), buffer size, and maximum rate.
+fn paint_scope_common_settings(
+    ui: &mut egui::Ui,
+    scope_settings: &mut ScopeCaptureSettings,
+    scope_auto_sample_rate: &mut bool,
+    availability: CaptureSettingsAvailability,
+    maximum_sample_rate_hz: u64,
+    maximum_sample_count: u64,
+) {
+    egui::Grid::new("dscope_common_capture_settings")
+        .num_columns(2)
+        .spacing([8.0, 5.0])
+        .show(ui, |ui| {
+            ui.label("Sample rate");
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(availability.sample_rate && !*scope_auto_sample_rate, |ui| {
+                    egui::ComboBox::from_id_salt("scope_sample_rate")
+                        .width(100.0)
+                        .selected_text(format_sample_rate(scope_settings.sample_rate_hz))
+                        .show_ui(ui, |ui| {
+                            for rate in DSCOPE_SAMPLE_RATES_HZ
+                                .into_iter()
+                                .filter(|rate| *rate <= maximum_sample_rate_hz)
+                            {
+                                ui.selectable_value(
+                                    &mut scope_settings.sample_rate_hz,
+                                    rate,
+                                    format_sample_rate(rate),
+                                );
+                            }
                         });
-                    ui.add_space(8.0);
-                    let channel_count = scope_settings.channels.len();
-                    let channel_enabled = scope_settings.channels.map(|channel| channel.enabled);
-                    for (index, channel) in scope_settings.channels.iter_mut().enumerate() {
-                        paint_scope_channel_settings(
-                            ui,
-                            index,
-                            channel,
-                            &mut scope_channel_colors[index],
-                            &mut scope_channel_names[index],
-                            channel_enabled[1 - index],
-                            availability,
-                        );
-                        if index + 1 < channel_count {
-                            ui.add_space(6.0);
+                });
+                ui.add_enabled(
+                    availability.sample_rate,
+                    egui::Checkbox::new(scope_auto_sample_rate, "Auto"),
+                );
+            });
+            ui.end_row();
+
+            ui.label("Buffer");
+            ui.add_enabled_ui(availability.capture, |ui| {
+                egui::ComboBox::from_id_salt("scope_sample_count")
+                    .selected_text(format_sample_count(scope_settings.sample_count))
+                    .show_ui(ui, |ui| {
+                        for count in DSCOPE_SAMPLE_COUNTS
+                            .into_iter()
+                            .filter(|count| *count <= maximum_sample_count)
+                        {
+                            ui.selectable_value(
+                                &mut scope_settings.sample_count,
+                                count,
+                                format_sample_count(count),
+                            );
                         }
-                    }
+                    });
+            });
+            ui.end_row();
+
+            ui.label("Maximum");
+            ui.monospace(format_sample_rate(maximum_sample_rate_hz));
+            ui.end_row();
+        });
+}
+
+/// The collapsible DSCope options: operating mode, bandwidth, and calibration.
+fn paint_scope_options(
+    ui: &mut egui::Ui,
+    scope_settings: &mut ScopeCaptureSettings,
+    availability: CaptureSettingsAvailability,
+    calibration_action: &mut Option<ScopeCalibrationAction>,
+) {
+    egui::CollapsingHeader::new(RichText::new("Options").strong())
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.add_enabled_ui(availability.capture, |ui| {
+                egui::Grid::new("dscope_options")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Operating mode");
+                        egui::ComboBox::from_id_salt("scope_operation_mode")
+                            .selected_text(match scope_settings.operation_mode {
+                                DsCopeOperationMode::Normal => "Normal",
+                                DsCopeOperationMode::InternalTest => "Internal test",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut scope_settings.operation_mode,
+                                    DsCopeOperationMode::Normal,
+                                    "Normal",
+                                );
+                                ui.selectable_value(
+                                    &mut scope_settings.operation_mode,
+                                    DsCopeOperationMode::InternalTest,
+                                    "Internal test",
+                                );
+                            });
+                        ui.end_row();
+
+                        ui.label("Bandwidth");
+                        egui::ComboBox::from_id_salt("scope_bandwidth_limit")
+                            .selected_text(match scope_settings.bandwidth_limit {
+                                DsCopeBandwidthLimit::Full => "Full",
+                                DsCopeBandwidthLimit::Mhz20 => "20 MHz",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut scope_settings.bandwidth_limit,
+                                    DsCopeBandwidthLimit::Full,
+                                    "Full",
+                                );
+                                ui.selectable_value(
+                                    &mut scope_settings.bandwidth_limit,
+                                    DsCopeBandwidthLimit::Mhz20,
+                                    "20 MHz",
+                                );
+                            });
+                        ui.end_row();
+                    });
+            });
+            ui.add_space(6.0);
+            ui.label(RichText::new("Calibration").color(TEXT_MUTED));
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(availability.capture, egui::Button::new("Auto…"))
+                    .clicked()
+                {
+                    *calibration_action = Some(ScopeCalibrationAction::Auto);
                 }
-            }
-            paint_capture_settings_save_button(
-                ui,
-                match tab {
-                    CaptureSettingsTab::DsLogic => SavedCaptureSettingsKind::LogicAnalyzer,
-                    CaptureSettingsTab::DsCope => SavedCaptureSettingsKind::Oscilloscope,
-                },
-                availability.capture,
-            )
-        })
-        .inner;
-    scope_settings.clamp_to_channel_limits();
-    save_clicked
+                if ui
+                    .add_enabled(
+                        availability.manual_calibration,
+                        egui::Button::new("Manual…"),
+                    )
+                    .clicked()
+                {
+                    *calibration_action = Some(ScopeCalibrationAction::Manual);
+                }
+            });
+        });
 }
 
 pub(crate) fn paint_capture_settings_save_button(
@@ -1115,4 +1229,223 @@ pub(crate) fn paint_logic_marker_color_picker(
             }
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Buffer-mode settings with a hardware trigger armed on channel 0.
+    fn armed_buffer_settings() -> LogicCaptureSettings {
+        LogicCaptureSettings {
+            operation_mode: DsLogicOperationMode::Buffer,
+            trigger_enabled: true,
+            ..LogicCaptureSettings::default()
+        }
+    }
+
+    fn normalize(settings: &mut LogicCaptureSettings) -> u64 {
+        normalize_logic_capture_settings(
+            settings,
+            AcquisitionMode::Single,
+            UsbSpeedClass::SuperSpeed,
+        )
+    }
+
+    #[test]
+    fn internal_test_mode_enables_every_channel_and_disarms_the_trigger() {
+        let mut settings = LogicCaptureSettings {
+            operation_mode: DsLogicOperationMode::InternalTest,
+            trigger_enabled: true,
+            ..LogicCaptureSettings::default()
+        };
+        settings.enabled_channels[2] = false;
+        settings.enabled_channels[9] = false;
+
+        let maximum = normalize(&mut settings);
+
+        assert_eq!(settings.enabled_channels, [true; LOGIC_CHANNEL_COUNT]);
+        assert!(!settings.trigger_enabled);
+        assert!(
+            maximum >= 100_000_000,
+            "the test assumes a 100 MHz test rate"
+        );
+        assert_eq!(settings.sample_rate_hz, 100_000_000);
+    }
+
+    #[test]
+    fn loop_acquisition_turns_the_hardware_trigger_off() {
+        let mut settings = armed_buffer_settings();
+        normalize_logic_capture_settings(
+            &mut settings,
+            AcquisitionMode::Loop,
+            UsbSpeedClass::SuperSpeed,
+        );
+        assert!(!settings.trigger_enabled);
+
+        let mut settings = armed_buffer_settings();
+        normalize_logic_capture_settings(
+            &mut settings,
+            AcquisitionMode::Repetitive,
+            UsbSpeedClass::SuperSpeed,
+        );
+        assert!(settings.trigger_enabled);
+    }
+
+    #[test]
+    fn a_smart_trigger_needs_buffer_mode() {
+        let mut settings = LogicCaptureSettings {
+            operation_mode: DsLogicOperationMode::Stream,
+            trigger_mode: LogicTriggerMode::Smart,
+            ..LogicCaptureSettings::default()
+        };
+        normalize(&mut settings);
+        assert_eq!(settings.trigger_mode, LogicTriggerMode::Simple);
+
+        let mut settings = LogicCaptureSettings {
+            operation_mode: DsLogicOperationMode::Buffer,
+            trigger_mode: LogicTriggerMode::Smart,
+            ..LogicCaptureSettings::default()
+        };
+        normalize(&mut settings);
+        assert_eq!(settings.trigger_mode, LogicTriggerMode::Smart);
+    }
+
+    #[test]
+    fn disabled_channels_lose_their_trigger_conditions() {
+        let mut settings = LogicCaptureSettings::default();
+        settings.enabled_channels[3] = false;
+        settings.trigger_conditions[3] = Some(DsLogicTriggerCondition::High);
+        settings.trigger_conditions[4] = Some(DsLogicTriggerCondition::Low);
+        settings.smart_trigger_conditions[0][3] = Some(DsLogicTriggerCondition::Low);
+        settings.smart_trigger_conditions[1][3] = Some(DsLogicTriggerCondition::High);
+        settings.smart_trigger_conditions[1][4] = Some(DsLogicTriggerCondition::High);
+
+        normalize(&mut settings);
+
+        assert_eq!(settings.trigger_conditions[3], None);
+        assert_eq!(settings.smart_trigger_conditions[0][3], None);
+        assert_eq!(settings.smart_trigger_conditions[1][3], None);
+        // Enabled channels keep theirs.
+        assert_eq!(
+            settings.trigger_conditions[4],
+            Some(DsLogicTriggerCondition::Low)
+        );
+        assert_eq!(
+            settings.smart_trigger_conditions[1][4],
+            Some(DsLogicTriggerCondition::High)
+        );
+    }
+
+    #[test]
+    fn an_armed_simple_trigger_without_conditions_uses_the_first_enabled_channel() {
+        let mut settings = armed_buffer_settings();
+        settings.trigger_conditions = [None; LOGIC_CHANNEL_COUNT];
+        settings.enabled_channels[0] = false;
+        settings.enabled_channels[1] = false;
+
+        normalize(&mut settings);
+
+        let mut expected = [None; LOGIC_CHANNEL_COUNT];
+        expected[2] = Some(DsLogicTriggerCondition::RisingEdge);
+        assert_eq!(settings.trigger_conditions, expected);
+    }
+
+    #[test]
+    fn an_armed_simple_trigger_keeps_the_conditions_it_has() {
+        let mut settings = armed_buffer_settings();
+        settings.trigger_conditions = [None; LOGIC_CHANNEL_COUNT];
+        settings.trigger_conditions[5] = Some(DsLogicTriggerCondition::High);
+
+        normalize(&mut settings);
+
+        let mut expected = [None; LOGIC_CHANNEL_COUNT];
+        expected[5] = Some(DsLogicTriggerCondition::High);
+        assert_eq!(settings.trigger_conditions, expected);
+    }
+
+    #[test]
+    fn a_disarmed_trigger_is_not_given_default_conditions() {
+        let mut settings = LogicCaptureSettings {
+            operation_mode: DsLogicOperationMode::Buffer,
+            trigger_enabled: false,
+            trigger_conditions: [None; LOGIC_CHANNEL_COUNT],
+            smart_trigger_conditions: [[None; LOGIC_CHANNEL_COUNT]; DSLOGIC_TRIGGER_STAGE_COUNT],
+            ..LogicCaptureSettings::default()
+        };
+        normalize(&mut settings);
+        assert_eq!(settings.trigger_conditions, [None; LOGIC_CHANNEL_COUNT]);
+
+        settings.trigger_mode = LogicTriggerMode::Smart;
+        normalize(&mut settings);
+        assert_eq!(
+            settings.smart_trigger_conditions,
+            [[None; LOGIC_CHANNEL_COUNT]; DSLOGIC_TRIGGER_STAGE_COUNT]
+        );
+    }
+
+    #[test]
+    fn a_trigger_with_no_enabled_channel_is_left_without_conditions() {
+        let mut settings = armed_buffer_settings();
+        settings.trigger_conditions = [None; LOGIC_CHANNEL_COUNT];
+        settings.enabled_channels = [false; LOGIC_CHANNEL_COUNT];
+
+        normalize(&mut settings);
+
+        assert_eq!(settings.trigger_conditions, [None; LOGIC_CHANNEL_COUNT]);
+    }
+
+    #[test]
+    fn an_armed_smart_trigger_fills_each_empty_stage_with_an_alternating_edge() {
+        let mut settings = armed_buffer_settings();
+        settings.trigger_mode = LogicTriggerMode::Smart;
+        settings.smart_trigger_stage_count = 3;
+        settings.smart_trigger_conditions =
+            [[None; LOGIC_CHANNEL_COUNT]; DSLOGIC_TRIGGER_STAGE_COUNT];
+        settings.smart_trigger_conditions[2][5] = Some(DsLogicTriggerCondition::Low);
+
+        normalize(&mut settings);
+
+        let stages = settings.smart_trigger_conditions;
+        assert_eq!(stages[0][0], Some(DsLogicTriggerCondition::RisingEdge));
+        assert_eq!(stages[1][0], Some(DsLogicTriggerCondition::FallingEdge));
+        // A stage that already has a condition is left alone, and so are the
+        // stages beyond the configured count.
+        assert_eq!(stages[2][0], None);
+        assert_eq!(stages[2][5], Some(DsLogicTriggerCondition::Low));
+        assert_eq!(stages[3], [None; LOGIC_CHANNEL_COUNT]);
+    }
+
+    #[test]
+    fn a_sample_rate_the_usb_link_cannot_carry_is_lowered_to_the_next_listed_rate() {
+        let mut settings = LogicCaptureSettings {
+            sample_rate_hz: 400_000_000,
+            ..LogicCaptureSettings::default()
+        };
+        let maximum = normalize_logic_capture_settings(
+            &mut settings,
+            AcquisitionMode::Single,
+            UsbSpeedClass::HighSpeed,
+        );
+
+        assert!(maximum < 400_000_000, "the test assumes a limited USB link");
+        let expected = DSLOGIC_SAMPLE_RATES_HZ
+            .iter()
+            .rev()
+            .copied()
+            .find(|rate| *rate <= maximum)
+            .unwrap();
+        assert_eq!(settings.sample_rate_hz, expected);
+
+        let mut settings = LogicCaptureSettings {
+            sample_rate_hz: 1_000_000,
+            ..LogicCaptureSettings::default()
+        };
+        normalize_logic_capture_settings(
+            &mut settings,
+            AcquisitionMode::Single,
+            UsbSpeedClass::HighSpeed,
+        );
+        assert_eq!(settings.sample_rate_hz, 1_000_000);
+    }
 }
