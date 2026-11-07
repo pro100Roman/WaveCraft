@@ -18872,6 +18872,79 @@ mod tests {
         assert_eq!(parse_color(&metadata["scope.ch1.color"]), Some(colors[1]));
     }
 
+    /// Every field is listed and set away from its default, so a field added to
+    /// `RadioSettings` or `RadioAnalyzerSettings` fails to compile here until it is
+    /// given a value, and a field that is not saved or restored fails the
+    /// comparison instead of silently reopening with its default.
+    #[test]
+    fn saved_rf_settings_round_trip_every_field() {
+        let settings = RadioSettings {
+            capture: RadioCaptureSettings {
+                center_frequency_hz: 915_000_000,
+                sample_rate_hz: 10_000_000,
+                bandwidth_hz: 8_000_000,
+                receive_channel: 1,
+                // Derived from `single_duration_millis` when a Single capture
+                // starts, so it is deliberately not saved.
+                sample_limit: None,
+            },
+            single_duration_millis: 2_500,
+            trigger_enabled: true,
+            trigger_posttrigger_micros: 25_000,
+            trigger_level_dbfs_tenths: -350,
+            gains_db: BTreeMap::from([("lna".to_owned(), 24), ("vga".to_owned(), 20)]),
+            frequency_correction_milli_ppm: 1_250,
+            iq_correction_enabled: false,
+            amplifier_enabled: true,
+            antenna_power_enabled: true,
+            analyzer: RadioAnalyzerSettings {
+                demodulation: RadioDemodulation::BinaryGfsk,
+                channels: vec![
+                    RadioAnalyzerChannelSettings {
+                        name: "Weather".to_owned(),
+                        frequency_offset_hz: 125_000,
+                    },
+                    RadioAnalyzerChannelSettings {
+                        name: "Control".to_owned(),
+                        frequency_offset_hz: -250_000,
+                    },
+                ],
+                channel_bandwidth_hz: 250_000,
+                output_sample_rate_hz: 600_000,
+                filter_tap_count: 129,
+                symbol_rate_hz: 38_400,
+                deviation_hz: 50_000,
+                gfsk_bt_milli: 300,
+                inverted: true,
+                adaptive_timing: false,
+                timing_loop_bandwidth_milli: 50,
+                max_clock_error_ppm: 5_000,
+                data_mode: RadioDataMode::Packets,
+                preamble_byte: 0x55,
+                preamble_bytes: 6,
+                sync_word: 0x2dd4,
+                sync_word_bytes: 2,
+                maximum_preamble_bit_errors: 3,
+                minimum_bit_confidence_milli: 250,
+                maximum_uncertain_bits: 2,
+                whitening_enabled: true,
+                whitening_preset: RadioWhiteningPreset::Pn9X9X5,
+                whitening_width: 9,
+                whitening_polynomial: 0x11,
+                whitening_seed: 0x1ff,
+                whitening_direction: WhiteningDirection::ShiftLeft,
+                whitening_invert_output: true,
+                whitening_start_bit: 8,
+                whitening_end_bit: Some(160),
+                whitening_advance_excluded_bits: true,
+            },
+        };
+
+        let metadata = saved_radio_settings_metadata(&settings);
+
+        assert_eq!(radio_settings_from_recording_metadata(&metadata), settings);
+    }
+
     #[test]
     fn saved_rf_settings_round_trip_independently() {
         let mut settings = RadioSettings::default();
