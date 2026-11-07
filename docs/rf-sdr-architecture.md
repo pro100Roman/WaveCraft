@@ -550,6 +550,29 @@ must highlight the correct time range in live and recorded views even after
 filter delay and resampling. Filter group delay is accounted for explicitly,
 not hidden by shifting results until they merely look plausible.
 
+The implementation mixes each batch into flat `f32` buffers and produces every
+output sample as one dot product over a contiguous window. Resampling is
+fractional: the filter is a Kaiser-windowed sinc evaluated at the exact output
+instant, from a bank of rows that sit a fraction of an input sample after the
+middle tap. When the reduced output-rate denominator is at most 64 (2 MS/s to
+512 kS/s needs 32) every output instant is reproduced exactly; otherwise it
+snaps to the nearest 1/64 of an input sample. Snapping each output to the
+nearest input sample instead modulated the discriminator output by 26% of a
+50 kHz tone at 2 MS/s to 512 kS/s; the bank leaves 0.08%.
+
+The filter length is part of the channel design. `filter_tap_count == 0`
+selects the automatic design: a 60 dB Kaiser filter whose transition band is a
+quarter of the channel bandwidth, so the length grows in proportion to the
+input rate (about 150 taps for a 200 kHz channel at 2 MS/s, 1,450 at 20 MS/s).
+A fixed 257-tap filter cut an adjacent channel 150 kHz away by 69 dB at 2 MS/s
+but by only 12 dB at 20 MS/s; the automatic design gives 62 to 64 dB at every
+rate. An explicit odd length from 3 to 4,095 is still honoured.
+
+Idle channels cost nothing: the radio runtime does not push IQ into a channel
+until its squelch opens, so a bank of channels pays only for those with an
+active burst. A shared first decimation stage would add cost and coupling for
+no gain in that model.
+
 ### FSK and GFSK demodulation
 
 The first demodulator supports binary 2-FSK. After channel filtering it uses a

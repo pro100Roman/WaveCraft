@@ -11,8 +11,8 @@ pub use analyzer::{
     BinaryFskProfile, BinaryGfskProfile, DemodulationProfile, SignalAnalyzer, SignalAnalyzerProfile,
 };
 pub use channelizer::{
-    ChannelizedBatch, Channelizer, ChannelizerConfig, PreparedIqBatch, TimedComplexSample,
-    WidebandIqPreprocessor,
+    automatic_filter_tap_count, ChannelizedBatch, Channelizer, ChannelizerConfig, PreparedIqBatch,
+    TimedComplexSample, WidebandIqPreprocessor, MAX_FILTER_TAP_COUNT,
 };
 pub use demodulation::{
     DemodulatedBatch, Demodulator, DemodulatorTelemetry, SparseSymbolAlternative, TimedAnalogBatch,
