@@ -1,8 +1,8 @@
 //! Modal dialogs and the instrument list shown in settings.
 
 use crate::{
-    egui, CalibrationModalAction, CalibrationProgressModal, Color32, DeviceEntry, LinkStatus,
-    RichText, Sense, Vec2, ACCENT, BACKGROUND, SCOPE_COLORS, TEXT_MUTED,
+    egui, Color32, DeviceEntry, DsCopeCalibrationValues, DsCopeCaptureConfig, LinkStatus, RichText,
+    Sense, Vec2, WaveformStore, ACCENT, BACKGROUND, SCOPE_COLORS, TEXT_MUTED,
 };
 
 pub(crate) fn paint_calibration_progress_modal(
@@ -105,4 +105,21 @@ pub(crate) fn paint_instrument_settings(ui: &mut egui::Ui, devices: &[DeviceEntr
                 );
             });
     }
+}
+
+pub(crate) struct CalibrationDisplay {
+    pub(crate) waveforms: WaveformStore,
+    pub(crate) scope_config: DsCopeCaptureConfig,
+}
+
+pub(crate) struct CalibrationProgressModal {
+    pub(crate) progress: f32,
+    pub(crate) phase: String,
+    pub(crate) completed: bool,
+    pub(crate) values: Option<DsCopeCalibrationValues>,
+}
+
+pub(crate) enum CalibrationModalAction {
+    Close,
+    Save(DsCopeCalibrationValues),
 }

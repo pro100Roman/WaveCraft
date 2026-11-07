@@ -6,6 +6,7 @@ mod format;
 mod frame_tests;
 mod measurements;
 mod protocol_analyzer;
+mod protocol_decode_cache;
 mod radio_analyzer;
 mod radio_trigger;
 mod recording;
@@ -40,6 +41,7 @@ use protocol_analyzer::{
     ProtocolAnalyzerSettings, ProtocolCaptureDecoder, ProtocolDataFormat, ProtocolDecodeOutcome,
     ProtocolDecodeSnapshot, ProtocolDecodedEvent, ProtocolDecodedKind, PROTOCOLS,
 };
+use protocol_decode_cache::*;
 use radio_analyzer::{
     process_radio_iq, RadioAnalyzerBank, RadioAnalyzerRuntime, RadioDataDecoderConfig,
     RadioDspOutput, RadioDspWorker,
@@ -58,7 +60,10 @@ use recording_metadata::{
     saved_logic_settings_metadata, saved_radio_settings_metadata, saved_scope_settings_metadata,
     scope_settings_from_recording_metadata,
 };
-use sessions::{SessionTabs, MAX_SESSION_TABS, SESSION_NAME_MAX_CHARS};
+use sessions::{
+    CombinedSessionSettings, SessionNameEditor, SessionTabAction, SessionTabs, MAX_SESSION_TABS,
+    SESSION_NAME_MAX_CHARS,
+};
 use snapshot::{crop_snapshot_image, save_snapshot_image, PendingSnapshot};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -457,184 +462,6 @@ pub fn run() -> eframe::Result<()> {
         options,
         Box::new(|creation_context| Ok(Box::new(WaveCraftApp::new(creation_context)))),
     )
-}
-
-#[derive(Debug)]
-struct ProtocolDecodeCacheKey {
-    waveform_revision: u64,
-    sample_offset: u64,
-    sample_count: usize,
-    analyzers: Vec<ProtocolAnalyzerInstance>,
-}
-
-impl ProtocolDecodeCacheKey {
-    /// Compares in place so a cache hit allocates nothing; the key is only built
-    /// when the inputs change.
-    fn matches(&self, waveforms: &WaveformStore, analyzers: &[ProtocolAnalyzerInstance]) -> bool {
-        self.waveform_revision == waveforms.logic_revision
-            && self.sample_offset == waveforms.logic_sample_offset
-            && self.sample_count == waveforms.logic_sample_count
-            && self.analyzers == analyzers
-    }
-}
-
-#[derive(Default)]
-struct ProtocolDecodeCache {
-    key: Option<ProtocolDecodeCacheKey>,
-    outcomes: Arc<Vec<ProtocolDecodeOutcome>>,
-    waveform_outcomes: Arc<Vec<ProtocolDecodeOutcome>>,
-}
-
-impl ProtocolDecodeCache {
-    #[cfg(test)]
-    fn outcomes<'a>(
-        &'a mut self,
-        waveforms: &WaveformStore,
-        analyzers: &[ProtocolAnalyzerInstance],
-        streamed: Option<&'a ProtocolDecodeSnapshot>,
-    ) -> &'a [ProtocolDecodeOutcome] {
-        if let Some(streamed) = streamed.filter(|decoder| decoder.matches_analyzers(analyzers)) {
-            return streamed.outcomes();
-        }
-        self.refresh(waveforms, analyzers);
-        &self.outcomes
-    }
-
-    /// Like [`Self::outcomes`], but returns a shared handle so the caller can
-    /// keep the result while mutably borrowing the cache again, without copying
-    /// every decoded event.
-    fn shared_outcomes(
-        &mut self,
-        waveforms: &WaveformStore,
-        analyzers: &[ProtocolAnalyzerInstance],
-        streamed: Option<&ProtocolDecodeSnapshot>,
-    ) -> Arc<Vec<ProtocolDecodeOutcome>> {
-        if let Some(streamed) = streamed.filter(|decoder| decoder.matches_analyzers(analyzers)) {
-            return streamed.shared_outcomes();
-        }
-        self.refresh(waveforms, analyzers);
-        Arc::clone(&self.outcomes)
-    }
-
-    fn waveform_outcomes<'a>(
-        &'a mut self,
-        waveforms: &WaveformStore,
-        analyzers: &[ProtocolAnalyzerInstance],
-        streamed: Option<&'a ProtocolDecodeSnapshot>,
-    ) -> &'a [ProtocolDecodeOutcome] {
-        if let Some(streamed) = streamed.filter(|decoder| decoder.matches_analyzers(analyzers)) {
-            return streamed.waveform_outcomes();
-        }
-        self.refresh(waveforms, analyzers);
-        &self.waveform_outcomes
-    }
-
-    fn refresh(&mut self, waveforms: &WaveformStore, analyzers: &[ProtocolAnalyzerInstance]) {
-        if self
-            .key
-            .as_ref()
-            .is_some_and(|key| key.matches(waveforms, analyzers))
-        {
-            return;
-        }
-        if waveforms.logic_sample_stride != 1
-            || waveforms
-                .logic_samples
-                .iter()
-                .any(|bucket| bucket.sample_count != 1)
-        {
-            let unavailable = Arc::new(
-                analyzers
-                    .iter()
-                    .map(|_| {
-                        ProtocolDecodeOutcome::Unavailable(
-                            "Raw samples are unavailable for this display capture".to_owned(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            self.waveform_outcomes = Arc::clone(&unavailable);
-            self.outcomes = unavailable;
-        } else {
-            let samples = waveforms
-                .logic_samples
-                .iter()
-                .map(|bucket| bucket.first)
-                .collect::<Vec<_>>();
-            self.outcomes = Arc::new(
-                analyzers
-                    .iter()
-                    .map(|analyzer| {
-                        decode_protocol_samples(
-                            analyzer,
-                            &samples,
-                            waveforms.logic_sample_offset,
-                            waveforms.logic_rate_hz,
-                        )
-                    })
-                    .collect(),
-            );
-            self.waveform_outcomes = Arc::new(
-                analyzers
-                    .iter()
-                    .map(|analyzer| {
-                        decode_transport_samples(
-                            analyzer,
-                            &samples,
-                            waveforms.logic_sample_offset,
-                            waveforms.logic_rate_hz,
-                        )
-                    })
-                    .collect(),
-            );
-        }
-        self.key = Some(ProtocolDecodeCacheKey {
-            waveform_revision: waveforms.logic_revision,
-            sample_offset: waveforms.logic_sample_offset,
-            sample_count: waveforms.logic_sample_count,
-            analyzers: analyzers.to_vec(),
-        });
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SessionTabAction {
-    Select(usize),
-    Add,
-    Close(usize),
-    BeginRename(usize),
-}
-
-struct SessionNameEditor {
-    target: CaptureTarget,
-    index: usize,
-    draft: String,
-    request_focus: bool,
-}
-
-struct CalibrationDisplay {
-    waveforms: WaveformStore,
-    scope_config: DsCopeCaptureConfig,
-}
-
-struct CalibrationProgressModal {
-    progress: f32,
-    phase: String,
-    completed: bool,
-    values: Option<DsCopeCalibrationValues>,
-}
-
-enum CalibrationModalAction {
-    Close,
-    Save(DsCopeCalibrationValues),
-}
-
-#[derive(Clone, Default)]
-struct CombinedSessionSettings {
-    logic: LogicSessionSettings,
-    scope: ScopeSessionSettings,
-    logic_ratio: f32,
-    viewport: WaveformViewport,
 }
 
 struct WaveCraftApp {

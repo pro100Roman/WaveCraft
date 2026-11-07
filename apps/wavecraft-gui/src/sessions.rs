@@ -1,3 +1,5 @@
+use crate::{CaptureTarget, LogicSessionSettings, ScopeSessionSettings, WaveformViewport};
+
 pub(crate) const MAX_SESSION_TABS: usize = 10;
 pub(crate) const SESSION_NAME_MAX_CHARS: usize = 48;
 
@@ -135,6 +137,29 @@ impl<T, S> SessionTabs<T, S> {
             .filter_map(|tab| tab.capture.as_ref())
             .any(predicate)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionTabAction {
+    Select(usize),
+    Add,
+    Close(usize),
+    BeginRename(usize),
+}
+
+pub(crate) struct SessionNameEditor {
+    pub(crate) target: CaptureTarget,
+    pub(crate) index: usize,
+    pub(crate) draft: String,
+    pub(crate) request_focus: bool,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CombinedSessionSettings {
+    pub(crate) logic: LogicSessionSettings,
+    pub(crate) scope: ScopeSessionSettings,
+    pub(crate) logic_ratio: f32,
+    pub(crate) viewport: WaveformViewport,
 }
 
 #[cfg(test)]
