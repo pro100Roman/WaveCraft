@@ -630,15 +630,6 @@ pub(crate) fn start_gui_recording(
     devices: &[DeviceDescriptor],
     settings: GuiRecordingSettings<'_>,
 ) -> Result<FileRecorder, String> {
-    let GuiRecordingSettings {
-        logic_config,
-        logic_settings,
-        scope_config,
-        scope_settings,
-        radio_settings,
-        logic_channel_names,
-        scope_channel_names,
-    } = settings;
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -649,8 +640,41 @@ pub(crate) fn start_gui_recording(
                 path.display()
             )
         })?;
+    let metadata = gui_recording_metadata(&settings);
+    RecordingWriter::new(BufWriter::new(file), devices, metadata).map_err(|error| error.to_string())
+}
+
+/// The session metadata that describes everything a capture was configured
+/// with. Readers rebuild the capture settings from these keys, so key names and
+/// values are part of the `.dsv` format.
+fn gui_recording_metadata(settings: &GuiRecordingSettings<'_>) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     metadata.insert("capture.command".to_owned(), "gui".to_owned());
+    insert_radio_capture_metadata(&mut metadata, settings.radio_settings);
+    insert_radio_analyzer_metadata(&mut metadata, settings.radio_settings);
+    insert_logic_capture_metadata(&mut metadata, settings.logic_config);
+    insert_logic_trigger_metadata(&mut metadata, settings.logic_config);
+    insert_logic_channel_metadata(
+        &mut metadata,
+        settings.logic_config,
+        &settings.logic_settings,
+    );
+    insert_channel_name_metadata(
+        &mut metadata,
+        settings.logic_channel_names,
+        settings.scope_channel_names,
+    );
+    insert_scope_capture_metadata(&mut metadata, settings.scope_config);
+    insert_scope_trigger_metadata(&mut metadata, settings.scope_config);
+    insert_scope_channel_metadata(&mut metadata, &settings.scope_settings);
+    metadata
+}
+
+/// The radio capture, trigger, correction, and gain keys.
+fn insert_radio_capture_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    radio_settings: &RadioSettings,
+) {
     metadata.insert(
         "radio.center_frequency_hz".to_owned(),
         radio_settings.capture.center_frequency_hz.to_string(),
@@ -712,152 +736,211 @@ pub(crate) fn start_gui_recording(
         }
         .to_owned(),
     );
-    for (key, value) in [
-        (
-            "channel_offset_hz",
-            radio_settings
-                .analyzer
-                .channels
-                .first()
-                .map_or(0, |channel| channel.frequency_offset_hz)
-                .to_string(),
-        ),
-        (
-            "channel_bandwidth_hz",
-            radio_settings.analyzer.channel_bandwidth_hz.to_string(),
-        ),
-        (
-            "output_sample_rate_hz",
-            radio_settings.analyzer.output_sample_rate_hz.to_string(),
-        ),
-        (
-            "filter_tap_count",
-            radio_settings.analyzer.filter_tap_count.to_string(),
-        ),
-        (
-            "symbol_rate_hz",
-            radio_settings.analyzer.symbol_rate_hz.to_string(),
-        ),
-        (
-            "deviation_hz",
-            radio_settings.analyzer.deviation_hz.to_string(),
-        ),
-        (
-            "gfsk_bt_milli",
-            radio_settings.analyzer.gfsk_bt_milli.to_string(),
-        ),
-        ("inverted", radio_settings.analyzer.inverted.to_string()),
-        (
-            "adaptive_timing",
-            radio_settings.analyzer.adaptive_timing.to_string(),
-        ),
-        (
-            "timing_loop_bandwidth_milli",
-            radio_settings
-                .analyzer
-                .timing_loop_bandwidth_milli
-                .to_string(),
-        ),
-        (
-            "max_clock_error_ppm",
-            radio_settings.analyzer.max_clock_error_ppm.to_string(),
-        ),
-        (
-            "data_mode",
-            match radio_settings.analyzer.data_mode {
-                RadioDataMode::Raw => "raw",
-                RadioDataMode::Packets => "packets",
-            }
-            .to_owned(),
-        ),
-        (
-            "preamble_byte",
-            radio_settings.analyzer.preamble_byte.to_string(),
-        ),
-        (
-            "preamble_bytes",
-            radio_settings.analyzer.preamble_bytes.to_string(),
-        ),
-        ("sync_word", radio_settings.analyzer.sync_word.to_string()),
-        (
-            "sync_word_bytes",
-            radio_settings.analyzer.sync_word_bytes.to_string(),
-        ),
-        (
-            "maximum_preamble_bit_errors",
-            radio_settings
-                .analyzer
-                .maximum_preamble_bit_errors
-                .to_string(),
-        ),
-        (
-            "minimum_bit_confidence_milli",
-            radio_settings
-                .analyzer
-                .minimum_bit_confidence_milli
-                .to_string(),
-        ),
-        (
-            "maximum_uncertain_bits",
-            radio_settings.analyzer.maximum_uncertain_bits.to_string(),
-        ),
-        (
-            "whitening_enabled",
-            radio_settings.analyzer.whitening_enabled.to_string(),
-        ),
-        (
-            "whitening_preset",
-            radio_settings
-                .analyzer
-                .whitening_preset
-                .metadata_value()
-                .to_owned(),
-        ),
-        (
-            "whitening_width",
-            radio_settings.analyzer.whitening_width.to_string(),
-        ),
-        (
-            "whitening_polynomial",
-            radio_settings.analyzer.whitening_polynomial.to_string(),
-        ),
-        (
-            "whitening_seed",
-            radio_settings.analyzer.whitening_seed.to_string(),
-        ),
-        (
-            "whitening_direction",
-            match radio_settings.analyzer.whitening_direction {
-                WhiteningDirection::ShiftRight => "right",
-                WhiteningDirection::ShiftLeft => "left",
-            }
-            .to_owned(),
-        ),
-        (
-            "whitening_invert_output",
-            radio_settings.analyzer.whitening_invert_output.to_string(),
-        ),
-        (
-            "whitening_start_bit",
-            radio_settings.analyzer.whitening_start_bit.to_string(),
-        ),
-        (
-            "whitening_end_bit",
-            radio_settings
-                .analyzer
-                .whitening_end_bit
-                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-        ),
-        (
-            "whitening_advance_excluded_bits",
-            radio_settings
-                .analyzer
-                .whitening_advance_excluded_bits
-                .to_string(),
-        ),
-    ] {
+    for (id, gain_db) in &radio_settings.gains_db {
+        metadata.insert(format!("radio.gain.{id}_db"), gain_db.to_string());
+    }
+}
+
+fn insert_radio_analyzer_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    radio_settings: &RadioSettings,
+) {
+    insert_radio_analyzer_signal_metadata(metadata, radio_settings);
+    insert_radio_analyzer_data_metadata(metadata, radio_settings);
+    insert_radio_analyzer_whitening_metadata(metadata, radio_settings);
+    insert_radio_analyzer_channel_metadata(metadata, radio_settings);
+}
+
+fn insert_radio_analyzer_fields<const COUNT: usize>(
+    metadata: &mut BTreeMap<String, String>,
+    fields: [(&str, String); COUNT],
+) {
+    for (key, value) in fields {
         metadata.insert(format!("radio.analyzer.{key}"), value);
     }
+}
+
+/// Channel filter, symbol timing, and clock-recovery keys.
+fn insert_radio_analyzer_signal_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    radio_settings: &RadioSettings,
+) {
+    insert_radio_analyzer_fields(
+        metadata,
+        [
+            (
+                "channel_offset_hz",
+                radio_settings
+                    .analyzer
+                    .channels
+                    .first()
+                    .map_or(0, |channel| channel.frequency_offset_hz)
+                    .to_string(),
+            ),
+            (
+                "channel_bandwidth_hz",
+                radio_settings.analyzer.channel_bandwidth_hz.to_string(),
+            ),
+            (
+                "output_sample_rate_hz",
+                radio_settings.analyzer.output_sample_rate_hz.to_string(),
+            ),
+            (
+                "filter_tap_count",
+                radio_settings.analyzer.filter_tap_count.to_string(),
+            ),
+            (
+                "symbol_rate_hz",
+                radio_settings.analyzer.symbol_rate_hz.to_string(),
+            ),
+            (
+                "deviation_hz",
+                radio_settings.analyzer.deviation_hz.to_string(),
+            ),
+            (
+                "gfsk_bt_milli",
+                radio_settings.analyzer.gfsk_bt_milli.to_string(),
+            ),
+            ("inverted", radio_settings.analyzer.inverted.to_string()),
+            (
+                "adaptive_timing",
+                radio_settings.analyzer.adaptive_timing.to_string(),
+            ),
+            (
+                "timing_loop_bandwidth_milli",
+                radio_settings
+                    .analyzer
+                    .timing_loop_bandwidth_milli
+                    .to_string(),
+            ),
+            (
+                "max_clock_error_ppm",
+                radio_settings.analyzer.max_clock_error_ppm.to_string(),
+            ),
+        ],
+    );
+}
+
+/// Raw/packet mode and the preamble and sync-word keys.
+fn insert_radio_analyzer_data_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    radio_settings: &RadioSettings,
+) {
+    insert_radio_analyzer_fields(
+        metadata,
+        [
+            (
+                "data_mode",
+                match radio_settings.analyzer.data_mode {
+                    RadioDataMode::Raw => "raw",
+                    RadioDataMode::Packets => "packets",
+                }
+                .to_owned(),
+            ),
+            (
+                "preamble_byte",
+                radio_settings.analyzer.preamble_byte.to_string(),
+            ),
+            (
+                "preamble_bytes",
+                radio_settings.analyzer.preamble_bytes.to_string(),
+            ),
+            ("sync_word", radio_settings.analyzer.sync_word.to_string()),
+            (
+                "sync_word_bytes",
+                radio_settings.analyzer.sync_word_bytes.to_string(),
+            ),
+            (
+                "maximum_preamble_bit_errors",
+                radio_settings
+                    .analyzer
+                    .maximum_preamble_bit_errors
+                    .to_string(),
+            ),
+            (
+                "minimum_bit_confidence_milli",
+                radio_settings
+                    .analyzer
+                    .minimum_bit_confidence_milli
+                    .to_string(),
+            ),
+            (
+                "maximum_uncertain_bits",
+                radio_settings.analyzer.maximum_uncertain_bits.to_string(),
+            ),
+        ],
+    );
+}
+
+fn insert_radio_analyzer_whitening_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    radio_settings: &RadioSettings,
+) {
+    insert_radio_analyzer_fields(
+        metadata,
+        [
+            (
+                "whitening_enabled",
+                radio_settings.analyzer.whitening_enabled.to_string(),
+            ),
+            (
+                "whitening_preset",
+                radio_settings
+                    .analyzer
+                    .whitening_preset
+                    .metadata_value()
+                    .to_owned(),
+            ),
+            (
+                "whitening_width",
+                radio_settings.analyzer.whitening_width.to_string(),
+            ),
+            (
+                "whitening_polynomial",
+                radio_settings.analyzer.whitening_polynomial.to_string(),
+            ),
+            (
+                "whitening_seed",
+                radio_settings.analyzer.whitening_seed.to_string(),
+            ),
+            (
+                "whitening_direction",
+                match radio_settings.analyzer.whitening_direction {
+                    WhiteningDirection::ShiftRight => "right",
+                    WhiteningDirection::ShiftLeft => "left",
+                }
+                .to_owned(),
+            ),
+            (
+                "whitening_invert_output",
+                radio_settings.analyzer.whitening_invert_output.to_string(),
+            ),
+            (
+                "whitening_start_bit",
+                radio_settings.analyzer.whitening_start_bit.to_string(),
+            ),
+            (
+                "whitening_end_bit",
+                radio_settings
+                    .analyzer
+                    .whitening_end_bit
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            ),
+            (
+                "whitening_advance_excluded_bits",
+                radio_settings
+                    .analyzer
+                    .whitening_advance_excluded_bits
+                    .to_string(),
+            ),
+        ],
+    );
+}
+
+fn insert_radio_analyzer_channel_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    radio_settings: &RadioSettings,
+) {
     metadata.insert(
         "radio.analyzer.channel_count".to_owned(),
         radio_settings.analyzer.channels.len().to_string(),
@@ -872,9 +955,12 @@ pub(crate) fn start_gui_recording(
             channel.name.clone(),
         );
     }
-    for (id, gain_db) in &radio_settings.gains_db {
-        metadata.insert(format!("radio.gain.{id}_db"), gain_db.to_string());
-    }
+}
+
+fn insert_logic_capture_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    logic_config: DsLogicCaptureConfig,
+) {
     metadata.insert(
         "logic.sample_rate_hz".to_owned(),
         logic_config.sample_rate_hz().to_string(),
@@ -928,6 +1014,14 @@ pub(crate) fn start_gui_recording(
         "logic.trigger.enabled".to_owned(),
         logic_config.trigger().is_some().to_string(),
     );
+}
+
+/// The trigger mode and conditions. Simple triggers also write the one-channel
+/// keys that recordings made before multi-channel triggers used.
+fn insert_logic_trigger_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    logic_config: DsLogicCaptureConfig,
+) {
     match logic_config.trigger() {
         Some(DsLogicTriggerConfig::Simple(trigger)) => {
             metadata.insert("logic.trigger.mode".to_owned(), "simple".to_owned());
@@ -974,6 +1068,13 @@ pub(crate) fn start_gui_recording(
         }
         None => {}
     }
+}
+
+fn insert_logic_channel_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    logic_config: DsLogicCaptureConfig,
+    logic_settings: &LogicCaptureSettings,
+) {
     for (channel, enabled) in logic_config.enabled_channels().into_iter().enumerate() {
         metadata.insert(format!("logic.ch{channel}.enabled"), enabled.to_string());
         metadata.insert(
@@ -981,7 +1082,12 @@ pub(crate) fn start_gui_recording(
             logic_settings.maximum_heights[channel].to_string(),
         );
     }
-    insert_channel_name_metadata(&mut metadata, logic_channel_names, scope_channel_names);
+}
+
+fn insert_scope_capture_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    scope_config: DsCopeCaptureConfig,
+) {
     metadata.insert(
         "scope.sample_rate_hz".to_owned(),
         scope_config.sample_rate_hz().to_string(),
@@ -990,6 +1096,12 @@ pub(crate) fn start_gui_recording(
         "scope.sample_count".to_owned(),
         scope_config.sample_count().to_string(),
     );
+}
+
+fn insert_scope_trigger_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    scope_config: DsCopeCaptureConfig,
+) {
     let trigger = scope_config.trigger();
     metadata.insert(
         "scope.trigger.position_percent".to_owned(),
@@ -1036,6 +1148,12 @@ pub(crate) fn start_gui_recording(
             level.to_string(),
         );
     }
+}
+
+fn insert_scope_channel_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    scope_settings: &ScopeCaptureSettings,
+) {
     for (index, channel) in scope_settings.channels.iter().enumerate() {
         metadata.insert(
             format!("scope.ch{index}.enabled"),
@@ -1058,7 +1176,6 @@ pub(crate) fn start_gui_recording(
             channel.vertical_offset.to_string(),
         );
     }
-    RecordingWriter::new(BufWriter::new(file), devices, metadata).map_err(|error| error.to_string())
 }
 
 pub(crate) fn finish_gui_recording(
