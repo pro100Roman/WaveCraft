@@ -605,6 +605,18 @@ Initial demodulator configuration includes:
 - timing-recovery loop bandwidth; and
 - carrier/squelch threshold with minimum burst duration.
 
+The channel bandwidth defaults to Auto in the GUI (stored as 0, like the filter
+length): Carson's rule `2 * deviation + bit rate` plus 15 kHz on each side for
+carrier error, rounded up to 5 kHz, and never more than the processing rate.
+That is 120 kHz for 19.2 kbit/s with 35 kHz deviation. Noise power grows with
+the bandwidth, so the 200 kHz channel that used to be the default cost
+sensitivity: at 14 dB Eb/N0 the bit error rate is 2.8e-3 at 120 kHz and 1.9e-2
+at 200 kHz, and the preamble is intact in 59 of 60 bursts against 51. The
+margin sets what the narrower channel tolerates: a 120 kHz channel decodes with
+a 20 kHz carrier error (8.5e-3) and loses the signal at 30 kHz, whereas 90 kHz,
+Carson with no margin, already fails at 20 kHz. A transmitter plus SDR that are
+further apart than that need Auto switched off and a wider channel.
+
 The first version requires a configured symbol rate and approximate deviation.
 Automatic baud, deviation, and modulation detection can be added later as an
 explicit estimation tool; it must not silently change a saved decoder profile.

@@ -2,12 +2,14 @@
 //! (demodulation, packet, and whitening) configuration.
 
 use crate::{
-    egui, nearest_domain_value, normalize_gain_value, paint_capture_settings_save_button,
-    selected_radio, Color32, DiscoveredRadio, FontId, Pos2, RadioAnalyzerChannelSettings,
-    RadioAnalyzerSettings, RadioDataMode, RadioDemodulation, RadioProvider, RadioProviderFailure,
-    RadioSettings, RadioWhiteningPreset, RangeInclusive, RichText, SavedCaptureSettingsKind,
-    SelectableHoverText, ValueDomain, WhiteningDirection, BACKGROUND, MAX_RADIO_ANALYZER_CHANNELS,
-    RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS, RAW_AUTOMATIC_PREAMBLE_BITS, TEXT_MUTED,
+    automatic_filter_tap_count, egui, nearest_domain_value, normalize_gain_value,
+    paint_capture_settings_save_button, selected_radio, Color32, DiscoveredRadio, FontId, Pos2,
+    RadioAnalyzerChannelSettings, RadioAnalyzerSettings, RadioDataMode, RadioDemodulation,
+    RadioProvider, RadioProviderFailure, RadioSettings, RadioWhiteningPreset, RangeInclusive,
+    RichText, SavedCaptureSettingsKind, SelectableHoverText, ValueDomain, WhiteningDirection,
+    AUTOMATIC_CHANNEL_BANDWIDTH_HZ, AUTOMATIC_FILTER_TAP_COUNT, BACKGROUND,
+    MAX_RADIO_ANALYZER_CHANNELS, RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS, RAW_AUTOMATIC_PREAMBLE_BITS,
+    TEXT_MUTED,
 };
 use std::collections::BTreeMap;
 use wavecraft_sdr::GainControlDescriptor;
@@ -432,16 +434,14 @@ fn paint_radio_analyzer_filter_rows(
     paint_radio_parameter_label(
         ui,
         "Channel bandwidth",
-        Some("Full complex bandwidth retained around the selected channel"),
+        Some(
+            "Full complex bandwidth retained around the selected channel. Auto uses \
+             Carson's rule (2 x deviation + bit rate) plus 15 kHz each side for carrier \
+             frequency error; a narrower channel passes less noise.",
+        ),
     );
     ui.add_enabled_ui(enabled, |ui| {
-        paint_scaled_u64_value(
-            ui,
-            &mut settings.channel_bandwidth_hz,
-            1_000_000.0,
-            0.000_001..=capture_rate_mhz.max(0.000_001),
-            "MHz",
-        );
+        paint_channel_bandwidth_value(ui, settings, capture_rate_mhz);
     });
     ui.end_row();
 
@@ -464,19 +464,97 @@ fn paint_radio_analyzer_filter_rows(
     paint_radio_parameter_label(
         ui,
         "Channel filter taps",
-        Some("Odd FIR length from 3 to 4095; more taps improve rejection but cost CPU"),
+        Some(
+            "Odd FIR length from 3 to 4095; more taps improve rejection but cost CPU. \
+             Auto sizes the filter from the capture rate so the transition band stays a \
+             quarter of the channel bandwidth.",
+        ),
     );
     ui.add_enabled_ui(enabled, |ui| {
-        add_left_aligned_sized(
-            ui,
-            egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-            egui::DragValue::new(&mut settings.filter_tap_count)
-                .range(3..=4_095)
-                .speed(2),
-        );
+        paint_filter_tap_count_value(ui, settings, capture_sample_rate_hz);
     });
-    settings.filter_tap_count = settings.filter_tap_count.clamp(3, 4_095) | 1;
+    if settings.filter_tap_count != AUTOMATIC_FILTER_TAP_COUNT {
+        settings.filter_tap_count = settings.filter_tap_count.clamp(3, 4_095) | 1;
+    }
     ui.end_row();
+}
+
+/// Channel bandwidth editor with an Auto switch. While Auto is on the value
+/// shown is the one the analyzer will use and cannot be edited.
+fn paint_channel_bandwidth_value(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    capture_rate_mhz: f64,
+) {
+    ui.horizontal(|ui| {
+        let effective_hz = settings.effective_channel_bandwidth_hz();
+        let mut automatic = settings.channel_bandwidth_hz == AUTOMATIC_CHANNEL_BANDWIDTH_HZ;
+        if automatic {
+            let mut shown_hz = effective_hz;
+            ui.add_enabled_ui(false, |ui| {
+                paint_scaled_u64_value(
+                    ui,
+                    &mut shown_hz,
+                    1_000_000.0,
+                    0.000_001..=capture_rate_mhz.max(0.000_001),
+                    "MHz",
+                );
+            });
+        } else {
+            paint_scaled_u64_value(
+                ui,
+                &mut settings.channel_bandwidth_hz,
+                1_000_000.0,
+                0.000_001..=capture_rate_mhz.max(0.000_001),
+                "MHz",
+            );
+        }
+        if ui.checkbox(&mut automatic, "Auto").changed() {
+            // Leaving Auto keeps the bandwidth that was in use.
+            settings.channel_bandwidth_hz = if automatic {
+                AUTOMATIC_CHANNEL_BANDWIDTH_HZ
+            } else {
+                effective_hz
+            };
+        }
+    });
+}
+
+/// Filter length editor with an Auto switch; see [`paint_channel_bandwidth_value`].
+fn paint_filter_tap_count_value(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    capture_sample_rate_hz: u64,
+) {
+    ui.horizontal(|ui| {
+        let automatic_taps = automatic_filter_tap_count(
+            capture_sample_rate_hz,
+            settings.effective_channel_bandwidth_hz(),
+        );
+        let mut automatic = settings.filter_tap_count == AUTOMATIC_FILTER_TAP_COUNT;
+        let size = egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y);
+        if automatic {
+            let mut shown = automatic_taps;
+            ui.add_enabled_ui(false, |ui| {
+                add_left_aligned_sized(ui, size, egui::DragValue::new(&mut shown).range(3..=4_095));
+            });
+        } else {
+            add_left_aligned_sized(
+                ui,
+                size,
+                egui::DragValue::new(&mut settings.filter_tap_count)
+                    .range(3..=4_095)
+                    .speed(2),
+            );
+        }
+        if ui.checkbox(&mut automatic, "Auto").changed() {
+            settings.filter_tap_count = if automatic {
+                AUTOMATIC_FILTER_TAP_COUNT
+            } else {
+                automatic_taps
+            };
+        }
+    });
 }
 
 fn paint_radio_analyzer_symbol_rows(
@@ -1108,7 +1186,8 @@ pub(crate) fn paint_radio_analyzer_channels(
         )
         .clicked()
     {
-        let step_hz = i64::try_from(settings.channel_bandwidth_hz.max(1)).unwrap_or(i64::MAX);
+        let step_hz =
+            i64::try_from(settings.effective_channel_bandwidth_hz().max(1)).unwrap_or(i64::MAX);
         let preferred = (0..MAX_RADIO_ANALYZER_CHANNELS)
             .flat_map(|index| {
                 let distance = i64::try_from(index)
@@ -1685,6 +1764,22 @@ mod tests {
         settings.filter_tap_count = 100_000;
         render_analyzer(&mut settings);
         assert_eq!(settings.filter_tap_count, 4_095);
+    }
+
+    #[test]
+    fn an_automatic_filter_tap_count_and_bandwidth_are_left_alone() {
+        let mut settings = enabled_analyzer();
+        assert_eq!(settings.filter_tap_count, AUTOMATIC_FILTER_TAP_COUNT);
+        assert_eq!(
+            settings.channel_bandwidth_hz,
+            AUTOMATIC_CHANNEL_BANDWIDTH_HZ
+        );
+        render_analyzer(&mut settings);
+        assert_eq!(settings.filter_tap_count, AUTOMATIC_FILTER_TAP_COUNT);
+        assert_eq!(
+            settings.channel_bandwidth_hz,
+            AUTOMATIC_CHANNEL_BANDWIDTH_HZ
+        );
     }
 
     #[test]

@@ -993,9 +993,12 @@ fn paint_analysis(
         }
         if telemetry.timing_locked {
             status.push_str(&format!(
-                " · timing {:.0}%",
+                " · eye {:.0}%",
                 telemetry.timing_lock_quality * 100.0
             ));
+            if let Some(snr) = telemetry.decision_snr_db {
+                status.push_str(&format!(" · SNR {snr:.0} dB"));
+            }
         }
     }
     selectable_overlay_label(

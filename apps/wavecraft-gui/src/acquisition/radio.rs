@@ -2,13 +2,13 @@
 //! configuration, and the translation to capture and runtime requests.
 
 use crate::{
-    AdditiveWhiteningConfig, BTreeMap, BinaryFskProfile, BinaryGfskProfile, BitOrder,
-    BitTransformConfig, ChannelizerConfig, DemodulationProfile, DiscoveredRadio, FskPolarity,
-    FskTiming, HashSet, RadioCapabilities, RadioCaptureSettings, RadioDataDecoderConfig,
-    RadioPacketFramerConfig, RadioPacketLength, RadioPacketPipelineConfig, RadioProviderSettings,
-    RadioSingleTriggerConfig, RawRadioConfig, SignalAnalyzerProfile, SyncWordConfig, ValueDomain,
-    WhiteningDirection, MAX_RADIO_ANALYZER_CHANNELS, RADIO_SPECTRUM_FFT_LENGTH,
-    RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS,
+    recommended_fsk_channel_bandwidth_hz, AdditiveWhiteningConfig, BTreeMap, BinaryFskProfile,
+    BinaryGfskProfile, BitOrder, BitTransformConfig, ChannelizerConfig, DemodulationProfile,
+    DiscoveredRadio, FskPolarity, FskTiming, HashSet, RadioCapabilities, RadioCaptureSettings,
+    RadioDataDecoderConfig, RadioPacketFramerConfig, RadioPacketLength, RadioPacketPipelineConfig,
+    RadioProviderSettings, RadioSingleTriggerConfig, RawRadioConfig, SignalAnalyzerProfile,
+    SyncWordConfig, ValueDomain, WhiteningDirection, MAX_RADIO_ANALYZER_CHANNELS,
+    RADIO_SPECTRUM_FFT_LENGTH, RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS,
 };
 
 pub(crate) struct RadioCaptureRequest {
@@ -78,6 +78,11 @@ impl RadioWhiteningPreset {
     }
 }
 
+/// `channel_bandwidth_hz` value that selects the recommended bandwidth.
+pub(crate) const AUTOMATIC_CHANNEL_BANDWIDTH_HZ: u64 = 0;
+/// `filter_tap_count` value that selects the length from the input rate.
+pub(crate) const AUTOMATIC_FILTER_TAP_COUNT: usize = 0;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RadioAnalyzerChannelSettings {
     pub(crate) name: String,
@@ -97,8 +102,13 @@ impl RadioAnalyzerChannelSettings {
 pub(crate) struct RadioAnalyzerSettings {
     pub(crate) demodulation: RadioDemodulation,
     pub(crate) channels: Vec<RadioAnalyzerChannelSettings>,
+    /// Channel bandwidth, or [`AUTOMATIC_CHANNEL_BANDWIDTH_HZ`] to derive it
+    /// from the bit rate and deviation (see
+    /// [`Self::effective_channel_bandwidth_hz`]).
     pub(crate) channel_bandwidth_hz: u64,
     pub(crate) output_sample_rate_hz: u64,
+    /// Odd FIR length, or [`AUTOMATIC_FILTER_TAP_COUNT`] to size it from the
+    /// capture rate and the channel bandwidth.
     pub(crate) filter_tap_count: usize,
     pub(crate) symbol_rate_hz: u64,
     pub(crate) deviation_hz: u64,
@@ -134,9 +144,9 @@ impl Default for RadioAnalyzerSettings {
             // Capture both observed 868.1/868.5 MHz channels around 868.3 MHz;
             // retain 868.1 MHz as the first channel if analysis is enabled.
             channels: vec![RadioAnalyzerChannelSettings::numbered(0, -200_000)],
-            channel_bandwidth_hz: 200_000,
+            channel_bandwidth_hz: AUTOMATIC_CHANNEL_BANDWIDTH_HZ,
             output_sample_rate_hz: 512_000,
-            filter_tap_count: 257,
+            filter_tap_count: AUTOMATIC_FILTER_TAP_COUNT,
             symbol_rate_hz: 19_200,
             deviation_hz: 35_000,
             gfsk_bt_milli: 500,
@@ -167,6 +177,17 @@ impl Default for RadioAnalyzerSettings {
 }
 
 impl RadioAnalyzerSettings {
+    /// Channel bandwidth in use: the configured one, or for
+    /// [`AUTOMATIC_CHANNEL_BANDWIDTH_HZ`] the recommended bandwidth for the bit rate and deviation, limited to the
+    /// processing rate that the channel is resampled to.
+    pub(crate) fn effective_channel_bandwidth_hz(&self) -> u64 {
+        if self.channel_bandwidth_hz != AUTOMATIC_CHANNEL_BANDWIDTH_HZ {
+            return self.channel_bandwidth_hz;
+        }
+        recommended_fsk_channel_bandwidth_hz(self.symbol_rate_hz, self.deviation_hz)
+            .clamp(1, self.output_sample_rate_hz.max(1))
+    }
+
     pub(crate) fn is_enabled(&self) -> bool {
         self.demodulation != RadioDemodulation::None
     }
@@ -283,6 +304,7 @@ impl RadioAnalyzerSettings {
         {
             return Err("signal analyzer channel offsets must be unique".to_owned());
         }
+        let bandwidth_hz = self.effective_channel_bandwidth_hz();
         let timing = if self.adaptive_timing {
             FskTiming::Adaptive {
                 loop_bandwidth: f64::from(self.timing_loop_bandwidth_milli) / 1_000.0,
@@ -318,7 +340,7 @@ impl RadioAnalyzerSettings {
                 let profile = SignalAnalyzerProfile {
                     channel: ChannelizerConfig {
                         frequency_offset_hz: channel.frequency_offset_hz,
-                        bandwidth_hz: self.channel_bandwidth_hz,
+                        bandwidth_hz,
                         output_sample_rate_hz: self.output_sample_rate_hz,
                         filter_tap_count: self.filter_tap_count,
                     },
@@ -580,7 +602,16 @@ mod tests {
         assert_eq!(settings.analyzer.channels[0].name, "Channel 1");
         assert_eq!(settings.analyzer.channels[0].frequency_offset_hz, -200_000);
         assert_eq!(settings.analyzer.output_sample_rate_hz, 512_000);
-        assert_eq!(settings.analyzer.filter_tap_count, 257);
+        assert_eq!(
+            settings.analyzer.channel_bandwidth_hz,
+            AUTOMATIC_CHANNEL_BANDWIDTH_HZ
+        );
+        assert_eq!(
+            settings.analyzer.filter_tap_count,
+            AUTOMATIC_FILTER_TAP_COUNT
+        );
+        // Carson's rule for 19.2 kbit/s and 35 kHz deviation plus the margin.
+        assert_eq!(settings.analyzer.effective_channel_bandwidth_hz(), 120_000);
         assert_eq!(settings.analyzer.maximum_preamble_bit_errors, 1);
         assert_eq!(settings.analyzer.minimum_bit_confidence_milli, 0);
         assert_eq!(settings.analyzer.maximum_uncertain_bits, 0);
@@ -675,6 +706,38 @@ mod tests {
         assert_eq!(gfsk.deviation_hz, 35_000);
         assert_eq!(gfsk.bt, 0.5);
         assert!(matches!(gfsk.timing, FskTiming::Adaptive { .. }));
+    }
+
+    #[test]
+    fn automatic_channel_bandwidth_follows_the_signal_and_manual_values_win() {
+        let mut settings = RadioAnalyzerSettings {
+            demodulation: RadioDemodulation::BinaryGfsk,
+            ..RadioAnalyzerSettings::default()
+        };
+        let profile =
+            |settings: &RadioAnalyzerSettings| settings.signal_profiles().unwrap().remove(0);
+
+        // 19.2 kbit/s with 35 kHz deviation: Carson 89.2 kHz plus 2 x 15 kHz.
+        let automatic = profile(&settings);
+        assert_eq!(automatic.channel.bandwidth_hz, 120_000);
+        assert_eq!(
+            automatic.channel.filter_tap_count,
+            AUTOMATIC_FILTER_TAP_COUNT
+        );
+
+        settings.deviation_hz = 50_000;
+        settings.symbol_rate_hz = 100_000;
+        assert_eq!(profile(&settings).channel.bandwidth_hz, 230_000);
+
+        // The channel cannot be wider than the rate it is resampled to.
+        settings.output_sample_rate_hz = 200_000;
+        assert_eq!(profile(&settings).channel.bandwidth_hz, 200_000);
+
+        settings.channel_bandwidth_hz = 150_000;
+        settings.filter_tap_count = 129;
+        let manual = profile(&settings);
+        assert_eq!(manual.channel.bandwidth_hz, 150_000);
+        assert_eq!(manual.channel.filter_tap_count, 129);
     }
 
     #[test]

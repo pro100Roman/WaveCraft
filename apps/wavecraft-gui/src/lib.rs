@@ -106,8 +106,9 @@ use wavecraft_decode::{
     WhiteningDirection,
 };
 use wavecraft_dsp::{
-    BinaryFskProfile, BinaryGfskProfile, ChannelizerConfig, DemodulationProfile, FskPolarity,
-    FskTiming, SignalAnalyzerProfile, SpectrumProcessor, SpectrumWindow,
+    automatic_filter_tap_count, recommended_fsk_channel_bandwidth_hz, BinaryFskProfile,
+    BinaryGfskProfile, ChannelizerConfig, DemodulationProfile, FskPolarity, FskTiming,
+    SignalAnalyzerProfile, SpectrumProcessor, SpectrumWindow,
 };
 use wavecraft_recording::{
     read_saleae, write_saleae, CompletionStatus, RecordingReader, RecordingWriter,
