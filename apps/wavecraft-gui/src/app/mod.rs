@@ -2,6 +2,7 @@
 //! `WaveCraftApp`, whose state lives in the crate root.
 
 pub mod calibration;
+pub mod captures;
 pub mod devices;
 pub mod files;
 pub mod view_state;
