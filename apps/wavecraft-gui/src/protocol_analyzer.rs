@@ -280,8 +280,13 @@ impl ProtocolDecodeSnapshot {
         self.analyzers == analyzers
     }
 
+    #[cfg(test)]
     pub fn outcomes(&self) -> &[ProtocolDecodeOutcome] {
         &self.outcomes
+    }
+
+    pub fn shared_outcomes(&self) -> Arc<Vec<ProtocolDecodeOutcome>> {
+        Arc::clone(&self.outcomes)
     }
 
     pub fn waveform_outcomes(&self) -> &[ProtocolDecodeOutcome] {
