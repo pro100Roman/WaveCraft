@@ -5850,32 +5850,7 @@ impl eframe::App for WaveCraftApp {
         };
         self.paint_toolbar(context, toolbar_inputs, &mut actions);
 
-        let available_waveform_tabs = self.available_waveform_tabs();
-        if !available_waveform_tabs.is_empty() {
-            egui::TopBottomPanel::top("waveform_tabs")
-                .frame(
-                    egui::Frame::none()
-                        .fill(PANEL)
-                        .inner_margin(egui::Margin::symmetric(14.0, 7.0)),
-                )
-                .show(context, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("VIEW").strong().color(TEXT_MUTED));
-                        ui.separator();
-                        for tab in &available_waveform_tabs {
-                            if ui
-                                .selectable_label(
-                                    self.active_waveform_tab == Some(*tab),
-                                    tab.label(),
-                                )
-                                .clicked()
-                            {
-                                self.select_waveform_tab(*tab);
-                            }
-                        }
-                    });
-                });
-        }
+        self.paint_waveform_tabs(context);
 
         self.paint_capture_setup_panel(
             context,
