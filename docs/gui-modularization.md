@@ -1,8 +1,10 @@
 # GUI modularization and multi-SDR integration plan
 
-Status: in progress. The split is partly done and the RF/SDR integration for
-HackRF One is implemented; see [Current status](#current-status) for what is
-finished and what remains.
+Status: the file split (migration steps 1-3 and 5-7) is done and `lib.rs` is
+down to 688 lines; the RF/SDR integration for HackRF One is implemented. What
+remains is the long functions inside the moved code, narrowing what the panels
+can reach, and the LimeSDR and AntSDR adapters. See
+[Current status](#current-status) and the [Migration sequence](#migration-sequence).
 
 This document describes a behavior-preserving split of the GUI application
 (originally all in `apps/wavecraft-gui/src/main.rs`, now mostly in
@@ -145,71 +147,77 @@ line count of `main.rs`. In particular:
 - the application remains the owner of mutable GUI state; and
 - focused tests should live beside the module whose behavior they verify.
 
-## Proposed source layout
+## Source layout
+
+This is the layout the code has now. Items marked *(planned)* do not exist yet.
 
 ```text
 apps/wavecraft-gui/src/
 ├── main.rs                       # native startup only
-├── app/
-│   ├── mod.rs                    # WaveCraftApp and top-level update cycle
-│   ├── actions.rs                # typed actions returned by panels/dialogs
-│   ├── state.rs                  # cross-view application state
-│   └── workers.rs                # polling and background-task coordination
+├── lib.rs                        # module declarations, WaveCraftApp struct,
+│                                 # constructors, run_frame, run()
+├── app/                          # WaveCraftApp methods, by responsibility
+│   ├── mod.rs
+│   ├── devices.rs                # refresh, device and radio selection
+│   ├── captures.rs               # begin/stop/poll captures, completed captures
+│   ├── worker.rs                 # poll_worker: results of background work
+│   ├── calibration.rs            # DSCope calibration and idle configuration
+│   ├── files.rs                  # open/export/attach recordings, snapshots
+│   └── view_state.rs             # saved settings, session settings, active tabs
 ├── acquisition/
-│   ├── mod.rs                    # instrument-independent capture lifecycle
+│   ├── mod.rs
+│   ├── capture.rs                # AcquisitionMode, CaptureTarget, ActiveCapture,
+│   │                             # start_capture
 │   ├── logic.rs                  # DSLogic capture/session settings
 │   ├── scope.rs                  # DSCope capture/session settings
-│   └── radio.rs                  # generic RF capture/session settings
-├── devices/
-│   ├── mod.rs                    # discovery aggregation and stable selection
-│   ├── logic.rs                  # logic capability mapping
-│   ├── scope.rs                  # scope capability mapping
-│   └── radio.rs                  # SDR capability mapping and backend labels
-├── sessions.rs                   # generic session tabs and saved view state
-├── recording.rs                  # native/Saleae loading, saving, metadata
+│   └── radio.rs                  # radio capture settings and requests
+├── devices.rs                    # selection helpers, USB speed warning,
+│                                 # resource directory
+├── sessions.rs                   # generic session tabs and session settings
+├── recording.rs                  # native/Saleae loading, saving
+├── recording_metadata.rs         # settings <-> .dsv metadata
+├── capture_settings.rs           # saved per-user capture setting profiles
 ├── snapshot.rs                   # screenshot crop and PNG persistence
-├── theme.rs                      # colors, spacing, and common widgets
+├── theme.rs                      # colors and style
 ├── format.rs                     # presentation-only value formatting
+├── process_stats.rs              # CPU and memory sampling for the status bar
+├── protocol_decode_cache.rs      # decode results for the displayed capture
 ├── ui/
 │   ├── mod.rs
-│   ├── toolbar.rs
-│   ├── status.rs
-│   ├── capture_settings.rs       # tab shell; delegates instrument controls
-│   ├── device_selector.rs
-│   ├── decoded_panel.rs
-│   └── dialogs/
-│       ├── mod.rs
-│       ├── calibration.rs
-│       ├── protocol_analyzer.rs
-│       └── settings.rs
+│   ├── frame_state.rs            # FrameState: flags computed once per frame
+│   ├── frame_actions.rs          # FrameActions: what the user asked for
+│   ├── toolbar.rs, waveform_tabs.rs, status_bar.rs, session_tabs.rs
+│   ├── capture_setup_panel.rs, capture_settings_panel.rs, radio_settings.rs,
+│   │   scope_settings.rs, scope_tools_panel.rs     # settings panels
+│   ├── central_panel.rs, decoded_panel.rs          # waveform area
+│   ├── app_windows.rs, dialogs.rs, protocol_analyzer_dialog.rs
+│   ├── scope_frontend_changes.rs # applies scope frontend edits after painting
+│   └── view_tabs.rs              # WaveformTab, CaptureSettingsTab
 ├── waveform/
-│   ├── mod.rs                    # waveform cards and shared pane layout
+│   ├── mod.rs
 │   ├── store.rs                  # bounded display data and revisions
 │   ├── viewport.rs               # pan, zoom, time axes, combined timeline
-│   ├── logic/
-│   │   ├── mod.rs
-│   │   ├── markers.rs
-│   │   ├── protocol_lanes.rs
-│   │   └── render.rs
-│   ├── scope/
-│   │   ├── mod.rs
-│   │   ├── fft.rs
-│   │   ├── markers.rs
-│   │   ├── measurements.rs
-│   │   └── render.rs
-│   └── radio/
-│       ├── mod.rs                # RF Spectrum view state and composition
-│       ├── spectrum.rs
-│       ├── waterfall.rs
-│       └── markers.rs
-├── measurements.rs               # existing scope measurement engine
-└── protocol_analyzer.rs           # existing logic protocol engine
+│   ├── chrome.rs                 # cards, grid, time ruler shared by all views
+│   ├── combined.rs               # logic + scope pane layout
+│   ├── logic.rs                  # logic lanes, markers, protocol lanes
+│   ├── scope.rs, scope_markers.rs, scope_fft.rs, scope_lissajous.rs
+│   └── radio.rs                  # RF Spectrum view state and composition
+├── measurements.rs               # scope measurement engine
+├── protocol_analyzer.rs          # logic protocol engine
+├── radio_analyzer.rs, radio_trigger.rs
+├── tests.rs                      # tests that cross modules
+└── frame_tests.rs                # headless whole-frame tests
+
+app/mod.rs                        # (planned) WaveCraftApp itself; see step 15
+devices/{logic,scope,radio}.rs    # (planned) capability mapping per instrument
 ```
 
-This is a destination layout, not a requirement to create every empty file in
-the first change. Modules should be introduced when code and tests move into
-them. Empty Rust modules add navigation cost without establishing a real
-contract.
+Compared with the first version of this plan, `waveform/logic/` and
+`waveform/scope/` are single files (and `scope_markers.rs`, `scope_fft.rs`, and
+`scope_lissajous.rs` split off), `app/` is organized by responsibility rather
+than `actions`/`state`/`workers`, and `ui/` is organized by panel. Modules are
+introduced when code and tests move into them; empty modules add navigation
+cost without establishing a real contract.
 
 ## Application ownership and UI communication
 
@@ -242,18 +250,25 @@ avoids giving every UI module unrestricted `&mut WaveCraftApp` access. It also
 prevents borrow-checker pressure from turning the new modules into one large
 web of shared mutable references.
 
-The `eframe::App::update` implementation should eventually read as a sequence
-of orchestration operations:
+`eframe::App::update` now only calls `run_frame`, which reads as a sequence of
+orchestration operations:
 
 ```text
 poll workers and capture events
 reconcile selected devices and tabs
-paint toolbar and settings panels
-paint the active instrument view
+compute FrameState (enablement flags and before-painting snapshots)
+paint toolbar, view tabs, and settings panels
+paint the active instrument view, session tabs, and status bar
 paint dialogs and warnings
-apply returned actions
+apply returned actions (FrameActions, scope frontend changes)
 schedule repaint when work remains
 ```
+
+Two parts of that picture are not met yet. The panels are `impl WaveCraftApp`
+methods that take `&mut self`, so they can reach all 77 fields of the
+application; narrowing that is step 14. And a few small actions (calibration
+requests, device-selection changes, radio runtime updates) are still applied
+inline in `run_frame`.
 
 ## Device-independent instrument model
 
@@ -482,30 +497,72 @@ It must reject RF-only export clearly rather than dropping IQ silently.
 ## Migration sequence
 
 The refactor should remain reviewable and keep the workspace buildable after
-each step:
+each step. The state of each step is in [Current status](#current-status).
 
-1. Move snapshot utilities and tests to `snapshot.rs`.
-2. Move generic session tabs and their tests to `sessions.rs`.
-3. Move recording/Saleae functions and tests to `recording.rs`.
+1. Move snapshot utilities and tests to `snapshot.rs`. *(done)*
+2. Move generic session tabs and their tests to `sessions.rs`. *(done)*
+3. Move recording/Saleae functions and tests to `recording.rs`. *(done)*
 4. Introduce `devices` and move current DSLogic/DSCope selection without
-   changing discovery behavior.
+   changing discovery behavior. *(partial: no `devices::{logic,scope,radio}`
+   capability modules)*
 5. Move bounded data, timeline, and viewport code into `waveform::store` and
-   `waveform::viewport`.
+   `waveform::viewport`. *(done)*
 6. Move logic rendering, markers, and protocol lanes into `waveform::logic`.
+   *(done)*
 7. Move scope rendering, markers, FFT, and measurement UI into
-   `waveform::scope`.
+   `waveform::scope`. *(done)*
 8. Split the top-level update loop into panels that return typed actions.
+   *(partial: panels are methods and record requests in `FrameActions`, but
+   take `&mut self`; see step 14)*
 9. Add the core IQ model, bounded streaming, recording changes, and simulator
-   in the order required by `rf-sdr-architecture.md`.
+   in the order required by `rf-sdr-architecture.md`. *(done)*
 10. Add `acquisition::radio`, `devices::radio`, and `waveform::radio` against
-    simulated and recorded IQ.
-11. Implement the HackRF One adapter and opt-in hardware tests.
+    simulated and recorded IQ. *(partial: no `devices::radio`)*
+11. Implement the HackRF One adapter and opt-in hardware tests. *(done)*
 12. Implement the LimeSDR-USB Type-A adapter with Lime Suite NG and the AntSDR
     E200 adapter with libiio over Gigabit Ethernet as independent changes.
+    *(not started)*
 
-Steps 1 through 8 are structural and should not change behavior. RF placeholder
-types may be introduced when step 9 begins; creating unused device enums or
-empty backend crates earlier would imply support that does not yet exist.
+Follow-up steps for the GUI structure. They are independent of steps 11 and 12
+and should not change behavior:
+
+13. Split the long functions inside the moved code, one behavior-preserving
+    change each: `paint_capture_settings` (815 lines),
+    `paint_radio_analyzer_configuration` (647), `paint_central_panel` (511),
+    `poll_worker` (487, one handler per `WorkerSuccess` variant),
+    `start_gui_recording` (435), `paint_scope_time_domain` (397), and
+    `poll_capture_target` (383). Where a piece turns out to be pure logic,
+    give it a unit test.
+14. Narrow what the panels can reach. Group the 77 fields of `WaveCraftApp`
+    into per-area state structs (for example logic, scope, radio, capture,
+    dialogs) and make each panel take the group it edits, plus `&FrameState`
+    and `&mut FrameActions`, instead of `&mut self`. Start with the panels that
+    touch few fields: the status bar, view tabs, and scope tools panel.
+15. Move `WaveCraftApp`, its constructors, and `run_frame` into `app/mod.rs`.
+    Do this after step 14, not before: see below.
+16. Add widget-level tests that feed pointer and key events to `run_frame` (or
+    use an egui test harness) for the toolbar, session tabs, and settings
+    panels. `frame_tests.rs` covers painting and the apply methods but does not
+    click anything.
+
+Why step 15 comes after step 14. A Rust field is private to the module that
+defines the struct and to that module's descendants. `WaveCraftApp` is defined
+in the crate root, so every module in the crate can read and write every field.
+Moving the struct into `app/` would hide its private fields from `ui/`, `lib.rs`,
+and the tests, which is the point of the move, but those modules use them: 64 of
+the 77 fields are accessed from `ui/` (about 240 accesses), plus about 40
+accesses in the tests and about 50 in `lib.rs` (counted by searching for
+`self.<field>` and `app.<field>`, so the numbers are approximate). Making the
+fields `pub(crate)` to keep the code compiling would leave the move purely
+cosmetic: it would relocate the struct, its constructors, and `run_frame`
+(roughly 400 lines) and leave `lib.rs` as module declarations and `run()`, but
+it would not change who can touch the state. The move only restricts access
+once step 14 has given the panels something narrower to use.
+
+Steps 1 through 8 and 13 through 15 are structural and should not change
+behavior. RF placeholder types may be introduced when step 9 begins; creating
+unused device enums or empty backend crates earlier would imply support that
+does not yet exist.
 
 ## Test boundaries
 
@@ -543,3 +600,12 @@ The modularization is complete when:
 - all capture sources still use the core coordinator and typed batches; and
 - formatting, Clippy, the default workspace tests, and release builds remain
   clean after the migration.
+
+Against these, as of commit `b3222cc`: `main.rs` only starts the app, and
+formatting, Clippy, the workspace tests, and the release build pass. `lib.rs`
+is 688 lines of module declarations, the state struct, and the frame loop, but
+rendering and file formats are in their own modules while the state is still one
+struct, so "isolated state" is not met (step 14). The GUI still registers
+`HackRfAdapter` in `begin_refresh` and uses HackRF settings types, so "device
+APIs confined to adapters" is only partly met. The other two criteria were not
+assessed.
