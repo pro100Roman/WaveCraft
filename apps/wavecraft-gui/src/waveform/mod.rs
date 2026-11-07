@@ -1,4 +1,5 @@
 pub mod chrome;
+pub mod combined;
 pub mod logic;
 pub mod radio;
 pub mod scope;

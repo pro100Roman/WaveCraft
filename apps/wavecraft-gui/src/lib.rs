@@ -27,8 +27,9 @@ use capture_settings::{
     CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository,
 };
 use devices::{
-    capture_devices_for_target, first_device_id_for_role, first_radio_id, selected_device_for_role,
-    selected_radio, usb_speed_warning, DeviceEntry, DeviceRole, UsbSpeedWarning,
+    capture_devices_for_target, default_resource_directory, first_device_id_for_role,
+    first_radio_id, selected_device_for_role, selected_radio, usb_speed_warning, DeviceEntry,
+    DeviceRole, UsbSpeedWarning,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use format::*;
@@ -132,6 +133,7 @@ use wavecraft_usb::{
     DSLOGIC_SAMPLE_RATES_HZ, DSLOGIC_TRIGGER_STAGE_COUNT, REQUIRED_RESOURCE_FILES,
 };
 use waveform::chrome::*;
+use waveform::combined::*;
 use waveform::logic::*;
 use waveform::radio::{RadioAnalysisStore, RadioDisplayStore, RadioViewOptions, RadioViewState};
 use waveform::scope::*;
@@ -512,165 +514,6 @@ impl WaveCraftApp {
     }
 }
 
-fn selected_device_text(
-    devices: &[DeviceEntry],
-    selected_id: Option<&str>,
-    role: DeviceRole,
-) -> String {
-    match selected_id {
-        Some(id) => selected_device_for_role(devices, Some(id), role)
-            .map(|device| format!("{} · {id}", device.profile.display_name))
-            .unwrap_or_else(|| format!("Unavailable · {id}")),
-        None => role.empty_label().to_owned(),
-    }
-}
-
-fn paint_device_selector(
-    ui: &mut egui::Ui,
-    id_salt: &'static str,
-    label: &str,
-    devices: &[DeviceEntry],
-    selected_id: &mut Option<String>,
-    role: DeviceRole,
-    enabled: bool,
-) -> bool {
-    let choices = devices
-        .iter()
-        .map(|entry| &entry.device)
-        .filter(|device| role.matches(device))
-        .map(|device| {
-            let id = device.location.stable_id();
-            (
-                id.clone(),
-                format!("{} · {id}", device.profile.display_name),
-            )
-        })
-        .collect::<Vec<_>>();
-    let before = selected_id.clone();
-    ui.label(RichText::new(label).small().color(TEXT_MUTED));
-    ui.add_enabled_ui(enabled && !choices.is_empty(), |ui| {
-        egui::ComboBox::from_id_salt(id_salt)
-            .width(ui.available_width())
-            .selected_text(selected_device_text(devices, selected_id.as_deref(), role))
-            .show_ui(ui, |ui| {
-                for (id, text) in choices {
-                    ui.selectable_value(selected_id, Some(id), text);
-                }
-            });
-    });
-    before != *selected_id
-}
-
-fn paint_capture_device_selectors(
-    ui: &mut egui::Ui,
-    active_tab: Option<WaveformTab>,
-    devices: &[DeviceEntry],
-    selected_logic_device_id: &mut Option<String>,
-    selected_scope_device_id: &mut Option<String>,
-    enabled: bool,
-) -> (bool, bool) {
-    let mut logic_changed = false;
-    let mut scope_changed = false;
-    match active_tab {
-        Some(WaveformTab::LogicAnalyzer) => {
-            logic_changed = paint_device_selector(
-                ui,
-                "logic_device_selector",
-                "Device",
-                devices,
-                selected_logic_device_id,
-                DeviceRole::LogicAnalyzer,
-                enabled,
-            );
-        }
-        Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
-            scope_changed = paint_device_selector(
-                ui,
-                "scope_device_selector",
-                "Device",
-                devices,
-                selected_scope_device_id,
-                DeviceRole::Oscilloscope,
-                enabled,
-            );
-        }
-        Some(WaveformTab::Combined) => {
-            logic_changed = paint_device_selector(
-                ui,
-                "combined_logic_device_selector",
-                "Logic analyzer",
-                devices,
-                selected_logic_device_id,
-                DeviceRole::LogicAnalyzer,
-                enabled,
-            );
-            ui.add_space(4.0);
-            scope_changed = paint_device_selector(
-                ui,
-                "combined_scope_device_selector",
-                "Oscilloscope",
-                devices,
-                selected_scope_device_id,
-                DeviceRole::Oscilloscope,
-                enabled,
-            );
-        }
-        Some(WaveformTab::RadioReceiver) => {}
-        None => {}
-    }
-    (logic_changed, scope_changed)
-}
-
-fn paint_usb_speed_warning(context: &egui::Context, warning: &UsbSpeedWarning) -> bool {
-    let mut dismissed = false;
-    let screen_rect = context.input(|input| input.screen_rect());
-    egui::Area::new(egui::Id::new("usb_speed_warning_backdrop"))
-        .order(egui::Order::Middle)
-        .fixed_pos(screen_rect.min)
-        .show(context, |ui| {
-            let (rect, _) = ui.allocate_exact_size(screen_rect.size(), Sense::click_and_drag());
-            ui.painter()
-                .rect_filled(rect, egui::Rounding::ZERO, Color32::from_black_alpha(112));
-        });
-
-    egui::Area::new(egui::Id::new("usb_speed_warning"))
-        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .order(egui::Order::Foreground)
-        .movable(false)
-        .show(context, |ui| {
-            egui::Frame::window(&context.style())
-                .inner_margin(egui::Margin::same(12.0))
-                .show(ui, |ui| {
-                    ui.set_max_width(340.0);
-                    ui.label(
-                        RichText::new("USB 3 connection recommended")
-                            .strong()
-                            .color(SCOPE_COLORS[0]),
-                    );
-                    ui.add_space(4.0);
-                    for device in &warning.devices {
-                        ui.add(
-                            egui::Label::new(format!(
-                                "{} is using {}.",
-                                device.profile.display_name,
-                                device.speed.description()
-                            ))
-                            .wrap(),
-                        );
-                    }
-                    ui.add_space(4.0);
-                    ui.label("Use a USB 3 port and cable for full performance.");
-                    ui.add_space(8.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("OK").clicked() {
-                            dismissed = true;
-                        }
-                    });
-                });
-        });
-    dismissed
-}
-
 impl eframe::App for WaveCraftApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.run_frame(context);
@@ -826,46 +669,6 @@ impl WaveCraftApp {
     }
 }
 
-fn default_resource_directory() -> String {
-    let mut candidates = Vec::new();
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(executable_directory) = executable.parent() {
-            #[cfg(target_os = "macos")]
-            if executable_directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                == Some("MacOS")
-            {
-                if let Some(contents_directory) = executable_directory.parent() {
-                    candidates.push(contents_directory.join("Resources/fpga"));
-                }
-            }
-            candidates.push(executable_directory.join("resources/fpga"));
-        }
-    }
-    candidates.push(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("resources/fpga"),
-    );
-    candidates.push(PathBuf::from("resources/fpga"));
-    let selected = candidates
-        .into_iter()
-        .find(|candidate| has_required_fpga_resources(candidate))
-        .unwrap_or_else(|| PathBuf::from("resources/fpga"));
-    selected
-        .canonicalize()
-        .unwrap_or(selected)
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn has_required_fpga_resources(directory: &Path) -> bool {
-    REQUIRED_RESOURCE_FILES
-        .iter()
-        .all(|name| directory.join(name).is_file())
-}
-
 fn append_error(error: &mut Option<String>, additional: String) {
     match error {
         Some(error) => {
@@ -880,213 +683,6 @@ const WAVEFORM_CARD_CHROME_HEIGHT: f32 = 58.0;
 const COMBINED_DIVIDER_HEIGHT: f32 = 10.0;
 const MIN_LOGIC_PANE_HEIGHT: f32 = 260.0;
 const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;
-
-struct ScopeWaveformOptions<'a> {
-    settings: ScopeCaptureSettings,
-    auto_sample_rate: bool,
-    smart_timing_enabled: bool,
-    function_settings: ScopeFunctionSettings,
-    channel_names: &'a [String; 2],
-    measurement_caches: &'a mut [ScopeMeasurementCache; 2],
-    measurement_window_positions: &'a mut [Vec2; 2],
-    marker_settings: &'a mut ScopeMarkerSettings,
-    quick_time_measurement: &'a mut ScopeQuickTimeMeasurement,
-    channel_colors: [Color32; 2],
-    vertical_offsets: &'a mut [u16; 2],
-    trigger_settings: &'a mut ScopeTriggerSettings,
-    time_per_division_seconds: &'a mut Option<f64>,
-    timebase_changed: &'a mut bool,
-    offset_controls_enabled: bool,
-    trigger_controls_enabled: bool,
-    time_axis: Option<WaveformTimeAxis>,
-}
-
-fn waveform_card_fill(
-    ui: &mut egui::Ui,
-    title: &str,
-    subtitle: &str,
-    paint: impl FnOnce(&mut egui::Ui, Rect),
-) -> Rect {
-    let plot_height = (ui.available_height() - WAVEFORM_CARD_CHROME_HEIGHT).max(64.0);
-    waveform_card(ui, title, subtitle, plot_height, paint)
-}
-
-fn combined_pane_heights(total_height: f32, logic_ratio: f32) -> (f32, f32) {
-    let usable_height = (total_height - COMBINED_DIVIDER_HEIGHT).max(0.0);
-    if usable_height == 0.0 {
-        return (0.0, 0.0);
-    }
-    let minimum_total = MIN_LOGIC_PANE_HEIGHT + MIN_SCOPE_PANE_HEIGHT;
-    let minimum_scale = (usable_height / minimum_total).min(1.0);
-    let minimum_logic_height = MIN_LOGIC_PANE_HEIGHT * minimum_scale;
-    let minimum_scope_height = MIN_SCOPE_PANE_HEIGHT * minimum_scale;
-    let logic_height = (usable_height * logic_ratio.clamp(0.0, 1.0))
-        .clamp(minimum_logic_height, usable_height - minimum_scope_height);
-    (logic_height, usable_height - logic_height)
-}
-
-struct CombinedWaveformViewports<'a> {
-    logic: &'a mut WaveformViewport,
-    scope: &'a mut WaveformViewport,
-    combined: &'a mut WaveformViewport,
-    fft: &'a mut ScopeFftViewport,
-}
-
-struct LogicWaveformOptions<'a> {
-    channel_colors: &'a mut [Color32; LOGIC_CHANNEL_COUNT],
-    channel_marker_opacities: &'a mut [u8; LOGIC_CHANNEL_COUNT],
-    channel_names: &'a mut [String; LOGIC_CHANNEL_COUNT],
-    channel_settings_drafts: &'a mut [LogicChannelSettingsDraft; LOGIC_CHANNEL_COUNT],
-    smart_timing_enabled: bool,
-    marker_settings: &'a mut LogicMarkerSettings,
-    maximum_heights: &'a mut [u8; LOGIC_CHANNEL_COUNT],
-    enabled_channels: &'a mut [bool; LOGIC_CHANNEL_COUNT],
-    protocol_analyzer: &'a ProtocolAnalyzerSettings,
-    protocol_decode_cache: &'a mut ProtocolDecodeCache,
-    protocol_stream: Option<&'a ProtocolDecodeSnapshot>,
-    time_axis: Option<WaveformTimeAxis>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct WaveformTimeAxis {
-    start_seconds: f64,
-    duration_seconds: f64,
-}
-
-fn combined_waveform_cards(
-    ui: &mut egui::Ui,
-    waveforms: &WaveformStore,
-    logic_ratio: &mut f32,
-    mut logic_options: LogicWaveformOptions<'_>,
-    viewports: CombinedWaveformViewports<'_>,
-    mut scope_options: ScopeWaveformOptions<'_>,
-) -> Rect {
-    let CombinedWaveformViewports {
-        logic: logic_viewport,
-        scope: scope_viewport,
-        combined: combined_viewport,
-        fft: scope_fft_viewport,
-    } = viewports;
-    let timeline = waveforms.combined_timeline();
-    if let Some(timeline) = timeline {
-        *logic_viewport = timeline.source_viewport(*combined_viewport, timeline.logic);
-        *scope_viewport = timeline.source_viewport(*combined_viewport, timeline.scope);
-        logic_options.time_axis = Some(WaveformTimeAxis {
-            start_seconds: timeline.logic.start_seconds - timeline.shared.start_seconds,
-            duration_seconds: timeline.logic.duration_seconds(),
-        });
-        scope_options.time_axis = Some(WaveformTimeAxis {
-            start_seconds: timeline.scope.start_seconds - timeline.shared.start_seconds,
-            duration_seconds: timeline.scope.duration_seconds(),
-        });
-    }
-    let available = ui.available_rect_before_wrap();
-    let (logic_height, _) = combined_pane_heights(available.height(), *logic_ratio);
-    let divider_y = available.top() + logic_height;
-    let divider_hit_rect = Rect::from_min_max(
-        Pos2::new(available.left(), divider_y),
-        Pos2::new(
-            available.right(),
-            (divider_y + COMBINED_DIVIDER_HEIGHT).min(available.bottom()),
-        ),
-    );
-    let divider_response = ui
-        .interact(
-            divider_hit_rect,
-            ui.make_persistent_id("combined_waveform_divider"),
-            Sense::drag(),
-        )
-        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
-    if divider_response.dragged() {
-        if let Some(pointer) = divider_response.interact_pointer_pos() {
-            let usable_height = (available.height() - COMBINED_DIVIDER_HEIGHT).max(1.0);
-            let minimum_total = MIN_LOGIC_PANE_HEIGHT + MIN_SCOPE_PANE_HEIGHT;
-            let minimum_scale = (usable_height / minimum_total).min(1.0);
-            let minimum_logic_ratio = MIN_LOGIC_PANE_HEIGHT * minimum_scale / usable_height;
-            let minimum_scope_ratio = MIN_SCOPE_PANE_HEIGHT * minimum_scale / usable_height;
-            *logic_ratio = ((pointer.y - available.top()) / usable_height)
-                .clamp(minimum_logic_ratio, 1.0 - minimum_scope_ratio);
-        }
-    }
-
-    let (logic_height, scope_height) = combined_pane_heights(available.height(), *logic_ratio);
-    let logic_rect = Rect::from_min_size(available.min, Vec2::new(available.width(), logic_height));
-    let scope_rect = Rect::from_min_size(
-        Pos2::new(
-            available.left(),
-            logic_rect.bottom() + COMBINED_DIVIDER_HEIGHT,
-        ),
-        Vec2::new(available.width(), scope_height),
-    );
-    ui.advance_cursor_after_rect(available);
-
-    let mut logic_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt("combined_logic_waveform")
-            .max_rect(logic_rect)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    );
-    let logic_plot_rect = waveform_card_fill(
-        &mut logic_ui,
-        "DIGITAL",
-        "DSLogic · channels 0–15",
-        |ui, rect| paint_logic(ui, rect, waveforms, logic_options, logic_viewport),
-    );
-
-    if let Some(timeline) = timeline {
-        *combined_viewport = timeline.shared_viewport(*logic_viewport, timeline.logic);
-        *scope_viewport = timeline.source_viewport(*combined_viewport, timeline.scope);
-        *scope_options.time_per_division_seconds = Some(
-            f64::from(combined_viewport.span) * timeline.shared.duration_seconds()
-                / SCOPE_HORIZONTAL_DIVISIONS as f64,
-        );
-    }
-
-    let mut scope_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt("combined_scope_waveform")
-            .max_rect(scope_rect)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    );
-    let scope_subtitle = scope_channels_subtitle(scope_options.channel_names);
-    let scope_plot_rect = waveform_card_fill(
-        &mut scope_ui,
-        "OSCILLOSCOPE",
-        &scope_subtitle,
-        |ui, rect| {
-            paint_scope(
-                ui,
-                rect,
-                waveforms,
-                scope_viewport,
-                scope_fft_viewport,
-                false,
-                scope_options,
-            )
-        },
-    );
-
-    if let Some(timeline) = timeline {
-        *combined_viewport = timeline.shared_viewport(*scope_viewport, timeline.scope);
-        *logic_viewport = timeline.source_viewport(*combined_viewport, timeline.logic);
-        *scope_viewport = timeline.source_viewport(*combined_viewport, timeline.scope);
-    }
-
-    let divider_color = if divider_response.hovered() || divider_response.dragged() {
-        ACCENT
-    } else {
-        GRID
-    };
-    let divider_center = logic_rect.bottom() + COMBINED_DIVIDER_HEIGHT * 0.5;
-    ui.painter().line_segment(
-        [
-            Pos2::new(available.left(), divider_center),
-            Pos2::new(available.right(), divider_center),
-        ],
-        Stroke::new(2.0_f32, divider_color),
-    );
-    logic_plot_rect.union(scope_plot_rect)
-}
 
 #[cfg(test)]
 mod tests {
@@ -2035,22 +1631,6 @@ mod tests {
     }
 
     #[test]
-    fn combined_panes_scale_with_window_and_respect_ratio() {
-        let (logic, scope) = combined_pane_heights(610.0, 0.6);
-        assert!((logic - 360.0).abs() < f32::EPSILON);
-        assert!((scope - 240.0).abs() < f32::EPSILON);
-
-        let (logic, scope) = combined_pane_heights(1_010.0, 0.6);
-        assert!((logic - 600.0).abs() < f32::EPSILON);
-        assert!((scope - 400.0).abs() < f32::EPSILON);
-
-        let (logic, scope) = combined_pane_heights(310.0, 0.99);
-        let minimum_scale = 300.0 / (MIN_LOGIC_PANE_HEIGHT + MIN_SCOPE_PANE_HEIGHT);
-        assert!((logic - MIN_LOGIC_PANE_HEIGHT * minimum_scale).abs() < 0.001);
-        assert!((scope - MIN_SCOPE_PANE_HEIGHT * minimum_scale).abs() < 0.001);
-    }
-
-    #[test]
     fn scope_markers_are_saved_and_compared_individually() {
         let mut settings = ScopeMarkerSettings::default();
         let viewport = WaveformViewport::default();
@@ -2089,12 +1669,6 @@ mod tests {
         assert_eq!(settings.channels[0].horizontal_count, 1);
         assert_eq!(settings.channels[0].horizontal_comparisons[0], None);
         assert_eq!(settings.channels[0].horizontal_positions[0], 0.7);
-    }
-
-    #[test]
-    fn default_resource_directory_contains_complete_upstream_resource_set() {
-        let directory = PathBuf::from(default_resource_directory());
-        assert!(has_required_fpga_resources(&directory));
     }
 
     #[test]

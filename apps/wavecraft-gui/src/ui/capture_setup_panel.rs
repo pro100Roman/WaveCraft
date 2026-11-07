@@ -1,11 +1,11 @@
 //! The fixed left panel: device selectors and per-instrument capture settings.
 
 use crate::{
-    egui, paint_capture_device_selectors, paint_capture_settings, paint_radio_capture_settings,
-    paint_radio_device_selector, selected_radio, ui::frame_state::FrameState,
-    CaptureSettingsAvailability, CaptureSettingsTab, LogicCaptureSettingsEditor, RichText,
-    SavedCaptureSettingsKind, ScopeCaptureSettingsEditor, ScopeVisualizationSettingsEditor,
-    WaveformTab, PANEL, TEXT_MUTED,
+    egui, paint_capture_settings, paint_radio_capture_settings, paint_radio_device_selector,
+    selected_device_for_role, selected_radio, ui::frame_state::FrameState,
+    CaptureSettingsAvailability, CaptureSettingsTab, DeviceEntry, DeviceRole,
+    LogicCaptureSettingsEditor, RichText, SavedCaptureSettingsKind, ScopeCaptureSettingsEditor,
+    ScopeVisualizationSettingsEditor, WaveformTab, PANEL, TEXT_MUTED,
 };
 
 use crate::{ui::frame_actions::FrameActions, WaveCraftApp};
@@ -185,4 +185,113 @@ impl WaveCraftApp {
                     });
             });
     }
+}
+
+pub(crate) fn selected_device_text(
+    devices: &[DeviceEntry],
+    selected_id: Option<&str>,
+    role: DeviceRole,
+) -> String {
+    match selected_id {
+        Some(id) => selected_device_for_role(devices, Some(id), role)
+            .map(|device| format!("{} · {id}", device.profile.display_name))
+            .unwrap_or_else(|| format!("Unavailable · {id}")),
+        None => role.empty_label().to_owned(),
+    }
+}
+
+pub(crate) fn paint_device_selector(
+    ui: &mut egui::Ui,
+    id_salt: &'static str,
+    label: &str,
+    devices: &[DeviceEntry],
+    selected_id: &mut Option<String>,
+    role: DeviceRole,
+    enabled: bool,
+) -> bool {
+    let choices = devices
+        .iter()
+        .map(|entry| &entry.device)
+        .filter(|device| role.matches(device))
+        .map(|device| {
+            let id = device.location.stable_id();
+            (
+                id.clone(),
+                format!("{} · {id}", device.profile.display_name),
+            )
+        })
+        .collect::<Vec<_>>();
+    let before = selected_id.clone();
+    ui.label(RichText::new(label).small().color(TEXT_MUTED));
+    ui.add_enabled_ui(enabled && !choices.is_empty(), |ui| {
+        egui::ComboBox::from_id_salt(id_salt)
+            .width(ui.available_width())
+            .selected_text(selected_device_text(devices, selected_id.as_deref(), role))
+            .show_ui(ui, |ui| {
+                for (id, text) in choices {
+                    ui.selectable_value(selected_id, Some(id), text);
+                }
+            });
+    });
+    before != *selected_id
+}
+
+pub(crate) fn paint_capture_device_selectors(
+    ui: &mut egui::Ui,
+    active_tab: Option<WaveformTab>,
+    devices: &[DeviceEntry],
+    selected_logic_device_id: &mut Option<String>,
+    selected_scope_device_id: &mut Option<String>,
+    enabled: bool,
+) -> (bool, bool) {
+    let mut logic_changed = false;
+    let mut scope_changed = false;
+    match active_tab {
+        Some(WaveformTab::LogicAnalyzer) => {
+            logic_changed = paint_device_selector(
+                ui,
+                "logic_device_selector",
+                "Device",
+                devices,
+                selected_logic_device_id,
+                DeviceRole::LogicAnalyzer,
+                enabled,
+            );
+        }
+        Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
+            scope_changed = paint_device_selector(
+                ui,
+                "scope_device_selector",
+                "Device",
+                devices,
+                selected_scope_device_id,
+                DeviceRole::Oscilloscope,
+                enabled,
+            );
+        }
+        Some(WaveformTab::Combined) => {
+            logic_changed = paint_device_selector(
+                ui,
+                "combined_logic_device_selector",
+                "Logic analyzer",
+                devices,
+                selected_logic_device_id,
+                DeviceRole::LogicAnalyzer,
+                enabled,
+            );
+            ui.add_space(4.0);
+            scope_changed = paint_device_selector(
+                ui,
+                "combined_scope_device_selector",
+                "Oscilloscope",
+                devices,
+                selected_scope_device_id,
+                DeviceRole::Oscilloscope,
+                enabled,
+            );
+        }
+        Some(WaveformTab::RadioReceiver) => {}
+        None => {}
+    }
+    (logic_changed, scope_changed)
 }
