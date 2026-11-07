@@ -2061,3 +2061,246 @@ pub(crate) fn paint_scope_time_domain(
         viewport,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    #[test]
+    fn scope_plot_segments_do_not_join_independent_captures() {
+        let segments = scope_plot_sample_segments(0..10, 4, 0, None, 100, &VecDeque::from([105]));
+
+        assert_eq!(segments, vec![vec![0, 4], vec![5, 8, 9]]);
+    }
+
+    #[test]
+    fn floating_measurement_windows_stay_relative_to_the_plot() {
+        let plot = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(800.0, 400.0));
+        let size = Vec2::new(200.0, 100.0);
+
+        let [channel_zero, channel_one] = default_scope_measurement_window_positions();
+        let bottom_left = scope_measurement_window_rect(plot, size, channel_zero);
+        assert_eq!(bottom_left.left_bottom(), plot.left_bottom());
+        let bottom_right = scope_measurement_window_rect(plot, size, channel_one);
+        assert_eq!(bottom_right.right_bottom(), plot.right_bottom());
+
+        let top_right = scope_measurement_window_rect(plot, size, Vec2::new(1.0, 0.0));
+        assert_eq!(top_right.right(), plot.right());
+        assert_eq!(top_right.top(), plot.top());
+        assert_eq!(
+            scope_measurement_window_position(plot, top_right),
+            Vec2::new(1.0, 0.0)
+        );
+
+        let center = scope_measurement_window_rect(plot, size, Vec2::new(0.5, 0.5));
+        assert_eq!(center.center(), plot.center());
+        assert_eq!(
+            scope_measurement_window_position(plot, center),
+            Vec2::new(0.5, 0.5)
+        );
+    }
+
+    #[test]
+    fn scope_markers_measure_horizontal_time_and_vertical_amplitude() {
+        let markers = ScopeMarkerSettings::default();
+
+        assert!(
+            (scope_time_marker_delta(
+                markers.channels[0].horizontal_positions[0],
+                markers.channels[0].horizontal_positions[1],
+                1_000,
+                1_000,
+            )
+            .unwrap()
+                - 0.1)
+                .abs()
+                < 0.000_001
+        );
+        assert!(
+            (scope_voltage_marker_delta(
+                markers.channels[0].vertical_positions[0],
+                markers.channels[0].vertical_positions[1],
+                ScopeCaptureSettings::default().channels[0]
+            ) - 0.8)
+                .abs()
+                < 0.000_001
+        );
+
+        let mut scope_settings = ScopeCaptureSettings::default();
+        scope_settings.channels[1].volts_per_div_mv = 500;
+        scope_settings.channels[1].probe_attenuation = 10;
+        assert!(
+            (scope_voltage_marker_delta(
+                markers.channels[1].vertical_positions[0],
+                markers.channels[1].vertical_positions[1],
+                scope_settings.channels[1]
+            ) - 4.0)
+                .abs()
+                < 0.000_001
+        );
+
+        assert_ne!(
+            markers.channels[0].horizontal_positions,
+            markers.channels[1].horizontal_positions
+        );
+        assert_eq!(
+            markers.channels[0].horizontal_positions.len(),
+            SCOPE_MARKER_LIMIT
+        );
+        assert_eq!(
+            markers.channels[1].vertical_positions.len(),
+            SCOPE_MARKER_LIMIT
+        );
+        assert_eq!(format_marker_voltage(0.125), "125.00 mV");
+    }
+
+    #[test]
+    fn rolling_scope_aligns_when_auto_trigger_finds_an_edge() {
+        assert!(should_align_scope_trigger(true, true, true));
+        assert!(!should_align_scope_trigger(true, true, false));
+        assert!(should_align_scope_trigger(true, false, false));
+        assert!(!should_align_scope_trigger(false, true, true));
+    }
+
+    #[test]
+    fn scope_smart_timing_ignores_a_zero_volt_trigger_level() {
+        let crossing = ScopeTriggerCrossing {
+            sample: 10.0,
+            channel_index: 0,
+        };
+        let mut settings = ScopeCaptureSettings::default();
+
+        assert!(!scope_smart_timing_has_nonzero_trigger(settings, crossing));
+
+        settings.trigger.levels[0] = 104;
+        assert!(scope_smart_timing_has_nonzero_trigger(settings, crossing));
+    }
+
+    #[test]
+    fn scope_trigger_coordinates_preserve_sub_sample_precision_at_large_offsets() {
+        let sample_offset = 10_000_000_000_u64;
+        let fraction = scope_sample_fraction(sample_offset as f64 + 50.25, sample_offset, 101);
+
+        assert!((fraction - 0.5025).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn scope_downsampling_preserves_trigger_crossing_samples() {
+        let indices = scope_plot_sample_indices(
+            0..1_000,
+            100,
+            0,
+            Some(ScopeTriggerCrossing {
+                sample: 512.25,
+                channel_index: 0,
+            }),
+            0,
+        );
+
+        assert!(indices.contains(&512));
+        assert!(indices.contains(&513));
+        assert_eq!(indices.last(), Some(&999));
+    }
+
+    #[test]
+    fn scope_downsampling_averages_each_screen_bucket() {
+        let samples = VecDeque::from(vec![
+            0.0, 4.0, -3.0, 1.0, 0.5, 0.25, -0.5, 0.0, 1.0, -5.0, 6.0, 2.0, 1.5, 0.75, 0.5, 1.0,
+        ]);
+
+        let segments =
+            scope_downsampled_segments(&samples, 0..samples.len(), 8, 0, &VecDeque::new());
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].len(), 2);
+        assert_eq!(segments[0][0].average, 0.28125);
+        assert_eq!(segments[0][1].average, 0.96875);
+    }
+
+    #[test]
+    fn scope_downsampling_does_not_join_independent_captures() {
+        let samples = VecDeque::from(vec![-1.0, -0.5, 4.0, 5.0]);
+
+        let segments = scope_downsampled_segments(&samples, 0..4, 4, 100, &VecDeque::from([102]));
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0][0].average, -0.75);
+        assert_eq!(segments[1][0].average, 4.5);
+    }
+
+    #[test]
+    fn scope_vertical_offset_maps_hardware_limits_to_the_plot() {
+        let rect = Rect::from_min_max(Pos2::new(0.0, 20.0), Pos2::new(100.0, 220.0));
+
+        assert_eq!(
+            scope_vertical_offset_y(rect, DSCOPE_VERTICAL_OFFSET_MIN),
+            rect.top()
+        );
+        assert_eq!(
+            scope_vertical_offset_y(rect, DSCOPE_VERTICAL_OFFSET_MAX),
+            rect.bottom()
+        );
+        assert_eq!(
+            scope_vertical_offset_from_y(rect, rect.top()),
+            DSCOPE_VERTICAL_OFFSET_MIN
+        );
+        assert_eq!(
+            scope_vertical_offset_from_y(rect, rect.bottom()),
+            DSCOPE_VERTICAL_OFFSET_MAX
+        );
+    }
+
+    #[test]
+    fn scope_input_range_rescales_captured_volts() {
+        let plot = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1_000.0, 800.0));
+        let one_volt_per_div = ScopeChannelSettings {
+            volts_per_div_mv: 1_000,
+            ..ScopeChannelSettings::default()
+        };
+        let half_volt_per_div = ScopeChannelSettings {
+            volts_per_div_mv: 500,
+            ..one_volt_per_div
+        };
+        let zero_y = scope_sample_y(plot, one_volt_per_div, 0.0);
+        let one_volt_y = scope_sample_y(plot, one_volt_per_div, 1.0);
+        let half_volt_range_y = scope_sample_y(plot, half_volt_per_div, 1.0);
+
+        let pixels_per_division = plot.height() / SCOPE_VERTICAL_DIVISIONS as f32;
+        assert!((zero_y - one_volt_y - pixels_per_division).abs() < 0.001);
+        assert!((zero_y - half_volt_range_y - pixels_per_division * 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn overlapping_scope_offset_arrows_remain_independently_selectable() {
+        let plot = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 200.0));
+        let mut settings = ScopeCaptureSettings::default();
+        let mut offsets = [DSCOPE_VERTICAL_OFFSET_CENTER; 2];
+        let center_y = scope_vertical_offset_y(plot, DSCOPE_VERTICAL_OFFSET_CENTER);
+
+        assert_eq!(
+            scope_offset_arrow_at_pointer(plot, center_y, settings, &offsets),
+            Some(0)
+        );
+
+        offsets[0] = DSCOPE_VERTICAL_OFFSET_MIN;
+        assert_eq!(
+            scope_offset_arrow_at_pointer(plot, center_y, settings, &offsets),
+            Some(1)
+        );
+
+        settings.channels[0].enabled = false;
+        offsets[0] = DSCOPE_VERTICAL_OFFSET_CENTER;
+        assert_eq!(
+            scope_offset_arrow_at_pointer(plot, center_y, settings, &offsets),
+            Some(1)
+        );
+
+        settings.channels[1].enabled = false;
+        assert_eq!(
+            scope_offset_arrow_at_pointer(plot, center_y, settings, &offsets),
+            None
+        );
+    }
+}

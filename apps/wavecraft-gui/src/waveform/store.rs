@@ -400,3 +400,299 @@ pub(crate) fn record_decoded_raw_messages(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    use wavecraft_core::{Iq8, IqBatch, LogicBatch, ScopeBatch};
+
+    #[test]
+    fn radio_iq_pipeline_runs_the_selected_analyzer() {
+        let settings = RadioAnalyzerSettings {
+            demodulation: RadioDemodulation::BinaryFsk,
+            channels: vec![RadioAnalyzerChannelSettings::numbered(0, 10_000)],
+            channel_bandwidth_hz: 4_000,
+            output_sample_rate_hz: 8_000,
+            filter_tap_count: 65,
+            symbol_rate_hz: 1_000,
+            deviation_hz: 1_000,
+            adaptive_timing: false,
+            ..RadioAnalyzerSettings::default()
+        };
+        let profile = settings.signal_profiles().unwrap().remove(0);
+        let mut analyzers = RadioAnalyzerBank::new(vec![RadioAnalyzerRuntime::new(
+            profile,
+            settings.decoder_config().unwrap(),
+        )
+        .unwrap()]);
+        // Keep the FFT shorter than this focused synthetic burst so the
+        // analyzer's burst gate receives a channel-power observation.
+        let mut spectrum = SpectrumProcessor::new(256, SpectrumWindow::Hann).unwrap();
+        let bits = [true, false, true, true, false, false, true];
+        let mut phase: f64 = 0.0;
+        let samples = bits
+            .into_iter()
+            .flat_map(|bit| {
+                let frequency_hz = 10_000.0 + if bit { 1_000.0 } else { -1_000.0 };
+                (0..64).map(move |_| frequency_hz)
+            })
+            .map(|frequency_hz| {
+                let sample = Iq8 {
+                    i: (100.0 * phase.cos()).round() as i8,
+                    q: (100.0 * phase.sin()).round() as i8,
+                };
+                phase += std::f64::consts::TAU * frequency_hz / 64_000.0;
+                sample
+            })
+            .collect();
+        let mut waveforms = WaveformStore::default();
+
+        ingest_radio_iq(
+            &mut waveforms,
+            &mut spectrum,
+            &mut analyzers,
+            &IqBatch {
+                sample_rate_hz: 64_000,
+                center_frequency_hz: 100_000_000,
+                first_sample_index: 0,
+                discontinuity: false,
+                samples,
+            },
+            -50.0,
+        );
+
+        assert_eq!(analyzers.len(), 1);
+        assert_eq!(
+            waveforms.radio_analysis.soft_symbol_alphabet_size(),
+            Some(2)
+        );
+        assert_eq!(waveforms.radio_analysis.soft_symbols().len(), 5);
+        assert_eq!(
+            waveforms
+                .radio_analysis
+                .soft_symbols()
+                .iter()
+                .map(|symbol| symbol.decision())
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(1), Some(0), Some(0)]
+        );
+        assert_eq!(waveforms.radio_analysis.error(), None);
+    }
+
+    #[test]
+    fn waveform_store_keeps_newest_samples_within_bound() {
+        let mut store = WaveformStore::default();
+        store.ingest(
+            &CaptureBatch::Logic(LogicBatch {
+                sample_rate_hz: 1_000,
+                channel_count: 2,
+                samples: (0..MAX_WAVEFORM_SAMPLES as u32 + 10).collect(),
+            }),
+            [true, true],
+        );
+
+        assert_eq!(store.logic_samples.len(), MAX_WAVEFORM_SAMPLES);
+        assert_eq!(
+            store.logic_samples.front(),
+            Some(&LogicSampleBucket::new(10))
+        );
+        assert_eq!(store.logic_sample_count, MAX_WAVEFORM_SAMPLES);
+        assert_eq!(store.logic_sample_offset, 10);
+    }
+
+    #[test]
+    fn waveform_store_preserves_a_one_second_logic_domain_with_bounded_buckets() {
+        let mut store = WaveformStore::default();
+        store.configure_logic_capture(1_000_000_000);
+
+        assert_eq!(store.logic_capacity, MAX_WAVEFORM_SAMPLES);
+        assert_eq!(store.logic_sample_stride, 500);
+
+        let mut samples = vec![0_u32; 1_000];
+        samples[123] = 1;
+        store.ingest(
+            &CaptureBatch::Logic(LogicBatch {
+                sample_rate_hz: 1_000_000_000,
+                channel_count: 3,
+                samples,
+            }),
+            [true, true],
+        );
+
+        assert_eq!(store.logic_sample_count, 1_000);
+        assert_eq!(store.logic_samples.len(), 2);
+        assert_eq!(store.logic_samples[0].sample_count, 500);
+        assert_eq!(store.logic_samples[0].activity & 1, 1);
+        assert_eq!(store.logic_sample_offset, 0);
+    }
+
+    #[test]
+    fn loop_waveform_capacity_covers_the_configured_two_second_span() {
+        let sample_rate_hz = 10_000_000_u64;
+        let expected_sample_count = aligned_logic_sample_count(2.0, sample_rate_hz, u64::MAX)
+            .expect("two seconds should fit the stream capture depth");
+        let mut store = WaveformStore::default();
+
+        store.configure_logic_capture(expected_sample_count);
+
+        let represented_samples = store.logic_capacity * store.logic_sample_stride;
+        assert!(store.logic_capacity <= MAX_WAVEFORM_SAMPLES);
+        assert_eq!(store.logic_sample_stride, 11);
+        assert!(represented_samples >= expected_sample_count as usize);
+        assert!(represented_samples - (expected_sample_count as usize) < store.logic_sample_stride);
+    }
+
+    #[test]
+    fn loop_restart_reuses_only_a_compatible_waveform_window() {
+        let sample_rate_hz = 10_000_000_u64;
+        let two_second_count = aligned_logic_sample_count(2.0, sample_rate_hz, u64::MAX).unwrap();
+        let one_second_count = aligned_logic_sample_count(1.0, sample_rate_hz, u64::MAX).unwrap();
+        let two_second_config = DsLogicCaptureConfig::new(sample_rate_hz, two_second_count)
+            .unwrap()
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_loop_mode(true);
+        let one_second_config = DsLogicCaptureConfig::new(sample_rate_hz, one_second_count)
+            .unwrap()
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_loop_mode(true);
+        let mut store = WaveformStore {
+            logic_rate_hz: sample_rate_hz,
+            ..WaveformStore::default()
+        };
+        store.configure_logic_capture(two_second_count);
+
+        assert!(store.can_continue_logic_loop(two_second_config));
+        assert!(!store.can_continue_logic_loop(one_second_config));
+    }
+
+    #[test]
+    fn waveform_store_tracks_scope_channels() {
+        let mut store = WaveformStore::default();
+        store.ingest(
+            &CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000_000,
+                trigger_sample_index: Some(1),
+                channels: vec![vec![0.1, 0.2], vec![-0.1, -0.2]],
+            }),
+            [true, true],
+        );
+
+        assert_eq!(store.scope_rate_hz, 1_000_000);
+        assert_eq!(store.scope_trigger_sample_index, Some(1));
+        assert_eq!(store.scope_channels[0].back(), Some(&0.2));
+        assert_eq!(store.scope_channels[1].back(), Some(&-0.2));
+    }
+
+    #[test]
+    fn combined_timeline_uses_timestamped_sample_overlap() {
+        let mut store = WaveformStore::default();
+        store.ingest_frame(
+            &CaptureFrame {
+                device_id: DeviceId::new("logic"),
+                sequence: 0,
+                captured_at: Duration::from_millis(10),
+                payload: CaptureBatch::Logic(LogicBatch {
+                    sample_rate_hz: 1_000,
+                    channel_count: 1,
+                    samples: vec![0; 100],
+                }),
+            },
+            [true, true],
+        );
+        store.ingest_frame(
+            &CaptureFrame {
+                device_id: DeviceId::new("scope"),
+                sequence: 0,
+                captured_at: Duration::from_millis(20),
+                payload: CaptureBatch::Scope(ScopeBatch {
+                    sample_rate_hz: 2_000,
+                    trigger_sample_index: None,
+                    channels: vec![vec![0.0; 200], vec![0.0; 200]],
+                }),
+            },
+            [true, true],
+        );
+
+        let timeline = store
+            .combined_timeline()
+            .expect("logic and scope ranges should overlap");
+        assert!((timeline.logic.start_seconds - 0.010).abs() < f64::EPSILON);
+        assert!((timeline.logic.end_seconds - 0.110).abs() < f64::EPSILON);
+        assert!((timeline.scope.start_seconds - 0.020).abs() < f64::EPSILON);
+        assert!((timeline.scope.end_seconds - 0.120).abs() < f64::EPSILON);
+        assert!((timeline.shared.start_seconds - 0.020).abs() < f64::EPSILON);
+        assert!((timeline.shared.end_seconds - 0.110).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn waveform_store_keeps_trigger_coordinates_across_appended_captures() {
+        let mut store = WaveformStore {
+            scope_capacity: 3,
+            ..WaveformStore::default()
+        };
+        for (capture_index, (trigger_sample_index, samples)) in
+            [(Some(1), vec![0.0, 1.0]), (Some(0), vec![2.0, 3.0])]
+                .into_iter()
+                .enumerate()
+        {
+            if capture_index > 0 {
+                store.mark_scope_capture_start([true, true]);
+            }
+            store.ingest(
+                &CaptureBatch::Scope(ScopeBatch {
+                    sample_rate_hz: 1_000_000,
+                    trigger_sample_index,
+                    channels: vec![samples.clone(), samples],
+                }),
+                [true, true],
+            );
+        }
+
+        assert_eq!(store.scope_channels[0], VecDeque::from(vec![1.0, 2.0, 3.0]));
+        assert_eq!(store.scope_trigger_sample_index, Some(2));
+        assert_eq!(store.scope_sample_offset, 1);
+        assert_eq!(store.scope_capture_boundaries, VecDeque::from([2]));
+    }
+
+    #[test]
+    fn rolling_scope_discards_boundaries_evicted_from_the_ring() {
+        let mut store = WaveformStore {
+            scope_capacity: 3,
+            scope_rolling: true,
+            ..WaveformStore::default()
+        };
+        for samples in [vec![0.0, 1.0], vec![2.0, 3.0], vec![4.0, 5.0]] {
+            store.mark_scope_capture_start([true, true]);
+            store.ingest(
+                &CaptureBatch::Scope(ScopeBatch {
+                    sample_rate_hz: 1_000,
+                    trigger_sample_index: None,
+                    channels: vec![samples.clone(), samples],
+                }),
+                [true, true],
+            );
+        }
+
+        assert_eq!(store.scope_sample_offset, 3);
+        assert_eq!(store.scope_capture_boundaries, VecDeque::from([4]));
+    }
+
+    #[test]
+    fn waveform_store_preserves_single_scope_channel_identity() {
+        let mut store = WaveformStore::default();
+        store.ingest(
+            &CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000_000_000,
+                trigger_sample_index: None,
+                channels: vec![vec![0.1, 0.2]],
+            }),
+            [false, true],
+        );
+
+        assert!(store.scope_channels[0].is_empty());
+        assert_eq!(store.scope_channels[1].back(), Some(&0.2));
+    }
+}

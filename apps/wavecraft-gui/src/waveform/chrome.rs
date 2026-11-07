@@ -414,3 +414,21 @@ pub(crate) fn paint_empty(painter: &egui::Painter, rect: Rect, text: &str) {
         TEXT_MUTED,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    #[test]
+    fn waveform_status_is_positioned_above_the_time_ruler() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 300.0));
+        let (status, ruler, plot) = split_waveform_chrome(rect);
+
+        assert_eq!(status.top(), rect.top());
+        assert_eq!(status.bottom(), ruler.top());
+        assert_eq!(ruler.bottom(), plot.top());
+        assert_eq!(plot.bottom(), rect.bottom());
+    }
+}

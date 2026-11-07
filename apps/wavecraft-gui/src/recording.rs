@@ -1634,7 +1634,10 @@ pub(crate) fn recording_completion_label(completion: CompletionStatus) -> &'stat
 mod tests {
     use super::*;
     use crate::waveform::radio::RadioAnalysisStore;
+    use crate::*;
+    use std::io::Cursor;
     use std::sync::Arc;
+    use wavecraft_core::{Iq8, IqBatch};
     use wavecraft_decode::{
         ByteStatus, RawRadioMessageStart, RawRadioOutput, SampleRange, TimedByte,
     };
@@ -1854,5 +1857,202 @@ mod tests {
         drop(file);
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recording_capture_target_covers_every_instrument_combination() {
+        let expected = [
+            ((false, false, false), None),
+            ((true, false, false), Some(CaptureTarget::LogicAnalyzer)),
+            ((false, true, false), Some(CaptureTarget::Oscilloscope)),
+            ((false, false, true), Some(CaptureTarget::RadioReceiver)),
+            ((true, true, false), Some(CaptureTarget::Combined)),
+            ((true, true, true), Some(CaptureTarget::Combined)),
+            // Combinations that include radio but not both wired instruments
+            // cannot be shown together and must be rejected, not panic.
+            ((true, false, true), None),
+            ((false, true, true), None),
+        ];
+        for ((logic, scope, radio), target) in expected {
+            assert_eq!(
+                recording_capture_target(logic, scope, radio),
+                target,
+                "logic={logic} scope={scope} radio={radio}"
+            );
+        }
+    }
+
+    #[test]
+    fn gui_recording_reader_restores_radio_iq_and_settings() {
+        let descriptor = DeviceDescriptor {
+            id: DeviceId::new("hackrf:test"),
+            name: "HackRF One".to_owned(),
+            kind: InstrumentKind::RadioReceiver,
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "radio.center_frequency_hz".to_owned(),
+            "433920000".to_owned(),
+        );
+        metadata.insert("radio.sample_rate_hz".to_owned(), "10000000".to_owned());
+        metadata.insert("radio.bandwidth_hz".to_owned(), "8000000".to_owned());
+        metadata.insert("radio.receive_channel".to_owned(), "0".to_owned());
+        metadata.insert("radio.single_duration_millis".to_owned(), "2500".to_owned());
+        metadata.insert("radio.trigger_enabled".to_owned(), "true".to_owned());
+        metadata.insert(
+            "radio.trigger_posttrigger_micros".to_owned(),
+            "25000".to_owned(),
+        );
+        metadata.insert(
+            "radio.trigger_level_dbfs_tenths".to_owned(),
+            "-425".to_owned(),
+        );
+        metadata.insert(
+            "radio.frequency_correction_milli_ppm".to_owned(),
+            "-12500".to_owned(),
+        );
+        metadata.insert("radio.gain.lna_db".to_owned(), "24".to_owned());
+        metadata.insert("radio.gain.vga_db".to_owned(), "20".to_owned());
+        metadata.insert("radio.amplifier_enabled".to_owned(), "true".to_owned());
+        metadata.insert("radio.iq_correction_enabled".to_owned(), "false".to_owned());
+        metadata.insert("radio.antenna_power_enabled".to_owned(), "true".to_owned());
+        let mut bytes = Vec::new();
+        {
+            let mut writer = RecordingWriter::new(&mut bytes, &[descriptor], metadata).unwrap();
+            writer
+                .write_event(&CaptureEvent::Frame(CaptureFrame {
+                    device_id: DeviceId::new("hackrf:test"),
+                    sequence: 0,
+                    captured_at: Duration::ZERO,
+                    payload: CaptureBatch::Iq(IqBatch {
+                        sample_rate_hz: 10_000_000,
+                        center_frequency_hz: 433_920_000,
+                        first_sample_index: 0,
+                        discontinuity: false,
+                        samples: vec![Iq8 { i: 64, q: 0 }; RADIO_SPECTRUM_FFT_LENGTH],
+                    }),
+                }))
+                .unwrap();
+            writer.finish(CompletionStatus::Complete).unwrap();
+        }
+
+        let loaded = read_gui_recording(Cursor::new(bytes)).expect("radio recording should reopen");
+
+        assert!(loaded.capture.has_radio);
+        assert!(!loaded.capture.has_logic);
+        assert!(!loaded.capture.has_scope);
+        assert_eq!(loaded.capture.waveforms.radio.waterfall().len(), 1);
+        let settings = loaded.radio_settings.expect("radio metadata should load");
+        assert_eq!(settings.capture.center_frequency_hz, 433_920_000);
+        assert_eq!(settings.capture.sample_rate_hz, 10_000_000);
+        assert_eq!(settings.capture.bandwidth_hz, 8_000_000);
+        assert_eq!(settings.single_duration_millis, 2_500);
+        assert!(settings.trigger_enabled);
+        assert_eq!(settings.trigger_posttrigger_micros, 25_000);
+        assert_eq!(settings.trigger_level_dbfs_tenths, -425);
+        assert_eq!(settings.frequency_correction_milli_ppm, -12_500);
+        assert_eq!(settings.gains_db.get("lna"), Some(&24));
+        assert_eq!(settings.gains_db.get("vga"), Some(&20));
+        assert!(!settings.iq_correction_enabled);
+        assert!(settings.amplifier_enabled);
+        assert!(settings.antenna_power_enabled);
+    }
+
+    #[test]
+    fn decoded_jsonl_opens_packets_in_the_rf_view() {
+        let jsonl = concat!(
+            "{\"type\":\"session\",\"format\":\"wavecraft-decoded-radio\",\"format_version\":1,\"center_frequency_hz\":433920000,\"sample_rate_hz\":2000000,\"bandwidth_hz\":1750000,\"data_mode\":\"packets\",\"channels\":[{\"name\":\"Weather\",\"frequency_offset_hz\":125000}]}\n",
+            "{\"type\":\"packet\",\"sequence\":1,\"channel_name\":\"Weather\",\"channel_frequency_offset_hz\":125000,\"sample_start\":100,\"sample_end\":124,\"confidence\":0.9,\"uncertain_bits\":0,\"preamble\":[170],\"data\":[18,52]}\n",
+            "{\"type\":\"footer\",\"status\":\"complete\",\"record_count\":1}\n",
+        );
+
+        let loaded = read_gui_decoded_data(Cursor::new(jsonl)).unwrap();
+
+        assert!(loaded.capture.has_radio);
+        assert!(!loaded.capture.has_logic);
+        assert!(!loaded.capture.has_scope);
+        assert_eq!(
+            loaded.capture.waveforms.radio_analysis.raw_messages().len(),
+            1
+        );
+        let message = loaded
+            .capture
+            .waveforms
+            .radio_analysis
+            .raw_messages()
+            .front()
+            .unwrap();
+        assert_eq!(message.channel_name(), "Weather");
+        assert_eq!(message.preamble_bytes(), 1);
+        assert_eq!(
+            message
+                .data_bytes()
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0x12, 0x34]
+        );
+        let settings = loaded.radio_settings.unwrap();
+        assert_eq!(settings.analyzer.data_mode, RadioDataMode::Packets);
+        assert_eq!(settings.capture.center_frequency_hz, 433_920_000);
+        assert_eq!(loaded.completion, CompletionStatus::Complete);
+    }
+
+    #[test]
+    fn decoded_jsonl_open_requires_the_rf_view() {
+        let path = Path::new("decoded-data.JSONL");
+
+        assert_eq!(
+            decoded_data_open_request(path, Some(WaveformTab::RadioReceiver)),
+            Ok(true)
+        );
+        assert!(decoded_data_open_request(path, Some(WaveformTab::Oscilloscope)).is_err());
+        assert_eq!(
+            decoded_data_open_request(Path::new("capture.dsv"), Some(WaveformTab::Oscilloscope)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn gui_saleae_reader_restores_channels_names_and_samples() {
+        let capture = SaleaeCapture {
+            digital: Some(SaleaeDigitalCapture {
+                sample_rate_hz: 1_000_000,
+                samples: vec![0, 1, 3, 2],
+                channels: vec![
+                    SaleaeChannel {
+                        index: 0,
+                        name: "Clock".to_owned(),
+                    },
+                    SaleaeChannel {
+                        index: 1,
+                        name: "Data".to_owned(),
+                    },
+                ],
+            }),
+            analog_sample_rate_hz: Some(1_000_000),
+            analog: vec![SaleaeAnalogChannel {
+                index: 0,
+                name: "Input".to_owned(),
+                samples: vec![-1.0, 0.0, 1.0, 0.5],
+                minimum_voltage: -2.0,
+                maximum_voltage: 2.0,
+            }],
+        };
+        let mut bytes = Cursor::new(Vec::new());
+        write_saleae(&mut bytes, &capture).expect("Saleae capture should serialize");
+        bytes.set_position(0);
+
+        let loaded = read_gui_saleae(bytes).expect("Saleae capture should open");
+
+        assert!(loaded.capture.has_logic);
+        assert!(loaded.capture.has_scope);
+        assert_eq!(loaded.logic_channel_names[0], "Clock");
+        assert_eq!(loaded.logic_channel_names[1], "Data");
+        assert_eq!(loaded.scope_channel_names[0], "Input");
+        assert_eq!(loaded.capture.waveforms.logic_samples.len(), 4);
+        assert_eq!(loaded.capture.waveforms.logic_samples[2].first, 3);
+        assert_eq!(loaded.capture.waveforms.scope_channels[0].len(), 4);
+        assert!((loaded.capture.waveforms.scope_channels[0][2] - 1.0).abs() < 0.002);
     }
 }

@@ -1038,6 +1038,7 @@ pub(crate) fn radio_settings_from_recording_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::*;
     use std::collections::HashSet;
 
     fn channel_keys<S>(fields: &[ChannelField<S>], channel_count: usize) -> Vec<String> {
@@ -1093,5 +1094,426 @@ mod tests {
         for key in field_keys(RADIO_FIELDS) {
             assert!(key.starts_with("radio."), "{key}");
         }
+    }
+
+    #[test]
+    fn saved_logic_settings_round_trip_independently() {
+        let mut settings = LogicCaptureSettings {
+            sample_rate_hz: 100_000_000,
+            sample_count: 2_000_000,
+            enabled_channels: std::array::from_fn(|channel| channel < 8),
+            maximum_heights: std::array::from_fn(|channel| (channel % 5 + 1) as u8),
+            operation_mode: DsLogicOperationMode::Buffer,
+            stop_option: DsLogicStopOption::StopImmediately,
+            threshold_voltage: 2.5,
+            input_filter: DsLogicInputFilter::OneSampleClock,
+            rle_enabled: true,
+            external_clock: true,
+            falling_clock_edge: true,
+            trigger_enabled: true,
+            trigger_mode: LogicTriggerMode::Smart,
+            trigger_conditions: [None; LOGIC_CHANNEL_COUNT],
+            smart_trigger_stage_count: 3,
+            smart_trigger_conditions: [[None; LOGIC_CHANNEL_COUNT]; DSLOGIC_TRIGGER_STAGE_COUNT],
+        };
+        settings.smart_trigger_conditions[0][0] = Some(DsLogicTriggerCondition::RisingEdge);
+        settings.smart_trigger_conditions[1][1] = Some(DsLogicTriggerCondition::High);
+        settings.smart_trigger_conditions[2][2] = Some(DsLogicTriggerCondition::FallingEdge);
+        let channel_names = std::array::from_fn(|channel| format!("L{channel}"));
+
+        let metadata = saved_logic_settings_metadata(
+            settings,
+            AcquisitionMode::Repetitive,
+            2.5,
+            false,
+            &channel_names,
+        );
+
+        assert_eq!(logic_settings_from_recording_metadata(&metadata), settings);
+        assert_eq!(metadata["logic.acquisition_mode"], "repetitive".to_owned());
+        assert_eq!(metadata["logic.repetitive_interval_seconds"], "2.5");
+        assert_eq!(metadata["logic.smart_timing_enabled"], "false");
+        assert_eq!(
+            channel_names_from_recording_metadata(&metadata).0,
+            channel_names
+        );
+    }
+
+    #[test]
+    fn saved_scope_settings_round_trip_independently() {
+        let settings = ScopeCaptureSettings {
+            sample_rate_hz: 500_000_000,
+            sample_count: 1_000_000,
+            channels: [
+                ScopeChannelSettings {
+                    enabled: true,
+                    volts_per_div_mv: 500,
+                    coupling: DsCopeCoupling::Ac,
+                    probe_attenuation: 10,
+                    vertical_offset: 120,
+                },
+                ScopeChannelSettings {
+                    enabled: true,
+                    volts_per_div_mv: 2_000,
+                    coupling: DsCopeCoupling::Dc,
+                    probe_attenuation: 100,
+                    vertical_offset: 140,
+                },
+            ],
+            trigger: ScopeTriggerSettings {
+                position_percent: 70,
+                source: DsCopeTriggerSource::ChannelZeroOrOne,
+                auto_channel: 1,
+                slope: DsCopeTriggerSlope::Falling,
+                holdoff_ns: 2_000_000,
+                holdoff_unit: TriggerHoldoffUnit::Milliseconds,
+                noise_sensitivity: 4,
+                levels: [100, 140],
+            },
+            operation_mode: DsCopeOperationMode::InternalTest,
+            bandwidth_limit: DsCopeBandwidthLimit::Mhz20,
+        };
+        let names = ["Input".to_owned(), "Reference".to_owned()];
+        let colors = [Color32::RED, Color32::BLUE];
+
+        let metadata = saved_scope_settings_metadata(settings, false, true, &names, colors);
+
+        assert_eq!(scope_settings_from_recording_metadata(&metadata), settings);
+        assert_eq!(metadata["scope.auto_sample_rate"], "false");
+        assert_eq!(metadata["scope.smart_timing_enabled"], "true");
+        assert_eq!(channel_names_from_recording_metadata(&metadata).1, names);
+        assert_eq!(parse_color(&metadata["scope.ch0.color"]), Some(colors[0]));
+        assert_eq!(parse_color(&metadata["scope.ch1.color"]), Some(colors[1]));
+    }
+
+    /// Every field is listed and set away from its default, so a field added to
+    /// `RadioSettings` or `RadioAnalyzerSettings` fails to compile here until it is
+    /// given a value, and a field that is not saved or restored fails the
+    /// comparison instead of silently reopening with its default.
+    #[test]
+    fn saved_rf_settings_round_trip_every_field() {
+        let settings = RadioSettings {
+            capture: RadioCaptureSettings {
+                center_frequency_hz: 915_000_000,
+                sample_rate_hz: 10_000_000,
+                bandwidth_hz: 8_000_000,
+                receive_channel: 1,
+                // Derived from `single_duration_millis` when a Single capture
+                // starts, so it is deliberately not saved.
+                sample_limit: None,
+            },
+            single_duration_millis: 2_500,
+            trigger_enabled: true,
+            trigger_posttrigger_micros: 25_000,
+            trigger_level_dbfs_tenths: -350,
+            gains_db: BTreeMap::from([("lna".to_owned(), 24), ("vga".to_owned(), 20)]),
+            frequency_correction_milli_ppm: 1_250,
+            iq_correction_enabled: false,
+            amplifier_enabled: true,
+            antenna_power_enabled: true,
+            analyzer: RadioAnalyzerSettings {
+                demodulation: RadioDemodulation::BinaryGfsk,
+                channels: vec![
+                    RadioAnalyzerChannelSettings {
+                        name: "Weather".to_owned(),
+                        frequency_offset_hz: 125_000,
+                    },
+                    RadioAnalyzerChannelSettings {
+                        name: "Control".to_owned(),
+                        frequency_offset_hz: -250_000,
+                    },
+                ],
+                channel_bandwidth_hz: 250_000,
+                output_sample_rate_hz: 600_000,
+                filter_tap_count: 129,
+                symbol_rate_hz: 38_400,
+                deviation_hz: 50_000,
+                gfsk_bt_milli: 300,
+                inverted: true,
+                adaptive_timing: false,
+                timing_loop_bandwidth_milli: 50,
+                max_clock_error_ppm: 5_000,
+                data_mode: RadioDataMode::Packets,
+                preamble_byte: 0x55,
+                preamble_bytes: 6,
+                sync_word: 0x2dd4,
+                sync_word_bytes: 2,
+                maximum_preamble_bit_errors: 3,
+                minimum_bit_confidence_milli: 250,
+                maximum_uncertain_bits: 2,
+                whitening_enabled: true,
+                whitening_preset: RadioWhiteningPreset::Pn9X9X5,
+                whitening_width: 9,
+                whitening_polynomial: 0x11,
+                whitening_seed: 0x1ff,
+                whitening_direction: WhiteningDirection::ShiftLeft,
+                whitening_invert_output: true,
+                whitening_start_bit: 8,
+                whitening_end_bit: Some(160),
+                whitening_advance_excluded_bits: true,
+            },
+        };
+
+        let metadata = saved_radio_settings_metadata(&settings);
+
+        assert_eq!(radio_settings_from_recording_metadata(&metadata), settings);
+    }
+
+    #[test]
+    fn saved_rf_settings_round_trip_independently() {
+        let mut settings = RadioSettings::default();
+        settings.capture.center_frequency_hz = 915_000_000;
+        settings.capture.sample_rate_hz = 10_000_000;
+        settings.capture.bandwidth_hz = 8_000_000;
+        settings.single_duration_millis = 2_500;
+        settings.trigger_enabled = true;
+        settings.trigger_posttrigger_micros = 25_000;
+        settings.trigger_level_dbfs_tenths = -350;
+        settings.frequency_correction_milli_ppm = 1_250;
+        settings.iq_correction_enabled = false;
+        settings.amplifier_enabled = true;
+        settings.antenna_power_enabled = true;
+        settings.gains_db.insert("lna".to_owned(), 24);
+        settings.gains_db.insert("vga".to_owned(), 20);
+        settings.analyzer.demodulation = RadioDemodulation::BinaryFsk;
+        settings.analyzer.channels = vec![
+            RadioAnalyzerChannelSettings {
+                name: "Weather".to_owned(),
+                frequency_offset_hz: 125_000,
+            },
+            RadioAnalyzerChannelSettings {
+                name: "Control".to_owned(),
+                frequency_offset_hz: -250_000,
+            },
+        ];
+        settings.analyzer.sync_word = 0xd391;
+        settings.analyzer.sync_word_bytes = 2;
+        settings.analyzer.data_mode = RadioDataMode::Packets;
+        settings.analyzer.whitening_enabled = true;
+        settings.analyzer.whitening_width = 9;
+        settings.analyzer.whitening_polynomial = 0x11;
+        settings.analyzer.whitening_seed = 0x1ff;
+        settings.analyzer.whitening_direction = WhiteningDirection::ShiftLeft;
+        settings.analyzer.whitening_invert_output = true;
+        settings.analyzer.whitening_start_bit = 8;
+        settings.analyzer.whitening_end_bit = Some(160);
+        settings.analyzer.whitening_advance_excluded_bits = true;
+
+        let metadata = saved_radio_settings_metadata(&settings);
+
+        assert_eq!(radio_settings_from_recording_metadata(&metadata), settings);
+    }
+
+    #[test]
+    fn radio_analyzer_settings_round_trip_from_recording_metadata() {
+        let metadata = BTreeMap::from([
+            ("radio.analyzer.enabled".to_owned(), "true".to_owned()),
+            (
+                "radio.analyzer.whitening_preset".to_owned(),
+                "pn9_x9_x5".to_owned(),
+            ),
+            ("radio.analyzer.demodulation".to_owned(), "gfsk2".to_owned()),
+            (
+                "radio.analyzer.channel_offset_hz".to_owned(),
+                "-125000".to_owned(),
+            ),
+            (
+                "radio.analyzer.channel_bandwidth_hz".to_owned(),
+                "250000".to_owned(),
+            ),
+            (
+                "radio.analyzer.output_sample_rate_hz".to_owned(),
+                "1000000".to_owned(),
+            ),
+            (
+                "radio.analyzer.filter_tap_count".to_owned(),
+                "257".to_owned(),
+            ),
+            (
+                "radio.analyzer.symbol_rate_hz".to_owned(),
+                "100000".to_owned(),
+            ),
+            ("radio.analyzer.deviation_hz".to_owned(), "50000".to_owned()),
+            ("radio.analyzer.gfsk_bt_milli".to_owned(), "300".to_owned()),
+            ("radio.analyzer.inverted".to_owned(), "true".to_owned()),
+            (
+                "radio.analyzer.adaptive_timing".to_owned(),
+                "false".to_owned(),
+            ),
+            (
+                "radio.analyzer.timing_loop_bandwidth_milli".to_owned(),
+                "50".to_owned(),
+            ),
+            (
+                "radio.analyzer.max_clock_error_ppm".to_owned(),
+                "20000".to_owned(),
+            ),
+            ("radio.analyzer.data_mode".to_owned(), "packets".to_owned()),
+            ("radio.analyzer.preamble_byte".to_owned(), "85".to_owned()),
+            ("radio.analyzer.preamble_bytes".to_owned(), "12".to_owned()),
+            ("radio.analyzer.sync_word".to_owned(), "11732".to_owned()),
+            ("radio.analyzer.sync_word_bytes".to_owned(), "2".to_owned()),
+            (
+                "radio.analyzer.maximum_preamble_bit_errors".to_owned(),
+                "2".to_owned(),
+            ),
+            (
+                "radio.analyzer.minimum_bit_confidence_milli".to_owned(),
+                "650".to_owned(),
+            ),
+            (
+                "radio.analyzer.maximum_uncertain_bits".to_owned(),
+                "3".to_owned(),
+            ),
+            (
+                "radio.analyzer.whitening_enabled".to_owned(),
+                "true".to_owned(),
+            ),
+            ("radio.analyzer.whitening_width".to_owned(), "9".to_owned()),
+            (
+                "radio.analyzer.whitening_polynomial".to_owned(),
+                "17".to_owned(),
+            ),
+            ("radio.analyzer.whitening_seed".to_owned(), "511".to_owned()),
+            (
+                "radio.analyzer.whitening_direction".to_owned(),
+                "left".to_owned(),
+            ),
+            (
+                "radio.analyzer.whitening_invert_output".to_owned(),
+                "true".to_owned(),
+            ),
+            (
+                "radio.analyzer.whitening_start_bit".to_owned(),
+                "8".to_owned(),
+            ),
+            (
+                "radio.analyzer.whitening_end_bit".to_owned(),
+                "160".to_owned(),
+            ),
+            (
+                "radio.analyzer.whitening_advance_excluded_bits".to_owned(),
+                "true".to_owned(),
+            ),
+        ]);
+
+        let settings = radio_settings_from_recording_metadata(&metadata).analyzer;
+
+        assert!(settings.is_enabled());
+        assert_eq!(settings.demodulation, RadioDemodulation::BinaryGfsk);
+        assert_eq!(settings.channels[0].name, "Channel 1");
+        assert_eq!(settings.channels[0].frequency_offset_hz, -125_000);
+        assert_eq!(settings.channel_bandwidth_hz, 250_000);
+        assert_eq!(settings.output_sample_rate_hz, 1_000_000);
+        assert_eq!(settings.filter_tap_count, 257);
+        assert_eq!(settings.symbol_rate_hz, 100_000);
+        assert_eq!(settings.deviation_hz, 50_000);
+        assert_eq!(settings.gfsk_bt_milli, 300);
+        assert!(settings.inverted);
+        assert!(!settings.adaptive_timing);
+        assert_eq!(settings.timing_loop_bandwidth_milli, 50);
+        assert_eq!(settings.max_clock_error_ppm, 20_000);
+        assert_eq!(settings.preamble_byte, 0x55);
+        assert_eq!(settings.preamble_bytes, 12);
+        assert_eq!(settings.sync_word, 0x2dd4);
+        assert_eq!(settings.sync_word_bytes, 2);
+        assert_eq!(settings.maximum_preamble_bit_errors, 2);
+        assert_eq!(settings.minimum_bit_confidence_milli, 650);
+        assert_eq!(settings.maximum_uncertain_bits, 3);
+        assert_eq!(settings.data_mode, RadioDataMode::Packets);
+        assert!(settings.whitening_enabled);
+        assert_eq!(settings.whitening_preset, RadioWhiteningPreset::Pn9X9X5);
+        assert_eq!(settings.whitening_width, 9);
+        assert_eq!(settings.whitening_polynomial, 0x11);
+        assert_eq!(settings.whitening_seed, 0x1ff);
+        assert_eq!(settings.whitening_direction, WhiteningDirection::ShiftLeft);
+        assert!(settings.whitening_invert_output);
+        assert_eq!(settings.whitening_start_bit, 8);
+        assert_eq!(settings.whitening_end_bit, Some(160));
+        assert!(settings.whitening_advance_excluded_bits);
+    }
+
+    #[test]
+    fn legacy_disabled_radio_analyzer_loads_as_none() {
+        let metadata = BTreeMap::from([
+            ("radio.analyzer.enabled".to_owned(), "false".to_owned()),
+            ("radio.analyzer.demodulation".to_owned(), "gfsk2".to_owned()),
+        ]);
+
+        let settings = radio_settings_from_recording_metadata(&metadata).analyzer;
+
+        assert_eq!(settings.demodulation, RadioDemodulation::None);
+        assert!(!settings.is_enabled());
+        assert!(settings.signal_profiles().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recording_metadata_restores_smart_trigger_stages() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("logic.operation_mode".to_owned(), "buffer".to_owned());
+        metadata.insert("logic.trigger.enabled".to_owned(), "true".to_owned());
+        metadata.insert("logic.trigger.mode".to_owned(), "smart".to_owned());
+        metadata.insert("logic.trigger.stage_count".to_owned(), "2".to_owned());
+        metadata.insert(
+            "logic.trigger.stage0.ch0.condition".to_owned(),
+            "rising_edge".to_owned(),
+        );
+        metadata.insert(
+            "logic.trigger.stage0.ch1.condition".to_owned(),
+            "high".to_owned(),
+        );
+        metadata.insert(
+            "logic.trigger.stage1.ch2.condition".to_owned(),
+            "falling_edge".to_owned(),
+        );
+
+        let settings = logic_settings_from_recording_metadata(&metadata);
+
+        assert!(settings.trigger_enabled);
+        assert_eq!(settings.trigger_mode, LogicTriggerMode::Smart);
+        assert_eq!(settings.smart_trigger_stage_count, 2);
+        assert_eq!(
+            settings.smart_trigger_conditions[0][0],
+            Some(DsLogicTriggerCondition::RisingEdge)
+        );
+        assert_eq!(
+            settings.smart_trigger_conditions[0][1],
+            Some(DsLogicTriggerCondition::High)
+        );
+        assert_eq!(
+            settings.smart_trigger_conditions[1][2],
+            Some(DsLogicTriggerCondition::FallingEdge)
+        );
+    }
+
+    #[test]
+    fn recordings_without_channel_names_use_hardware_identifiers() {
+        let (logic_names, scope_names) = channel_names_from_recording_metadata(&BTreeMap::new());
+
+        assert!(logic_names.iter().all(String::is_empty));
+        assert!(scope_names.iter().all(String::is_empty));
+        assert_eq!(channel_label("D", 0, &logic_names[0]), "D0");
+        assert_eq!(scope_channel_label(1, &scope_names), "CH1");
+    }
+
+    #[test]
+    fn recording_metadata_saves_normalized_channel_names() {
+        let mut logic_names = empty_logic_channel_names();
+        logic_names[0] = "  Clock  ".to_owned();
+        let mut scope_names = empty_scope_channel_names();
+        scope_names[1] = "Reference".to_owned();
+        let mut metadata = BTreeMap::new();
+
+        insert_channel_name_metadata(&mut metadata, &logic_names, &scope_names);
+
+        assert_eq!(
+            metadata.get("logic.ch0.name").map(String::as_str),
+            Some("Clock")
+        );
+        assert_eq!(metadata.get("logic.ch1.name").map(String::as_str), Some(""));
+        assert_eq!(
+            metadata.get("scope.ch1.name").map(String::as_str),
+            Some("Reference")
+        );
     }
 }

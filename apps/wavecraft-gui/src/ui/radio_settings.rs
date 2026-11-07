@@ -1467,3 +1467,78 @@ pub(crate) fn paint_radio_device_selector(
     }
     before != *selected_id
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    #[test]
+    fn analyzer_render_does_not_clamp_values_to_a_temporary_dependent_minimum() {
+        let context = egui::Context::default();
+        let mut settings = RadioAnalyzerSettings {
+            demodulation: RadioDemodulation::BinaryGfsk,
+            output_sample_rate_hz: 0,
+            symbol_rate_hz: 19_200,
+            deviation_hz: 35_000,
+            preamble_bytes: 0,
+            sync_word: 0xd391,
+            sync_word_bytes: 2,
+            ..RadioAnalyzerSettings::default()
+        };
+
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_radio_analyzer_configuration(ui, &mut settings, 0, true);
+            });
+        });
+
+        assert_eq!(settings.symbol_rate_hz, 19_200);
+        assert_eq!(settings.deviation_hz, 35_000);
+        assert_eq!(settings.preamble_bytes, 0);
+    }
+
+    #[test]
+    fn displayed_hackrf_id_omits_serial_leading_zeroes() {
+        let radio = DiscoveredRadio {
+            descriptor: DeviceDescriptor {
+                id: DeviceId::new("hackrf:0000000000001234"),
+                name: "HackRF One".to_owned(),
+                kind: InstrumentKind::RadioReceiver,
+            },
+            provider: RadioProvider::HackRf,
+            model: wavecraft_sdr::RadioModel::HackRfOne,
+            connection_backend: wavecraft_sdr::ConnectionBackend::Usb,
+            persistent_id: Some("0000000000001234".to_owned()),
+            capabilities: wavecraft_hackrf::hackrf_one_capabilities(),
+        };
+
+        assert_eq!(displayed_radio_id(&radio), "hackrf:1234");
+    }
+
+    #[test]
+    fn radio_values_convert_fractional_mhz_to_hz() {
+        let domain = ValueDomain::Stepped {
+            range: 1_000_000..=6_000_000_000,
+            step: 1,
+        };
+
+        assert_eq!(radio_hz_from_mhz(&domain, 433.920_125), 433_920_125);
+        assert_eq!(radio_hz_from_mhz(&domain, 0.5), 1_000_000);
+        assert_eq!(radio_hz_from_mhz(&domain, 6_100.0), 6_000_000_000);
+
+        let sample_rate_domain = ValueDomain::Stepped {
+            range: 2_000_000..=20_000_000,
+            step: 1,
+        };
+        assert_eq!(radio_hz_from_mhz(&sample_rate_domain, 12.5), 12_500_000);
+    }
+
+    #[test]
+    fn radio_mhz_numbers_omit_the_unit_and_trailing_zeroes() {
+        assert_eq!(format_radio_mhz_number(1_750_000), "1.75");
+        assert_eq!(format_radio_mhz_number(5_500_000), "5.5");
+        assert_eq!(format_radio_mhz_number(20_000_000), "20");
+    }
+}

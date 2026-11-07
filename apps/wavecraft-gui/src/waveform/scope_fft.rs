@@ -332,3 +332,98 @@ pub(crate) fn paint_scope_fft(
         ));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    #[test]
+    fn scope_fft_finds_the_input_tone() {
+        let length = 1_024;
+        let tone_bin = 64;
+        let samples = (0..length)
+            .map(|index| {
+                (std::f32::consts::TAU * tone_bin as f32 * index as f32 / length as f32).sin()
+            })
+            .collect::<VecDeque<_>>();
+
+        let spectrum = scope_fft_spectrum(&samples, 0..length, length, ScopeFftWindow::Hann);
+        let peak_bin = spectrum
+            .iter()
+            .enumerate()
+            .skip(1)
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(bin, _)| bin)
+            .unwrap();
+
+        assert_eq!(peak_bin, tone_bin);
+        assert!((spectrum[peak_bin] + 3.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn scope_fft_supports_vendor_window_types() {
+        let samples = (0..1_024)
+            .map(|index| (std::f32::consts::TAU * 32.0 * index as f32 / 1_024.0).sin())
+            .collect::<VecDeque<_>>();
+
+        for window in [
+            ScopeFftWindow::Rectangular,
+            ScopeFftWindow::Hann,
+            ScopeFftWindow::Hamming,
+            ScopeFftWindow::Blackman,
+            ScopeFftWindow::FlatTop,
+        ] {
+            let spectrum = scope_fft_spectrum(&samples, 0..1_024, 1_024, window);
+            assert_eq!(spectrum.len(), 513);
+            assert!(spectrum.iter().all(|magnitude| magnitude.is_finite()));
+            assert_eq!(
+                spectrum
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .max_by(|left, right| left.1.total_cmp(right.1))
+                    .map(|(bin, _)| bin),
+                Some(32),
+            );
+        }
+    }
+
+    #[test]
+    fn scope_fft_mouse_position_maps_to_frequency() {
+        let plot = Rect::from_min_size(Pos2::new(100.0, 20.0), Vec2::new(800.0, 200.0));
+
+        assert_eq!(fft_frequency_at_x(plot, 100.0, 0.0, 500_000.0), 0.0);
+        assert_eq!(fft_frequency_at_x(plot, 500.0, 0.0, 500_000.0), 250_000.0);
+        assert_eq!(fft_frequency_at_x(plot, 900.0, 0.0, 500_000.0), 500_000.0);
+        assert_eq!(fft_frequency_at_x(plot, 950.0, 0.0, 500_000.0), 500_000.0);
+        assert_eq!(
+            fft_frequency_at_x(plot, 100.0, 100_000.0, 200_000.0),
+            100_000.0
+        );
+        assert_eq!(
+            fft_frequency_at_x(plot, 900.0, 100_000.0, 200_000.0),
+            200_000.0
+        );
+        assert_eq!(fft_bin_at_x(plot, 100.0, 128, 256), 128);
+        assert_eq!(fft_bin_at_x(plot, 500.0, 128, 256), 192);
+        assert_eq!(fft_bin_at_x(plot, 900.0, 128, 256), 256);
+        assert_eq!(fft_bin_at_x(plot, 950.0, 128, 256), 256);
+    }
+
+    #[test]
+    fn scope_fft_viewport_zooms_at_pointer_and_pans() {
+        let mut viewport = ScopeFftViewport::default();
+
+        viewport.zoom(1.0, 0.25, 0.01);
+        assert!((viewport.span - 0.8).abs() < f32::EPSILON);
+        assert!((viewport.start - 0.05).abs() < f32::EPSILON);
+
+        viewport.pan(-100.0, 1_000.0);
+        assert!((viewport.start - 0.13).abs() < f32::EPSILON);
+
+        viewport.zoom(-1.0, 0.5, 0.01);
+        assert_eq!(viewport, ScopeFftViewport::default());
+    }
+}

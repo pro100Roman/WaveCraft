@@ -963,3 +963,16 @@ pub(crate) fn paint_scope_tools(
         channel_names,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_input_range_encoder_steps_and_clamps_supported_ranges() {
+        assert_eq!(step_scope_input_range(100, 1), 200);
+        assert_eq!(step_scope_input_range(100, -1), 50);
+        assert_eq!(step_scope_input_range(10, -10), 10);
+        assert_eq!(step_scope_input_range(2_000, 10), 2_000);
+    }
+}

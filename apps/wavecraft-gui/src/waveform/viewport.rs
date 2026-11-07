@@ -403,3 +403,258 @@ pub(crate) fn update_waveform_viewport(
     }
     (panned, timebase_changed, click, requested_timebase)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    #[test]
+    fn combined_timeline_maps_both_viewports_to_the_same_time_window() {
+        let timeline = CombinedTimeline {
+            shared: CaptureTimeRange {
+                start_seconds: 0.020,
+                end_seconds: 0.110,
+            },
+            logic: CaptureTimeRange {
+                start_seconds: 0.010,
+                end_seconds: 0.110,
+            },
+            scope: CaptureTimeRange {
+                start_seconds: 0.020,
+                end_seconds: 0.120,
+            },
+        };
+        let shared = WaveformViewport {
+            start: 0.25,
+            span: 0.5,
+            anchor_locked: false,
+        };
+
+        let logic = timeline.source_viewport(shared, timeline.logic);
+        let scope = timeline.source_viewport(shared, timeline.scope);
+        let logic_start = timeline.logic.start_seconds
+            + f64::from(logic.start) * timeline.logic.duration_seconds();
+        let scope_start = timeline.scope.start_seconds
+            + f64::from(scope.start) * timeline.scope.duration_seconds();
+        let logic_span = f64::from(logic.span) * timeline.logic.duration_seconds();
+        let scope_span = f64::from(scope.span) * timeline.scope.duration_seconds();
+
+        assert!((logic_start - scope_start).abs() < 1.0e-8);
+        assert!((logic_span - scope_span).abs() < 1.0e-8);
+        let round_trip = timeline.shared_viewport(logic, timeline.logic);
+        assert!((round_trip.start - shared.start).abs() < 1.0e-6);
+        assert!((round_trip.span - shared.span).abs() < 1.0e-6);
+        assert_eq!(round_trip.anchor_locked, shared.anchor_locked);
+    }
+
+    #[test]
+    fn new_scope_markers_start_in_the_visible_pane_center() {
+        let settings = ScopeMarkerSettings::default();
+        let viewport = WaveformViewport {
+            start: 0.6,
+            span: 0.2,
+            ..WaveformViewport::default()
+        };
+
+        let time = ScopeMarkerEditor::for_new(settings, viewport, 0, ScopeMarkerKind::Time);
+        let voltage = ScopeMarkerEditor::for_new(settings, viewport, 0, ScopeMarkerKind::Voltage);
+
+        assert!((time.position - 0.7).abs() < f32::EPSILON);
+        assert!((voltage.position - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn scope_marker_limit_is_shared_across_types_and_markers_can_change_type() {
+        let mut settings = ScopeMarkerSettings::default();
+        let viewport = WaveformViewport::default();
+        for index in 0..SCOPE_MARKER_LIMIT {
+            let kind = if index % 2 == 0 {
+                ScopeMarkerKind::Time
+            } else {
+                ScopeMarkerKind::Voltage
+            };
+            let editor = ScopeMarkerEditor::for_new(settings, viewport, 0, kind);
+            assert!(editor.save(&mut settings));
+        }
+        assert_eq!(settings.channels[0].total_count(), SCOPE_MARKER_LIMIT);
+        assert!(
+            !ScopeMarkerEditor::for_new(settings, viewport, 0, ScopeMarkerKind::Time)
+                .save(&mut settings)
+        );
+
+        let key = ScopeMarkerKey {
+            channel: 0,
+            kind: ScopeMarkerKind::Time,
+            index: 0,
+        };
+        let mut editor = ScopeMarkerEditor::for_existing(settings, key).unwrap();
+        editor.kind = ScopeMarkerKind::Voltage;
+        assert!(editor.save(&mut settings));
+        assert_eq!(settings.channels[0].total_count(), SCOPE_MARKER_LIMIT);
+        assert_eq!(settings.channels[0].count(ScopeMarkerKind::Time), 4);
+        assert_eq!(settings.channels[0].count(ScopeMarkerKind::Voltage), 6);
+    }
+
+    #[test]
+    fn high_zoom_keeps_a_visible_range_for_large_logic_captures() {
+        let sample_count = 1_250_000_128;
+        let viewport = WaveformViewport {
+            start: 0.75,
+            span: 1.0 / sample_count as f32,
+            anchor_locked: false,
+        };
+        assert_eq!(viewport.start + viewport.span, viewport.start);
+
+        let visible_range = viewport.sample_range(sample_count);
+
+        assert!(!visible_range.is_empty());
+        assert!(visible_range.len() <= 2);
+    }
+
+    #[test]
+    fn waveform_zoom_preserves_the_sample_under_the_pointer() {
+        let mut viewport = WaveformViewport::default();
+
+        assert!(viewport.step_timebase(1.0, 1_000_000, 1_000_000, 0.25));
+
+        assert!((viewport.span - 0.5).abs() < f32::EPSILON);
+        assert!((viewport.start + viewport.span * 0.25 - 0.25).abs() < 0.000_001);
+        assert!(!viewport.anchor_locked);
+        assert!(viewport.sample_range(1_000).len() < 1_000);
+        assert_eq!(viewport.time_per_division(1_000_000, 1_000_000), Some(0.05));
+    }
+
+    #[test]
+    fn waveform_zoom_out_is_clamped_to_the_full_capture() {
+        let mut viewport = WaveformViewport::default();
+        viewport.step_timebase(1.0, 1_000_000, 1_000_000, 0.75);
+
+        viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.75);
+        assert!(!viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.25));
+
+        assert_eq!(viewport.start, 0.0);
+        assert_eq!(viewport.span, 1.0);
+        assert!(!viewport.anchor_locked);
+        assert_eq!(viewport.sample_range(1_000), 0..1_000);
+    }
+
+    #[test]
+    fn scope_timebase_fits_when_selected_window_is_wider_than_the_capture() {
+        let mut viewport = WaveformViewport {
+            start: 0.25,
+            span: 0.5,
+            ..WaveformViewport::default()
+        };
+        let selected_timebase = viewport.time_per_division(1_000_000, 1_000_000).unwrap();
+
+        apply_time_per_division(&mut viewport, 250_000, 1_000_000, selected_timebase);
+
+        assert_eq!(viewport.start, 0.0);
+        assert_eq!(viewport.span, 1.0);
+        assert!(
+            (viewport.time_per_division(250_000, 1_000_000).unwrap() - 0.025).abs() < f64::EPSILON,
+            "fit-to-capture should replace a wider persisted timebase"
+        );
+    }
+
+    #[test]
+    fn scope_auto_timebase_preserves_zoom_out_request_beyond_current_capture() {
+        let displayed_timebase = 2.0e-3;
+        let requested_timebase = adjacent_timebase(displayed_timebase, false).unwrap();
+        assert_eq!(requested_timebase, 5.0e-3);
+
+        let selected = resolve_scope_timebase(
+            Some(displayed_timebase),
+            Some(displayed_timebase),
+            Some(requested_timebase),
+            1.0,
+            true,
+        );
+        assert_eq!(selected, Some(requested_timebase));
+        assert_eq!(
+            resolve_scope_timebase(selected, Some(displayed_timebase), None, 1.0, true),
+            Some(requested_timebase),
+            "the request must survive while the old capture is still displayed"
+        );
+        assert_eq!(
+            resolve_scope_timebase(selected, Some(displayed_timebase), None, 1.0, false),
+            Some(displayed_timebase),
+            "manual sample rate remains limited by the captured buffer"
+        );
+
+        let settings = ScopeCaptureSettings::default();
+        let adjusted_rate = settings.sample_rate_for_timebase(requested_timebase);
+        assert_eq!(adjusted_rate, 20_000_000);
+        let mut viewport = WaveformViewport::default();
+        apply_time_per_division(
+            &mut viewport,
+            settings.sample_count as usize,
+            adjusted_rate,
+            requested_timebase,
+        );
+        assert_eq!(
+            viewport.time_per_division(settings.sample_count as usize, adjusted_rate),
+            Some(requested_timebase)
+        );
+    }
+
+    #[test]
+    fn timebase_steps_follow_the_vendor_one_two_five_sequence() {
+        assert_eq!(TIMEBASE_STEPS_SECONDS.first(), Some(&2.0e-9));
+        assert_eq!(TIMEBASE_STEPS_SECONDS.last(), Some(&10.0));
+        assert!(TIMEBASE_STEPS_SECONDS.contains(&DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS));
+        assert_eq!(adjacent_timebase(10.0e-9, true), Some(5.0e-9));
+        assert_eq!(adjacent_timebase(10.0e-9, false), Some(20.0e-9));
+        assert_eq!(adjacent_timebase(2.0e-9, true), None);
+        assert_eq!(adjacent_timebase(10.0, false), None);
+
+        let mut default_viewport = WaveformViewport::default();
+        apply_time_per_division(
+            &mut default_viewport,
+            SAMPLE_COUNT as usize,
+            SAMPLE_RATE_HZ,
+            DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS,
+        );
+        assert!(
+            (default_viewport
+                .time_per_division(SAMPLE_COUNT as usize, SAMPLE_RATE_HZ)
+                .unwrap()
+                - DEFAULT_SCOPE_TIME_PER_DIVISION_SECONDS)
+                .abs()
+                < 1.0e-9
+        );
+
+        let mut viewport = WaveformViewport::default();
+        assert!(!viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.5));
+        assert!(viewport.step_timebase(1.0, 1_000_000, 1_000_000, 0.5));
+        assert_eq!(viewport.time_per_division(1_000_000, 1_000_000), Some(0.05));
+        assert!(viewport.step_timebase(1.0, 1_000_000, 1_000_000, 0.5));
+        assert!(
+            (viewport.time_per_division(1_000_000, 1_000_000).unwrap() - 0.02).abs() < 0.000_001
+        );
+        assert!(viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.5));
+        assert!(viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.5));
+        assert_eq!(viewport.span, 1.0);
+        assert_eq!(viewport.sample_range(1_000_000), 0..1_000_000);
+        assert!(!viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.5));
+    }
+
+    #[test]
+    fn waveform_pan_tracks_mouse_motion_and_clamps_to_capture() {
+        let mut viewport = WaveformViewport {
+            start: 0.25,
+            span: 0.5,
+            ..WaveformViewport::default()
+        };
+
+        assert!(viewport.pan_by_screen_delta(-100.0, 1_000.0));
+        assert!((viewport.start - 0.3).abs() < 0.000_001);
+        assert!(!viewport.anchor_locked);
+
+        assert!(viewport.pan_by_screen_delta(10_000.0, 1_000.0));
+        assert_eq!(viewport.start, 0.0);
+        assert!(!viewport.pan_by_screen_delta(1.0, 1_000.0));
+    }
+}

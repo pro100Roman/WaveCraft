@@ -463,3 +463,37 @@ pub(crate) fn paint_decoded_data_panel(
     }
     selected_range
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    #[test]
+    fn decoded_panel_retains_older_view_when_new_messages_are_inserted_above() {
+        assert_eq!(retained_decoded_scroll_offset(0.0, 80.0, 500.0), 0.0);
+        assert_eq!(retained_decoded_scroll_offset(120.0, 80.0, 500.0), 200.0);
+        assert_eq!(retained_decoded_scroll_offset(470.0, 80.0, 500.0), 500.0);
+        assert_eq!(retained_decoded_scroll_offset(120.0, -20.0, 500.0), 120.0);
+    }
+
+    #[test]
+    fn decoded_panel_timestamp_does_not_reset_when_the_waveform_buffer_moves() {
+        let event_start_sample = 2_000_000;
+        let waveform_sample_offset = 1_500_000;
+        let sample_rate_hz = 1_000_000;
+
+        let elapsed = protocol_event_elapsed(event_start_sample, sample_rate_hz)
+            .expect("a nonzero sample rate should produce a timestamp");
+
+        assert_eq!(elapsed, Duration::from_secs(2));
+        assert_ne!(
+            elapsed,
+            Duration::from_secs_f64(
+                event_start_sample.saturating_sub(waveform_sample_offset) as f64
+                    / sample_rate_hz as f64,
+            )
+        );
+    }
+}

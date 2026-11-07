@@ -1586,3 +1586,109 @@ pub(crate) fn paint_logic(
         *viewport,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    #[test]
+    fn logic_markers_normalize_reverse_drags_and_stop_at_twenty() {
+        let mut settings = LogicMarkerSettings::default();
+        for index in 0..LOGIC_MARKER_LIMIT {
+            assert!(settings.arm());
+            settings.start((index * 10 + 9) as u64);
+            settings.update((index * 10) as u64);
+            assert!(settings.finish(1_000));
+        }
+
+        assert_eq!(settings.markers.len(), LOGIC_MARKER_LIMIT);
+        assert_eq!(settings.markers[0].start_sample, 0);
+        assert_eq!(settings.markers[0].end_sample, 9);
+        assert_eq!(settings.markers[0].duration(), Duration::from_millis(9));
+        assert!(settings.markers[0].name.is_empty());
+        assert_eq!(settings.markers[0].color, logic_marker_color(0));
+        settings.markers[0].name = "Clock pulse".to_owned();
+        settings.markers[0].color = Color32::RED;
+        assert_eq!(settings.markers[0].name, "Clock pulse");
+        assert_eq!(settings.markers[0].color, Color32::RED);
+        assert!(!settings.arm());
+    }
+
+    #[test]
+    fn logic_channel_markers_stay_compact_and_inside_their_lanes() {
+        let plot = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 320.0));
+        let lane_height = 20.0;
+        let marker = logic_channel_marker_rect(plot, lane_height * 0.75, lane_height, "15");
+        let named_marker =
+            logic_channel_marker_rect(plot, lane_height * 0.75, lane_height, "CLOCKCLK");
+
+        assert_eq!(marker.width(), 26.0);
+        assert_eq!(named_marker.width(), 62.0);
+        assert!(marker.height() <= 13.0);
+        assert!(marker.top() >= plot.top());
+        assert!(marker.bottom() <= plot.top() + lane_height);
+    }
+
+    #[test]
+    fn logic_maximum_height_uses_the_selected_multiple() {
+        let mut maximum_heights = [1; LOGIC_CHANNEL_COUNT];
+
+        for multiple in 1..=5 {
+            maximum_heights[8] = multiple;
+            let layout = logic_signal_layout(0.0, 320.0, &maximum_heights);
+            let (high, low) = layout.levels[8];
+            assert!((low - high - layout.base_height * f32::from(multiple)).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn logic_maximum_height_reflows_channels_inside_the_plot() {
+        let height_patterns = [
+            [1; LOGIC_CHANNEL_COUNT],
+            [5; LOGIC_CHANNEL_COUNT],
+            [5, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 5],
+            [5, 1, 5, 1, 5, 1, 5, 1, 5, 1, 5, 1, 5, 1, 5, 1],
+        ];
+
+        for maximum_heights in height_patterns {
+            let layout = logic_signal_layout(40.0, 320.0, &maximum_heights);
+            assert!(layout.levels[0].0 >= 40.0 + layout.base_height);
+            assert!(layout.levels[LOGIC_CHANNEL_COUNT - 1].1 <= 360.0 - layout.base_height);
+            for channel in 1..LOGIC_CHANNEL_COUNT {
+                assert!(
+                    layout.levels[channel - 1].1 + layout.base_height
+                        <= layout.levels[channel].0 + f32::EPSILON
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn logic_reflow_moves_neighbors_in_base_height_steps() {
+        let defaults = logic_signal_layout(0.0, 320.0, &[1; LOGIC_CHANNEL_COUNT]);
+        let mut maximum_heights = [1; LOGIC_CHANNEL_COUNT];
+        maximum_heights[0] = 5;
+        let enlarged_first = logic_signal_layout(0.0, 320.0, &maximum_heights);
+        assert!((defaults.base_height - enlarged_first.base_height).abs() < f32::EPSILON);
+        assert!(
+            (enlarged_first.levels[1].0 - defaults.levels[1].0 - defaults.base_height).abs()
+                < f32::EPSILON
+        );
+
+        maximum_heights = [1; LOGIC_CHANNEL_COUNT];
+        maximum_heights[LOGIC_CHANNEL_COUNT - 1] = 5;
+        let enlarged_last = logic_signal_layout(0.0, 320.0, &maximum_heights);
+        let movement = (defaults.levels[14].0 - enlarged_last.levels[14].0) / defaults.base_height;
+        assert!((movement - movement.round()).abs() < f32::EPSILON);
+        assert!(movement >= 1.0);
+    }
+
+    #[test]
+    fn logic_channel_marker_uses_name_limited_to_eight_characters() {
+        assert_eq!(logic_channel_marker_text(3, ""), "3");
+        assert_eq!(logic_channel_marker_text(3, "  CLOCK  "), "CLOCK");
+        assert_eq!(logic_channel_marker_text(3, "DATA-LONG-NAME"), "DATA-LON");
+    }
+}
