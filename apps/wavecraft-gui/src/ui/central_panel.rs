@@ -1,18 +1,20 @@
 //! The central waveform area of the application window.
 
 use crate::{
-    combined_waveform_cards, egui, focus_logic_sample_range, format_radio_value,
-    paint_decoded_data_panel, paint_logic, paint_scope, paint_scope_lissajous, scope_channel_label,
-    scope_channels_subtitle, scope_tools_panel_is_visible, toolbar_action_button,
+    card_frame, collapsed_side_panel_frame, combined_waveform_cards, egui, fill_card_height,
+    focus_logic_sample_range, format_radio_value, paint_decoded_data_panel, paint_logic,
+    paint_scope, paint_scope_lissajous, scope_channel_label, scope_channels_subtitle,
+    scope_tools_panel_is_visible, toolbar_action_button,
     ui::{frame_state::FrameState, scope_tools_panel::scope_tools_layout},
-    waveform_card_fill, Color32, CombinedWaveformViewports, LogicChannelSettingsDraft,
+    waveform_card, Color32, CombinedWaveformViewports, LogicChannelSettingsDraft,
     LogicMarkerSettings, LogicWaveformOptions, PendingSnapshot, ProtocolAnalyzerSettings,
     ProtocolDecodeCache, ProtocolDecodeOutcome, ProtocolDecodeSnapshot, RadioDataMode,
     RadioViewOptions, Rect, RichText, ScopeCaptureSettings, ScopeFftViewport,
     ScopeLissajousPaintOptions, ScopeMarkerSettings, ScopeMeasurementCache,
     ScopeQuickTimeMeasurement, ScopeTriggerSettings, ScopeWaveformOptions, SelectableHoverText,
     Sense, Stroke, Vec2, WaveCraftApp, WaveformStore, WaveformTab, WaveformViewport, ACCENT,
-    BACKGROUND, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, LOGIC_CHANNEL_COUNT, PANEL, TEXT_MUTED,
+    BACKGROUND, COLLAPSED_SIDE_PANEL_WIDTH, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID,
+    LOGIC_CHANNEL_COUNT, TEXT_MUTED,
 };
 
 /// App state that `paint_central_panel` moves out of [`WaveCraftApp`] while the
@@ -296,7 +298,7 @@ impl WaveCraftApp {
         state: &mut PanelState,
         edits: &mut WaveformViewEdits,
     ) -> Rect {
-        waveform_card_fill(
+        waveform_card(
             waveform_ui,
             "DIGITAL",
             "DSLogic · channels 0–15",
@@ -378,13 +380,8 @@ impl WaveCraftApp {
                 Vec2::new(state.decoded_data_panel_width, available_size.y),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    selected_range = paint_decoded_data_side_panel(
-                        ui,
-                        available_size,
-                        state,
-                        decoded_outcomes,
-                        sample_rate_hz,
-                    );
+                    selected_range =
+                        paint_decoded_data_side_panel(ui, state, decoded_outcomes, sample_rate_hz);
                 },
             );
         });
@@ -402,8 +399,7 @@ impl WaveCraftApp {
     ) {
         let available_size = ui.available_size();
         let spacing = ui.spacing().item_spacing.x;
-        let collapsed_width = 34.0;
-        let waveform_width = (available_size.x - collapsed_width - spacing).max(1.0);
+        let waveform_width = (available_size.x - COLLAPSED_SIDE_PANEL_WIDTH - spacing).max(1.0);
         ui.horizontal(|ui| {
             ui.allocate_ui_with_layout(
                 Vec2::new(waveform_width, available_size.y),
@@ -414,26 +410,22 @@ impl WaveCraftApp {
                 },
             );
             ui.allocate_ui_with_layout(
-                Vec2::new(collapsed_width, available_size.y),
+                Vec2::new(COLLAPSED_SIDE_PANEL_WIDTH, available_size.y),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    egui::Frame::none()
-                        .fill(PANEL)
-                        .rounding(egui::Rounding::same(6.0))
-                        .inner_margin(egui::Margin::same(4.0))
-                        .show(ui, |ui| {
-                            ui.set_min_height((available_size.y - 8.0).max(0.0));
-                            if ui
-                                .add_sized(
-                                    DECODED_PANEL_ACTION_BUTTON_SIZE,
-                                    toolbar_action_button("◀", ACCENT),
-                                )
-                                .on_hover_selectable_text("Expand decoded data")
-                                .clicked()
-                            {
-                                state.decoded_data_panel_open = true;
-                            }
-                        });
+                    collapsed_side_panel_frame().show(ui, |ui| {
+                        fill_card_height(ui);
+                        if ui
+                            .add_sized(
+                                DECODED_PANEL_ACTION_BUTTON_SIZE,
+                                toolbar_action_button("◀", ACCENT),
+                            )
+                            .on_hover_selectable_text("Expand decoded data")
+                            .clicked()
+                        {
+                            state.decoded_data_panel_open = true;
+                        }
+                    });
                 },
             );
         });
@@ -454,18 +446,14 @@ impl WaveCraftApp {
             ..
         } = *frame;
         let subtitle = scope_channels_subtitle(&self.scope_channel_names);
-        state.snapshot_plot_rect = Some(waveform_card_fill(
-            ui,
-            "OSCILLOSCOPE",
-            &subtitle,
-            |ui, rect| {
+        state.snapshot_plot_rect =
+            Some(waveform_card(ui, "OSCILLOSCOPE", &subtitle, |ui, rect| {
                 paint_scope(
                     ui,
                     rect,
                     waveforms,
                     &mut edits.scope_viewport,
                     &mut edits.scope_fft_viewport,
-                    true,
                     ScopeWaveformOptions {
                         settings: scope_settings,
                         auto_sample_rate: self.scope_auto_sample_rate,
@@ -486,8 +474,7 @@ impl WaveCraftApp {
                         time_axis: None,
                     },
                 )
-            },
-        ));
+            }));
     }
 
     fn paint_lissajous_view(
@@ -512,25 +499,20 @@ impl WaveCraftApp {
         {
             channel.vertical_offset = vertical_offset;
         }
-        state.snapshot_plot_rect = Some(waveform_card_fill(
-            ui,
-            "LISSAJOUS",
-            &subtitle,
-            |ui, rect| {
-                paint_scope_lissajous(
-                    ui,
-                    rect,
-                    waveforms,
-                    ScopeLissajousPaintOptions {
-                        viewport: edits.scope_viewport,
-                        settings: lissajous_scope_settings,
-                        lissajous,
-                        channel_colors: self.scope_channel_colors,
-                        channel_names: &self.scope_channel_names,
-                    },
-                )
-            },
-        ));
+        state.snapshot_plot_rect = Some(waveform_card(ui, "LISSAJOUS", &subtitle, |ui, rect| {
+            paint_scope_lissajous(
+                ui,
+                rect,
+                waveforms,
+                ScopeLissajousPaintOptions {
+                    viewport: edits.scope_viewport,
+                    settings: lissajous_scope_settings,
+                    lissajous,
+                    channel_colors: self.scope_channel_colors,
+                    channel_names: &self.scope_channel_names,
+                },
+            )
+        }));
     }
 
     fn paint_radio_view(
@@ -554,27 +536,21 @@ impl WaveCraftApp {
                 )
             },
         );
-        state.snapshot_plot_rect = Some(waveform_card_fill(
-            ui,
-            "RF SPECTRUM",
-            &subtitle,
-            |ui, rect| {
-                self.radio_view.borrow_mut().paint(
-                    ui,
-                    rect,
-                    &waveforms.radio,
-                    &waveforms.radio_analysis,
-                    RadioViewOptions {
-                        analysis_enabled: self.radio_settings.analyzer.is_enabled(),
-                        packet_mode: self.radio_settings.analyzer.data_mode
-                            == RadioDataMode::Packets,
-                        sample_rate_hz: self.radio_settings.capture.sample_rate_hz,
-                        trigger_level_dbfs_tenths: &mut state.radio_trigger_level_dbfs_tenths,
-                        trigger_controls_enabled: rf_trigger_level_controls_enabled,
-                    },
-                );
-            },
-        ));
+        state.snapshot_plot_rect = Some(waveform_card(ui, "RF SPECTRUM", &subtitle, |ui, rect| {
+            self.radio_view.borrow_mut().paint(
+                ui,
+                rect,
+                &waveforms.radio,
+                &waveforms.radio_analysis,
+                RadioViewOptions {
+                    analysis_enabled: self.radio_settings.analyzer.is_enabled(),
+                    packet_mode: self.radio_settings.analyzer.data_mode == RadioDataMode::Packets,
+                    sample_rate_hz: self.radio_settings.capture.sample_rate_hz,
+                    trigger_level_dbfs_tenths: &mut state.radio_trigger_level_dbfs_tenths,
+                    trigger_controls_enabled: rf_trigger_level_controls_enabled,
+                },
+            );
+        }));
     }
 
     fn paint_combined_view(
@@ -718,42 +694,37 @@ fn paint_connect_instrument_message(ui: &mut egui::Ui) {
 /// selected in it. Collapsing it clears `decoded_data_panel_open`.
 fn paint_decoded_data_side_panel(
     ui: &mut egui::Ui,
-    available_size: Vec2,
     state: &mut PanelState,
     decoded_outcomes: &[ProtocolDecodeOutcome],
     sample_rate_hz: u64,
 ) -> Option<(u64, u64)> {
     let mut selected_range = None;
-    egui::Frame::none()
-        .fill(PANEL)
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::same(12.0))
-        .show(ui, |ui| {
-            ui.set_min_height((available_size.y - 24.0).max(0.0));
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("DECODED DATA").strong().color(TEXT_MUTED));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_sized(
-                            DECODED_PANEL_ACTION_BUTTON_SIZE,
-                            toolbar_action_button("▶", ACCENT),
-                        )
-                        .on_hover_selectable_text("Collapse decoded data")
-                        .clicked()
-                    {
-                        state.decoded_data_panel_open = false;
-                    }
-                });
+    card_frame(12.0).show(ui, |ui| {
+        fill_card_height(ui);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("DECODED DATA").strong().color(TEXT_MUTED));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_sized(
+                        DECODED_PANEL_ACTION_BUTTON_SIZE,
+                        toolbar_action_button("▶", ACCENT),
+                    )
+                    .on_hover_selectable_text("Collapse decoded data")
+                    .clicked()
+                {
+                    state.decoded_data_panel_open = false;
+                }
             });
-            ui.add_space(8.0);
-            ui.set_width(ui.available_width());
-            selected_range = paint_decoded_data_panel(
-                ui,
-                &state.protocol_analyzer.analyzers,
-                decoded_outcomes,
-                sample_rate_hz,
-            );
         });
+        ui.add_space(8.0);
+        ui.set_width(ui.available_width());
+        selected_range = paint_decoded_data_panel(
+            ui,
+            &state.protocol_analyzer.analyzers,
+            decoded_outcomes,
+            sample_rate_hz,
+        );
+    });
     selected_range
 }
 

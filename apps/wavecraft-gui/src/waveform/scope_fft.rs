@@ -2,7 +2,7 @@
 //! rendering.
 
 use crate::{
-    egui, fit_rect_to_grid, format_frequency, paint_empty, paint_plot_background, paint_plot_grid,
+    egui, format_frequency, paint_empty, paint_plot_background, paint_plot_grid,
     scope_channel_label, FontId, Pos2, Range, Rect, ScopeFftSettings, ScopeFftWindow,
     SelectableHoverText, Sense, Stroke, Vec2, VecDeque, WaveformStore, WaveformViewport, ACCENT,
     SCOPE_COLORS, TEXT_MUTED,
@@ -186,7 +186,6 @@ pub(crate) struct ScopeFftPaintOptions<'a> {
     pub(crate) fft_viewport: &'a mut ScopeFftViewport,
     pub(crate) settings: ScopeFftSettings,
     pub(crate) channel_names: &'a [String; 2],
-    pub(crate) square_grid_cells: bool,
 }
 
 pub(crate) fn paint_scope_fft(
@@ -200,15 +199,9 @@ pub(crate) fn paint_scope_fft(
         fft_viewport,
         settings,
         channel_names,
-        square_grid_cells,
     } = options;
     const MIN_DBV: f32 = -120.0;
     const MAX_DBV: f32 = 20.0;
-    let rect = if square_grid_cells {
-        fit_rect_to_grid(rect, 10, 4)
-    } else {
-        rect
-    };
     paint_plot_background(ui, rect);
     let painter = ui.painter().with_clip_rect(rect);
     paint_plot_grid(ui, rect);

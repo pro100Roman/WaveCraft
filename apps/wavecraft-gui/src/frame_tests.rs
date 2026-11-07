@@ -340,3 +340,135 @@ fn reconfiguration_waits_while_the_user_refreshes() {
     );
     assert!(app.scope_configuration_due.is_some());
 }
+
+/// Every rectangle `run_frame` paints in the last of a few frames.
+fn painted_rects(context: &egui::Context, app: &mut WaveCraftApp) -> Vec<egui::epaint::RectShape> {
+    fn collect(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect(shape, out)),
+            egui::Shape::Rect(rect) => out.push(*rect),
+            _ => {}
+        }
+    }
+    let mut output = None;
+    for _ in 0..3 {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        output = Some(context.run(input, |context| app.run_frame(context)));
+    }
+    let mut rects = Vec::new();
+    for clipped in &output.expect("a frame ran").shapes {
+        collect(&clipped.shape, &mut rects);
+    }
+    rects
+}
+
+/// The rectangles painted with the card fill that are tall enough to be a
+/// waveform card or a side panel beside it, ordered left to right.
+fn card_like_rects(
+    context: &egui::Context,
+    app: &mut WaveCraftApp,
+) -> Vec<egui::epaint::RectShape> {
+    let mut rects = painted_rects(context, app);
+    // The window-level panels are square; the cards and their side panels are not.
+    rects.retain(|rect| rect.fill == PANEL && rect.rounding.nw > 0.0 && rect.rect.height() > 200.0);
+    rects.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
+    rects
+}
+
+#[test]
+fn the_side_panels_have_the_outline_and_height_of_the_waveform_card() {
+    let scenarios = [
+        ("scope tools open", WaveformTab::Oscilloscope, true, false),
+        (
+            "scope tools collapsed",
+            WaveformTab::Oscilloscope,
+            false,
+            false,
+        ),
+        ("decoded data open", WaveformTab::LogicAnalyzer, true, true),
+        (
+            "decoded data collapsed",
+            WaveformTab::LogicAnalyzer,
+            true,
+            false,
+        ),
+    ];
+    for (name, tab, scope_tools_open, decoded_data_open) in scenarios {
+        let mut app = app_with_every_instrument();
+        let context = context();
+        app.select_waveform_tab(tab);
+        app.scope_tools_panel_open = scope_tools_open;
+        app.decoded_data_panel_open = decoded_data_open;
+        let rects = card_like_rects(&context, &mut app);
+        assert_eq!(
+            rects.len(),
+            2,
+            "{name}: a card and one side panel, got {rects:?}"
+        );
+        // The logic card sits left of its panel; the scope card sits left too.
+        let (card, panel) = (&rects[0], &rects[1]);
+        assert_eq!(card.rect.top(), panel.rect.top(), "{name}: same top edge");
+        assert_eq!(
+            card.rect.bottom(),
+            panel.rect.bottom(),
+            "{name}: same bottom edge"
+        );
+        assert_eq!(
+            card.rounding, panel.rounding,
+            "{name}: same corner rounding"
+        );
+        assert_eq!(card.stroke, panel.stroke, "{name}: same outline");
+        assert!(card.stroke.width > 0.0, "{name}: the outline is drawn");
+        assert!(
+            card.rect.right() < panel.rect.left(),
+            "{name}: side by side"
+        );
+    }
+}
+
+#[test]
+fn the_scope_plot_fills_the_whole_oscilloscope_card() {
+    for scope_tools_open in [true, false] {
+        let mut app = app_with_every_instrument();
+        let context = context();
+        app.select_waveform_tab(WaveformTab::Oscilloscope);
+        app.scope_tools_panel_open = scope_tools_open;
+        let rects = painted_rects(&context, &mut app);
+        let mut cards = rects
+            .iter()
+            .filter(|rect| {
+                rect.fill == PANEL && rect.rounding.nw > 0.0 && rect.rect.height() > 200.0
+            })
+            .collect::<Vec<_>>();
+        cards.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
+        let card = cards
+            .first()
+            .expect("the oscilloscope card is painted")
+            .rect;
+        let plot = rects
+            .iter()
+            .filter(|rect| rect.fill == BACKGROUND && rect.rounding.nw == 4.0)
+            .map(|rect| rect.rect)
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("the plot background is painted");
+        // The card's outline is drawn on the edge of its fill, so the plot
+        // should be inset by the card's inner margin alone, with no gap left.
+        let expected = card.shrink(12.0);
+        for (name, actual, wanted) in [
+            ("left", plot.left(), expected.left()),
+            ("right", plot.right(), expected.right()),
+            ("bottom", plot.bottom(), expected.bottom()),
+        ] {
+            assert!(
+                (actual - wanted).abs() < 0.5,
+                "tools open={scope_tools_open}: plot {name} {actual} should reach the card's {wanted}"
+            );
+        }
+    }
+}

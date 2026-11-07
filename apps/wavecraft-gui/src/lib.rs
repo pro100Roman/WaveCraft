@@ -678,7 +678,6 @@ fn append_error(error: &mut Option<String>, additional: String) {
     }
 }
 
-const WAVEFORM_CARD_CHROME_HEIGHT: f32 = 58.0;
 const COMBINED_DIVIDER_HEIGHT: f32 = 10.0;
 const MIN_LOGIC_PANE_HEIGHT: f32 = 260.0;
 const MIN_SCOPE_PANE_HEIGHT: f32 = 165.0;

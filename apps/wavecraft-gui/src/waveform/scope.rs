@@ -2,23 +2,22 @@
 //! level handles, timing measurements, markers, and the math trace.
 
 use crate::{
-    align_waveform_chrome, apply_time_per_division, egui, fit_rect_to_grid, format_duration,
-    format_frequency, format_trigger_voltage, marker_text_color, paint_dashed_line, paint_empty,
-    paint_marker_handle, paint_marker_readout, paint_plot_background, paint_scope_fft,
-    paint_waveform_status, paint_waveform_time_scale, resolve_scope_timebase, scope_channel_label,
-    split_waveform_chrome, update_waveform_viewport, waveform_sample_x, Color32,
-    DsCopeTriggerSlope, DsCopeTriggerSource, Duration, FontId, HashSet, Pos2, Range, Rect,
-    ScopeCaptureSettings, ScopeChannelSettings, ScopeFftPaintOptions, ScopeFftViewport,
-    ScopeFunctionSettings, ScopeMarkerSettings, ScopeMathOperation, ScopeMathSettings,
-    ScopeMeasurementCache, ScopeQuickTimeMeasurement, ScopeTriggerSettings, ScopeWaveformOptions,
-    SelectableHoverText, Sense, Stroke, Vec2, VecDeque, WaveformPlotClick, WaveformStore,
-    WaveformViewport, WaveformViewportOptions, WaveformZoomAnchor, BACKGROUND,
-    DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
-    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
-    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN, GRID,
-    MATH_COLOR, PANEL, SCOPE_ADC_VERTICAL_DIVISIONS, SCOPE_DOWNSAMPLE_MIN_SAMPLES_PER_PIXEL,
-    SCOPE_HORIZONTAL_DIVISIONS, SCOPE_MARKER_LIMIT, SCOPE_MEASUREMENT_KINDS,
-    SCOPE_VERTICAL_DIVISIONS, TEXT_MUTED,
+    align_waveform_chrome, apply_time_per_division, egui, format_duration, format_frequency,
+    format_trigger_voltage, marker_text_color, paint_dashed_line, paint_empty, paint_marker_handle,
+    paint_marker_readout, paint_plot_background, paint_scope_fft, paint_waveform_status,
+    paint_waveform_time_scale, resolve_scope_timebase, scope_channel_label, split_waveform_chrome,
+    update_waveform_viewport, waveform_sample_x, Color32, DsCopeTriggerSlope, DsCopeTriggerSource,
+    Duration, FontId, HashSet, Pos2, Range, Rect, ScopeCaptureSettings, ScopeChannelSettings,
+    ScopeFftPaintOptions, ScopeFftViewport, ScopeFunctionSettings, ScopeMarkerSettings,
+    ScopeMathOperation, ScopeMathSettings, ScopeMeasurementCache, ScopeQuickTimeMeasurement,
+    ScopeTriggerSettings, ScopeWaveformOptions, SelectableHoverText, Sense, Stroke, Vec2, VecDeque,
+    WaveformPlotClick, WaveformStore, WaveformViewport, WaveformViewportOptions,
+    WaveformZoomAnchor, BACKGROUND, DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX,
+    DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
+    DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
+    DSCOPE_VERTICAL_OFFSET_MIN, GRID, MATH_COLOR, PANEL, SCOPE_ADC_VERTICAL_DIVISIONS,
+    SCOPE_DOWNSAMPLE_MIN_SAMPLES_PER_PIXEL, SCOPE_HORIZONTAL_DIVISIONS, SCOPE_MARKER_LIMIT,
+    SCOPE_MEASUREMENT_KINDS, SCOPE_VERTICAL_DIVISIONS, TEXT_MUTED,
 };
 
 pub(crate) fn paint_scope_graticule(painter: &egui::Painter, rect: Rect) {
@@ -1608,20 +1607,12 @@ pub(crate) fn paint_scope(
     waveforms: &WaveformStore,
     viewport: &mut WaveformViewport,
     fft_viewport: &mut ScopeFftViewport,
-    square_grid_cells: bool,
     scope_options: ScopeWaveformOptions<'_>,
 ) {
     let fft_settings = scope_options.function_settings.fft;
     let channel_names = scope_options.channel_names;
     if !fft_settings.enabled {
-        paint_scope_time_domain(
-            ui,
-            rect,
-            waveforms,
-            viewport,
-            square_grid_cells,
-            scope_options,
-        );
+        paint_scope_time_domain(ui, rect, waveforms, viewport, scope_options);
         return;
     }
 
@@ -1634,14 +1625,7 @@ pub(crate) fn paint_scope(
         Pos2::new(rect.left(), time_rect.bottom() + FFT_GAP),
         Vec2::new(rect.width(), fft_height),
     );
-    paint_scope_time_domain(
-        ui,
-        time_rect,
-        waveforms,
-        viewport,
-        square_grid_cells,
-        scope_options,
-    );
+    paint_scope_time_domain(ui, time_rect, waveforms, viewport, scope_options);
     paint_scope_fft(
         ui,
         fft_rect,
@@ -1651,17 +1635,8 @@ pub(crate) fn paint_scope(
             fft_viewport,
             settings: fft_settings,
             channel_names,
-            square_grid_cells,
         },
     );
-}
-
-pub(crate) fn scope_plot_rect(area: Rect, square_grid_cells: bool) -> Rect {
-    if square_grid_cells {
-        fit_rect_to_grid(area, SCOPE_HORIZONTAL_DIVISIONS, SCOPE_VERTICAL_DIVISIONS)
-    } else {
-        area
-    }
 }
 
 /// How many samples the scope view spans and how fast they were taken.
@@ -1745,7 +1720,6 @@ pub(crate) fn paint_scope_time_domain(
     rect: Rect,
     waveforms: &WaveformStore,
     viewport: &mut WaveformViewport,
-    square_grid_cells: bool,
     scope_options: ScopeWaveformOptions<'_>,
 ) {
     let mut options = scope_options;
@@ -1773,8 +1747,7 @@ pub(crate) fn paint_scope_time_domain(
     }
     paint_plot_background(ui, rect);
     let painter = ui.painter();
-    let (status_area, ruler_area, plot_area) = split_waveform_chrome(rect);
-    let plot = scope_plot_rect(plot_area, square_grid_cells);
+    let (status_area, ruler_area, plot) = split_waveform_chrome(rect);
     let (status_bar, time_ruler) = align_waveform_chrome(status_area, ruler_area, plot);
     let scope_painter = painter.with_clip_rect(plot);
     paint_scope_graticule(&scope_painter, plot);

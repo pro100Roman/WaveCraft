@@ -638,24 +638,6 @@ fn lissajous_coordinates_use_each_channels_voltage_scale() {
 }
 
 #[test]
-fn waveform_grids_fit_square_division_cells() {
-    let wide_area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_600.0, 800.0));
-    let scope_grid = fit_rect_to_grid(wide_area, 10, 8);
-    assert!((scope_grid.width() - 1_000.0).abs() < 0.001);
-    assert!((scope_grid.height() - 800.0).abs() < 0.001);
-    assert!((scope_grid.center().x - wide_area.center().x).abs() < 0.001);
-    assert!((scope_grid.width() / 10.0 - scope_grid.height() / 8.0).abs() < 0.001);
-    assert_eq!(scope_plot_rect(wide_area, false), wide_area);
-    assert_eq!(scope_plot_rect(wide_area, true), scope_grid);
-
-    let square_area = Rect::from_min_size(Pos2::ZERO, Vec2::splat(800.0));
-    let fft_grid = fit_rect_to_grid(square_area, 10, 4);
-    assert!((fft_grid.width() - 800.0).abs() < 0.001);
-    assert!((fft_grid.height() - 320.0).abs() < 0.001);
-    assert!((fft_grid.width() / 10.0 - fft_grid.height() / 4.0).abs() < 0.001);
-}
-
-#[test]
 fn waveform_tabs_target_their_matching_instruments() {
     assert_eq!(
         WaveformTab::LogicAnalyzer.capture_target(),

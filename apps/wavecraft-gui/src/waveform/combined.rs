@@ -8,7 +8,7 @@ use crate::{
     ScopeFunctionSettings, ScopeMarkerSettings, ScopeMeasurementCache, ScopeQuickTimeMeasurement,
     ScopeTriggerSettings, Sense, Stroke, Vec2, WaveformStore, WaveformViewport, ACCENT,
     COMBINED_DIVIDER_HEIGHT, GRID, LOGIC_CHANNEL_COUNT, MIN_LOGIC_PANE_HEIGHT,
-    MIN_SCOPE_PANE_HEIGHT, SCOPE_HORIZONTAL_DIVISIONS, WAVEFORM_CARD_CHROME_HEIGHT,
+    MIN_SCOPE_PANE_HEIGHT, SCOPE_HORIZONTAL_DIVISIONS,
 };
 
 pub(crate) struct ScopeWaveformOptions<'a> {
@@ -29,16 +29,6 @@ pub(crate) struct ScopeWaveformOptions<'a> {
     pub(crate) offset_controls_enabled: bool,
     pub(crate) trigger_controls_enabled: bool,
     pub(crate) time_axis: Option<WaveformTimeAxis>,
-}
-
-pub(crate) fn waveform_card_fill(
-    ui: &mut egui::Ui,
-    title: &str,
-    subtitle: &str,
-    paint: impl FnOnce(&mut egui::Ui, Rect),
-) -> Rect {
-    let plot_height = (ui.available_height() - WAVEFORM_CARD_CHROME_HEIGHT).max(64.0);
-    waveform_card(ui, title, subtitle, plot_height, paint)
 }
 
 pub(crate) fn combined_pane_heights(total_height: f32, logic_ratio: f32) -> (f32, f32) {
@@ -156,7 +146,7 @@ pub(crate) fn combined_waveform_cards(
             .max_rect(logic_rect)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
-    let logic_plot_rect = waveform_card_fill(
+    let logic_plot_rect = waveform_card(
         &mut logic_ui,
         "DIGITAL",
         "DSLogic · channels 0–15",
@@ -179,7 +169,7 @@ pub(crate) fn combined_waveform_cards(
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
     let scope_subtitle = scope_channels_subtitle(scope_options.channel_names);
-    let scope_plot_rect = waveform_card_fill(
+    let scope_plot_rect = waveform_card(
         &mut scope_ui,
         "OSCILLOSCOPE",
         &scope_subtitle,
@@ -190,7 +180,6 @@ pub(crate) fn combined_waveform_cards(
                 waveforms,
                 scope_viewport,
                 scope_fft_viewport,
-                false,
                 scope_options,
             )
         },
