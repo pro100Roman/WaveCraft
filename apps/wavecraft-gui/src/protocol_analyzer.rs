@@ -118,7 +118,9 @@ pub struct ProtocolAnalyzerInstance {
     pub protocol_id: &'static str,
     pub channel_mappings: Vec<Option<usize>>,
     pub data_format: ProtocolDataFormat,
-    pub custom_protocol: Option<CustomProtocolAnalyzer>,
+    /// Shared so cloning or comparing an analyzer list, which the GUI does on
+    /// every frame, does not copy the YAML source and parsed schema.
+    pub custom_protocol: Option<Arc<CustomProtocolAnalyzer>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,11 +201,11 @@ impl ProtocolAnalyzerSettings {
                 transport_name(selected_transport)
             ));
         }
-        analyzer.custom_protocol = Some(CustomProtocolAnalyzer {
+        analyzer.custom_protocol = Some(Arc::new(CustomProtocolAnalyzer {
             source_path,
             source,
             schema,
-        });
+        }));
         self.editor = Some(ProtocolAnalyzerEditor {
             analyzer,
             target_index: Some(analyzer_index),
@@ -3143,11 +3145,11 @@ messages:
         )
         .unwrap();
         let mut spi = analyzer("1:spi", vec![Some(0), Some(1), Some(2), Some(3)]);
-        spi.custom_protocol = Some(CustomProtocolAnalyzer {
+        spi.custom_protocol = Some(Arc::new(CustomProtocolAnalyzer {
             source_path: PathBuf::from("spi-byte.yaml"),
             source: String::new(),
             schema,
-        });
+        }));
         let mut samples = vec![
             logic_word(false, false, true),
             logic_word(false, false, false),
@@ -3187,11 +3189,11 @@ messages:
             include_str!("../../../docs/examples/motor-controller.wavecraft-protocol.yaml");
         let schema = load_protocol_schema(source).unwrap();
         let mut uart = analyzer("1:uart", vec![Some(0)]);
-        uart.custom_protocol = Some(CustomProtocolAnalyzer {
+        uart.custom_protocol = Some(Arc::new(CustomProtocolAnalyzer {
             source_path: PathBuf::from("motor-controller.wavecraft-protocol.yaml"),
             source: source.to_owned(),
             schema,
-        });
+        }));
         let mut frame = vec![0xaa, 0x55, 0x05, 0x10, 0x02, 0xd0, 0x07, 0x03];
         frame.push(crc8_smbus(&frame[2..]));
         let samples = uart_8n1(&frame, 10);
@@ -3304,6 +3306,26 @@ messages:
         assert!(settings.clear_custom_protocol(0));
         assert_eq!(analyzer_name(&settings.analyzers[0]), "1:UART");
         assert!(!settings.clear_custom_protocol(0));
+    }
+
+    #[test]
+    fn cloned_analyzers_share_the_custom_protocol_schema() {
+        let source =
+            include_str!("../../../docs/examples/motor-controller.wavecraft-protocol.yaml");
+        let mut uart = analyzer("1:uart", vec![Some(0)]);
+        uart.custom_protocol = Some(Arc::new(CustomProtocolAnalyzer {
+            source_path: PathBuf::from("motor-controller.wavecraft-protocol.yaml"),
+            source: source.to_owned(),
+            schema: load_protocol_schema(source).unwrap(),
+        }));
+
+        let copy = uart.clone();
+
+        assert_eq!(copy, uart);
+        assert!(Arc::ptr_eq(
+            copy.custom_protocol.as_ref().unwrap(),
+            uart.custom_protocol.as_ref().unwrap()
+        ));
     }
 
     #[test]
