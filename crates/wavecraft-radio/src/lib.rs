@@ -1,5 +1,6 @@
 //! Device-independent radio demodulation and raw-frame acquisition.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use wavecraft_core::IqBatch;
 use wavecraft_decode::{
@@ -15,6 +16,11 @@ const SQUELCH_RELEASE_FRAMES: usize = 3;
 const AUTOMATIC_SQUELCH_MARGIN_DB: f32 = 8.0;
 const NOISE_FLOOR_RISE_GAIN: f32 = 0.005;
 const NOISE_FLOOR_FALL_GAIN: f32 = 0.2;
+/// Spectrum windows of IQ kept from before a channel opens. A burst is only
+/// noticed in the window in which its energy crosses the squelch, so its
+/// beginning, and with it the first preamble bits, is in the window before.
+/// Two windows also let the channel filter fill before the burst arrives.
+const PRE_ROLL_WINDOWS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RadioAnalyzerTelemetry {
@@ -53,6 +59,8 @@ pub struct RadioDspOutput {
 pub struct RadioAnalyzerBank {
     analyzers: Vec<RadioAnalyzerRuntime>,
     preprocessor: WidebandIqPreprocessor,
+    /// The last few prepared windows, oldest first, for channels that open.
+    pre_roll: VecDeque<PreparedIqBatch>,
 }
 
 impl RadioAnalyzerBank {
@@ -60,6 +68,7 @@ impl RadioAnalyzerBank {
         Self {
             analyzers,
             preprocessor: WidebandIqPreprocessor::new(),
+            pre_roll: VecDeque::with_capacity(PRE_ROLL_WINDOWS),
         }
     }
 
@@ -155,6 +164,8 @@ pub struct RadioAnalyzerRuntime {
     channel_name: Arc<str>,
     channel_bandwidth_hz: u64,
     burst_active: bool,
+    /// Set when the squelch opens, until the first IQ of the burst arrives.
+    burst_just_opened: bool,
     quiet_spectrum_frames: usize,
     last_channel_power_dbfs: Option<f32>,
     noise_floor_dbfs: Option<f32>,
@@ -189,6 +200,7 @@ impl RadioAnalyzerRuntime {
             channel_name: channel_name.into(),
             channel_bandwidth_hz,
             burst_active: false,
+            burst_just_opened: false,
             quiet_spectrum_frames: 0,
             last_channel_power_dbfs: None,
             noise_floor_dbfs: None,
@@ -205,14 +217,28 @@ impl RadioAnalyzerRuntime {
         if let Some(output) = self.begin_push(spectrum, squelch_threshold_dbfs) {
             return Ok(output);
         }
+        // A lone analyzer has no earlier windows to start from.
+        self.burst_just_opened = false;
         let demodulated = self.signal.push(input).map_err(|error| error.to_string())?;
         self.finish_push(demodulated)
     }
 
-    fn push_prepared(&mut self, input: &PreparedIqBatch) -> Result<RadioAnalyzerOutput, String> {
+    /// Runs a burst's first window together with the `pre_roll` windows that
+    /// came before it, so the burst is demodulated from its true beginning.
+    fn push_prepared(
+        &mut self,
+        pre_roll: &VecDeque<PreparedIqBatch>,
+        input: &PreparedIqBatch,
+    ) -> Result<RadioAnalyzerOutput, String> {
+        let joined = if std::mem::take(&mut self.burst_just_opened) && !pre_roll.is_empty() {
+            let windows = pre_roll.iter().chain(Some(input)).collect::<Vec<_>>();
+            PreparedIqBatch::join(&windows)
+        } else {
+            None
+        };
         let demodulated = self
             .signal
-            .push_prepared(input)
+            .push_prepared(joined.as_ref().unwrap_or(input))
             .map_err(|error| error.to_string())?;
         self.finish_push(demodulated)
     }
@@ -256,6 +282,7 @@ impl RadioAnalyzerRuntime {
             if !self.burst_active {
                 self.signal.reset();
                 self.decoder.reset();
+                self.burst_just_opened = true;
             }
             self.burst_active = true;
             self.quiet_spectrum_frames = 0;
@@ -266,6 +293,7 @@ impl RadioAnalyzerRuntime {
             let (raw, packets) = self.decoder.finish();
             self.signal.reset();
             self.burst_active = false;
+            self.burst_just_opened = false;
             self.quiet_spectrum_frames = 0;
             return Some(RadioAnalyzerOutput {
                 channel_frequency_offset_hz: self.channel_frequency_offset_hz,
@@ -353,7 +381,10 @@ pub fn process_radio_iq(
             .iter_mut()
             .map(|analyzer| analyzer.begin_push(&frames, squelch_threshold_dbfs))
             .collect::<Vec<_>>();
-        let prepared = preliminary.iter().any(Option::is_none).then(|| {
+        // Every window is prepared, even while all channels are idle, so a
+        // channel that opens can start from the windows before the one that
+        // opened it.
+        let prepared = (!analyzer_bank.analyzers.is_empty()).then(|| {
             analyzer_bank
                 .preprocessor
                 .push(&chunk)
@@ -364,11 +395,10 @@ pub fn process_radio_iq(
             let analysis = match preliminary {
                 Some(output) => Ok(output),
                 None => match prepared.as_ref() {
-                    Some(Ok(prepared)) => {
-                        analyzer_bank.analyzers[analyzer_index].push_prepared(prepared)
-                    }
+                    Some(Ok(prepared)) => analyzer_bank.analyzers[analyzer_index]
+                        .push_prepared(&analyzer_bank.pre_roll, prepared),
                     Some(Err(error)) => Err(error.clone()),
-                    // Preprocessing runs whenever any analyzer needs it, so this
+                    // Preparation runs whenever there is an analyzer, so this
                     // is only reachable if that condition changes.
                     None => Err("demodulation preprocessing did not run".to_owned()),
                 },
@@ -381,8 +411,17 @@ pub fn process_radio_iq(
                 analyzer_index += 1;
             }
         }
-        if let Some(Ok(prepared)) = prepared {
-            analyzer_bank.preprocessor.recycle(prepared);
+        match prepared {
+            Some(Ok(prepared)) => {
+                analyzer_bank.pre_roll.push_back(prepared);
+                while analyzer_bank.pre_roll.len() > PRE_ROLL_WINDOWS {
+                    if let Some(oldest) = analyzer_bank.pre_roll.pop_front() {
+                        analyzer_bank.preprocessor.recycle(oldest);
+                    }
+                }
+            }
+            Some(Err(_)) => analyzer_bank.pre_roll.clear(),
+            None => {}
         }
         output.spectrum.extend(frames);
     }
@@ -651,6 +690,63 @@ mod tests {
                 .map(|analysis| analysis.as_ref().unwrap().channel_frequency_offset_hz)
                 .collect::<Vec<_>>(),
             [1_000, -1_000, 1_000, -1_000]
+        );
+    }
+
+    #[test]
+    fn a_channel_that_opens_late_starts_from_the_window_before_the_burst() {
+        // The burst begins 16 samples before the end of the first window, too
+        // little energy to open the squelch there. The channel opens in the
+        // second window, but the burst's first symbols are in the first, and
+        // dropping them would leave a preamble short of its first bits.
+        let fft_length = 256;
+        let burst_start = fft_length - 16;
+        let mut phase = 0.0_f32;
+        let samples = (0..2 * fft_length)
+            .map(|index| {
+                if index < burst_start {
+                    return Iq8 { i: 0, q: 0 };
+                }
+                let symbol = (index - burst_start) / 8;
+                let frequency_hz = if symbol % 2 == 0 { 2_000.0 } else { 0.0 };
+                phase += TAU * frequency_hz / 8_000.0;
+                Iq8 {
+                    i: (phase.cos() * 100.0).round() as i8,
+                    q: (phase.sin() * 100.0).round() as i8,
+                }
+            })
+            .collect();
+        let input = IqBatch {
+            sample_rate_hz: 8_000,
+            center_frequency_hz: 100_000_000,
+            first_sample_index: 0,
+            discontinuity: true,
+            samples,
+        };
+        let mut spectrum = SpectrumProcessor::new(fft_length, SpectrumWindow::Hann).unwrap();
+        let mut analyzers = RadioAnalyzerBank::new(vec![RadioAnalyzerRuntime::new(
+            profile(),
+            RadioDataDecoderConfig::Raw(raw_config()),
+        )
+        .unwrap()]);
+
+        let output = process_radio_iq(&mut spectrum, &mut analyzers, &input, -40.0);
+
+        assert_eq!(output.analyses.len(), 2);
+        assert!(
+            output.analyses[0].as_ref().unwrap().demodulated.is_none(),
+            "the first window must be too quiet to open the channel"
+        );
+        let Some(DemodulatedBatch::SoftSymbols(symbols)) =
+            output.analyses[1].as_ref().unwrap().demodulated.as_ref()
+        else {
+            panic!("the second window must be demodulated");
+        };
+        let first = symbols.symbols.first().expect("symbols from the burst");
+        assert!(
+            first.source_range.start < fft_length as u64,
+            "first symbol starts at {}, inside the second window",
+            first.source_range.start
         );
     }
 

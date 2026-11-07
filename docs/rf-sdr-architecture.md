@@ -573,6 +573,18 @@ until its squelch opens, so a bank of channels pays only for those with an
 active burst. A shared first decimation stage would add cost and coupling for
 no gain in that model.
 
+The squelch decides per spectrum window (2,048 samples, about 20 symbols at
+19.2 kbit/s), so a burst is noticed in the window in which its energy crosses
+the threshold, and its first symbols can lie in the window before. The radio
+bank therefore prepares every window, keeps the last two, and starts a channel
+that has just opened on those windows joined to the current one
+(`PreparedIqBatch::join`, contiguous windows only). The channel filter is also
+full when the burst arrives. On a 154 s capture of a 19.2 kbit/s link with a
+10 byte preamble, requiring all ten preamble bytes found 133 bursts without the
+pre-roll and 166 with it, against 174 when requiring eight. More than two windows of
+lead-in noise is harmless only because of the noise gate described under
+*Symbol timing and soft symbols*.
+
 ### FSK and GFSK demodulation
 
 The first demodulator supports binary 2-FSK. After channel filtering it uses a

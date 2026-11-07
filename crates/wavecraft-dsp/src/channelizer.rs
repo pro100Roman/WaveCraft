@@ -131,6 +131,54 @@ pub struct PreparedIqBatch {
     samples: Vec<(f64, f64)>,
 }
 
+impl PreparedIqBatch {
+    /// Number of IQ samples in the batch.
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    /// Joins the trailing run of `batches` that follow each other without a
+    /// gap, retune or rate change into one batch, or `None` if there are none.
+    ///
+    /// A channelizer started on the joined batch sees the earlier samples as
+    /// the beginning of its stream, which is how a burst detected late keeps
+    /// its first symbols.
+    pub fn join(batches: &[&PreparedIqBatch]) -> Option<PreparedIqBatch> {
+        let last = batches.last()?;
+        let mut first = batches.len() - 1;
+        while first > 0 {
+            let (previous, next) = (batches[first - 1], batches[first]);
+            let contiguous = !next.discontinuity
+                && previous.sample_rate_hz == next.sample_rate_hz
+                && previous.center_frequency_hz == next.center_frequency_hz
+                && previous
+                    .first_sample_index
+                    .saturating_add(previous.samples.len() as u64)
+                    == next.first_sample_index;
+            if !contiguous {
+                break;
+            }
+            first -= 1;
+        }
+        let run = &batches[first..];
+        let mut samples = Vec::with_capacity(run.iter().map(|batch| batch.samples.len()).sum());
+        for batch in run {
+            samples.extend_from_slice(&batch.samples);
+        }
+        Some(PreparedIqBatch {
+            sample_rate_hz: last.sample_rate_hz,
+            center_frequency_hz: last.center_frequency_hz,
+            first_sample_index: run[0].first_sample_index,
+            discontinuity: run[0].discontinuity,
+            samples,
+        })
+    }
+}
+
 /// Stateful preprocessing shared by a bank of channelizers.
 #[derive(Default)]
 pub struct WidebandIqPreprocessor {
@@ -646,6 +694,31 @@ mod tests {
     use super::*;
     use std::f64::consts::TAU;
     use wavecraft_core::Iq8;
+
+    #[test]
+    fn joins_the_trailing_contiguous_prepared_batches_into_one() {
+        let mut preprocessor = WidebandIqPreprocessor::new();
+        let first = preprocessor.push(&tone_batch(0, 4, true)).unwrap();
+        let second = preprocessor.push(&tone_batch(4, 4, false)).unwrap();
+        let after_gap = preprocessor.push(&tone_batch(100, 4, false)).unwrap();
+        let last = preprocessor.push(&tone_batch(104, 4, false)).unwrap();
+        assert!(!second.discontinuity);
+        assert!(after_gap.discontinuity);
+
+        let joined = PreparedIqBatch::join(&[&first, &second]).unwrap();
+        assert_eq!(joined.len(), 8);
+        assert_eq!(joined.first_sample_index, 0);
+        assert!(joined.discontinuity);
+
+        // Batches before a gap do not belong to the same stream.
+        let joined = PreparedIqBatch::join(&[&first, &second, &after_gap, &last]).unwrap();
+        assert_eq!(joined.len(), 8);
+        assert_eq!(joined.first_sample_index, 100);
+        assert!(joined.discontinuity);
+
+        assert_eq!(PreparedIqBatch::join(&[&last]).unwrap().len(), 4);
+        assert!(PreparedIqBatch::join(&[]).is_none());
+    }
 
     fn tone_batch(first_sample_index: u64, count: usize, discontinuity: bool) -> IqBatch {
         tone_batch_at(first_sample_index, count, discontinuity, 1_000.0)
