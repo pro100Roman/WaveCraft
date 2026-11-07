@@ -1,7 +1,6 @@
+use crate::driver_util::{capture_error, combine_results, push_u16, push_u32, read_u16, read_u32};
 use crate::transport::{QueuedBulkRead, QueuedBulkReadOutcome};
-use crate::{
-    DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbError, UsbSpeedClass, DSCOPE_U3P100,
-};
+use crate::{DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbSpeedClass, DSCOPE_U3P100};
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -2864,49 +2863,6 @@ fn raw_to_volts(raw: u8, hardware_offset: u8, channel: DsCopeChannelConfig) -> f
     let input_span = f32::from(channel.volts_per_div_mv) / 1_000.0 * 10.0;
     (f32::from(hardware_offset) - f32::from(raw)) * input_span / ADC_REFERENCE_SPAN
         * f32::from(channel.probe_attenuation)
-}
-
-fn combine_results(
-    primary: Result<(), CaptureError>,
-    cleanup: Result<(), CaptureError>,
-    cleanup_action: &str,
-) -> Result<(), CaptureError> {
-    match (primary, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(primary), Err(cleanup)) => Err(CaptureError::new(format!(
-            "{primary}; additionally failed to {cleanup_action}: {cleanup}"
-        ))),
-    }
-}
-
-fn capture_error(error: UsbError) -> CaptureError {
-    CaptureError::new(error.to_string())
-}
-
-fn push_u16(bytes: &mut Vec<u8>, value: u16) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(
-        bytes[offset..offset + 2]
-            .try_into()
-            .expect("fixed field size"),
-    )
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("fixed field size"),
-    )
 }
 
 #[cfg(test)]

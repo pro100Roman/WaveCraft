@@ -1,7 +1,9 @@
+#[cfg(test)]
+use crate::driver_util::read_u16;
+use crate::driver_util::{capture_error, combine_results, push_u16, push_u32, read_u32};
 use crate::transport::{QueuedBulkRead, QueuedBulkReadOutcome};
 use crate::{
-    BulkReadOutcome, DeviceModel, DeviceProfile, DiscoveredDevice, UsbDeviceSession, UsbError,
-    UsbSpeedClass,
+    BulkReadOutcome, DeviceModel, DeviceProfile, DiscoveredDevice, UsbDeviceSession, UsbSpeedClass,
 };
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -1776,50 +1778,6 @@ impl TriggerPosition {
         }
         Ok((requested_samples - self.remaining_samples) & !(SAMPLE_ALIGNMENT - 1))
     }
-}
-
-fn combine_results(
-    primary: Result<(), CaptureError>,
-    cleanup: Result<(), CaptureError>,
-    cleanup_action: &str,
-) -> Result<(), CaptureError> {
-    match (primary, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(primary), Err(cleanup)) => Err(CaptureError::new(format!(
-            "{primary}; additionally failed to {cleanup_action}: {cleanup}"
-        ))),
-    }
-}
-
-fn capture_error(error: UsbError) -> CaptureError {
-    CaptureError::new(error.to_string())
-}
-
-fn push_u16(bytes: &mut Vec<u8>, value: u16) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-#[cfg(test)]
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(
-        bytes[offset..offset + 2]
-            .try_into()
-            .expect("fixed field size"),
-    )
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("fixed field size"),
-    )
 }
 
 #[cfg(test)]
