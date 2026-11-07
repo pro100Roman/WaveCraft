@@ -9,6 +9,8 @@ use crate::{
     SelectableHoverText, ValueDomain, WhiteningDirection, BACKGROUND, MAX_RADIO_ANALYZER_CHANNELS,
     RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS, RAW_AUTOMATIC_PREAMBLE_BITS, TEXT_MUTED,
 };
+use std::collections::BTreeMap;
+use wavecraft_sdr::GainControlDescriptor;
 
 pub(crate) fn selected_radio_text(radios: &[DiscoveredRadio], selected_id: Option<&str>) -> String {
     match selected_id {
@@ -1158,6 +1160,9 @@ pub(crate) fn paint_radio_analyzer_channels(
     );
 }
 
+/// The receive parameters of one radio as a two-column grid: tuning, capture
+/// length, trigger, bandwidth, gains and the HackRF front-end switches. Rows
+/// that a driver cannot honour are left out.
 pub(crate) fn paint_radio_receive_configuration(
     ui: &mut egui::Ui,
     radio: &DiscoveredRadio,
@@ -1168,279 +1173,37 @@ pub(crate) fn paint_radio_receive_configuration(
 ) {
     ui.set_max_width(ui.available_width());
     let tuning_enabled = enabled || runtime_enabled;
-    let center_frequency_help = (radio.provider == RadioProvider::HackRf).then_some(
-        "Tunes the frequency at the center of the RF spectrum and waterfall. HackRF One range: 1 MHz–6 GHz. This can be changed while capture is running.",
-    );
-    let sample_rate_help = (radio.provider == RadioProvider::HackRf).then_some(
-        "Sets the I/Q sampling rate and the captured RF frequency span. Supported range: 2–20 MHz. Step: 1 Hz (0.000001 MHz). HackRF supports any whole-Hz value in this range; 8 MHz or higher is recommended.",
-    );
-    let bandwidth_help = (radio.provider == RadioProvider::HackRf).then_some(
-        "Selects the HackRF analog baseband low-pass filter width. A narrower filter rejects more out-of-band noise and interference. Keep it at or below the sample rate to limit aliasing.",
-    );
     egui::Grid::new("radio_receive_configuration")
         .num_columns(2)
         .max_col_width(126.0)
         .spacing([8.0, 6.0])
         .show(ui, |ui| {
-            paint_radio_parameter_label(ui, "Center frequency", center_frequency_help);
-            ui.add_enabled_ui(tuning_enabled, |ui| {
-                paint_radio_mhz_value(
-                    ui,
-                    &mut settings.capture.center_frequency_hz,
-                    &radio.capabilities.frequency_hz,
-                );
-            });
-            ui.end_row();
-
+            paint_radio_center_frequency_row(ui, radio, settings, tuning_enabled);
             if radio.provider == RadioProvider::HackRf {
-                paint_radio_parameter_label(
-                    ui,
-                    "Frequency correction",
-                    Some(
-                        "Signed HackRF reference correction. Positive values compensate a fast clock. Changes apply to RF tuning and the sample clock during Run and reset the live DSP stream. Range: -200 to +200 ppm.",
-                    ),
-                );
-                ui.add_enabled_ui(tuning_enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        let mut correction_ppm =
-                            f64::from(settings.frequency_correction_milli_ppm) / 1_000.0;
-                        if add_left_aligned_sized(
-                            ui,
-                            egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                            egui::DragValue::new(&mut correction_ppm)
-                                .range(-200.0..=200.0)
-                                .speed(0.001)
-                                .min_decimals(3)
-                                .max_decimals(3),
-                        )
-                        .changed()
-                        {
-                            settings.frequency_correction_milli_ppm =
-                                (correction_ppm * 1_000.0).round() as i32;
-                        }
-                        ui.label("ppm");
-                    });
-                });
-                settings.frequency_correction_milli_ppm = settings
-                    .frequency_correction_milli_ppm
-                    .clamp(-200_000, 200_000);
-                ui.end_row();
+                paint_radio_frequency_correction_row(ui, settings, tuning_enabled);
             }
-
-            paint_radio_parameter_label(ui, "Sample rate", sample_rate_help);
-            ui.add_enabled_ui(enabled, |ui| {
-                paint_radio_mhz_value(
-                    ui,
-                    &mut settings.capture.sample_rate_hz,
-                    &radio.capabilities.sample_rates_hz,
-                );
-            });
-            ui.end_row();
-
-            paint_radio_parameter_label(
+            paint_radio_sample_rate_row(ui, radio, settings, enabled);
+            paint_radio_single_duration_row(ui, settings, enabled);
+            paint_radio_wait_for_trigger_row(ui, settings, enabled);
+            paint_radio_post_trigger_row(
                 ui,
-                "Single duration",
-                Some(
-                    "Capture time used by RF Single when Wait for trigger is disabled; a triggered Single uses Post-trigger instead",
-                ),
-            );
-            ui.add_enabled_ui(enabled, |ui| {
-                ui.horizontal(|ui| {
-                    let mut duration_seconds = settings.single_duration_millis as f64 / 1_000.0;
-                    if add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut duration_seconds)
-                            .range(0.001..=3_600.0)
-                            .speed(0.01)
-                            .min_decimals(3)
-                            .max_decimals(3),
-                    )
-                    .changed()
-                    {
-                        settings.single_duration_millis =
-                            (duration_seconds * 1_000.0).round() as u64;
-                    }
-                    ui.label("s");
-                });
-            });
-            settings.single_duration_millis =
-                settings.single_duration_millis.clamp(1, 3_600_000);
-            ui.end_row();
-
-            paint_radio_parameter_label(
-                ui,
-                "Wait for trigger",
-                Some(
-                    "In RF Single mode, wait until the spectrum peak reaches the trigger level, display the configured post-trigger interval, then freeze",
-                ),
-            );
-            ui.add_enabled_ui(enabled, |ui| {
-                ui.checkbox(&mut settings.trigger_enabled, "Enabled");
-            });
-            ui.end_row();
-
-            paint_radio_parameter_label(
-                ui,
-                "Post-trigger",
-                Some(
-                    "Additional IQ display time after the triggering FFT window. Resolution: 0.001 ms. At 19.2 kbit/s, a 10-byte preamble alone lasts 4.167 ms, so allow enough time for the complete packet",
-                ),
-            );
-            ui.add_enabled_ui(
+                settings,
                 (enabled && settings.trigger_enabled) || trigger_runtime_enabled,
-                |ui| {
-                ui.horizontal(|ui| {
-                    let mut milliseconds = settings.trigger_posttrigger_micros as f64 / 1_000.0;
-                    if add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut milliseconds)
-                            .range(
-                                0.0..=RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS as f64 / 1_000.0,
-                            )
-                            .speed(0.001)
-                            .min_decimals(3)
-                            .max_decimals(3),
-                    )
-                    .changed()
-                    {
-                        settings.trigger_posttrigger_micros =
-                            (milliseconds * 1_000.0).round() as u64;
-                    }
-                    ui.label("ms");
-                });
-                },
             );
-            settings.trigger_posttrigger_micros = settings
-                .trigger_posttrigger_micros
-                .min(RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS);
-            ui.end_row();
-
-            paint_radio_parameter_label(
+            paint_radio_trigger_level_row(
                 ui,
-                "RF trigger level",
-                Some(
-                    "Peak FFT-bin power threshold used by RF Single when Wait for trigger is enabled. After an FSK/GFSK preamble locks, the same level acts as squelch inside the configured analyzer channel and closes RAW data when the RF burst ends. Also represented by the draggable T marker",
-                ),
+                settings,
+                enabled || runtime_enabled || trigger_runtime_enabled,
             );
-            ui.add_enabled_ui(enabled || runtime_enabled || trigger_runtime_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    let mut level_dbfs = f64::from(settings.trigger_level_dbfs_tenths) / 10.0;
-                    if add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut level_dbfs)
-                            .range(-120.0..=0.0)
-                            .speed(0.1)
-                            .min_decimals(1)
-                            .max_decimals(1),
-                    )
-                    .changed()
-                    {
-                        settings.trigger_level_dbfs_tenths = (level_dbfs * 10.0).round() as i16;
-                    }
-                    ui.label("dBFS");
-                });
-            });
-            settings.trigger_level_dbfs_tenths =
-                settings.trigger_level_dbfs_tenths.clamp(-1_200, 0);
-            ui.end_row();
-
-            paint_radio_parameter_label(ui, "Baseband bandwidth", bandwidth_help);
-            ui.add_enabled_ui(tuning_enabled, |ui| {
-                paint_radio_bandwidth_value(
-                    ui,
-                    &mut settings.capture.bandwidth_hz,
-                    &radio.capabilities.bandwidths_hz,
-                );
-            });
-            ui.end_row();
-
+            paint_radio_bandwidth_row(ui, radio, settings, tuning_enabled);
             if radio.capabilities.receive_channels > 1 {
-                ui.label("Receive channel");
-                ui.add_enabled_ui(enabled, |ui| {
-                    egui::ComboBox::from_id_salt("radio_receive_channel")
-                        .width(RADIO_VALUE_WIDTH)
-                        .selected_text(format!("RX {}", settings.capture.receive_channel))
-                        .show_ui(ui, |ui| {
-                            for channel in 0..radio.capabilities.receive_channels {
-                                ui.selectable_value(
-                                    &mut settings.capture.receive_channel,
-                                    channel,
-                                    format!("RX {channel}"),
-                                );
-                            }
-                        });
-                });
-                ui.end_row();
+                paint_radio_receive_channel_row(ui, radio, settings, enabled);
             }
-
             for control in &radio.capabilities.gain_controls {
-                paint_radio_parameter_label(ui, &control.label, control.help.as_deref());
-                let value = settings
-                    .gains_db
-                    .entry(control.id.clone())
-                    .or_insert(control.default_db);
-                let slider_response = ui
-                    .add_enabled_ui(tuning_enabled, |ui| {
-                        ui.horizontal(|ui| {
-                            let response = ui
-                                .scope(|ui| {
-                                    paint_radio_gain_slider(
-                                        ui,
-                                        value,
-                                        control.range_db.clone(),
-                                        control.step_db,
-                                    )
-                                })
-                                .inner;
-                            ui.label("dB");
-                            response
-                        })
-                        .inner
-                    })
-                    .inner;
-                if let Some(help) = &control.help {
-                    slider_response.on_hover_selectable_text(help);
-                }
-                *value = normalize_gain_value(
-                    *value,
-                    *control.range_db.start(),
-                    *control.range_db.end(),
-                    control.step_db,
-                );
-                ui.end_row();
+                paint_radio_gain_row(ui, control, &mut settings.gains_db, tuning_enabled);
             }
-
             if radio.provider == RadioProvider::HackRf {
-                let iq_help = "Remove the measured I/Q DC offset before spectrum processing";
-                paint_radio_parameter_label(ui, "IQ correction", Some(iq_help));
-                ui.add_enabled(
-                    enabled,
-                    egui::Checkbox::without_text(&mut settings.iq_correction_enabled),
-                )
-                .on_hover_selectable_text(iq_help);
-                ui.end_row();
-
-                let amplifier_help = "Adds roughly 11 dB of HackRF front-end gain. Leave disabled around strong signals to reduce overload and distortion.";
-                paint_radio_parameter_label(ui, "RF amplifier", Some(amplifier_help));
-                ui.add_enabled(
-                    tuning_enabled,
-                    egui::Checkbox::without_text(&mut settings.amplifier_enabled),
-                )
-                .on_hover_selectable_text(amplifier_help);
-                ui.end_row();
-
-                let antenna_help =
-                    "Only enable for an antenna or accessory designed for bias power";
-                paint_radio_parameter_label(ui, "Antenna port power (3.3 V)", Some(antenna_help));
-                ui.add_enabled(
-                    enabled,
-                    egui::Checkbox::without_text(&mut settings.antenna_power_enabled),
-                )
-                .on_hover_selectable_text(antenna_help);
-                ui.end_row();
+                paint_radio_hackrf_option_rows(ui, settings, enabled, tuning_enabled);
             }
         });
     if settings.capture.bandwidth_hz > settings.capture.sample_rate_hz {
@@ -1450,6 +1213,327 @@ pub(crate) fn paint_radio_receive_configuration(
                 .color(Color32::from_rgb(255, 190, 80)),
         );
     }
+}
+
+fn paint_radio_center_frequency_row(
+    ui: &mut egui::Ui,
+    radio: &DiscoveredRadio,
+    settings: &mut RadioSettings,
+    tuning_enabled: bool,
+) {
+    let center_frequency_help = (radio.provider == RadioProvider::HackRf).then_some(
+        "Tunes the frequency at the center of the RF spectrum and waterfall. HackRF One range: 1 MHz–6 GHz. This can be changed while capture is running.",
+    );
+    paint_radio_parameter_label(ui, "Center frequency", center_frequency_help);
+    ui.add_enabled_ui(tuning_enabled, |ui| {
+        paint_radio_mhz_value(
+            ui,
+            &mut settings.capture.center_frequency_hz,
+            &radio.capabilities.frequency_hz,
+        );
+    });
+    ui.end_row();
+}
+
+/// The signed reference correction in ppm, kept within ±200 ppm.
+fn paint_radio_frequency_correction_row(
+    ui: &mut egui::Ui,
+    settings: &mut RadioSettings,
+    tuning_enabled: bool,
+) {
+    paint_radio_parameter_label(
+        ui,
+        "Frequency correction",
+        Some(
+            "Signed HackRF reference correction. Positive values compensate a fast clock. Changes apply to RF tuning and the sample clock during Run and reset the live DSP stream. Range: -200 to +200 ppm.",
+        ),
+    );
+    ui.add_enabled_ui(tuning_enabled, |ui| {
+        ui.horizontal(|ui| {
+            let mut correction_ppm = f64::from(settings.frequency_correction_milli_ppm) / 1_000.0;
+            if add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut correction_ppm)
+                    .range(-200.0..=200.0)
+                    .speed(0.001)
+                    .min_decimals(3)
+                    .max_decimals(3),
+            )
+            .changed()
+            {
+                settings.frequency_correction_milli_ppm = (correction_ppm * 1_000.0).round() as i32;
+            }
+            ui.label("ppm");
+        });
+    });
+    settings.frequency_correction_milli_ppm = settings
+        .frequency_correction_milli_ppm
+        .clamp(-200_000, 200_000);
+    ui.end_row();
+}
+
+fn paint_radio_sample_rate_row(
+    ui: &mut egui::Ui,
+    radio: &DiscoveredRadio,
+    settings: &mut RadioSettings,
+    enabled: bool,
+) {
+    let sample_rate_help = (radio.provider == RadioProvider::HackRf).then_some(
+        "Sets the I/Q sampling rate and the captured RF frequency span. Supported range: 2–20 MHz. Step: 1 Hz (0.000001 MHz). HackRF supports any whole-Hz value in this range; 8 MHz or higher is recommended.",
+    );
+    paint_radio_parameter_label(ui, "Sample rate", sample_rate_help);
+    ui.add_enabled_ui(enabled, |ui| {
+        paint_radio_mhz_value(
+            ui,
+            &mut settings.capture.sample_rate_hz,
+            &radio.capabilities.sample_rates_hz,
+        );
+    });
+    ui.end_row();
+}
+
+/// How long RF Single captures when it is not waiting for a trigger, in
+/// seconds with millisecond resolution, between 1 ms and one hour.
+fn paint_radio_single_duration_row(ui: &mut egui::Ui, settings: &mut RadioSettings, enabled: bool) {
+    paint_radio_parameter_label(
+        ui,
+        "Single duration",
+        Some(
+            "Capture time used by RF Single when Wait for trigger is disabled; a triggered Single uses Post-trigger instead",
+        ),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            let mut duration_seconds = settings.single_duration_millis as f64 / 1_000.0;
+            if add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut duration_seconds)
+                    .range(0.001..=3_600.0)
+                    .speed(0.01)
+                    .min_decimals(3)
+                    .max_decimals(3),
+            )
+            .changed()
+            {
+                settings.single_duration_millis = (duration_seconds * 1_000.0).round() as u64;
+            }
+            ui.label("s");
+        });
+    });
+    settings.single_duration_millis = settings.single_duration_millis.clamp(1, 3_600_000);
+    ui.end_row();
+}
+
+fn paint_radio_wait_for_trigger_row(
+    ui: &mut egui::Ui,
+    settings: &mut RadioSettings,
+    enabled: bool,
+) {
+    paint_radio_parameter_label(
+        ui,
+        "Wait for trigger",
+        Some(
+            "In RF Single mode, wait until the spectrum peak reaches the trigger level, display the configured post-trigger interval, then freeze",
+        ),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.checkbox(&mut settings.trigger_enabled, "Enabled");
+    });
+    ui.end_row();
+}
+
+/// The interval shown after the trigger, in milliseconds with microsecond
+/// resolution, up to [`RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS`].
+fn paint_radio_post_trigger_row(ui: &mut egui::Ui, settings: &mut RadioSettings, enabled: bool) {
+    paint_radio_parameter_label(
+        ui,
+        "Post-trigger",
+        Some(
+            "Additional IQ display time after the triggering FFT window. Resolution: 0.001 ms. At 19.2 kbit/s, a 10-byte preamble alone lasts 4.167 ms, so allow enough time for the complete packet",
+        ),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            let mut milliseconds = settings.trigger_posttrigger_micros as f64 / 1_000.0;
+            if add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut milliseconds)
+                    .range(0.0..=RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS as f64 / 1_000.0)
+                    .speed(0.001)
+                    .min_decimals(3)
+                    .max_decimals(3),
+            )
+            .changed()
+            {
+                settings.trigger_posttrigger_micros = (milliseconds * 1_000.0).round() as u64;
+            }
+            ui.label("ms");
+        });
+    });
+    settings.trigger_posttrigger_micros = settings
+        .trigger_posttrigger_micros
+        .min(RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS);
+    ui.end_row();
+}
+
+/// The RF trigger threshold in dBFS with 0.1 dB resolution, between -120 and 0.
+fn paint_radio_trigger_level_row(ui: &mut egui::Ui, settings: &mut RadioSettings, enabled: bool) {
+    paint_radio_parameter_label(
+        ui,
+        "RF trigger level",
+        Some(
+            "Peak FFT-bin power threshold used by RF Single when Wait for trigger is enabled. After an FSK/GFSK preamble locks, the same level acts as squelch inside the configured analyzer channel and closes RAW data when the RF burst ends. Also represented by the draggable T marker",
+        ),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            let mut level_dbfs = f64::from(settings.trigger_level_dbfs_tenths) / 10.0;
+            if add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut level_dbfs)
+                    .range(-120.0..=0.0)
+                    .speed(0.1)
+                    .min_decimals(1)
+                    .max_decimals(1),
+            )
+            .changed()
+            {
+                settings.trigger_level_dbfs_tenths = (level_dbfs * 10.0).round() as i16;
+            }
+            ui.label("dBFS");
+        });
+    });
+    settings.trigger_level_dbfs_tenths = settings.trigger_level_dbfs_tenths.clamp(-1_200, 0);
+    ui.end_row();
+}
+
+fn paint_radio_bandwidth_row(
+    ui: &mut egui::Ui,
+    radio: &DiscoveredRadio,
+    settings: &mut RadioSettings,
+    tuning_enabled: bool,
+) {
+    let bandwidth_help = (radio.provider == RadioProvider::HackRf).then_some(
+        "Selects the HackRF analog baseband low-pass filter width. A narrower filter rejects more out-of-band noise and interference. Keep it at or below the sample rate to limit aliasing.",
+    );
+    paint_radio_parameter_label(ui, "Baseband bandwidth", bandwidth_help);
+    ui.add_enabled_ui(tuning_enabled, |ui| {
+        paint_radio_bandwidth_value(
+            ui,
+            &mut settings.capture.bandwidth_hz,
+            &radio.capabilities.bandwidths_hz,
+        );
+    });
+    ui.end_row();
+}
+
+/// Which of the radio's receive inputs to capture; only shown when it has
+/// more than one.
+fn paint_radio_receive_channel_row(
+    ui: &mut egui::Ui,
+    radio: &DiscoveredRadio,
+    settings: &mut RadioSettings,
+    enabled: bool,
+) {
+    ui.label("Receive channel");
+    ui.add_enabled_ui(enabled, |ui| {
+        egui::ComboBox::from_id_salt("radio_receive_channel")
+            .width(RADIO_VALUE_WIDTH)
+            .selected_text(format!("RX {}", settings.capture.receive_channel))
+            .show_ui(ui, |ui| {
+                for channel in 0..radio.capabilities.receive_channels {
+                    ui.selectable_value(
+                        &mut settings.capture.receive_channel,
+                        channel,
+                        format!("RX {channel}"),
+                    );
+                }
+            });
+    });
+    ui.end_row();
+}
+
+/// One gain stage: a slider whose value is snapped to the stage's range and
+/// step. A stage that has no value yet starts at its default.
+fn paint_radio_gain_row(
+    ui: &mut egui::Ui,
+    control: &GainControlDescriptor,
+    gains_db: &mut BTreeMap<String, i32>,
+    tuning_enabled: bool,
+) {
+    paint_radio_parameter_label(ui, &control.label, control.help.as_deref());
+    let value = gains_db
+        .entry(control.id.clone())
+        .or_insert(control.default_db);
+    let slider_response = ui
+        .add_enabled_ui(tuning_enabled, |ui| {
+            ui.horizontal(|ui| {
+                let response = ui
+                    .scope(|ui| {
+                        paint_radio_gain_slider(
+                            ui,
+                            value,
+                            control.range_db.clone(),
+                            control.step_db,
+                        )
+                    })
+                    .inner;
+                ui.label("dB");
+                response
+            })
+            .inner
+        })
+        .inner;
+    if let Some(help) = &control.help {
+        slider_response.on_hover_selectable_text(help);
+    }
+    *value = normalize_gain_value(
+        *value,
+        *control.range_db.start(),
+        *control.range_db.end(),
+        control.step_db,
+    );
+    ui.end_row();
+}
+
+/// The HackRF-only switches: I/Q DC correction, the RF amplifier and the
+/// antenna port bias power.
+fn paint_radio_hackrf_option_rows(
+    ui: &mut egui::Ui,
+    settings: &mut RadioSettings,
+    enabled: bool,
+    tuning_enabled: bool,
+) {
+    let iq_help = "Remove the measured I/Q DC offset before spectrum processing";
+    paint_radio_parameter_label(ui, "IQ correction", Some(iq_help));
+    ui.add_enabled(
+        enabled,
+        egui::Checkbox::without_text(&mut settings.iq_correction_enabled),
+    )
+    .on_hover_selectable_text(iq_help);
+    ui.end_row();
+
+    let amplifier_help = "Adds roughly 11 dB of HackRF front-end gain. Leave disabled around strong signals to reduce overload and distortion.";
+    paint_radio_parameter_label(ui, "RF amplifier", Some(amplifier_help));
+    ui.add_enabled(
+        tuning_enabled,
+        egui::Checkbox::without_text(&mut settings.amplifier_enabled),
+    )
+    .on_hover_selectable_text(amplifier_help);
+    ui.end_row();
+
+    let antenna_help = "Only enable for an antenna or accessory designed for bias power";
+    paint_radio_parameter_label(ui, "Antenna port power (3.3 V)", Some(antenna_help));
+    ui.add_enabled(
+        enabled,
+        egui::Checkbox::without_text(&mut settings.antenna_power_enabled),
+    )
+    .on_hover_selectable_text(antenna_help);
+    ui.end_row();
 }
 
 pub(crate) fn paint_radio_settings(
@@ -1716,5 +1800,595 @@ mod tests {
         assert_eq!(format_radio_mhz_number(1_750_000), "1.75");
         assert_eq!(format_radio_mhz_number(5_500_000), "5.5");
         assert_eq!(format_radio_mhz_number(20_000_000), "20");
+    }
+
+    fn receive_radio(provider: RadioProvider) -> DiscoveredRadio {
+        DiscoveredRadio {
+            descriptor: DeviceDescriptor {
+                id: DeviceId::new("test:radio"),
+                name: "Test radio".to_owned(),
+                kind: InstrumentKind::RadioReceiver,
+            },
+            provider,
+            model: wavecraft_sdr::RadioModel::HackRfOne,
+            connection_backend: wavecraft_sdr::ConnectionBackend::Usb,
+            persistent_id: None,
+            capabilities: wavecraft_hackrf::hackrf_one_capabilities(),
+        }
+    }
+
+    /// Settings in which every edit box shows a different text.
+    fn receive_settings() -> RadioSettings {
+        let mut settings = RadioSettings::default();
+        settings.capture.center_frequency_hz = 433_920_000;
+        settings.capture.sample_rate_hz = 8_000_000;
+        settings.capture.bandwidth_hz = 3_500_000;
+        settings.single_duration_millis = 5_000;
+        settings.trigger_enabled = true;
+        settings.trigger_posttrigger_micros = 1_500;
+        settings.trigger_level_dbfs_tenths = -500;
+        settings.frequency_correction_milli_ppm = 1_234;
+        settings.gains_db.insert("lna".to_owned(), 24);
+        settings.gains_db.insert("vga".to_owned(), 20);
+        settings
+    }
+
+    /// What one frame of the receive panel painted.
+    struct Painted {
+        texts: Vec<(String, Pos2)>,
+        squares: Vec<Pos2>,
+    }
+
+    impl Painted {
+        fn new(shapes: &[egui::epaint::ClippedShape]) -> Self {
+            fn collect(shape: &egui::Shape, painted: &mut Painted) {
+                match shape {
+                    egui::Shape::Vec(shapes) => {
+                        shapes.iter().for_each(|shape| collect(shape, painted));
+                    }
+                    egui::Shape::Text(text) => painted.texts.push((
+                        text.galley.text().replace('\u{2212}', "-"),
+                        text.visual_bounding_rect().center(),
+                    )),
+                    egui::Shape::Rect(rect) => {
+                        let size = rect.rect.size();
+                        if (size.x - size.y).abs() < 1.0 && (10.0..24.0).contains(&size.x) {
+                            painted.squares.push(rect.rect.center());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut painted = Self {
+                texts: Vec::new(),
+                squares: Vec::new(),
+            };
+            for clipped in shapes {
+                collect(&clipped.shape, &mut painted);
+            }
+            painted
+        }
+
+        fn has(&self, text: &str) -> bool {
+            self.texts.iter().any(|(painted, _)| painted == text)
+        }
+
+        fn starts_with(&self, prefix: &str) -> bool {
+            self.texts
+                .iter()
+                .any(|(painted, _)| painted.starts_with(prefix))
+        }
+
+        fn center_of(&self, text: &str) -> Pos2 {
+            let matches = self
+                .texts
+                .iter()
+                .filter(|(painted, _)| painted == text)
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "expected exactly one {text:?}");
+            matches[0].1
+        }
+
+        /// The check box in the row of `label`.
+        fn checkbox_beside(&self, label: &str) -> Pos2 {
+            let row = self.center_of(label);
+            let matches = self
+                .squares
+                .iter()
+                .filter(|square| (square.y - row.y).abs() < 6.0 && square.x > row.x)
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "expected one check box beside {label:?}");
+            *matches[0]
+        }
+    }
+
+    /// The radio receive panel, painted frame after frame like the real one.
+    struct ReceivePanel {
+        context: egui::Context,
+        radio: DiscoveredRadio,
+        settings: RadioSettings,
+        enabled: bool,
+        runtime_enabled: bool,
+        trigger_runtime_enabled: bool,
+        frames: u32,
+    }
+
+    impl ReceivePanel {
+        fn new(radio: DiscoveredRadio, settings: RadioSettings) -> Self {
+            let mut panel = Self {
+                context: egui::Context::default(),
+                radio,
+                settings,
+                enabled: true,
+                runtime_enabled: false,
+                trigger_runtime_enabled: false,
+                frames: 0,
+            };
+            // The grid only knows its column widths after its first frame.
+            panel.frame(Vec::new());
+            panel
+        }
+
+        fn stopped(mut self) -> Self {
+            self.enabled = false;
+            self
+        }
+
+        fn running(mut self) -> Self {
+            self.enabled = false;
+            self.runtime_enabled = true;
+            self
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> Painted {
+            self.frames += 1;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 900.0))),
+                time: Some(f64::from(self.frames) / 60.0),
+                events,
+                ..egui::RawInput::default()
+            };
+            let output = self.context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    paint_radio_receive_configuration(
+                        ui,
+                        &self.radio,
+                        &mut self.settings,
+                        self.enabled,
+                        self.runtime_enabled,
+                        self.trigger_runtime_enabled,
+                    );
+                });
+            });
+            Painted::new(&output.shapes)
+        }
+
+        fn painted(&mut self) -> Painted {
+            self.frame(Vec::new())
+        }
+
+        fn press(position: Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            }
+        }
+
+        fn click(&mut self, position: Pos2) {
+            self.frame(vec![
+                egui::Event::PointerMoved(position),
+                Self::press(position, true),
+            ]);
+            self.frame(vec![Self::press(position, false)]);
+            self.frame(Vec::new());
+        }
+
+        /// Clicks the edit box that currently shows `shown`, types `typed` and
+        /// confirms it with Enter.
+        fn type_into(&mut self, shown: &str, typed: &str) {
+            let position = self.painted().center_of(shown);
+            self.click(position);
+            self.frame(vec![egui::Event::Text(typed.to_owned())]);
+            self.frame(vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }]);
+            self.frame(Vec::new());
+        }
+
+        /// Drags the control whose value is painted as `shown` to the right.
+        fn drag_right(&mut self, shown: &str) {
+            let start = self.painted().center_of(shown);
+            let end = start + Vec2::new(60.0, 0.0);
+            self.frame(vec![
+                egui::Event::PointerMoved(start),
+                Self::press(start, true),
+            ]);
+            self.frame(vec![egui::Event::PointerMoved(end)]);
+            self.frame(vec![Self::press(end, false)]);
+            self.frame(Vec::new());
+        }
+
+        /// Rests the pointer on `position` until its tooltip is shown.
+        fn hover(&mut self, position: Pos2) -> Painted {
+            self.frame(vec![egui::Event::PointerMoved(position)]);
+            for _ in 0..60 {
+                self.frame(Vec::new());
+            }
+            let painted = self.painted();
+            self.frame(vec![egui::Event::PointerGone]);
+            painted
+        }
+    }
+
+    #[test]
+    fn a_hackrf_shows_every_receive_row_but_the_channel_choice() {
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings());
+
+        let painted = panel.painted();
+
+        for row in [
+            "Center frequency",
+            "Frequency correction",
+            "Sample rate",
+            "Single duration",
+            "Wait for trigger",
+            "Post-trigger",
+            "RF trigger level",
+            "Baseband bandwidth",
+            "IF (LNA) gain",
+            "Baseband (VGA) gain",
+            "IQ correction",
+            "RF amplifier",
+            "Antenna port power (3.3 V)",
+        ] {
+            assert!(painted.has(row), "missing row {row:?}");
+        }
+        assert!(!painted.has("Receive channel"));
+        for unit in ["MHz", "ppm", "s", "ms", "dBFS", "dB"] {
+            assert!(painted.has(unit), "missing unit {unit:?}");
+        }
+    }
+
+    #[test]
+    fn the_receive_rows_follow_each_other_in_a_fixed_order() {
+        let mut radio = receive_radio(RadioProvider::HackRf);
+        radio.capabilities.receive_channels = 2;
+        let mut panel = ReceivePanel::new(radio, receive_settings());
+        let painted = panel.painted();
+
+        let rows = [
+            "Center frequency",
+            "Frequency correction",
+            "Sample rate",
+            "Single duration",
+            "Wait for trigger",
+            "Post-trigger",
+            "RF trigger level",
+            "Baseband bandwidth",
+            "Receive channel",
+            "IF (LNA) gain",
+            "Baseband (VGA) gain",
+            "IQ correction",
+            "RF amplifier",
+            "Antenna port power (3.3 V)",
+        ];
+        let heights = rows.map(|row| painted.center_of(row).y);
+        assert!(
+            heights.windows(2).all(|pair| pair[0] < pair[1]),
+            "the rows are out of order: {heights:?}"
+        );
+    }
+
+    #[test]
+    fn other_radios_leave_out_the_hackrf_only_rows() {
+        let mut settings = receive_settings();
+        settings.frequency_correction_milli_ppm = 300_000;
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::Simulator), settings);
+
+        let painted = panel.painted();
+
+        for row in [
+            "Frequency correction",
+            "IQ correction",
+            "RF amplifier",
+            "Antenna port power (3.3 V)",
+        ] {
+            assert!(!painted.has(row), "unexpected row {row:?}");
+        }
+        assert_eq!(
+            panel.settings.frequency_correction_milli_ppm, 300_000,
+            "a row that is not shown does not limit its value"
+        );
+    }
+
+    #[test]
+    fn the_receive_channel_choice_appears_only_for_a_radio_with_several_channels() {
+        let mut radio = receive_radio(RadioProvider::LimeSuiteNg);
+        radio.capabilities.receive_channels = 2;
+        let mut panel = ReceivePanel::new(radio, receive_settings());
+
+        assert!(panel.painted().has("Receive channel"));
+
+        panel.radio.capabilities.receive_channels = 1;
+        assert!(!panel.painted().has("Receive channel"));
+    }
+
+    #[test]
+    fn the_receive_channel_can_be_chosen_only_while_stopped() {
+        let mut radio = receive_radio(RadioProvider::LimeSuiteNg);
+        radio.capabilities.receive_channels = 2;
+        let mut panel = ReceivePanel::new(radio, receive_settings());
+
+        let position = panel.painted().center_of("RX 0");
+        panel.click(position);
+        let second = panel.painted().center_of("RX 1");
+        panel.click(second);
+        assert_eq!(panel.settings.capture.receive_channel, 1);
+
+        let mut radio = receive_radio(RadioProvider::LimeSuiteNg);
+        radio.capabilities.receive_channels = 2;
+        let mut panel = ReceivePanel::new(radio, receive_settings()).running();
+        let position = panel.painted().center_of("RX 0");
+        panel.click(position);
+        assert!(
+            !panel.painted().has("RX 1"),
+            "the choice does not open while capturing"
+        );
+    }
+
+    #[test]
+    fn a_bandwidth_above_the_sample_rate_is_flagged() {
+        const WARNING: &str = "Bandwidth above sample rate may cause aliasing";
+        let mut settings = receive_settings();
+        settings.capture.sample_rate_hz = 8_000_000;
+        settings.capture.bandwidth_hz = 8_000_000;
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings);
+        assert!(!panel.painted().has(WARNING));
+
+        panel.settings.capture.bandwidth_hz = 15_000_000;
+        assert!(panel.painted().has(WARNING));
+    }
+
+    #[test]
+    fn a_gain_without_a_value_starts_at_its_default() {
+        let mut settings = receive_settings();
+        settings.gains_db.clear();
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings);
+
+        panel.painted();
+
+        for control in &panel.radio.capabilities.gain_controls {
+            assert_eq!(panel.settings.gains_db[&control.id], control.default_db);
+        }
+    }
+
+    #[test]
+    fn gains_are_limited_to_their_range_and_snapped_to_their_step() {
+        let mut settings = receive_settings();
+        settings.gains_db.insert("lna".to_owned(), 19);
+        settings.gains_db.insert("vga".to_owned(), 500);
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings);
+
+        panel.painted();
+
+        assert_eq!(
+            panel.settings.gains_db["lna"], 16,
+            "19 dB is nearer 16 than 24 in 8 dB steps"
+        );
+        assert_eq!(panel.settings.gains_db["vga"], 62);
+    }
+
+    #[test]
+    fn a_gain_can_be_moved_while_stopped_or_capturing_but_not_otherwise() {
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings());
+        panel.drag_right("24");
+        assert!(panel.settings.gains_db["lna"] > 24);
+
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings()).running();
+        panel.drag_right("24");
+        assert!(panel.settings.gains_db["lna"] > 24);
+
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings()).stopped();
+        panel.drag_right("24");
+        assert_eq!(panel.settings.gains_db["lna"], 24);
+    }
+
+    #[test]
+    fn typed_values_are_converted_to_the_units_of_the_settings() {
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings());
+
+        panel.type_into("1.234", "-2.5");
+        assert_eq!(panel.settings.frequency_correction_milli_ppm, -2_500);
+        panel.type_into("5.000", "2.5");
+        assert_eq!(panel.settings.single_duration_millis, 2_500);
+        panel.type_into("1.500", "2.25");
+        assert_eq!(panel.settings.trigger_posttrigger_micros, 2_250);
+        panel.type_into("-50.0", "-70.3");
+        assert_eq!(panel.settings.trigger_level_dbfs_tenths, -703);
+    }
+
+    #[test]
+    fn typed_values_stop_at_the_limits_of_their_fields() {
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings());
+
+        panel.type_into("1.234", "500");
+        assert_eq!(panel.settings.frequency_correction_milli_ppm, 200_000);
+        panel.type_into("5.000", "99999");
+        assert_eq!(panel.settings.single_duration_millis, 3_600_000);
+        panel.type_into("3600.000", "0");
+        assert_eq!(panel.settings.single_duration_millis, 1);
+        panel.type_into("1.500", "99999");
+        assert_eq!(
+            panel.settings.trigger_posttrigger_micros,
+            RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS
+        );
+        panel.type_into("-50.0", "10");
+        assert_eq!(panel.settings.trigger_level_dbfs_tenths, 0);
+        panel.type_into("0.0", "-500");
+        assert_eq!(panel.settings.trigger_level_dbfs_tenths, -1_200);
+    }
+
+    #[test]
+    fn a_stopped_panel_with_nothing_running_edits_nothing() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings()).stopped();
+        panel.radio.capabilities.bandwidths_hz = wavecraft_sdr::ValueDomain::Stepped {
+            range: 1_000_000..=28_000_000,
+            step: 1_000,
+        };
+        let before = panel.settings.clone();
+
+        panel.type_into("433.920", "100");
+        panel.type_into("8.000", "10");
+        panel.type_into("3.500", "5");
+        panel.type_into("5.000", "2");
+        panel.type_into("-50.0", "-60");
+        panel.type_into("1.234", "2");
+        for label in [
+            "Wait for trigger",
+            "IQ correction",
+            "RF amplifier",
+            "Antenna port power (3.3 V)",
+        ] {
+            let checkbox = panel.painted().checkbox_beside(label);
+            panel.click(checkbox);
+        }
+
+        assert_eq!(panel.settings, before);
+    }
+
+    #[test]
+    fn a_running_capture_can_only_retune_and_move_the_trigger_level() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings()).running();
+        panel.radio.capabilities.bandwidths_hz = wavecraft_sdr::ValueDomain::Stepped {
+            range: 1_000_000..=28_000_000,
+            step: 1_000,
+        };
+
+        panel.type_into("433.920", "100");
+        panel.type_into("1.234", "2");
+        panel.type_into("3.500", "6");
+        panel.type_into("-50.0", "-60");
+        panel.type_into("8.000", "10");
+        panel.type_into("5.000", "2");
+        for label in [
+            "Wait for trigger",
+            "IQ correction",
+            "Antenna port power (3.3 V)",
+        ] {
+            let checkbox = panel.painted().checkbox_beside(label);
+            panel.click(checkbox);
+        }
+        let amplifier = panel.painted().checkbox_beside("RF amplifier");
+        panel.click(amplifier);
+
+        assert_eq!(panel.settings.capture.center_frequency_hz, 100_000_000);
+        assert_eq!(panel.settings.frequency_correction_milli_ppm, 2_000);
+        assert_eq!(panel.settings.capture.bandwidth_hz, 6_000_000);
+        assert_eq!(panel.settings.trigger_level_dbfs_tenths, -600);
+        assert!(panel.settings.amplifier_enabled);
+        assert_eq!(panel.settings.capture.sample_rate_hz, 8_000_000);
+        assert_eq!(panel.settings.single_duration_millis, 5_000);
+        assert!(panel.settings.trigger_enabled);
+        assert!(
+            panel.settings.iq_correction_enabled,
+            "the I/Q correction stays on"
+        );
+        assert!(!panel.settings.antenna_power_enabled);
+    }
+
+    #[test]
+    fn a_stopped_panel_toggles_its_switches() {
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings());
+
+        for label in [
+            "Wait for trigger",
+            "IQ correction",
+            "RF amplifier",
+            "Antenna port power (3.3 V)",
+        ] {
+            let checkbox = panel.painted().checkbox_beside(label);
+            panel.click(checkbox);
+        }
+
+        assert!(!panel.settings.trigger_enabled);
+        assert!(
+            !panel.settings.iq_correction_enabled,
+            "the I/Q correction starts on"
+        );
+        assert!(panel.settings.amplifier_enabled);
+        assert!(panel.settings.antenna_power_enabled);
+    }
+
+    #[test]
+    fn the_post_trigger_interval_is_editable_with_a_trigger_or_a_running_trigger_only() {
+        let mut settings = receive_settings();
+        settings.trigger_enabled = false;
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings);
+
+        panel.type_into("1.500", "2");
+        assert_eq!(
+            panel.settings.trigger_posttrigger_micros, 1_500,
+            "without a trigger the interval is not editable"
+        );
+
+        panel.trigger_runtime_enabled = true;
+        panel.type_into("1.500", "2");
+        assert_eq!(panel.settings.trigger_posttrigger_micros, 2_000);
+    }
+
+    #[test]
+    fn the_trigger_level_follows_a_running_trigger_alone() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings()).stopped();
+        panel.trigger_runtime_enabled = true;
+
+        panel.type_into("-50.0", "-60");
+
+        assert_eq!(panel.settings.trigger_level_dbfs_tenths, -600);
+    }
+
+    #[test]
+    fn only_a_hackrf_explains_its_tuning_rows() {
+        for (provider, explained) in [
+            (RadioProvider::HackRf, true),
+            (RadioProvider::Simulator, false),
+        ] {
+            for (row, help) in [
+                ("Center frequency", "Tunes the frequency"),
+                ("Sample rate", "Sets the I/Q sampling rate"),
+                ("Baseband bandwidth", "Selects the HackRF analog baseband"),
+            ] {
+                let mut panel = ReceivePanel::new(receive_radio(provider), receive_settings());
+                let position = panel.painted().center_of(row);
+
+                let painted = panel.hover(position);
+
+                assert_eq!(
+                    painted.starts_with(help),
+                    explained,
+                    "{provider:?} {row:?} help"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_gain_slider_shows_the_help_of_its_control() {
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings());
+        let slider = panel.painted().center_of("24");
+
+        let painted = panel.hover(slider);
+
+        assert!(painted.starts_with("Controls IF-stage gain"));
     }
 }
