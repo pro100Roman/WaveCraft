@@ -221,7 +221,7 @@ impl WaveCraftApp {
                 }
             };
         let count = session.descriptors().len();
-        let recorders =
+        let mut recorders =
             match self.start_capture_recorders(session.descriptors(), logic_config, scope_config) {
                 Ok(recorders) => recorders,
                 Err(error) => {
@@ -241,6 +241,8 @@ impl WaveCraftApp {
         let radio_trigger = match self.arm_radio_trigger(mode, target, has_radio) {
             Ok(trigger) => trigger,
             Err(error) => {
+                // The capture file is already open; do not leave it without a footer.
+                let _ = finish_gui_recording(&mut recorders.recorder, CompletionStatus::Failed);
                 self.abort_capture(session, error);
                 return;
             }
@@ -1683,6 +1685,36 @@ mod tests {
 
         assert!(app.captures.is_empty());
         assert!(app.last_error.is_some());
+        let loaded = load_gui_recording(&recording, &app.protocol_analyzer.analyzers)
+            .expect("the capture file was finished, not left half written");
+        assert_eq!(loaded.completion, CompletionStatus::Failed);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn an_rf_trigger_that_cannot_be_armed_marks_the_capture_file_as_failed() {
+        let directory = scratch_directory("rf-trigger-failure-finishes-recording");
+        let recording = directory.join("capture.dsv");
+        let mut app = app();
+        request(&mut app, CaptureTarget::RadioReceiver);
+        app.record_capture = true;
+        app.recording_path = recording.to_string_lossy().into_owned();
+        app.radio_settings.trigger_enabled = true;
+        app.radio_settings.trigger_posttrigger_micros = u64::MAX;
+        let started = ready(
+            &app,
+            InstrumentKind::RadioReceiver,
+            AcquisitionMode::Single,
+            CaptureTarget::RadioReceiver,
+        );
+
+        app.handle_capture_ready(started);
+
+        assert!(app.captures.is_empty());
+        assert!(app
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("failed to arm RF trigger")));
         let loaded = load_gui_recording(&recording, &app.protocol_analyzer.analyzers)
             .expect("the capture file was finished, not left half written");
         assert_eq!(loaded.completion, CompletionStatus::Failed);
