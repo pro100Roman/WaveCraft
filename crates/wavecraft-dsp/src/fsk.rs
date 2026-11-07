@@ -22,6 +22,15 @@ const TONE_TRACKING_GAIN: f64 = 0.002;
 /// is treated as noise. Noise-only windows spread over most of the range;
 /// signal windows are much narrower unless the SNR is very low.
 const NOISE_SPREAD_FRACTION: f64 = 0.4;
+/// Raw discriminator spread of channel noise per unit of channel bandwidth,
+/// in deviations: the filter keeps the noise within its passband, so a 120 kHz
+/// channel around a 35 kHz deviation signal spreads noise over about 5.5
+/// deviations, far less than the 14.6 of the whole sample rate, while a clean
+/// signal spreads over 2 and one at 12 dB Eb/N0 over at most 3.9. Measured on
+/// that link: at 1.3 of the bandwidth in deviations (4.5) 1 of 600 noise
+/// windows was taken for a signal and every burst at 8 dB was acquired; the
+/// full-range limit of 5.85 accepted 31% of noise windows.
+const NOISE_BANDWIDTH_SPREAD: f64 = 1.3;
 /// How far the tone centres of consecutive acquisition windows may differ,
 /// relative to their separation, while still counting as the same candidate.
 /// The centres are outer-decile means of a few dozen samples, so at moderate
@@ -29,6 +38,11 @@ const NOISE_SPREAD_FRACTION: f64 = 0.4;
 /// 100 kbit/s link at 12 dB Eb/N0 were acquired late and 3% lost the whole
 /// preamble. At 20% none were, and the noise-lead-in cases are unchanged.
 const TONE_STABILITY_FRACTION: f64 = 0.2;
+/// How far before the first available sample, as a fraction of a symbol, the
+/// centre of a burst's first symbol may lie and still be decided from that
+/// sample. At 0.3 of a symbol the matched-filter output is still well inside
+/// the eye of a GFSK signal.
+const EARLY_CENTRE_REACH: f64 = 0.3;
 
 pub const BINARY_FSK_DEMODULATOR_ID: &str = "fsk2";
 pub const BINARY_GFSK_DEMODULATOR_ID: &str = "gfsk2";
@@ -598,11 +612,14 @@ impl FskDemodulator {
                         self.config.symbol_rate_hz,
                     );
                     // Pure noise fills the discriminator's whole range, which
-                    // spans `sample_rate / deviation` deviations.
-                    let raw_spread_limit = MAX_TONE_SEPARATION.max(
-                        NOISE_SPREAD_FRACTION * batch.sample_rate_hz as f64
-                            / self.config.deviation_hz as f64,
-                    );
+                    // spans `sample_rate / deviation` deviations, unless the
+                    // channel filter narrows it first.
+                    let deviation_hz = self.config.deviation_hz as f64;
+                    let full_range_limit = MAX_TONE_SEPARATION
+                        .max(NOISE_SPREAD_FRACTION * batch.sample_rate_hz as f64 / deviation_hz);
+                    let channel_limit = MAX_TONE_SEPARATION
+                        .max(NOISE_BANDWIDTH_SPREAD * batch.bandwidth_hz as f64 / deviation_hz);
+                    let raw_spread_limit = full_range_limit.min(channel_limit);
                     if !self.tone_tracker.is_acquired() {
                         self.carrier_acquisition.push_back(discriminator);
                         // Acquisition needs one window to fill and one more
@@ -927,6 +944,13 @@ fn eye_centre_skip(values: &[f64], samples_per_symbol: f64) -> usize {
 /// A loop that only starts at the first centre cannot have been tracking
 /// earlier symbols, and the few it spans are too few for the nominal period to
 /// drift by a noticeable part of a symbol.
+///
+/// The first symbol of a burst is often centred just before the first sample:
+/// the channel filter outputs its first sample half a filter length into the
+/// stream, which can be past the middle of the burst's first symbol. The
+/// extended start of the receive filter makes the first sample read as that
+/// symbol, so a centre up to [`EARLY_CENTRE_REACH`] of a symbol before it is
+/// still read there instead of being dropped.
 fn earlier_symbol_centres(
     samples: &[DiscriminatorSample],
     first_centre: f64,
@@ -934,10 +958,11 @@ fn earlier_symbol_centres(
 ) -> Vec<(f64, Range<u64>)> {
     let mut centres = Vec::new();
     let mut position = first_centre - period;
-    while position >= 0.0 {
-        let index = position.floor() as usize;
+    while position >= -EARLY_CENTRE_REACH * period {
+        let position_in_samples = position.max(0.0);
+        let index = position_in_samples.floor() as usize;
         if let [earlier, later, ..] = &samples[index.min(samples.len())..] {
-            let fraction = position - index as f64;
+            let fraction = position_in_samples - index as f64;
             centres.push((
                 earlier.likelihood + (later.likelihood - earlier.likelihood) * fraction,
                 earlier.source_range.start..later.source_range.end,
@@ -1394,6 +1419,7 @@ mod tests {
         ChannelizedBatch {
             source_sample_rate_hz: 8_000,
             sample_rate_hz: 8_000,
+            bandwidth_hz: 8_000,
             center_frequency_hz: 100_000_000,
             segment_start_sample_index,
             filter_delay_input_samples: 0,

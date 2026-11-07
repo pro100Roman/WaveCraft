@@ -511,3 +511,107 @@ fn adaptive_gfsk_keeps_the_preamble_after_a_long_noise_lead_in() {
         );
     }
 }
+
+/// The GUI's default link at its real rates: a 2 MS/s capture of a
+/// 19.2 kbit/s, 35 kHz deviation GFSK signal, cut out by a 120 kHz channel
+/// filter and resampled to 512 kS/s.
+fn gui_default_link() -> Link {
+    Link {
+        sample_rate_hz: 2_000_000,
+        symbol_rate_hz: 19_200,
+        deviation_hz: 35_000,
+        bt: Some(0.5),
+        channel_offset_hz: 500_000,
+        channel_bandwidth_hz: 120_000,
+        channel_rate_hz: 512_000,
+    }
+}
+
+#[test]
+fn adaptive_gfsk_keeps_the_first_preamble_symbol_of_a_burst_that_starts_late() {
+    // The radio runtime starts an analyzer at the spectrum window in which a
+    // burst is detected, so the burst begins a few dozen samples into the
+    // stream. The channel filter then outputs its first sample half a filter
+    // length later, a little after the centre of the first symbol. That symbol
+    // used to be dropped, which also moves a byte-aligned search for the
+    // preamble to the next 1 bit and loses a second bit: a 10 byte preamble
+    // decoded as nine `aa` bytes and `a8`, and a detector that needs all ten
+    // missed the burst.
+    let link = gui_default_link();
+    // First symbol centred from 12 samples before the first filter output
+    // (0.12 symbol) to half a symbol after it.
+    for lead_samples in [64_usize, 80, 96, 112, 128] {
+        let mut rng = Rng(0x5eed_00c1);
+        let mut burst = burst(link, &mut rng, 30.0, 0, 200);
+        let mut iq = (0..lead_samples)
+            .map(|_| Iq8 {
+                i: (0.8 * rng.gaussian()).round() as i8,
+                q: (0.8 * rng.gaussian()).round() as i8,
+            })
+            .collect::<Vec<_>>();
+        iq.append(&mut burst.iq);
+        burst.iq = iq;
+        let decoded = decode(&mut link.analyzer(adaptive_timing()), link, &burst);
+
+        // The payload fixes the alignment: an alternating preamble matches
+        // itself shifted by two bits.
+        let (lag, _, _) = best_alignment(&burst.bits, &decoded, 0);
+        assert!(
+            lag >= 0,
+            "{lead_samples} samples ahead of the burst: {} leading bits missing",
+            -lag
+        );
+        let preamble = &decoded[lag as usize..lag as usize + PREAMBLE_BITS];
+        assert_eq!(
+            preamble,
+            &burst.bits[..PREAMBLE_BITS],
+            "{lead_samples} samples ahead of the burst"
+        );
+    }
+}
+
+#[test]
+fn noise_in_a_narrow_channel_does_not_decode_as_tones() {
+    // The channel filter keeps noise inside its passband, so a 120 kHz channel
+    // around a 35 kHz deviation signal spreads the discriminator over about
+    // 5.5 deviations, not over the whole 14.6 of the sample rate. A noise gate
+    // sized from the sample rate alone accepted 31% of these windows (of 24
+    // symbols, the length of noise a late-opened channel can start with) as
+    // tones, and the tones it then tracked ruined the burst that followed.
+    // Measured with the bandwidth-sized gate: 1 of 600, at any noise level.
+    let link = gui_default_link();
+    let mut accepted = 0;
+    for trial in 0..90_u64 {
+        let mut rng = Rng(0x5eed_00d0 + trial);
+        let sigma = [0.6, 1.5, 4.0][trial as usize % 3];
+        let iq = (0..2_500)
+            .map(|_| Iq8 {
+                i: (sigma * rng.gaussian()).round() as i8,
+                q: (sigma * rng.gaussian()).round() as i8,
+            })
+            .collect();
+        let noise = Burst {
+            bits: Vec::new(),
+            iq,
+        };
+        accepted +=
+            usize::from(!decode(&mut link.analyzer(adaptive_timing()), link, &noise).is_empty());
+    }
+    assert!(accepted <= 1, "{accepted} of 90 noise windows decoded");
+}
+
+#[test]
+fn adaptive_gfsk_acquires_weak_bursts_in_a_narrow_channel() {
+    // The tighter noise gate must not cost sensitivity: at 8 dB Eb/N0, where
+    // the bit error rate is already about 1e-1, every burst is still acquired.
+    let (_, decoded) = error_rate(
+        gui_default_link(),
+        adaptive_timing(),
+        8.0,
+        24,
+        16,
+        300,
+        0x5eed_00e0,
+    );
+    assert_eq!(decoded, 16, "every burst must be acquired");
+}

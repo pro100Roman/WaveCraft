@@ -109,6 +109,8 @@ pub struct TimedComplexSample {
 pub struct ChannelizedBatch {
     pub source_sample_rate_hz: u64,
     pub sample_rate_hz: u64,
+    /// Full complex bandwidth of the channel filter that produced the samples.
+    pub bandwidth_hz: u64,
     pub center_frequency_hz: u64,
     /// First input sample index after the latest gap, retune, or rate change.
     pub segment_start_sample_index: u64,
@@ -385,6 +387,7 @@ impl Channelizer {
         Ok(ChannelizedBatch {
             source_sample_rate_hz: batch.sample_rate_hz,
             sample_rate_hz: self.config.output_sample_rate_hz,
+            bandwidth_hz: self.config.bandwidth_hz,
             center_frequency_hz: selected_frequency,
             segment_start_sample_index: self
                 .segment_start_sample_index

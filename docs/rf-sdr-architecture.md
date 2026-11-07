@@ -652,9 +652,17 @@ burst:
 
 - Tone acquisition judges the *unfiltered* discriminator as well as the
   filtered one. Filtering narrows the spread of pure noise until it resembles
-  two tones, so a noise window is rejected when its raw spread exceeds
-  `max(4, 0.4 * sample_rate / deviation)` deviations. The filtered samples still
-  provide the tone centres.
+  two tones, so a noise window is rejected when its raw spread exceeds a limit
+  in deviations. The filtered samples still provide the tone centres. The limit
+  is the smaller of `max(4, 0.4 * sample_rate / deviation)`, for noise that
+  fills the whole sample rate, and `max(4, 1.3 * channel_bandwidth / deviation)`,
+  because the channel filter keeps noise inside its passband: a 120 kHz channel
+  around a 35 kHz deviation signal spreads noise over about 5.5 deviations, not
+  the 14.6 of the 512 kS/s sample rate. With the sample-rate limit alone 31% of
+  24-symbol noise windows on that link were accepted as tones and the tones
+  tracked from them ruined the burst that followed; at 1.3 it is 1 of 600 and
+  every burst at 8 dB Eb/N0 is still acquired. The demodulator learns the
+  bandwidth from `ChannelizedBatch::bandwidth_hz`.
 - The tone centres are committed only after they stay put for a whole
   acquisition window, so a window straddling the burst edge never supplies
   them. Consecutive windows count as the same candidate when their centres
@@ -675,7 +683,14 @@ burst:
 The centred filter needs look-ahead: the last two symbols of a GFSK burst (half
 a symbol for FSK) are decided only when later samples arrive. A real burst is
 followed by a quiet channel until the squelch releases, which supplies them.
-The filter's start is extended backwards so the first preamble symbols are kept.
+The filter's start is extended backwards so the first preamble symbols are kept,
+and the first symbol of a burst is still decided from the first sample when its
+centre lies up to 0.3 of a symbol before it. The channel filter outputs its first
+sample half a filter length into the stream, which for a 257-tap filter at
+2 MS/s is 1.2 symbols, so a burst that starts a few dozen samples after the
+analyzer does has its first symbol centred just before the first output.
+Dropping that symbol also moved a byte-aligned preamble search to the next `1`
+bit, so a 10 byte preamble read as nine `aa` bytes and `a8`.
 
 Digital demodulators emit soft symbols rather than immediately packing bytes.
 The generic contract retains likelihoods for every member of the configured
