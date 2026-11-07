@@ -1,4 +1,6 @@
-use crate::driver_util::{capture_error, combine_results, push_u16, push_u32, read_u16, read_u32};
+use crate::ds_driver_util::{
+    capture_error, combine_results, push_u16, push_u32, read_u16, read_u32,
+};
 use crate::transport::{QueuedBulkRead, QueuedBulkReadOutcome};
 use crate::{DeviceModel, DiscoveredDevice, UsbDeviceSession, UsbSpeedClass, DSCOPE_U3P100};
 use std::collections::VecDeque;

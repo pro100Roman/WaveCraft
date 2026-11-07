@@ -39,7 +39,7 @@ Python client tests, and `cargo +1.79.0 check --workspace --locked`.
 | 1. Per-frame analyzer copies | Done. Custom protocols are shared through `Arc`; the decode cache compares its key in place and shares outcomes through `Arc`. Not profiled: frame time was not measured before or after. |
 | 2. Large `lib.rs` | Started. The recording-metadata mapping moved to `recording_metadata.rs` (about 1,000 lines). `update` and the other long functions remain, along with migration steps 5-8 in [GUI modularization](gui-modularization.md). |
 | 3. Hand-written metadata mapping | Partly done. The functions moved into one module, and a new test round-trips every `RadioSettings` field (logic and scope already did). The single key table that drives both directions was not built. |
-| 4. Copied USB helpers | Done for the six identical helpers (`driver_util.rs`). The queued-read bookkeeping in the two drivers was not compared or merged. |
+| 4. Copied USB helpers | Done for the six identical helpers (`ds_driver_util.rs`). The queued-read bookkeeping in the two drivers was not compared or merged. |
 | 5. Panics in production code | Done for `crates/`. About 45 sites were removed (the count of "about 20" below was low because the scan stopped at the first `#[cfg(test)]`), and `clippy::unwrap_used` and `clippy::expect_used` are now enforced there. Not done: the apps, which still have about a dozen `unwrap`/`expect` and a few `unreachable!` in `wavecraft-gui` and one `expect` in the CLI. |
 | 6. Smaller items | `serde` and `serde_json` now come from `[workspace.dependencies]`. The CI changes (duplicate runs, cache, audit) were not made: they change release-pipeline behavior and cannot be verified locally, so they need a decision. |
 

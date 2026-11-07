@@ -8,7 +8,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use wavecraft_core::InstrumentKind;
 
-mod driver_util;
+mod ds_driver_util;
 mod dscope;
 mod dslogic;
 mod prepare;

@@ -1,6 +1,6 @@
 #[cfg(test)]
-use crate::driver_util::read_u16;
-use crate::driver_util::{capture_error, combine_results, push_u16, push_u32, read_u32};
+use crate::ds_driver_util::read_u16;
+use crate::ds_driver_util::{capture_error, combine_results, push_u16, push_u32, read_u32};
 use crate::transport::{QueuedBulkRead, QueuedBulkReadOutcome};
 use crate::{
     BulkReadOutcome, DeviceModel, DeviceProfile, DiscoveredDevice, UsbDeviceSession, UsbSpeedClass,
