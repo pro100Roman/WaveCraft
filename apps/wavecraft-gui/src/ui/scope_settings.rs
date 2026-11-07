@@ -547,7 +547,7 @@ pub(crate) fn paint_scope_marker_settings(
                                     if ui
                                         .add_enabled(
                                             total < SCOPE_MARKER_LIMIT,
-                                            egui::Button::new("+ Add marker"),
+                                            egui::Button::new("Add"),
                                         )
                                         .clicked()
                                     {
