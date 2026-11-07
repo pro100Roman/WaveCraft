@@ -1,17 +1,26 @@
 name: CI
 
 on:
-  # Branches are built through their pull request; pushing them as well ran
-  # every job twice. Pushes still run for main and for release tags (the
-  # `release` job below needs the tag run).
+  # Every branch push is built, with or without a pull request, and so are
+  # release tags (the `release` job below needs the tag run). A pull request
+  # from a branch in this repository is covered by that branch's push, so the
+  # `pull_request` event only builds pull requests from forks (see the `if` on
+  # each job); otherwise every job would run twice.
   push:
-    branches: [main]
+    branches: ["**"]
     tags: ["v*"]
   pull_request:
+
+concurrency:
+  # A newer push to a branch replaces the run still in progress for it.
+  # `main` and release tags always run to the end.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && github.ref != 'refs/heads/main' }}
 
 jobs:
   python-client:
     name: Python client
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +36,7 @@ jobs:
 
   msrv:
     name: Rust 1.79
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -63,6 +73,7 @@ jobs:
 
   workspace:
     name: ${{ matrix.name }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
