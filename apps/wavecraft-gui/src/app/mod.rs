@@ -6,3 +6,4 @@ pub mod captures;
 pub mod devices;
 pub mod files;
 pub mod view_state;
+pub mod worker;
