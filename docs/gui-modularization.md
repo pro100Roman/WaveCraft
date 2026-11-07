@@ -1,7 +1,7 @@
 # GUI modularization and multi-SDR integration plan
 
 Status: the file split (migration steps 1-3 and 5-7) is done and `lib.rs` is
-down to 688 lines; the RF/SDR integration for HackRF One is implemented. What
+down to 683 lines; the RF/SDR integration for HackRF One is implemented. What
 remains most of the long functions inside the moved code (`poll_worker` and
 `poll_capture_target` are split), narrowing what the panels can reach, and the
 LimeSDR and AntSDR adapters. See
@@ -25,7 +25,7 @@ implemented for an identified model and transport.
 ## Current status
 
 Reviewed 2026-11-07 on branch `chore/code-health-improvements` at commit
-`b3222cc`. Sizes below were measured, not estimated: "before" is `e74c2bc`,
+`8ab03b1`. Sizes below were measured, not estimated: "before" is `e74c2bc`,
 the commit before the GUI split began.
 
 `apps/wavecraft-gui/src/main.rs` is only the native entry point
@@ -33,10 +33,10 @@ the commit before the GUI split began.
 
 | Measure | Before | Now |
 | ------- | ------ | --- |
-| `lib.rs` total lines | 23,218 | 688 |
-| `lib.rs` production lines | 18,778 | 688 |
+| `lib.rs` total lines | 23,218 | 683 |
+| `lib.rs` production lines | 18,778 | 683 |
 | tests in `lib.rs` | 157 tests, 4,440 lines | none (see below) |
-| `eframe::App::update` lines | 1,874 | 3 (it calls `run_frame`, 143 lines) |
+| `eframe::App::update` lines | 1,874 | 3 (it calls `run_frame`, 139 lines) |
 
 An earlier version of this document said `lib.rs` held "roughly 13,000 lines of
 production code". That was wrong; it was about 18,800.
@@ -48,6 +48,12 @@ moved into these modules, mostly unchanged apart from `pub(crate)` visibility:
 - `acquisition/{capture,logic,scope,radio}.rs`: capture settings, session
   settings, and the capture lifecycle types (`AcquisitionMode`, `CaptureTarget`,
   `ActiveCapture`, `start_capture`).
+- `acquisition/radio_backend.rs`: the only production module that names the
+  HackRF driver crate. It builds the `RadioRegistry` used for discovery, turns
+  GUI radio settings into provider settings, opens the radio source, and wraps
+  the driver's runtime control in `RadioRuntimeControl`, so callers do not see
+  `HackRfRuntimeControl`. Adding LimeSDR or AntSDR means changing this file,
+  not the capture lifecycle or the frame loop.
 - `app/{devices,calibration,files,view_state,captures,worker}.rs`: the methods
   of `WaveCraftApp`, grouped by what they do. They are separate `impl` blocks,
   so the state still lives in one struct.
@@ -92,7 +98,8 @@ module they cover. The other 41 cover more than one module or only the
 application root, and are in `src/tests.rs`. The test names were unchanged by the
 move (255 listed, 253 run, 2 ignored). `src/frame_tests.rs` adds 15 headless tests
 (see below). `app/worker.rs` has 38 tests of its own and `app/captures.rs` has 35,
-so the crate now lists 328 tests (326 run, 2 ignored).
+`acquisition/radio_backend.rs` has 5, so the crate now lists 333 tests (331 run,
+2 ignored).
 
 | Step | State | Notes |
 | ---- | ----- | ----- |
@@ -119,7 +126,7 @@ Differences between this plan and the code:
   `&mut FrameActions` to record what the user asked for. This kept each move
   verbatim and borrow-checker friendly, but the UI modules still have
   unrestricted access to application state. Narrowing that is future work.
-- `run_frame` is 143 lines. It sequences the panels and applies a few small
+- `run_frame` is 139 lines. It sequences the panels and applies a few small
   actions inline (calibration requests, device-selection changes, radio runtime
   updates). The rest of the apply code is in `FrameActions` and
   `scope_frontend_changes.rs`.
@@ -128,6 +135,13 @@ Differences between this plan and the code:
   `RadioCapabilities` (with `ValueDomain`). There is no combined
   `InstrumentCapabilities` enum or `RadioBackendSettings` enum yet; HackRF
   settings are the concrete `HackRfSettings`.
+- The GUI does not depend on the HackRF driver outside
+  `acquisition/radio_backend.rs`: `begin_refresh` asks `radio_registry()` to
+  discover radios, `start_capture` calls `open_radio_source` and keeps an
+  `Option<RadioRuntimeControl>`, and the frame loop calls its `update` and
+  `update_status`. The radio settings model in `acquisition/radio.rs` is still
+  shaped like HackRF (`HackRfSettings` from `wavecraft-sdr`), and the GUI tests
+  still use `wavecraft_hackrf::hackrf_one_capabilities()` as a fixture.
 - `WaveformTab` has `LogicAnalyzer`, `Oscilloscope`, `Lissajous`,
   `RadioReceiver`, and `Combined`, rather than the four-variant sketch below.
 - The modules are flat files, not the directories in the layout below:
@@ -218,7 +232,9 @@ apps/wavecraft-gui/src/
 │   │                             # start_capture
 │   ├── logic.rs                  # DSLogic capture/session settings
 │   ├── scope.rs                  # DSCope capture/session settings
-│   └── radio.rs                  # radio capture settings and requests
+│   ├── radio.rs                  # radio capture settings and requests
+│   └── radio_backend.rs          # the one module that names the HackRF driver:
+│                                 # registry, provider settings, open, runtime control
 ├── devices.rs                    # selection helpers, USB speed warning,
 │                                 # resource directory
 ├── sessions.rs                   # generic session tabs and session settings
@@ -652,11 +668,13 @@ The modularization is complete when:
 - formatting, Clippy, the default workspace tests, and release builds remain
   clean after the migration.
 
-Against these, as of commit `b3222cc`: `main.rs` only starts the app, and
+Against these, as of commit `8ab03b1`: `main.rs` only starts the app, and
 formatting, Clippy, the workspace tests, and the release build pass. `lib.rs`
-is 688 lines of module declarations, the state struct, and the frame loop, but
+is 683 lines of module declarations, the state struct, and the frame loop, but
 rendering and file formats are in their own modules while the state is still one
-struct, so "isolated state" is not met (step 14). The GUI still registers
-`HackRfAdapter` in `begin_refresh` and uses HackRF settings types, so "device
-APIs confined to adapters" is only partly met. The other two criteria were not
-assessed.
+struct, so "isolated state" is not met (step 14). The HackRF driver crate is
+now named by one production module, `acquisition/radio_backend.rs`, but the
+radio settings model is still HackRF-shaped and there is no second adapter to
+show that the seam fits another radio, so "device APIs confined to adapters" is
+mostly met for the driver and not yet for the settings. The other two criteria
+were not assessed.
