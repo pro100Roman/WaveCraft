@@ -483,7 +483,7 @@ fn gui_recording_reader_restores_full_capture_and_scope_settings() {
 #[test]
 #[ignore = "requires a connected HackRF One and installed libhackrf"]
 fn gui_hackrf_capture_pipeline_receives_and_spectrally_processes_iq() {
-    let adapter = HackRfAdapter::new();
+    let adapter = wavecraft_hackrf::HackRfAdapter::new();
     let device = adapter
         .discover()
         .expect("GUI HackRF discovery should succeed")
@@ -499,7 +499,7 @@ fn gui_hackrf_capture_pipeline_receives_and_spectrally_processes_iq() {
             receive_channel: 0,
             sample_limit: Some(4_096),
         },
-        provider_settings: RadioProviderSettings::HackRf(HackRfSettings::default()),
+        provider_settings: RadioProviderSettings::HackRf(wavecraft_sdr::HackRfSettings::default()),
         iq_correction_enabled: true,
         analyzer_profiles: Vec::new(),
         analyzer_channel_names: Vec::new(),
@@ -528,8 +528,13 @@ fn gui_hackrf_capture_pipeline_receives_and_spectrally_processes_iq() {
     let StartedCapture {
         session,
         mut radio_dsp,
+        radio_runtime_control,
         ..
     } = started;
+    assert!(
+        radio_runtime_control.is_some(),
+        "a HackRF capture can be retuned while it runs"
+    );
     let frame = match session
         .recv_timeout(Duration::from_secs(5))
         .expect("GUI radio capture should produce an event")

@@ -2,8 +2,8 @@
 
 use crate::{
     discover_supported_devices, first_device_id_for_role, first_radio_id, mpsc,
-    normalize_radio_settings, selected_device_for_role, selected_radio, thread, DeviceRole,
-    DiscoveredDevice, HackRfAdapter, RadioRegistry, WorkerSuccess,
+    normalize_radio_settings, radio_registry, selected_device_for_role, selected_radio, thread,
+    DeviceRole, DiscoveredDevice, WorkerSuccess,
 };
 
 use crate::WaveCraftApp;
@@ -26,9 +26,7 @@ impl WaveCraftApp {
         self.status = "Discovering instruments…".to_owned();
         self.last_error = None;
         thread::spawn(move || {
-            let radio = RadioRegistry::new()
-                .with_adapter(HackRfAdapter::new())
-                .discover();
+            let radio = radio_registry().discover();
             let result = discover_supported_devices()
                 .map(|report| WorkerSuccess::Devices {
                     usb: report.devices,

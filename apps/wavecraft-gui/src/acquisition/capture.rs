@@ -2,17 +2,17 @@
 //! completed captures, and starting a capture on its worker.
 
 use crate::{
-    prepare_device, BufWriter, CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame,
-    CaptureSession, CaptureSource, CompletionStatus, DeviceId, DeviceModel, DiscoveredDevice,
-    DsCopeCalibrationValues, DsCopeCaptureConfig, DsCopeCaptureSource,
+    open_radio_source, prepare_device, BufWriter, CaptureBatch, CaptureCoordinator, CaptureEvent,
+    CaptureFrame, CaptureSession, CaptureSource, CompletionStatus, DeviceId, DeviceModel,
+    DiscoveredDevice, DsCopeCalibrationValues, DsCopeCaptureConfig, DsCopeCaptureSource,
     DsCopeRuntimeCalibrationControl, DsCopeRuntimeTriggerControl, DsCopeTriggerSource,
     DsLogicCaptureConfig, DsLogicCaptureSource, DsLogicOperationMode, Duration, File,
-    FileDecodedDataRecorder, HackRfAdapter, HackRfRuntimeControl, HashSet, Instant, LinkStatus,
-    LoadedRecording, LogicDecodeOutput, LogicDecodeWorker, Path, PathBuf, ProtocolAnalyzerInstance,
-    ProtocolCaptureDecoder, ProtocolDecodeSnapshot, RadioAnalyzerRuntime, RadioCaptureRequest,
-    RadioDiscoveryReport, RadioDspWorker, RadioProvider, RadioSingleTrigger, RecordingWriter,
-    SpectrumProcessor, SpectrumWindow, WaveformStore, DSCOPE_FRAME_SEQUENCE_STRIDE,
-    RADIO_SPECTRUM_FFT_LENGTH, SCOPE_HORIZONTAL_DIVISIONS, SCOPE_ROLLING_MEMORY_BUDGET_BYTES,
+    FileDecodedDataRecorder, HashSet, Instant, LinkStatus, LoadedRecording, LogicDecodeOutput,
+    LogicDecodeWorker, Path, PathBuf, ProtocolAnalyzerInstance, ProtocolCaptureDecoder,
+    ProtocolDecodeSnapshot, RadioAnalyzerRuntime, RadioCaptureRequest, RadioDiscoveryReport,
+    RadioDspWorker, RadioRuntimeControl, RadioSingleTrigger, RecordingWriter, SpectrumProcessor,
+    SpectrumWindow, WaveformStore, DSCOPE_FRAME_SEQUENCE_STRIDE, RADIO_SPECTRUM_FFT_LENGTH,
+    SCOPE_HORIZONTAL_DIVISIONS, SCOPE_ROLLING_MEMORY_BUDGET_BYTES,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -281,7 +281,7 @@ pub(crate) struct ActiveCapture {
     pub(crate) scope_config: DsCopeCaptureConfig,
     pub(crate) scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     pub(crate) scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
-    pub(crate) radio_runtime_control: Option<HackRfRuntimeControl>,
+    pub(crate) radio_runtime_control: Option<RadioRuntimeControl>,
     pub(crate) stopped: HashSet<DeviceId>,
     pub(crate) waveforms: WaveformStore,
     pub(crate) protocol_decode_snapshot: ProtocolDecodeSnapshot,
@@ -346,7 +346,7 @@ pub(crate) struct CaptureReady {
     pub(crate) scope_config: DsCopeCaptureConfig,
     pub(crate) scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     pub(crate) scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
-    pub(crate) radio_runtime_control: Option<HackRfRuntimeControl>,
+    pub(crate) radio_runtime_control: Option<RadioRuntimeControl>,
     pub(crate) radio_spectrum: SpectrumProcessor,
     pub(crate) radio_dsp: RadioDspWorker,
 }
@@ -375,7 +375,7 @@ pub(crate) struct StartedCapture {
     pub(crate) session: CaptureSession,
     pub(crate) scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     pub(crate) scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
-    pub(crate) radio_runtime_control: Option<HackRfRuntimeControl>,
+    pub(crate) radio_runtime_control: Option<RadioRuntimeControl>,
     pub(crate) radio_spectrum: SpectrumProcessor,
     pub(crate) radio_dsp: RadioDspWorker,
 }
@@ -454,24 +454,9 @@ pub(crate) fn start_capture(
         }
     }
     if let Some(request) = radio_request {
-        let source = match request.device.provider {
-            RadioProvider::HackRf => {
-                let (source, control) = HackRfAdapter::new()
-                    .open_with_runtime_control(
-                        &request.device,
-                        request.settings,
-                        request.provider_settings,
-                    )
-                    .map_err(|error| error.to_string())?;
-                radio_runtime_control = Some(control);
-                source
-            }
-            provider => {
-                return Err(format!(
-                    "capture is not implemented for the {provider:?} radio provider"
-                ));
-            }
-        };
+        let (source, control) =
+            open_radio_source(&request.device, request.settings, request.provider_settings)?;
+        radio_runtime_control = control;
         sources.push(source);
     }
     let radio_spectrum = SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?

@@ -5,15 +5,14 @@ use crate::{
     clears_completed_capture_on_start, decoded_data_recording_is_supported,
     finish_decoded_data_recording, finish_gui_recording, finish_logic_decode,
     ingest_active_capture_frame, ingest_logic_decode_output, ingest_radio_dsp_output, mpsc,
-    radio_gain_u32, radio_microsecond_sample_count, radio_single_sample_limit,
+    radio_microsecond_sample_count, radio_provider_settings, radio_single_sample_limit,
     record_decoded_radio_packets, record_decoded_raw_messages, repetitive_interval, selected_radio,
     should_rearm_acquisition, start_capture, thread, AcquisitionMode, ActiveCapture, CaptureBatch,
     CaptureEvent, CaptureFrame, CaptureReady, CaptureTarget, CompletedCapture, CompletionStatus,
-    DsLogicOperationMode, FileDecodedDataRecorder, HackRfSettings, Instant, PathBuf,
-    ProtocolAnalyzerInstance, ProtocolCaptureDecoder, ProtocolDecodeCache, RadioCaptureRequest,
-    RadioDataDecoderConfig, RadioDspWorker, RadioProvider, RadioProviderSettings,
-    RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache, WaveformStore,
-    WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
+    DsLogicOperationMode, FileDecodedDataRecorder, Instant, PathBuf, ProtocolAnalyzerInstance,
+    ProtocolCaptureDecoder, ProtocolDecodeCache, RadioCaptureRequest, RadioDataDecoderConfig,
+    RadioDspWorker, RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache,
+    WaveformStore, WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
 };
 
 use crate::WaveCraftApp;
@@ -403,20 +402,7 @@ impl WaveCraftApp {
         settings
             .validate(&device.capabilities)
             .map_err(|error| error.to_string())?;
-        let provider_settings = match device.provider {
-            RadioProvider::HackRf => RadioProviderSettings::HackRf(HackRfSettings {
-                lna_gain_db: radio_gain_u32(&self.radio_settings, "lna")?,
-                vga_gain_db: radio_gain_u32(&self.radio_settings, "vga")?,
-                amplifier_enabled: self.radio_settings.amplifier_enabled,
-                antenna_power_enabled: self.radio_settings.antenna_power_enabled,
-                frequency_correction_milli_ppm: self.radio_settings.frequency_correction_milli_ppm,
-            }),
-            provider => {
-                return Err(format!(
-                    "capture is not implemented for the {provider:?} radio provider"
-                ));
-            }
-        };
+        let provider_settings = radio_provider_settings(device.provider, &self.radio_settings)?;
         let analyzer_profiles = self.radio_settings.analyzer.signal_profiles()?;
         let analyzer_channel_names = (0..analyzer_profiles.len())
             .map(|index| self.radio_settings.analyzer.channel_name(index))

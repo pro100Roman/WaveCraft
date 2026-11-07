@@ -270,7 +270,7 @@ mod tests {
     #[test]
     #[ignore = "requires a connected HackRF One and installed libhackrf"]
     fn gui_hackrf_trigger_gate_stops_an_unbounded_single_capture() {
-        let adapter = HackRfAdapter::new();
+        let adapter = wavecraft_hackrf::HackRfAdapter::new();
         let device = adapter
             .discover()
             .expect("GUI HackRF discovery should succeed")
@@ -286,7 +286,9 @@ mod tests {
                 receive_channel: 0,
                 sample_limit: None,
             },
-            provider_settings: RadioProviderSettings::HackRf(HackRfSettings::default()),
+            provider_settings: RadioProviderSettings::HackRf(
+                wavecraft_sdr::HackRfSettings::default(),
+            ),
             iq_correction_enabled: true,
             analyzer_profiles: Vec::new(),
             analyzer_channel_names: Vec::new(),

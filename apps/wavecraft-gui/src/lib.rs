@@ -24,6 +24,7 @@ pub mod waveform;
 use acquisition::capture::*;
 use acquisition::logic::*;
 use acquisition::radio::*;
+use acquisition::radio_backend::*;
 use acquisition::scope::*;
 use capture_settings::{
     CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository,
@@ -108,14 +109,13 @@ use wavecraft_dsp::{
     BinaryFskProfile, BinaryGfskProfile, ChannelizerConfig, DemodulationProfile, FskPolarity,
     FskTiming, SignalAnalyzerProfile, SpectrumProcessor, SpectrumWindow,
 };
-use wavecraft_hackrf::{HackRfAdapter, HackRfRuntimeControl, HackRfRuntimeSettings};
 use wavecraft_recording::{
     read_saleae, write_saleae, CompletionStatus, RecordingReader, RecordingWriter,
     SaleaeAnalogChannel, SaleaeCapture, SaleaeChannel, SaleaeDigitalCapture,
 };
 use wavecraft_sdr::{
-    DiscoveredRadio, HackRfSettings, RadioCapabilities, RadioCaptureSettings, RadioDiscoveryReport,
-    RadioProvider, RadioProviderFailure, RadioProviderSettings, RadioRegistry, ValueDomain,
+    DiscoveredRadio, RadioCapabilities, RadioCaptureSettings, RadioDiscoveryReport, RadioProvider,
+    RadioProviderFailure, RadioProviderSettings, ValueDomain,
 };
 use wavecraft_usb::{
     apply_dscope_configuration, auto_calibrate_dscope_with_progress, discover_supported_devices,
@@ -647,13 +647,9 @@ impl WaveCraftApp {
                         .flatten()
                 });
             if let Some(runtime_control) = runtime_control {
-                let update_result =
-                    hackrf_runtime_settings(&self.radio_settings).and_then(|settings| {
-                        runtime_control.update(settings).map_err(|e| e.to_string())
-                    });
-                match update_result {
+                match runtime_control.update(&self.radio_settings) {
                     Ok(()) => {
-                        self.status = "Updating HackRF tuning during capture…".to_owned();
+                        self.status = runtime_control.update_status().to_owned();
                         self.last_error = None;
                     }
                     Err(error) => self.set_error(error),

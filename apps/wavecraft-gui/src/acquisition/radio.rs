@@ -4,11 +4,11 @@
 use crate::{
     AdditiveWhiteningConfig, BTreeMap, BinaryFskProfile, BinaryGfskProfile, BitOrder,
     BitTransformConfig, ChannelizerConfig, DemodulationProfile, DiscoveredRadio, FskPolarity,
-    FskTiming, HackRfRuntimeSettings, HashSet, RadioCapabilities, RadioCaptureSettings,
-    RadioDataDecoderConfig, RadioPacketFramerConfig, RadioPacketLength, RadioPacketPipelineConfig,
-    RadioProviderSettings, RadioSingleTriggerConfig, RawRadioConfig, SignalAnalyzerProfile,
-    SyncWordConfig, ValueDomain, WhiteningDirection, MAX_RADIO_ANALYZER_CHANNELS,
-    RADIO_SPECTRUM_FFT_LENGTH, RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS,
+    FskTiming, HashSet, RadioCapabilities, RadioCaptureSettings, RadioDataDecoderConfig,
+    RadioPacketFramerConfig, RadioPacketLength, RadioPacketPipelineConfig, RadioProviderSettings,
+    RadioSingleTriggerConfig, RawRadioConfig, SignalAnalyzerProfile, SyncWordConfig, ValueDomain,
+    WhiteningDirection, MAX_RADIO_ANALYZER_CHANNELS, RADIO_SPECTRUM_FFT_LENGTH,
+    RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS,
 };
 
 pub(crate) struct RadioCaptureRequest {
@@ -512,19 +512,6 @@ pub(crate) fn radio_trigger_level_runtime_controls_are_enabled(
     run_runtime_enabled || single_trigger_runtime_enabled
 }
 
-pub(crate) fn hackrf_runtime_settings(
-    settings: &RadioSettings,
-) -> Result<HackRfRuntimeSettings, String> {
-    Ok(HackRfRuntimeSettings {
-        center_frequency_hz: settings.capture.center_frequency_hz,
-        bandwidth_hz: settings.capture.bandwidth_hz,
-        lna_gain_db: radio_gain_u32(settings, "lna")?,
-        vga_gain_db: radio_gain_u32(settings, "vga")?,
-        amplifier_enabled: settings.amplifier_enabled,
-        frequency_correction_milli_ppm: settings.frequency_correction_milli_ppm,
-    })
-}
-
 pub(crate) fn radio_runtime_settings_differ(
     current: &RadioSettings,
     previous: &RadioSettings,
@@ -643,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn radio_runtime_settings_include_only_live_hackrf_controls() {
+    fn radio_runtime_settings_differ_only_for_live_controls() {
         let capabilities = wavecraft_hackrf::hackrf_one_capabilities();
         let mut initial = RadioSettings::default();
         normalize_radio_settings(&mut initial, &capabilities);
@@ -662,17 +649,6 @@ mod tests {
         edited.amplifier_enabled = true;
         edited.frequency_correction_milli_ppm = 12_500;
         assert!(radio_runtime_settings_differ(&edited, &initial));
-        assert_eq!(
-            hackrf_runtime_settings(&edited).unwrap(),
-            HackRfRuntimeSettings {
-                center_frequency_hz: 433_920_000,
-                bandwidth_hz: 8_000_000,
-                lna_gain_db: Some(24),
-                vga_gain_db: Some(20),
-                amplifier_enabled: true,
-                frequency_correction_milli_ppm: 12_500,
-            }
-        );
     }
 
     #[test]

@@ -4,4 +4,5 @@
 pub mod capture;
 pub mod logic;
 pub mod radio;
+pub mod radio_backend;
 pub mod scope;
