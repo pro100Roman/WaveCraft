@@ -2055,4 +2055,615 @@ mod tests {
         assert_eq!(loaded.capture.waveforms.scope_channels[0].len(), 4);
         assert!((loaded.capture.waveforms.scope_channels[0][2] - 1.0).abs() < 0.002);
     }
+
+    /// The settings `start_gui_recording` turns into session metadata. Tests
+    /// change what they care about and leave the rest at the defaults.
+    struct RecordingCase {
+        logic_config: DsLogicCaptureConfig,
+        logic_settings: LogicCaptureSettings,
+        scope_config: DsCopeCaptureConfig,
+        scope_settings: ScopeCaptureSettings,
+        radio_settings: RadioSettings,
+        logic_channel_names: [String; LOGIC_CHANNEL_COUNT],
+        scope_channel_names: [String; 2],
+    }
+
+    impl RecordingCase {
+        fn new() -> Self {
+            Self {
+                logic_config: DsLogicCaptureConfig::new(20_000_000, 65_536).unwrap(),
+                logic_settings: LogicCaptureSettings::default(),
+                scope_config: DsCopeCaptureConfig::new(1_000_000, 100_000).unwrap(),
+                scope_settings: ScopeCaptureSettings::default(),
+                radio_settings: RadioSettings::default(),
+                logic_channel_names: empty_logic_channel_names(),
+                scope_channel_names: empty_scope_channel_names(),
+            }
+        }
+
+        fn start(&self, path: &Path) -> Result<FileRecorder, String> {
+            let devices = [DeviceDescriptor {
+                id: wavecraft_core::DeviceId::new("test-device"),
+                name: "Test device".to_owned(),
+                kind: InstrumentKind::LogicAnalyzer,
+            }];
+            start_gui_recording(
+                path,
+                &devices,
+                GuiRecordingSettings {
+                    logic_config: self.logic_config,
+                    logic_settings: self.logic_settings,
+                    scope_config: self.scope_config,
+                    scope_settings: self.scope_settings,
+                    radio_settings: &self.radio_settings,
+                    logic_channel_names: &self.logic_channel_names,
+                    scope_channel_names: &self.scope_channel_names,
+                },
+            )
+        }
+
+        /// Records these settings to a new file and returns the metadata read
+        /// back from it.
+        fn recorded_metadata(&self, name: &str) -> BTreeMap<String, String> {
+            let path = crate::app::test_support::scratch_directory(name).join("capture.dsv");
+            let mut recorder = self.start(&path).unwrap();
+            recorder.finish(CompletionStatus::Complete).unwrap();
+            let reader = RecordingReader::new(BufReader::new(File::open(&path).unwrap())).unwrap();
+            reader.header().metadata.clone()
+        }
+    }
+
+    #[track_caller]
+    fn assert_recorded(metadata: &BTreeMap<String, String>, expected: &[(&str, &str)]) {
+        for (key, value) in expected {
+            assert_eq!(
+                metadata.get(*key).map(String::as_str),
+                Some(*value),
+                "metadata key {key}"
+            );
+        }
+    }
+
+    #[track_caller]
+    fn assert_not_recorded(metadata: &BTreeMap<String, String>, keys: &[&str]) {
+        for key in keys {
+            assert!(
+                !metadata.contains_key(*key),
+                "unexpected metadata key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_recording_never_replaces_an_existing_file() {
+        let directory = crate::app::test_support::scratch_directory("gui-recording-exists");
+        let path = directory.join("capture.dsv");
+        std::fs::write(&path, b"keep me").unwrap();
+
+        let error = RecordingCase::new()
+            .start(&path)
+            .err()
+            .expect("an existing file must not be replaced");
+
+        assert!(
+            error.contains("without overwriting an existing file"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn a_recording_names_the_gui_as_its_source_and_lists_the_devices() {
+        let case = RecordingCase::new();
+        let path =
+            crate::app::test_support::scratch_directory("gui-recording-source").join("capture.dsv");
+        let mut recorder = case.start(&path).unwrap();
+        recorder.finish(CompletionStatus::Complete).unwrap();
+
+        let reader = RecordingReader::new(BufReader::new(File::open(&path).unwrap())).unwrap();
+
+        assert_eq!(reader.header().devices.len(), 1);
+        assert_eq!(reader.header().devices[0].name, "Test device");
+        assert_recorded(&reader.header().metadata, &[("capture.command", "gui")]);
+    }
+
+    #[test]
+    fn logic_capture_options_are_recorded() {
+        let mut case = RecordingCase::new();
+        let mut channels = [false; 16];
+        channels[0] = true;
+        channels[3] = true;
+        case.logic_config = DsLogicCaptureConfig::new(20_000_000, 65_536)
+            .unwrap()
+            .with_operation_mode(DsLogicOperationMode::Stream)
+            .with_stop_option(DsLogicStopOption::StopImmediately)
+            .with_threshold_voltage(1.8)
+            .unwrap()
+            .with_input_filter(DsLogicInputFilter::OneSampleClock)
+            .with_rle_enabled(true)
+            .with_external_clock(true)
+            .with_falling_clock_edge(true)
+            .with_enabled_channels(channels)
+            .unwrap();
+        case.logic_settings.maximum_heights[3] = 77;
+
+        let metadata = case.recorded_metadata("gui-recording-logic");
+
+        assert_recorded(
+            &metadata,
+            &[
+                ("logic.sample_rate_hz", "20000000"),
+                ("logic.sample_count", "65536"),
+                ("logic.operation_mode", "stream"),
+                ("logic.stop_option", "stop_immediately"),
+                ("logic.threshold_voltage", "1.8"),
+                ("logic.input_filter", "one_sample_clock"),
+                ("logic.rle_enabled", "true"),
+                ("logic.external_clock", "true"),
+                ("logic.falling_clock_edge", "true"),
+                ("logic.ch0.enabled", "true"),
+                ("logic.ch1.enabled", "false"),
+                ("logic.ch3.enabled", "true"),
+                ("logic.ch3.maximum_height", "77"),
+                ("logic.ch15.enabled", "false"),
+                ("logic.trigger.enabled", "false"),
+            ],
+        );
+        assert_not_recorded(
+            &metadata,
+            &[
+                "logic.trigger.mode",
+                "logic.trigger.channel",
+                "logic.trigger.condition",
+                "logic.trigger.stage_count",
+                "logic.ch16.enabled",
+            ],
+        );
+    }
+
+    #[test]
+    fn every_logic_option_is_recorded_under_its_own_name() {
+        for (mode, name) in [
+            (DsLogicOperationMode::Buffer, "buffer"),
+            (DsLogicOperationMode::Stream, "stream"),
+            (DsLogicOperationMode::InternalTest, "internal_test"),
+        ] {
+            let mut case = RecordingCase::new();
+            case.logic_config = case.logic_config.with_operation_mode(mode);
+            let metadata = case.recorded_metadata("gui-recording-logic-mode");
+            assert_recorded(&metadata, &[("logic.operation_mode", name)]);
+        }
+        for (stop, name) in [
+            (DsLogicStopOption::StopImmediately, "stop_immediately"),
+            (
+                DsLogicStopOption::UploadCapturedData,
+                "upload_captured_data",
+            ),
+        ] {
+            let mut case = RecordingCase::new();
+            case.logic_config = case.logic_config.with_stop_option(stop);
+            let metadata = case.recorded_metadata("gui-recording-logic-stop");
+            assert_recorded(&metadata, &[("logic.stop_option", name)]);
+        }
+        for (filter, name) in [
+            (DsLogicInputFilter::None, "none"),
+            (DsLogicInputFilter::OneSampleClock, "one_sample_clock"),
+        ] {
+            let mut case = RecordingCase::new();
+            case.logic_config = case.logic_config.with_input_filter(filter);
+            let metadata = case.recorded_metadata("gui-recording-logic-filter");
+            assert_recorded(&metadata, &[("logic.input_filter", name)]);
+        }
+        for (condition, name) in [
+            (DsLogicTriggerCondition::Low, "low"),
+            (DsLogicTriggerCondition::High, "high"),
+            (DsLogicTriggerCondition::RisingEdge, "rising_edge"),
+            (DsLogicTriggerCondition::FallingEdge, "falling_edge"),
+            (DsLogicTriggerCondition::EitherEdge, "either_edge"),
+        ] {
+            let mut case = RecordingCase::new();
+            let trigger = DsLogicSimpleTrigger::new(4, condition).unwrap();
+            case.logic_config = case
+                .logic_config
+                .with_trigger(Some(DsLogicTriggerConfig::Simple(trigger)));
+            let metadata = case.recorded_metadata("gui-recording-logic-condition");
+            assert_recorded(&metadata, &[("logic.trigger.ch4.condition", name)]);
+        }
+    }
+
+    #[test]
+    fn a_simple_trigger_records_every_condition_and_keeps_the_one_channel_keys() {
+        let mut case = RecordingCase::new();
+        let trigger = DsLogicSimpleTrigger::new(5, DsLogicTriggerCondition::RisingEdge)
+            .unwrap()
+            .with_channel_condition(2, DsLogicTriggerCondition::Low)
+            .unwrap()
+            .with_channel_condition(9, DsLogicTriggerCondition::EitherEdge)
+            .unwrap();
+        case.logic_config = case
+            .logic_config
+            .with_trigger(Some(DsLogicTriggerConfig::Simple(trigger)));
+
+        let metadata = case.recorded_metadata("gui-recording-simple-trigger");
+
+        assert_recorded(
+            &metadata,
+            &[
+                ("logic.trigger.enabled", "true"),
+                ("logic.trigger.mode", "simple"),
+                ("logic.trigger.ch2.condition", "low"),
+                ("logic.trigger.ch5.condition", "rising_edge"),
+                ("logic.trigger.ch9.condition", "either_edge"),
+                // Older readers know only one condition: the lowest channel.
+                ("logic.trigger.channel", "2"),
+                ("logic.trigger.condition", "low"),
+            ],
+        );
+        assert_not_recorded(
+            &metadata,
+            &[
+                "logic.trigger.ch3.condition",
+                "logic.trigger.stage_count",
+                "logic.trigger.stage0.ch2.condition",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_smart_trigger_records_the_conditions_of_each_stage() {
+        let mut case = RecordingCase::new();
+        let first = DsLogicTriggerStage::new(1, DsLogicTriggerCondition::High).unwrap();
+        let second = DsLogicTriggerStage::new(0, DsLogicTriggerCondition::FallingEdge)
+            .unwrap()
+            .with_channel_condition(4, DsLogicTriggerCondition::Low)
+            .unwrap();
+        let trigger = DsLogicSmartTrigger::new(first).with_stage(second).unwrap();
+        case.logic_config = case
+            .logic_config
+            .with_trigger(Some(DsLogicTriggerConfig::Smart(trigger)));
+
+        let metadata = case.recorded_metadata("gui-recording-smart-trigger");
+
+        assert_recorded(
+            &metadata,
+            &[
+                ("logic.trigger.enabled", "true"),
+                ("logic.trigger.mode", "smart"),
+                ("logic.trigger.stage_count", "2"),
+                ("logic.trigger.stage0.ch1.condition", "high"),
+                ("logic.trigger.stage1.ch0.condition", "falling_edge"),
+                ("logic.trigger.stage1.ch4.condition", "low"),
+            ],
+        );
+        assert_not_recorded(
+            &metadata,
+            &[
+                "logic.trigger.stage0.ch0.condition",
+                "logic.trigger.stage2.ch1.condition",
+                "logic.trigger.channel",
+                "logic.trigger.condition",
+                "logic.trigger.ch1.condition",
+            ],
+        );
+    }
+
+    #[test]
+    fn channel_names_are_recorded_trimmed() {
+        let mut case = RecordingCase::new();
+        case.logic_channel_names[2] = "  Clock  ".to_owned();
+        case.scope_channel_names[1] = " Probe ".to_owned();
+
+        let metadata = case.recorded_metadata("gui-recording-names");
+
+        assert_recorded(
+            &metadata,
+            &[("logic.ch2.name", "Clock"), ("scope.ch1.name", "Probe")],
+        );
+    }
+
+    #[test]
+    fn the_scope_trigger_is_recorded() {
+        let mut case = RecordingCase::new();
+        let trigger = DsCopeTriggerConfig::new(
+            DsCopeTriggerSource::ChannelZeroAndOne,
+            DsCopeTriggerSlope::Falling,
+        )
+        .with_position_percent(30)
+        .unwrap()
+        .with_auto_channel(1)
+        .unwrap()
+        .with_holdoff_ns(2_500)
+        .unwrap()
+        .with_noise_sensitivity(7)
+        .unwrap()
+        .with_levels([100, 150])
+        .unwrap();
+        case.scope_config = DsCopeCaptureConfig::new(2_000_000, 50_000)
+            .unwrap()
+            .with_trigger_config(trigger)
+            .unwrap();
+
+        let metadata = case.recorded_metadata("gui-recording-scope-trigger");
+
+        assert_recorded(
+            &metadata,
+            &[
+                ("scope.sample_rate_hz", "2000000"),
+                ("scope.sample_count", "50000"),
+                ("scope.trigger.position_percent", "30"),
+                ("scope.trigger.source", "ch0_and_ch1"),
+                ("scope.trigger.auto_channel", "1"),
+                ("scope.trigger.slope", "falling"),
+                ("scope.trigger.holdoff_ns", "2500"),
+                ("scope.trigger.noise_sensitivity", "7"),
+                ("scope.trigger.level", "100"),
+                ("scope.trigger.ch0.level", "100"),
+                ("scope.trigger.ch1.level", "150"),
+            ],
+        );
+    }
+
+    #[test]
+    fn every_scope_trigger_source_and_slope_is_recorded_under_its_own_name() {
+        for (source, name) in [
+            (DsCopeTriggerSource::Auto, "auto"),
+            (DsCopeTriggerSource::ChannelZero, "ch0"),
+            (DsCopeTriggerSource::ChannelOne, "ch1"),
+            (DsCopeTriggerSource::ChannelZeroAndOne, "ch0_and_ch1"),
+            (DsCopeTriggerSource::ChannelZeroOrOne, "ch0_or_ch1"),
+        ] {
+            let mut case = RecordingCase::new();
+            let trigger = DsCopeTriggerConfig::new(source, DsCopeTriggerSlope::Rising);
+            case.scope_config = case.scope_config.with_trigger_config(trigger).unwrap();
+            let metadata = case.recorded_metadata("gui-recording-scope-source");
+            assert_recorded(&metadata, &[("scope.trigger.source", name)]);
+        }
+        for (slope, name) in [
+            (DsCopeTriggerSlope::Rising, "rising"),
+            (DsCopeTriggerSlope::Falling, "falling"),
+        ] {
+            let mut case = RecordingCase::new();
+            let trigger = DsCopeTriggerConfig::new(DsCopeTriggerSource::Auto, slope);
+            case.scope_config = case.scope_config.with_trigger_config(trigger).unwrap();
+            let metadata = case.recorded_metadata("gui-recording-scope-slope");
+            assert_recorded(&metadata, &[("scope.trigger.slope", name)]);
+        }
+    }
+
+    #[test]
+    fn scope_channel_settings_are_recorded_per_channel() {
+        let mut case = RecordingCase::new();
+        case.scope_settings.channels[0].enabled = false;
+        case.scope_settings.channels[0].volts_per_div_mv = 200;
+        case.scope_settings.channels[0].coupling = DsCopeCoupling::Ac;
+        case.scope_settings.channels[0].probe_attenuation = 10;
+        case.scope_settings.channels[0].vertical_offset = 99;
+        case.scope_settings.channels[1].volts_per_div_mv = 50;
+        case.scope_settings.channels[1].coupling = DsCopeCoupling::Dc;
+
+        let metadata = case.recorded_metadata("gui-recording-scope-channels");
+
+        assert_recorded(
+            &metadata,
+            &[
+                ("scope.ch0.enabled", "false"),
+                ("scope.ch0.volts_per_div_mv", "200"),
+                ("scope.ch0.coupling", "ac"),
+                ("scope.ch0.probe_attenuation", "10"),
+                ("scope.ch0.vertical_offset", "99"),
+                ("scope.ch1.enabled", "true"),
+                ("scope.ch1.volts_per_div_mv", "50"),
+                ("scope.ch1.coupling", "dc"),
+            ],
+        );
+    }
+
+    #[test]
+    fn radio_capture_settings_are_recorded() {
+        let mut case = RecordingCase::new();
+        let radio = &mut case.radio_settings;
+        radio.capture.center_frequency_hz = 868_300_000;
+        radio.capture.sample_rate_hz = 2_000_000;
+        radio.capture.bandwidth_hz = 1_750_000;
+        radio.capture.receive_channel = 1;
+        radio.single_duration_millis = 1_500;
+        radio.trigger_enabled = true;
+        radio.trigger_posttrigger_micros = 250;
+        radio.trigger_level_dbfs_tenths = -425;
+        radio.frequency_correction_milli_ppm = -1_200;
+        radio.iq_correction_enabled = true;
+        radio.amplifier_enabled = true;
+        radio.antenna_power_enabled = true;
+        radio.gains_db.clear();
+        radio.gains_db.insert("lna".to_owned(), 24);
+        radio.gains_db.insert("vga".to_owned(), 16);
+
+        let metadata = case.recorded_metadata("gui-recording-radio");
+
+        assert_recorded(
+            &metadata,
+            &[
+                ("radio.center_frequency_hz", "868300000"),
+                ("radio.sample_rate_hz", "2000000"),
+                ("radio.bandwidth_hz", "1750000"),
+                ("radio.receive_channel", "1"),
+                ("radio.single_duration_millis", "1500"),
+                ("radio.trigger_enabled", "true"),
+                ("radio.trigger_posttrigger_micros", "250"),
+                ("radio.trigger_level_dbfs_tenths", "-425"),
+                ("radio.frequency_correction_milli_ppm", "-1200"),
+                ("radio.iq_correction_enabled", "true"),
+                ("radio.amplifier_enabled", "true"),
+                ("radio.antenna_power_enabled", "true"),
+                ("radio.gain.lna_db", "24"),
+                ("radio.gain.vga_db", "16"),
+            ],
+        );
+        assert_not_recorded(&metadata, &["radio.gain.amp_db"]);
+    }
+
+    #[test]
+    fn the_radio_analyzer_is_recorded_with_its_demodulation_and_whitening() {
+        let mut case = RecordingCase::new();
+        let analyzer = &mut case.radio_settings.analyzer;
+        analyzer.demodulation = RadioDemodulation::BinaryGfsk;
+        analyzer.channel_bandwidth_hz = 150_000;
+        analyzer.output_sample_rate_hz = 400_000;
+        analyzer.filter_tap_count = 129;
+        analyzer.symbol_rate_hz = 38_400;
+        analyzer.deviation_hz = 20_000;
+        analyzer.gfsk_bt_milli = 300;
+        analyzer.inverted = true;
+        analyzer.adaptive_timing = false;
+        analyzer.timing_loop_bandwidth_milli = 80;
+        analyzer.max_clock_error_ppm = 5_000;
+        analyzer.data_mode = RadioDataMode::Packets;
+        analyzer.preamble_byte = 0xaa;
+        analyzer.preamble_bytes = 4;
+        analyzer.sync_word = 0x2d_d4;
+        analyzer.sync_word_bytes = 2;
+        analyzer.maximum_preamble_bit_errors = 1;
+        analyzer.minimum_bit_confidence_milli = 600;
+        analyzer.maximum_uncertain_bits = 3;
+        analyzer.whitening_enabled = true;
+        analyzer.whitening_preset = RadioWhiteningPreset::Pn9X9X5;
+        analyzer.whitening_width = 9;
+        analyzer.whitening_polynomial = 0x21;
+        analyzer.whitening_seed = 0x1ff;
+        analyzer.whitening_direction = WhiteningDirection::ShiftLeft;
+        analyzer.whitening_invert_output = true;
+        analyzer.whitening_start_bit = 8;
+        analyzer.whitening_end_bit = Some(120);
+        analyzer.whitening_advance_excluded_bits = true;
+
+        let metadata = case.recorded_metadata("gui-recording-analyzer");
+
+        assert_recorded(
+            &metadata,
+            &[
+                ("radio.analyzer.enabled", "true"),
+                ("radio.analyzer.demodulation", "gfsk2"),
+                ("radio.analyzer.channel_bandwidth_hz", "150000"),
+                ("radio.analyzer.output_sample_rate_hz", "400000"),
+                ("radio.analyzer.filter_tap_count", "129"),
+                ("radio.analyzer.symbol_rate_hz", "38400"),
+                ("radio.analyzer.deviation_hz", "20000"),
+                ("radio.analyzer.gfsk_bt_milli", "300"),
+                ("radio.analyzer.inverted", "true"),
+                ("radio.analyzer.adaptive_timing", "false"),
+                ("radio.analyzer.timing_loop_bandwidth_milli", "80"),
+                ("radio.analyzer.max_clock_error_ppm", "5000"),
+                ("radio.analyzer.data_mode", "packets"),
+                ("radio.analyzer.preamble_byte", "170"),
+                ("radio.analyzer.preamble_bytes", "4"),
+                ("radio.analyzer.sync_word", "11732"),
+                ("radio.analyzer.sync_word_bytes", "2"),
+                ("radio.analyzer.maximum_preamble_bit_errors", "1"),
+                ("radio.analyzer.minimum_bit_confidence_milli", "600"),
+                ("radio.analyzer.maximum_uncertain_bits", "3"),
+                ("radio.analyzer.whitening_enabled", "true"),
+                ("radio.analyzer.whitening_preset", "pn9_x9_x5"),
+                ("radio.analyzer.whitening_width", "9"),
+                ("radio.analyzer.whitening_polynomial", "33"),
+                ("radio.analyzer.whitening_seed", "511"),
+                ("radio.analyzer.whitening_direction", "left"),
+                ("radio.analyzer.whitening_invert_output", "true"),
+                ("radio.analyzer.whitening_start_bit", "8"),
+                ("radio.analyzer.whitening_end_bit", "120"),
+                ("radio.analyzer.whitening_advance_excluded_bits", "true"),
+            ],
+        );
+    }
+
+    #[test]
+    fn radio_analyzer_options_are_recorded_under_their_own_names() {
+        for (demodulation, name, enabled) in [
+            (RadioDemodulation::None, "none", "false"),
+            (RadioDemodulation::BinaryFsk, "fsk2", "true"),
+            (RadioDemodulation::BinaryGfsk, "gfsk2", "true"),
+        ] {
+            let mut case = RecordingCase::new();
+            case.radio_settings.analyzer.demodulation = demodulation;
+            let metadata = case.recorded_metadata("gui-recording-analyzer-demodulation");
+            assert_recorded(
+                &metadata,
+                &[
+                    ("radio.analyzer.demodulation", name),
+                    ("radio.analyzer.enabled", enabled),
+                ],
+            );
+        }
+        for (mode, name) in [
+            (RadioDataMode::Raw, "raw"),
+            (RadioDataMode::Packets, "packets"),
+        ] {
+            let mut case = RecordingCase::new();
+            case.radio_settings.analyzer.data_mode = mode;
+            let metadata = case.recorded_metadata("gui-recording-analyzer-mode");
+            assert_recorded(&metadata, &[("radio.analyzer.data_mode", name)]);
+        }
+        for (direction, name) in [
+            (WhiteningDirection::ShiftRight, "right"),
+            (WhiteningDirection::ShiftLeft, "left"),
+        ] {
+            let mut case = RecordingCase::new();
+            case.radio_settings.analyzer.whitening_direction = direction;
+            let metadata = case.recorded_metadata("gui-recording-analyzer-direction");
+            assert_recorded(&metadata, &[("radio.analyzer.whitening_direction", name)]);
+        }
+        for (preset, name) in [
+            (RadioWhiteningPreset::Custom, "custom"),
+            (RadioWhiteningPreset::Pn9X9X5, "pn9_x9_x5"),
+        ] {
+            let mut case = RecordingCase::new();
+            case.radio_settings.analyzer.whitening_preset = preset;
+            let metadata = case.recorded_metadata("gui-recording-analyzer-preset");
+            assert_recorded(&metadata, &[("radio.analyzer.whitening_preset", name)]);
+        }
+        let mut case = RecordingCase::new();
+        case.radio_settings.analyzer.whitening_end_bit = None;
+        let metadata = case.recorded_metadata("gui-recording-analyzer-end-bit");
+        assert_recorded(&metadata, &[("radio.analyzer.whitening_end_bit", "none")]);
+    }
+
+    #[test]
+    fn the_radio_analyzer_channel_list_is_recorded_with_the_first_offset_as_the_legacy_key() {
+        let mut case = RecordingCase::new();
+        case.radio_settings.analyzer.channels = vec![
+            RadioAnalyzerChannelSettings {
+                name: "Uplink".to_owned(),
+                frequency_offset_hz: -200_000,
+            },
+            RadioAnalyzerChannelSettings {
+                name: "Downlink".to_owned(),
+                frequency_offset_hz: 200_000,
+            },
+        ];
+
+        let metadata = case.recorded_metadata("gui-recording-analyzer-channels");
+
+        assert_recorded(
+            &metadata,
+            &[
+                ("radio.analyzer.channel_count", "2"),
+                ("radio.analyzer.channel.0.offset_hz", "-200000"),
+                ("radio.analyzer.channel.0.name", "Uplink"),
+                ("radio.analyzer.channel.1.offset_hz", "200000"),
+                ("radio.analyzer.channel.1.name", "Downlink"),
+                ("radio.analyzer.channel_offset_hz", "-200000"),
+            ],
+        );
+        assert_not_recorded(&metadata, &["radio.analyzer.channel.2.name"]);
+
+        case.radio_settings.analyzer.channels.clear();
+        let metadata = case.recorded_metadata("gui-recording-analyzer-no-channels");
+        assert_recorded(
+            &metadata,
+            &[
+                ("radio.analyzer.channel_count", "0"),
+                ("radio.analyzer.channel_offset_hz", "0"),
+            ],
+        );
+        assert_not_recorded(&metadata, &["radio.analyzer.channel.0.name"]);
+    }
 }
