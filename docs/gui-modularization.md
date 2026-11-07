@@ -64,13 +64,34 @@ moved into these modules, mostly unchanged apart from `pub(crate)` visibility:
 - `format.rs`, `process_stats.rs`, `protocol_decode_cache.rs`, `recording.rs`,
   `recording_metadata.rs`, `sessions.rs`, `devices.rs`, `snapshot.rs`.
 
-Moving code did not shorten the long functions inside it. The longest ones now
-are `paint_capture_settings` (815 lines), `paint_radio_analyzer_configuration`
-(647), `paint_central_panel` (511, moved verbatim out of `update`),
-`start_gui_recording` (435), and `paint_scope_time_domain` (397). They are in
-the right module but still need to be split. Next come `paint_raw_messages`
-(369), `paint_radio_receive_configuration` (293), `paint_logic` (282), and
-`paint_session_tabs` (272); `begin_capture` is 163.
+Moving code did not shorten the long functions inside it, so they are being
+split one at a time. Done so far, with the length before and after: `paint_capture_settings`
+(815 to 60 lines, `7b10dc5`), `paint_radio_analyzer_configuration` (647 to 30,
+`64d2ab9`), `paint_central_panel` (511 to 29, `346b2ad`), `start_gui_recording`
+(435 to 18, `65dcc32`), `paint_scope_time_domain` (397 to 131, `a1f97bf`),
+`paint_raw_messages` (369 to 60, `13df215`), `paint_radio_receive_configuration`
+(293 to 51, `ec489c5`), and `paint_logic` (282 to 140, `906ced9`). The two
+orchestrators that are still over 100 lines, `paint_logic` and
+`paint_scope_time_domain`, can be cut further. The longest remaining functions
+are `paint_session_tabs` (272), `paint_scope_markers` (199), the two protocol
+analyzer dialog functions (191 and 181), `paint_scope_marker_editor` (185),
+`paint_toolbar` (182), `paint_capture_setup_panel` (173), `paint_analysis`
+(172), `paint_spectrum` (167), `begin_capture` (163), and
+`paint_scope_function_settings` (151). `protocol_channels` (a data table) and
+`calculate_scope_measurements` (a pure calculation) are long but are not paint
+code.
+
+How each split was checked: before the change, a temporary test painted the
+function over a few hundred randomized frame sequences (pointer moves, clicks,
+drags, wheel, typed text) and hashed every egui shape and the resulting state; the
+same test passed with identical hashes after the split, and was then deleted. Each new
+piece was then mutated (one condition or constant changed at a time) to see that
+either that test or a permanent unit test fails. The permanent tests drive the
+panels with pointer and key events where that is the only way to reach the
+behavior, and call pure functions directly where a piece turned out to be pure
+logic. What the splits do not do: they keep the bodies verbatim, so repeated
+patterns (for example the four value-and-unit drag fields in the radio receive
+panel) are still repeated. They also keep the runtime behavior and speed the same.
 
 Two have been split. `poll_worker` (487 lines) is now a 40-line
 dispatcher over `WorkerSuccess` plus one `handle_*` method per result that does
@@ -591,15 +612,17 @@ Follow-up steps for the GUI structure. They are independent of steps 11 and 12
 and should not change behavior:
 
 13. Split the long functions inside the moved code, one behavior-preserving
-    change each: `paint_capture_settings` (815 lines),
-    `paint_radio_analyzer_configuration` (647), `paint_central_panel` (511),
-    `start_gui_recording` (435), `paint_scope_time_domain` (397),
-    `paint_raw_messages` (369), `paint_radio_receive_configuration` (293),
-    `paint_logic` (282), and `paint_session_tabs` (272), then `begin_capture`
-    (163) and the other long functions. Where a piece turns out to be pure logic,
-    give it a unit test. *(partial: `poll_worker` (487, one handler per `WorkerSuccess`
-    variant) and `poll_capture_target` (383, polling separate from finishing)
-    are done; the others are not.)*
+    change each. Where a piece turns out to be pure logic, give it a unit test.
+    *(partial. Done: `poll_worker` (487, one handler per `WorkerSuccess` variant),
+    `poll_capture_target` (383, polling separate from finishing),
+    `paint_capture_settings`, `paint_radio_analyzer_configuration`,
+    `paint_central_panel`, `start_gui_recording`, `paint_scope_time_domain`,
+    `paint_raw_messages`, `paint_radio_receive_configuration`, and `paint_logic`.
+    Not done: `paint_session_tabs` (272), `paint_scope_markers` (199),
+    `paint_protocol_analyzer_settings` (191), `paint_scope_marker_editor` (185),
+    `paint_toolbar` (182), `paint_protocol_analyzer_modal` (181),
+    `paint_capture_setup_panel` (173), `paint_analysis` (172), `paint_spectrum`
+    (167), `begin_capture` (163), and `paint_scope_function_settings` (151).)*
 14. Narrow what the panels can reach. Group the 77 fields of `WaveCraftApp`
     into per-area state structs (for example logic, scope, radio, capture,
     dialogs) and make each panel take the group it edits, plus `&FrameState`
