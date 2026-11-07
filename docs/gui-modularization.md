@@ -25,7 +25,7 @@ Reviewed 2026-11-07 against commit `65f909f`.
 
 `apps/wavecraft-gui/src/main.rs` is now only the native entry point
 (`wavecraft_gui::run()`). The application lives in the library crate, and
-`src/lib.rs` is still about 24,000 lines (roughly 14,000 of production code)
+`src/lib.rs` is still about 23,000 lines (roughly 13,000 of production code)
 with `update` alone near 1,900 lines. The earlier description of the file below
 therefore applies to `lib.rs` today.
 
@@ -33,7 +33,7 @@ therefore applies to `lib.rs` today.
 | ---- | ----- | ----- |
 | 1. Snapshot utilities | Done | `snapshot.rs` holds image cropping and PNG persistence with its tests. The in-app capture flow (`finish_pending_snapshot`) stays in `lib.rs`. |
 | 2. Generic session tabs | Done | `sessions.rs` holds the generic `SessionTab`. One session-tab test (`session_tabs_preserve_selected_device_ids`) remains in `lib.rs`. |
-| 3. Recording and Saleae | Partial | `recording.rs` holds path selection, decoded-data JSON Lines I/O, and Saleae export file handling. `start_gui_recording`, `read_gui_recording*`, and the `*_settings_metadata` / `*_from_recording_metadata` functions are still in `lib.rs`. |
+| 3. Recording and Saleae | Partial | `recording.rs` holds path selection, decoded-data JSON Lines I/O, and Saleae export file handling. `recording_metadata.rs` holds the `saved_*_settings_metadata` / `*_settings_from_recording_metadata` mapping between capture settings and `.dsv` metadata. `start_gui_recording` and `read_gui_recording*` are still in `lib.rs`. |
 | 4. Devices | Partial | `devices.rs` holds selection helpers and the USB speed warning. Discovery and refresh orchestration (`discover_supported_devices`, `poll_worker`) are still in `lib.rs`. |
 | 5. Waveform store and viewport | Not started | `waveform/mod.rs` contains only `pub mod radio;`. |
 | 6. Logic rendering, markers, protocol lanes | Not started | `paint_logic*` functions are in `lib.rs`. |

@@ -1,11 +1,12 @@
 # Code health review and improvement backlog
 
-Status: proposed. Reviewed 2026-11-07 against commit `65f909f`; line numbers
-below refer to that commit and will drift.
+Status: in progress. Reviewed 2026-11-07 against commit `65f909f`; line numbers
+in the findings below refer to that commit and will drift. See
+[Progress](#progress) for what has been done since.
 
-This document records a read-only review of the workspace and a ranked list of
-improvements. It does not change behavior. Items describe what was verified and
-what was not, so that each can be confirmed before work starts.
+This document records a review of the workspace and a ranked list of
+improvements. The findings describe what was verified and what was not, so that
+each can be confirmed before work starts.
 
 ## Baseline
 
@@ -24,9 +25,33 @@ Areas reviewed and found sound, which need no change:
   capture failure instead of silently dropping IQ. The FFI code carries SAFETY
   comments.
 
+## Progress
+
+Each item below was fixed in its own commit on the `chore/code-health-improvements`
+branch. Formatting, Clippy, and the tests for the touched crates were run after
+each step. At the end of the series the full CI command set passed: `cargo fmt
+--all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo
+test --workspace` (538 tests), `cargo build --workspace --release --locked`, the
+Python client tests, and `cargo +1.79.0 check --workspace --locked`.
+
+| Item | State |
+| ---- | ----- |
+| 1. Per-frame analyzer copies | Done. Custom protocols are shared through `Arc`; the decode cache compares its key in place and shares outcomes through `Arc`. Not profiled: frame time was not measured before or after. |
+| 2. Large `lib.rs` | Started. The recording-metadata mapping moved to `recording_metadata.rs` (about 1,000 lines). `update` and the other long functions remain, along with migration steps 5-8 in [GUI modularization](gui-modularization.md). |
+| 3. Hand-written metadata mapping | Partly done. The functions moved into one module, and a new test round-trips every `RadioSettings` field (logic and scope already did). The single key table that drives both directions was not built. |
+| 4. Copied USB helpers | Done for the six identical helpers (`driver_util.rs`). The queued-read bookkeeping in the two drivers was not compared or merged. |
+| 5. Panics in production code | Done for `crates/`. About 45 sites were removed (the count of "about 20" below was low because the scan stopped at the first `#[cfg(test)]`), and `clippy::unwrap_used` and `clippy::expect_used` are now enforced there. Not done: the apps, which still have about a dozen `unwrap`/`expect` and a few `unreachable!` in `wavecraft-gui` and one `expect` in the CLI. |
+| 6. Smaller items | `serde` and `serde_json` now come from `[workspace.dependencies]`. The CI changes (duplicate runs, cache, audit) were not made: they change release-pipeline behavior and cannot be verified locally, so they need a decision. |
+
+Two fixes could not be fully covered by tests. The USB driver changes only convert
+unreachable states into errors, so no test drives those states, and the
+`discover_for_selector` retry loop in `wavecraft-automation` has no direct test;
+its behavior (number of discovery calls and sleeps) was checked by reading.
+
 ## Improvements
 
 Ordered by value for effort. Each entry lists the evidence and the intended fix.
+These are the findings as originally written, before any of the work above.
 
 ### 1. Per-frame deep copies of protocol-analyzer state in the GUI
 
