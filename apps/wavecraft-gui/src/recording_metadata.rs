@@ -3,6 +3,13 @@
 //! The metadata keys written here are part of the recording format (see
 //! `docs/recording-format.md`). Renaming a key or dropping a legacy fallback
 //! makes older recordings reopen with default settings.
+//!
+//! Most settings are described once, in a [`MetadataField`] or
+//! [`ChannelField`] table entry, and that entry drives both saving and loading,
+//! so a key cannot be written under one name and read under another. Settings
+//! whose encoding depends on other keys are kept as hand-written code next to
+//! the tables and are marked as such: the logic trigger, the radio analyzer's
+//! channel list and gains, and the legacy radio analyzer flag.
 
 use super::{
     coupling_label, logic_trigger_condition_key, normalized_channel_name,
@@ -49,6 +56,601 @@ pub(crate) fn parse_logic_acquisition_mode(value: &str) -> Option<AcquisitionMod
     }
 }
 
+/// One persisted setting: the key it is stored under and how to write and read
+/// it. `load` ignores values that fail to parse or fall outside the allowed
+/// range, leaving the default in place.
+struct MetadataField<S> {
+    key: &'static str,
+    save: fn(&S) -> String,
+    load: fn(&mut S, &str),
+}
+
+/// A persisted setting that exists once per channel. `key` builds the key for a
+/// channel index.
+struct ChannelField<S> {
+    key: fn(usize) -> String,
+    save: fn(&S, usize) -> String,
+    load: fn(&mut S, usize, &str),
+}
+
+/// A field that is stored as `Display` text and read back with `FromStr`.
+macro_rules! parsed_field {
+    ($key:literal, $($path:ident).+) => {
+        MetadataField {
+            key: $key,
+            save: |settings| settings.$($path).+.to_string(),
+            load: |settings, value| {
+                if let Ok(parsed) = value.parse() {
+                    settings.$($path).+ = parsed;
+                }
+            },
+        }
+    };
+}
+
+fn write_fields<S>(
+    metadata: &mut BTreeMap<String, String>,
+    settings: &S,
+    fields: &[MetadataField<S>],
+) {
+    for field in fields {
+        metadata.insert(field.key.to_owned(), (field.save)(settings));
+    }
+}
+
+fn read_fields<S>(
+    settings: &mut S,
+    metadata: &BTreeMap<String, String>,
+    fields: &[MetadataField<S>],
+) {
+    for field in fields {
+        if let Some(value) = metadata.get(field.key) {
+            (field.load)(settings, value);
+        }
+    }
+}
+
+fn write_channel_fields<S>(
+    metadata: &mut BTreeMap<String, String>,
+    settings: &S,
+    channel_count: usize,
+    fields: &[ChannelField<S>],
+) {
+    for channel in 0..channel_count {
+        for field in fields {
+            metadata.insert((field.key)(channel), (field.save)(settings, channel));
+        }
+    }
+}
+
+fn read_channel_fields<S>(
+    settings: &mut S,
+    metadata: &BTreeMap<String, String>,
+    channel_count: usize,
+    fields: &[ChannelField<S>],
+) {
+    for channel in 0..channel_count {
+        for field in fields {
+            if let Some(value) = metadata.get(&(field.key)(channel)) {
+                (field.load)(settings, channel, value);
+            }
+        }
+    }
+}
+
+fn parse_bool_into(value: &str, destination: &mut bool) {
+    if let Ok(parsed) = value.parse() {
+        *destination = parsed;
+    }
+}
+
+/// Logic settings that are one key each. `operation_mode` must stay before
+/// `sample_count`: the largest accepted sample count depends on the mode.
+const LOGIC_FIELDS: &[MetadataField<LogicCaptureSettings>] = &[
+    MetadataField {
+        key: "logic.sample_rate_hz",
+        save: |settings| settings.sample_rate_hz.to_string(),
+        load: |settings, value| {
+            if let Ok(sample_rate_hz) = value.parse::<u64>() {
+                if DSLOGIC_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
+                    settings.sample_rate_hz = sample_rate_hz;
+                }
+            }
+        },
+    },
+    MetadataField {
+        key: "logic.operation_mode",
+        save: |settings| {
+            match settings.operation_mode {
+                DsLogicOperationMode::Buffer => "buffer",
+                DsLogicOperationMode::Stream => "stream",
+                DsLogicOperationMode::InternalTest => "internal_test",
+            }
+            .to_owned()
+        },
+        load: |settings, value| {
+            settings.operation_mode = match value {
+                "stream" => DsLogicOperationMode::Stream,
+                "internal_test" => DsLogicOperationMode::InternalTest,
+                _ => DsLogicOperationMode::Buffer,
+            };
+        },
+    },
+    MetadataField {
+        key: "logic.sample_count",
+        save: |settings| settings.sample_count.to_string(),
+        load: |settings, value| {
+            if let Ok(sample_count) = value.parse::<u64>() {
+                if (DSLOGIC_SAMPLE_ALIGNMENT..=settings.maximum_sample_count())
+                    .contains(&sample_count)
+                {
+                    settings.sample_count = sample_count;
+                }
+            }
+        },
+    },
+    MetadataField {
+        key: "logic.stop_option",
+        save: |settings| {
+            match settings.stop_option {
+                DsLogicStopOption::StopImmediately => "stop_immediately",
+                DsLogicStopOption::UploadCapturedData => "upload_captured_data",
+            }
+            .to_owned()
+        },
+        load: |settings, value| {
+            settings.stop_option = match value {
+                "stop_immediately" => DsLogicStopOption::StopImmediately,
+                _ => DsLogicStopOption::UploadCapturedData,
+            };
+        },
+    },
+    MetadataField {
+        key: "logic.threshold_voltage",
+        save: |settings| settings.threshold_voltage.to_string(),
+        load: |settings, value| {
+            if let Ok(threshold_voltage) = value.parse::<f32>() {
+                if threshold_voltage.is_finite() && (0.0..=5.0).contains(&threshold_voltage) {
+                    settings.threshold_voltage = threshold_voltage;
+                }
+            }
+        },
+    },
+    MetadataField {
+        key: "logic.input_filter",
+        save: |settings| {
+            match settings.input_filter {
+                DsLogicInputFilter::None => "none",
+                DsLogicInputFilter::OneSampleClock => "one_sample_clock",
+            }
+            .to_owned()
+        },
+        load: |settings, value| {
+            settings.input_filter = match value {
+                "one_sample_clock" => DsLogicInputFilter::OneSampleClock,
+                _ => DsLogicInputFilter::None,
+            };
+        },
+    },
+    parsed_field!("logic.rle_enabled", rle_enabled),
+    parsed_field!("logic.external_clock", external_clock),
+    parsed_field!("logic.falling_clock_edge", falling_clock_edge),
+];
+
+const LOGIC_CHANNEL_FIELDS: &[ChannelField<LogicCaptureSettings>] = &[
+    ChannelField {
+        key: |channel| format!("logic.ch{channel}.enabled"),
+        save: |settings, channel| settings.enabled_channels[channel].to_string(),
+        load: |settings, channel, value| {
+            parse_bool_into(value, &mut settings.enabled_channels[channel]);
+        },
+    },
+    ChannelField {
+        key: |channel| format!("logic.ch{channel}.maximum_height"),
+        save: |settings, channel| settings.maximum_heights[channel].to_string(),
+        load: |settings, channel, value| {
+            if let Ok(maximum_height) = value.parse::<u8>() {
+                if (1..=5).contains(&maximum_height) {
+                    settings.maximum_heights[channel] = maximum_height;
+                }
+            }
+        },
+    },
+];
+
+/// Scope settings that are one key each.
+const SCOPE_FIELDS: &[MetadataField<ScopeCaptureSettings>] = &[
+    MetadataField {
+        key: "scope.sample_rate_hz",
+        save: |settings| settings.sample_rate_hz.to_string(),
+        load: |settings, value| {
+            if let Ok(sample_rate_hz) = value.parse::<u64>() {
+                if DSCOPE_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
+                    settings.sample_rate_hz = sample_rate_hz;
+                }
+            }
+        },
+    },
+    MetadataField {
+        key: "scope.sample_count",
+        save: |settings| settings.sample_count.to_string(),
+        load: |settings, value| {
+            if let Ok(sample_count) = value.parse::<u64>() {
+                if DSCOPE_SAMPLE_COUNTS.contains(&sample_count) {
+                    settings.sample_count = sample_count;
+                }
+            }
+        },
+    },
+    MetadataField {
+        key: "scope.operation_mode",
+        save: |settings| {
+            match settings.operation_mode {
+                DsCopeOperationMode::Normal => "normal",
+                DsCopeOperationMode::InternalTest => "internal_test",
+            }
+            .to_owned()
+        },
+        load: |settings, value| {
+            settings.operation_mode = match value {
+                "internal_test" => DsCopeOperationMode::InternalTest,
+                _ => DsCopeOperationMode::Normal,
+            };
+        },
+    },
+    MetadataField {
+        key: "scope.bandwidth_limit",
+        save: |settings| {
+            match settings.bandwidth_limit {
+                DsCopeBandwidthLimit::Full => "full",
+                DsCopeBandwidthLimit::Mhz20 => "20_mhz",
+            }
+            .to_owned()
+        },
+        load: |settings, value| {
+            settings.bandwidth_limit = match value {
+                "20_mhz" => DsCopeBandwidthLimit::Mhz20,
+                _ => DsCopeBandwidthLimit::Full,
+            };
+        },
+    },
+    MetadataField {
+        key: "scope.trigger.position_percent",
+        save: |settings| settings.trigger.position_percent.to_string(),
+        load: |settings, value| {
+            if let Ok(position_percent) = value.parse::<u8>() {
+                if (DSCOPE_TRIGGER_POSITION_MIN_PERCENT..=DSCOPE_TRIGGER_POSITION_MAX_PERCENT)
+                    .contains(&position_percent)
+                {
+                    settings.trigger.position_percent = position_percent;
+                }
+            }
+        },
+    },
+    MetadataField {
+        key: "scope.trigger.source",
+        save: |settings| {
+            match settings.trigger.source {
+                DsCopeTriggerSource::Auto => "auto",
+                DsCopeTriggerSource::ChannelZero => "ch0",
+                DsCopeTriggerSource::ChannelOne => "ch1",
+                DsCopeTriggerSource::ChannelZeroAndOne => "ch0_and_ch1",
+                DsCopeTriggerSource::ChannelZeroOrOne => "ch0_or_ch1",
+            }
+            .to_owned()
+        },
+        load: |settings, value| {
+            settings.trigger.source = match value {
+                "ch0" => DsCopeTriggerSource::ChannelZero,
+                "ch1" => DsCopeTriggerSource::ChannelOne,
+                "ch0_and_ch1" => DsCopeTriggerSource::ChannelZeroAndOne,
+                "ch0_or_ch1" => DsCopeTriggerSource::ChannelZeroOrOne,
+                _ => DsCopeTriggerSource::Auto,
+            };
+        },
+    },
+    MetadataField {
+        key: "scope.trigger.auto_channel",
+        save: |settings| settings.trigger.auto_channel.to_string(),
+        load: |settings, value| {
+            if let Ok(auto_channel) = value.parse::<u8>() {
+                if auto_channel <= 1 {
+                    settings.trigger.auto_channel = auto_channel;
+                }
+            }
+        },
+    },
+    MetadataField {
+        key: "scope.trigger.slope",
+        save: |settings| {
+            match settings.trigger.slope {
+                DsCopeTriggerSlope::Rising => "rising",
+                DsCopeTriggerSlope::Falling => "falling",
+            }
+            .to_owned()
+        },
+        load: |settings, value| {
+            settings.trigger.slope = if value == "falling" {
+                DsCopeTriggerSlope::Falling
+            } else {
+                DsCopeTriggerSlope::Rising
+            };
+        },
+    },
+    MetadataField {
+        key: "scope.trigger.holdoff_ns",
+        save: |settings| settings.trigger.holdoff_ns.to_string(),
+        load: |settings, value| {
+            if let Ok(holdoff_ns) = value.parse::<u64>() {
+                settings.trigger.holdoff_ns = holdoff_ns.min(DSCOPE_TRIGGER_HOLDOFF_MAX_NS);
+                settings.trigger.holdoff_unit = if settings.trigger.holdoff_ns >= 1_000_000_000 {
+                    TriggerHoldoffUnit::Seconds
+                } else if settings.trigger.holdoff_ns >= 1_000_000 {
+                    TriggerHoldoffUnit::Milliseconds
+                } else {
+                    TriggerHoldoffUnit::Microseconds
+                };
+            }
+        },
+    },
+    MetadataField {
+        key: "scope.trigger.noise_sensitivity",
+        save: |settings| settings.trigger.noise_sensitivity.to_string(),
+        load: |settings, value| {
+            if let Ok(noise_sensitivity) = value.parse::<u8>() {
+                settings.trigger.noise_sensitivity =
+                    noise_sensitivity.min(DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX);
+            }
+        },
+    },
+];
+
+const SCOPE_CHANNEL_FIELDS: &[ChannelField<ScopeCaptureSettings>] = &[
+    ChannelField {
+        key: |channel| format!("scope.ch{channel}.enabled"),
+        save: |settings, channel| settings.channels[channel].enabled.to_string(),
+        load: |settings, channel, value| {
+            parse_bool_into(value, &mut settings.channels[channel].enabled);
+        },
+    },
+    ChannelField {
+        key: |channel| format!("scope.ch{channel}.volts_per_div_mv"),
+        save: |settings, channel| settings.channels[channel].volts_per_div_mv.to_string(),
+        load: |settings, channel, value| {
+            if let Ok(volts_per_div_mv) = value.parse::<u16>() {
+                if DSCOPE_VOLTS_PER_DIV_MV.contains(&volts_per_div_mv) {
+                    settings.channels[channel].volts_per_div_mv = volts_per_div_mv;
+                }
+            }
+        },
+    },
+    ChannelField {
+        key: |channel| format!("scope.ch{channel}.coupling"),
+        save: |settings, channel| {
+            coupling_label(settings.channels[channel].coupling).to_ascii_lowercase()
+        },
+        load: |settings, channel, value| {
+            settings.channels[channel].coupling = if value.eq_ignore_ascii_case("ac") {
+                DsCopeCoupling::Ac
+            } else {
+                DsCopeCoupling::Dc
+            };
+        },
+    },
+    ChannelField {
+        key: |channel| format!("scope.ch{channel}.probe_attenuation"),
+        save: |settings, channel| settings.channels[channel].probe_attenuation.to_string(),
+        load: |settings, channel, value| {
+            if let Ok(probe_attenuation) = value.parse::<u8>() {
+                if matches!(probe_attenuation, 1 | 10 | 100) {
+                    settings.channels[channel].probe_attenuation = probe_attenuation;
+                }
+            }
+        },
+    },
+    ChannelField {
+        key: |channel| format!("scope.ch{channel}.vertical_offset"),
+        save: |settings, channel| settings.channels[channel].vertical_offset.to_string(),
+        load: |settings, channel, value| {
+            if let Ok(vertical_offset) = value.parse::<u16>() {
+                if (DSCOPE_VERTICAL_OFFSET_MIN..=DSCOPE_VERTICAL_OFFSET_MAX)
+                    .contains(&vertical_offset)
+                {
+                    settings.channels[channel].vertical_offset = vertical_offset;
+                }
+            }
+        },
+    },
+    ChannelField {
+        key: |channel| format!("scope.trigger.ch{channel}.level"),
+        save: |settings, channel| settings.trigger.levels[channel].to_string(),
+        load: |settings, channel, value| {
+            if let Ok(level) = value.parse::<u8>() {
+                settings.trigger.levels[channel] =
+                    level.clamp(DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_LEVEL_MAX);
+            }
+        },
+    },
+];
+
+/// Written for readers that predate `radio.analyzer.demodulation`; on load it
+/// only matters when the demodulation key is absent (see
+/// [`radio_settings_from_recording_metadata`]).
+const RADIO_LEGACY_ANALYZER_ENABLED_KEY: &str = "radio.analyzer.enabled";
+const RADIO_DEMODULATION_KEY: &str = "radio.analyzer.demodulation";
+/// Single-channel analyzer offset, written for old readers and used on load only
+/// when the recording has no `radio.analyzer.channel_count`.
+const RADIO_LEGACY_CHANNEL_OFFSET_KEY: &str = "radio.analyzer.channel_offset_hz";
+
+/// Radio settings that are one key each. The analyzer channel list, the gains,
+/// and the legacy keys above are handled in code, not here.
+const RADIO_FIELDS: &[MetadataField<RadioSettings>] = &[
+    parsed_field!("radio.center_frequency_hz", capture.center_frequency_hz),
+    parsed_field!("radio.sample_rate_hz", capture.sample_rate_hz),
+    parsed_field!("radio.bandwidth_hz", capture.bandwidth_hz),
+    parsed_field!("radio.receive_channel", capture.receive_channel),
+    parsed_field!("radio.single_duration_millis", single_duration_millis),
+    parsed_field!("radio.trigger_enabled", trigger_enabled),
+    MetadataField {
+        key: "radio.trigger_posttrigger_micros",
+        save: |settings| settings.trigger_posttrigger_micros.to_string(),
+        load: |settings, value| {
+            if let Ok(micros) = value.parse::<u64>() {
+                settings.trigger_posttrigger_micros =
+                    micros.min(RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS);
+            }
+        },
+    },
+    parsed_field!("radio.trigger_level_dbfs_tenths", trigger_level_dbfs_tenths),
+    parsed_field!(
+        "radio.frequency_correction_milli_ppm",
+        frequency_correction_milli_ppm
+    ),
+    parsed_field!("radio.iq_correction_enabled", iq_correction_enabled),
+    parsed_field!("radio.amplifier_enabled", amplifier_enabled),
+    parsed_field!("radio.antenna_power_enabled", antenna_power_enabled),
+    MetadataField {
+        key: RADIO_DEMODULATION_KEY,
+        save: |settings| {
+            match settings.analyzer.demodulation {
+                RadioDemodulation::None => "none",
+                RadioDemodulation::BinaryFsk => "fsk2",
+                RadioDemodulation::BinaryGfsk => "gfsk2",
+            }
+            .to_owned()
+        },
+        load: |settings, value| {
+            settings.analyzer.demodulation = match value {
+                "none" => RadioDemodulation::None,
+                "gfsk2" => RadioDemodulation::BinaryGfsk,
+                _ => RadioDemodulation::BinaryFsk,
+            };
+        },
+    },
+    parsed_field!(
+        "radio.analyzer.channel_bandwidth_hz",
+        analyzer.channel_bandwidth_hz
+    ),
+    parsed_field!(
+        "radio.analyzer.output_sample_rate_hz",
+        analyzer.output_sample_rate_hz
+    ),
+    parsed_field!("radio.analyzer.filter_tap_count", analyzer.filter_tap_count),
+    parsed_field!("radio.analyzer.symbol_rate_hz", analyzer.symbol_rate_hz),
+    parsed_field!("radio.analyzer.deviation_hz", analyzer.deviation_hz),
+    parsed_field!("radio.analyzer.gfsk_bt_milli", analyzer.gfsk_bt_milli),
+    parsed_field!("radio.analyzer.inverted", analyzer.inverted),
+    parsed_field!("radio.analyzer.adaptive_timing", analyzer.adaptive_timing),
+    parsed_field!(
+        "radio.analyzer.timing_loop_bandwidth_milli",
+        analyzer.timing_loop_bandwidth_milli
+    ),
+    parsed_field!(
+        "radio.analyzer.max_clock_error_ppm",
+        analyzer.max_clock_error_ppm
+    ),
+    MetadataField {
+        key: "radio.analyzer.data_mode",
+        save: |settings| {
+            match settings.analyzer.data_mode {
+                RadioDataMode::Raw => "raw",
+                RadioDataMode::Packets => "packets",
+            }
+            .to_owned()
+        },
+        load: |settings, value| {
+            settings.analyzer.data_mode = match value {
+                "packets" => RadioDataMode::Packets,
+                _ => RadioDataMode::Raw,
+            };
+        },
+    },
+    parsed_field!("radio.analyzer.preamble_byte", analyzer.preamble_byte),
+    parsed_field!("radio.analyzer.preamble_bytes", analyzer.preamble_bytes),
+    parsed_field!("radio.analyzer.sync_word", analyzer.sync_word),
+    parsed_field!("radio.analyzer.sync_word_bytes", analyzer.sync_word_bytes),
+    parsed_field!(
+        "radio.analyzer.maximum_preamble_bit_errors",
+        analyzer.maximum_preamble_bit_errors
+    ),
+    parsed_field!(
+        "radio.analyzer.minimum_bit_confidence_milli",
+        analyzer.minimum_bit_confidence_milli
+    ),
+    parsed_field!(
+        "radio.analyzer.maximum_uncertain_bits",
+        analyzer.maximum_uncertain_bits
+    ),
+    parsed_field!(
+        "radio.analyzer.whitening_enabled",
+        analyzer.whitening_enabled
+    ),
+    MetadataField {
+        key: "radio.analyzer.whitening_preset",
+        save: |settings| {
+            settings
+                .analyzer
+                .whitening_preset
+                .metadata_value()
+                .to_owned()
+        },
+        load: |settings, value| {
+            settings.analyzer.whitening_preset = match value {
+                "pn9_x9_x5" => RadioWhiteningPreset::Pn9X9X5,
+                _ => RadioWhiteningPreset::Custom,
+            };
+        },
+    },
+    parsed_field!("radio.analyzer.whitening_width", analyzer.whitening_width),
+    parsed_field!(
+        "radio.analyzer.whitening_polynomial",
+        analyzer.whitening_polynomial
+    ),
+    parsed_field!("radio.analyzer.whitening_seed", analyzer.whitening_seed),
+    MetadataField {
+        key: "radio.analyzer.whitening_direction",
+        save: |settings| {
+            match settings.analyzer.whitening_direction {
+                WhiteningDirection::ShiftRight => "right",
+                WhiteningDirection::ShiftLeft => "left",
+            }
+            .to_owned()
+        },
+        load: |settings, value| {
+            settings.analyzer.whitening_direction = match value {
+                "left" => WhiteningDirection::ShiftLeft,
+                _ => WhiteningDirection::ShiftRight,
+            };
+        },
+    },
+    parsed_field!(
+        "radio.analyzer.whitening_invert_output",
+        analyzer.whitening_invert_output
+    ),
+    parsed_field!(
+        "radio.analyzer.whitening_start_bit",
+        analyzer.whitening_start_bit
+    ),
+    MetadataField {
+        key: "radio.analyzer.whitening_end_bit",
+        save: |settings| {
+            settings
+                .analyzer
+                .whitening_end_bit
+                .map_or_else(|| "none".to_owned(), |value| value.to_string())
+        },
+        load: |settings, value| {
+            settings.analyzer.whitening_end_bit = (value != "none")
+                .then(|| value.parse::<usize>().ok())
+                .flatten();
+        },
+    },
+    parsed_field!(
+        "radio.analyzer.whitening_advance_excluded_bits",
+        analyzer.whitening_advance_excluded_bits
+    ),
+];
+
 pub(crate) fn saved_logic_settings_metadata(
     settings: LogicCaptureSettings,
     acquisition_mode: AcquisitionMode,
@@ -57,52 +659,19 @@ pub(crate) fn saved_logic_settings_metadata(
     channel_names: &[String; LOGIC_CHANNEL_COUNT],
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
-    metadata.insert(
-        "logic.sample_rate_hz".to_owned(),
-        settings.sample_rate_hz.to_string(),
+    write_fields(&mut metadata, &settings, LOGIC_FIELDS);
+    write_channel_fields(
+        &mut metadata,
+        &settings,
+        LOGIC_CHANNEL_COUNT,
+        LOGIC_CHANNEL_FIELDS,
     );
+    write_logic_trigger(&mut metadata, &settings);
+    // Not part of `LogicCaptureSettings`; restored by the caller.
     metadata.insert(
-        "logic.sample_count".to_owned(),
-        settings.sample_count.to_string(),
+        "logic.smart_timing_enabled".to_owned(),
+        smart_timing_enabled.to_string(),
     );
-    metadata.insert(
-        "logic.operation_mode".to_owned(),
-        match settings.operation_mode {
-            DsLogicOperationMode::Buffer => "buffer",
-            DsLogicOperationMode::Stream => "stream",
-            DsLogicOperationMode::InternalTest => "internal_test",
-        }
-        .to_owned(),
-    );
-    metadata.insert(
-        "logic.stop_option".to_owned(),
-        match settings.stop_option {
-            DsLogicStopOption::StopImmediately => "stop_immediately",
-            DsLogicStopOption::UploadCapturedData => "upload_captured_data",
-        }
-        .to_owned(),
-    );
-    metadata.insert(
-        "logic.threshold_voltage".to_owned(),
-        settings.threshold_voltage.to_string(),
-    );
-    metadata.insert(
-        "logic.input_filter".to_owned(),
-        match settings.input_filter {
-            DsLogicInputFilter::None => "none",
-            DsLogicInputFilter::OneSampleClock => "one_sample_clock",
-        }
-        .to_owned(),
-    );
-    for (key, value) in [
-        ("logic.rle_enabled", settings.rle_enabled),
-        ("logic.external_clock", settings.external_clock),
-        ("logic.falling_clock_edge", settings.falling_clock_edge),
-        ("logic.trigger.enabled", settings.trigger_enabled),
-        ("logic.smart_timing_enabled", smart_timing_enabled),
-    ] {
-        metadata.insert(key.to_owned(), value.to_string());
-    }
     metadata.insert(
         "logic.acquisition_mode".to_owned(),
         match acquisition_mode {
@@ -117,6 +686,23 @@ pub(crate) fn saved_logic_settings_metadata(
         "logic.repetitive_interval_seconds".to_owned(),
         repetitive_interval_seconds.to_string(),
     );
+    for (channel, channel_name) in channel_names.iter().enumerate() {
+        metadata.insert(
+            format!("logic.ch{channel}.name"),
+            normalized_channel_name(channel_name),
+        );
+    }
+    metadata
+}
+
+/// Hand-written: the trigger keys depend on each other (mode, stage count,
+/// per-stage conditions), so they are not table-driven. Keep this in step with
+/// [`read_logic_trigger`].
+fn write_logic_trigger(metadata: &mut BTreeMap<String, String>, settings: &LogicCaptureSettings) {
+    metadata.insert(
+        "logic.trigger.enabled".to_owned(),
+        settings.trigger_enabled.to_string(),
+    );
     metadata.insert(
         "logic.trigger.mode".to_owned(),
         match settings.trigger_mode {
@@ -129,19 +715,7 @@ pub(crate) fn saved_logic_settings_metadata(
         "logic.trigger.stage_count".to_owned(),
         settings.smart_trigger_stage_count.to_string(),
     );
-    for (channel, channel_name) in channel_names.iter().enumerate() {
-        metadata.insert(
-            format!("logic.ch{channel}.enabled"),
-            settings.enabled_channels[channel].to_string(),
-        );
-        metadata.insert(
-            format!("logic.ch{channel}.maximum_height"),
-            settings.maximum_heights[channel].to_string(),
-        );
-        metadata.insert(
-            format!("logic.ch{channel}.name"),
-            normalized_channel_name(channel_name),
-        );
+    for channel in 0..LOGIC_CHANNEL_COUNT {
         if let Some(condition) = settings.trigger_conditions[channel] {
             metadata.insert(
                 format!("logic.trigger.ch{channel}.condition"),
@@ -157,7 +731,6 @@ pub(crate) fn saved_logic_settings_metadata(
             }
         }
     }
-    metadata
 }
 
 pub(crate) fn saved_scope_settings_metadata(
@@ -168,14 +741,9 @@ pub(crate) fn saved_scope_settings_metadata(
     channel_colors: [Color32; 2],
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
-    metadata.insert(
-        "scope.sample_rate_hz".to_owned(),
-        settings.sample_rate_hz.to_string(),
-    );
-    metadata.insert(
-        "scope.sample_count".to_owned(),
-        settings.sample_count.to_string(),
-    );
+    write_fields(&mut metadata, &settings, SCOPE_FIELDS);
+    write_channel_fields(&mut metadata, &settings, 2, SCOPE_CHANNEL_FIELDS);
+    // Not part of `ScopeCaptureSettings`; restored by the caller.
     metadata.insert(
         "scope.auto_sample_rate".to_owned(),
         auto_sample_rate.to_string(),
@@ -184,83 +752,7 @@ pub(crate) fn saved_scope_settings_metadata(
         "scope.smart_timing_enabled".to_owned(),
         smart_timing_enabled.to_string(),
     );
-    metadata.insert(
-        "scope.operation_mode".to_owned(),
-        match settings.operation_mode {
-            DsCopeOperationMode::Normal => "normal",
-            DsCopeOperationMode::InternalTest => "internal_test",
-        }
-        .to_owned(),
-    );
-    metadata.insert(
-        "scope.bandwidth_limit".to_owned(),
-        match settings.bandwidth_limit {
-            DsCopeBandwidthLimit::Full => "full",
-            DsCopeBandwidthLimit::Mhz20 => "20_mhz",
-        }
-        .to_owned(),
-    );
-    let trigger = settings.trigger;
-    metadata.insert(
-        "scope.trigger.position_percent".to_owned(),
-        trigger.position_percent.to_string(),
-    );
-    metadata.insert(
-        "scope.trigger.source".to_owned(),
-        match trigger.source {
-            DsCopeTriggerSource::Auto => "auto",
-            DsCopeTriggerSource::ChannelZero => "ch0",
-            DsCopeTriggerSource::ChannelOne => "ch1",
-            DsCopeTriggerSource::ChannelZeroAndOne => "ch0_and_ch1",
-            DsCopeTriggerSource::ChannelZeroOrOne => "ch0_or_ch1",
-        }
-        .to_owned(),
-    );
-    metadata.insert(
-        "scope.trigger.auto_channel".to_owned(),
-        trigger.auto_channel.to_string(),
-    );
-    metadata.insert(
-        "scope.trigger.slope".to_owned(),
-        match trigger.slope {
-            DsCopeTriggerSlope::Rising => "rising",
-            DsCopeTriggerSlope::Falling => "falling",
-        }
-        .to_owned(),
-    );
-    metadata.insert(
-        "scope.trigger.holdoff_ns".to_owned(),
-        trigger.holdoff_ns.to_string(),
-    );
-    metadata.insert(
-        "scope.trigger.noise_sensitivity".to_owned(),
-        trigger.noise_sensitivity.to_string(),
-    );
-    for (index, channel) in settings.channels.iter().enumerate() {
-        metadata.insert(
-            format!("scope.ch{index}.enabled"),
-            channel.enabled.to_string(),
-        );
-        metadata.insert(
-            format!("scope.ch{index}.volts_per_div_mv"),
-            channel.volts_per_div_mv.to_string(),
-        );
-        metadata.insert(
-            format!("scope.ch{index}.coupling"),
-            coupling_label(channel.coupling).to_ascii_lowercase(),
-        );
-        metadata.insert(
-            format!("scope.ch{index}.probe_attenuation"),
-            channel.probe_attenuation.to_string(),
-        );
-        metadata.insert(
-            format!("scope.ch{index}.vertical_offset"),
-            channel.vertical_offset.to_string(),
-        );
-        metadata.insert(
-            format!("scope.trigger.ch{index}.level"),
-            trigger.levels[index].to_string(),
-        );
+    for index in 0..2 {
         metadata.insert(
             format!("scope.ch{index}.name"),
             normalized_channel_name(&channel_names[index]),
@@ -275,210 +767,22 @@ pub(crate) fn saved_scope_settings_metadata(
 
 pub(crate) fn saved_radio_settings_metadata(settings: &RadioSettings) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
-    for (key, value) in [
-        (
-            "radio.center_frequency_hz",
-            settings.capture.center_frequency_hz.to_string(),
-        ),
-        (
-            "radio.sample_rate_hz",
-            settings.capture.sample_rate_hz.to_string(),
-        ),
-        (
-            "radio.bandwidth_hz",
-            settings.capture.bandwidth_hz.to_string(),
-        ),
-        (
-            "radio.receive_channel",
-            settings.capture.receive_channel.to_string(),
-        ),
-        (
-            "radio.single_duration_millis",
-            settings.single_duration_millis.to_string(),
-        ),
-        (
-            "radio.trigger_enabled",
-            settings.trigger_enabled.to_string(),
-        ),
-        (
-            "radio.trigger_posttrigger_micros",
-            settings.trigger_posttrigger_micros.to_string(),
-        ),
-        (
-            "radio.trigger_level_dbfs_tenths",
-            settings.trigger_level_dbfs_tenths.to_string(),
-        ),
-        (
-            "radio.frequency_correction_milli_ppm",
-            settings.frequency_correction_milli_ppm.to_string(),
-        ),
-        (
-            "radio.iq_correction_enabled",
-            settings.iq_correction_enabled.to_string(),
-        ),
-        (
-            "radio.amplifier_enabled",
-            settings.amplifier_enabled.to_string(),
-        ),
-        (
-            "radio.antenna_power_enabled",
-            settings.antenna_power_enabled.to_string(),
-        ),
-        (
-            "radio.analyzer.enabled",
-            settings.analyzer.is_enabled().to_string(),
-        ),
-        (
-            "radio.analyzer.demodulation",
-            match settings.analyzer.demodulation {
-                RadioDemodulation::None => "none",
-                RadioDemodulation::BinaryFsk => "fsk2",
-                RadioDemodulation::BinaryGfsk => "gfsk2",
-            }
-            .to_owned(),
-        ),
-        (
-            "radio.analyzer.channel_offset_hz",
-            settings
-                .analyzer
-                .channels
-                .first()
-                .map_or(0, |channel| channel.frequency_offset_hz)
-                .to_string(),
-        ),
-        (
-            "radio.analyzer.channel_bandwidth_hz",
-            settings.analyzer.channel_bandwidth_hz.to_string(),
-        ),
-        (
-            "radio.analyzer.output_sample_rate_hz",
-            settings.analyzer.output_sample_rate_hz.to_string(),
-        ),
-        (
-            "radio.analyzer.filter_tap_count",
-            settings.analyzer.filter_tap_count.to_string(),
-        ),
-        (
-            "radio.analyzer.symbol_rate_hz",
-            settings.analyzer.symbol_rate_hz.to_string(),
-        ),
-        (
-            "radio.analyzer.deviation_hz",
-            settings.analyzer.deviation_hz.to_string(),
-        ),
-        (
-            "radio.analyzer.gfsk_bt_milli",
-            settings.analyzer.gfsk_bt_milli.to_string(),
-        ),
-        (
-            "radio.analyzer.inverted",
-            settings.analyzer.inverted.to_string(),
-        ),
-        (
-            "radio.analyzer.adaptive_timing",
-            settings.analyzer.adaptive_timing.to_string(),
-        ),
-        (
-            "radio.analyzer.timing_loop_bandwidth_milli",
-            settings.analyzer.timing_loop_bandwidth_milli.to_string(),
-        ),
-        (
-            "radio.analyzer.max_clock_error_ppm",
-            settings.analyzer.max_clock_error_ppm.to_string(),
-        ),
-        (
-            "radio.analyzer.data_mode",
-            match settings.analyzer.data_mode {
-                RadioDataMode::Raw => "raw",
-                RadioDataMode::Packets => "packets",
-            }
-            .to_owned(),
-        ),
-        (
-            "radio.analyzer.preamble_byte",
-            settings.analyzer.preamble_byte.to_string(),
-        ),
-        (
-            "radio.analyzer.preamble_bytes",
-            settings.analyzer.preamble_bytes.to_string(),
-        ),
-        (
-            "radio.analyzer.sync_word",
-            settings.analyzer.sync_word.to_string(),
-        ),
-        (
-            "radio.analyzer.sync_word_bytes",
-            settings.analyzer.sync_word_bytes.to_string(),
-        ),
-        (
-            "radio.analyzer.maximum_preamble_bit_errors",
-            settings.analyzer.maximum_preamble_bit_errors.to_string(),
-        ),
-        (
-            "radio.analyzer.minimum_bit_confidence_milli",
-            settings.analyzer.minimum_bit_confidence_milli.to_string(),
-        ),
-        (
-            "radio.analyzer.maximum_uncertain_bits",
-            settings.analyzer.maximum_uncertain_bits.to_string(),
-        ),
-        (
-            "radio.analyzer.whitening_enabled",
-            settings.analyzer.whitening_enabled.to_string(),
-        ),
-        (
-            "radio.analyzer.whitening_preset",
-            settings
-                .analyzer
-                .whitening_preset
-                .metadata_value()
-                .to_owned(),
-        ),
-        (
-            "radio.analyzer.whitening_width",
-            settings.analyzer.whitening_width.to_string(),
-        ),
-        (
-            "radio.analyzer.whitening_polynomial",
-            settings.analyzer.whitening_polynomial.to_string(),
-        ),
-        (
-            "radio.analyzer.whitening_seed",
-            settings.analyzer.whitening_seed.to_string(),
-        ),
-        (
-            "radio.analyzer.whitening_direction",
-            match settings.analyzer.whitening_direction {
-                WhiteningDirection::ShiftRight => "right",
-                WhiteningDirection::ShiftLeft => "left",
-            }
-            .to_owned(),
-        ),
-        (
-            "radio.analyzer.whitening_invert_output",
-            settings.analyzer.whitening_invert_output.to_string(),
-        ),
-        (
-            "radio.analyzer.whitening_start_bit",
-            settings.analyzer.whitening_start_bit.to_string(),
-        ),
-        (
-            "radio.analyzer.whitening_end_bit",
-            settings
-                .analyzer
-                .whitening_end_bit
-                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-        ),
-        (
-            "radio.analyzer.whitening_advance_excluded_bits",
-            settings
-                .analyzer
-                .whitening_advance_excluded_bits
-                .to_string(),
-        ),
-    ] {
-        metadata.insert(key.to_owned(), value);
-    }
+    write_fields(&mut metadata, settings, RADIO_FIELDS);
+    // Derived keys kept for readers that predate the demodulation setting and
+    // the analyzer channel list.
+    metadata.insert(
+        RADIO_LEGACY_ANALYZER_ENABLED_KEY.to_owned(),
+        settings.analyzer.is_enabled().to_string(),
+    );
+    metadata.insert(
+        RADIO_LEGACY_CHANNEL_OFFSET_KEY.to_owned(),
+        settings
+            .analyzer
+            .channels
+            .first()
+            .map_or(0, |channel| channel.frequency_offset_hz)
+            .to_string(),
+    );
     metadata.insert(
         "radio.analyzer.channel_count".to_owned(),
         settings.analyzer.channels.len().to_string(),
@@ -544,74 +848,27 @@ pub(crate) fn logic_settings_from_recording_metadata(
     metadata: &BTreeMap<String, String>,
 ) -> LogicCaptureSettings {
     let mut settings = LogicCaptureSettings::default();
-    if let Some(sample_rate_hz) = recording_metadata_value::<u64>(metadata, "logic.sample_rate_hz")
-    {
-        if DSLOGIC_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
-            settings.sample_rate_hz = sample_rate_hz;
-        }
-    }
-    if let Some(operation_mode) = metadata.get("logic.operation_mode") {
-        settings.operation_mode = match operation_mode.as_str() {
-            "stream" => DsLogicOperationMode::Stream,
-            "internal_test" => DsLogicOperationMode::InternalTest,
-            _ => DsLogicOperationMode::Buffer,
-        };
-    }
-    if let Some(sample_count) = recording_metadata_value::<u64>(metadata, "logic.sample_count") {
-        if (DSLOGIC_SAMPLE_ALIGNMENT..=settings.maximum_sample_count()).contains(&sample_count) {
-            settings.sample_count = sample_count;
-        }
-    }
-    for (channel, enabled) in settings.enabled_channels.iter_mut().enumerate() {
-        if let Some(recorded) =
-            recording_metadata_value::<bool>(metadata, &format!("logic.ch{channel}.enabled"))
-        {
-            *enabled = recorded;
-        }
-    }
-    if let Some(stop_option) = metadata.get("logic.stop_option") {
-        settings.stop_option = match stop_option.as_str() {
-            "stop_immediately" => DsLogicStopOption::StopImmediately,
-            _ => DsLogicStopOption::UploadCapturedData,
-        };
-    }
-    if let Some(threshold_voltage) =
-        recording_metadata_value::<f32>(metadata, "logic.threshold_voltage")
-    {
-        if threshold_voltage.is_finite() && (0.0..=5.0).contains(&threshold_voltage) {
-            settings.threshold_voltage = threshold_voltage;
-        }
-    }
-    if let Some(input_filter) = metadata.get("logic.input_filter") {
-        settings.input_filter = match input_filter.as_str() {
-            "one_sample_clock" => DsLogicInputFilter::OneSampleClock,
-            _ => DsLogicInputFilter::None,
-        };
-    }
+    read_fields(&mut settings, metadata, LOGIC_FIELDS);
+    // Older recordings stored one height for every channel; per-channel keys
+    // below take precedence.
     if let Some(maximum_height) = recording_metadata_value::<u8>(metadata, "logic.maximum_height") {
         if (1..=5).contains(&maximum_height) {
             settings.maximum_heights = [maximum_height; LOGIC_CHANNEL_COUNT];
         }
     }
-    for (channel, maximum_height) in settings.maximum_heights.iter_mut().enumerate() {
-        if let Some(recorded) =
-            recording_metadata_value::<u8>(metadata, &format!("logic.ch{channel}.maximum_height"))
-        {
-            if (1..=5).contains(&recorded) {
-                *maximum_height = recorded;
-            }
-        }
-    }
-    if let Some(rle_enabled) = recording_metadata_value(metadata, "logic.rle_enabled") {
-        settings.rle_enabled = rle_enabled;
-    }
-    if let Some(external_clock) = recording_metadata_value(metadata, "logic.external_clock") {
-        settings.external_clock = external_clock;
-    }
-    if let Some(falling_clock_edge) = recording_metadata_value(metadata, "logic.falling_clock_edge")
-    {
-        settings.falling_clock_edge = falling_clock_edge;
-    }
+    read_channel_fields(
+        &mut settings,
+        metadata,
+        LOGIC_CHANNEL_COUNT,
+        LOGIC_CHANNEL_FIELDS,
+    );
+    read_logic_trigger(&mut settings, metadata);
+    settings
+}
+
+/// Hand-written counterpart of [`write_logic_trigger`]. It runs after the
+/// channel and operation-mode fields because trigger validity depends on them.
+fn read_logic_trigger(settings: &mut LogicCaptureSettings, metadata: &BTreeMap<String, String>) {
     if recording_metadata_value::<bool>(metadata, "logic.trigger.enabled") == Some(true) {
         if metadata.get("logic.trigger.mode").map(String::as_str) == Some("smart") {
             let stage_count = recording_metadata_value::<u8>(metadata, "logic.trigger.stage_count")
@@ -706,129 +963,14 @@ pub(crate) fn logic_settings_from_recording_metadata(
             })
         });
     }
-    settings
 }
 
 pub(crate) fn scope_settings_from_recording_metadata(
     metadata: &BTreeMap<String, String>,
 ) -> ScopeCaptureSettings {
     let mut settings = ScopeCaptureSettings::default();
-    if let Some(operation_mode) = metadata.get("scope.operation_mode") {
-        settings.operation_mode = match operation_mode.as_str() {
-            "internal_test" => DsCopeOperationMode::InternalTest,
-            _ => DsCopeOperationMode::Normal,
-        };
-    }
-    if let Some(bandwidth_limit) = metadata.get("scope.bandwidth_limit") {
-        settings.bandwidth_limit = match bandwidth_limit.as_str() {
-            "20_mhz" => DsCopeBandwidthLimit::Mhz20,
-            _ => DsCopeBandwidthLimit::Full,
-        };
-    }
-    if let Some(sample_rate_hz) = recording_metadata_value::<u64>(metadata, "scope.sample_rate_hz")
-    {
-        if DSCOPE_SAMPLE_RATES_HZ.contains(&sample_rate_hz) {
-            settings.sample_rate_hz = sample_rate_hz;
-        }
-    }
-    if let Some(sample_count) = recording_metadata_value::<u64>(metadata, "scope.sample_count") {
-        if DSCOPE_SAMPLE_COUNTS.contains(&sample_count) {
-            settings.sample_count = sample_count;
-        }
-    }
-    for (index, channel) in settings.channels.iter_mut().enumerate() {
-        if let Some(enabled) =
-            recording_metadata_value::<bool>(metadata, &format!("scope.ch{index}.enabled"))
-        {
-            channel.enabled = enabled;
-        }
-        if let Some(volts_per_div_mv) =
-            recording_metadata_value::<u16>(metadata, &format!("scope.ch{index}.volts_per_div_mv"))
-        {
-            if DSCOPE_VOLTS_PER_DIV_MV.contains(&volts_per_div_mv) {
-                channel.volts_per_div_mv = volts_per_div_mv;
-            }
-        }
-        if let Some(coupling) = metadata.get(&format!("scope.ch{index}.coupling")) {
-            channel.coupling = if coupling.eq_ignore_ascii_case("ac") {
-                DsCopeCoupling::Ac
-            } else {
-                DsCopeCoupling::Dc
-            };
-        }
-        if let Some(probe_attenuation) =
-            recording_metadata_value::<u8>(metadata, &format!("scope.ch{index}.probe_attenuation"))
-        {
-            if matches!(probe_attenuation, 1 | 10 | 100) {
-                channel.probe_attenuation = probe_attenuation;
-            }
-        }
-        if let Some(vertical_offset) =
-            recording_metadata_value::<u16>(metadata, &format!("scope.ch{index}.vertical_offset"))
-        {
-            if (DSCOPE_VERTICAL_OFFSET_MIN..=DSCOPE_VERTICAL_OFFSET_MAX).contains(&vertical_offset)
-            {
-                channel.vertical_offset = vertical_offset;
-            }
-        }
-    }
-
-    if let Some(position_percent) =
-        recording_metadata_value::<u8>(metadata, "scope.trigger.position_percent")
-    {
-        if (DSCOPE_TRIGGER_POSITION_MIN_PERCENT..=DSCOPE_TRIGGER_POSITION_MAX_PERCENT)
-            .contains(&position_percent)
-        {
-            settings.trigger.position_percent = position_percent;
-        }
-    }
-    if let Some(source) = metadata.get("scope.trigger.source") {
-        settings.trigger.source = match source.as_str() {
-            "ch0" => DsCopeTriggerSource::ChannelZero,
-            "ch1" => DsCopeTriggerSource::ChannelOne,
-            "ch0_and_ch1" => DsCopeTriggerSource::ChannelZeroAndOne,
-            "ch0_or_ch1" => DsCopeTriggerSource::ChannelZeroOrOne,
-            _ => DsCopeTriggerSource::Auto,
-        };
-    }
-    if let Some(auto_channel) =
-        recording_metadata_value::<u8>(metadata, "scope.trigger.auto_channel")
-    {
-        if auto_channel <= 1 {
-            settings.trigger.auto_channel = auto_channel;
-        }
-    }
-    if let Some(slope) = metadata.get("scope.trigger.slope") {
-        settings.trigger.slope = if slope == "falling" {
-            DsCopeTriggerSlope::Falling
-        } else {
-            DsCopeTriggerSlope::Rising
-        };
-    }
-    if let Some(holdoff_ns) = recording_metadata_value::<u64>(metadata, "scope.trigger.holdoff_ns")
-    {
-        settings.trigger.holdoff_ns = holdoff_ns.min(DSCOPE_TRIGGER_HOLDOFF_MAX_NS);
-        settings.trigger.holdoff_unit = if settings.trigger.holdoff_ns >= 1_000_000_000 {
-            TriggerHoldoffUnit::Seconds
-        } else if settings.trigger.holdoff_ns >= 1_000_000 {
-            TriggerHoldoffUnit::Milliseconds
-        } else {
-            TriggerHoldoffUnit::Microseconds
-        };
-    }
-    if let Some(noise_sensitivity) =
-        recording_metadata_value::<u8>(metadata, "scope.trigger.noise_sensitivity")
-    {
-        settings.trigger.noise_sensitivity =
-            noise_sensitivity.min(DSCOPE_TRIGGER_NOISE_SENSITIVITY_MAX);
-    }
-    for (index, level) in settings.trigger.levels.iter_mut().enumerate() {
-        if let Some(recorded_level) =
-            recording_metadata_value::<u8>(metadata, &format!("scope.trigger.ch{index}.level"))
-        {
-            *level = recorded_level.clamp(DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_LEVEL_MAX);
-        }
-    }
+    read_fields(&mut settings, metadata, SCOPE_FIELDS);
+    read_channel_fields(&mut settings, metadata, 2, SCOPE_CHANNEL_FIELDS);
     settings
         .trigger
         .clamp_to_channels(settings.channels.map(|channel| channel.enabled));
@@ -839,60 +981,20 @@ pub(crate) fn radio_settings_from_recording_metadata(
     metadata: &BTreeMap<String, String>,
 ) -> RadioSettings {
     let mut settings = RadioSettings::default();
-    if let Some(value) = recording_metadata_value(metadata, "radio.center_frequency_hz") {
-        settings.capture.center_frequency_hz = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.sample_rate_hz") {
-        settings.capture.sample_rate_hz = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.bandwidth_hz") {
-        settings.capture.bandwidth_hz = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.receive_channel") {
-        settings.capture.receive_channel = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.single_duration_millis") {
-        settings.single_duration_millis = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.trigger_enabled") {
-        settings.trigger_enabled = value;
-    }
-    if let Some(value) =
-        recording_metadata_value::<u64>(metadata, "radio.trigger_posttrigger_micros")
-    {
-        settings.trigger_posttrigger_micros = value.min(RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS);
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.trigger_level_dbfs_tenths") {
-        settings.trigger_level_dbfs_tenths = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.frequency_correction_milli_ppm")
-    {
-        settings.frequency_correction_milli_ppm = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.amplifier_enabled") {
-        settings.amplifier_enabled = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.iq_correction_enabled") {
-        settings.iq_correction_enabled = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.antenna_power_enabled") {
-        settings.antenna_power_enabled = value;
-    }
+    read_fields(&mut settings, metadata, RADIO_FIELDS);
+    // Older recordings only had an on/off flag: `false` always disables the
+    // analyzer, and `true` without a demodulation key meant GFSK.
     let legacy_analyzer_enabled =
-        recording_metadata_value::<bool>(metadata, "radio.analyzer.enabled");
-    settings.analyzer.demodulation = if legacy_analyzer_enabled == Some(false) {
-        RadioDemodulation::None
-    } else if let Some(value) = metadata.get("radio.analyzer.demodulation") {
-        match value.as_str() {
-            "none" => RadioDemodulation::None,
-            "gfsk2" => RadioDemodulation::BinaryGfsk,
-            _ => RadioDemodulation::BinaryFsk,
-        }
-    } else if legacy_analyzer_enabled == Some(true) {
-        RadioDemodulation::BinaryGfsk
-    } else {
-        RadioDemodulation::None
-    };
+        recording_metadata_value::<bool>(metadata, RADIO_LEGACY_ANALYZER_ENABLED_KEY);
+    if legacy_analyzer_enabled == Some(false) {
+        settings.analyzer.demodulation = RadioDemodulation::None;
+    } else if !metadata.contains_key(RADIO_DEMODULATION_KEY) {
+        settings.analyzer.demodulation = if legacy_analyzer_enabled == Some(true) {
+            RadioDemodulation::BinaryGfsk
+        } else {
+            RadioDemodulation::None
+        };
+    }
     if let Some(channel_count) =
         recording_metadata_value::<usize>(metadata, "radio.analyzer.channel_count")
     {
@@ -915,117 +1017,9 @@ pub(crate) fn radio_settings_from_recording_metadata(
         if !channels.is_empty() {
             settings.analyzer.channels = channels;
         }
-    } else if let Some(value) =
-        recording_metadata_value(metadata, "radio.analyzer.channel_offset_hz")
+    } else if let Some(value) = recording_metadata_value(metadata, RADIO_LEGACY_CHANNEL_OFFSET_KEY)
     {
         settings.analyzer.channels = vec![RadioAnalyzerChannelSettings::numbered(0, value)];
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.channel_bandwidth_hz") {
-        settings.analyzer.channel_bandwidth_hz = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.output_sample_rate_hz")
-    {
-        settings.analyzer.output_sample_rate_hz = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.filter_tap_count") {
-        settings.analyzer.filter_tap_count = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.symbol_rate_hz") {
-        settings.analyzer.symbol_rate_hz = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.deviation_hz") {
-        settings.analyzer.deviation_hz = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.gfsk_bt_milli") {
-        settings.analyzer.gfsk_bt_milli = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.inverted") {
-        settings.analyzer.inverted = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.adaptive_timing") {
-        settings.analyzer.adaptive_timing = value;
-    }
-    if let Some(value) =
-        recording_metadata_value(metadata, "radio.analyzer.timing_loop_bandwidth_milli")
-    {
-        settings.analyzer.timing_loop_bandwidth_milli = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.max_clock_error_ppm") {
-        settings.analyzer.max_clock_error_ppm = value;
-    }
-    if let Some(value) = metadata.get("radio.analyzer.data_mode") {
-        settings.analyzer.data_mode = match value.as_str() {
-            "packets" => RadioDataMode::Packets,
-            _ => RadioDataMode::Raw,
-        };
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.preamble_byte") {
-        settings.analyzer.preamble_byte = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.preamble_bytes") {
-        settings.analyzer.preamble_bytes = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.sync_word") {
-        settings.analyzer.sync_word = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.sync_word_bytes") {
-        settings.analyzer.sync_word_bytes = value;
-    }
-    if let Some(value) =
-        recording_metadata_value(metadata, "radio.analyzer.maximum_preamble_bit_errors")
-    {
-        settings.analyzer.maximum_preamble_bit_errors = value;
-    }
-    if let Some(value) =
-        recording_metadata_value(metadata, "radio.analyzer.minimum_bit_confidence_milli")
-    {
-        settings.analyzer.minimum_bit_confidence_milli = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.maximum_uncertain_bits")
-    {
-        settings.analyzer.maximum_uncertain_bits = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.whitening_enabled") {
-        settings.analyzer.whitening_enabled = value;
-    }
-    if let Some(value) = metadata.get("radio.analyzer.whitening_preset") {
-        settings.analyzer.whitening_preset = match value.as_str() {
-            "pn9_x9_x5" => RadioWhiteningPreset::Pn9X9X5,
-            _ => RadioWhiteningPreset::Custom,
-        };
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.whitening_width") {
-        settings.analyzer.whitening_width = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.whitening_polynomial") {
-        settings.analyzer.whitening_polynomial = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.whitening_seed") {
-        settings.analyzer.whitening_seed = value;
-    }
-    if let Some(value) = metadata.get("radio.analyzer.whitening_direction") {
-        settings.analyzer.whitening_direction = match value.as_str() {
-            "left" => WhiteningDirection::ShiftLeft,
-            _ => WhiteningDirection::ShiftRight,
-        };
-    }
-    if let Some(value) =
-        recording_metadata_value(metadata, "radio.analyzer.whitening_invert_output")
-    {
-        settings.analyzer.whitening_invert_output = value;
-    }
-    if let Some(value) = recording_metadata_value(metadata, "radio.analyzer.whitening_start_bit") {
-        settings.analyzer.whitening_start_bit = value;
-    }
-    if let Some(value) = metadata.get("radio.analyzer.whitening_end_bit") {
-        settings.analyzer.whitening_end_bit = (value != "none")
-            .then(|| value.parse::<usize>().ok())
-            .flatten();
-    }
-    if let Some(value) =
-        recording_metadata_value(metadata, "radio.analyzer.whitening_advance_excluded_bits")
-    {
-        settings.analyzer.whitening_advance_excluded_bits = value;
     }
     for (key, value) in metadata {
         let Some(id) = key
@@ -1039,4 +1033,65 @@ pub(crate) fn radio_settings_from_recording_metadata(
         }
     }
     settings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn channel_keys<S>(fields: &[ChannelField<S>], channel_count: usize) -> Vec<String> {
+        fields
+            .iter()
+            .flat_map(|field| (0..channel_count).map(|channel| (field.key)(channel)))
+            .collect()
+    }
+
+    fn field_keys<S>(fields: &[MetadataField<S>]) -> Vec<String> {
+        fields.iter().map(|field| field.key.to_owned()).collect()
+    }
+
+    fn assert_unique(label: &str, keys: &[String]) {
+        let mut seen = HashSet::new();
+        for key in keys {
+            assert!(seen.insert(key), "{label} table lists {key} more than once");
+        }
+    }
+
+    /// A key listed twice would make one entry silently overwrite the other on
+    /// save, and both would read the same stored value on load.
+    #[test]
+    fn table_keys_are_unique_within_each_instrument() {
+        let mut logic = field_keys(LOGIC_FIELDS);
+        logic.extend(channel_keys(LOGIC_CHANNEL_FIELDS, LOGIC_CHANNEL_COUNT));
+        assert_unique("logic", &logic);
+
+        let mut scope = field_keys(SCOPE_FIELDS);
+        scope.extend(channel_keys(SCOPE_CHANNEL_FIELDS, 2));
+        assert_unique("scope", &scope);
+
+        let mut radio = field_keys(RADIO_FIELDS);
+        radio.push(RADIO_LEGACY_ANALYZER_ENABLED_KEY.to_owned());
+        radio.push(RADIO_LEGACY_CHANNEL_OFFSET_KEY.to_owned());
+        assert_unique("radio", &radio);
+    }
+
+    #[test]
+    fn table_keys_stay_inside_their_instrument_namespace() {
+        for key in field_keys(LOGIC_FIELDS)
+            .into_iter()
+            .chain(channel_keys(LOGIC_CHANNEL_FIELDS, LOGIC_CHANNEL_COUNT))
+        {
+            assert!(key.starts_with("logic."), "{key}");
+        }
+        for key in field_keys(SCOPE_FIELDS)
+            .into_iter()
+            .chain(channel_keys(SCOPE_CHANNEL_FIELDS, 2))
+        {
+            assert!(key.starts_with("scope."), "{key}");
+        }
+        for key in field_keys(RADIO_FIELDS) {
+            assert!(key.starts_with("radio."), "{key}");
+        }
+    }
 }
