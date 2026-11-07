@@ -8,8 +8,9 @@ use wavecraft_decode::{
     RawRadioDecoder, RawRadioOutput, SampleRange, TimedBit, TimedBitBatch,
 };
 use wavecraft_dsp::{
-    DemodulatedBatch, DemodulatorRegistry, PreparedIqBatch, SignalAnalyzer, SignalAnalyzerProfile,
-    SpectrumFrame, SpectrumProcessor, TimedSoftSymbolBatch, WidebandIqPreprocessor,
+    ChannelizedBatch, DemodulatedBatch, DemodulatorRegistry, LevelStepSegmenter, PreparedIqBatch,
+    SignalAnalyzer, SignalAnalyzerProfile, SpectrumFrame, SpectrumProcessor, TimedSoftSymbolBatch,
+    WidebandIqPreprocessor,
 };
 
 const SQUELCH_RELEASE_FRAMES: usize = 3;
@@ -147,6 +148,13 @@ impl RadioDataDecoder {
         }
     }
 
+    fn is_synchronized(&self) -> bool {
+        match self {
+            Self::Raw(decoder) => decoder.is_synchronized(),
+            Self::Packets(_) => false,
+        }
+    }
+
     fn finish(&mut self) -> (RawRadioOutput, RadioPacketPipelineOutput) {
         match self {
             Self::Raw(decoder) => (decoder.finish(), RadioPacketPipelineOutput::default()),
@@ -159,6 +167,9 @@ impl RadioDataDecoder {
 /// binary symbol decisions, and raw or packet radio decoding.
 pub struct RadioAnalyzerRuntime {
     signal: SignalAnalyzer,
+    /// Splits the channel where its level steps, so that each transmission
+    /// reaches the demodulator and the decoder on its own.
+    segmenter: LevelStepSegmenter,
     decoder: RadioDataDecoder,
     channel_frequency_offset_hz: i64,
     channel_name: Arc<str>,
@@ -188,6 +199,7 @@ impl RadioAnalyzerRuntime {
     ) -> Result<Self, String> {
         let channel_frequency_offset_hz = profile.channel.frequency_offset_hz;
         let channel_bandwidth_hz = profile.channel.bandwidth_hz;
+        let segmenter = LevelStepSegmenter::new(profile.demodulation.symbol_rate_hz());
         let registry = DemodulatorRegistry::with_builtins()
             .map_err(|error| format!("failed to initialize demodulators: {error}"))?;
         let signal = SignalAnalyzer::new(profile, &registry)
@@ -195,6 +207,7 @@ impl RadioAnalyzerRuntime {
         let decoder = RadioDataDecoder::new(decoder_config)?;
         Ok(Self {
             signal,
+            segmenter,
             decoder,
             channel_frequency_offset_hz,
             channel_name: channel_name.into(),
@@ -219,8 +232,11 @@ impl RadioAnalyzerRuntime {
         }
         // A lone analyzer has no earlier windows to start from.
         self.burst_just_opened = false;
-        let demodulated = self.signal.push(input).map_err(|error| error.to_string())?;
-        self.finish_push(demodulated)
+        let channelized = self
+            .signal
+            .channel(input)
+            .map_err(|error| error.to_string())?;
+        self.demodulate_channel(&channelized)
     }
 
     /// Runs a burst's first window together with the `pre_roll` windows that
@@ -236,11 +252,11 @@ impl RadioAnalyzerRuntime {
         } else {
             None
         };
-        let demodulated = self
+        let channelized = self
             .signal
-            .push_prepared(joined.as_ref().unwrap_or(input))
+            .channel_prepared(joined.as_ref().unwrap_or(input))
             .map_err(|error| error.to_string())?;
-        self.finish_push(demodulated)
+        self.demodulate_channel(&channelized)
     }
 
     fn begin_push(
@@ -280,7 +296,7 @@ impl RadioAnalyzerRuntime {
         let signal_present = powers.iter().any(|power| *power >= effective_squelch_dbfs);
         if signal_present {
             if !self.burst_active {
-                self.signal.reset();
+                self.reset_signal();
                 self.decoder.reset();
                 self.burst_just_opened = true;
             }
@@ -291,7 +307,7 @@ impl RadioAnalyzerRuntime {
         }
         if self.burst_active && self.quiet_spectrum_frames >= SQUELCH_RELEASE_FRAMES {
             let (raw, packets) = self.decoder.finish();
-            self.signal.reset();
+            self.reset_signal();
             self.burst_active = false;
             self.burst_just_opened = false;
             self.quiet_spectrum_frames = 0;
@@ -319,17 +335,56 @@ impl RadioAnalyzerRuntime {
         None
     }
 
-    fn finish_push(
+    fn reset_signal(&mut self) {
+        self.signal.reset();
+        self.segmenter.reset();
+    }
+
+    /// Demodulates and decodes the channel, one steady-level run at a time.
+    ///
+    /// A step in the level is the end of one transmission, or the start of a
+    /// different one, and the demodulator and decoder must not carry what they
+    /// learned from the first over to the second: its tones, symbol clock and
+    /// byte alignment are the first transmitter's. At a step the demodulator
+    /// hands over the symbols it still holds and the decoder ends its message,
+    /// so the noise after a carrier is never decoded as part of it, and a
+    /// burst that follows is acquired from its own first sample, not from
+    /// whatever the noise before it left in the demodulator.
+    fn demodulate_channel(
         &mut self,
-        demodulated: DemodulatedBatch,
+        channelized: &ChannelizedBatch,
     ) -> Result<RadioAnalyzerOutput, String> {
-        let (raw, packets) = self.decoder.push_demodulated(&demodulated)?;
+        let mut outcome = SegmentOutcome::default();
+        for mut segment in self.segmenter.push(channelized) {
+            if segment.step.is_some() {
+                if let Some(held) = self
+                    .signal
+                    .finish_demodulation()
+                    .map_err(|error| error.to_string())?
+                {
+                    let (raw, packets) = self.decoder.push_demodulated(&held)?;
+                    outcome.absorb(Some(held), raw, packets);
+                }
+                let (raw, packets) = self.decoder.finish();
+                self.decoder.reset();
+                outcome.absorb(None, raw, packets);
+                segment.batch.discontinuity = true;
+            }
+            let demodulated = self
+                .signal
+                .demodulate(&segment.batch)
+                .map_err(|error| error.to_string())?;
+            let (raw, packets) = self.decoder.push_demodulated(&demodulated)?;
+            outcome.absorb(Some(demodulated), raw, packets);
+        }
+        // The state after the last run, also when the batch held no run.
+        outcome.raw.synchronized = self.decoder.is_synchronized();
         Ok(RadioAnalyzerOutput {
             channel_frequency_offset_hz: self.channel_frequency_offset_hz,
             channel_name: Arc::clone(&self.channel_name),
-            demodulated: Some(demodulated),
-            raw,
-            packets,
+            demodulated: outcome.demodulated,
+            raw: outcome.raw,
+            packets: outcome.packets,
             burst_ended: false,
             telemetry: self.telemetry(),
         })
@@ -349,6 +404,40 @@ impl RadioAnalyzerRuntime {
             estimated_frequency_offset_hz: demodulator.estimated_frequency_offset_hz,
             estimated_tone_separation_hz: demodulator.estimated_tone_separation_hz,
         }
+    }
+}
+
+/// What the runs of one channel batch produced, joined into one output.
+#[derive(Default)]
+struct SegmentOutcome {
+    demodulated: Option<DemodulatedBatch>,
+    raw: RawRadioOutput,
+    packets: RadioPacketPipelineOutput,
+}
+
+impl SegmentOutcome {
+    fn absorb(
+        &mut self,
+        demodulated: Option<DemodulatedBatch>,
+        raw: RawRadioOutput,
+        packets: RadioPacketPipelineOutput,
+    ) {
+        match (&mut self.demodulated, demodulated) {
+            (slot @ None, demodulated) => *slot = demodulated,
+            (
+                Some(DemodulatedBatch::SoftSymbols(existing)),
+                Some(DemodulatedBatch::SoftSymbols(more)),
+            ) => existing.symbols.extend(more.symbols),
+            // The radio decoders take soft symbols only, so nothing else gets
+            // this far.
+            _ => {}
+        }
+        self.raw.bytes.extend(raw.bytes);
+        self.raw.message_starts.extend(raw.message_starts);
+        self.raw.diagnostics.extend(raw.diagnostics);
+        self.raw.synchronized = raw.synchronized;
+        self.packets.packets.extend(packets.packets);
+        self.packets.diagnostics.extend(packets.diagnostics);
     }
 }
 
@@ -748,6 +837,99 @@ mod tests {
             "first symbol starts at {}, inside the second window",
             first.source_range.start
         );
+    }
+
+    /// Binary FSK at 1 kHz, 8 samples per symbol, on the tones the test
+    /// profile listens for: a one is 2 kHz and a zero is 0 Hz.
+    fn fsk_burst(bytes: &[u8], amplitude: f32) -> Vec<Iq8> {
+        let mut phase = 0.0_f32;
+        let mut samples = Vec::new();
+        for byte in bytes {
+            for bit in (0..8).rev() {
+                let frequency_hz = if byte >> bit & 1 == 1 { 2_000.0 } else { 0.0 };
+                for _ in 0..8 {
+                    phase += TAU * frequency_hz / 8_000.0;
+                    samples.push(Iq8 {
+                        i: (phase.cos() * amplitude).round() as i8,
+                        q: (phase.sin() * amplitude).round() as i8,
+                    });
+                }
+            }
+        }
+        samples
+    }
+
+    /// Runs `samples` through one raw-decoding channel and returns its
+    /// messages, each as the bytes from one message start to the next.
+    fn decoded_messages(samples: Vec<Iq8>) -> Vec<Vec<u8>> {
+        const FFT_LENGTH: usize = 256;
+        let input = IqBatch {
+            sample_rate_hz: 8_000,
+            center_frequency_hz: 100_000_000,
+            first_sample_index: 0,
+            discontinuity: true,
+            samples,
+        };
+        let mut spectrum = SpectrumProcessor::new(FFT_LENGTH, SpectrumWindow::Hann).unwrap();
+        let mut analyzers = RadioAnalyzerBank::new(vec![RadioAnalyzerRuntime::new(
+            profile(),
+            RadioDataDecoderConfig::Raw(raw_config()),
+        )
+        .unwrap()]);
+
+        let output = process_radio_iq(&mut spectrum, &mut analyzers, &input, -60.0);
+
+        let mut messages: Vec<Vec<u8>> = Vec::new();
+        for analysis in output.analyses {
+            let analysis = analysis.unwrap();
+            let starts = analysis
+                .raw
+                .message_starts
+                .iter()
+                .map(|start| start.sample_index)
+                .collect::<Vec<_>>();
+            for byte in analysis.raw.bytes {
+                if starts.contains(&byte.range.start) || messages.is_empty() {
+                    messages.push(Vec::new());
+                }
+                messages.last_mut().unwrap().push(byte.value);
+            }
+        }
+        messages
+    }
+
+    fn quiet(windows: usize) -> Vec<Iq8> {
+        vec![Iq8 { i: 0, q: 0 }; 256 * windows]
+    }
+
+    #[test]
+    fn a_message_ends_where_its_carrier_ends() {
+        // The squelch holds the channel open for a few windows after the
+        // carrier stops. What the demodulator makes of that silence is not
+        // part of the frame.
+        let frame = [0xaa, 0xaa, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34];
+        let mut samples = quiet(1);
+        samples.extend(fsk_burst(&frame, 100.0));
+        samples.extend(quiet(6));
+
+        let messages = decoded_messages(samples);
+
+        assert_eq!(messages, vec![frame.to_vec()]);
+    }
+
+    #[test]
+    fn a_weak_burst_right_after_a_strong_one_is_a_message_of_its_own() {
+        let strong = [0xaa, 0xaa, 0xc1, 0xc2, 0xc3, 0xc4];
+        let weak = [0xaa, 0xaa, 0xd1, 0xd2, 0xd3, 0xd4];
+        let mut samples = quiet(1);
+        samples.extend(fsk_burst(&strong, 100.0));
+        samples.extend(vec![Iq8 { i: 0, q: 0 }; 48]);
+        samples.extend(fsk_burst(&weak, 16.0));
+        samples.extend(quiet(6));
+
+        let messages = decoded_messages(samples);
+
+        assert_eq!(messages, vec![strong.to_vec(), weak.to_vec()]);
     }
 
     #[test]

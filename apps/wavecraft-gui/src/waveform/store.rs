@@ -431,7 +431,13 @@ mod tests {
         // Keep the FFT shorter than this focused synthetic burst so the
         // analyzer's burst gate receives a channel-power observation.
         let mut spectrum = SpectrumProcessor::new(256, SpectrumWindow::Hann).unwrap();
-        let bits = [true, false, true, true, false, false, true];
+        // The carrier keeps going after the symbols checked below: the channel
+        // is only handed to the demodulator a few symbols behind the newest
+        // sample, so that a change of level is seen before the samples around
+        // it are decoded.
+        let bits = [
+            true, false, true, true, false, false, true, true, false, true, false,
+        ];
         let mut phase: f64 = 0.0;
         let samples = bits
             .into_iter()
@@ -469,7 +475,7 @@ mod tests {
             waveforms.radio_analysis.soft_symbol_alphabet_size(),
             Some(2)
         );
-        assert_eq!(waveforms.radio_analysis.soft_symbols().len(), 5);
+        assert_eq!(waveforms.radio_analysis.soft_symbols().len(), 6);
         assert_eq!(
             waveforms
                 .radio_analysis
@@ -477,7 +483,7 @@ mod tests {
                 .iter()
                 .map(|symbol| symbol.decision())
                 .collect::<Vec<_>>(),
-            vec![Some(0), Some(1), Some(1), Some(0), Some(0)]
+            vec![Some(0), Some(1), Some(1), Some(0), Some(0), Some(1)]
         );
         assert_eq!(waveforms.radio_analysis.error(), None);
     }

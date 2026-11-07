@@ -585,6 +585,52 @@ pre-roll and 166 with it, against 174 when requiring eight. More than two window
 lead-in noise is harmless only because of the noise gate described under
 *Symbol timing and soft symbols*.
 
+### Transmissions that follow each other
+
+The squelch cannot see where a burst ends or that a second one began. It holds
+a channel open for three quiet windows (about 3 ms, seven bytes at
+19.2 kbit/s) after the carrier, and everything in that time reached the
+demodulator and the decoder: a message grew by about five bytes of noise, a
+63 byte frame read as 70, and a weak transmission starting 1.3 to 1.6 ms after
+a strong one (a repeater answering) was decoded as part of the first, with the
+tone and clock settings of the strong one and a damaged second preamble and
+sync word.
+
+The filtered channel shows both events as steps in level: the envelope of FSK
+and GFSK is constant, so a change of 6 dB or more is a different signal, not
+modulation. `LevelStepSegmenter` (`wavecraft-dsp`) compares the mean power of
+the three symbols before and after every channel sample and reports the sharpest
+step at its exact sample. A step needs the window after it, so the samples are
+released three symbols late, unchanged. The radio runtime hands each steady run
+to the demodulator separately. At a step it
+
+1. finishes the demodulator (`FskDemodulator::finish`), which continues the
+   carrier at its last frequency for half a receive-filter span so that the
+   symbols the filter still holds, two for GFSK, are not lost,
+2. ends the decoder's message (`finish`, then `reset`), and
+3. starts the next run with `discontinuity` set, so a transmission is acquired
+   from its own first sample and not from what the noise before it left in the
+   tone tracker and clock loop.
+
+A drop is the end of the carrier, so the noise after it is not decoded as part
+of the message (it reaches an idle demodulator, which does not acquire noise).
+A rise starts a transmission. A signal less than 6 dB above the noise has no
+edge that stands out, and is left to the squelch as before.
+
+On a 61 s capture with two channels and 63 messages, the message end was a
+median 4.9 bytes (at most 6.9) past the end of the carrier and now is 0.0 (at
+most 0.4); transmissions merged into one message fell from 10 to 1. Frames now
+have the lengths the transmitter sends: a long frame is 63 bytes after the sync
+word in all seven cases (it was 67 to 71, and 101 where two followed each other),
+and its retransmissions on the other channel agree on exactly those 63 bytes.
+Over the two captures 6 messages were found that were hidden before, and none
+was lost.
+
+Which byte boundary the raw decoder aligns to still depends on bits before the
+burst, because the alternating preamble matches itself shifted by two bits: the
+sync word `91 d3` also appears as `a4 74`, `a9 1d` and `47 4f` with the same
+bits. About one message in four is affected whatever the segmentation.
+
 ### FSK and GFSK demodulation
 
 The first demodulator supports binary 2-FSK. After channel filtering it uses a
@@ -693,8 +739,10 @@ burst:
   instead of 53 to 71.
 
 The centred filter needs look-ahead: the last two symbols of a GFSK burst (half
-a symbol for FSK) are decided only when later samples arrive. A real burst is
-followed by a quiet channel until the squelch releases, which supplies them.
+a symbol for FSK) are decided only when later samples arrive. When the burst's
+end is found (see *Transmissions that follow each other*), `finish` supplies
+them by continuing the carrier; otherwise the quiet channel until the squelch
+releases does.
 The filter's start is extended backwards so the first preamble symbols are kept,
 and the first symbol of a burst is still decided from the first sample when its
 centre lies up to 0.3 of a symbol before it. The channel filter outputs its first
