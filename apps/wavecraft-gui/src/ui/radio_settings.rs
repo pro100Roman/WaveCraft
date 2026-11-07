@@ -335,6 +335,35 @@ pub(crate) fn paint_radio_analyzer_configuration(
     enabled: bool,
 ) {
     ui.set_max_width(ui.available_width());
+    paint_radio_analyzer_modulation(ui, settings, enabled);
+
+    if !settings.is_enabled() {
+        return;
+    }
+
+    egui::Grid::new("radio_signal_analyzer_parameters")
+        .num_columns(2)
+        .max_col_width(126.0)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            paint_radio_analyzer_filter_rows(ui, settings, capture_sample_rate_hz, enabled);
+            paint_radio_analyzer_symbol_rows(ui, settings, enabled);
+            paint_radio_analyzer_preamble_rows(ui, settings, enabled);
+            paint_radio_analyzer_sync_word_rows(ui, settings, enabled);
+            paint_radio_analyzer_timing_rows(ui, settings, enabled);
+            paint_radio_analyzer_acquisition_rows(ui, settings, enabled);
+            paint_radio_analyzer_data_mode_row(ui, settings, enabled);
+            paint_radio_analyzer_whitening_rows(ui, settings, enabled);
+        });
+
+    paint_radio_analyzer_configuration_error(ui, settings);
+}
+
+fn paint_radio_analyzer_modulation(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    enabled: bool,
+) {
     egui::Grid::new("radio_signal_analyzer_configuration")
         .num_columns(2)
         .max_col_width(126.0)
@@ -373,295 +402,319 @@ pub(crate) fn paint_radio_analyzer_configuration(
             });
             ui.end_row();
         });
+}
 
-    if !settings.is_enabled() {
-        return;
-    }
-
-    let controls_enabled = enabled;
-    egui::Grid::new("radio_signal_analyzer_parameters")
-        .num_columns(2)
-        .max_col_width(126.0)
-        .spacing([8.0, 6.0])
-        .show(ui, |ui| {
-
-            paint_radio_parameter_label(ui, "Polarity", Some("Swaps mark and space decisions"));
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                egui::ComboBox::from_id_salt("radio_analyzer_polarity")
-                    .width(RADIO_VALUE_WIDTH)
-                    .selected_text(if settings.inverted {
-                        "Inverted"
-                    } else {
-                        "Normal"
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut settings.inverted, false, "Normal");
-                        ui.selectable_value(&mut settings.inverted, true, "Inverted");
-                    });
+fn paint_radio_analyzer_filter_rows(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    capture_sample_rate_hz: u64,
+    enabled: bool,
+) {
+    paint_radio_parameter_label(ui, "Polarity", Some("Swaps mark and space decisions"));
+    ui.add_enabled_ui(enabled, |ui| {
+        egui::ComboBox::from_id_salt("radio_analyzer_polarity")
+            .width(RADIO_VALUE_WIDTH)
+            .selected_text(if settings.inverted {
+                "Inverted"
+            } else {
+                "Normal"
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut settings.inverted, false, "Normal");
+                ui.selectable_value(&mut settings.inverted, true, "Inverted");
             });
-            ui.end_row();
+    });
+    ui.end_row();
 
-            let capture_rate_mhz = capture_sample_rate_hz as f64 / 1_000_000.0;
-            paint_radio_parameter_label(
+    let capture_rate_mhz = capture_sample_rate_hz as f64 / 1_000_000.0;
+    paint_radio_parameter_label(
+        ui,
+        "Channel bandwidth",
+        Some("Full complex bandwidth retained around the selected channel"),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        paint_scaled_u64_value(
+            ui,
+            &mut settings.channel_bandwidth_hz,
+            1_000_000.0,
+            0.000_001..=capture_rate_mhz.max(0.000_001),
+            "MHz",
+        );
+    });
+    ui.end_row();
+
+    paint_radio_parameter_label(
+        ui,
+        "Processing rate",
+        Some("IQ sample rate after channel filtering and bounded downsampling"),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        paint_scaled_u64_value(
+            ui,
+            &mut settings.output_sample_rate_hz,
+            1_000_000.0,
+            0.000_001..=capture_rate_mhz.max(0.000_001),
+            "MHz",
+        );
+    });
+    ui.end_row();
+
+    paint_radio_parameter_label(
+        ui,
+        "Channel filter taps",
+        Some("Odd FIR length from 3 to 4095; more taps improve rejection but cost CPU"),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        add_left_aligned_sized(
+            ui,
+            egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+            egui::DragValue::new(&mut settings.filter_tap_count)
+                .range(3..=4_095)
+                .speed(2),
+        );
+    });
+    settings.filter_tap_count = settings.filter_tap_count.clamp(3, 4_095) | 1;
+    ui.end_row();
+}
+
+fn paint_radio_analyzer_symbol_rows(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    enabled: bool,
+) {
+    let processing_rate_khz = settings.output_sample_rate_hz as f64 / 1_000.0;
+    paint_radio_parameter_label(
+        ui,
+        "Bit rate",
+        Some("Raw bit rate for binary FSK/GFSK; one symbol carries one bit"),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        paint_scaled_u64_value(
+            ui,
+            &mut settings.symbol_rate_hz,
+            1_000.0,
+            0.001..=(processing_rate_khz / 2.0).max(0.001),
+            "kbit/s",
+        );
+    });
+    ui.end_row();
+
+    paint_radio_parameter_label(
+        ui,
+        "Frequency deviation",
+        Some("Expected mark or space displacement from the channel center"),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        paint_scaled_u64_value(
+            ui,
+            &mut settings.deviation_hz,
+            1_000.0,
+            0.001..=(processing_rate_khz / 2.0).max(0.001),
+            "kHz",
+        );
+    });
+    ui.end_row();
+
+    if settings.demodulation == RadioDemodulation::BinaryGfsk {
+        paint_radio_parameter_label(
+            ui,
+            "Gaussian BT",
+            Some("Expected transmitter Gaussian bandwidth-time product"),
+        );
+        ui.add_enabled_ui(enabled, |ui| {
+            let mut bt = f64::from(settings.gfsk_bt_milli) / 1_000.0;
+            if add_left_aligned_sized(
                 ui,
-                "Channel bandwidth",
-                Some("Full complex bandwidth retained around the selected channel"),
-            );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                paint_scaled_u64_value(
-                    ui,
-                    &mut settings.channel_bandwidth_hz,
-                    1_000_000.0,
-                    0.000_001..=capture_rate_mhz.max(0.000_001),
-                    "MHz",
-                );
-            });
-            ui.end_row();
-
-            paint_radio_parameter_label(
-                ui,
-                "Processing rate",
-                Some("IQ sample rate after channel filtering and bounded downsampling"),
-            );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                paint_scaled_u64_value(
-                    ui,
-                    &mut settings.output_sample_rate_hz,
-                    1_000_000.0,
-                    0.000_001..=capture_rate_mhz.max(0.000_001),
-                    "MHz",
-                );
-            });
-            ui.end_row();
-
-            paint_radio_parameter_label(
-                ui,
-                "Channel filter taps",
-                Some("Odd FIR length from 3 to 4095; more taps improve rejection but cost CPU"),
-            );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                add_left_aligned_sized(
-                    ui,
-                    egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                    egui::DragValue::new(&mut settings.filter_tap_count)
-                        .range(3..=4_095)
-                        .speed(2),
-                );
-            });
-            settings.filter_tap_count = settings.filter_tap_count.clamp(3, 4_095) | 1;
-            ui.end_row();
-
-            let processing_rate_khz = settings.output_sample_rate_hz as f64 / 1_000.0;
-            paint_radio_parameter_label(
-                ui,
-                "Bit rate",
-                Some("Raw bit rate for binary FSK/GFSK; one symbol carries one bit"),
-            );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                paint_scaled_u64_value(
-                    ui,
-                    &mut settings.symbol_rate_hz,
-                    1_000.0,
-                    0.001..=(processing_rate_khz / 2.0).max(0.001),
-                    "kbit/s",
-                );
-            });
-            ui.end_row();
-
-            paint_radio_parameter_label(
-                ui,
-                "Frequency deviation",
-                Some("Expected mark or space displacement from the channel center"),
-            );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                paint_scaled_u64_value(
-                    ui,
-                    &mut settings.deviation_hz,
-                    1_000.0,
-                    0.001..=(processing_rate_khz / 2.0).max(0.001),
-                    "kHz",
-                );
-            });
-            ui.end_row();
-
-            if settings.demodulation == RadioDemodulation::BinaryGfsk {
-                paint_radio_parameter_label(
-                    ui,
-                    "Gaussian BT",
-                    Some("Expected transmitter Gaussian bandwidth-time product"),
-                );
-                ui.add_enabled_ui(controls_enabled, |ui| {
-                    let mut bt = f64::from(settings.gfsk_bt_milli) / 1_000.0;
-                    if add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut bt)
-                            .range(0.01..=2.0)
-                            .speed(0.01)
-                            .min_decimals(2)
-                            .max_decimals(3),
-                    )
-                    .changed()
-                    {
-                        settings.gfsk_bt_milli = (bt * 1_000.0).round() as u32;
-                    }
-                });
-                ui.end_row();
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut bt)
+                    .range(0.01..=2.0)
+                    .speed(0.01)
+                    .min_decimals(2)
+                    .max_decimals(3),
+            )
+            .changed()
+            {
+                settings.gfsk_bt_milli = (bt * 1_000.0).round() as u32;
             }
+        });
+        ui.end_row();
+    }
+}
 
-            paint_radio_parameter_label(
+fn paint_radio_analyzer_preamble_rows(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    enabled: bool,
+) {
+    paint_radio_parameter_label(
+        ui,
+        "Preamble value",
+        Some("One hexadecimal byte repeated at the start of the FSK data"),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            add_left_aligned_sized(
                 ui,
-                "Preamble value",
-                Some("One hexadecimal byte repeated at the start of the FSK data"),
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut settings.preamble_byte)
+                    .range(0..=u8::MAX)
+                    .speed(1)
+                    .hexadecimal(2, false, true),
             );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut settings.preamble_byte)
-                            .range(0..=u8::MAX)
-                            .speed(1)
-                            .hexadecimal(2, false, true),
-                    );
-                    ui.label("hex");
-                });
-            });
-            ui.end_row();
+            ui.label("hex");
+        });
+    });
+    ui.end_row();
 
-            paint_radio_parameter_label(
+    paint_radio_parameter_label(
                 ui,
                 "Preamble length",
                 Some("Minimum consecutive preamble bytes required; in raw mode zero starts at the first recovered bit and keeps the preamble as data, while sync or three repeated preamble bytes refine later packet boundaries"),
             );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut settings.preamble_bytes)
-                            .range(0..=256)
-                            .speed(1),
-                    );
-                    ui.label("bytes");
-                });
-            });
-            settings.preamble_bytes = settings.preamble_bytes.min(256);
-            ui.end_row();
-
-            paint_radio_parameter_label(
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            add_left_aligned_sized(
                 ui,
-                "Sync word",
-                Some(if settings.data_mode == RadioDataMode::Packets {
-                    "Required 1-to-8-byte unwhitened word that establishes the packet and whitening boundary"
-                } else {
-                    "Optional 1-to-8-byte word after the repeated preamble; unlike 0xAA, it establishes an unambiguous byte boundary"
-                }),
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut settings.preamble_bytes)
+                    .range(0..=256)
+                    .speed(1),
             );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut settings.sync_word)
-                            .range(0..=u64::MAX)
-                            .speed(1)
-                            .hexadecimal(2, false, true),
-                    );
-                    ui.label("hex");
-                });
-            });
-            ui.end_row();
+            ui.label("bytes");
+        });
+    });
+    settings.preamble_bytes = settings.preamble_bytes.min(256);
+    ui.end_row();
+}
 
-            paint_radio_parameter_label(
+fn paint_radio_analyzer_sync_word_rows(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    enabled: bool,
+) {
+    paint_radio_parameter_label(
+        ui,
+        "Sync word",
+        Some(if settings.data_mode == RadioDataMode::Packets {
+            "Required 1-to-8-byte unwhitened word that establishes the packet and whitening boundary"
+        } else {
+            "Optional 1-to-8-byte word after the repeated preamble; unlike 0xAA, it establishes an unambiguous byte boundary"
+        }),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            add_left_aligned_sized(
                 ui,
-                "Sync word length",
-                Some(if settings.data_mode == RadioDataMode::Packets {
-                    "Required in packet mode; bytes are taken big-endian from the value above"
-                } else {
-                    "Zero disables the separate sync word; bytes are taken big-endian from the value above"
-                }),
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut settings.sync_word)
+                    .range(0..=u64::MAX)
+                    .speed(1)
+                    .hexadecimal(2, false, true),
             );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut settings.sync_word_bytes)
-                            .range(if settings.data_mode == RadioDataMode::Packets {
-                                1..=8
-                            } else {
-                                0..=8
-                            })
-                            .speed(1),
-                    );
-                    ui.label("bytes");
-                });
-            });
-            settings.sync_word_bytes = settings.sync_word_bytes.min(8);
-            if settings.data_mode == RadioDataMode::Packets {
-                settings.sync_word_bytes = settings.sync_word_bytes.max(1);
-            }
-            ui.end_row();
+            ui.label("hex");
+        });
+    });
+    ui.end_row();
 
-            paint_radio_parameter_label(
+    paint_radio_parameter_label(
+        ui,
+        "Sync word length",
+        Some(if settings.data_mode == RadioDataMode::Packets {
+            "Required in packet mode; bytes are taken big-endian from the value above"
+        } else {
+            "Zero disables the separate sync word; bytes are taken big-endian from the value above"
+        }),
+    );
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut settings.sync_word_bytes)
+                    .range(if settings.data_mode == RadioDataMode::Packets {
+                        1..=8
+                    } else {
+                        0..=8
+                    })
+                    .speed(1),
+            );
+            ui.label("bytes");
+        });
+    });
+    settings.sync_word_bytes = settings.sync_word_bytes.min(8);
+    if settings.data_mode == RadioDataMode::Packets {
+        settings.sync_word_bytes = settings.sync_word_bytes.max(1);
+    }
+    ui.end_row();
+}
+
+fn paint_radio_analyzer_timing_rows(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    enabled: bool,
+) {
+    paint_radio_parameter_label(
                 ui,
                 "Adaptive timing",
                 Some("GNU Radio-style Mueller-and-Muller symbol synchronization after quadrature demodulation"),
             );
-            ui.add_enabled(
-                controls_enabled,
-                egui::Checkbox::without_text(&mut settings.adaptive_timing),
-            );
-            ui.end_row();
+    ui.add_enabled(
+        enabled,
+        egui::Checkbox::without_text(&mut settings.adaptive_timing),
+    );
+    ui.end_row();
 
-            if settings.adaptive_timing {
-                paint_radio_parameter_label(
-                    ui,
-                    "Timing loop bandwidth",
-                    Some("Higher values track faster but admit more timing jitter"),
-                );
-                ui.add_enabled_ui(controls_enabled, |ui| {
-                    let mut bandwidth =
-                        f64::from(settings.timing_loop_bandwidth_milli) / 1_000.0;
-                    if add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut bandwidth)
-                            .range(0.001..=1.0)
-                            .speed(0.001)
-                            .min_decimals(3)
-                            .max_decimals(3),
-                    )
-                    .changed()
-                    {
-                        settings.timing_loop_bandwidth_milli =
-                            (bandwidth * 1_000.0).round() as u32;
-                    }
-                });
-                ui.end_row();
-
-                paint_radio_parameter_label(
-                    ui,
-                    "Clock error limit",
-                    Some("Maximum symbol-clock correction allowed by the timing loop"),
-                );
-                ui.add_enabled_ui(controls_enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        add_left_aligned_sized(
-                            ui,
-                            egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                            egui::DragValue::new(&mut settings.max_clock_error_ppm)
-                                .range(0..=250_000)
-                                .speed(100),
-                        );
-                        ui.label("ppm");
-                    });
-                });
-                ui.end_row();
+    if settings.adaptive_timing {
+        paint_radio_parameter_label(
+            ui,
+            "Timing loop bandwidth",
+            Some("Higher values track faster but admit more timing jitter"),
+        );
+        ui.add_enabled_ui(enabled, |ui| {
+            let mut bandwidth = f64::from(settings.timing_loop_bandwidth_milli) / 1_000.0;
+            if add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut bandwidth)
+                    .range(0.001..=1.0)
+                    .speed(0.001)
+                    .min_decimals(3)
+                    .max_decimals(3),
+            )
+            .changed()
+            {
+                settings.timing_loop_bandwidth_milli = (bandwidth * 1_000.0).round() as u32;
             }
+        });
+        ui.end_row();
 
-            paint_radio_parameter_label(
+        paint_radio_parameter_label(
+            ui,
+            "Clock error limit",
+            Some("Maximum symbol-clock correction allowed by the timing loop"),
+        );
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.horizontal(|ui| {
+                add_left_aligned_sized(
+                    ui,
+                    egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                    egui::DragValue::new(&mut settings.max_clock_error_ppm)
+                        .range(0..=250_000)
+                        .speed(100),
+                );
+                ui.label("ppm");
+            });
+        });
+        ui.end_row();
+    }
+}
+
+fn paint_radio_analyzer_acquisition_rows(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    enabled: bool,
+) {
+    paint_radio_parameter_label(
                 ui,
                 if settings.data_mode == RadioDataMode::Packets {
                     "Sync bit errors"
@@ -670,297 +723,312 @@ pub(crate) fn paint_radio_analyzer_configuration(
                 },
                 Some("Maximum hard-decision mismatches accepted in the sync word, or in the preamble when sync is disabled"),
             );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut settings.maximum_preamble_bit_errors)
-                            .range(0..=64)
-                            .speed(1),
-                    );
-                    ui.label("bits");
-                });
-            });
-            let acquisition_bits = if settings.sync_word_bytes > 0 {
-                usize::from(settings.sync_word_bytes).saturating_mul(8)
-            } else if settings.preamble_bytes == 0 {
-                RAW_AUTOMATIC_PREAMBLE_BITS
-            } else {
-                settings.preamble_bytes.saturating_mul(8)
-            };
-            settings.maximum_preamble_bit_errors = settings
-                .maximum_preamble_bit_errors
-                .min(acquisition_bits.saturating_sub(1));
-            ui.end_row();
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut settings.maximum_preamble_bit_errors)
+                    .range(0..=64)
+                    .speed(1),
+            );
+            ui.label("bits");
+        });
+    });
+    let acquisition_bits = if settings.sync_word_bytes > 0 {
+        usize::from(settings.sync_word_bytes).saturating_mul(8)
+    } else if settings.preamble_bytes == 0 {
+        RAW_AUTOMATIC_PREAMBLE_BITS
+    } else {
+        settings.preamble_bytes.saturating_mul(8)
+    };
+    settings.maximum_preamble_bit_errors = settings
+        .maximum_preamble_bit_errors
+        .min(acquisition_bits.saturating_sub(1));
+    ui.end_row();
 
-            if settings.data_mode == RadioDataMode::Raw {
-                paint_radio_parameter_label(
+    if settings.data_mode == RadioDataMode::Raw {
+        paint_radio_parameter_label(
                     ui,
                     "Minimum bit confidence",
                     Some("Bits below this 0-to-1 demodulator confidence count as uncertain; zero disables confidence filtering"),
                 );
-                ui.add_enabled_ui(controls_enabled, |ui| {
-                    let mut confidence =
-                        f64::from(settings.minimum_bit_confidence_milli) / 1_000.0;
-                    if add_left_aligned_sized(
-                        ui,
-                        egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                        egui::DragValue::new(&mut confidence)
-                            .range(0.0..=1.0)
-                            .speed(0.01)
-                            .min_decimals(2)
-                            .max_decimals(3),
-                    )
-                    .changed()
-                    {
-                        settings.minimum_bit_confidence_milli =
-                            (confidence * 1_000.0).round() as u16;
-                    }
-                });
-                ui.end_row();
+        ui.add_enabled_ui(enabled, |ui| {
+            let mut confidence = f64::from(settings.minimum_bit_confidence_milli) / 1_000.0;
+            if add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut confidence)
+                    .range(0.0..=1.0)
+                    .speed(0.01)
+                    .min_decimals(2)
+                    .max_decimals(3),
+            )
+            .changed()
+            {
+                settings.minimum_bit_confidence_milli = (confidence * 1_000.0).round() as u16;
+            }
+        });
+        ui.end_row();
 
-                paint_radio_parameter_label(
+        paint_radio_parameter_label(
                     ui,
                     "Maximum uncertain bits",
                     Some("Rejects a completed RAW message when more bits fall below the confidence threshold"),
                 );
-                ui.add_enabled_ui(controls_enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        add_left_aligned_sized(
-                            ui,
-                            egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                            egui::DragValue::new(&mut settings.maximum_uncertain_bits)
-                                .range(0..=1_000_000)
-                                .speed(1),
-                        );
-                        ui.label("bits");
-                    });
-                });
-                ui.end_row();
-            }
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.horizontal(|ui| {
+                add_left_aligned_sized(
+                    ui,
+                    egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                    egui::DragValue::new(&mut settings.maximum_uncertain_bits)
+                        .range(0..=1_000_000)
+                        .speed(1),
+                );
+                ui.label("bits");
+            });
+        });
+        ui.end_row();
+    }
+}
 
-            paint_radio_parameter_label(
+fn paint_radio_analyzer_data_mode_row(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    enabled: bool,
+) {
+    paint_radio_parameter_label(
                 ui,
                 "Data decoding",
                 Some("RAW discovers byte alignment from a repeated preamble; Fixed requires the configured preamble and sync, then dewhitens post-sync data"),
             );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                egui::ComboBox::from_id_salt("radio_analyzer_data_mode")
-                    .width(RADIO_VALUE_WIDTH)
-                    .selected_text(match settings.data_mode {
-                        RadioDataMode::Raw => "RAW",
-                        RadioDataMode::Packets => "Fixed",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut settings.data_mode, RadioDataMode::Raw, "RAW");
-                        ui.selectable_value(
-                            &mut settings.data_mode,
-                            RadioDataMode::Packets,
-                            "Fixed",
-                        );
-                    });
+    ui.add_enabled_ui(enabled, |ui| {
+        egui::ComboBox::from_id_salt("radio_analyzer_data_mode")
+            .width(RADIO_VALUE_WIDTH)
+            .selected_text(match settings.data_mode {
+                RadioDataMode::Raw => "RAW",
+                RadioDataMode::Packets => "Fixed",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut settings.data_mode, RadioDataMode::Raw, "RAW");
+                ui.selectable_value(&mut settings.data_mode, RadioDataMode::Packets, "Fixed");
             });
-            ui.end_row();
+    });
+    ui.end_row();
+}
 
-            if settings.data_mode == RadioDataMode::Packets {
-                paint_radio_parameter_label(
-                    ui,
-                    "Data whitening",
-                    Some("XOR packet bits after sync with a reset additive LFSR sequence"),
-                );
-                ui.add_enabled(
-                    controls_enabled,
-                    egui::Checkbox::without_text(&mut settings.whitening_enabled),
-                );
-                ui.end_row();
+fn paint_radio_analyzer_whitening_rows(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    enabled: bool,
+) {
+    if settings.data_mode == RadioDataMode::Packets {
+        paint_radio_parameter_label(
+            ui,
+            "Data whitening",
+            Some("XOR packet bits after sync with a reset additive LFSR sequence"),
+        );
+        ui.add_enabled(
+            enabled,
+            egui::Checkbox::without_text(&mut settings.whitening_enabled),
+        );
+        ui.end_row();
 
-                if settings.whitening_enabled {
-                    let whitening_enabled = controls_enabled && settings.whitening_enabled;
-                    paint_radio_parameter_label(
-                        ui,
-                        "Whitening preset",
-                        Some("Selects a predefined whitening sequence; Custom exposes all LFSR parameters"),
-                    );
-                    ui.add_enabled_ui(whitening_enabled, |ui| {
-                        let combo = egui::ComboBox::from_id_salt("radio_whitening_preset")
-                            .width(RADIO_VALUE_WIDTH)
-                            .selected_text(settings.whitening_preset.label())
-                            .show_ui(ui, |ui| {
-                                for preset in [
-                                    RadioWhiteningPreset::Custom,
-                                    RadioWhiteningPreset::Pn9X9X5,
-                                ] {
-                                    let response = ui.selectable_value(
-                                        &mut settings.whitening_preset,
-                                        preset,
-                                        preset.label(),
-                                    );
-                                    if let Some(description) = preset.description() {
-                                        response.on_hover_selectable_text(description);
-                                    }
-                                }
-                            });
-                        if let Some(description) = settings.whitening_preset.description() {
-                            combo.response.on_hover_selectable_text(description);
-                        }
-                    });
-                    ui.end_row();
+        if settings.whitening_enabled {
+            let whitening_enabled = enabled && settings.whitening_enabled;
+            paint_radio_whitening_preset_row(ui, settings, whitening_enabled);
+            if settings.whitening_preset == RadioWhiteningPreset::Custom {
+                paint_radio_whitening_register_rows(ui, settings, whitening_enabled);
+                paint_radio_whitening_output_rows(ui, settings, whitening_enabled);
+                paint_radio_whitening_range_rows(ui, settings, whitening_enabled);
+            }
+        }
+    }
+}
 
-                    if settings.whitening_preset == RadioWhiteningPreset::Custom {
-                        paint_radio_parameter_label(
-                            ui,
-                            "LFSR width",
-                            Some("Whitening register width"),
-                        );
-                        ui.add_enabled_ui(whitening_enabled, |ui| {
-                            ui.horizontal(|ui| {
-                                add_left_aligned_sized(
-                                    ui,
-                                    egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                                    egui::DragValue::new(&mut settings.whitening_width)
-                                        .range(1..=64)
-                                        .speed(1),
-                                );
-                                ui.label("bits");
-                            });
-                        });
-                        ui.end_row();
-
-                        for (label, help, value) in [
-                        (
-                            "LFSR tap mask",
-                            "Tap mask over the current LFSR state; tapped-bit parity becomes feedback",
-                            &mut settings.whitening_polynomial,
-                        ),
-                        (
-                            "LFSR seed",
-                            "Nonzero register state loaded immediately after sync",
-                            &mut settings.whitening_seed,
-                        ),
-                        ] {
-                            paint_radio_parameter_label(ui, label, Some(help));
-                            ui.add_enabled_ui(whitening_enabled, |ui| {
-                                ui.horizontal(|ui| {
-                                    add_left_aligned_sized(
-                                        ui,
-                                        egui::vec2(
-                                            RADIO_VALUE_WIDTH,
-                                            ui.spacing().interact_size.y,
-                                        ),
-                                        egui::DragValue::new(value)
-                                            .range(0..=u64::MAX)
-                                            .speed(1)
-                                            .hexadecimal(2, false, true),
-                                    );
-                                    ui.label("hex");
-                                });
-                            });
-                            ui.end_row();
-                        }
-
-                    paint_radio_parameter_label(
-                        ui,
-                        "LFSR direction",
-                        Some("Selects the emitted end and shift direction of the register"),
-                    );
-                    ui.add_enabled_ui(whitening_enabled, |ui| {
-                        egui::ComboBox::from_id_salt("radio_whitening_direction")
-                            .width(RADIO_VALUE_WIDTH)
-                            .selected_text(match settings.whitening_direction {
-                                WhiteningDirection::ShiftRight => "Right · emit LSB",
-                                WhiteningDirection::ShiftLeft => "Left · emit MSB",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut settings.whitening_direction,
-                                    WhiteningDirection::ShiftRight,
-                                    "Right · emit LSB",
-                                );
-                                ui.selectable_value(
-                                    &mut settings.whitening_direction,
-                                    WhiteningDirection::ShiftLeft,
-                                    "Left · emit MSB",
-                                );
-                            });
-                    });
-                    ui.end_row();
-
-                    paint_radio_parameter_label(
-                        ui,
-                        "Invert PN output",
-                        Some("Inverts every generated whitening bit before XOR"),
-                    );
-                    ui.add_enabled(
-                        whitening_enabled,
-                        egui::Checkbox::without_text(&mut settings.whitening_invert_output),
-                    );
-                    ui.end_row();
-
-                    paint_radio_parameter_label(
-                        ui,
-                        "Whitening start",
-                        Some("First covered packet bit relative to the end of sync"),
-                    );
-                    ui.add_enabled_ui(whitening_enabled, |ui| {
-                        ui.horizontal(|ui| {
-                            add_left_aligned_sized(
-                                ui,
-                                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                                egui::DragValue::new(&mut settings.whitening_start_bit)
-                                    .speed(1),
-                            );
-                            ui.label("bit");
-                        });
-                    });
-                    ui.end_row();
-
-                    paint_radio_parameter_label(
-                        ui,
-                        "Whitening end",
-                        Some("Optional exclusive data-bit end; disabled covers all following data"),
-                    );
-                    ui.add_enabled_ui(whitening_enabled, |ui| {
-                        ui.horizontal(|ui| {
-                            let mut bounded = settings.whitening_end_bit.is_some();
-                            if ui.checkbox(&mut bounded, "Bounded").changed() {
-                                settings.whitening_end_bit = bounded.then_some(
-                                    settings.whitening_start_bit.saturating_add(1),
-                                );
-                            }
-                            if let Some(end) = &mut settings.whitening_end_bit {
-                                ui.add(
-                                    egui::DragValue::new(end)
-                                        .range(
-                                            settings.whitening_start_bit.saturating_add(1)
-                                                ..=usize::MAX,
-                                        )
-                                        .speed(1),
-                                );
-                                ui.label("bit");
-                            }
-                        });
-                    });
-                    ui.end_row();
-
-                    paint_radio_parameter_label(
-                        ui,
-                        "Advance outside range",
-                        Some("Advances the PN sequence over clear packet bits outside the covered range"),
-                    );
-                    ui.add_enabled(
-                        whitening_enabled,
-                        egui::Checkbox::without_text(
-                            &mut settings.whitening_advance_excluded_bits,
-                        ),
-                    );
-                    ui.end_row();
+fn paint_radio_whitening_preset_row(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    whitening_enabled: bool,
+) {
+    paint_radio_parameter_label(
+        ui,
+        "Whitening preset",
+        Some("Selects a predefined whitening sequence; Custom exposes all LFSR parameters"),
+    );
+    ui.add_enabled_ui(whitening_enabled, |ui| {
+        let combo = egui::ComboBox::from_id_salt("radio_whitening_preset")
+            .width(RADIO_VALUE_WIDTH)
+            .selected_text(settings.whitening_preset.label())
+            .show_ui(ui, |ui| {
+                for preset in [RadioWhiteningPreset::Custom, RadioWhiteningPreset::Pn9X9X5] {
+                    let response =
+                        ui.selectable_value(&mut settings.whitening_preset, preset, preset.label());
+                    if let Some(description) = preset.description() {
+                        response.on_hover_selectable_text(description);
+                    }
                 }
-            }
-            }
+            });
+        if let Some(description) = settings.whitening_preset.description() {
+            combo.response.on_hover_selectable_text(description);
+        }
+    });
+    ui.end_row();
+}
 
+fn paint_radio_whitening_register_rows(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    whitening_enabled: bool,
+) {
+    paint_radio_parameter_label(ui, "LFSR width", Some("Whitening register width"));
+    ui.add_enabled_ui(whitening_enabled, |ui| {
+        ui.horizontal(|ui| {
+            add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut settings.whitening_width)
+                    .range(1..=64)
+                    .speed(1),
+            );
+            ui.label("bits");
         });
+    });
+    ui.end_row();
 
+    for (label, help, value) in [
+        (
+            "LFSR tap mask",
+            "Tap mask over the current LFSR state; tapped-bit parity becomes feedback",
+            &mut settings.whitening_polynomial,
+        ),
+        (
+            "LFSR seed",
+            "Nonzero register state loaded immediately after sync",
+            &mut settings.whitening_seed,
+        ),
+    ] {
+        paint_radio_parameter_label(ui, label, Some(help));
+        ui.add_enabled_ui(whitening_enabled, |ui| {
+            ui.horizontal(|ui| {
+                add_left_aligned_sized(
+                    ui,
+                    egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                    egui::DragValue::new(value)
+                        .range(0..=u64::MAX)
+                        .speed(1)
+                        .hexadecimal(2, false, true),
+                );
+                ui.label("hex");
+            });
+        });
+        ui.end_row();
+    }
+}
+
+fn paint_radio_whitening_output_rows(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    whitening_enabled: bool,
+) {
+    paint_radio_parameter_label(
+        ui,
+        "LFSR direction",
+        Some("Selects the emitted end and shift direction of the register"),
+    );
+    ui.add_enabled_ui(whitening_enabled, |ui| {
+        egui::ComboBox::from_id_salt("radio_whitening_direction")
+            .width(RADIO_VALUE_WIDTH)
+            .selected_text(match settings.whitening_direction {
+                WhiteningDirection::ShiftRight => "Right · emit LSB",
+                WhiteningDirection::ShiftLeft => "Left · emit MSB",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut settings.whitening_direction,
+                    WhiteningDirection::ShiftRight,
+                    "Right · emit LSB",
+                );
+                ui.selectable_value(
+                    &mut settings.whitening_direction,
+                    WhiteningDirection::ShiftLeft,
+                    "Left · emit MSB",
+                );
+            });
+    });
+    ui.end_row();
+
+    paint_radio_parameter_label(
+        ui,
+        "Invert PN output",
+        Some("Inverts every generated whitening bit before XOR"),
+    );
+    ui.add_enabled(
+        whitening_enabled,
+        egui::Checkbox::without_text(&mut settings.whitening_invert_output),
+    );
+    ui.end_row();
+}
+
+fn paint_radio_whitening_range_rows(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    whitening_enabled: bool,
+) {
+    paint_radio_parameter_label(
+        ui,
+        "Whitening start",
+        Some("First covered packet bit relative to the end of sync"),
+    );
+    ui.add_enabled_ui(whitening_enabled, |ui| {
+        ui.horizontal(|ui| {
+            add_left_aligned_sized(
+                ui,
+                egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
+                egui::DragValue::new(&mut settings.whitening_start_bit).speed(1),
+            );
+            ui.label("bit");
+        });
+    });
+    ui.end_row();
+
+    paint_radio_parameter_label(
+        ui,
+        "Whitening end",
+        Some("Optional exclusive data-bit end; disabled covers all following data"),
+    );
+    ui.add_enabled_ui(whitening_enabled, |ui| {
+        ui.horizontal(|ui| {
+            let mut bounded = settings.whitening_end_bit.is_some();
+            if ui.checkbox(&mut bounded, "Bounded").changed() {
+                settings.whitening_end_bit =
+                    bounded.then_some(settings.whitening_start_bit.saturating_add(1));
+            }
+            if let Some(end) = &mut settings.whitening_end_bit {
+                ui.add(
+                    egui::DragValue::new(end)
+                        .range(settings.whitening_start_bit.saturating_add(1)..=usize::MAX)
+                        .speed(1),
+                );
+                ui.label("bit");
+            }
+        });
+    });
+    ui.end_row();
+
+    paint_radio_parameter_label(
+        ui,
+        "Advance outside range",
+        Some("Advances the PN sequence over clear packet bits outside the covered range"),
+    );
+    ui.add_enabled(
+        whitening_enabled,
+        egui::Checkbox::without_text(&mut settings.whitening_advance_excluded_bits),
+    );
+    ui.end_row();
+}
+
+fn paint_radio_analyzer_configuration_error(ui: &mut egui::Ui, settings: &RadioAnalyzerSettings) {
     if settings.is_enabled() {
         if let Err(error) = settings.signal_profiles() {
             ui.add(
@@ -1497,6 +1565,114 @@ mod tests {
         assert_eq!(settings.symbol_rate_hz, 19_200);
         assert_eq!(settings.deviation_hz, 35_000);
         assert_eq!(settings.preamble_bytes, 0);
+    }
+
+    /// Paints the analyzer configuration for one frame and returns the settings
+    /// it leaves behind, so each test sees the normalisation the panel applies.
+    fn render_analyzer(settings: &mut RadioAnalyzerSettings) {
+        let context = egui::Context::default();
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_radio_analyzer_configuration(ui, settings, 20_000_000, true);
+            });
+        });
+    }
+
+    fn enabled_analyzer() -> RadioAnalyzerSettings {
+        RadioAnalyzerSettings {
+            demodulation: RadioDemodulation::BinaryFsk,
+            ..RadioAnalyzerSettings::default()
+        }
+    }
+
+    #[test]
+    fn an_even_filter_tap_count_is_rounded_up_to_an_odd_one() {
+        let mut settings = RadioAnalyzerSettings {
+            filter_tap_count: 4,
+            ..enabled_analyzer()
+        };
+        render_analyzer(&mut settings);
+        assert_eq!(settings.filter_tap_count, 5);
+
+        settings.filter_tap_count = 1;
+        render_analyzer(&mut settings);
+        assert_eq!(settings.filter_tap_count, 3);
+
+        settings.filter_tap_count = 100_000;
+        render_analyzer(&mut settings);
+        assert_eq!(settings.filter_tap_count, 4_095);
+    }
+
+    #[test]
+    fn a_disabled_modulation_shows_and_changes_nothing_else() {
+        let mut settings = RadioAnalyzerSettings {
+            demodulation: RadioDemodulation::None,
+            filter_tap_count: 4,
+            maximum_preamble_bit_errors: 500,
+            ..RadioAnalyzerSettings::default()
+        };
+        let before = settings.clone();
+        render_analyzer(&mut settings);
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn preamble_bit_errors_stay_below_the_synchronisation_length() {
+        // A sync word is what the receiver locks on, so it sets the limit.
+        let mut settings = RadioAnalyzerSettings {
+            sync_word_bytes: 2,
+            preamble_bytes: 4,
+            maximum_preamble_bit_errors: 64,
+            ..enabled_analyzer()
+        };
+        render_analyzer(&mut settings);
+        assert_eq!(settings.maximum_preamble_bit_errors, 15);
+
+        // Without a sync word the repeated preamble is matched instead.
+        settings.sync_word_bytes = 0;
+        settings.maximum_preamble_bit_errors = 64;
+        render_analyzer(&mut settings);
+        assert_eq!(settings.maximum_preamble_bit_errors, 31);
+
+        // Raw mode with neither searches for the automatic preamble.
+        settings.preamble_bytes = 0;
+        settings.maximum_preamble_bit_errors = 1_000;
+        render_analyzer(&mut settings);
+        assert_eq!(
+            settings.maximum_preamble_bit_errors,
+            RAW_AUTOMATIC_PREAMBLE_BITS - 1
+        );
+    }
+
+    #[test]
+    fn a_preamble_longer_than_the_limit_is_shortened() {
+        let mut settings = RadioAnalyzerSettings {
+            preamble_bytes: 1_000,
+            ..enabled_analyzer()
+        };
+        render_analyzer(&mut settings);
+        assert_eq!(settings.preamble_bytes, 256);
+    }
+
+    #[test]
+    fn fixed_packets_always_have_a_sync_word_of_at_least_one_byte() {
+        let mut settings = RadioAnalyzerSettings {
+            data_mode: RadioDataMode::Packets,
+            sync_word_bytes: 0,
+            ..enabled_analyzer()
+        };
+        render_analyzer(&mut settings);
+        assert_eq!(settings.sync_word_bytes, 1);
+
+        settings.sync_word_bytes = 200;
+        render_analyzer(&mut settings);
+        assert_eq!(settings.sync_word_bytes, 8);
+
+        // Raw decoding may run without one.
+        settings.data_mode = RadioDataMode::Raw;
+        settings.sync_word_bytes = 0;
+        render_analyzer(&mut settings);
+        assert_eq!(settings.sync_word_bytes, 0);
     }
 
     #[test]
