@@ -11,5 +11,6 @@ pub mod protocol_analyzer_dialog;
 pub mod radio_settings;
 pub mod scope_settings;
 pub mod scope_tools_panel;
+pub mod session_tabs;
 pub mod status_bar;
 pub mod toolbar;
