@@ -72,6 +72,7 @@ use ui::capture_settings_panel::*;
 use ui::central_panel::CentralPanelInputs;
 use ui::decoded_panel::*;
 use ui::dialogs::*;
+use ui::frame_actions::FrameActions;
 use ui::protocol_analyzer_dialog::*;
 use ui::radio_settings::*;
 use ui::scope_settings::*;
@@ -5739,19 +5740,7 @@ impl eframe::App for WaveCraftApp {
         self.poll_queued_capture_rearms();
         self.finish_pending_snapshot(context);
 
-        let mut refresh_clicked = false;
-        let mut snapshot_clicked = false;
-        let mut record_now_clicked = false;
-        let mut record_decoded_data_clicked = false;
-        let mut open_recording_clicked = false;
-        let mut export_saleae_clicked = false;
-        let mut start_request = None;
-        let mut stop_clicked = false;
-        let mut calibration_action = None;
-        let mut save_capture_settings_kind = None;
-        let mut logic_device_selection_changed = false;
-        let mut scope_device_selection_changed = false;
-        let mut radio_device_selection_changed = false;
+        let mut actions = FrameActions::default();
         let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
         let capture_settings_enabled = control_target
             .map_or(true, |target| !self.capture_target_is_active(target))
@@ -5869,7 +5858,7 @@ impl eframe::App for WaveCraftApp {
                     ui.separator();
                     ui.label(RichText::new("USB and SDR capture workbench").color(TEXT_MUTED));
                     ui.separator();
-                    refresh_clicked = ui
+                    actions.refresh_clicked = ui
                         .add_enabled(
                             !self.is_busy(),
                             toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
@@ -5894,7 +5883,7 @@ impl eframe::App for WaveCraftApp {
                         })
                         .clicked()
                     {
-                        record_now_clicked = true;
+                        actions.record_now_clicked = true;
                     }
                     if control_target == Some(CaptureTarget::RadioReceiver)
                         && ui
@@ -5910,7 +5899,7 @@ impl eframe::App for WaveCraftApp {
                             )
                             .clicked()
                     {
-                        record_decoded_data_clicked = true;
+                        actions.record_decoded_data_clicked = true;
                     }
                     if ui
                         .add_enabled(
@@ -5921,7 +5910,7 @@ impl eframe::App for WaveCraftApp {
                         .on_hover_selectable_text("Open a saved .dsv capture")
                         .clicked()
                     {
-                        open_recording_clicked = true;
+                        actions.open_recording_clicked = true;
                     }
                     if ui
                         .add_enabled(
@@ -5932,7 +5921,7 @@ impl eframe::App for WaveCraftApp {
                         .on_hover_selectable_text("Export the completed capture as a Saleae Logic 2 .sal file")
                         .clicked()
                     {
-                        export_saleae_clicked = true;
+                        actions.export_saleae_clicked = true;
                     }
                     ui.separator();
                     if ui
@@ -5944,7 +5933,7 @@ impl eframe::App for WaveCraftApp {
                         .on_hover_selectable_text("Save the visible waveform plot as a PNG snapshot")
                         .clicked()
                     {
-                        snapshot_clicked = true;
+                        actions.snapshot_clicked = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let logic_only = control_target == Some(CaptureTarget::LogicAnalyzer);
@@ -5996,9 +5985,9 @@ impl eframe::App for WaveCraftApp {
                             .clicked();
                         if run_stop_clicked {
                             if acquisition_active {
-                                stop_clicked = true;
+                                actions.stop_clicked = true;
                             } else if let Some(target) = control_target {
-                                start_request = Some((start_mode, target));
+                                actions.start_request = Some((start_mode, target));
                             }
                         }
                         if ui
@@ -6012,7 +6001,7 @@ impl eframe::App for WaveCraftApp {
                             .clicked()
                         {
                             if let Some(target) = control_target {
-                                start_request = Some((AcquisitionMode::Single, target));
+                                actions.start_request = Some((AcquisitionMode::Single, target));
                             }
                         }
                     });
@@ -6084,16 +6073,16 @@ impl eframe::App for WaveCraftApp {
                             &mut self.selected_scope_device_id,
                             capture_settings_enabled && self.manual_calibration.is_none(),
                         );
-                        logic_device_selection_changed |= logic_changed;
-                        scope_device_selection_changed |= scope_changed;
+                        actions.logic_device_selection_changed |= logic_changed;
+                        actions.scope_device_selection_changed |= scope_changed;
                         if self.active_waveform_tab == Some(WaveformTab::RadioReceiver) {
-                            radio_device_selection_changed |= paint_radio_device_selector(
+                            actions.radio_device_selection_changed |= paint_radio_device_selector(
                                 ui,
                                 &self.radios,
                                 &mut self.selected_radio_id,
                                 capture_settings_enabled,
                             );
-                            if radio_device_selection_changed {
+                            if actions.radio_device_selection_changed {
                                 self.reconcile_radio_settings();
                             }
                             if let Some(radio) =
@@ -6109,7 +6098,7 @@ impl eframe::App for WaveCraftApp {
                                     radio_trigger_runtime_controls_enabled,
                                     true,
                                 ) {
-                                    save_capture_settings_kind =
+                                    actions.save_capture_settings_kind =
                                         Some(SavedCaptureSettingsKind::RadioFrequency);
                                 }
                             }
@@ -6122,13 +6111,13 @@ impl eframe::App for WaveCraftApp {
                                     .small()
                                     .color(TEXT_MUTED),
                             );
-                            radio_device_selection_changed |= paint_radio_device_selector(
+                            actions.radio_device_selection_changed |= paint_radio_device_selector(
                                 ui,
                                 &self.radios,
                                 &mut self.selected_radio_id,
                                 capture_settings_enabled,
                             );
-                            if radio_device_selection_changed {
+                            if actions.radio_device_selection_changed {
                                 self.reconcile_radio_settings();
                             }
                         }
@@ -6188,10 +6177,10 @@ impl eframe::App for WaveCraftApp {
                                     input_range: frontend_controls_enabled,
                                     manual_calibration: manual_calibration_enabled,
                                 },
-                                &mut calibration_action,
+                                &mut actions.calibration_action,
                             )
                         {
-                            save_capture_settings_kind =
+                            actions.save_capture_settings_kind =
                                 Some(match self.active_capture_settings_tab {
                                     CaptureSettingsTab::DsLogic => {
                                         SavedCaptureSettingsKind::LogicAnalyzer
@@ -6204,7 +6193,7 @@ impl eframe::App for WaveCraftApp {
                     });
             });
 
-        if let Some(kind) = save_capture_settings_kind {
+        if let Some(kind) = actions.save_capture_settings_kind {
             self.save_capture_settings(kind);
         }
 
@@ -6602,7 +6591,7 @@ impl eframe::App for WaveCraftApp {
                 rf_trigger_level_controls_enabled,
                 scope_settings_before_ui,
                 scope_auto_sample_rate_before_ui,
-                snapshot_clicked,
+                snapshot_clicked: actions.snapshot_clicked,
             },
         );
 
@@ -6610,8 +6599,8 @@ impl eframe::App for WaveCraftApp {
             context,
             radio_runtime_controls_enabled,
             radio_trigger_runtime_controls_enabled,
-            &mut refresh_clicked,
-            &mut radio_device_selection_changed,
+            &mut actions.refresh_clicked,
+            &mut actions.radio_device_selection_changed,
         );
 
         let dismiss_usb_speed_warning = self
@@ -6644,7 +6633,7 @@ impl eframe::App for WaveCraftApp {
             None => {}
         }
 
-        if record_now_clicked {
+        if actions.record_now_clicked {
             self.record_capture = false;
             self.record_decoded_data = false;
             if let Some(path) = choose_recording_save_path(&self.recording_path) {
@@ -6660,11 +6649,11 @@ impl eframe::App for WaveCraftApp {
                     } else {
                         AcquisitionMode::Single
                     };
-                    start_request = Some((mode, target));
+                    actions.start_request = Some((mode, target));
                 }
             }
         }
-        if record_decoded_data_clicked {
+        if actions.record_decoded_data_clicked {
             self.record_capture = false;
             self.record_decoded_data = false;
             if let Some(path) = choose_decoded_data_save_path(&self.decoded_data_path) {
@@ -6673,29 +6662,30 @@ impl eframe::App for WaveCraftApp {
                     self.attach_run_decoded_data_recording(path);
                 } else if control_target == Some(CaptureTarget::RadioReceiver) {
                     self.record_decoded_data = true;
-                    start_request = Some((AcquisitionMode::Run, CaptureTarget::RadioReceiver));
+                    actions.start_request =
+                        Some((AcquisitionMode::Run, CaptureTarget::RadioReceiver));
                 }
             }
         }
-        if open_recording_clicked {
+        if actions.open_recording_clicked {
             if let Some(path) = choose_recording_to_open() {
                 self.open_selected_recording(path);
             }
         }
-        if export_saleae_clicked {
+        if actions.export_saleae_clicked {
             if let Some(path) = choose_saleae_export_path() {
                 self.begin_export_saleae(path);
             }
         }
-        if refresh_clicked {
+        if actions.refresh_clicked {
             self.begin_refresh();
         }
-        if !open_recording_clicked {
-            if let Some((mode, target)) = start_request {
+        if !actions.open_recording_clicked {
+            if let Some((mode, target)) = actions.start_request {
                 self.begin_capture(mode, target);
             }
         }
-        if stop_clicked {
+        if actions.stop_clicked {
             if let Some(target) = control_target {
                 let requested = self
                     .capture_requests
@@ -6727,7 +6717,7 @@ impl eframe::App for WaveCraftApp {
                 }
             }
         }
-        match calibration_action {
+        match actions.calibration_action {
             Some(ScopeCalibrationAction::Auto) => {
                 self.auto_calibration_confirmation_open = true;
             }
@@ -6740,14 +6730,14 @@ impl eframe::App for WaveCraftApp {
         if let Some(values) = save_manual_values {
             self.request_save_manual_calibration(values);
         }
-        if logic_device_selection_changed || scope_device_selection_changed {
+        if actions.logic_device_selection_changed || actions.scope_device_selection_changed {
             if let Some(active) = self.active_waveform_tab {
                 self.save_waveform_view_settings(active);
             }
             self.last_error = None;
             self.status = "Capture device selection updated".to_owned();
         }
-        if radio_device_selection_changed {
+        if actions.radio_device_selection_changed {
             self.last_error = None;
             self.status = "Radio device selection updated".to_owned();
         }
@@ -6773,7 +6763,7 @@ impl eframe::App for WaveCraftApp {
                 }
             }
         }
-        if scope_device_selection_changed
+        if actions.scope_device_selection_changed
             && self.selected_scope_device_ref().is_some()
             && self.pending.is_none()
             && !self.capture_target_is_active(CaptureTarget::Oscilloscope)
@@ -6863,9 +6853,9 @@ impl eframe::App for WaveCraftApp {
         let scope_configuration_is_due = self
             .scope_configuration_due
             .is_some_and(|due| Instant::now() >= due);
-        if !refresh_clicked
-            && start_request.is_none()
-            && !stop_clicked
+        if !actions.refresh_clicked
+            && actions.start_request.is_none()
+            && !actions.stop_clicked
             && scope_configuration_is_due
         {
             if scope_capture_requested && selected_scope_device {
