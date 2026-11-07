@@ -264,7 +264,11 @@ pub enum DemodulatedBatch {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DemodulatorTelemetry {
     pub timing_locked: bool,
+    /// Eye opening at the decision instants, from zero to one.
     pub timing_lock_quality: f32,
+    /// Squared mean over variance of the decision magnitudes, in dB, once
+    /// enough symbols were decided.
+    pub decision_snr_db: Option<f32>,
     pub estimated_symbol_rate_hz: Option<f64>,
     pub estimated_frequency_offset_hz: Option<f64>,
     pub estimated_tone_separation_hz: Option<f64>,

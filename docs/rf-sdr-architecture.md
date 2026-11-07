@@ -626,6 +626,45 @@ Fixed source-time sampling remains available for deterministic captures. Later
 PSK/QAM demodulators can provide a different timing-error detector, such as a
 Gardner loop, behind the same timed-symbol contract.
 
+The matched filter applies in both timing modes: Gaussian with the configured
+BT for GFSK, and a one-symbol average for FSK with adaptive timing (fixed
+timing already integrates each symbol). GNU Radio's `gfsk_demod` omits it, but
+at the SNR of real captures the raw discriminator is dominated by wideband
+noise and a decision-directed clock loop then slips symbols. In simulation
+with 12 dB Eb/N0 the filter lowers the adaptive bit error rate from about
+1e-1 to about 4e-4, which equals decoding with ideal timing. The `radio_fsk_noise`
+integration tests keep this guarantee.
+
+Three details keep adaptive decoding robust against the noise that precedes a
+burst:
+
+- Tone acquisition judges the *unfiltered* discriminator as well as the
+  filtered one. Filtering narrows the spread of pure noise until it resembles
+  two tones, so a noise window is rejected when its raw spread exceeds
+  `max(4, 0.4 * sample_rate / deviation)` deviations. The filtered samples still
+  provide the tone centres.
+- The tone centres are committed only after they stay put for a whole
+  acquisition window, so a window straddling the burst edge never supplies
+  them. Consecutive windows count as the same candidate when their centres
+  agree within 20% of the tone separation: they are outer-decile means of a few
+  dozen samples and jitter by more than 10% at moderate SNR, and with a 10%
+  limit 13% of the bursts on a 100 kbit/s link at 12 dB Eb/N0 were acquired
+  late and 3% lost the whole preamble. Samples seen meanwhile are replayed.
+- Mueller-and-Muller has no timing error on an ideal alternating preamble, so
+  its starting phase would persist and could sit on a symbol boundary. The
+  replay therefore starts at the phase with the largest mean eye opening.
+  That phase is chosen from the last two acquisition windows, which are known
+  to lie inside the burst, and the older samples (which may be the noise the
+  burst began in, up to a whole 2,048-sample chunk) are read backwards along
+  the same grid rather than fed to the loop. With a 32 to 128 symbol noise
+  lead-in on the 100 kbit/s link the preamble stays intact in 80 of 80 bursts
+  instead of 53 to 71.
+
+The centred filter needs look-ahead: the last two symbols of a GFSK burst (half
+a symbol for FSK) are decided only when later samples arrive. A real burst is
+followed by a quiet channel until the squelch releases, which supplies them.
+The filter's start is extended backwards so the first preamble symbols are kept.
+
 Digital demodulators emit soft symbols rather than immediately packing bytes.
 The generic contract retains likelihoods for every member of the configured
 alphabet. Binary modulation can expose its compact compatibility view as:
@@ -642,6 +681,30 @@ confidence. `range` refers to
 the contributing samples in the original IQ source domain. Low confidence,
 loss of carrier, loop unlock, and input discontinuity are explicit events so a
 framer can reject or mark a packet instead of returning convincing bad data.
+
+Confidence is `1 - 2 Q(|v| / sd)`: the probability that noise of the burst's
+own spread would not have carried a sample of the opposite symbol as far across
+the slicer as this one lies from it. `v` is the tone-normalized decision value
+at the symbol centre and `sd` the running standard deviation of `|v|` (about 64
+symbols of memory, seeded by a moderately noisy prior and floored at 0.05). The
+raw magnitude clipped to one meant a different thing on every link: at 12 dB
+Eb/N0 a bit at 0.45 was wrong 5.5% of the time and at 9 dB 24% of the time.
+With the normalization the error rate per confidence bin agrees between the two
+(`[0.7, 0.8)`: 14.7% and 17.4%; `[0.2, 0.3)`: 37% and 41%). Noise is heavier
+tailed than Gaussian, so the middle bins are somewhat overconfident (35% errors
+where 20 to 25% is predicted at `[0.5, 0.6)`), and bits that are wrong with a
+large margin, such as after a symbol slip, still look confident.
+
+The demodulator also reports how open the eye is. `timing_lock_quality` is the
+mean decision magnitude less two standard deviations, clamped to `[0, 1]` and
+zero until 16 symbols were decided: about 0.7 on a clean GFSK link (intersymbol
+interference keeps it below one), 0.4 at 12 dB, 0.1 to 0.2 at 9 dB and zero at
+6 dB, tracking the measured error rate. The earlier figure, built from the loop
+error alone, did not (0.49 for a burst at 0.8% errors and 0.81 for one at
+2.8%). `timing_locked` requires the clock loop to have converged, 16 symbols,
+and an eye opening of at least 0.1; the former `output_count >= 4` test passed
+for pure noise. `decision_snr_db` is the squared mean over the variance of the
+decision magnitudes; intersymbol interference caps it near 22 dB.
 
 ### Bit transforms and packet framing
 

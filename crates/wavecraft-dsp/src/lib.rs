@@ -21,8 +21,9 @@ pub use demodulation::{
     MAX_SPARSE_SYMBOL_ALTERNATIVES,
 };
 pub use fsk::{
-    FskConfig, FskDemodulator, FskModulation, FskPolarity, FskTiming, TimedSoftBit,
-    BINARY_FSK_DEMODULATOR_ID, BINARY_GFSK_DEMODULATOR_ID,
+    fsk_carson_bandwidth_hz, recommended_fsk_channel_bandwidth_hz, FskConfig, FskDemodulator,
+    FskModulation, FskPolarity, FskTiming, TimedSoftBit, BINARY_FSK_DEMODULATOR_ID,
+    BINARY_GFSK_DEMODULATOR_ID,
 };
 pub use registry::{
     DemodulatorDescriptor, DemodulatorFactory, DemodulatorOutputKind, DemodulatorRegistry,
