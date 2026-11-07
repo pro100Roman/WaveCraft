@@ -8,14 +8,378 @@ use crate::{
     radio_gain_u32, radio_microsecond_sample_count, radio_single_sample_limit,
     record_decoded_radio_packets, record_decoded_raw_messages, repetitive_interval, selected_radio,
     should_rearm_acquisition, start_capture, thread, AcquisitionMode, ActiveCapture, CaptureBatch,
-    CaptureEvent, CaptureReady, CaptureTarget, CompletedCapture, CompletionStatus,
-    DsLogicOperationMode, HackRfSettings, Instant, PathBuf, ProtocolDecodeCache,
-    RadioCaptureRequest, RadioDataDecoderConfig, RadioProvider, RadioProviderSettings,
-    RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache, WaveformTab,
-    WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
+    CaptureEvent, CaptureFrame, CaptureReady, CaptureTarget, CompletedCapture, CompletionStatus,
+    DsLogicOperationMode, FileDecodedDataRecorder, HackRfSettings, Instant, PathBuf,
+    ProtocolAnalyzerInstance, ProtocolCaptureDecoder, ProtocolDecodeCache, RadioCaptureRequest,
+    RadioDataDecoderConfig, RadioDspWorker, RadioProvider, RadioProviderSettings,
+    RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache, WaveformStore,
+    WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
 };
 
 use crate::WaveCraftApp;
+use std::ops::ControlFlow;
+
+/// How a polled capture ended: the message to show when it succeeded or the
+/// error when it did not, and the completion recorded in its files.
+struct CaptureFinish {
+    result: Result<String, String>,
+    completion: CompletionStatus,
+}
+
+impl CaptureFinish {
+    fn complete(message: &str) -> Self {
+        Self {
+            result: Ok(message.to_owned()),
+            completion: CompletionStatus::Complete,
+        }
+    }
+
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            result: Err(error.into()),
+            completion: CompletionStatus::Failed,
+        }
+    }
+}
+
+/// What one poll of a running capture found: whether it has ended, and a new
+/// status line to show while it runs.
+#[derive(Default)]
+struct CapturePoll {
+    finish: Option<CaptureFinish>,
+    status: Option<String>,
+}
+
+impl CapturePoll {
+    /// Stops the capture and records that it failed with `error`.
+    fn fail(&mut self, active: &ActiveCapture, error: impl Into<String>) {
+        active.session.request_stop();
+        self.finish = Some(CaptureFinish::failed(error));
+    }
+}
+
+/// The RF trigger settings as they are now. A running single capture re-reads
+/// them on every frame, so edits take effect while it waits.
+struct RadioTriggerSettings {
+    threshold_dbfs: f32,
+    posttrigger_samples: Result<u64, String>,
+}
+
+/// What is left of a capture once its workers have stopped and its files are closed.
+struct FinishedCapture {
+    waveforms: WaveformStore,
+    protocol_decode: ProtocolCaptureDecoder,
+    error: Option<String>,
+}
+
+/// Whether a capture that ended keeps its data for display in place of the one
+/// already shown. A display that was kept until the new capture completed is
+/// replaced only by a capture that did, except that a restart for a scope
+/// frontend change replaces it whenever it was not to be kept.
+fn completed_capture_replaces_display(
+    restart_for_frontend: bool,
+    completion: CompletionStatus,
+    preserve_display_until_complete: bool,
+) -> bool {
+    if restart_for_frontend {
+        !preserve_display_until_complete
+    } else {
+        completion == CompletionStatus::Complete || !preserve_display_until_complete
+    }
+}
+
+/// Reads what a running capture has produced since the last poll: at most
+/// `MAX_CAPTURE_EVENTS_PER_POLL` events, then the output of the logic decoder
+/// and the radio DSP worker.
+fn poll_running_capture(
+    active: &mut ActiveCapture,
+    analyzers: &[ProtocolAnalyzerInstance],
+    radio_trigger: &RadioTriggerSettings,
+) -> CapturePoll {
+    let mut poll = CapturePoll::default();
+    reconfigure_logic_decoder(active, analyzers, &mut poll);
+    for _ in 0..MAX_CAPTURE_EVENTS_PER_POLL {
+        match active.session.try_recv() {
+            Ok(event) => {
+                if handle_capture_event(active, event, radio_trigger, &mut poll).is_break() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                poll.finish = Some(CaptureFinish::failed("capture event stream disconnected"));
+                break;
+            }
+        }
+    }
+    drain_logic_decode(active, &mut poll);
+    drain_radio_dsp(active, &mut poll);
+    poll
+}
+
+/// Sends the protocol analyzers the user edited to the running logic decoder.
+fn reconfigure_logic_decoder(
+    active: &mut ActiveCapture,
+    analyzers: &[ProtocolAnalyzerInstance],
+    poll: &mut CapturePoll,
+) {
+    if active.protocol_analyzers != analyzers {
+        match active.logic_decode.reconfigure(analyzers.to_vec()) {
+            Ok(()) => active.protocol_analyzers = analyzers.to_vec(),
+            Err(error) => poll.fail(active, error),
+        }
+    }
+}
+
+/// Handles one event of the capture session. `Break` means the poll is over:
+/// the capture has ended or failed, and `poll.finish` says which.
+fn handle_capture_event(
+    active: &mut ActiveCapture,
+    event: CaptureEvent,
+    radio_trigger: &RadioTriggerSettings,
+    poll: &mut CapturePoll,
+) -> ControlFlow<()> {
+    match event {
+        CaptureEvent::Frame(frame) => handle_capture_frame(active, frame, radio_trigger, poll),
+        CaptureEvent::SourceFailed { device_id, error } => {
+            if let Some(recorder) = active.recorder.as_mut() {
+                if let Err(write_error) = recorder.write_event(&CaptureEvent::SourceFailed {
+                    device_id: device_id.clone(),
+                    error: error.clone(),
+                }) {
+                    poll.fail(active, format!("failed to write recording: {write_error}"));
+                    return ControlFlow::Break(());
+                }
+            }
+            poll.fail(active, format!("{device_id}: {error}"));
+            ControlFlow::Break(())
+        }
+        CaptureEvent::SourceStopped { device_id } => {
+            if let Some(recorder) = active.recorder.as_mut() {
+                if let Err(error) = recorder.write_event(&CaptureEvent::SourceStopped {
+                    device_id: device_id.clone(),
+                }) {
+                    poll.fail(active, format!("failed to write recording: {error}"));
+                    return ControlFlow::Break(());
+                }
+            }
+            active.stopped.insert(device_id);
+            if active.stopped.len() == active.session.descriptors().len() {
+                poll.finish = Some(CaptureFinish::complete("Capture complete"));
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+/// Handles one frame of samples: keeps the RF trigger up to date and lets it
+/// decide which samples are kept, records the frame, and feeds the displays and
+/// decoders.
+fn handle_capture_frame(
+    active: &mut ActiveCapture,
+    frame: CaptureFrame,
+    radio_trigger: &RadioTriggerSettings,
+    poll: &mut CapturePoll,
+) -> ControlFlow<()> {
+    if let Some(trigger) = active.radio_trigger.as_mut() {
+        let update_result = radio_trigger
+            .posttrigger_samples
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|samples| {
+                trigger.set_threshold_dbfs(radio_trigger.threshold_dbfs)?;
+                trigger.set_posttrigger_samples(*samples);
+                Ok(())
+            });
+        if let Err(error) = update_result {
+            poll.fail(active, format!("RF trigger update failed: {error}"));
+            return ControlFlow::Break(());
+        }
+    }
+    let trigger_armed = active
+        .radio_trigger
+        .as_ref()
+        .is_some_and(RadioSingleTrigger::is_armed);
+    if trigger_armed {
+        if let CaptureBatch::Iq(iq) = &frame.payload {
+            for spectrum in active.radio_spectrum.push(iq) {
+                active.waveforms.radio.ingest(spectrum);
+            }
+        }
+    }
+    let frame_is_iq = matches!(&frame.payload, CaptureBatch::Iq(_));
+    let (frames, trigger_event, trigger_complete) =
+        if let (Some(trigger), true) = (active.radio_trigger.as_mut(), frame_is_iq) {
+            match trigger.push(frame) {
+                Ok(output) => (output.frames, output.event, output.complete),
+                Err(error) => {
+                    poll.fail(active, format!("RF trigger failed: {error}"));
+                    return ControlFlow::Break(());
+                }
+            }
+        } else {
+            (vec![frame], None, false)
+        };
+    if let Some(event) = trigger_event {
+        active.radio_spectrum.reset();
+        poll.status = Some(format!(
+            "RF trigger · {:.3} MHz at {:.1} dBFS; capturing…",
+            event.frequency_hz / 1_000_000.0,
+            event.power_dbfs
+        ));
+    }
+    for frame in frames {
+        if let Err(error) = ingest_active_capture_frame(active, frame, radio_trigger.threshold_dbfs)
+        {
+            poll.fail(active, error);
+            break;
+        }
+    }
+    if poll.finish.is_some() {
+        return ControlFlow::Break(());
+    }
+    if trigger_complete {
+        active.session.request_stop();
+        poll.finish = Some(CaptureFinish::complete("RF triggered capture complete"));
+        return ControlFlow::Break(());
+    }
+    ControlFlow::Continue(())
+}
+
+/// Takes the output the logic decoder has ready.
+fn drain_logic_decode(active: &mut ActiveCapture, poll: &mut CapturePoll) {
+    loop {
+        match active.logic_decode.try_recv() {
+            Ok(output) => ingest_logic_decode_output(active, output),
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if poll.finish.is_none() {
+                    poll.fail(active, "logic decode worker disconnected");
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Takes the output the radio DSP worker has ready and records the decoded data.
+fn drain_radio_dsp(active: &mut ActiveCapture, poll: &mut CapturePoll) {
+    loop {
+        match active.radio_dsp.try_recv() {
+            Ok(output) => {
+                if let Err(error) =
+                    record_decoded_radio_packets(&mut active.decoded_data_recorder, &output)
+                {
+                    poll.fail(active, error);
+                    break;
+                }
+                ingest_radio_dsp_output(&mut active.waveforms, output);
+                if let Err(error) = record_decoded_raw_messages(
+                    &mut active.decoded_data_recorder,
+                    &active.waveforms.radio_analysis,
+                ) {
+                    poll.fail(active, error);
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if poll.finish.is_none() {
+                    poll.fail(active, "radio DSP worker disconnected");
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Stops a capture that has ended and closes its files. The error covers
+/// everything that went wrong on the way, starting with `result_error`; any
+/// failure marks the recordings as failed whatever `completion` says.
+fn shut_down_capture(
+    mut active: ActiveCapture,
+    result_error: Option<String>,
+    completion: CompletionStatus,
+) -> FinishedCapture {
+    let (protocol_decode, logic_decode_error) = finish_logic_decode(&mut active);
+    let stop_result = active.session.stop();
+    let mut error = result_error;
+    if let Err(stop_error) = &stop_result {
+        append_error(&mut error, format!("failed to stop capture: {stop_error}"));
+    }
+    finish_decoding(
+        &mut active.radio_dsp,
+        &mut active.decoded_data_recorder,
+        &mut active.waveforms,
+        logic_decode_error,
+        &mut error,
+    );
+    let recording_completion = if stop_result.is_ok() && error.is_none() {
+        completion
+    } else {
+        CompletionStatus::Failed
+    };
+    let recording_result = finish_gui_recording(&mut active.recorder, recording_completion);
+    let decoded_recording_result =
+        finish_decoded_data_recording(&mut active.decoded_data_recorder, recording_completion);
+    if let Err(recording_error) = recording_result {
+        append_error(
+            &mut error,
+            format!("failed to finish recording: {recording_error}"),
+        );
+    }
+    if let Err(recording_error) = decoded_recording_result {
+        append_error(
+            &mut error,
+            format!("failed to finish decoded data recording: {recording_error}"),
+        );
+    }
+    FinishedCapture {
+        waveforms: active.waveforms,
+        protocol_decode,
+        error,
+    }
+}
+
+/// Collects what the radio DSP worker still holds, closes the raw-message
+/// capture, and adds the logic decoder's error, in that order. Every way a
+/// capture ends goes through it, after the session has stopped.
+fn finish_decoding(
+    radio_dsp: &mut RadioDspWorker,
+    decoded_data_recorder: &mut Option<FileDecodedDataRecorder>,
+    waveforms: &mut WaveformStore,
+    logic_decode_error: Option<String>,
+    error: &mut Option<String>,
+) {
+    match radio_dsp.finish() {
+        Ok(outputs) => {
+            for output in outputs {
+                if let Err(recording_error) =
+                    record_decoded_radio_packets(decoded_data_recorder, &output)
+                {
+                    append_error(error, recording_error);
+                }
+                ingest_radio_dsp_output(waveforms, output);
+                if let Err(recording_error) =
+                    record_decoded_raw_messages(decoded_data_recorder, &waveforms.radio_analysis)
+                {
+                    append_error(error, recording_error);
+                }
+            }
+        }
+        Err(dsp_error) => append_error(error, dsp_error),
+    }
+    if let Some(logic_decode_error) = logic_decode_error {
+        append_error(error, logic_decode_error);
+    }
+    waveforms.radio_analysis.finish_raw_capture();
+    if let Err(recording_error) =
+        record_decoded_raw_messages(decoded_data_recorder, &waveforms.radio_analysis)
+    {
+        append_error(error, recording_error);
+    }
+}
 
 impl WaveCraftApp {
     pub(crate) fn radio_capture_request(
@@ -272,37 +636,14 @@ impl WaveCraftApp {
         active.session.request_stop();
         let (protocol_decode, logic_decode_error) = finish_logic_decode(&mut active);
         let stop_result = active.session.stop();
-        let radio_dsp_result = active.radio_dsp.finish();
         let mut error = stop_result.as_ref().err().map(ToString::to_string);
-        match radio_dsp_result {
-            Ok(outputs) => {
-                for output in outputs {
-                    if let Err(recording_error) =
-                        record_decoded_radio_packets(&mut active.decoded_data_recorder, &output)
-                    {
-                        append_error(&mut error, recording_error);
-                    }
-                    ingest_radio_dsp_output(&mut active.waveforms, output);
-                    if let Err(recording_error) = record_decoded_raw_messages(
-                        &mut active.decoded_data_recorder,
-                        &active.waveforms.radio_analysis,
-                    ) {
-                        append_error(&mut error, recording_error);
-                    }
-                }
-            }
-            Err(dsp_error) => append_error(&mut error, dsp_error),
-        }
-        if let Some(logic_decode_error) = logic_decode_error {
-            append_error(&mut error, logic_decode_error);
-        }
-        active.waveforms.radio_analysis.finish_raw_capture();
-        if let Err(recording_error) = record_decoded_raw_messages(
+        finish_decoding(
+            &mut active.radio_dsp,
             &mut active.decoded_data_recorder,
-            &active.waveforms.radio_analysis,
-        ) {
-            append_error(&mut error, recording_error);
-        }
+            &mut active.waveforms,
+            logic_decode_error,
+            &mut error,
+        );
         let completion = if stop_result.is_ok() && error.is_none() {
             CompletionStatus::Cancelled
         } else {
@@ -367,378 +708,138 @@ impl WaveCraftApp {
             return;
         };
         let mut active = self.captures.swap_remove(index);
-        let mut finish_status = None::<(Result<String, String>, CompletionStatus)>;
-        let mut capture_status = None::<String>;
-        let protocol_analyzers = self.protocol_analyzer.analyzers.clone();
-        let radio_trigger_threshold_dbfs =
-            f32::from(self.radio_settings.trigger_level_dbfs_tenths) / 10.0;
-        let radio_trigger_posttrigger_samples = radio_microsecond_sample_count(
-            self.radio_settings.capture.sample_rate_hz,
-            self.radio_settings.trigger_posttrigger_micros,
+        let radio_trigger = RadioTriggerSettings {
+            threshold_dbfs: f32::from(self.radio_settings.trigger_level_dbfs_tenths) / 10.0,
+            posttrigger_samples: radio_microsecond_sample_count(
+                self.radio_settings.capture.sample_rate_hz,
+                self.radio_settings.trigger_posttrigger_micros,
+            ),
+        };
+        let poll = poll_running_capture(
+            &mut active,
+            &self.protocol_analyzer.analyzers,
+            &radio_trigger,
         );
-        {
-            let active = &mut active;
-            if active.protocol_analyzers != protocol_analyzers {
-                match active.logic_decode.reconfigure(protocol_analyzers.clone()) {
-                    Ok(()) => active.protocol_analyzers = protocol_analyzers.clone(),
-                    Err(error) => {
-                        active.session.request_stop();
-                        finish_status = Some((Err(error), CompletionStatus::Failed));
-                    }
-                }
-            }
-            for _ in 0..MAX_CAPTURE_EVENTS_PER_POLL {
-                match active.session.try_recv() {
-                    Ok(event) => match event {
-                        CaptureEvent::Frame(frame) => {
-                            if let Some(trigger) = active.radio_trigger.as_mut() {
-                                let update_result = radio_trigger_posttrigger_samples
-                                    .as_ref()
-                                    .map_err(Clone::clone)
-                                    .and_then(|samples| {
-                                        trigger.set_threshold_dbfs(radio_trigger_threshold_dbfs)?;
-                                        trigger.set_posttrigger_samples(*samples);
-                                        Ok(())
-                                    });
-                                if let Err(error) = update_result {
-                                    active.session.request_stop();
-                                    finish_status = Some((
-                                        Err(format!("RF trigger update failed: {error}")),
-                                        CompletionStatus::Failed,
-                                    ));
-                                    break;
-                                }
-                            }
-                            let trigger_armed = active
-                                .radio_trigger
-                                .as_ref()
-                                .is_some_and(RadioSingleTrigger::is_armed);
-                            if trigger_armed {
-                                if let CaptureBatch::Iq(iq) = &frame.payload {
-                                    for spectrum in active.radio_spectrum.push(iq) {
-                                        active.waveforms.radio.ingest(spectrum);
-                                    }
-                                }
-                            }
-                            let frame_is_iq = matches!(&frame.payload, CaptureBatch::Iq(_));
-                            let (frames, trigger_event, trigger_complete) =
-                                if let (Some(trigger), true) =
-                                    (active.radio_trigger.as_mut(), frame_is_iq)
-                                {
-                                    match trigger.push(frame) {
-                                        Ok(output) => {
-                                            (output.frames, output.event, output.complete)
-                                        }
-                                        Err(error) => {
-                                            active.session.request_stop();
-                                            finish_status = Some((
-                                                Err(format!("RF trigger failed: {error}")),
-                                                CompletionStatus::Failed,
-                                            ));
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    (vec![frame], None, false)
-                                };
-                            if let Some(event) = trigger_event {
-                                active.radio_spectrum.reset();
-                                capture_status = Some(format!(
-                                    "RF trigger · {:.3} MHz at {:.1} dBFS; capturing…",
-                                    event.frequency_hz / 1_000_000.0,
-                                    event.power_dbfs
-                                ));
-                            }
-                            for frame in frames {
-                                if let Err(error) = ingest_active_capture_frame(
-                                    active,
-                                    frame,
-                                    radio_trigger_threshold_dbfs,
-                                ) {
-                                    active.session.request_stop();
-                                    finish_status = Some((Err(error), CompletionStatus::Failed));
-                                    break;
-                                }
-                            }
-                            if finish_status.is_some() {
-                                break;
-                            }
-                            if trigger_complete {
-                                active.session.request_stop();
-                                finish_status = Some((
-                                    Ok("RF triggered capture complete".to_owned()),
-                                    CompletionStatus::Complete,
-                                ));
-                                break;
-                            }
-                        }
-                        CaptureEvent::SourceFailed { device_id, error } => {
-                            if let Some(recorder) = active.recorder.as_mut() {
-                                if let Err(write_error) =
-                                    recorder.write_event(&CaptureEvent::SourceFailed {
-                                        device_id: device_id.clone(),
-                                        error: error.clone(),
-                                    })
-                                {
-                                    active.session.request_stop();
-                                    finish_status = Some((
-                                        Err(format!("failed to write recording: {write_error}")),
-                                        CompletionStatus::Failed,
-                                    ));
-                                    break;
-                                }
-                            }
-                            active.session.request_stop();
-                            finish_status = Some((
-                                Err(format!("{device_id}: {error}")),
-                                CompletionStatus::Failed,
-                            ));
-                            break;
-                        }
-                        CaptureEvent::SourceStopped { device_id } => {
-                            if let Some(recorder) = active.recorder.as_mut() {
-                                if let Err(error) =
-                                    recorder.write_event(&CaptureEvent::SourceStopped {
-                                        device_id: device_id.clone(),
-                                    })
-                                {
-                                    active.session.request_stop();
-                                    finish_status = Some((
-                                        Err(format!("failed to write recording: {error}")),
-                                        CompletionStatus::Failed,
-                                    ));
-                                    break;
-                                }
-                            }
-                            active.stopped.insert(device_id);
-                            if active.stopped.len() == active.session.descriptors().len() {
-                                finish_status = Some((
-                                    Ok("Capture complete".to_owned()),
-                                    CompletionStatus::Complete,
-                                ));
-                                break;
-                            }
-                        }
-                    },
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        finish_status = Some((
-                            Err("capture event stream disconnected".to_owned()),
-                            CompletionStatus::Failed,
-                        ));
-                        break;
-                    }
-                }
-            }
-            loop {
-                match active.logic_decode.try_recv() {
-                    Ok(output) => ingest_logic_decode_output(active, output),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        if finish_status.is_none() {
-                            active.session.request_stop();
-                            finish_status = Some((
-                                Err("logic decode worker disconnected".to_owned()),
-                                CompletionStatus::Failed,
-                            ));
-                        }
-                        break;
-                    }
-                }
-            }
-            loop {
-                match active.radio_dsp.try_recv() {
-                    Ok(output) => {
-                        if let Err(error) =
-                            record_decoded_radio_packets(&mut active.decoded_data_recorder, &output)
-                        {
-                            active.session.request_stop();
-                            finish_status = Some((Err(error), CompletionStatus::Failed));
-                            break;
-                        }
-                        ingest_radio_dsp_output(&mut active.waveforms, output);
-                        if let Err(error) = record_decoded_raw_messages(
-                            &mut active.decoded_data_recorder,
-                            &active.waveforms.radio_analysis,
-                        ) {
-                            active.session.request_stop();
-                            finish_status = Some((Err(error), CompletionStatus::Failed));
-                            break;
-                        }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        if finish_status.is_none() {
-                            active.session.request_stop();
-                            finish_status = Some((
-                                Err("radio DSP worker disconnected".to_owned()),
-                                CompletionStatus::Failed,
-                            ));
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some(status) = capture_status {
+        if let Some(status) = poll.status {
             self.status = status;
         }
+        match poll.finish {
+            Some(finish) => self.finish_capture(active, finish),
+            None => self.captures.push(active),
+        }
+    }
 
-        let Some((result, completion)) = finish_status else {
-            self.captures.push(active);
-            return;
-        };
-        {
-            let mode = active.mode;
-            let target = active.target;
-            let preserve_display_until_complete = active.preserve_display_until_complete;
-            let recording_path = active.recording_path.take();
-            let decoded_data_path = active.decoded_data_path.take();
-            let has_logic = active.has_logic;
-            let has_scope = active.has_scope;
-            let has_radio = active.has_radio;
-            let restart_for_frontend = self.scope_capture_restart_requested
-                && self.capture_is_requested(target)
-                && target.includes_oscilloscope();
-            self.scope_capture_restart_requested = false;
-            let (protocol_decode, logic_decode_error) = finish_logic_decode(&mut active);
-            let stop_result = active.session.stop();
-            let mut error = result.as_ref().err().cloned();
-            if let Err(stop_error) = &stop_result {
-                append_error(&mut error, format!("failed to stop capture: {stop_error}"));
-            }
-            match active.radio_dsp.finish() {
-                Ok(outputs) => {
-                    for output in outputs {
-                        if let Err(recording_error) =
-                            record_decoded_radio_packets(&mut active.decoded_data_recorder, &output)
-                        {
-                            append_error(&mut error, recording_error);
-                        }
-                        ingest_radio_dsp_output(&mut active.waveforms, output);
-                        if let Err(recording_error) = record_decoded_raw_messages(
-                            &mut active.decoded_data_recorder,
-                            &active.waveforms.radio_analysis,
-                        ) {
-                            append_error(&mut error, recording_error);
-                        }
-                    }
-                }
-                Err(dsp_error) => append_error(&mut error, dsp_error),
-            }
-            if let Some(decode_error) = logic_decode_error {
-                append_error(&mut error, decode_error);
-            }
-            active.waveforms.radio_analysis.finish_raw_capture();
-            if let Err(recording_error) = record_decoded_raw_messages(
-                &mut active.decoded_data_recorder,
-                &active.waveforms.radio_analysis,
-            ) {
-                append_error(&mut error, recording_error);
-            }
-            let recording_completion = if stop_result.is_ok() && error.is_none() {
-                completion
-            } else {
-                CompletionStatus::Failed
-            };
-            let recording_result = finish_gui_recording(&mut active.recorder, recording_completion);
-            let decoded_recording_result = finish_decoded_data_recording(
-                &mut active.decoded_data_recorder,
-                recording_completion,
+    /// Ends a capture that has run its course or failed: stops its workers,
+    /// closes its recordings, keeps what it captured for display, and then
+    /// starts whatever was waiting for it (a calibration, or the next acquisition).
+    fn finish_capture(&mut self, mut active: ActiveCapture, finish: CaptureFinish) {
+        let CaptureFinish { result, completion } = finish;
+        let mode = active.mode;
+        let target = active.target;
+        let preserve_display_until_complete = active.preserve_display_until_complete;
+        let recording_path = active.recording_path.take();
+        let decoded_data_path = active.decoded_data_path.take();
+        let has_logic = active.has_logic;
+        let has_scope = active.has_scope;
+        let has_radio = active.has_radio;
+        let restart_for_frontend = self.scope_capture_restart_requested
+            && self.capture_is_requested(target)
+            && target.includes_oscilloscope();
+        self.scope_capture_restart_requested = false;
+        let FinishedCapture {
+            waveforms,
+            protocol_decode,
+            error,
+        } = shut_down_capture(active, result.as_ref().err().cloned(), completion);
+        if completed_capture_replaces_display(
+            restart_for_frontend,
+            completion,
+            preserve_display_until_complete,
+        ) {
+            self.set_completed_capture_for_target(
+                target,
+                CompletedCapture {
+                    waveforms,
+                    protocol_decode,
+                    has_logic,
+                    has_scope,
+                    has_radio,
+                },
             );
-            if let Err(recording_error) = recording_result {
-                append_error(
-                    &mut error,
-                    format!("failed to finish recording: {recording_error}"),
-                );
-            }
-            if let Err(recording_error) = decoded_recording_result {
-                append_error(
-                    &mut error,
-                    format!("failed to finish decoded data recording: {recording_error}"),
-                );
-            }
-            let update_completed_capture = if restart_for_frontend {
-                !preserve_display_until_complete
-            } else {
-                completion == CompletionStatus::Complete || !preserve_display_until_complete
-            };
-            if update_completed_capture {
-                self.set_completed_capture_for_target(
-                    target,
-                    CompletedCapture {
-                        waveforms: active.waveforms,
-                        protocol_decode,
-                        has_logic,
-                        has_scope,
-                        has_radio,
-                    },
-                );
-            }
-            if error.is_none() && self.manual_calibration_load_requested {
-                self.manual_calibration_load_requested = false;
-                self.begin_manual_calibration();
+        }
+        if error.is_none() && self.manual_calibration_load_requested {
+            self.manual_calibration_load_requested = false;
+            self.begin_manual_calibration();
+            return;
+        }
+        if error.is_none() {
+            if let Some(values) = self.manual_calibration_save_requested.take() {
+                self.begin_save_manual_calibration(values);
                 return;
             }
-            if error.is_none() {
-                if let Some(values) = self.manual_calibration_save_requested.take() {
-                    self.begin_save_manual_calibration(values);
-                    return;
-                }
+        }
+        let repeat = error.is_none()
+            && (restart_for_frontend
+                || should_rearm_acquisition(
+                    mode,
+                    self.capture_is_requested(target),
+                    completion,
+                    false,
+                ));
+        if !repeat {
+            self.capture_requests.remove(&target);
+        }
+        self.record_capture = false;
+        self.record_decoded_data = false;
+        match error {
+            Some(error) => self.set_error(error),
+            None if restart_for_frontend => {
+                self.status = "Reconfiguring oscilloscope frontend…".to_owned();
             }
-            let repeat = error.is_none()
-                && (restart_for_frontend
-                    || should_rearm_acquisition(
-                        mode,
-                        self.capture_is_requested(target),
-                        completion,
-                        false,
-                    ));
-            if !repeat {
-                self.capture_requests.remove(&target);
-            }
-            self.record_capture = false;
-            self.record_decoded_data = false;
-            match error {
-                Some(error) => self.set_error(error),
-                None if restart_for_frontend => {
-                    self.status = "Reconfiguring oscilloscope frontend…".to_owned();
-                }
-                None => {
-                    let capture_status =
-                        result.ok().unwrap_or_else(|| "Capture complete".to_owned());
-                    self.status = decoded_data_path
-                        .or(recording_path)
-                        .map_or(capture_status.clone(), |path| {
-                            format!("{capture_status} · recording saved to {}", path.display())
-                        });
-                }
-            }
-            if repeat {
-                if mode == AcquisitionMode::Repetitive && !restart_for_frontend {
-                    let interval = repetitive_interval(
-                        self.logic_settings.operation_mode,
-                        self.repetitive_interval_seconds,
-                    );
-                    self.scheduled_repetitive_capture = Some(ScheduledRepetitiveCapture {
-                        due: Instant::now() + interval,
-                        target,
+            None => {
+                let capture_status = result.ok().unwrap_or_else(|| "Capture complete".to_owned());
+                self.status = decoded_data_path
+                    .or(recording_path)
+                    .map_or(capture_status.clone(), |path| {
+                        format!("{capture_status} · recording saved to {}", path.display())
                     });
-                    self.status = format!(
-                        "Repetitive · next acquisition in {:.1} s",
-                        interval.as_secs_f32()
-                    );
-                } else if self.pending.is_none() {
-                    self.begin_capture(mode, target);
-                } else if !self
-                    .queued_capture_rearms
-                    .iter()
-                    .any(|(_, queued_target)| *queued_target == target)
-                {
-                    self.queued_capture_rearms.push((mode, target));
-                }
             }
+        }
+        if repeat {
+            self.start_next_acquisition(mode, target, restart_for_frontend);
+        }
+    }
+
+    /// Starts the capture that follows a finished one: a Repetitive capture is
+    /// scheduled after its interval, any other starts at once, or is queued when
+    /// a background operation is still running.
+    fn start_next_acquisition(
+        &mut self,
+        mode: AcquisitionMode,
+        target: CaptureTarget,
+        restart_for_frontend: bool,
+    ) {
+        if mode == AcquisitionMode::Repetitive && !restart_for_frontend {
+            let interval = repetitive_interval(
+                self.logic_settings.operation_mode,
+                self.repetitive_interval_seconds,
+            );
+            self.scheduled_repetitive_capture = Some(ScheduledRepetitiveCapture {
+                due: Instant::now() + interval,
+                target,
+            });
+            self.status = format!(
+                "Repetitive · next acquisition in {:.1} s",
+                interval.as_secs_f32()
+            );
+        } else if self.pending.is_none() {
+            self.begin_capture(mode, target);
+        } else if !self
+            .queued_capture_rearms
+            .iter()
+            .any(|(_, queued_target)| *queued_target == target)
+        {
+            self.queued_capture_rearms.push((mode, target));
         }
     }
 
@@ -939,6 +1040,30 @@ mod tests {
         load_gui_recording(path, &app.protocol_analyzer.analyzers)
             .expect("the recording was finished")
             .completion
+    }
+
+    #[test]
+    fn a_finished_capture_replaces_the_display_unless_that_was_to_be_kept() {
+        use CompletionStatus::{Cancelled, Complete, Failed};
+        // (restart for a frontend change, completion, display kept until
+        // complete) -> whether the finished capture is shown
+        for (restart, completion, preserve, replaces) in [
+            (false, Complete, false, true),
+            (false, Complete, true, true),
+            (false, Failed, false, true),
+            (false, Failed, true, false),
+            (false, Cancelled, true, false),
+            (true, Complete, false, true),
+            (true, Complete, true, false),
+            (true, Failed, false, true),
+            (true, Failed, true, false),
+        ] {
+            assert_eq!(
+                completed_capture_replaces_display(restart, completion, preserve),
+                replaces,
+                "restart = {restart}, {completion:?}, preserve = {preserve}"
+            );
+        }
     }
 
     #[test]
@@ -1515,6 +1640,87 @@ mod tests {
             .radio_trigger
             .as_ref()
             .is_some_and(RadioSingleTrigger::is_armed));
+    }
+
+    #[test]
+    fn an_rf_trigger_that_has_fired_reports_it_while_the_capture_continues() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::RadioReceiver);
+        app.radio_settings.trigger_enabled = true;
+        app.radio_settings.trigger_level_dbfs_tenths = -1_000;
+        // A post-trigger interval much longer than the one batch the source sends.
+        app.radio_settings.trigger_posttrigger_micros = 1_000_000;
+        let tone = (0..2 * RADIO_SPECTRUM_FFT_LENGTH)
+            .map(|index| match index % 4 {
+                0 => Iq8 { i: 100, q: 0 },
+                1 => Iq8 { i: 0, q: 100 },
+                2 => Iq8 { i: -100, q: 0 },
+                _ => Iq8 { i: 0, q: -100 },
+            })
+            .collect();
+        let batch = CaptureBatch::Iq(IqBatch {
+            sample_rate_hz: app.radio_settings.capture.sample_rate_hz,
+            center_frequency_hz: app.radio_settings.capture.center_frequency_hz,
+            first_sample_index: 0,
+            discontinuity: false,
+            samples: tone,
+        });
+        let started = ready_scripted(
+            &app,
+            vec![(
+                InstrumentKind::RadioReceiver,
+                Script::sending(vec![batch], SourceEnding::Idle),
+            )],
+            AcquisitionMode::Single,
+            CaptureTarget::RadioReceiver,
+        );
+        app.handle_capture_ready(started);
+
+        poll_until(&mut app, CaptureTarget::RadioReceiver, |app| {
+            app.status.starts_with("RF trigger · ")
+        });
+
+        assert!(app.status.ends_with("dBFS; capturing…"), "{}", app.status);
+        assert_eq!(
+            app.captures.len(),
+            1,
+            "the capture waits for its post-trigger samples"
+        );
+        assert!(app.captures[0]
+            .radio_trigger
+            .as_ref()
+            .is_some_and(|trigger| !trigger.is_armed()));
+    }
+
+    #[test]
+    fn a_capture_whose_event_stream_closes_early_ends_with_an_error() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::Combined);
+        let started = ready_scripted(
+            &app,
+            vec![
+                (InstrumentKind::LogicAnalyzer, finishing_with(&app, vec![1])),
+                (
+                    InstrumentKind::Oscilloscope,
+                    Script::sending(Vec::new(), SourceEnding::Panic),
+                ),
+            ],
+            AcquisitionMode::Single,
+            CaptureTarget::Combined,
+        );
+        app.handle_capture_ready(started);
+
+        poll_until_finished(&mut app, CaptureTarget::Combined);
+
+        // The instrument that crashed never reported that it stopped, so the
+        // capture cannot complete; stopping it also finds the crashed worker.
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some(
+                "capture event stream disconnected; \
+                 failed to stop capture: a capture worker panicked"
+            )
+        );
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub(crate) enum SourceEnding {
     Finish,
     /// Return this error, which makes the session report the source as failed.
     Fail(String),
+    /// Crash after the batches are sent, so the source never reports that it
+    /// stopped and the session's event stream just closes.
+    Panic,
 }
 
 /// What a fake instrument does once the capture starts.
@@ -77,6 +80,7 @@ impl CaptureSource for ScriptedSource {
             }
             SourceEnding::Finish => Ok(()),
             SourceEnding::Fail(message) => Err(CaptureError::new(message)),
+            SourceEnding::Panic => panic!("the scripted source crashed"),
         }
     }
 }
