@@ -19,7 +19,7 @@ Rust 1.79 or newer is required. Run commands from the workspace root.
 
 ## Coding Style & Naming Conventions
 
-Use `rustfmt` defaults and keep Clippy clean. Follow Rust naming conventions: `snake_case` for modules and functions, `PascalCase` for types and traits, and `UPPER_SNAKE_CASE` for constants. Prefer explicit domain names such as `CaptureCoordinator` over abbreviations. Production crates must not panic on device input; return `CaptureError` with actionable context instead. Crates under `crates/` enforce this with the `clippy::unwrap_used` and `clippy::expect_used` workspace lints; test code is exempt through `clippy.toml`, and integration tests opt out with a file-level `#![allow]`.
+Use `rustfmt` defaults and keep Clippy clean. Follow Rust naming conventions: `snake_case` for modules and functions, `PascalCase` for types and traits, and `UPPER_SNAKE_CASE` for constants. Prefer explicit domain names such as `CaptureCoordinator` over abbreviations. Production crates must not panic on device input; return `CaptureError` with actionable context instead. Crates under `crates/` and the apps under `apps/` enforce this with the `clippy::unwrap_used` and `clippy::expect_used` workspace lints; test code is exempt through `clippy.toml`, and integration tests opt out with a file-level `#![allow]`.
 
 ## Testing Guidelines
 
