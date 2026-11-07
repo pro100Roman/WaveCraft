@@ -21,31 +21,64 @@ implemented for an identified model and transport.
 
 ## Current status
 
-Reviewed 2026-11-07 against commit `65f909f`.
+Reviewed 2026-11-07 on branch `chore/code-health-improvements` at commit
+`1c26d5c`. Sizes below were measured, not estimated: "before" is `e74c2bc`,
+the commit before the GUI split began.
 
-`apps/wavecraft-gui/src/main.rs` is now only the native entry point
-(`wavecraft_gui::run()`). The application lives in the library crate, and
-`src/lib.rs` is still about 23,000 lines (roughly 13,000 of production code)
-with `update` alone near 1,900 lines. The earlier description of the file below
-therefore applies to `lib.rs` today.
+`apps/wavecraft-gui/src/main.rs` is only the native entry point
+(`wavecraft_gui::run()`). The application lives in the library crate.
+
+| Measure | Before | Now |
+| ------- | ------ | --- |
+| `lib.rs` total lines | 23,218 | 10,829 |
+| `lib.rs` production lines | 18,778 | 6,389 |
+| `lib.rs` test lines (`mod tests`) | 4,440 | 4,440 |
+| `eframe::App::update` lines | 1,874 | 277 |
+
+An earlier version of this document said `lib.rs` held "roughly 13,000 lines of
+production code". That was wrong; it was about 18,800.
+
+What is still in `lib.rs`: the `WaveCraftApp` struct and its `impl` (about 2,400
+lines, the largest remaining block), the capture and session settings types and
+their impls (logic, scope, radio analyzer, marker and trigger settings),
+`start_capture`, `combined_waveform_cards`, `ProtocolDecodeCache`, and all of
+the tests. The tests were not moved with the code they cover, so the rule in
+[Test boundaries](#test-boundaries) is not met yet.
 
 | Step | State | Notes |
 | ---- | ----- | ----- |
 | 1. Snapshot utilities | Done | `snapshot.rs` holds image cropping and PNG persistence with its tests. The in-app capture flow (`finish_pending_snapshot`) stays in `lib.rs`. |
-| 2. Generic session tabs | Done | `sessions.rs` holds the generic `SessionTab`. One session-tab test (`session_tabs_preserve_selected_device_ids`) remains in `lib.rs`. |
-| 3. Recording and Saleae | Partial | `recording.rs` holds path selection, decoded-data JSON Lines I/O, and Saleae export file handling. `recording_metadata.rs` holds the `saved_*_settings_metadata` / `*_settings_from_recording_metadata` mapping between capture settings and `.dsv` metadata. `start_gui_recording` and `read_gui_recording*` are still in `lib.rs`. |
-| 4. Devices | Partial | `devices.rs` holds selection helpers and the USB speed warning. Discovery and refresh orchestration (`discover_supported_devices`, `poll_worker`) are still in `lib.rs`. |
-| 5. Waveform store and viewport | Not started | `waveform/mod.rs` contains only `pub mod radio;`. |
-| 6. Logic rendering, markers, protocol lanes | Not started | `paint_logic*` functions are in `lib.rs`. |
-| 7. Scope rendering, markers, FFT, measurements UI | Not started | `paint_scope*` functions are in `lib.rs`; `measurements.rs` is the engine only. |
-| 8. Split `update` into panels returning typed actions | Not started | |
+| 2. Generic session tabs | Done | `sessions.rs` holds the generic `SessionTab`. One session-tab test (`session_tabs_preserve_selected_device_ids`) remains in `lib.rs`. The tab strip and its select/add/close/rename handling are in `ui/session_tabs.rs`. |
+| 3. Recording and Saleae | Done | `recording.rs` holds path selection, decoded-data JSON Lines I/O, Saleae export file handling, `start_gui_recording`, `read_gui_recording*`, `LoadedRecording`, and `recording_capture_target`. `recording_metadata.rs` holds the table-driven mapping between capture settings and `.dsv` metadata. The `WaveCraftApp` methods that drive recording (`attach_run_capture_recording`, `open_selected_recording`, `begin_export_saleae`) are still in `lib.rs`. |
+| 4. Devices | Partial | `devices.rs` holds selection helpers and the USB speed warning. Discovery itself is `wavecraft_usb::discover_supported_devices`; the GUI's refresh orchestration (`begin_refresh`, `poll_worker`) is still in `lib.rs`. |
+| 5. Waveform store and viewport | Done | `waveform/store.rs` holds `WaveformStore` and the bounded display buffers; `waveform/viewport.rs` holds the viewport, timebase, combined timeline, and pointer gestures. The tests for both are still in `lib.rs`. |
+| 6. Logic rendering, markers, protocol lanes | Done | `waveform/logic.rs` holds the signal lanes, channel and time markers, timing measurements, and protocol-decode lanes. |
+| 7. Scope rendering, markers, FFT, measurements UI | Done | `waveform/scope.rs` (time domain, markers, math trace), `waveform/scope_fft.rs`, `waveform/scope_lissajous.rs`, and `waveform/chrome.rs` (cards, grid, and time ruler shared by every view). The measurement settings UI is in `ui/scope_settings.rs`; `measurements.rs` is still only the engine. |
+| 8. Split `update` into panels returning typed actions | Partial | Every panel `update()` paints is a method in `ui/`: `paint_toolbar`, `paint_waveform_tabs`, `paint_capture_setup_panel`, `paint_scope_tools_panel`, `paint_status_bar`, `paint_session_tabs`, `paint_central_panel`, and the settings and calibration windows. Requests are collected in `FrameActions` (`ui/frame_actions.rs`) and applied after painting (`apply_toolbar_actions`, `apply_scope_frontend_changes`). See the deviations below. |
 | 9. Core IQ model, recording, simulator | Done | See [RF/SDR architecture](rf-sdr-architecture.md). |
-| 10. Radio GUI | Partial | `waveform/radio.rs`, `radio_analyzer.rs`, and `radio_trigger.rs` exist and `WaveformTab::RadioReceiver` is a live tab. Radio settings panels remain in `lib.rs`; there is no `acquisition::radio` or `devices::radio` module. |
+| 10. Radio GUI | Partial | `waveform/radio.rs`, `radio_analyzer.rs`, and `radio_trigger.rs` exist and `WaveformTab::RadioReceiver` is a live tab. The radio settings panels moved to `ui/radio_settings.rs`; `RadioAnalyzerSettings` and other non-UI radio helpers are still in `lib.rs`. There is no `acquisition::radio` or `devices::radio` module. |
 | 11. HackRF One adapter | Done | `wavecraft-hackrf` is a receive-only adapter. Hardware tests must remain opt-in. |
 | 12. LimeSDR-USB and AntSDR E200 adapters | Not started | `wavecraft-sdr` names `RadioProvider::LimeSuiteNg`, `RadioProvider::Libiio`, `RadioModel::LimeSdrUsbTypeA`, and `RadioModel::AntSdrE200`, but no adapter crates exist. These names are not support claims. |
 
 Differences between this plan and the code:
 
+- The panels do not follow the "narrow editor model in, typed action out"
+  pattern described in
+  [Application ownership and UI communication](#application-ownership-and-ui-communication).
+  The extracted panels are `impl WaveCraftApp` methods that take `&mut self`,
+  plus a small `Copy` inputs struct (`ToolbarInputs`, `CaptureSetupInputs`,
+  `CentralPanelInputs`, `ScopeFrontendInputs`) for the values `update()`
+  computes first, and `&mut FrameActions` to record what the user asked for.
+  This kept each move verbatim and borrow-checker friendly, but it means the
+  UI modules still have unrestricted access to application state. Narrowing
+  that is future work.
+- `update()` is still 277 lines. About 100 of them compute the gating flags and
+  before-painting snapshots (`capture_settings_enabled`,
+  `radio_runtime_controls_enabled`, `trigger_controls_enabled`, and so on), and
+  the rest sequence the panels and apply a few small actions inline
+  (calibration requests, device-selection changes, radio runtime updates).
+  Putting the flags into one struct returned by a `&self` method is the next
+  obvious step.
 - The planned `DeviceProvider` enum is implemented for radios as `RadioProvider`
   and `RadioModel` in `wavecraft-sdr`, alongside `ConnectionBackend` and
   `RadioCapabilities` (with `ValueDomain`). There is no combined
@@ -53,8 +86,22 @@ Differences between this plan and the code:
   settings are the concrete `HackRfSettings`.
 - `WaveformTab` has `LogicAnalyzer`, `Oscilloscope`, `Lissajous`,
   `RadioReceiver`, and `Combined`, rather than the four-variant sketch below.
-- The `app/`, `acquisition/`, `ui/`, and per-instrument `waveform/logic`,
-  `waveform/scope` directories in the layout are still destination layout only.
+- The modules are flat files, not the directories in the layout below:
+  `waveform/logic.rs` and `waveform/scope.rs` (plus `scope_fft.rs`,
+  `scope_lissajous.rs`, `chrome.rs`) instead of `waveform/logic/` and
+  `waveform/scope/`, and `ui/` holds `toolbar.rs`, `status_bar.rs`,
+  `capture_setup_panel.rs`, `capture_settings_panel.rs`, `central_panel.rs`,
+  `decoded_panel.rs`, `dialogs.rs`, `app_windows.rs`, `session_tabs.rs`,
+  `waveform_tabs.rs`, `scope_tools_panel.rs`, `scope_settings.rs`,
+  `radio_settings.rs`, `protocol_analyzer_dialog.rs`,
+  `scope_frontend_changes.rs`, and `frame_actions.rs`. `format.rs` exists as
+  planned.
+- The `app/`, `acquisition/`, and `devices/` directories in the layout do not
+  exist. `WaveCraftApp` and the settings types are still in `lib.rs`.
+- The moved UI code has no automated tests of its own. The existing 238 GUI
+  tests cover the helper functions and settings logic. The panels were checked
+  by compiling, clippy, those tests, and a 10-second launch of the app without
+  a panic; none of the panel interactions were exercised.
 
 ## Why split the GUI now
 

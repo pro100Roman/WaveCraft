@@ -29,15 +29,16 @@ Areas reviewed and found sound, which need no change:
 
 Each item below was fixed in its own commit on the `chore/code-health-improvements`
 branch. Formatting, Clippy, and the tests for the touched crates were run after
-each step. At the end of the series the full CI command set passed: `cargo fmt
---all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo
-test --workspace` (538 tests), `cargo build --workspace --release --locked`, the
-Python client tests, and `cargo +1.79.0 check --workspace --locked`.
+each step. After the last code change (`1c26d5c`, the GUI split) the full CI
+command set passed: `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --workspace` (544 passed, 6 ignored),
+`cargo build --workspace --release --locked`, the Python client tests (9), and
+`cargo +1.79.0 check --workspace --locked`.
 
 | Item | State |
 | ---- | ----- |
 | 1. Per-frame analyzer copies | Done and measured; see [Measurements](#measurements-for-item-1). Custom protocols are shared through `Arc`; the decode cache compares its key in place and shares outcomes through `Arc`. The measured saving is small: under 0.1 ms per frame except with about 10,000 or more decoded events in the cache path. |
-| 2. Large `lib.rs` | Started. The recording-metadata mapping moved to `recording_metadata.rs` (about 1,000 lines). `update` and the other long functions remain, along with migration steps 5-8 in [GUI modularization](gui-modularization.md). |
+| 2. Large `lib.rs` | Mostly done for the split, not finished. `lib.rs` went from 23,218 to 10,829 lines (production code 18,778 to 6,389; `eframe::App::update` 1,874 to 277 lines). Moved out: the waveform store, viewport, logic, scope, FFT, Lissajous and shared chrome code (`waveform/`), formatting (`format.rs`), the recording code (`recording.rs`), the metadata mapping (`recording_metadata.rs`, see item 3), and every panel, window and dialog `update()` paints (`ui/`). Requests from the panels are collected in `FrameActions` and applied after painting. Still in `lib.rs`: the `WaveCraftApp` struct and its `impl` (about 2,400 lines), the settings types, and all 4,440 lines of tests (they were not moved with the code). `update()` still computes about 100 lines of gating flags before painting. The moved panel code has no tests of its own; it was checked by compiling, Clippy, the 238 existing GUI tests, and a 10-second launch of the app that did not panic. No panel interaction was exercised. Details and deviations from the plan are in [GUI modularization](gui-modularization.md). |
 | 3. Hand-written metadata mapping | Done for the one-key-per-setting fields. `recording_metadata.rs` now describes each such setting once, in a `MetadataField` or `ChannelField` table entry that drives both saving and loading (logic, scope and radio). Still hand-written, and marked as such in the file: the logic trigger (mode, stage count and per-stage conditions depend on each other), the radio analyzer channel list and gains, and the legacy radio analyzer keys. The file is not shorter (about 1,100 lines, up from 1,040, because rustfmt expands the table entries). Checked against the old code by saving and loading about 19,000 cases (every key removed, set to 34 odd values, plus legacy-key combinations) and comparing the output byte for byte; that harness was temporary and is not in the repository. A new test checks that table keys are unique. |
 | 4. Copied USB helpers | Done for the six identical helpers (`ds_driver_util.rs`). The queued-read bookkeeping in the two drivers was not compared or merged. |
 | 5. Panics in production code | Done. About 45 sites in `crates/` were removed (the count of "about 20" below was low because the scan stopped at the first `#[cfg(test)]`), plus the remaining `expect`/`unreachable!` sites in `wavecraft-gui` (one looks reachable from the code: a recording holding logic and radio, or scope and radio, but not all three, passed the reader and then hit `unreachable!`; this was not reproduced with a real file). `clippy::unwrap_used` and `clippy::expect_used` are now enforced for every crate and both apps. The CLI had no production sites; its one `expect` is in test code. |
@@ -142,8 +143,11 @@ decoded-event count, so measure frame time before and after the change.
 
 ### 2. `apps/wavecraft-gui/src/lib.rs` is too large
 
-The file is 24,017 lines, of which about 14,000 are production code (tests start
-near line 14,254 and 19,729). The longest functions are:
+When this review was written the file was 24,017 lines. Measured again on the
+commit before the split began (`e74c2bc`, after the metadata mapping had moved
+out), it was 23,218 lines: 18,778 of production code, and one `mod tests` of
+4,440 lines starting at line 18,780. An earlier version of this section said
+"about 14,000 production lines"; that was wrong. The longest functions were:
 
 | Lines | Function |
 | ----- | -------- |
@@ -158,16 +162,17 @@ near line 14,254 and 19,729). The longest functions are:
 It is also the most frequently changed file (about 80 commits since August 2026),
 so its size raises review cost and merge-conflict risk.
 
-[GUI modularization](gui-modularization.md) already defines the destination.
-Migration steps 1-4 appear done, judging by the existence of `snapshot.rs`,
-`sessions.rs`, `recording.rs`, and `devices.rs`; the contents of each were not
-audited against the plan. Steps 5-8 remain: `waveform::store` and `waveform::viewport`, the
-logic and scope renderers, and splitting `update` into panels that return typed
-actions. Continue those steps as small, behavior-preserving changes.
+Since then `update` shrank to 277 lines, and `paint_capture_settings`,
+`paint_radio_analyzer_configuration`, `start_gui_recording` and
+`paint_scope_time_domain` moved into `ui/`, `recording.rs` and `waveform/`
+without changes to their bodies. `poll_worker` and `poll_capture_target` are still in
+`lib.rs` and still long (they were not touched).
 
-That document is stale: it names `main.rs` where the code now lives in `lib.rs`,
-and its status is still "proposed" although the first four steps landed. Update
-it as part of the next migration step.
+[GUI modularization](gui-modularization.md) defines the destination, and its
+status table is now current. Of its migration steps, 1, 2, 3, 5, 6 and 7 are
+done, 4 (devices) and 8 (splitting `update`) are partial, and nothing has been
+done on moving `WaveCraftApp` and the settings types out of `lib.rs` or moving
+the tests next to the code they cover.
 
 ### 3. Hand-written recording-metadata mapping
 
