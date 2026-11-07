@@ -34,7 +34,7 @@ Crate roles:
 - `wavecraft-decode` – layered decoding: UART/SPI/I2C transport decoders → byte framing → declarative YAML custom-protocol schemas (`schema.rs`); plus radio packet/CRC/whitening pipeline. Decoders are incremental and independent of the GUI's bounded display buffers; decoded events carry authoritative sample ranges.
 - `wavecraft-radio` – radio settings/trigger types; `wavecraft-recording` – lossless CRC-checked `.dsv` recording and Saleae `.sal` import/export (never overwrites existing files).
 - `wavecraft-automation` – shared command layer behind the CLI JSON/NDJSON contract and the MCP/automation surface; `python/` is a first-party `subprocess` client over the CLI. Automation must not parse human-readable text.
-- `apps/wavecraft-cli`, `apps/wavecraft-gui` (egui-style native app; `src/lib.rs` is very large, with feature modules alongside).
+- `apps/wavecraft-cli`, `apps/wavecraft-gui` (egui-style native app). In the GUI, `src/lib.rs` holds the `WaveCraftApp` struct and `run_frame`; capture settings are in `acquisition/`, the `WaveCraftApp` methods in `app/`, panels and dialogs in `ui/`, waveform views in `waveform/`. Tests sit next to the module they cover; `src/tests.rs` and `src/frame_tests.rs` hold the cross-module and headless-frame tests.
 
 Key rules: YAML protocol schemas never touch hardware samples or implement DSP; GUI sessions are independent per instrument; production code must return `CaptureError` rather than panic on device input.
 
