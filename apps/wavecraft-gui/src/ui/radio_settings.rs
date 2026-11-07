@@ -433,12 +433,36 @@ fn paint_radio_analyzer_filter_rows(
     let capture_rate_mhz = capture_sample_rate_hz as f64 / 1_000_000.0;
     paint_radio_parameter_label(
         ui,
-        "Channel bandwidth",
+        "Auto channel bandwidth",
         Some(
-            "Full complex bandwidth retained around the selected channel. Auto uses \
-             Carson's rule (2 x deviation + bit rate) plus 15 kHz each side for carrier \
-             frequency error; a narrower channel passes less noise.",
+            "Choose the channel bandwidth from the bit rate and deviation: Carson's rule \
+             (2 x deviation + bit rate) plus 15 kHz each side for carrier frequency error, \
+             rounded up to 5 kHz. A narrower channel passes less noise, but a carrier more \
+             than about 20 kHz off the channel centre is lost; switch this off and set a \
+             wider channel then.",
         ),
+    );
+    let mut automatic_bandwidth = settings.channel_bandwidth_hz == AUTOMATIC_CHANNEL_BANDWIDTH_HZ;
+    if ui
+        .add_enabled(
+            enabled,
+            egui::Checkbox::without_text(&mut automatic_bandwidth),
+        )
+        .changed()
+    {
+        // Switching Auto off keeps the bandwidth that was in use.
+        settings.channel_bandwidth_hz = if automatic_bandwidth {
+            AUTOMATIC_CHANNEL_BANDWIDTH_HZ
+        } else {
+            settings.effective_channel_bandwidth_hz()
+        };
+    }
+    ui.end_row();
+
+    paint_radio_parameter_label(
+        ui,
+        "Channel bandwidth",
+        Some("Full complex bandwidth retained around the selected channel"),
     );
     ui.add_enabled_ui(enabled, |ui| {
         paint_channel_bandwidth_value(ui, settings, capture_rate_mhz);
@@ -463,12 +487,33 @@ fn paint_radio_analyzer_filter_rows(
 
     paint_radio_parameter_label(
         ui,
-        "Channel filter taps",
+        "Auto filter taps",
         Some(
-            "Odd FIR length from 3 to 4095; more taps improve rejection but cost CPU. \
-             Auto sizes the filter from the capture rate so the transition band stays a \
-             quarter of the channel bandwidth.",
+            "Size the channel filter from the capture rate so its transition band stays a \
+             quarter of the channel bandwidth with 60 dB of rejection. A fixed length \
+             loses selectivity as the capture rate grows.",
         ),
+    );
+    let mut automatic_taps = settings.filter_tap_count == AUTOMATIC_FILTER_TAP_COUNT;
+    if ui
+        .add_enabled(enabled, egui::Checkbox::without_text(&mut automatic_taps))
+        .changed()
+    {
+        settings.filter_tap_count = if automatic_taps {
+            AUTOMATIC_FILTER_TAP_COUNT
+        } else {
+            automatic_filter_tap_count(
+                capture_sample_rate_hz,
+                settings.effective_channel_bandwidth_hz(),
+            )
+        };
+    }
+    ui.end_row();
+
+    paint_radio_parameter_label(
+        ui,
+        "Channel filter taps",
+        Some("Odd FIR length from 3 to 4095; more taps improve rejection but cost CPU"),
     );
     ui.add_enabled_ui(enabled, |ui| {
         paint_filter_tap_count_value(ui, settings, capture_sample_rate_hz);
@@ -479,82 +524,55 @@ fn paint_radio_analyzer_filter_rows(
     ui.end_row();
 }
 
-/// Channel bandwidth editor with an Auto switch. While Auto is on the value
-/// shown is the one the analyzer will use and cannot be edited.
+/// Channel bandwidth editor. While Auto is on it shows the bandwidth the
+/// analyzer will use and cannot be edited.
 fn paint_channel_bandwidth_value(
     ui: &mut egui::Ui,
     settings: &mut RadioAnalyzerSettings,
     capture_rate_mhz: f64,
 ) {
-    ui.horizontal(|ui| {
-        let effective_hz = settings.effective_channel_bandwidth_hz();
-        let mut automatic = settings.channel_bandwidth_hz == AUTOMATIC_CHANNEL_BANDWIDTH_HZ;
-        if automatic {
-            let mut shown_hz = effective_hz;
-            ui.add_enabled_ui(false, |ui| {
-                paint_scaled_u64_value(
-                    ui,
-                    &mut shown_hz,
-                    1_000_000.0,
-                    0.000_001..=capture_rate_mhz.max(0.000_001),
-                    "MHz",
-                );
-            });
-        } else {
-            paint_scaled_u64_value(
-                ui,
-                &mut settings.channel_bandwidth_hz,
-                1_000_000.0,
-                0.000_001..=capture_rate_mhz.max(0.000_001),
-                "MHz",
-            );
-        }
-        if ui.checkbox(&mut automatic, "Auto").changed() {
-            // Leaving Auto keeps the bandwidth that was in use.
-            settings.channel_bandwidth_hz = if automatic {
-                AUTOMATIC_CHANNEL_BANDWIDTH_HZ
-            } else {
-                effective_hz
-            };
-        }
-    });
+    let range = 0.000_001..=capture_rate_mhz.max(0.000_001);
+    if settings.channel_bandwidth_hz == AUTOMATIC_CHANNEL_BANDWIDTH_HZ {
+        let mut shown_hz = settings.effective_channel_bandwidth_hz();
+        ui.add_enabled_ui(false, |ui| {
+            paint_scaled_u64_value(ui, &mut shown_hz, 1_000_000.0, range, "MHz");
+        });
+    } else {
+        paint_scaled_u64_value(
+            ui,
+            &mut settings.channel_bandwidth_hz,
+            1_000_000.0,
+            range,
+            "MHz",
+        );
+    }
 }
 
-/// Filter length editor with an Auto switch; see [`paint_channel_bandwidth_value`].
+/// Filter length editor. While Auto is on it shows the length the channelizer
+/// will use and cannot be edited.
 fn paint_filter_tap_count_value(
     ui: &mut egui::Ui,
     settings: &mut RadioAnalyzerSettings,
     capture_sample_rate_hz: u64,
 ) {
-    ui.horizontal(|ui| {
-        let automatic_taps = automatic_filter_tap_count(
+    let size = egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y);
+    if settings.filter_tap_count == AUTOMATIC_FILTER_TAP_COUNT {
+        let mut shown = automatic_filter_tap_count(
             capture_sample_rate_hz,
             settings.effective_channel_bandwidth_hz(),
         );
-        let mut automatic = settings.filter_tap_count == AUTOMATIC_FILTER_TAP_COUNT;
-        let size = egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y);
-        if automatic {
-            let mut shown = automatic_taps;
-            ui.add_enabled_ui(false, |ui| {
-                add_left_aligned_sized(ui, size, egui::DragValue::new(&mut shown).range(3..=4_095));
-            });
-        } else {
-            add_left_aligned_sized(
-                ui,
-                size,
-                egui::DragValue::new(&mut settings.filter_tap_count)
-                    .range(3..=4_095)
-                    .speed(2),
-            );
-        }
-        if ui.checkbox(&mut automatic, "Auto").changed() {
-            settings.filter_tap_count = if automatic {
-                AUTOMATIC_FILTER_TAP_COUNT
-            } else {
-                automatic_taps
-            };
-        }
-    });
+        ui.add_enabled_ui(false, |ui| {
+            add_left_aligned_sized(ui, size, egui::DragValue::new(&mut shown).range(3..=4_095));
+        });
+    } else {
+        add_left_aligned_sized(
+            ui,
+            size,
+            egui::DragValue::new(&mut settings.filter_tap_count)
+                .range(3..=4_095)
+                .speed(2),
+        );
+    }
 }
 
 fn paint_radio_analyzer_symbol_rows(
@@ -2005,6 +2023,8 @@ mod tests {
         enabled: bool,
         runtime_enabled: bool,
         trigger_runtime_enabled: bool,
+        /// Paint the signal analyzer section instead of the receive one.
+        analyzer_section: bool,
         frames: u32,
     }
 
@@ -2017,6 +2037,7 @@ mod tests {
                 enabled: true,
                 runtime_enabled: false,
                 trigger_runtime_enabled: false,
+                analyzer_section: false,
                 frames: 0,
             };
             // The grid only knows its column widths after its first frame.
@@ -2026,6 +2047,12 @@ mod tests {
 
         fn stopped(mut self) -> Self {
             self.enabled = false;
+            self
+        }
+
+        fn analyzer_section(mut self) -> Self {
+            self.analyzer_section = true;
+            self.frame(Vec::new());
             self
         }
 
@@ -2045,14 +2072,23 @@ mod tests {
             };
             let output = self.context.run(input, |context| {
                 egui::CentralPanel::default().show(context, |ui| {
-                    paint_radio_receive_configuration(
-                        ui,
-                        &self.radio,
-                        &mut self.settings,
-                        self.enabled,
-                        self.runtime_enabled,
-                        self.trigger_runtime_enabled,
-                    );
+                    if self.analyzer_section {
+                        paint_radio_analyzer_configuration(
+                            ui,
+                            &mut self.settings.analyzer,
+                            self.settings.capture.sample_rate_hz,
+                            self.enabled,
+                        );
+                    } else {
+                        paint_radio_receive_configuration(
+                            ui,
+                            &self.radio,
+                            &mut self.settings,
+                            self.enabled,
+                            self.runtime_enabled,
+                            self.trigger_runtime_enabled,
+                        );
+                    }
                 });
             });
             Painted::new(&output.shapes)
@@ -2422,6 +2458,113 @@ mod tests {
         );
         assert!(panel.settings.amplifier_enabled);
         assert!(panel.settings.antenna_power_enabled);
+    }
+
+    fn analyzer_settings() -> RadioSettings {
+        let mut settings = receive_settings();
+        settings.analyzer.demodulation = RadioDemodulation::BinaryGfsk;
+        settings
+    }
+
+    #[test]
+    fn the_automatic_switches_have_their_own_rows_and_start_on() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+                .analyzer_section();
+        let painted = panel.painted();
+
+        for label in [
+            "Auto channel bandwidth",
+            "Channel bandwidth",
+            "Auto filter taps",
+            "Channel filter taps",
+        ] {
+            assert!(painted.has(label), "missing the {label:?} row");
+        }
+        // The switches sit on rows of their own, above the value they control.
+        let row = |label: &str| painted.center_of(label).y;
+        assert!(row("Auto channel bandwidth") < row("Channel bandwidth"));
+        assert!(row("Auto filter taps") < row("Channel filter taps"));
+        painted.checkbox_beside("Auto channel bandwidth");
+        painted.checkbox_beside("Auto filter taps");
+        assert_eq!(
+            panel.settings.analyzer.channel_bandwidth_hz,
+            AUTOMATIC_CHANNEL_BANDWIDTH_HZ
+        );
+        assert_eq!(
+            panel.settings.analyzer.filter_tap_count,
+            AUTOMATIC_FILTER_TAP_COUNT
+        );
+    }
+
+    #[test]
+    fn switching_the_automatic_bandwidth_off_keeps_the_value_in_use() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+                .analyzer_section();
+        let automatic = panel.settings.analyzer.effective_channel_bandwidth_hz();
+        assert_eq!(automatic, 120_000);
+
+        let checkbox = panel.painted().checkbox_beside("Auto channel bandwidth");
+        panel.click(checkbox);
+        assert_eq!(panel.settings.analyzer.channel_bandwidth_hz, automatic);
+
+        // A manual value no longer follows the bit rate and deviation;
+        // switching Auto back on does.
+        panel.settings.analyzer.symbol_rate_hz = 100_000;
+        panel.settings.analyzer.deviation_hz = 50_000;
+        assert_eq!(
+            panel.settings.analyzer.effective_channel_bandwidth_hz(),
+            automatic
+        );
+        let checkbox = panel.painted().checkbox_beside("Auto channel bandwidth");
+        panel.click(checkbox);
+        assert_eq!(
+            panel.settings.analyzer.channel_bandwidth_hz,
+            AUTOMATIC_CHANNEL_BANDWIDTH_HZ
+        );
+        assert_eq!(
+            panel.settings.analyzer.effective_channel_bandwidth_hz(),
+            230_000
+        );
+    }
+
+    #[test]
+    fn switching_the_automatic_filter_taps_off_keeps_the_length_in_use() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+                .analyzer_section();
+        let capture_rate = panel.settings.capture.sample_rate_hz;
+        let automatic = automatic_filter_tap_count(
+            capture_rate,
+            panel.settings.analyzer.effective_channel_bandwidth_hz(),
+        );
+
+        let checkbox = panel.painted().checkbox_beside("Auto filter taps");
+        panel.click(checkbox);
+        assert_eq!(panel.settings.analyzer.filter_tap_count, automatic);
+        assert_eq!(automatic % 2, 1);
+
+        let checkbox = panel.painted().checkbox_beside("Auto filter taps");
+        panel.click(checkbox);
+        assert_eq!(
+            panel.settings.analyzer.filter_tap_count,
+            AUTOMATIC_FILTER_TAP_COUNT
+        );
+    }
+
+    #[test]
+    fn a_stopped_panel_leaves_the_automatic_switches_alone() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+                .stopped()
+                .analyzer_section();
+        let before = panel.settings.clone();
+        for label in ["Auto channel bandwidth", "Auto filter taps"] {
+            let checkbox = panel.painted().checkbox_beside(label);
+            panel.click(checkbox);
+        }
+        assert_eq!(panel.settings, before);
     }
 
     #[test]
