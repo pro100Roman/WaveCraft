@@ -1,36 +1,28 @@
 //! The top toolbar: refresh, start/stop, recording, and snapshot controls.
 
 use crate::{
-    egui, toolbar_action_button, AcquisitionMode, CaptureTarget, Color32, RichText,
-    SelectableHoverText, Vec2, ACCENT, CAPTURE_FILE_BUTTON_WIDTH, ORANGE, PANEL, SCOPE_COLORS,
-    TEXT_MUTED,
+    egui, toolbar_action_button, ui::frame_state::FrameState, AcquisitionMode, CaptureTarget,
+    Color32, RichText, SelectableHoverText, Vec2, ACCENT, CAPTURE_FILE_BUTTON_WIDTH, ORANGE, PANEL,
+    SCOPE_COLORS, TEXT_MUTED,
 };
 
 use crate::{ui::frame_actions::FrameActions, WaveCraftApp};
-
-/// Values `update()` computes before painting that the toolbar reads.
-#[derive(Clone, Copy)]
-pub(crate) struct ToolbarInputs {
-    pub(crate) control_target: Option<CaptureTarget>,
-    pub(crate) control_target_available: bool,
-    pub(crate) can_attach_run_capture_recording: bool,
-    pub(crate) can_attach_run_decoded_recording: bool,
-}
 
 impl WaveCraftApp {
     /// Paints the toolbar and records the user's requests in `actions`.
     pub(crate) fn paint_toolbar(
         &mut self,
         context: &egui::Context,
-        inputs: ToolbarInputs,
+        frame: &FrameState,
         actions: &mut FrameActions,
     ) {
-        let ToolbarInputs {
+        let FrameState {
             control_target,
             control_target_available,
             can_attach_run_capture_recording,
             can_attach_run_decoded_recording,
-        } = inputs;
+            ..
+        } = *frame;
         egui::TopBottomPanel::top("toolbar")
             .frame(
                 egui::Frame::none()

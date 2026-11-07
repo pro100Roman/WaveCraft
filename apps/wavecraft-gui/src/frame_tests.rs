@@ -7,10 +7,7 @@
 //! interaction paths are covered only by calling the apply methods directly.
 
 use super::*;
-use crate::ui::{
-    frame_actions::FrameActions, scope_frontend_changes::ScopeFrontendInputs,
-    toolbar::ToolbarInputs,
-};
+use crate::ui::frame_actions::FrameActions;
 use wavecraft_core::{DeviceDescriptor, DeviceId, InstrumentKind};
 use wavecraft_sdr::{ConnectionBackend, RadioModel, RadioProvider};
 use wavecraft_usb::{DeviceLocation, DeviceProfile, DSCOPE_U3P100, DSLOGIC_U3PRO16};
@@ -174,45 +171,33 @@ fn radio_and_scope_panels_paint_in_each_capture_settings_tab() {
     run_frames(&mut app, &context, 2);
 }
 
-fn toolbar_inputs(target: Option<CaptureTarget>) -> ToolbarInputs {
-    ToolbarInputs {
-        control_target: target,
-        control_target_available: target.is_some(),
-        can_attach_run_capture_recording: false,
-        can_attach_run_decoded_recording: false,
+fn stop_request() -> FrameActions {
+    FrameActions {
+        stop_clicked: true,
+        ..FrameActions::default()
     }
 }
 
 #[test]
 fn stopping_with_nothing_running_reports_it() {
     let mut app = app_with_every_instrument();
-    let mut actions = FrameActions {
-        stop_clicked: true,
-        ..FrameActions::default()
-    };
-    app.apply_toolbar_actions(
-        &mut actions,
-        toolbar_inputs(Some(CaptureTarget::LogicAnalyzer)),
-    );
+    app.select_waveform_tab(WaveformTab::LogicAnalyzer);
+    let frame = app.frame_state();
+    app.apply_toolbar_actions(&mut stop_request(), &frame);
     assert_eq!(app.status, "Acquisition stopped");
 }
 
 #[test]
 fn stop_forgets_the_requested_capture_and_pending_repeats() {
     let mut app = app_with_every_instrument();
+    app.select_waveform_tab(WaveformTab::LogicAnalyzer);
     app.capture_requests.insert(CaptureTarget::LogicAnalyzer);
     app.requested_capture_target = Some(CaptureTarget::LogicAnalyzer);
     app.queued_capture_rearms
         .push((AcquisitionMode::Single, CaptureTarget::LogicAnalyzer));
     app.scope_configuration_due = Some(Instant::now());
-    let mut actions = FrameActions {
-        stop_clicked: true,
-        ..FrameActions::default()
-    };
-    app.apply_toolbar_actions(
-        &mut actions,
-        toolbar_inputs(Some(CaptureTarget::LogicAnalyzer)),
-    );
+    let frame = app.frame_state();
+    app.apply_toolbar_actions(&mut stop_request(), &frame);
     assert!(app.capture_requests.is_empty());
     assert_eq!(app.requested_capture_target, None);
     assert!(app.queued_capture_rearms.is_empty());
@@ -222,39 +207,59 @@ fn stop_forgets_the_requested_capture_and_pending_repeats() {
 #[test]
 fn stop_without_a_view_does_nothing() {
     let mut app = app_with_every_instrument();
+    assert_eq!(app.active_waveform_tab, None);
     let status = app.status.clone();
-    let mut actions = FrameActions {
-        stop_clicked: true,
-        ..FrameActions::default()
-    };
-    app.apply_toolbar_actions(&mut actions, toolbar_inputs(None));
+    let frame = app.frame_state();
+    app.apply_toolbar_actions(&mut stop_request(), &frame);
     assert_eq!(app.status, status);
 }
 
-fn scope_inputs(before: ScopeCaptureSettings) -> ScopeFrontendInputs {
-    ScopeFrontendInputs {
-        scope_settings_before_ui: before,
-        manual_calibration_before_ui: None,
-        manual_calibration_range_before_ui: None,
-        scope_capture_requested: false,
-        selected_scope_device: true,
-    }
+#[test]
+fn the_frame_state_follows_the_selected_view_and_devices() {
+    let mut app = app();
+    let frame = app.frame_state();
+    assert_eq!(frame.control_target, None);
+    assert!(!frame.selected_scope_device);
+    assert!(!frame.control_target_available);
+
+    let mut app_with_devices = app_with_every_instrument();
+    app_with_devices.select_waveform_tab(WaveformTab::Oscilloscope);
+    // `run_frame` reconciles the device selection before it computes the state,
+    // and selecting a view restores that view's saved (empty) selection.
+    app_with_devices.reconcile_device_selections();
+    let frame = app_with_devices.frame_state();
+    assert_eq!(frame.control_target, Some(CaptureTarget::Oscilloscope));
+    assert!(frame.selected_scope_device);
+    assert!(frame.control_target_available);
+    assert!(frame.capture_settings_enabled);
+
+    // Controls lock while a device is being prepared.
+    let (_sender, receiver) = mpsc::channel();
+    app_with_devices.pending = Some(receiver);
+    assert!(!app_with_devices.frame_state().capture_settings_enabled);
+
+    // The snapshots are taken before painting, so they do not follow later edits.
+    app.scope_settings.sample_rate_hz += 1;
+    assert_ne!(
+        app.frame_state().scope_settings_before_ui,
+        frame.scope_settings_before_ui
+    );
 }
 
 #[test]
 fn an_unchanged_scope_frontend_schedules_nothing() {
     let mut app = app_with_every_instrument();
-    let before = app.scope_settings;
-    app.apply_scope_frontend_changes(&FrameActions::default(), scope_inputs(before));
+    let frame = app.frame_state();
+    app.apply_scope_frontend_changes(&FrameActions::default(), &frame);
     assert_eq!(app.scope_configuration_due, None);
 }
 
 #[test]
 fn a_scope_frontend_edit_schedules_a_debounced_reconfiguration() {
     let mut app = app_with_every_instrument();
-    let before = app.scope_settings;
-    app.scope_settings.sample_rate_hz = before.sample_rate_hz / 2;
-    app.apply_scope_frontend_changes(&FrameActions::default(), scope_inputs(before));
+    let frame = app.frame_state();
+    app.scope_settings.sample_rate_hz = frame.scope_settings_before_ui.sample_rate_hz / 2;
+    app.apply_scope_frontend_changes(&FrameActions::default(), &frame);
     assert!(app.scope_configuration_due.is_some());
     assert_eq!(app.status, "Adjusting DSCope configuration…");
 }
@@ -262,45 +267,39 @@ fn a_scope_frontend_edit_schedules_a_debounced_reconfiguration() {
 #[test]
 fn selecting_a_scope_device_schedules_a_configuration_when_idle() {
     let mut app = app_with_every_instrument();
-    let before = app.scope_settings;
+    let frame = app.frame_state();
     let actions = FrameActions {
         scope_device_selection_changed: true,
         ..FrameActions::default()
     };
-    app.apply_scope_frontend_changes(&actions, scope_inputs(before));
+    app.apply_scope_frontend_changes(&actions, &frame);
     assert!(app.scope_configuration_due.is_some());
 }
 
 #[test]
 fn selecting_a_scope_device_schedules_nothing_when_none_is_connected() {
     let mut app = app();
-    let before = app.scope_settings;
+    let frame = app.frame_state();
     let actions = FrameActions {
         scope_device_selection_changed: true,
         ..FrameActions::default()
     };
-    app.apply_scope_frontend_changes(
-        &actions,
-        ScopeFrontendInputs {
-            selected_scope_device: false,
-            ..scope_inputs(before)
-        },
-    );
+    app.apply_scope_frontend_changes(&actions, &frame);
     assert_eq!(app.scope_configuration_due, None);
 }
 
 #[test]
 fn reconfiguration_waits_while_the_user_refreshes() {
     let mut app = app_with_every_instrument();
-    let before = app.scope_settings;
-    app.scope_settings.sample_rate_hz = before.sample_rate_hz / 2;
+    let frame = app.frame_state();
+    app.scope_settings.sample_rate_hz = frame.scope_settings_before_ui.sample_rate_hz / 2;
     // Already due, but a refresh in the same frame holds it back.
     app.scope_configuration_due = Some(Instant::now() - Duration::from_secs(1));
     let actions = FrameActions {
         refresh_clicked: true,
         ..FrameActions::default()
     };
-    app.apply_scope_frontend_changes(&actions, scope_inputs(before));
+    app.apply_scope_frontend_changes(&actions, &frame);
     assert!(
         app.pending.is_none(),
         "no configuration should have started"

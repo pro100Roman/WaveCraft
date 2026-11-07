@@ -2,21 +2,11 @@
 //! while `update()` painted the panels.
 
 use crate::{
-    CaptureTarget, DsCopeCalibrationValues, Instant, ScopeCaptureSettings, DSCOPE_VOLTS_PER_DIV_MV,
+    ui::frame_state::FrameState, CaptureTarget, Instant, DSCOPE_VOLTS_PER_DIV_MV,
     SCOPE_CONFIGURATION_DEBOUNCE,
 };
 
 use crate::{ui::frame_actions::FrameActions, WaveCraftApp};
-
-/// Values `update()` captured before painting, to compare with the state after.
-#[derive(Clone, Copy)]
-pub(crate) struct ScopeFrontendInputs {
-    pub(crate) scope_settings_before_ui: ScopeCaptureSettings,
-    pub(crate) manual_calibration_before_ui: Option<DsCopeCalibrationValues>,
-    pub(crate) manual_calibration_range_before_ui: Option<usize>,
-    pub(crate) scope_capture_requested: bool,
-    pub(crate) selected_scope_device: bool,
-}
 
 impl WaveCraftApp {
     /// Compares the oscilloscope settings with their state before painting and
@@ -28,15 +18,16 @@ impl WaveCraftApp {
     pub(crate) fn apply_scope_frontend_changes(
         &mut self,
         actions: &FrameActions,
-        inputs: ScopeFrontendInputs,
+        frame: &FrameState,
     ) {
-        let ScopeFrontendInputs {
+        let FrameState {
             scope_settings_before_ui,
             manual_calibration_before_ui,
             manual_calibration_range_before_ui,
             scope_capture_requested,
             selected_scope_device,
-        } = inputs;
+            ..
+        } = *frame;
         if actions.scope_device_selection_changed
             && self.selected_scope_device_ref().is_some()
             && self.pending.is_none()

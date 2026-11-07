@@ -3,7 +3,7 @@
 
 use crate::{
     choose_decoded_data_save_path, choose_recording_save_path, choose_recording_to_open,
-    choose_saleae_export_path, ui::toolbar::ToolbarInputs, AcquisitionMode, CaptureTarget,
+    choose_saleae_export_path, ui::frame_state::FrameState, AcquisitionMode, CaptureTarget,
     SavedCaptureSettingsKind, ScopeCalibrationAction, WaveCraftApp,
 };
 
@@ -32,17 +32,13 @@ impl WaveCraftApp {
     /// exporting files, refreshing devices, starting, and stopping.
     ///
     /// A recording request may add a start request, so `actions` is mutable.
-    pub(crate) fn apply_toolbar_actions(
-        &mut self,
-        actions: &mut FrameActions,
-        inputs: ToolbarInputs,
-    ) {
-        let ToolbarInputs {
+    pub(crate) fn apply_toolbar_actions(&mut self, actions: &mut FrameActions, frame: &FrameState) {
+        let FrameState {
             control_target,
             can_attach_run_capture_recording,
             can_attach_run_decoded_recording,
             ..
-        } = inputs;
+        } = *frame;
         if actions.record_now_clicked {
             self.record_capture = false;
             self.record_decoded_data = false;

@@ -2,40 +2,31 @@
 
 use crate::{
     egui, paint_capture_device_selectors, paint_capture_settings, paint_radio_capture_settings,
-    paint_radio_device_selector, selected_radio, CaptureSettingsAvailability, CaptureSettingsTab,
-    LogicCaptureSettingsEditor, RichText, SavedCaptureSettingsKind, ScopeCaptureSettingsEditor,
-    ScopeVisualizationSettingsEditor, UsbSpeedClass, WaveformTab, PANEL, TEXT_MUTED,
+    paint_radio_device_selector, selected_radio, ui::frame_state::FrameState,
+    CaptureSettingsAvailability, CaptureSettingsTab, LogicCaptureSettingsEditor, RichText,
+    SavedCaptureSettingsKind, ScopeCaptureSettingsEditor, ScopeVisualizationSettingsEditor,
+    WaveformTab, PANEL, TEXT_MUTED,
 };
 
 use crate::{ui::frame_actions::FrameActions, WaveCraftApp};
-
-/// Values `update()` computes before painting that the capture setup panel reads.
-#[derive(Clone, Copy)]
-pub(crate) struct CaptureSetupInputs {
-    pub(crate) capture_settings_enabled: bool,
-    pub(crate) radio_runtime_controls_enabled: bool,
-    pub(crate) radio_trigger_runtime_controls_enabled: bool,
-    pub(crate) frontend_controls_enabled: bool,
-    pub(crate) manual_calibration_enabled: bool,
-    pub(crate) logic_settings_speed: UsbSpeedClass,
-}
 
 impl WaveCraftApp {
     /// Paints the capture setup panel and records the user's requests in `actions`.
     pub(crate) fn paint_capture_setup_panel(
         &mut self,
         context: &egui::Context,
-        inputs: CaptureSetupInputs,
+        frame: &FrameState,
         actions: &mut FrameActions,
     ) {
-        let CaptureSetupInputs {
+        let FrameState {
             capture_settings_enabled,
             radio_runtime_controls_enabled,
             radio_trigger_runtime_controls_enabled,
             frontend_controls_enabled,
             manual_calibration_enabled,
             logic_settings_speed,
-        } = inputs;
+            ..
+        } = *frame;
         let (displayed_logic_sample_count, displayed_logic_sample_rate_hz) = self
             .active_capture_for_view()
             .filter(|active| !active.preserve_display_until_complete)

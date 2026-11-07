@@ -71,16 +71,12 @@ use theme::{
     SCOPE_COLORS, TEXT_MUTED,
 };
 use ui::capture_settings_panel::*;
-use ui::capture_setup_panel::CaptureSetupInputs;
-use ui::central_panel::CentralPanelInputs;
 use ui::decoded_panel::*;
 use ui::dialogs::*;
 use ui::frame_actions::FrameActions;
 use ui::protocol_analyzer_dialog::*;
 use ui::radio_settings::*;
-use ui::scope_frontend_changes::ScopeFrontendInputs;
 use ui::scope_settings::*;
-use ui::toolbar::ToolbarInputs;
 use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
@@ -5765,126 +5761,14 @@ impl WaveCraftApp {
         self.finish_pending_snapshot(context);
 
         let mut actions = FrameActions::default();
-        let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
-        let capture_settings_enabled = control_target
-            .map_or(true, |target| !self.capture_target_is_active(target))
-            && self.pending.is_none();
-        let radio_runtime_controls_enabled = self
-            .capture_for_target(CaptureTarget::RadioReceiver)
-            .is_some_and(|active| {
-                active.mode == AcquisitionMode::Run
-                    && active.has_radio
-                    && active.radio_runtime_control.is_some()
-            });
-        let can_attach_run_capture_recording = control_target
-            .and_then(|target| self.capture_for_target(target))
-            .is_some_and(|active| {
-                active_continuous_capture_accepts_recording(active.mode, active.recorder.is_some())
-            });
-        let active_radio_run_recorders = self
-            .capture_for_target(CaptureTarget::RadioReceiver)
-            .filter(|active| active.mode == AcquisitionMode::Run && active.has_radio)
-            .map(|active| {
-                (
-                    active.recorder.is_some(),
-                    active.decoded_data_recorder.is_some(),
-                )
-            });
-        let can_attach_run_decoded_recording =
-            active_radio_run_recorders.is_some_and(|(_, decoded_active)| !decoded_active);
-        let radio_trigger_runtime_controls_enabled = self
-            .capture_for_target(CaptureTarget::RadioReceiver)
-            .is_some_and(|active| {
-                active.has_radio
-                    && active
-                        .radio_trigger
-                        .as_ref()
-                        .is_some_and(RadioSingleTrigger::is_armed)
-            });
-        let radio_trigger_level_runtime_controls_enabled =
-            radio_trigger_level_runtime_controls_are_enabled(
-                radio_runtime_controls_enabled,
-                radio_trigger_runtime_controls_enabled,
-            );
-        let rf_trigger_level_controls_enabled = radio_trigger_level_controls_are_enabled(
-            capture_settings_enabled,
-            radio_trigger_level_runtime_controls_enabled,
-        );
+        let frame = self.frame_state();
         let radio_settings_before_ui = self.radio_settings.clone();
-        let selected_logic_device = self.selected_logic_device().is_some();
-        let logic_settings_speed = self
-            .selected_logic_device()
-            .map(|device| device.speed)
-            .or_else(|| {
-                self.devices
-                    .iter()
-                    .filter(|entry| entry.device.profile.model.is_logic_analyzer())
-                    .map(|entry| entry.device.speed)
-                    .min()
-            })
-            .unwrap_or(UsbSpeedClass::HighSpeed);
-        let selected_scope_device = self.selected_scope_device_ref().is_some();
-        let selected_radio_device =
-            selected_radio(&self.radios, self.selected_radio_id.as_deref()).is_some();
-        let control_target_available = control_target.is_some_and(|target| {
-            target.is_available(
-                selected_logic_device,
-                selected_scope_device,
-                selected_radio_device,
-            )
-        });
-        let scope_capture_requested = self
-            .capture_requests
-            .iter()
-            .any(|target| target.includes_oscilloscope());
-        let active_scope_capture = self.capture_for_target(CaptureTarget::Oscilloscope);
-        let manual_calibration_enabled = manual_calibration_control_is_enabled(
-            self.pending.is_some(),
-            selected_scope_device,
-            self.manual_calibration.is_some(),
-            active_scope_capture.map(|active| active.mode),
-        );
-        let trigger_controls_enabled = scope_trigger_controls_are_enabled(
-            self.pending.is_some(),
-            scope_capture_requested,
-            selected_scope_device,
-            active_scope_capture.map(|active| !active.scope_trigger_controls.is_empty()),
-        );
-        let frontend_controls_enabled = scope_frontend_controls_are_enabled(
-            self.pending.is_some(),
-            scope_capture_requested,
-            selected_scope_device,
-        ) && !((self.record_capture || self.record_decoded_data)
-            && self.pending.is_some());
-        let scope_settings_before_ui = self.scope_settings;
-        let scope_auto_sample_rate_before_ui = self.scope_auto_sample_rate;
-        let manual_calibration_before_ui =
-            self.manual_calibration.as_ref().map(|editor| editor.values);
-        let manual_calibration_range_before_ui =
-            self.manual_calibration.as_ref().map(|editor| editor.range);
 
-        let toolbar_inputs = ToolbarInputs {
-            control_target,
-            control_target_available,
-            can_attach_run_capture_recording,
-            can_attach_run_decoded_recording,
-        };
-        self.paint_toolbar(context, toolbar_inputs, &mut actions);
+        self.paint_toolbar(context, &frame, &mut actions);
 
         self.paint_waveform_tabs(context);
 
-        self.paint_capture_setup_panel(
-            context,
-            CaptureSetupInputs {
-                capture_settings_enabled,
-                radio_runtime_controls_enabled,
-                radio_trigger_runtime_controls_enabled,
-                frontend_controls_enabled,
-                manual_calibration_enabled,
-                logic_settings_speed,
-            },
-            &mut actions,
-        );
+        self.paint_capture_setup_panel(context, &frame, &mut actions);
 
         if let Some(kind) = actions.save_capture_settings_kind {
             self.save_capture_settings(kind);
@@ -5903,28 +5787,17 @@ impl WaveCraftApp {
             self.logic_acquisition_mode = AcquisitionMode::Single;
         }
 
-        self.paint_scope_tools_panel(context, trigger_controls_enabled);
+        self.paint_scope_tools_panel(context, frame.trigger_controls_enabled);
 
         self.paint_status_bar(context);
 
         self.paint_session_tabs(context);
 
-        self.paint_central_panel(
-            context,
-            CentralPanelInputs {
-                trigger_controls_enabled,
-                frontend_controls_enabled,
-                rf_trigger_level_controls_enabled,
-                scope_settings_before_ui,
-                scope_auto_sample_rate_before_ui,
-                snapshot_clicked: actions.snapshot_clicked,
-            },
-        );
+        self.paint_central_panel(context, &frame, actions.snapshot_clicked);
 
         self.paint_settings_window(
             context,
-            radio_runtime_controls_enabled,
-            radio_trigger_runtime_controls_enabled,
+            &frame,
             &mut actions.refresh_clicked,
             &mut actions.radio_device_selection_changed,
         );
@@ -5959,7 +5832,7 @@ impl WaveCraftApp {
             None => {}
         }
 
-        self.apply_toolbar_actions(&mut actions, toolbar_inputs);
+        self.apply_toolbar_actions(&mut actions, &frame);
         match actions.calibration_action {
             Some(ScopeCalibrationAction::Auto) => {
                 self.auto_calibration_confirmation_open = true;
@@ -6006,16 +5879,7 @@ impl WaveCraftApp {
                 }
             }
         }
-        self.apply_scope_frontend_changes(
-            &actions,
-            ScopeFrontendInputs {
-                scope_settings_before_ui,
-                manual_calibration_before_ui,
-                manual_calibration_range_before_ui,
-                scope_capture_requested,
-                selected_scope_device,
-            },
-        );
+        self.apply_scope_frontend_changes(&actions, &frame);
         if self.pending.is_some() || !self.captures.is_empty() {
             context.request_repaint_after(Duration::from_millis(16));
         } else if let Some(scheduled) = self.scheduled_repetitive_capture {

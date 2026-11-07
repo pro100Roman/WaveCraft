@@ -3,8 +3,8 @@
 
 use crate::{
     egui, paint_instrument_settings, paint_radio_capture_settings, paint_radio_settings,
-    selected_radio, Color32, DsCopeCalibrationValues, RichText, Sense, Vec2, WaveCraftApp, ACCENT,
-    DSCOPE_VOLTS_PER_DIV_MV, TEXT_MUTED,
+    selected_radio, ui::frame_state::FrameState, Color32, DsCopeCalibrationValues, RichText, Sense,
+    Vec2, WaveCraftApp, ACCENT, DSCOPE_VOLTS_PER_DIV_MV, TEXT_MUTED,
 };
 
 impl WaveCraftApp {
@@ -14,11 +14,15 @@ impl WaveCraftApp {
     pub(crate) fn paint_settings_window(
         &mut self,
         context: &egui::Context,
-        radio_runtime_controls_enabled: bool,
-        radio_trigger_runtime_controls_enabled: bool,
+        frame: &FrameState,
         refresh_clicked: &mut bool,
         radio_device_selection_changed: &mut bool,
     ) {
+        let FrameState {
+            radio_runtime_controls_enabled,
+            radio_trigger_runtime_controls_enabled,
+            ..
+        } = *frame;
         let mut settings_open = self.settings_open;
         let mut close_settings = false;
         let settings_locked = self.is_busy();

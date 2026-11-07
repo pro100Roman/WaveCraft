@@ -3,23 +3,12 @@
 use crate::{
     combined_waveform_cards, egui, focus_logic_sample_range, format_radio_value,
     paint_decoded_data_panel, paint_logic, paint_scope, paint_scope_lissajous, scope_channel_label,
-    scope_channels_subtitle, toolbar_action_button, waveform_card_fill, CombinedWaveformViewports,
-    LogicWaveformOptions, PendingSnapshot, RadioDataMode, RadioViewOptions, RichText,
-    ScopeCaptureSettings, ScopeLissajousPaintOptions, ScopeWaveformOptions, SelectableHoverText,
-    Sense, Stroke, Vec2, WaveCraftApp, WaveformStore, WaveformTab, ACCENT, BACKGROUND,
-    DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, PANEL, TEXT_MUTED,
+    scope_channels_subtitle, toolbar_action_button, ui::frame_state::FrameState,
+    waveform_card_fill, CombinedWaveformViewports, LogicWaveformOptions, PendingSnapshot,
+    RadioDataMode, RadioViewOptions, RichText, ScopeCaptureSettings, ScopeLissajousPaintOptions,
+    ScopeWaveformOptions, SelectableHoverText, Sense, Stroke, Vec2, WaveCraftApp, WaveformStore,
+    WaveformTab, ACCENT, BACKGROUND, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, PANEL, TEXT_MUTED,
 };
-
-/// Values `update()` computes before painting that the central panel reads.
-#[derive(Clone, Copy)]
-pub(crate) struct CentralPanelInputs {
-    pub(crate) trigger_controls_enabled: bool,
-    pub(crate) frontend_controls_enabled: bool,
-    pub(crate) rf_trigger_level_controls_enabled: bool,
-    pub(crate) scope_settings_before_ui: ScopeCaptureSettings,
-    pub(crate) scope_auto_sample_rate_before_ui: bool,
-    pub(crate) snapshot_clicked: bool,
-}
 
 impl WaveCraftApp {
     /// Paints the waveform views, their decoded-data side panel, and the
@@ -27,16 +16,17 @@ impl WaveCraftApp {
     pub(crate) fn paint_central_panel(
         &mut self,
         context: &egui::Context,
-        inputs: CentralPanelInputs,
+        frame: &FrameState,
+        snapshot_clicked: bool,
     ) {
-        let CentralPanelInputs {
+        let FrameState {
             trigger_controls_enabled,
             frontend_controls_enabled,
             rf_trigger_level_controls_enabled,
             scope_settings_before_ui,
             scope_auto_sample_rate_before_ui,
-            snapshot_clicked,
-        } = inputs;
+            ..
+        } = *frame;
         let mut snapshot_plot_rect = None;
         let protocol_analyzer_for_waveform = self.protocol_analyzer.clone();
         let mut protocol_decode_cache = std::mem::take(&mut self.protocol_decode_cache);
