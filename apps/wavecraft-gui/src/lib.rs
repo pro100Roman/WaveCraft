@@ -1,6 +1,8 @@
 mod capture_settings;
 mod devices;
 mod format;
+#[cfg(test)]
+mod frame_tests;
 mod measurements;
 mod protocol_analyzer;
 mod radio_analyzer;
@@ -2978,6 +2980,22 @@ impl WaveCraftApp {
                 },
                 Err(error) => (None, CaptureSettingsDocument::default(), Some(error)),
             };
+        let mut app = Self::with_settings(capture_settings_repository, saved_capture_settings);
+        app.begin_refresh();
+        if let Some(error) = settings_load_error {
+            app.last_error = Some(format!(
+                "Saved capture settings could not be loaded; using defaults: {error}"
+            ));
+        }
+        app
+    }
+
+    /// Builds the application state from saved settings. It neither discovers
+    /// devices nor reads or writes the settings file, so tests can use it.
+    fn with_settings(
+        capture_settings_repository: Option<CaptureSettingsRepository>,
+        saved_capture_settings: CaptureSettingsDocument,
+    ) -> Self {
         let mut app = Self {
             capture_settings_repository,
             saved_capture_settings,
@@ -3064,12 +3082,6 @@ impl WaveCraftApp {
         app.save_active_logic_session_settings();
         app.save_active_scope_session_settings();
         app.combined_settings = app.current_combined_session_settings();
-        app.begin_refresh();
-        if let Some(error) = settings_load_error {
-            app.last_error = Some(format!(
-                "Saved capture settings could not be loaded; using defaults: {error}"
-            ));
-        }
         app
     }
 
@@ -5729,6 +5741,15 @@ fn paint_usb_speed_warning(context: &egui::Context, warning: &UsbSpeedWarning) -
 
 impl eframe::App for WaveCraftApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.run_frame(context);
+    }
+}
+
+impl WaveCraftApp {
+    /// Runs one frame: polls workers, paints every panel, and applies what the
+    /// user asked for. It does not use the `eframe::Frame`, so tests can call it
+    /// with a bare `egui::Context`.
+    fn run_frame(&mut self, context: &egui::Context) {
         self.cpu_load.update();
         self.memory_usage.update();
         context.request_repaint_after(CPU_LOAD_SAMPLE_INTERVAL);
