@@ -769,19 +769,20 @@ impl DeviceCatalog {
             .as_deref()
             .filter(|connection_id| connection_id.starts_with("usb-"));
         let attempts = exact_usb_id.map_or(1, |_| USB_DISCOVERY_ATTEMPTS);
-        for attempt in 0..attempts {
+        // Retry until the requested USB device appears; the final attempt is
+        // made outside the loop and returns whatever it finds.
+        for _ in 1..attempts {
             let records = self.discover(operation)?;
             if exact_usb_id.map_or(true, |connection_id| {
                 records
                     .iter()
                     .any(|record| record.describe().connection_id == connection_id)
-            }) || attempt + 1 == attempts
-            {
+            }) {
                 return Ok(records);
             }
             thread::sleep(USB_DISCOVERY_RETRY_DELAY);
         }
-        unreachable!("USB discovery attempt count is always positive")
+        self.discover(operation)
     }
 }
 

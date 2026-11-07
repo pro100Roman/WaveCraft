@@ -32,20 +32,23 @@ pub(crate) fn push_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Reads a little-endian `u16`. The caller must have checked that
+/// `offset + 2 <= bytes.len()`; every device-facing caller validates the
+/// transfer length first.
 pub(crate) fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(
-        bytes[offset..offset + 2]
-            .try_into()
-            .expect("fixed field size"),
-    )
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
 
+/// Reads a little-endian `u32`. The caller must have checked that
+/// `offset + 4 <= bytes.len()`; every device-facing caller validates the
+/// transfer length first.
 pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("fixed field size"),
-    )
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
 }
 
 #[cfg(test)]

@@ -822,12 +822,8 @@ fn parse_segmented_length(value: &Yaml) -> Result<(usize, usize, Endian, u64), S
             ));
         }
     };
-    let full_mask = match width {
-        1 => u64::from(u8::MAX),
-        2 => u64::from(u16::MAX),
-        4 => u64::from(u32::MAX),
-        _ => unreachable!(),
-    };
+    // `width` was validated as 1, 2 or 4 bytes above.
+    let full_mask = (1_u64 << (width * 8)) - 1;
     let mask = optional_u64(map, "mask", "framing.length.mask")?.unwrap_or(full_mask);
     if mask == 0 || mask & !full_mask != 0 {
         return Err(SchemaError::at(

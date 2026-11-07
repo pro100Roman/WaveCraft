@@ -363,7 +363,9 @@ pub fn process_radio_iq(
                         analyzer_bank.analyzers[analyzer_index].push_prepared(prepared)
                     }
                     Some(Err(error)) => Err(error.clone()),
-                    None => unreachable!("demodulation work requires prepared IQ"),
+                    // Preprocessing runs whenever any analyzer needs it, so this
+                    // is only reachable if that condition changes.
+                    None => Err("demodulation preprocessing did not run".to_owned()),
                 },
             };
             let failed = analysis.is_err();
