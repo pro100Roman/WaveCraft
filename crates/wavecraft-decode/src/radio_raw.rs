@@ -5,14 +5,17 @@ use crate::{
 
 const MAX_PREAMBLE_BYTES: usize = 256;
 const MAX_UNCERTAIN_BITS: usize = 1_000_000;
+const AUTOMATIC_PREAMBLE_BYTES: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawRadioConfig {
     /// Byte repeated to form the acquisition preamble.
     pub preamble_byte: u8,
     /// Minimum number of consecutive preamble bytes required for acquisition.
-    /// Zero makes the preamble part of the decoded data. Acquisition then uses
-    /// the sync word when configured, or starts at the first recovered bit.
+    /// Zero starts decoding at the first recovered bit and makes the preamble
+    /// part of the decoded data. A configured sync word, or three repeated
+    /// preamble bytes without sync, then refines packet boundaries and byte phase
+    /// without gating the burst.
     pub preamble_bytes: usize,
     /// Optional big-endian sync word following the repeated preamble.
     pub sync_word: u64,
@@ -42,7 +45,7 @@ impl RawRadioConfig {
         let acquisition_bits = if self.sync_word_bytes > 0 {
             usize::from(self.sync_word_bytes).saturating_mul(8)
         } else {
-            self.preamble_bytes.saturating_mul(8)
+            acquisition_preamble_bytes(self).saturating_mul(8)
         };
         if acquisition_bits > 0 && self.maximum_preamble_bit_errors >= acquisition_bits {
             return Err(DecodeError::new(
@@ -90,9 +93,8 @@ pub struct RawRadioDecoder {
     search_bits: Vec<TimedBit>,
     pending_bits: Vec<TimedBit>,
     synchronized: bool,
-    preamble_run_bytes: usize,
-    preamble_run_uncertain_bits: usize,
-    preamble_run_start: Option<u64>,
+    inside_detected_preamble: bool,
+    current_message_start: Option<u64>,
     last_input_start: Option<u64>,
 }
 
@@ -106,9 +108,8 @@ impl RawRadioDecoder {
             preamble_bits,
             config,
             synchronized: false,
-            preamble_run_bytes: 0,
-            preamble_run_uncertain_bits: 0,
-            preamble_run_start: None,
+            inside_detected_preamble: false,
+            current_message_start: None,
             last_input_start: None,
         })
     }
@@ -125,9 +126,8 @@ impl RawRadioDecoder {
         self.search_bits.clear();
         self.pending_bits.clear();
         self.synchronized = false;
-        self.preamble_run_bytes = 0;
-        self.preamble_run_uncertain_bits = 0;
-        self.preamble_run_start = None;
+        self.inside_detected_preamble = false;
+        self.current_message_start = None;
         self.last_input_start = None;
     }
 
@@ -149,15 +149,13 @@ impl RawRadioDecoder {
             ));
         }
 
-        if !self.synchronized && self.config.preamble_bytes == 0 && self.config.sync_word_bytes == 0
-        {
+        // With no required preamble there is no safe acquisition gate: a sync
+        // word can also be damaged or absent. Start provisionally at the first
+        // recovered bit so a failed boundary cannot suppress the whole burst.
+        if !self.synchronized && self.config.preamble_bytes == 0 {
             if let Some(first) = batch.bits.first() {
                 self.synchronized = true;
-                output.message_starts.push(RawRadioMessageStart {
-                    sample_index: first.range.start,
-                    preamble_bytes: 0,
-                    maximum_uncertain_bits: self.config.maximum_uncertain_bits,
-                });
+                self.push_message_start(&mut output, first.range.start, 0);
             }
         }
 
@@ -187,14 +185,11 @@ impl RawRadioDecoder {
                         let sample_index = preamble
                             .first()
                             .map_or(bit.range.start, |byte| byte.range.start);
-                        self.preamble_run_bytes = 0;
-                        self.preamble_run_uncertain_bits = 0;
-                        self.preamble_run_start = None;
-                        output.message_starts.push(RawRadioMessageStart {
+                        self.push_message_start(
+                            &mut output,
                             sample_index,
-                            preamble_bytes: self.displayed_preamble_bytes(preamble.len()),
-                            maximum_uncertain_bits: self.config.maximum_uncertain_bits,
-                        });
+                            self.displayed_preamble_bytes(preamble.len()),
+                        );
                         output.bytes.extend(preamble);
                     } else if self.search_bits.len() == self.retained_search_bits() {
                         let payload_bit = self.search_bits.remove(0);
@@ -202,9 +197,50 @@ impl RawRadioDecoder {
                             output.bytes.push(byte);
                         }
                     }
-                } else if let Some(byte) = self.push_synchronized_bit(*bit) {
-                    self.observe_synchronized_byte(byte, &mut output.message_starts);
-                    output.bytes.push(byte);
+                } else if self.inside_detected_preamble {
+                    if let Some(byte) = self.push_synchronized_bit(*bit) {
+                        if (byte.value ^ self.config.preamble_byte).count_ones() as usize
+                            > self.config.maximum_preamble_bit_errors.min(1)
+                        {
+                            self.inside_detected_preamble = false;
+                        }
+                        output.bytes.push(byte);
+                    }
+                } else {
+                    // Continue correlating at bit resolution after initial lock.
+                    // A dropped or inserted decision between bursts otherwise
+                    // changes 0xAA into 0x55 and makes byte-wise reacquisition
+                    // impossible.
+                    self.search_bits.push(*bit);
+                    if let Some(header_start) = self.acquisition_header_start() {
+                        let held_bits = std::mem::take(&mut self.search_bits);
+                        for payload_bit in held_bits[..header_start].iter().copied() {
+                            if let Some(byte) = self.push_synchronized_bit(payload_bit) {
+                                output.bytes.push(byte);
+                            }
+                        }
+                        self.pending_bits.clear();
+                        let preamble = pack_bytes(
+                            &held_bits[header_start..],
+                            self.config.bit_order,
+                            self.minimum_bit_confidence(),
+                        );
+                        let sample_index = preamble
+                            .first()
+                            .map_or(bit.range.start, |byte| byte.range.start);
+                        self.push_message_start(
+                            &mut output,
+                            sample_index,
+                            self.displayed_preamble_bytes(preamble.len()),
+                        );
+                        output.bytes.extend(preamble);
+                        self.inside_detected_preamble = true;
+                    } else if self.search_bits.len() == self.retained_search_bits() {
+                        let payload_bit = self.search_bits.remove(0);
+                        if let Some(byte) = self.push_synchronized_bit(payload_bit) {
+                            output.bytes.push(byte);
+                        }
+                    }
                 }
             } else {
                 self.push_search_bit(*bit);
@@ -217,21 +253,15 @@ impl RawRadioDecoder {
                     let sample_index = preamble
                         .first()
                         .map_or(bit.range.start, |byte| byte.range.start);
-                    let preamble_uncertain_bits = preamble
-                        .iter()
-                        .map(|byte| usize::from(byte.status.low_confidence_bits))
-                        .sum();
-                    output.message_starts.push(RawRadioMessageStart {
+                    self.push_message_start(
+                        &mut output,
                         sample_index,
-                        preamble_bytes: self.displayed_preamble_bytes(preamble.len()),
-                        maximum_uncertain_bits: self.config.maximum_uncertain_bits,
-                    });
+                        self.displayed_preamble_bytes(preamble.len()),
+                    );
                     output.bytes.extend(preamble);
                     self.search_bits.clear();
                     self.synchronized = true;
-                    self.preamble_run_bytes = self.config.preamble_bytes;
-                    self.preamble_run_uncertain_bits = preamble_uncertain_bits;
-                    self.preamble_run_start = Some(sample_index);
+                    self.inside_detected_preamble = self.config.sync_word_bytes == 0;
                 }
             }
         }
@@ -268,6 +298,23 @@ impl RawRadioDecoder {
         } else {
             None
         }
+    }
+
+    fn push_message_start(
+        &mut self,
+        output: &mut RawRadioOutput,
+        sample_index: u64,
+        preamble_bytes: usize,
+    ) {
+        if self.current_message_start == Some(sample_index) {
+            return;
+        }
+        output.message_starts.push(RawRadioMessageStart {
+            sample_index,
+            preamble_bytes,
+            maximum_uncertain_bits: self.config.maximum_uncertain_bits,
+        });
+        self.current_message_start = Some(sample_index);
     }
 
     fn push_search_bit(&mut self, bit: TimedBit) {
@@ -315,7 +362,7 @@ impl RawRadioDecoder {
         let mut recovered_preamble_bytes = 0;
         while recovered_preamble_bytes < MAX_PREAMBLE_BYTES && header_start >= 8 {
             let candidate_start = header_start - 8;
-            if !self.exact_pattern_matches(candidate_start, &expected_byte)
+            if self.pattern_error_count(candidate_start, &expected_byte) != Some(0)
                 || !self.confidence_acceptable(candidate_start, header_start)
             {
                 break;
@@ -326,22 +373,19 @@ impl RawRadioDecoder {
         (recovered_preamble_bytes >= self.config.preamble_bytes).then_some(header_start)
     }
 
-    fn exact_pattern_matches(&self, start: usize, expected: &[bool]) -> bool {
-        self.search_bits.len() >= start.saturating_add(expected.len())
-            && self.search_bits[start..]
-                .iter()
-                .zip(expected)
-                .all(|(actual, expected)| actual.value == *expected)
-    }
-
-    fn pattern_matches(&self, start: usize, expected: &[bool]) -> bool {
-        self.search_bits.len() >= start.saturating_add(expected.len())
-            && self.search_bits[start..]
+    fn pattern_error_count(&self, start: usize, expected: &[bool]) -> Option<usize> {
+        (self.search_bits.len() >= start.saturating_add(expected.len())).then(|| {
+            self.search_bits[start..]
                 .iter()
                 .zip(expected)
                 .filter(|(actual, expected)| actual.value != **expected)
                 .count()
-                <= self.config.maximum_preamble_bit_errors
+        })
+    }
+
+    fn pattern_matches(&self, start: usize, expected: &[bool]) -> bool {
+        self.pattern_error_count(start, expected)
+            .is_some_and(|errors| errors <= self.config.maximum_preamble_bit_errors)
     }
 
     fn confidence_acceptable(&self, start: usize, end: usize) -> bool {
@@ -353,52 +397,13 @@ impl RawRadioDecoder {
     }
 
     fn flush_held_bits(&mut self, output: &mut RawRadioOutput) {
-        if !self.synchronized || self.config.sync_word_bytes == 0 {
+        if !self.synchronized {
             return;
         }
         for bit in std::mem::take(&mut self.search_bits) {
             if let Some(byte) = self.push_synchronized_bit(bit) {
                 output.bytes.push(byte);
             }
-        }
-    }
-
-    fn observe_synchronized_byte(
-        &mut self,
-        byte: TimedByte,
-        message_starts: &mut Vec<RawRadioMessageStart>,
-    ) {
-        if self.config.sync_word_bytes > 0 {
-            return;
-        }
-        let uncertain_bits = usize::from(byte.status.low_confidence_bits);
-        if byte.value != self.config.preamble_byte
-            || self
-                .preamble_run_uncertain_bits
-                .saturating_add(uncertain_bits)
-                > self.config.maximum_uncertain_bits
-        {
-            self.preamble_run_bytes = 0;
-            self.preamble_run_uncertain_bits = 0;
-            self.preamble_run_start = None;
-            return;
-        }
-        if self.preamble_run_bytes == 0 {
-            self.preamble_run_start = Some(byte.range.start);
-        }
-        self.preamble_run_bytes = self.preamble_run_bytes.saturating_add(1);
-        self.preamble_run_uncertain_bits = self
-            .preamble_run_uncertain_bits
-            .saturating_add(uncertain_bits);
-        if self.preamble_run_bytes == self.config.preamble_bytes {
-            message_starts.push(RawRadioMessageStart {
-                sample_index: self.preamble_run_start.unwrap_or(byte.range.start),
-                preamble_bytes: self
-                    .config
-                    .preamble_bytes
-                    .saturating_add(usize::from(self.config.sync_word_bytes)),
-                maximum_uncertain_bits: self.config.maximum_uncertain_bits,
-            });
         }
     }
 
@@ -434,7 +439,7 @@ impl RawRadioDecoder {
 }
 
 fn repeated_byte_bits(config: RawRadioConfig) -> Vec<bool> {
-    let preamble = std::iter::repeat(config.preamble_byte).take(config.preamble_bytes);
+    let preamble = std::iter::repeat(config.preamble_byte).take(acquisition_preamble_bytes(config));
     let sync = (0..config.sync_word_bytes).map(|index| {
         let shift = u32::from(config.sync_word_bytes - index - 1) * 8;
         ((config.sync_word >> shift) & 0xff) as u8
@@ -451,6 +456,14 @@ fn repeated_byte_bits(config: RawRadioConfig) -> Vec<bool> {
             })
         })
         .collect()
+}
+
+fn acquisition_preamble_bytes(config: RawRadioConfig) -> usize {
+    if config.preamble_bytes == 0 && config.sync_word_bytes == 0 {
+        AUTOMATIC_PREAMBLE_BYTES
+    } else {
+        config.preamble_bytes
+    }
 }
 
 fn preamble_byte_bits(config: RawRadioConfig) -> Vec<bool> {
@@ -579,7 +592,8 @@ mod tests {
         let mut input = vec![false, false, false];
         input.extend(byte_bits(&[0xaa, 0xaa, 0xaa, 0x12, 0x34]));
 
-        let output = decoder.push(&bits(&input, 10, false)).unwrap();
+        let mut output = decoder.push(&bits(&input, 10, false)).unwrap();
+        output.bytes.extend(decoder.finish().bytes);
 
         assert!(output.synchronized);
         assert_eq!(
@@ -616,6 +630,7 @@ mod tests {
             );
             offset = end;
         }
+        decoded.extend(decoder.finish().bytes);
 
         assert_eq!(
             decoded.iter().map(|byte| byte.value).collect::<Vec<_>>(),
@@ -765,6 +780,31 @@ mod tests {
                 .map(|byte| byte.value)
                 .collect::<Vec<_>>(),
             [0x2d, 0xd4, 0x12, 0x34]
+        );
+    }
+
+    #[test]
+    fn zero_length_preamble_does_not_drop_a_burst_when_sync_is_not_found() {
+        let mut synchronized = config();
+        synchronized.preamble_bytes = 0;
+        synchronized.sync_word = 0x2dd4;
+        synchronized.sync_word_bytes = 2;
+        let input = byte_bits(&[0x12, 0x34]);
+        let mut decoder = RawRadioDecoder::new(synchronized).unwrap();
+
+        let mut output = decoder.push(&bits(&input, 0, false)).unwrap();
+        output.bytes.extend(decoder.finish().bytes);
+
+        assert_eq!(output.message_starts.len(), 1);
+        assert_eq!(output.message_starts[0].sample_index, 0);
+        assert_eq!(output.message_starts[0].preamble_bytes, 0);
+        assert_eq!(
+            output
+                .bytes
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0x12, 0x34]
         );
     }
 
@@ -955,6 +995,29 @@ mod tests {
     }
 
     #[test]
+    fn preamble_only_mode_realigns_after_an_inserted_bit() {
+        let mut decoder = RawRadioDecoder::new(config()).unwrap();
+        let mut input = byte_bits(&[0xaa, 0xaa, 0xaa, 0x12]);
+        input.push(true);
+        input.extend(byte_bits(&[0xaa, 0xaa, 0xaa, 0x34]));
+
+        let mut output = decoder.push(&bits(&input, 0, false)).unwrap();
+        output.bytes.extend(decoder.finish().bytes);
+
+        assert_eq!(output.message_starts.len(), 2);
+        assert_eq!(output.message_starts[1].sample_index, 33 * 2);
+        assert_eq!(output.message_starts[1].preamble_bytes, 3);
+        assert_eq!(
+            output
+                .bytes
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0xaa, 0xaa, 0xaa, 0x12, 0xaa, 0xaa, 0xaa, 0x34]
+        );
+    }
+
+    #[test]
     fn discontinuity_discards_partial_byte_and_requires_a_new_preamble() {
         let mut decoder = RawRadioDecoder::new(config()).unwrap();
         let mut first = byte_bits(&[0xaa, 0xaa, 0xaa, 0x12]);
@@ -1002,15 +1065,46 @@ mod tests {
     }
 
     #[test]
-    fn zero_length_preamble_without_sync_treats_all_recovered_bytes_as_data() {
+    fn zero_length_preamble_without_sync_auto_detects_and_keeps_preamble_as_data() {
         let mut unframed = config();
         unframed.preamble_bytes = 0;
-        let input = byte_bits(&[0xaa, 0xaa, 0x12, 0x34]);
+        let mut input = vec![false, false, true];
+        input.extend(byte_bits(&[0xaa, 0xaa, 0xaa, 0x12, 0x34]));
         let mut decoder = RawRadioDecoder::new(unframed).unwrap();
 
-        let output = decoder.push(&bits(&input, 0, false)).unwrap();
+        let mut output = decoder.push(&bits(&input, 0, false)).unwrap();
+        output.bytes.extend(decoder.finish().bytes);
 
         assert!(output.synchronized);
+        assert_eq!(output.message_starts.len(), 2);
+        assert_eq!(output.message_starts[0].sample_index, 0);
+        assert_eq!(output.message_starts[1].sample_index, 3 * 2);
+        assert!(output
+            .message_starts
+            .iter()
+            .all(|start| start.preamble_bytes == 0));
+        assert_eq!(
+            output
+                .bytes
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0xaa, 0xaa, 0xaa, 0x12, 0x34]
+        );
+    }
+
+    #[test]
+    fn zero_length_preamble_does_not_drop_a_burst_without_a_detectable_header() {
+        let mut unframed = config();
+        unframed.preamble_bytes = 0;
+        let input = byte_bits(&[0x12, 0x34]);
+        let mut decoder = RawRadioDecoder::new(unframed).unwrap();
+
+        let mut output = decoder.push(&bits(&input, 0, false)).unwrap();
+        output.bytes.extend(decoder.finish().bytes);
+
+        assert_eq!(output.message_starts.len(), 1);
+        assert_eq!(output.message_starts[0].sample_index, 0);
         assert_eq!(output.message_starts[0].preamble_bytes, 0);
         assert_eq!(
             output
@@ -1018,7 +1112,33 @@ mod tests {
                 .iter()
                 .map(|byte| byte.value)
                 .collect::<Vec<_>>(),
-            [0xaa, 0xaa, 0x12, 0x34]
+            [0x12, 0x34]
+        );
+    }
+
+    #[test]
+    fn zero_length_preamble_splits_packets_and_repairs_aa_55_phase_slip() {
+        let mut automatic = config();
+        automatic.preamble_bytes = 0;
+        let mut input = byte_bits(&[0xaa, 0xaa, 0xaa, 0x12]);
+        input.push(false);
+        input.extend(byte_bits(&[0xaa, 0xaa, 0xaa, 0x34]));
+        let mut decoder = RawRadioDecoder::new(automatic).unwrap();
+
+        let mut output = decoder.push(&bits(&input, 0, false)).unwrap();
+        output.bytes.extend(decoder.finish().bytes);
+
+        assert_eq!(output.message_starts.len(), 2);
+        assert_eq!(output.message_starts[0].preamble_bytes, 0);
+        assert_eq!(output.message_starts[1].preamble_bytes, 0);
+        assert_eq!(output.message_starts[1].sample_index, 33 * 2);
+        assert_eq!(
+            output
+                .bytes
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0xaa, 0xaa, 0xaa, 0x12, 0xaa, 0xaa, 0xaa, 0x34]
         );
     }
 }

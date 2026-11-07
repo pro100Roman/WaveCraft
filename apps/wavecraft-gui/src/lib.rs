@@ -130,6 +130,7 @@ const LOGIC_CHANNEL_COUNT: usize = 16;
 const RADIO_SPECTRUM_FFT_LENGTH: usize = 2_048;
 const RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS: u64 = 1_000_000;
 const MAX_RADIO_ANALYZER_CHANNELS: usize = 100;
+const RAW_AUTOMATIC_PREAMBLE_BITS: usize = 24;
 const MAX_CAPTURE_EVENTS_PER_POLL: usize = 8;
 // Bound logic display storage by activity-preserving buckets. The bucket stride
 // expands to cover the configured finite or Loop duration without limiting the
@@ -9701,7 +9702,7 @@ fn paint_radio_analyzer_configuration(
             paint_radio_parameter_label(
                 ui,
                 "Preamble length",
-                Some("Minimum consecutive preamble bytes required; in raw mode zero treats the preamble as data and starts from sync or the first recovered FSK/GFSK bit"),
+                Some("Minimum consecutive preamble bytes required; in raw mode zero starts at the first recovered bit and keeps the preamble as data, while sync or three repeated preamble bytes refine later packet boundaries"),
             );
             ui.add_enabled_ui(controls_enabled, |ui| {
                 ui.horizontal(|ui| {
@@ -9853,6 +9854,8 @@ fn paint_radio_analyzer_configuration(
             });
             let acquisition_bits = if settings.sync_word_bytes > 0 {
                 usize::from(settings.sync_word_bytes).saturating_mul(8)
+            } else if settings.preamble_bytes == 0 {
+                RAW_AUTOMATIC_PREAMBLE_BITS
             } else {
                 settings.preamble_bytes.saturating_mul(8)
             };
