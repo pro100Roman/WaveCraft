@@ -138,3 +138,112 @@ pub(crate) fn scope_tools_panel_is_visible(active_tab: Option<WaveformTab>) -> b
         Some(WaveformTab::Oscilloscope) | Some(WaveformTab::Lissajous)
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waveform_tabs_require_their_connected_devices() {
+        assert!(waveform_tabs(false, false, false, true).is_empty());
+        assert_eq!(
+            waveform_tabs(true, false, false, true),
+            vec![WaveformTab::LogicAnalyzer]
+        );
+        assert_eq!(
+            waveform_tabs(false, true, false, false),
+            vec![WaveformTab::Oscilloscope]
+        );
+        assert_eq!(
+            waveform_tabs(false, true, false, true),
+            vec![WaveformTab::Oscilloscope, WaveformTab::Lissajous]
+        );
+        assert_eq!(
+            waveform_tabs(true, true, false, false),
+            vec![
+                WaveformTab::LogicAnalyzer,
+                WaveformTab::Oscilloscope,
+                WaveformTab::Combined,
+            ]
+        );
+        assert_eq!(
+            waveform_tabs(true, true, false, true),
+            vec![
+                WaveformTab::LogicAnalyzer,
+                WaveformTab::Oscilloscope,
+                WaveformTab::Lissajous,
+                WaveformTab::Combined,
+            ]
+        );
+        assert_eq!(
+            waveform_tabs(false, false, true, false),
+            vec![WaveformTab::RadioReceiver]
+        );
+    }
+
+    #[test]
+    fn scope_tools_panel_is_limited_to_scope_views() {
+        assert!(scope_tools_panel_is_visible(Some(
+            WaveformTab::Oscilloscope
+        )));
+        assert!(scope_tools_panel_is_visible(Some(WaveformTab::Lissajous)));
+        assert!(!scope_tools_panel_is_visible(Some(
+            WaveformTab::LogicAnalyzer
+        )));
+        assert!(!scope_tools_panel_is_visible(Some(WaveformTab::Combined)));
+        assert!(!scope_tools_panel_is_visible(None));
+    }
+
+    #[test]
+    fn capture_setup_tabs_follow_connected_devices() {
+        assert!(capture_settings_tabs(false, false).is_empty());
+        assert_eq!(
+            capture_settings_tabs(true, false),
+            vec![CaptureSettingsTab::DsLogic]
+        );
+        assert_eq!(
+            capture_settings_tabs(false, true),
+            vec![CaptureSettingsTab::DsCope]
+        );
+        let tabs = capture_settings_tabs(true, true);
+        assert_eq!(
+            tabs,
+            vec![CaptureSettingsTab::DsLogic, CaptureSettingsTab::DsCope]
+        );
+        assert_eq!(
+            tabs.iter()
+                .copied()
+                .map(CaptureSettingsTab::label)
+                .collect::<Vec<_>>(),
+            ["DSLogic", "DSCope"]
+        );
+    }
+
+    #[test]
+    fn capture_setup_stays_available_for_offline_capture_analysis() {
+        assert_eq!(
+            capture_settings_tabs_for_view(
+                Some(WaveformTab::LogicAnalyzer),
+                false,
+                false,
+                true,
+                false,
+            ),
+            vec![CaptureSettingsTab::DsLogic]
+        );
+        assert_eq!(
+            capture_settings_tabs_for_view(
+                Some(WaveformTab::Oscilloscope),
+                false,
+                false,
+                false,
+                true,
+            ),
+            vec![CaptureSettingsTab::DsCope]
+        );
+        assert_eq!(
+            capture_settings_tabs_for_view(Some(WaveformTab::Combined), false, false, true, true,),
+            vec![CaptureSettingsTab::DsLogic, CaptureSettingsTab::DsCope]
+        );
+    }
+}

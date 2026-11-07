@@ -389,3 +389,53 @@ impl ScopeMeasurementCache {
         self.results
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quick_time_measurement_starts_then_finishes_with_clamped_positions() {
+        let mut measurement = ScopeQuickTimeMeasurement::default();
+
+        measurement.finish(0.8);
+        assert_eq!(measurement, ScopeQuickTimeMeasurement::Idle);
+
+        measurement.start(-0.2);
+        assert_eq!(
+            measurement,
+            ScopeQuickTimeMeasurement::AwaitingSecond {
+                first_position: 0.0,
+            }
+        );
+
+        measurement.finish(1.2);
+        assert_eq!(
+            measurement,
+            ScopeQuickTimeMeasurement::Complete {
+                first_position: 0.0,
+                second_position: 1.0,
+            }
+        );
+
+        measurement.finish(0.4);
+        assert_eq!(
+            measurement,
+            ScopeQuickTimeMeasurement::Complete {
+                first_position: 0.0,
+                second_position: 1.0,
+            }
+        );
+
+        measurement.start(0.25);
+        assert_eq!(
+            measurement,
+            ScopeQuickTimeMeasurement::AwaitingSecond {
+                first_position: 0.25,
+            }
+        );
+
+        measurement.clear();
+        assert_eq!(measurement, ScopeQuickTimeMeasurement::Idle);
+    }
+}

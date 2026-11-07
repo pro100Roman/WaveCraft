@@ -486,3 +486,235 @@ pub(crate) fn start_capture(
         radio_dsp,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    #[test]
+    fn acquisition_modes_rearm_only_successful_continuous_runs() {
+        for mode in [AcquisitionMode::Repetitive, AcquisitionMode::Run] {
+            assert!(should_rearm_acquisition(
+                mode,
+                true,
+                CompletionStatus::Complete,
+                false,
+            ));
+        }
+        assert!(!should_rearm_acquisition(
+            AcquisitionMode::Loop,
+            true,
+            CompletionStatus::Complete,
+            false,
+        ));
+        assert!(!should_rearm_acquisition(
+            AcquisitionMode::Run,
+            false,
+            CompletionStatus::Complete,
+            false,
+        ));
+        assert!(!should_rearm_acquisition(
+            AcquisitionMode::Run,
+            true,
+            CompletionStatus::Failed,
+            true,
+        ));
+        assert!(!should_rearm_acquisition(
+            AcquisitionMode::Single,
+            true,
+            CompletionStatus::Complete,
+            false,
+        ));
+    }
+
+    #[test]
+    fn capture_recording_supports_single_and_run_modes() {
+        assert!(capture_recording_is_supported(AcquisitionMode::Single));
+        assert!(capture_recording_is_supported(AcquisitionMode::Run));
+        assert!(!capture_recording_is_supported(AcquisitionMode::Repetitive));
+        assert!(!capture_recording_is_supported(AcquisitionMode::Loop));
+    }
+
+    #[test]
+    fn new_single_run_and_loop_captures_release_the_previous_capture() {
+        for mode in [
+            AcquisitionMode::Single,
+            AcquisitionMode::Run,
+            AcquisitionMode::Loop,
+        ] {
+            assert!(clears_completed_capture_on_start(mode, false));
+        }
+        assert!(!clears_completed_capture_on_start(
+            AcquisitionMode::Repetitive,
+            false,
+        ));
+
+        assert!(clears_completed_capture_on_start(
+            AcquisitionMode::Single,
+            true,
+        ));
+        assert!(!clears_completed_capture_on_start(
+            AcquisitionMode::Run,
+            true,
+        ));
+        assert!(!clears_completed_capture_on_start(
+            AcquisitionMode::Loop,
+            true,
+        ));
+        assert!(!clears_completed_capture_on_start(
+            AcquisitionMode::Repetitive,
+            true,
+        ));
+    }
+
+    #[test]
+    fn active_continuous_capture_accepts_a_new_recording() {
+        assert!(active_continuous_capture_accepts_recording(
+            AcquisitionMode::Run,
+            false
+        ));
+        assert!(active_continuous_capture_accepts_recording(
+            AcquisitionMode::Loop,
+            false
+        ));
+        assert!(!active_continuous_capture_accepts_recording(
+            AcquisitionMode::Run,
+            true
+        ));
+        assert!(!active_continuous_capture_accepts_recording(
+            AcquisitionMode::Single,
+            false
+        ));
+        assert!(!active_continuous_capture_accepts_recording(
+            AcquisitionMode::Repetitive,
+            false
+        ));
+    }
+
+    #[test]
+    fn decoded_data_recording_requires_rf_run_mode() {
+        assert!(decoded_data_recording_is_supported(
+            AcquisitionMode::Run,
+            CaptureTarget::RadioReceiver,
+        ));
+        assert!(!decoded_data_recording_is_supported(
+            AcquisitionMode::Single,
+            CaptureTarget::RadioReceiver,
+        ));
+        assert!(!decoded_data_recording_is_supported(
+            AcquisitionMode::Run,
+            CaptureTarget::LogicAnalyzer,
+        ));
+    }
+
+    #[test]
+    fn continuous_scope_sequences_identify_each_hardware_frame() {
+        assert!(is_scope_frame_start(0));
+        assert!(!is_scope_frame_start(1));
+        assert!(is_scope_frame_start(DSCOPE_FRAME_SEQUENCE_STRIDE));
+        assert!(!is_scope_frame_start(DSCOPE_FRAME_SEQUENCE_STRIDE + 1));
+    }
+
+    #[test]
+    fn repetitive_interval_matches_original_stream_and_buffer_behavior() {
+        assert_eq!(
+            repetitive_interval(DsLogicOperationMode::Stream, 7.5),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            repetitive_interval(DsLogicOperationMode::Buffer, 1.5),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            repetitive_interval(DsLogicOperationMode::Buffer, 0.0),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            repetitive_interval(DsLogicOperationMode::Buffer, 20.0),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn trigger_controls_stay_enabled_while_continuous_capture_rearms() {
+        assert!(scope_trigger_controls_are_enabled(true, true, true, None));
+        assert!(scope_trigger_controls_are_enabled(
+            false,
+            true,
+            true,
+            Some(true)
+        ));
+        assert!(!scope_trigger_controls_are_enabled(true, false, true, None));
+        assert!(!scope_trigger_controls_are_enabled(
+            false,
+            true,
+            false,
+            Some(false)
+        ));
+        assert!(scope_frontend_controls_are_enabled(true, true, true));
+        assert!(!scope_frontend_controls_are_enabled(true, false, true));
+        assert!(scope_frontend_controls_are_enabled(false, false, false));
+    }
+
+    #[test]
+    fn manual_calibration_stays_available_during_continuous_capture() {
+        assert!(manual_calibration_control_is_enabled(
+            false,
+            true,
+            false,
+            Some(AcquisitionMode::Run)
+        ));
+        assert!(manual_calibration_control_is_enabled(
+            false, true, false, None
+        ));
+        assert!(!manual_calibration_control_is_enabled(
+            true,
+            true,
+            false,
+            Some(AcquisitionMode::Run)
+        ));
+        assert!(!manual_calibration_control_is_enabled(
+            false,
+            true,
+            false,
+            Some(AcquisitionMode::Single)
+        ));
+        assert!(!manual_calibration_control_is_enabled(
+            false,
+            true,
+            true,
+            Some(AcquisitionMode::Run)
+        ));
+    }
+
+    #[test]
+    fn combined_capture_requires_both_instrument_types() {
+        assert!(CaptureTarget::LogicAnalyzer.is_available(true, false, false));
+        assert!(CaptureTarget::Oscilloscope.is_available(false, true, false));
+        assert!(CaptureTarget::RadioReceiver.is_available(false, false, true));
+        assert!(!CaptureTarget::Combined.is_available(true, false, false));
+        assert!(!CaptureTarget::Combined.is_available(false, true, false));
+        assert!(CaptureTarget::Combined.is_available(true, true, false));
+        assert!(CaptureTarget::Combined.includes_radio_receiver());
+        assert!(CaptureTarget::Combined.captures_selected_radio(true));
+        assert!(!CaptureTarget::Combined.captures_selected_radio(false));
+        assert!(CaptureTarget::RadioReceiver.captures_selected_radio(false));
+        assert!(CaptureTarget::Combined.includes(CaptureTarget::LogicAnalyzer));
+        assert!(CaptureTarget::Combined.includes(CaptureTarget::Oscilloscope));
+        assert!(CaptureTarget::Combined.includes(CaptureTarget::RadioReceiver));
+        assert!(!CaptureTarget::LogicAnalyzer.includes(CaptureTarget::RadioReceiver));
+    }
+
+    #[test]
+    fn independent_instrument_targets_can_capture_concurrently() {
+        assert!(!CaptureTarget::LogicAnalyzer.overlaps(CaptureTarget::Oscilloscope));
+        assert!(!CaptureTarget::LogicAnalyzer.overlaps(CaptureTarget::RadioReceiver));
+        assert!(!CaptureTarget::Oscilloscope.overlaps(CaptureTarget::RadioReceiver));
+        assert!(CaptureTarget::LogicAnalyzer.overlaps(CaptureTarget::LogicAnalyzer));
+        assert!(CaptureTarget::Combined.overlaps(CaptureTarget::LogicAnalyzer));
+        assert!(CaptureTarget::Combined.overlaps(CaptureTarget::Oscilloscope));
+        assert!(CaptureTarget::Combined.overlaps(CaptureTarget::RadioReceiver));
+    }
+}

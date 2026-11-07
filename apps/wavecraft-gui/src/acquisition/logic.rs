@@ -460,3 +460,201 @@ impl Default for LogicSessionSettings {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    #[test]
+    fn default_logic_capture_config_is_valid() {
+        // The limit helpers fall back to the default rate and count when this
+        // configuration cannot be built, so it must stay buildable.
+        assert!(default_logic_capture_config().is_some());
+    }
+
+    #[test]
+    fn logic_capture_defaults_to_stream_mode() {
+        assert_eq!(
+            LogicCaptureSettings::default().operation_mode,
+            DsLogicOperationMode::Stream
+        );
+    }
+
+    #[test]
+    fn logic_capture_menu_offers_five_milliseconds_at_125_megahertz() {
+        let option = logic_capture_duration_options(LogicCaptureSettings {
+            sample_rate_hz: 125_000_000,
+            ..LogicCaptureSettings::default()
+        })
+        .into_iter()
+        .find(|(duration, _)| (*duration - 0.005).abs() < f64::EPSILON)
+        .expect("5 ms should be available");
+
+        assert_eq!(option.1, 625_664);
+        let settings = LogicCaptureSettings {
+            sample_rate_hz: 125_000_000,
+            sample_count: option.1,
+            ..LogicCaptureSettings::default()
+        };
+        assert_eq!(logic_capture_duration_label(settings), "5.00 ms");
+    }
+
+    #[test]
+    fn changing_logic_sample_rate_preserves_capture_duration() {
+        let mut settings = LogicCaptureSettings {
+            sample_rate_hz: 125_000_000,
+            sample_count: 625_664,
+            ..LogicCaptureSettings::default()
+        };
+
+        set_logic_sample_rate_preserving_duration(&mut settings, 250_000_000);
+
+        assert_eq!(settings.sample_rate_hz, 250_000_000);
+        assert_eq!(settings.sample_count, 1_250_304);
+        assert_eq!(logic_capture_duration_label(settings), "5.00 ms");
+    }
+
+    #[test]
+    fn stream_duration_choices_do_not_shrink_at_high_sample_rates() {
+        let settings = LogicCaptureSettings {
+            sample_rate_hz: 1_000_000_000,
+            enabled_channels: [
+                true, true, true, false, false, false, false, false, false, false, false, false,
+                false, false, false, false,
+            ],
+            ..LogicCaptureSettings::default()
+        };
+
+        let ten_seconds = logic_capture_duration_options(settings)
+            .into_iter()
+            .find(|(duration, _)| (*duration - 10.0).abs() < f64::EPSILON)
+            .expect("10 s should remain available in stream mode");
+
+        assert_eq!(ten_seconds.1, 10_000_000_000);
+    }
+
+    #[test]
+    fn switching_to_buffer_mode_clamps_capture_to_hardware_depth() {
+        let mut settings = LogicCaptureSettings {
+            sample_rate_hz: 125_000_000,
+            sample_count: 1_250_000_128,
+            ..LogicCaptureSettings::default()
+        };
+
+        set_logic_operation_mode_preserving_duration(&mut settings, DsLogicOperationMode::Buffer);
+
+        assert_eq!(settings.sample_count, 134_217_728);
+    }
+
+    #[test]
+    fn logic_settings_map_every_device_option() {
+        let mut enabled_channels = [false; LOGIC_CHANNEL_COUNT];
+        enabled_channels[0] = true;
+        enabled_channels[3] = true;
+        let mut trigger_conditions = [None; LOGIC_CHANNEL_COUNT];
+        trigger_conditions[0] = Some(DsLogicTriggerCondition::RisingEdge);
+        trigger_conditions[3] = Some(DsLogicTriggerCondition::FallingEdge);
+        let settings = LogicCaptureSettings {
+            sample_rate_hz: 250_000_000,
+            sample_count: 625_664,
+            enabled_channels,
+            maximum_heights: [4; LOGIC_CHANNEL_COUNT],
+            operation_mode: DsLogicOperationMode::Buffer,
+            stop_option: DsLogicStopOption::StopImmediately,
+            threshold_voltage: 2.5,
+            input_filter: DsLogicInputFilter::OneSampleClock,
+            rle_enabled: true,
+            external_clock: true,
+            falling_clock_edge: true,
+            trigger_enabled: true,
+            trigger_conditions,
+            ..LogicCaptureSettings::default()
+        };
+
+        let config = settings
+            .capture_config()
+            .expect("logic settings should be valid");
+
+        assert_eq!(config.operation_mode(), settings.operation_mode);
+        assert_eq!(config.sample_rate_hz(), settings.sample_rate_hz);
+        assert_eq!(config.sample_count(), settings.sample_count);
+        assert_eq!(config.enabled_channels(), settings.enabled_channels);
+        assert_eq!(config.stop_option(), settings.stop_option);
+        assert_eq!(config.threshold_voltage(), settings.threshold_voltage);
+        assert_eq!(config.input_filter(), settings.input_filter);
+        assert!(config.rle_enabled());
+        assert!(config.external_clock());
+        assert!(config.falling_clock_edge());
+        assert_eq!(
+            config.trigger(),
+            Some(DsLogicTriggerConfig::Simple(
+                DsLogicSimpleTrigger::new(0, DsLogicTriggerCondition::RisingEdge)
+                    .unwrap()
+                    .with_channel_condition(3, DsLogicTriggerCondition::FallingEdge)
+                    .unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn smart_logic_settings_build_ordered_hardware_stages() {
+        let mut settings = LogicCaptureSettings {
+            operation_mode: DsLogicOperationMode::Buffer,
+            trigger_enabled: true,
+            trigger_mode: LogicTriggerMode::Smart,
+            smart_trigger_stage_count: 2,
+            ..LogicCaptureSettings::default()
+        };
+        settings.smart_trigger_conditions =
+            [[None; LOGIC_CHANNEL_COUNT]; DSLOGIC_TRIGGER_STAGE_COUNT];
+        settings.smart_trigger_conditions[0][0] = Some(DsLogicTriggerCondition::RisingEdge);
+        settings.smart_trigger_conditions[0][1] = Some(DsLogicTriggerCondition::High);
+        settings.smart_trigger_conditions[1][2] = Some(DsLogicTriggerCondition::FallingEdge);
+
+        let config = settings
+            .capture_config()
+            .expect("smart trigger settings should be valid");
+
+        let first_stage = DsLogicTriggerStage::new(0, DsLogicTriggerCondition::RisingEdge)
+            .unwrap()
+            .with_channel_condition(1, DsLogicTriggerCondition::High)
+            .unwrap();
+        let second_stage =
+            DsLogicTriggerStage::new(2, DsLogicTriggerCondition::FallingEdge).unwrap();
+        assert_eq!(
+            config.trigger(),
+            Some(DsLogicTriggerConfig::Smart(
+                DsLogicSmartTrigger::new(first_stage)
+                    .with_stage(second_stage)
+                    .unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn stream_mode_ignores_buffer_only_options() {
+        let settings = LogicCaptureSettings {
+            operation_mode: DsLogicOperationMode::Stream,
+            stop_option: DsLogicStopOption::UploadCapturedData,
+            rle_enabled: true,
+            ..LogicCaptureSettings::default()
+        };
+
+        let config = settings
+            .capture_config()
+            .expect("logic settings should be valid");
+
+        assert_eq!(config.stop_option(), DsLogicStopOption::StopImmediately);
+        assert!(!config.rle_enabled());
+    }
+
+    #[test]
+    fn every_logic_channel_has_a_distinct_default_color() {
+        let colors = default_logic_channel_colors();
+        for (index, color) in colors.iter().enumerate() {
+            assert!(!colors[..index].contains(color));
+        }
+    }
+}

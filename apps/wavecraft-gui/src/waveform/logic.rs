@@ -1820,4 +1820,17 @@ mod tests {
         assert_eq!(logic_channel_marker_text(3, "  CLOCK  "), "CLOCK");
         assert_eq!(logic_channel_marker_text(3, "DATA-LONG-NAME"), "DATA-LON");
     }
+
+    #[test]
+    fn zero_length_logic_marker_drag_remains_armed() {
+        let mut settings = LogicMarkerSettings::default();
+        assert!(settings.arm());
+        settings.start(42);
+        settings.update(42);
+
+        assert!(!settings.finish(1_000_000));
+        assert!(settings.adding);
+        assert!(settings.markers.is_empty());
+        assert!(settings.draft.is_none());
+    }
 }

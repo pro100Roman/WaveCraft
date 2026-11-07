@@ -546,3 +546,348 @@ pub(crate) fn normalize_gain_value(value: i32, minimum: i32, maximum: i32, step:
     let rounded_steps = (offset + step / 2) / step;
     (i64::from(minimum) + rounded_steps * step).min(i64::from(maximum)) as i32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    #[test]
+    fn radio_settings_follow_selected_device_capabilities() {
+        let capabilities = wavecraft_hackrf::hackrf_one_capabilities();
+        let mut settings = RadioSettings::default();
+        settings.capture.center_frequency_hz = 100;
+        settings.capture.sample_rate_hz = 21_000_000;
+        settings.capture.bandwidth_hz = 8_100_000;
+        settings.capture.receive_channel = 7;
+        settings.gains_db.insert("lna".to_owned(), 39);
+        settings.gains_db.insert("stale".to_owned(), 10);
+
+        normalize_radio_settings(&mut settings, &capabilities);
+
+        assert_eq!(settings.capture.center_frequency_hz, 1_000_000);
+        assert_eq!(settings.capture.sample_rate_hz, 20_000_000);
+        assert_eq!(settings.capture.bandwidth_hz, 8_000_000);
+        assert_eq!(settings.capture.receive_channel, 0);
+        assert_eq!(settings.gains_db.get("lna"), Some(&40));
+        assert_eq!(settings.gains_db.get("vga"), Some(&16));
+        assert!(!settings.gains_db.contains_key("stale"));
+        settings
+            .capture
+            .validate(&capabilities)
+            .expect("normalized radio settings should validate");
+    }
+
+    #[test]
+    fn radio_defaults_start_with_signal_analysis_disabled() {
+        let settings = RadioSettings::default();
+
+        assert_eq!(settings.capture.center_frequency_hz, 868_300_000);
+        assert_eq!(settings.capture.sample_rate_hz, 8_000_000);
+        assert_eq!(settings.capture.bandwidth_hz, 1_750_000);
+        assert_eq!(settings.analyzer.demodulation, RadioDemodulation::None);
+        assert!(!settings.analyzer.is_enabled());
+        assert_eq!(settings.analyzer.symbol_rate_hz, 19_200);
+        assert_eq!(settings.analyzer.deviation_hz, 35_000);
+        assert_eq!(settings.analyzer.channels[0].name, "Channel 1");
+        assert_eq!(settings.analyzer.channels[0].frequency_offset_hz, -200_000);
+        assert_eq!(settings.analyzer.output_sample_rate_hz, 512_000);
+        assert_eq!(settings.analyzer.filter_tap_count, 257);
+        assert_eq!(settings.analyzer.maximum_preamble_bit_errors, 1);
+        assert_eq!(settings.analyzer.minimum_bit_confidence_milli, 0);
+        assert_eq!(settings.analyzer.maximum_uncertain_bits, 0);
+        assert_eq!(settings.trigger_posttrigger_micros, 2_000);
+        settings
+            .capture
+            .validate(&wavecraft_hackrf::hackrf_one_capabilities())
+            .expect("default radio settings should be supported by HackRF One");
+    }
+
+    #[test]
+    fn radio_single_duration_derives_an_exact_bounded_sample_limit() {
+        assert_eq!(
+            radio_single_sample_limit(10_000_000, 1_500).unwrap(),
+            15_000_000
+        );
+        assert_eq!(radio_single_sample_limit(3, 1).unwrap(), 1);
+        assert!(radio_single_sample_limit(10_000_000, 0).is_err());
+    }
+
+    #[test]
+    fn radio_single_trigger_derives_fractional_millisecond_posttrigger_samples() {
+        let mut settings = RadioSettings::default();
+        settings.capture.sample_rate_hz = 10_000_000;
+        settings.trigger_posttrigger_micros = 125;
+
+        let config = radio_single_trigger_config(&settings).unwrap();
+
+        assert_eq!(config.posttrigger_samples, 1_250);
+        assert_eq!(config.fft_length, RADIO_SPECTRUM_FFT_LENGTH);
+    }
+
+    #[test]
+    fn radio_trigger_level_stays_editable_during_run_and_while_single_is_armed() {
+        assert!(radio_trigger_level_runtime_controls_are_enabled(
+            true, false
+        ));
+        assert!(radio_trigger_level_runtime_controls_are_enabled(
+            false, true
+        ));
+        assert!(!radio_trigger_level_runtime_controls_are_enabled(
+            false, false
+        ));
+        assert!(radio_trigger_level_controls_are_enabled(false, true));
+        assert!(radio_trigger_level_controls_are_enabled(true, false));
+        assert!(!radio_trigger_level_controls_are_enabled(false, false));
+    }
+
+    #[test]
+    fn radio_runtime_settings_include_only_live_hackrf_controls() {
+        let capabilities = wavecraft_hackrf::hackrf_one_capabilities();
+        let mut initial = RadioSettings::default();
+        normalize_radio_settings(&mut initial, &capabilities);
+        let mut edited = initial.clone();
+        edited.capture.sample_rate_hz = 12_000_000;
+        assert!(!radio_runtime_settings_differ(&edited, &initial));
+
+        let mut correction_only = initial.clone();
+        correction_only.frequency_correction_milli_ppm = -8_250;
+        assert!(radio_runtime_settings_differ(&correction_only, &initial));
+
+        edited.capture.center_frequency_hz = 433_920_000;
+        edited.capture.bandwidth_hz = 8_000_000;
+        edited.gains_db.insert("lna".to_owned(), 24);
+        edited.gains_db.insert("vga".to_owned(), 20);
+        edited.amplifier_enabled = true;
+        edited.frequency_correction_milli_ppm = 12_500;
+        assert!(radio_runtime_settings_differ(&edited, &initial));
+        assert_eq!(
+            hackrf_runtime_settings(&edited).unwrap(),
+            HackRfRuntimeSettings {
+                center_frequency_hz: 433_920_000,
+                bandwidth_hz: 8_000_000,
+                lna_gain_db: Some(24),
+                vga_gain_db: Some(20),
+                amplifier_enabled: true,
+                frequency_correction_milli_ppm: 12_500,
+            }
+        );
+    }
+
+    #[test]
+    fn radio_analyzer_settings_build_a_tagged_signal_profile() {
+        let mut settings = RadioAnalyzerSettings::default();
+        assert!(settings.signal_profiles().unwrap().is_empty());
+
+        settings.demodulation = RadioDemodulation::BinaryGfsk;
+        settings.channels = vec![
+            RadioAnalyzerChannelSettings::numbered(0, 125_000),
+            RadioAnalyzerChannelSettings::numbered(1, -250_000),
+        ];
+        settings.gfsk_bt_milli = 500;
+        let profiles = settings.signal_profiles().unwrap();
+        assert_eq!(profiles.len(), 2);
+        let profile = profiles[0].clone();
+
+        assert_eq!(profile.channel.frequency_offset_hz, 125_000);
+        assert_eq!(profiles[1].channel.frequency_offset_hz, -250_000);
+        let DemodulationProfile::BinaryGfsk(gfsk) = profile.demodulation else {
+            panic!("GFSK settings should build the GFSK profile variant");
+        };
+        assert_eq!(gfsk.symbol_rate_hz, 19_200);
+        assert_eq!(gfsk.deviation_hz, 35_000);
+        assert_eq!(gfsk.bt, 0.5);
+        assert!(matches!(gfsk.timing, FskTiming::Adaptive { .. }));
+    }
+
+    #[test]
+    fn radio_analyzer_supports_up_to_one_hundred_unique_channels() {
+        let mut settings = RadioAnalyzerSettings {
+            demodulation: RadioDemodulation::BinaryGfsk,
+            channels: (0..MAX_RADIO_ANALYZER_CHANNELS)
+                .map(|index| RadioAnalyzerChannelSettings::numbered(index, index as i64 * 1_000))
+                .collect(),
+            ..RadioAnalyzerSettings::default()
+        };
+
+        assert_eq!(
+            settings.signal_profiles().unwrap().len(),
+            MAX_RADIO_ANALYZER_CHANNELS
+        );
+
+        settings
+            .channels
+            .push(RadioAnalyzerChannelSettings::numbered(
+                MAX_RADIO_ANALYZER_CHANNELS,
+                200_000,
+            ));
+        assert!(settings
+            .signal_profiles()
+            .unwrap_err()
+            .contains("between 1 and 100"));
+
+        settings.channels = vec![
+            RadioAnalyzerChannelSettings::numbered(0, 100_000),
+            RadioAnalyzerChannelSettings::numbered(1, 100_000),
+        ];
+        assert!(settings
+            .signal_profiles()
+            .unwrap_err()
+            .contains("must be unique"));
+    }
+
+    #[test]
+    fn radio_analyzer_settings_build_a_post_sync_whitening_pipeline() {
+        let mut settings = RadioAnalyzerSettings {
+            data_mode: RadioDataMode::Packets,
+            sync_word: 0xd391,
+            sync_word_bytes: 2,
+            maximum_preamble_bit_errors: 1,
+            whitening_enabled: true,
+            whitening_width: 9,
+            whitening_polynomial: 0x11,
+            whitening_seed: 0x1ff,
+            whitening_direction: WhiteningDirection::ShiftLeft,
+            whitening_invert_output: true,
+            whitening_start_bit: 8,
+            whitening_end_bit: Some(160),
+            whitening_advance_excluded_bits: true,
+            ..RadioAnalyzerSettings::default()
+        };
+
+        let RadioDataDecoderConfig::Packets(config) = settings.decoder_config().unwrap() else {
+            panic!("packet settings should build a packet decoder");
+        };
+        assert_eq!(
+            config.framing.preamble,
+            [true, false, true, false, true, false, true, false].repeat(4)
+        );
+        assert_eq!(
+            config.framing.sync.bits,
+            [
+                true, true, false, true, false, false, true, true, true, false, false, true, false,
+                false, false, true
+            ]
+        );
+        assert_eq!(config.framing.sync.max_bit_errors, 1);
+        assert_eq!(config.framing.length, RadioPacketLength::UntilEndOfStream);
+        assert_eq!(
+            config.framing.whitening,
+            Some(AdditiveWhiteningConfig {
+                width: 9,
+                polynomial: 0x11,
+                seed: 0x1ff,
+                direction: WhiteningDirection::ShiftLeft,
+                invert_output: true,
+                start_bit: 8,
+                end_bit: Some(160),
+                advance_excluded_bits: true,
+            })
+        );
+
+        settings.sync_word_bytes = 0;
+        assert_eq!(
+            settings.decoder_config().unwrap_err(),
+            "packet decoding requires a sync word"
+        );
+    }
+
+    #[test]
+    fn radio_analyzer_allows_zero_preamble_length() {
+        let raw = RadioAnalyzerSettings {
+            data_mode: RadioDataMode::Raw,
+            preamble_bytes: 0,
+            sync_word: 0xd391,
+            sync_word_bytes: 2,
+            ..RadioAnalyzerSettings::default()
+        };
+        assert!(matches!(
+            raw.decoder_config().unwrap(),
+            RadioDataDecoderConfig::Raw(RawRadioConfig {
+                preamble_bytes: 0,
+                sync_word: 0xd391,
+                sync_word_bytes: 2,
+                ..
+            })
+        ));
+
+        let packets = RadioAnalyzerSettings {
+            data_mode: RadioDataMode::Packets,
+            preamble_bytes: 0,
+            sync_word: 0xd391,
+            sync_word_bytes: 2,
+            ..RadioAnalyzerSettings::default()
+        };
+        let RadioDataDecoderConfig::Packets(config) = packets.decoder_config().unwrap() else {
+            panic!("packet settings should build a packet decoder");
+        };
+        assert!(config.framing.preamble.is_empty());
+
+        let raw_without_sync = RadioAnalyzerSettings {
+            data_mode: RadioDataMode::Raw,
+            preamble_bytes: 0,
+            sync_word_bytes: 0,
+            ..RadioAnalyzerSettings::default()
+        };
+        assert!(matches!(
+            raw_without_sync.decoder_config().unwrap(),
+            RadioDataDecoderConfig::Raw(RawRadioConfig {
+                preamble_bytes: 0,
+                sync_word_bytes: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn pn9_whitening_preset_uses_sx127x_compatible_parameters() {
+        let settings = RadioAnalyzerSettings {
+            data_mode: RadioDataMode::Packets,
+            sync_word: 0xd391,
+            sync_word_bytes: 2,
+            whitening_enabled: true,
+            whitening_preset: RadioWhiteningPreset::Pn9X9X5,
+            // Named presets must ignore retained custom values.
+            whitening_width: 3,
+            whitening_polynomial: 1,
+            whitening_seed: 1,
+            whitening_direction: WhiteningDirection::ShiftLeft,
+            whitening_invert_output: true,
+            whitening_start_bit: 8,
+            whitening_end_bit: Some(16),
+            whitening_advance_excluded_bits: true,
+            ..RadioAnalyzerSettings::default()
+        };
+
+        let RadioDataDecoderConfig::Packets(config) = settings.decoder_config().unwrap() else {
+            panic!("packet settings should build a packet decoder");
+        };
+        assert_eq!(
+            config.framing.whitening,
+            Some(AdditiveWhiteningConfig {
+                width: 9,
+                polynomial: 0x21,
+                seed: 0x1ff,
+                direction: WhiteningDirection::ShiftRight,
+                invert_output: false,
+                start_bit: 0,
+                end_bit: None,
+                advance_excluded_bits: false,
+            })
+        );
+    }
+
+    #[test]
+    fn stepped_radio_domains_choose_the_nearest_supported_value() {
+        let domain = ValueDomain::Stepped {
+            range: 10..=30,
+            step: 8,
+        };
+
+        assert_eq!(nearest_domain_value(&domain, 9), 10);
+        assert_eq!(nearest_domain_value(&domain, 15), 18);
+        assert_eq!(nearest_domain_value(&domain, 23), 26);
+        assert_eq!(nearest_domain_value(&domain, 100), 26);
+    }
+}

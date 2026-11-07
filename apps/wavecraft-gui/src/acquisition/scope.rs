@@ -517,3 +517,115 @@ pub(crate) fn trigger_slope_label(slope: DsCopeTriggerSlope) -> &'static str {
         DsCopeTriggerSlope::Falling => "Falling edge",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::*;
+
+    #[test]
+    fn scope_math_operations_use_captured_channel_values() {
+        assert_eq!(ScopeMathOperation::Add.apply(6.0, 2.0), Some(8.0));
+        assert_eq!(ScopeMathOperation::Subtract.apply(6.0, 2.0), Some(4.0));
+        assert_eq!(ScopeMathOperation::Multiply.apply(6.0, 2.0), Some(12.0));
+        assert_eq!(ScopeMathOperation::Divide.apply(6.0, 2.0), Some(3.0));
+        assert_eq!(ScopeMathOperation::Divide.apply(6.0, 0.0), None);
+    }
+
+    #[test]
+    fn scope_timebase_selects_the_vendor_floor_sample_rate() {
+        let mut settings = ScopeCaptureSettings::default();
+
+        assert_eq!(settings.sample_rate_for_timebase(1.0e-3), 100_000_000);
+        assert_eq!(settings.sample_rate_for_timebase(500.0e-6), 125_000_000);
+        assert_eq!(settings.sample_rate_for_timebase(200.0e-6), 500_000_000);
+        assert_eq!(settings.sample_rate_for_timebase(10.0), 10_000);
+        assert_eq!(
+            settings.sample_rate_for_timebase(f64::NAN),
+            settings.sample_rate_hz
+        );
+
+        settings.channels[1].enabled = false;
+        settings.sample_count = 2_000_000;
+        assert_eq!(settings.sample_rate_for_timebase(200.0e-6), 1_000_000_000);
+    }
+
+    #[test]
+    fn scope_limits_follow_the_enabled_channel_count() {
+        let mut settings = ScopeCaptureSettings::default();
+        assert_eq!(settings.maximum_sample_rate_hz(), 500_000_000);
+        assert_eq!(settings.maximum_sample_count(), 1_000_000);
+
+        settings.channels[1].enabled = false;
+        settings.sample_rate_hz = 1_000_000_000;
+        settings.sample_count = 2_000_000;
+
+        assert_eq!(settings.maximum_sample_rate_hz(), 1_000_000_000);
+        assert_eq!(settings.maximum_sample_count(), 2_000_000);
+        assert!(settings.capture_config().is_ok());
+    }
+
+    #[test]
+    fn scope_frontend_change_detection_ignores_display_conversion_and_buffer() {
+        let original = ScopeCaptureSettings::default();
+        let mut changed = original;
+        changed.sample_count = 250_000;
+        changed.channels[0].probe_attenuation = 10;
+        assert!(!changed.frontend_differs_from(original));
+
+        changed = original;
+        changed.channels[1].enabled = false;
+        assert!(changed.frontend_differs_from(original));
+        assert!(changed.runtime_frontend_differs_from(original));
+
+        changed = original;
+        changed.channels[0].volts_per_div_mv = 100;
+        assert!(changed.frontend_differs_from(original));
+        assert!(changed.runtime_frontend_differs_from(original));
+
+        changed = original;
+        changed.channels[0].vertical_offset = 64;
+        assert!(!changed.frontend_differs_from(original));
+        assert!(!changed.runtime_frontend_differs_from(original));
+
+        changed = original;
+        changed.channels[0].coupling = DsCopeCoupling::Ac;
+        assert!(changed.frontend_differs_from(original));
+        assert!(!changed.runtime_frontend_differs_from(original));
+
+        changed = original;
+        changed.trigger.holdoff_unit = TriggerHoldoffUnit::Seconds;
+        assert!(!changed.frontend_differs_from(original));
+
+        changed.trigger.slope = DsCopeTriggerSlope::Falling;
+        assert!(changed.frontend_differs_from(original));
+
+        changed = original;
+        changed.trigger.levels[0] = 64;
+        assert!(changed.frontend_differs_from(original));
+
+        changed = original;
+        changed.operation_mode = DsCopeOperationMode::InternalTest;
+        assert!(changed.frontend_differs_from(original));
+
+        changed = original;
+        changed.bandwidth_limit = DsCopeBandwidthLimit::Mhz20;
+        assert!(changed.frontend_differs_from(original));
+    }
+
+    #[test]
+    fn scope_trigger_source_tracks_enabled_channels() {
+        let mut trigger = ScopeTriggerSettings {
+            source: DsCopeTriggerSource::ChannelOne,
+            auto_channel: 1,
+            ..ScopeTriggerSettings::default()
+        };
+
+        trigger.clamp_to_channels([true, false]);
+
+        assert_eq!(trigger.source, DsCopeTriggerSource::Auto);
+        assert_eq!(trigger.auto_channel, 0);
+        assert!(trigger.capture_config().is_ok());
+    }
+}
