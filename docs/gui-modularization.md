@@ -1,9 +1,12 @@
 # GUI modularization and multi-SDR integration plan
 
-Status: proposed.
+Status: in progress. The split is partly done and the RF/SDR integration for
+HackRF One is implemented; see [Current status](#current-status) for what is
+finished and what remains.
 
-This document describes a behavior-preserving split of the current
-`apps/wavecraft-gui/src/main.rs` and reserves explicit integration seams for
+This document describes a behavior-preserving split of the GUI application
+(originally all in `apps/wavecraft-gui/src/main.rs`, now mostly in
+`apps/wavecraft-gui/src/lib.rs`) and reserves explicit integration seams for
 HackRF One, LimeSDR, and AntSDR. It complements
 [Capture Architecture](architecture.md) and
 [RF/SDR capture and signal-decoding architecture](rf-sdr-architecture.md).
@@ -16,14 +19,51 @@ exists. A backend becomes supported only after discovery, configuration,
 capture, cancellation, error handling, and opt-in hardware tests are
 implemented for an identified model and transport.
 
+## Current status
+
+Reviewed 2026-11-07 against commit `65f909f`.
+
+`apps/wavecraft-gui/src/main.rs` is now only the native entry point
+(`wavecraft_gui::run()`). The application lives in the library crate, and
+`src/lib.rs` is still about 24,000 lines (roughly 14,000 of production code)
+with `update` alone near 1,900 lines. The earlier description of the file below
+therefore applies to `lib.rs` today.
+
+| Step | State | Notes |
+| ---- | ----- | ----- |
+| 1. Snapshot utilities | Done | `snapshot.rs` holds image cropping and PNG persistence with its tests. The in-app capture flow (`finish_pending_snapshot`) stays in `lib.rs`. |
+| 2. Generic session tabs | Done | `sessions.rs` holds the generic `SessionTab`. One session-tab test (`session_tabs_preserve_selected_device_ids`) remains in `lib.rs`. |
+| 3. Recording and Saleae | Partial | `recording.rs` holds path selection, decoded-data JSON Lines I/O, and Saleae export file handling. `start_gui_recording`, `read_gui_recording*`, and the `*_settings_metadata` / `*_from_recording_metadata` functions are still in `lib.rs`. |
+| 4. Devices | Partial | `devices.rs` holds selection helpers and the USB speed warning. Discovery and refresh orchestration (`discover_supported_devices`, `poll_worker`) are still in `lib.rs`. |
+| 5. Waveform store and viewport | Not started | `waveform/mod.rs` contains only `pub mod radio;`. |
+| 6. Logic rendering, markers, protocol lanes | Not started | `paint_logic*` functions are in `lib.rs`. |
+| 7. Scope rendering, markers, FFT, measurements UI | Not started | `paint_scope*` functions are in `lib.rs`; `measurements.rs` is the engine only. |
+| 8. Split `update` into panels returning typed actions | Not started | |
+| 9. Core IQ model, recording, simulator | Done | See [RF/SDR architecture](rf-sdr-architecture.md). |
+| 10. Radio GUI | Partial | `waveform/radio.rs`, `radio_analyzer.rs`, and `radio_trigger.rs` exist and `WaveformTab::RadioReceiver` is a live tab. Radio settings panels remain in `lib.rs`; there is no `acquisition::radio` or `devices::radio` module. |
+| 11. HackRF One adapter | Done | `wavecraft-hackrf` is a receive-only adapter. Hardware tests must remain opt-in. |
+| 12. LimeSDR-USB and AntSDR E200 adapters | Not started | `wavecraft-sdr` names `RadioProvider::LimeSuiteNg`, `RadioProvider::Libiio`, `RadioModel::LimeSdrUsbTypeA`, and `RadioModel::AntSdrE200`, but no adapter crates exist. These names are not support claims. |
+
+Differences between this plan and the code:
+
+- The planned `DeviceProvider` enum is implemented for radios as `RadioProvider`
+  and `RadioModel` in `wavecraft-sdr`, alongside `ConnectionBackend` and
+  `RadioCapabilities` (with `ValueDomain`). There is no combined
+  `InstrumentCapabilities` enum or `RadioBackendSettings` enum yet; HackRF
+  settings are the concrete `HackRfSettings`.
+- `WaveformTab` has `LogicAnalyzer`, `Oscilloscope`, `Lissajous`,
+  `RadioReceiver`, and `Combined`, rather than the four-variant sketch below.
+- The `app/`, `acquisition/`, `ui/`, and per-instrument `waveform/logic`,
+  `waveform/scope` directories in the layout are still destination layout only.
+
 ## Why split the GUI now
 
-`apps/wavecraft-gui/src/main.rs` currently contains the executable entry point,
-application state, capture orchestration, device selection, session tabs,
-recording import and export, settings panels, dialogs, waveform storage,
-viewport calculations, logic rendering, scope rendering, FFT processing,
-markers, and their tests. These responsibilities change for different reasons
-and already have useful internal boundaries.
+The GUI application (originally in `apps/wavecraft-gui/src/main.rs`, now mostly
+in `src/lib.rs`) contains application state, capture orchestration, device
+selection, settings panels, dialogs, waveform storage, viewport calculations,
+logic rendering, scope rendering, FFT processing, markers, and their tests.
+These responsibilities change for different reasons and already have useful
+internal boundaries.
 
 The refactor should improve ownership and test locality, not only reduce the
 line count of `main.rs`. In particular:
@@ -251,8 +291,8 @@ and recorded IQ data should drive RF GUI development.
 
 ### HackRF One
 
-`wavecraft-hackrf` remains the first planned physical backend and follows the
-detailed sequence in `rf-sdr-architecture.md`. Its initial scope is
+`wavecraft-hackrf` is the first physical backend and is implemented, following
+the detailed sequence in `rf-sdr-architecture.md`. Its initial scope is
 receive-only, single-channel IQ streaming. HackRF-specific gain and amplifier
 controls remain in `HackRfSettings` and are surfaced through capabilities.
 
