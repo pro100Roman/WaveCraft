@@ -9,3 +9,4 @@ pub mod frame_actions;
 pub mod protocol_analyzer_dialog;
 pub mod radio_settings;
 pub mod scope_settings;
+pub mod toolbar;
