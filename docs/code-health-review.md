@@ -43,10 +43,22 @@ Python client tests, and `cargo +1.79.0 check --workspace --locked`.
 | 5. Panics in production code | Done. About 45 sites in `crates/` were removed (the count of "about 20" below was low because the scan stopped at the first `#[cfg(test)]`), plus the remaining `expect`/`unreachable!` sites in `wavecraft-gui` (one looks reachable from the code: a recording holding logic and radio, or scope and radio, but not all three, passed the reader and then hit `unreachable!`; this was not reproduced with a real file). `clippy::unwrap_used` and `clippy::expect_used` are now enforced for every crate and both apps. The CLI had no production sites; its one `expect` is in test code. |
 | 6. Smaller items | `serde` and `serde_json` now come from `[workspace.dependencies]`. CI changes were made but have **not been run on GitHub**; the YAML parses, nothing more was checked. (a) `ci.yml` now triggers on pull requests, pushes to `main`, and `v*` tags, so a branch with an open pull request no longer runs every job twice. The cost: a branch pushed without a pull request gets no CI. (b) `Swatinem/rust-cache` was added to the `msrv` and `workspace` jobs; it is skipped on release tags so release binaries still build from a clean tree, and only `main` writes the cache. (c) A separate `audit.yml` runs `cargo deny check advisories` when `Cargo.lock` or a manifest changes, weekly, and on demand. It is not a dependency of the `release` job. `cargo audit` and `cargo deny` are not installed here, so it is unknown whether the current `Cargo.lock` has advisories that would fail its first run. |
 
-Two fixes could not be fully covered by tests. The USB driver changes only convert
-unreachable states into errors, so no test drives those states, and the
+Two fixes could not be fully covered by unit tests. The USB driver changes only
+convert unreachable states into errors, so no test drives those states, and the
 `discover_for_selector` retry loop in `wavecraft-automation` has no direct test;
 its behavior (number of discovery calls and sleeps) was checked by reading.
+
+The opt-in hardware tests were run at commit `ee7b325` (after the USB driver
+changes) with a DSLogic U3Pro16, a DSCope U3P100, and a HackRF One connected and
+idle, and all passed:
+
+- `cargo test -p wavecraft-usb --test hardware -- --ignored` (idle bulk reads cancel promptly)
+- `cargo test -p wavecraft-automation --test hardware -- --ignored` (DSLogic and DSCope capture contract)
+- `cargo test -p wavecraft-hackrf --test hardware -- --ignored` (HackRF discovery and finite IQ capture)
+
+That shows the changed driver code still prepares, captures, and cancels on real
+devices. It does not show that the new error paths behave correctly, since the
+hardware never reaches those states.
 
 ## Measurements for item 1
 
