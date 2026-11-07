@@ -3017,7 +3017,7 @@ dependencies = [
 
 [[package]]
 name = "wavecraft-cli"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "serde_json",
  "wavecraft-automation",
@@ -3047,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "wavecraft-gui"
-version = "0.6.1"
+version = "0.8.0"
 dependencies = [
  "eframe",
  "image",
