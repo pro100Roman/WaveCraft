@@ -2,8 +2,9 @@
 
 Status: the file split (migration steps 1-3 and 5-7) is done and `lib.rs` is
 down to 688 lines; the RF/SDR integration for HackRF One is implemented. What
-remains is the long functions inside the moved code, narrowing what the panels
-can reach, and the LimeSDR and AntSDR adapters. See
+remains most of the long functions inside the moved code (`poll_worker` is
+split), narrowing what the panels can reach, and the LimeSDR and AntSDR
+adapters. See
 [Current status](#current-status) and the [Migration sequence](#migration-sequence).
 
 This document describes a behavior-preserving split of the GUI application
@@ -59,16 +60,27 @@ moved into these modules, mostly unchanged apart from `pub(crate)` visibility:
 
 Moving code did not shorten the long functions inside it. The longest ones now
 are `paint_capture_settings` (815 lines), `paint_radio_analyzer_configuration`
-(647), `paint_central_panel` (511, moved verbatim out of `update`), `poll_worker`
-(487), `start_gui_recording` (435), `paint_scope_time_domain` (397), and
+(647), `paint_central_panel` (511, moved verbatim out of `update`),
+`start_gui_recording` (435), `paint_scope_time_domain` (397), and
 `poll_capture_target` (383). They are in the right module but still need to be
 split.
 
+`poll_worker` (487 lines) is the one that has been split. It is now a 40-line
+dispatcher over `WorkerSuccess` plus one `handle_*` method per result that does
+real work (devices found, capture ready, recording loaded, and the four DSCope
+calibration results). The largest of them, `handle_capture_ready` (323 lines), is
+a sequence of named steps of at most about 70 lines each: `discard_capture_nobody_wants`,
+`scope_config_with_latest_trigger`, `start_capture_recorders`, `arm_radio_trigger`,
+`prepare_capture_display`, and the pure `started_capture_status`. The capture
+payload is a `CaptureReady` struct (boxed in `WorkerSuccess::Capture`) instead of
+eleven loose fields.
+
 Tests: 116 of the 157 tests that were in `lib.rs` moved next to the single
 module they cover. The other 41 cover more than one module or only the
-application root, and are in `src/tests.rs`. The test names are unchanged
-(255 listed, 253 run, 2 ignored). `src/frame_tests.rs` adds 15 headless tests
-(see below).
+application root, and are in `src/tests.rs`. The test names were unchanged by the
+move (255 listed, 253 run, 2 ignored). `src/frame_tests.rs` adds 15 headless tests
+(see below). `app/worker.rs` has 38 tests of its own, so the crate now lists 293
+tests (291 run, 2 ignored).
 
 | Step | State | Notes |
 | ---- | ----- | ----- |
@@ -122,6 +134,17 @@ Verification of the split, and its limits:
   `apply_scope_frontend_changes` directly. A panic inserted into each paint
   method, into several inner branches, and into the apply methods made these
   tests fail.
+- `app/worker.rs` tests run the worker result handlers against a real
+  `CaptureSession` built from an idle fake `CaptureSource`, so the capture
+  start-up logic is covered without hardware: the requested/unwanted/restart
+  gates, recording and decoded-data file failures, RF trigger arming, which
+  modes keep the finished capture on screen, loop continuation, the status
+  line for every mode and trigger, and opening a recording. Changing each step
+  of the handlers made these fail, with two exceptions: the DSCope auto
+  calibrated and calibration loaded handlers are untested because
+  `DsCopeCalibrationValues` has no public constructor (it can only be read from
+  a device), and the trigger that reaches a running DSCope source cannot be
+  observed because the source's receiving end is private.
 - The tests do not click anything, so button and drag handling inside the
   panels is not covered. Hardware tests exercise the drivers, not the GUI.
 - The app was also started by hand for 10 seconds after the larger steps and
@@ -160,7 +183,7 @@ apps/wavecraft-gui/src/
 │   ├── mod.rs
 │   ├── devices.rs                # refresh, device and radio selection
 │   ├── captures.rs               # begin/stop/poll captures, completed captures
-│   ├── worker.rs                 # poll_worker: results of background work
+│   ├── worker.rs                 # poll_worker and the handler for each result
 │   ├── calibration.rs            # DSCope calibration and idle configuration
 │   ├── files.rs                  # open/export/attach recordings, snapshots
 │   └── view_state.rs             # saved settings, session settings, active tabs
@@ -529,10 +552,10 @@ and should not change behavior:
 13. Split the long functions inside the moved code, one behavior-preserving
     change each: `paint_capture_settings` (815 lines),
     `paint_radio_analyzer_configuration` (647), `paint_central_panel` (511),
-    `poll_worker` (487, one handler per `WorkerSuccess` variant),
     `start_gui_recording` (435), `paint_scope_time_domain` (397), and
     `poll_capture_target` (383). Where a piece turns out to be pure logic,
-    give it a unit test.
+    give it a unit test. *(partial: `poll_worker` (487, one handler per
+    `WorkerSuccess` variant) is done; the others are not.)*
 14. Narrow what the panels can reach. Group the 77 fields of `WaveCraftApp`
     into per-area state structs (for example logic, scope, radio, capture,
     dialogs) and make each panel take the group it edits, plus `&FrameState`
