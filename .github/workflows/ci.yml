@@ -1,7 +1,12 @@
 name: CI
 
 on:
+  # Branches are built through their pull request; pushing them as well ran
+  # every job twice. Pushes still run for main and for release tags (the
+  # `release` job below needs the tag run).
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 
 jobs:
@@ -32,6 +37,13 @@ jobs:
           python-version: "3.12"
 
       - uses: dtolnay/rust-toolchain@1.79.0
+
+      # Release tags build from a clean tree; only branch and PR runs use the
+      # cache, and only main writes it.
+      - uses: Swatinem/rust-cache@v2
+        if: github.ref_type != 'tag'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set application version from release tag
         if: github.ref_type == 'tag'
@@ -81,6 +93,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      # Release tags build from a clean tree; only branch and PR runs use the
+      # cache, and only main writes it.
+      - uses: Swatinem/rust-cache@v2
+        if: github.ref_type != 'tag'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set application version from release tag
         if: github.ref_type == 'tag'
