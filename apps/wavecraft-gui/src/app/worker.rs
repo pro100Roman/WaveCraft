@@ -4,14 +4,127 @@ use crate::{
     create_decoded_data_recorder, finish_gui_recording, radio_single_trigger_config,
     recording_capture_target, recording_completion_label, scope_rolling_sample_capacity,
     start_gui_recording, usb_speed_warning, uses_rolling_scope_buffer, AcquisitionMode,
-    ActiveCapture, CaptureReady, CaptureSettingsTab, CaptureTarget, CompletionStatus, DeviceEntry,
-    DiscoveredDevice, DsCopeCalibrationValues, DsCopeTriggerSource, GuiRecordingSettings, HashSet,
-    InstrumentKind, LoadedRecording, LogicDecodeWorker, ManualCalibrationEditor, PathBuf,
-    ProtocolCaptureDecoder, RadioDiscoveryReport, RadioSingleTrigger, ScopeMeasurementCache,
-    TryRecvError, WaveformStore, WaveformTab, WorkerSuccess, DSCOPE_VOLTS_PER_DIV_MV,
+    ActiveCapture, CaptureReady, CaptureSession, CaptureSettingsTab, CaptureTarget,
+    CompletionStatus, DeviceDescriptor, DeviceEntry, DiscoveredDevice, DsCopeCalibrationValues,
+    DsCopeCaptureConfig, DsCopeRuntimeTriggerControl, DsCopeTriggerSource, DsLogicCaptureConfig,
+    FileDecodedDataRecorder, FileRecorder, GuiRecordingSettings, HashSet, InstrumentKind,
+    LoadedRecording, LogicDecodeWorker, ManualCalibrationEditor, Path, PathBuf,
+    ProtocolAnalyzerInstance, ProtocolCaptureDecoder, ProtocolDecodeSnapshot, RadioDiscoveryReport,
+    RadioSingleTrigger, ScopeMeasurementCache, TryRecvError, WaveformStore, WaveformTab,
+    WorkerSuccess, DSCOPE_VOLTS_PER_DIV_MV,
 };
 
 use crate::WaveCraftApp;
+
+/// The files a starting capture writes to, with the paths they were opened at.
+struct CaptureRecorders {
+    recorder: Option<FileRecorder>,
+    recording_path: Option<PathBuf>,
+    decoded_data_recorder: Option<FileDecodedDataRecorder>,
+    decoded_data_path: Option<PathBuf>,
+}
+
+/// What a starting capture shows: the waveforms to fill and the decoder that
+/// reads the logic samples while they arrive.
+struct CaptureDisplay {
+    preserve_display_until_complete: bool,
+    waveforms: WaveformStore,
+    protocol_decode_snapshot: ProtocolDecodeSnapshot,
+    protocol_analyzers: Vec<ProtocolAnalyzerInstance>,
+    logic_decode: LogicDecodeWorker,
+}
+
+/// Everything the status line of a started capture depends on.
+#[derive(Clone, Copy)]
+struct StartedCaptureFacts<'a> {
+    mode: AcquisitionMode,
+    target: CaptureTarget,
+    instrument_count: usize,
+    recording_path: Option<&'a Path>,
+    decoded_data_path: Option<&'a Path>,
+    waiting_for_radio_trigger: bool,
+    has_logic_trigger: bool,
+    has_scope_trigger: bool,
+    scope_trigger_is_auto: bool,
+    radio_trigger_level_dbfs: f32,
+}
+
+fn started_capture_status(facts: &StartedCaptureFacts) -> String {
+    let StartedCaptureFacts {
+        mode,
+        target,
+        instrument_count: count,
+        recording_path,
+        decoded_data_path,
+        waiting_for_radio_trigger,
+        has_logic_trigger,
+        has_scope_trigger,
+        scope_trigger_is_auto,
+        radio_trigger_level_dbfs: level,
+    } = *facts;
+    if let Some(path) = decoded_data_path {
+        return format!(
+            "RF Run acquisition from {count} instrument(s) · decoded data to {}",
+            path.display()
+        );
+    }
+    match (mode, recording_path) {
+        (AcquisitionMode::Single, Some(path)) if waiting_for_radio_trigger => format!(
+            "Single · waiting for RF trigger at {level:.1} dBFS; recording to {}",
+            path.display()
+        ),
+        (AcquisitionMode::Single, Some(path)) if has_logic_trigger => format!(
+            "Single · waiting for logic trigger; recording to {}",
+            path.display()
+        ),
+        (AcquisitionMode::Single, Some(path)) => {
+            format!(
+                "{} Single acquisition from {count} instrument(s) to {}",
+                target.label(),
+                path.display()
+            )
+        }
+        (AcquisitionMode::Single, None) => {
+            if waiting_for_radio_trigger {
+                format!("Single · waiting for RF trigger at {level:.1} dBFS")
+            } else if has_logic_trigger {
+                "Single · waiting for logic trigger".to_owned()
+            } else if has_scope_trigger && !scope_trigger_is_auto {
+                "Single · waiting for trigger".to_owned()
+            } else {
+                format!(
+                    "{} Single acquisition from {count} instrument(s)",
+                    target.label()
+                )
+            }
+        }
+        (AcquisitionMode::Repetitive, _) => format!(
+            "{} Repetitive acquisition from {count} instrument(s)",
+            target.label()
+        ),
+        (AcquisitionMode::Loop, _) => format!(
+            "{} Loop acquisition from {count} instrument(s)",
+            target.label()
+        ),
+        (AcquisitionMode::Run, Some(path)) => format!(
+            "{} Run acquisition from {count} instrument(s) · recording to {}",
+            target.label(),
+            path.display()
+        ),
+        (AcquisitionMode::Run, None) => {
+            if has_scope_trigger && scope_trigger_is_auto {
+                "Run · Auto".to_owned()
+            } else if has_scope_trigger {
+                "Run · waiting for trigger".to_owned()
+            } else {
+                format!(
+                    "{} Run acquisition from {count} instrument(s)",
+                    target.label()
+                )
+            }
+        }
+    }
+}
 
 impl WaveCraftApp {
     pub(crate) fn poll_worker(&mut self) {
@@ -83,115 +196,199 @@ impl WaveCraftApp {
     /// decides whether the display continues the previous capture, and adds it to
     /// the running captures. A capture nobody wants any more is stopped instead.
     pub(crate) fn handle_capture_ready(&mut self, ready: CaptureReady) {
+        let Some(ready) = self.discard_capture_nobody_wants(ready) else {
+            return;
+        };
         let CaptureReady {
             session,
             mode,
             target,
             retain_protocol_history,
             logic_config,
-            mut scope_config,
+            scope_config,
             scope_trigger_controls,
             scope_calibration_controls,
             radio_runtime_control,
             radio_spectrum,
             radio_dsp,
         } = ready;
-        if !self.capture_is_requested(target) {
-            self.requested_capture_target = None;
-            self.record_capture = false;
-            self.record_decoded_data = false;
-            match session.stop() {
-                Ok(()) => self.status = "Acquisition stopped".to_owned(),
-                Err(error) => self.set_error(error.to_string()),
-            }
-            return;
-        }
-        if self.scope_capture_restart_requested {
-            self.scope_capture_restart_requested = false;
-            match session.stop() {
-                Ok(()) => {
-                    self.status = "Reconfiguring oscilloscope frontend…".to_owned();
-                    self.begin_capture(mode, target);
-                }
-                Err(error) => self.set_error(error.to_string()),
-            }
-            return;
-        }
-        if !scope_trigger_controls.is_empty() {
-            let desired_trigger = match self.scope_settings.trigger.capture_config() {
-                Ok(trigger) => trigger,
+        let scope_config =
+            match self.scope_config_with_latest_trigger(scope_config, &scope_trigger_controls) {
+                Ok(scope_config) => scope_config,
                 Err(error) => {
-                    let cleanup = session.stop().err();
-                    self.set_error(match cleanup {
-                        Some(cleanup) => {
-                            format!("{error}; additionally failed to stop: {cleanup}")
-                        }
-                        None => error,
-                    });
+                    self.abort_capture(session, error);
                     return;
                 }
             };
-            if desired_trigger != scope_config.trigger() {
-                let update_result = scope_config
-                    .with_trigger_config(desired_trigger)
-                    .map_err(|error| error.to_string())
-                    .and_then(|updated_config| {
-                        for control in &scope_trigger_controls {
-                            control
-                                .update(desired_trigger)
-                                .map_err(|error| error.to_string())?;
-                        }
-                        Ok(updated_config)
-                    });
-                match update_result {
-                    Ok(updated_config) => scope_config = updated_config,
-                    Err(error) => {
-                        let cleanup = session.stop().err();
-                        self.set_error(match cleanup {
-                            Some(cleanup) => format!(
-                                "failed to apply the latest trigger settings: {error}; additionally failed to stop: {cleanup}"
-                            ),
-                            None => format!(
-                                "failed to apply the latest trigger settings: {error}"
-                            ),
-                        });
-                        return;
-                    }
-                }
-            }
-        }
         let count = session.descriptors().len();
+        let recorders =
+            match self.start_capture_recorders(session.descriptors(), logic_config, scope_config) {
+                Ok(recorders) => recorders,
+                Err(error) => {
+                    self.abort_capture(session, error);
+                    return;
+                }
+            };
+        let has_instrument = |kind| {
+            session
+                .descriptors()
+                .iter()
+                .any(|device| device.kind == kind)
+        };
+        let has_logic = has_instrument(InstrumentKind::LogicAnalyzer);
+        let has_scope = has_instrument(InstrumentKind::Oscilloscope);
+        let has_radio = has_instrument(InstrumentKind::RadioReceiver);
+        let radio_trigger = match self.arm_radio_trigger(mode, target, has_radio) {
+            Ok(trigger) => trigger,
+            Err(error) => {
+                self.abort_capture(session, error);
+                return;
+            }
+        };
+        let display = self.prepare_capture_display(
+            mode,
+            target,
+            has_scope,
+            retain_protocol_history,
+            logic_config,
+            scope_config,
+        );
+        let status = started_capture_status(&StartedCaptureFacts {
+            mode,
+            target,
+            instrument_count: count,
+            recording_path: recorders.recording_path.as_deref(),
+            decoded_data_path: recorders.decoded_data_path.as_deref(),
+            waiting_for_radio_trigger: radio_trigger.is_some(),
+            has_logic_trigger: has_logic && logic_config.trigger().is_some(),
+            has_scope_trigger: !scope_trigger_controls.is_empty(),
+            scope_trigger_is_auto: scope_config.trigger().source() == DsCopeTriggerSource::Auto,
+            radio_trigger_level_dbfs: f32::from(self.radio_settings.trigger_level_dbfs_tenths)
+                / 10.0,
+        });
+        self.captures.push(ActiveCapture {
+            session,
+            mode,
+            target,
+            preserve_display_until_complete: display.preserve_display_until_complete,
+            scope_config,
+            scope_trigger_controls,
+            scope_calibration_controls,
+            radio_runtime_control,
+            stopped: HashSet::new(),
+            waveforms: display.waveforms,
+            protocol_decode_snapshot: display.protocol_decode_snapshot,
+            protocol_analyzers: display.protocol_analyzers,
+            logic_decode: display.logic_decode,
+            radio_spectrum,
+            radio_dsp,
+            radio_trigger,
+            recorder: recorders.recorder,
+            recording_path: recorders.recording_path,
+            decoded_data_recorder: recorders.decoded_data_recorder,
+            decoded_data_path: recorders.decoded_data_path,
+            has_logic,
+            has_scope,
+            has_radio,
+        });
+        self.requested_capture_target = None;
+        self.record_capture = false;
+        self.record_decoded_data = false;
+        self.status = status;
+    }
+
+    /// Stops a capture that must not be shown: one nobody asks for any more, or
+    /// one that a scope frontend change has already made out of date (which then
+    /// starts again). Returns the capture when it should be shown.
+    fn discard_capture_nobody_wants(&mut self, ready: CaptureReady) -> Option<CaptureReady> {
+        if !self.capture_is_requested(ready.target) {
+            self.requested_capture_target = None;
+            self.record_capture = false;
+            self.record_decoded_data = false;
+            match ready.session.stop() {
+                Ok(()) => self.status = "Acquisition stopped".to_owned(),
+                Err(error) => self.set_error(error.to_string()),
+            }
+            return None;
+        }
+        if self.scope_capture_restart_requested {
+            self.scope_capture_restart_requested = false;
+            match ready.session.stop() {
+                Ok(()) => {
+                    self.status = "Reconfiguring oscilloscope frontend…".to_owned();
+                    self.begin_capture(ready.mode, ready.target);
+                }
+                Err(error) => self.set_error(error.to_string()),
+            }
+            return None;
+        }
+        Some(ready)
+    }
+
+    /// Stops a capture that could not be set up and reports why, adding the
+    /// reason the stop failed too when it did.
+    fn abort_capture(&mut self, session: CaptureSession, error: String) {
+        let cleanup = session.stop().err();
+        self.set_error(match cleanup {
+            Some(cleanup) => format!("{error}; additionally failed to stop: {cleanup}"),
+            None => error,
+        });
+    }
+
+    /// The scope config with the trigger the user has chosen since the capture was
+    /// requested. The new trigger is also sent to the running source, which is
+    /// the only place it can change without restarting.
+    fn scope_config_with_latest_trigger(
+        &self,
+        scope_config: DsCopeCaptureConfig,
+        trigger_controls: &[DsCopeRuntimeTriggerControl],
+    ) -> Result<DsCopeCaptureConfig, String> {
+        if trigger_controls.is_empty() {
+            return Ok(scope_config);
+        }
+        let desired_trigger = self.scope_settings.trigger.capture_config()?;
+        if desired_trigger == scope_config.trigger() {
+            return Ok(scope_config);
+        }
+        scope_config
+            .with_trigger_config(desired_trigger)
+            .map_err(|error| error.to_string())
+            .and_then(|updated_config| {
+                for control in trigger_controls {
+                    control
+                        .update(desired_trigger)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(updated_config)
+            })
+            .map_err(|error| format!("failed to apply the latest trigger settings: {error}"))
+    }
+
+    /// Opens the capture and decoded-data files the user asked for. A decoded-data
+    /// file that cannot be created marks the capture file as failed.
+    fn start_capture_recorders(
+        &self,
+        descriptors: &[DeviceDescriptor],
+        logic_config: DsLogicCaptureConfig,
+        scope_config: DsCopeCaptureConfig,
+    ) -> Result<CaptureRecorders, String> {
         let recording_path = self
             .record_capture
             .then(|| PathBuf::from(self.recording_path.trim()));
         let mut recorder = match recording_path.as_deref() {
-            Some(path) => {
-                match start_gui_recording(
-                    path,
-                    session.descriptors(),
-                    GuiRecordingSettings {
-                        logic_config,
-                        logic_settings: self.logic_settings,
-                        scope_config,
-                        scope_settings: self.scope_settings,
-                        radio_settings: &self.radio_settings,
-                        logic_channel_names: &self.logic_channel_names,
-                        scope_channel_names: &self.scope_channel_names,
-                    },
-                ) {
-                    Ok(recorder) => Some(recorder),
-                    Err(error) => {
-                        let cleanup = session.stop().err();
-                        self.set_error(match cleanup {
-                            Some(cleanup) => {
-                                format!("{error}; additionally failed to stop: {cleanup}")
-                            }
-                            None => error,
-                        });
-                        return;
-                    }
-                }
-            }
+            Some(path) => Some(start_gui_recording(
+                path,
+                descriptors,
+                GuiRecordingSettings {
+                    logic_config,
+                    logic_settings: self.logic_settings,
+                    scope_config,
+                    scope_settings: self.scope_settings,
+                    radio_settings: &self.radio_settings,
+                    logic_channel_names: &self.logic_channel_names,
+                    scope_channel_names: &self.scope_channel_names,
+                },
+            )?),
             None => None,
         };
         let decoded_data_path = self
@@ -202,55 +399,50 @@ impl WaveCraftApp {
                 Ok(recorder) => Some(recorder),
                 Err(error) => {
                     let _ = finish_gui_recording(&mut recorder, CompletionStatus::Failed);
-                    let cleanup = session.stop().err();
-                    self.set_error(match cleanup {
-                        Some(cleanup) => {
-                            format!("{error}; additionally failed to stop: {cleanup}")
-                        }
-                        None => error,
-                    });
-                    return;
+                    return Err(error);
                 }
             },
             None => None,
         };
-        let has_logic = session
-            .descriptors()
-            .iter()
-            .any(|device| device.kind == InstrumentKind::LogicAnalyzer);
-        let has_scope = session
-            .descriptors()
-            .iter()
-            .any(|device| device.kind == InstrumentKind::Oscilloscope);
-        let has_radio = session
-            .descriptors()
-            .iter()
-            .any(|device| device.kind == InstrumentKind::RadioReceiver);
-        let radio_trigger = if mode == AcquisitionMode::Single
+        Ok(CaptureRecorders {
+            recorder,
+            recording_path,
+            decoded_data_recorder,
+            decoded_data_path,
+        })
+    }
+
+    /// The single-shot RF trigger for a capture that waits for one, if it does.
+    fn arm_radio_trigger(
+        &self,
+        mode: AcquisitionMode,
+        target: CaptureTarget,
+        has_radio: bool,
+    ) -> Result<Option<RadioSingleTrigger>, String> {
+        let waits_for_trigger = mode == AcquisitionMode::Single
             && target.includes_radio_receiver()
             && has_radio
-            && self.radio_settings.trigger_enabled
-        {
-            let config = radio_single_trigger_config(&self.radio_settings);
-            match config.and_then(RadioSingleTrigger::new) {
-                Ok(trigger) => Some(trigger),
-                Err(error) => {
-                    let cleanup = session.stop().err();
-                    self.set_error(match cleanup {
-                        Some(cleanup) => format!(
-                            "failed to arm RF trigger: {error}; additionally failed to stop: {cleanup}"
-                        ),
-                        None => format!("failed to arm RF trigger: {error}"),
-                    });
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let waiting_for_radio_trigger = radio_trigger.is_some();
-        let has_scope_trigger = !scope_trigger_controls.is_empty();
-        let has_logic_trigger = has_logic && logic_config.trigger().is_some();
+            && self.radio_settings.trigger_enabled;
+        if !waits_for_trigger {
+            return Ok(None);
+        }
+        radio_single_trigger_config(&self.radio_settings)
+            .and_then(RadioSingleTrigger::new)
+            .map(Some)
+            .map_err(|error| format!("failed to arm RF trigger: {error}"))
+    }
+
+    /// Decides whether the new capture continues the finished one on display or
+    /// replaces it, and builds the waveform store and decoder it will fill.
+    fn prepare_capture_display(
+        &mut self,
+        mode: AcquisitionMode,
+        target: CaptureTarget,
+        has_scope: bool,
+        retain_protocol_history: bool,
+        logic_config: DsLogicCaptureConfig,
+        scope_config: DsCopeCaptureConfig,
+    ) -> CaptureDisplay {
         let rolling = uses_rolling_scope_buffer(mode, has_scope, scope_config.trigger().source());
         let scope_capacity = if rolling {
             scope_rolling_sample_capacity(scope_config, self.scope_time_per_division_seconds)
@@ -307,102 +499,12 @@ impl WaveCraftApp {
         }
         waveforms.scope_capacity = scope_capacity;
         waveforms.scope_rolling = rolling;
-        self.captures.push(ActiveCapture {
-            session,
-            mode,
-            target,
+        CaptureDisplay {
             preserve_display_until_complete,
-            scope_config,
-            scope_trigger_controls,
-            scope_calibration_controls,
-            radio_runtime_control,
-            stopped: HashSet::new(),
             waveforms,
             protocol_decode_snapshot,
             protocol_analyzers,
             logic_decode,
-            radio_spectrum,
-            radio_dsp,
-            radio_trigger,
-            recorder,
-            recording_path: recording_path.clone(),
-            decoded_data_recorder,
-            decoded_data_path: decoded_data_path.clone(),
-            has_logic,
-            has_scope,
-            has_radio,
-        });
-        self.requested_capture_target = None;
-        self.record_capture = false;
-        self.record_decoded_data = false;
-        self.status = match (mode, recording_path.as_ref()) {
-            (AcquisitionMode::Single, Some(path)) if waiting_for_radio_trigger => format!(
-                "Single · waiting for RF trigger at {:.1} dBFS; recording to {}",
-                f32::from(self.radio_settings.trigger_level_dbfs_tenths) / 10.0,
-                path.display()
-            ),
-            (AcquisitionMode::Single, Some(path)) if has_logic_trigger => format!(
-                "Single · waiting for logic trigger; recording to {}",
-                path.display()
-            ),
-            (AcquisitionMode::Single, Some(path)) => {
-                format!(
-                    "{} Single acquisition from {count} instrument(s) to {}",
-                    target.label(),
-                    path.display()
-                )
-            }
-            (AcquisitionMode::Single, None) => {
-                if waiting_for_radio_trigger {
-                    format!(
-                        "Single · waiting for RF trigger at {:.1} dBFS",
-                        f32::from(self.radio_settings.trigger_level_dbfs_tenths) / 10.0
-                    )
-                } else if has_logic_trigger {
-                    "Single · waiting for logic trigger".to_owned()
-                } else if has_scope_trigger
-                    && scope_config.trigger().source() != DsCopeTriggerSource::Auto
-                {
-                    "Single · waiting for trigger".to_owned()
-                } else {
-                    format!(
-                        "{} Single acquisition from {count} instrument(s)",
-                        target.label()
-                    )
-                }
-            }
-            (AcquisitionMode::Repetitive, _) => format!(
-                "{} Repetitive acquisition from {count} instrument(s)",
-                target.label()
-            ),
-            (AcquisitionMode::Loop, _) => format!(
-                "{} Loop acquisition from {count} instrument(s)",
-                target.label()
-            ),
-            (AcquisitionMode::Run, Some(path)) => format!(
-                "{} Run acquisition from {count} instrument(s) · recording to {}",
-                target.label(),
-                path.display()
-            ),
-            (AcquisitionMode::Run, None) => {
-                if has_scope_trigger && scope_config.trigger().source() == DsCopeTriggerSource::Auto
-                {
-                    "Run · Auto".to_owned()
-                } else if has_scope_trigger {
-                    "Run · waiting for trigger".to_owned()
-                } else {
-                    format!(
-                        "{} Run acquisition from {count} instrument(s)",
-                        target.label()
-                    )
-                }
-            }
-        };
-        if let Some(path) = decoded_data_path {
-            self.status = format!(
-                "RF Run acquisition from {count} instrument(s) · decoded data to {}",
-                path.display()
-            );
         }
     }
 
@@ -581,31 +683,38 @@ mod tests {
         mode: AcquisitionMode,
         target: CaptureTarget,
     ) -> CaptureReady {
-        ready_from(app, kind, false, mode, target)
+        ready_with(app, &[kind], false, mode, target)
     }
 
-    fn ready_from(
+    /// Like `ready`, with one idle instrument per kind; `panic_when_stopped`
+    /// makes stopping the session fail.
+    fn ready_with(
         app: &WaveCraftApp,
-        kind: InstrumentKind,
+        kinds: &[InstrumentKind],
         panic_when_stopped: bool,
         mode: AcquisitionMode,
         target: CaptureTarget,
     ) -> CaptureReady {
-        let source = IdleSource {
-            descriptor: DeviceDescriptor {
-                id: DeviceId::new("fake:1"),
-                name: "Fake instrument".to_owned(),
-                kind,
-            },
-            panic_when_stopped,
-        };
+        let sources = kinds
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                Box::new(IdleSource {
+                    descriptor: DeviceDescriptor {
+                        id: DeviceId::new(format!("fake:{index}")),
+                        name: format!("Fake instrument {index}"),
+                        kind: *kind,
+                    },
+                    panic_when_stopped,
+                }) as Box<dyn CaptureSource>
+            })
+            .collect();
         let spectrum = || {
             SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)
                 .expect("the spectrum processor accepts the GUI FFT length")
         };
         CaptureReady {
-            session: CaptureCoordinator::start(vec![Box::new(source)])
-                .expect("the idle source starts"),
+            session: CaptureCoordinator::start(sources).expect("the idle sources start"),
             mode,
             target,
             retain_protocol_history: false,
@@ -677,6 +786,165 @@ mod tests {
             scope_channel_names: ["Probe A".to_owned(), "Probe B".to_owned()],
             completion: CompletionStatus::Complete,
         })
+    }
+
+    fn status_facts() -> StartedCaptureFacts<'static> {
+        StartedCaptureFacts {
+            mode: AcquisitionMode::Run,
+            target: CaptureTarget::LogicAnalyzer,
+            instrument_count: 2,
+            recording_path: None,
+            decoded_data_path: None,
+            waiting_for_radio_trigger: false,
+            has_logic_trigger: false,
+            has_scope_trigger: false,
+            scope_trigger_is_auto: false,
+            radio_trigger_level_dbfs: -42.5,
+        }
+    }
+
+    #[test]
+    fn the_started_capture_status_describes_every_mode_and_trigger() {
+        let file = Some(Path::new("cap.dsv"));
+        let single = StartedCaptureFacts {
+            mode: AcquisitionMode::Single,
+            ..status_facts()
+        };
+        let run = status_facts();
+        let cases = [
+            (
+                "single, RF trigger, recording",
+                StartedCaptureFacts {
+                    recording_path: file,
+                    waiting_for_radio_trigger: true,
+                    // The RF trigger is named first when a logic trigger exists too.
+                    has_logic_trigger: true,
+                    ..single
+                },
+                "Single · waiting for RF trigger at -42.5 dBFS; recording to cap.dsv",
+            ),
+            (
+                "single, logic trigger, recording",
+                StartedCaptureFacts {
+                    recording_path: file,
+                    has_logic_trigger: true,
+                    ..single
+                },
+                "Single · waiting for logic trigger; recording to cap.dsv",
+            ),
+            (
+                "single, recording",
+                StartedCaptureFacts {
+                    recording_path: file,
+                    // Only the logic and RF triggers are named while recording.
+                    has_scope_trigger: true,
+                    ..single
+                },
+                "Logic Analyzer Single acquisition from 2 instrument(s) to cap.dsv",
+            ),
+            (
+                "single, RF trigger",
+                StartedCaptureFacts {
+                    waiting_for_radio_trigger: true,
+                    has_logic_trigger: true,
+                    ..single
+                },
+                "Single · waiting for RF trigger at -42.5 dBFS",
+            ),
+            (
+                "single, logic trigger",
+                StartedCaptureFacts {
+                    has_logic_trigger: true,
+                    has_scope_trigger: true,
+                    ..single
+                },
+                "Single · waiting for logic trigger",
+            ),
+            (
+                "single, scope trigger",
+                StartedCaptureFacts {
+                    has_scope_trigger: true,
+                    ..single
+                },
+                "Single · waiting for trigger",
+            ),
+            (
+                "single, scope auto trigger does not wait",
+                StartedCaptureFacts {
+                    has_scope_trigger: true,
+                    scope_trigger_is_auto: true,
+                    ..single
+                },
+                "Logic Analyzer Single acquisition from 2 instrument(s)",
+            ),
+            (
+                "single",
+                single,
+                "Logic Analyzer Single acquisition from 2 instrument(s)",
+            ),
+            (
+                "repetitive ignores the recording",
+                StartedCaptureFacts {
+                    mode: AcquisitionMode::Repetitive,
+                    recording_path: file,
+                    ..run
+                },
+                "Logic Analyzer Repetitive acquisition from 2 instrument(s)",
+            ),
+            (
+                "loop",
+                StartedCaptureFacts {
+                    mode: AcquisitionMode::Loop,
+                    target: CaptureTarget::Combined,
+                    ..run
+                },
+                "Combined Loop acquisition from 2 instrument(s)",
+            ),
+            (
+                "run, recording",
+                StartedCaptureFacts {
+                    recording_path: file,
+                    has_scope_trigger: true,
+                    ..run
+                },
+                "Logic Analyzer Run acquisition from 2 instrument(s) · recording to cap.dsv",
+            ),
+            (
+                "run, scope auto trigger",
+                StartedCaptureFacts {
+                    has_scope_trigger: true,
+                    scope_trigger_is_auto: true,
+                    ..run
+                },
+                "Run · Auto",
+            ),
+            (
+                "run, scope trigger",
+                StartedCaptureFacts {
+                    has_scope_trigger: true,
+                    ..run
+                },
+                "Run · waiting for trigger",
+            ),
+            (
+                "run",
+                run,
+                "Logic Analyzer Run acquisition from 2 instrument(s)",
+            ),
+            (
+                "decoded data replaces the mode text",
+                StartedCaptureFacts {
+                    target: CaptureTarget::RadioReceiver,
+                    recording_path: file,
+                    decoded_data_path: Some(Path::new("decoded.dsv")),
+                    ..run
+                },
+                "RF Run acquisition from 2 instrument(s) · decoded data to decoded.dsv",
+            ),
+        ];
+        for (label, facts, expected) in cases {
+            assert_eq!(started_capture_status(&facts), expected, "{label}");
+        }
     }
 
     #[test]
@@ -1009,9 +1277,9 @@ mod tests {
             .join("capture.dsv")
             .to_string_lossy()
             .into_owned();
-        let started = ready_from(
+        let started = ready_with(
             &app,
-            InstrumentKind::LogicAnalyzer,
+            &[InstrumentKind::LogicAnalyzer],
             true,
             AcquisitionMode::Run,
             CaptureTarget::LogicAnalyzer,
@@ -1061,7 +1329,8 @@ mod tests {
         let mut app = app();
         request(&mut app, CaptureTarget::LogicAnalyzer);
         app.record_capture = true;
-        app.recording_path = path.to_string_lossy().into_owned();
+        // Whitespace around the path typed into the field is not part of the name.
+        app.recording_path = format!("  {} ", path.display());
         let started = ready(
             &app,
             InstrumentKind::LogicAnalyzer,
@@ -1083,34 +1352,66 @@ mod tests {
     }
 
     #[test]
-    fn a_single_rf_capture_with_the_trigger_enabled_waits_for_the_trigger() {
-        for (trigger_enabled, waits) in [(true, true), (false, false)] {
-            let mut app = app();
-            request(&mut app, CaptureTarget::RadioReceiver);
-            app.radio_settings.trigger_enabled = trigger_enabled;
-            let started = ready(
-                &app,
-                InstrumentKind::RadioReceiver,
-                AcquisitionMode::Single,
+    fn only_a_single_rf_capture_with_the_trigger_enabled_waits_for_the_trigger() {
+        // (target, mode, trigger enabled, whether the capture waits)
+        for (target, mode, trigger_enabled, waits) in [
+            (
                 CaptureTarget::RadioReceiver,
-            );
+                AcquisitionMode::Single,
+                true,
+                true,
+            ),
+            (
+                CaptureTarget::RadioReceiver,
+                AcquisitionMode::Single,
+                false,
+                false,
+            ),
+            (
+                CaptureTarget::RadioReceiver,
+                AcquisitionMode::Run,
+                true,
+                false,
+            ),
+            (CaptureTarget::Combined, AcquisitionMode::Single, true, true),
+        ] {
+            let mut app = app();
+            request(&mut app, target);
+            app.radio_settings.trigger_enabled = trigger_enabled;
+            app.radio_settings.trigger_level_dbfs_tenths = -425;
+            let started = ready_with(&app, &[InstrumentKind::RadioReceiver], false, mode, target);
 
             app.handle_capture_ready(started);
 
-            assert_eq!(app.captures.len(), 1);
-            assert!(app.captures[0].has_radio);
+            let label = format!("{target:?} {mode:?} trigger_enabled = {trigger_enabled}");
+            assert_eq!(app.captures.len(), 1, "{label}");
+            assert!(app.captures[0].has_radio, "{label}");
+            assert_eq!(app.captures[0].radio_trigger.is_some(), waits, "{label}");
             assert_eq!(
-                app.captures[0].radio_trigger.is_some(),
+                app.status == "Single · waiting for RF trigger at -42.5 dBFS",
                 waits,
-                "trigger_enabled = {trigger_enabled}"
-            );
-            assert_eq!(
-                app.status.contains("waiting for RF trigger"),
-                waits,
-                "{}",
+                "{label}: {}",
                 app.status
             );
         }
+    }
+
+    #[test]
+    fn a_single_rf_capture_without_a_radio_instrument_does_not_wait_for_the_trigger() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::Combined);
+        app.radio_settings.trigger_enabled = true;
+        let started = ready_with(
+            &app,
+            &[InstrumentKind::LogicAnalyzer, InstrumentKind::Oscilloscope],
+            false,
+            AcquisitionMode::Single,
+            CaptureTarget::Combined,
+        );
+
+        app.handle_capture_ready(started);
+
+        assert!(app.captures[0].radio_trigger.is_none());
     }
 
     #[test]
@@ -1133,6 +1434,259 @@ mod tests {
             .last_error
             .as_deref()
             .is_some_and(|error| error.starts_with("failed to arm RF trigger")));
+    }
+
+    /// An idle scope capture whose trigger can be changed while it runs. The
+    /// returned source must stay alive for the control to keep working.
+    fn scope_trigger_control(
+        app: &WaveCraftApp,
+    ) -> (DsCopeCaptureSource, DsCopeRuntimeTriggerControl) {
+        let device = DiscoveredDevice {
+            profile: &wavecraft_usb::DSCOPE_U3P100,
+            location: DeviceLocation {
+                platform_path: "usb:scope".to_owned(),
+            },
+            speed: UsbSpeedClass::SuperSpeed,
+        };
+        DsCopeCaptureSource::with_runtime_trigger_control(
+            device,
+            app.scope_settings.capture_config().unwrap(),
+        )
+        .expect("a DSCope source can be built without hardware")
+    }
+
+    #[test]
+    fn a_scope_capture_that_can_update_its_trigger_starts_with_the_latest_one() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::Oscilloscope);
+        let (_source, control) = scope_trigger_control(&app);
+        let mut started = ready(
+            &app,
+            InstrumentKind::Oscilloscope,
+            AcquisitionMode::Run,
+            CaptureTarget::Oscilloscope,
+        );
+        started.scope_trigger_controls = vec![control];
+        assert_eq!(
+            started.scope_config.trigger().source(),
+            DsCopeTriggerSource::Auto
+        );
+        // The user changed the trigger while the capture was starting.
+        app.scope_settings.trigger.source = DsCopeTriggerSource::ChannelZero;
+
+        app.handle_capture_ready(started);
+
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+        assert_eq!(app.captures.len(), 1);
+        assert_eq!(
+            app.captures[0].scope_config.trigger().source(),
+            DsCopeTriggerSource::ChannelZero
+        );
+        assert_eq!(app.status, "Run · waiting for trigger");
+    }
+
+    #[test]
+    fn the_status_of_a_scope_capture_names_its_trigger() {
+        for (mode, source, expected) in [
+            (
+                AcquisitionMode::Run,
+                DsCopeTriggerSource::Auto,
+                "Run · Auto",
+            ),
+            (
+                AcquisitionMode::Run,
+                DsCopeTriggerSource::ChannelOne,
+                "Run · waiting for trigger",
+            ),
+            (
+                AcquisitionMode::Single,
+                DsCopeTriggerSource::ChannelOne,
+                "Single · waiting for trigger",
+            ),
+            (
+                AcquisitionMode::Single,
+                DsCopeTriggerSource::Auto,
+                "Oscilloscope Single acquisition from 1 instrument(s)",
+            ),
+        ] {
+            let mut app = app();
+            app.scope_settings.trigger.source = source;
+            request(&mut app, CaptureTarget::Oscilloscope);
+            let (_source, control) = scope_trigger_control(&app);
+            let mut started = ready(
+                &app,
+                InstrumentKind::Oscilloscope,
+                mode,
+                CaptureTarget::Oscilloscope,
+            );
+            started.scope_trigger_controls = vec![control];
+
+            app.handle_capture_ready(started);
+
+            assert_eq!(app.status, expected, "{mode:?} {source:?}");
+        }
+    }
+
+    #[test]
+    fn a_trigger_that_the_running_capture_no_longer_accepts_stops_it_and_reports_the_error() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::Oscilloscope);
+        let (source, control) = scope_trigger_control(&app);
+        let mut started = ready(
+            &app,
+            InstrumentKind::Oscilloscope,
+            AcquisitionMode::Run,
+            CaptureTarget::Oscilloscope,
+        );
+        started.scope_trigger_controls = vec![control];
+        app.scope_settings.trigger.source = DsCopeTriggerSource::ChannelZero;
+        // Dropping the source closes the channel the control sends on.
+        drop(source);
+
+        app.handle_capture_ready(started);
+
+        assert!(app.captures.is_empty());
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some(
+                "failed to apply the latest trigger settings: \
+                 DSCope capture is no longer running"
+            )
+        );
+    }
+
+    #[test]
+    fn an_invalid_scope_trigger_setting_stops_the_capture_and_reports_the_error() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::Oscilloscope);
+        let (_source, control) = scope_trigger_control(&app);
+        let mut started = ready(
+            &app,
+            InstrumentKind::Oscilloscope,
+            AcquisitionMode::Run,
+            CaptureTarget::Oscilloscope,
+        );
+        started.scope_trigger_controls = vec![control];
+        app.scope_settings.trigger.position_percent = 255;
+
+        app.handle_capture_ready(started);
+
+        assert!(app.captures.is_empty());
+        let error = app
+            .last_error
+            .as_deref()
+            .expect("the invalid trigger is reported");
+        assert!(!error.starts_with("failed to apply"), "{error}");
+        assert!(!app.capture_is_requested(CaptureTarget::Oscilloscope));
+    }
+
+    #[test]
+    fn a_scope_capture_without_trigger_controls_keeps_the_trigger_it_started_with() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::Oscilloscope);
+        let started = ready(
+            &app,
+            InstrumentKind::Oscilloscope,
+            AcquisitionMode::Run,
+            CaptureTarget::Oscilloscope,
+        );
+        app.scope_settings.trigger.source = DsCopeTriggerSource::ChannelZero;
+
+        app.handle_capture_ready(started);
+
+        assert_eq!(
+            app.captures[0].scope_config.trigger().source(),
+            DsCopeTriggerSource::Auto
+        );
+    }
+
+    #[test]
+    fn a_combined_capture_counts_and_flags_every_instrument() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::Combined);
+        let started = ready_with(
+            &app,
+            &[InstrumentKind::LogicAnalyzer, InstrumentKind::Oscilloscope],
+            false,
+            AcquisitionMode::Run,
+            CaptureTarget::Combined,
+        );
+
+        app.handle_capture_ready(started);
+
+        let capture = &app.captures[0];
+        assert!(capture.has_logic && capture.has_scope && !capture.has_radio);
+        assert_eq!(app.status, "Combined Run acquisition from 2 instrument(s)");
+    }
+
+    #[test]
+    fn a_single_logic_capture_with_a_trigger_waits_for_it() {
+        let mut app = app();
+        request(&mut app, CaptureTarget::LogicAnalyzer);
+        app.logic_settings.trigger_enabled = true;
+        let started = ready(
+            &app,
+            InstrumentKind::LogicAnalyzer,
+            AcquisitionMode::Single,
+            CaptureTarget::LogicAnalyzer,
+        );
+        assert!(
+            started.logic_config.trigger().is_some(),
+            "the enabled logic trigger reaches the capture config"
+        );
+
+        app.handle_capture_ready(started);
+
+        assert_eq!(app.status, "Single · waiting for logic trigger");
+    }
+
+    #[test]
+    fn a_finished_radio_capture_is_not_kept_on_display_when_a_new_run_starts() {
+        let mut app = app();
+        let finished = completed_capture(&app, false, false, true);
+        app.set_completed_capture_for_target(CaptureTarget::RadioReceiver, finished);
+        request(&mut app, CaptureTarget::RadioReceiver);
+        let started = ready(
+            &app,
+            InstrumentKind::RadioReceiver,
+            AcquisitionMode::Run,
+            CaptureTarget::RadioReceiver,
+        );
+
+        app.handle_capture_ready(started);
+
+        assert!(!app.captures[0].preserve_display_until_complete);
+    }
+
+    #[test]
+    fn a_decoded_data_file_that_cannot_be_created_marks_the_capture_file_as_failed() {
+        let directory = scratch_directory("decoded-failure-finishes-recording");
+        let recording = directory.join("capture.dsv");
+        let mut app = app();
+        request(&mut app, CaptureTarget::RadioReceiver);
+        app.record_capture = true;
+        app.recording_path = recording.to_string_lossy().into_owned();
+        app.record_decoded_data = true;
+        app.decoded_data_path = directory
+            .join("missing")
+            .join("decoded.dsv")
+            .to_string_lossy()
+            .into_owned();
+        let started = ready(
+            &app,
+            InstrumentKind::RadioReceiver,
+            AcquisitionMode::Run,
+            CaptureTarget::RadioReceiver,
+        );
+
+        app.handle_capture_ready(started);
+
+        assert!(app.captures.is_empty());
+        assert!(app.last_error.is_some());
+        let loaded = load_gui_recording(&recording, &app.protocol_analyzer.analyzers)
+            .expect("the capture file was finished, not left half written");
+        assert_eq!(loaded.completion, CompletionStatus::Failed);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
