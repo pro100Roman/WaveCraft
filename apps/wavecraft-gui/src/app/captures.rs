@@ -8,11 +8,11 @@ use crate::{
     radio_gain_u32, radio_microsecond_sample_count, radio_single_sample_limit,
     record_decoded_radio_packets, record_decoded_raw_messages, repetitive_interval, selected_radio,
     should_rearm_acquisition, start_capture, thread, AcquisitionMode, ActiveCapture, CaptureBatch,
-    CaptureEvent, CaptureTarget, CompletedCapture, CompletionStatus, DsLogicOperationMode,
-    HackRfSettings, Instant, PathBuf, ProtocolDecodeCache, RadioCaptureRequest,
-    RadioDataDecoderConfig, RadioProvider, RadioProviderSettings, RadioSingleTrigger,
-    ScheduledRepetitiveCapture, ScopeMeasurementCache, WaveformTab, WorkerSuccess,
-    MAX_CAPTURE_EVENTS_PER_POLL,
+    CaptureEvent, CaptureReady, CaptureTarget, CompletedCapture, CompletionStatus,
+    DsLogicOperationMode, HackRfSettings, Instant, PathBuf, ProtocolDecodeCache,
+    RadioCaptureRequest, RadioDataDecoderConfig, RadioProvider, RadioProviderSettings,
+    RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache, WaveformTab,
+    WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
 };
 
 use crate::WaveCraftApp;
@@ -231,18 +231,20 @@ impl WaveCraftApp {
                 scope_config,
                 calibration_values,
             )
-            .map(|started| WorkerSuccess::Capture {
-                session: started.session,
-                mode,
-                target,
-                retain_protocol_history,
-                logic_config: Box::new(logic_config),
-                scope_config,
-                scope_trigger_controls: started.scope_trigger_controls,
-                scope_calibration_controls: started.scope_calibration_controls,
-                radio_runtime_control: started.radio_runtime_control,
-                radio_spectrum: Box::new(started.radio_spectrum),
-                radio_dsp: Box::new(started.radio_dsp),
+            .map(|started| {
+                WorkerSuccess::Capture(Box::new(CaptureReady {
+                    session: started.session,
+                    mode,
+                    target,
+                    retain_protocol_history,
+                    logic_config,
+                    scope_config,
+                    scope_trigger_controls: started.scope_trigger_controls,
+                    scope_calibration_controls: started.scope_calibration_controls,
+                    radio_runtime_control: started.radio_runtime_control,
+                    radio_spectrum: started.radio_spectrum,
+                    radio_dsp: started.radio_dsp,
+                }))
             });
             let _ = sender.send(result);
         });

@@ -335,24 +335,28 @@ pub(crate) struct CompletedCapture {
 
 pub(crate) type FileRecorder = RecordingWriter<BufWriter<File>>;
 
+/// A capture that has started on its worker thread and is waiting to be adopted
+/// by the UI thread (see `WaveCraftApp::handle_capture_ready`).
+pub(crate) struct CaptureReady {
+    pub(crate) session: CaptureSession,
+    pub(crate) mode: AcquisitionMode,
+    pub(crate) target: CaptureTarget,
+    pub(crate) retain_protocol_history: bool,
+    pub(crate) logic_config: DsLogicCaptureConfig,
+    pub(crate) scope_config: DsCopeCaptureConfig,
+    pub(crate) scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
+    pub(crate) scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
+    pub(crate) radio_runtime_control: Option<HackRfRuntimeControl>,
+    pub(crate) radio_spectrum: SpectrumProcessor,
+    pub(crate) radio_dsp: RadioDspWorker,
+}
+
 pub(crate) enum WorkerSuccess {
     Devices {
         usb: Vec<DiscoveredDevice>,
         radio: RadioDiscoveryReport,
     },
-    Capture {
-        session: CaptureSession,
-        mode: AcquisitionMode,
-        target: CaptureTarget,
-        retain_protocol_history: bool,
-        logic_config: Box<DsLogicCaptureConfig>,
-        scope_config: DsCopeCaptureConfig,
-        scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
-        scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
-        radio_runtime_control: Option<HackRfRuntimeControl>,
-        radio_spectrum: Box<SpectrumProcessor>,
-        radio_dsp: Box<RadioDspWorker>,
-    },
+    Capture(Box<CaptureReady>),
     ScopeConfigured,
     ScopeAutoCalibrated(DsCopeCalibrationValues),
     ScopeAutoCalibrationSaved,
