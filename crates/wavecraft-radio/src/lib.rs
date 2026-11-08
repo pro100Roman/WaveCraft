@@ -43,6 +43,9 @@ pub struct RadioAnalyzerTelemetry {
 pub struct RadioAnalyzerOutput {
     pub channel_frequency_offset_hz: i64,
     pub channel_name: Arc<str>,
+    /// The sync word the channel's decoder looks for, as hexadecimal bytes
+    /// such as `91 d3`; `None` when the channel is decoded without one.
+    pub sync_word: Option<Arc<str>>,
     pub demodulated: Option<DemodulatedBatch>,
     pub raw: RawRadioOutput,
     pub packets: RadioPacketPipelineOutput,
@@ -86,6 +89,49 @@ impl RadioAnalyzerBank {
 pub enum RadioDataDecoderConfig {
     Raw(RawRadioConfig),
     Packets(RadioPacketPipelineConfig),
+}
+
+impl RadioDataDecoderConfig {
+    /// The sync word this decoder looks for, as hexadecimal bytes such as
+    /// `91 d3`, or as bits when it is not a whole number of bytes. `None`
+    /// when the decoder has no sync word.
+    pub fn sync_word_text(&self) -> Option<String> {
+        match self {
+            Self::Raw(config) if config.sync_word_bytes > 0 => Some(
+                (0..config.sync_word_bytes)
+                    .map(|index| {
+                        let shift = u32::from(config.sync_word_bytes - index - 1) * 8;
+                        format!("{:02x}", (config.sync_word >> shift) & 0xff)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            Self::Raw(_) => None,
+            Self::Packets(config) => sync_bits_text(&config.framing.sync.bits),
+        }
+    }
+}
+
+fn sync_bits_text(bits: &[bool]) -> Option<String> {
+    if bits.is_empty() {
+        return None;
+    }
+    let digit = |bit: &bool| if *bit { '1' } else { '0' };
+    if bits.len() % 8 != 0 {
+        return Some(bits.iter().map(digit).collect());
+    }
+    Some(
+        bits.chunks(8)
+            .map(|byte| {
+                format!(
+                    "{:02x}",
+                    byte.iter()
+                        .fold(0_u8, |value, bit| value << 1 | u8::from(*bit))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 enum RadioDataDecoder {
@@ -173,6 +219,7 @@ pub struct RadioAnalyzerRuntime {
     decoder: RadioDataDecoder,
     channel_frequency_offset_hz: i64,
     channel_name: Arc<str>,
+    sync_word: Option<Arc<str>>,
     channel_bandwidth_hz: u64,
     burst_active: bool,
     /// Set when the squelch opens, until the first IQ of the burst arrives.
@@ -204,6 +251,7 @@ impl RadioAnalyzerRuntime {
             .map_err(|error| format!("failed to initialize demodulators: {error}"))?;
         let signal = SignalAnalyzer::new(profile, &registry)
             .map_err(|error| format!("invalid radio analyzer profile: {error}"))?;
+        let sync_word = decoder_config.sync_word_text().map(Arc::from);
         let decoder = RadioDataDecoder::new(decoder_config)?;
         Ok(Self {
             signal,
@@ -211,6 +259,7 @@ impl RadioAnalyzerRuntime {
             decoder,
             channel_frequency_offset_hz,
             channel_name: channel_name.into(),
+            sync_word,
             channel_bandwidth_hz,
             burst_active: false,
             burst_just_opened: false,
@@ -314,6 +363,7 @@ impl RadioAnalyzerRuntime {
             return Some(RadioAnalyzerOutput {
                 channel_frequency_offset_hz: self.channel_frequency_offset_hz,
                 channel_name: Arc::clone(&self.channel_name),
+                sync_word: self.sync_word.clone(),
                 demodulated: None,
                 raw,
                 packets,
@@ -325,6 +375,7 @@ impl RadioAnalyzerRuntime {
             return Some(RadioAnalyzerOutput {
                 channel_frequency_offset_hz: self.channel_frequency_offset_hz,
                 channel_name: Arc::clone(&self.channel_name),
+                sync_word: self.sync_word.clone(),
                 demodulated: None,
                 raw: RawRadioOutput::default(),
                 packets: RadioPacketPipelineOutput::default(),
@@ -382,6 +433,7 @@ impl RadioAnalyzerRuntime {
         Ok(RadioAnalyzerOutput {
             channel_frequency_offset_hz: self.channel_frequency_offset_hz,
             channel_name: Arc::clone(&self.channel_name),
+            sync_word: self.sync_word.clone(),
             demodulated: outcome.demodulated,
             raw: outcome.raw,
             packets: outcome.packets,
@@ -612,6 +664,118 @@ mod tests {
             bit_order: BitOrder::MostSignificantFirst,
             minimum_bit_confidence_milli: 500,
             maximum_uncertain_bits: 0,
+        }
+    }
+
+    fn raw_config_with_sync(sync_word: u64, sync_word_bytes: u8) -> RadioDataDecoderConfig {
+        RadioDataDecoderConfig::Raw(RawRadioConfig {
+            sync_word,
+            sync_word_bytes,
+            ..raw_config()
+        })
+    }
+
+    fn packet_config_with_sync(bits: Vec<bool>) -> RadioDataDecoderConfig {
+        RadioDataDecoderConfig::Packets(RadioPacketPipelineConfig {
+            bit_transform: BitTransformConfig::default(),
+            framing: RadioPacketFramerConfig {
+                preamble: Vec::new(),
+                sync: SyncWordConfig {
+                    bits,
+                    max_bit_errors: 0,
+                },
+                whitening: None,
+                bit_order: BitOrder::MostSignificantFirst,
+                length: RadioPacketLength::Fixed { packet_bytes: 1 },
+                max_search_bits: 64,
+            },
+            crc: None,
+        })
+    }
+
+    fn bits_of(byte_values: &[u8]) -> Vec<bool> {
+        byte_values
+            .iter()
+            .flat_map(|byte| (0..8).rev().map(move |shift| (byte >> shift) & 1 == 1))
+            .collect()
+    }
+
+    #[test]
+    fn a_raw_decoder_names_its_sync_word_in_bytes_as_on_the_air() {
+        assert_eq!(
+            raw_config_with_sync(0x91d3, 2).sync_word_text().as_deref(),
+            Some("91 d3")
+        );
+        // Only the low-order bytes count, and a zero byte is still a byte.
+        assert_eq!(
+            raw_config_with_sync(0xff00_00d3, 2)
+                .sync_word_text()
+                .as_deref(),
+            Some("00 d3")
+        );
+        assert_eq!(
+            raw_config_with_sync(0x2d, 1).sync_word_text().as_deref(),
+            Some("2d")
+        );
+    }
+
+    #[test]
+    fn a_raw_decoder_without_a_sync_word_names_none() {
+        // The word is ignored when it has no bytes.
+        assert_eq!(raw_config_with_sync(0x91d3, 0).sync_word_text(), None);
+    }
+
+    #[test]
+    fn a_packet_decoder_names_its_sync_word_in_bytes_or_in_bits() {
+        assert_eq!(
+            packet_config_with_sync(bits_of(&[0x91, 0xd3]))
+                .sync_word_text()
+                .as_deref(),
+            Some("91 d3")
+        );
+        assert_eq!(
+            packet_config_with_sync(vec![true, false, true, false])
+                .sync_word_text()
+                .as_deref(),
+            Some("1010")
+        );
+        assert_eq!(packet_config_with_sync(Vec::new()).sync_word_text(), None);
+    }
+
+    #[test]
+    fn every_output_of_a_channel_names_the_sync_word_of_its_decoder() {
+        let fft_length = 256;
+        let input = IqBatch {
+            sample_rate_hz: 8_000,
+            center_frequency_hz: 100_000_000,
+            first_sample_index: 0,
+            discontinuity: true,
+            samples: vec![Iq8 { i: 0, q: 0 }; fft_length * 2],
+        };
+        let mut spectrum = SpectrumProcessor::new(fft_length, SpectrumWindow::Hann).unwrap();
+        let mut second_profile = profile();
+        second_profile.channel.frequency_offset_hz = -1_000;
+        let mut analyzers = RadioAnalyzerBank::new(vec![
+            RadioAnalyzerRuntime::new_named(profile(), raw_config_with_sync(0x91d3, 2), "Own")
+                .unwrap(),
+            RadioAnalyzerRuntime::new_named(
+                second_profile,
+                RadioDataDecoderConfig::Raw(raw_config()),
+                "General",
+            )
+            .unwrap(),
+        ]);
+
+        let output = process_radio_iq(&mut spectrum, &mut analyzers, &input, -40.0);
+
+        assert!(!output.analyses.is_empty());
+        for analysis in output.analyses {
+            let analysis = analysis.unwrap();
+            match &*analysis.channel_name {
+                "Own" => assert_eq!(analysis.sync_word.as_deref(), Some("91 d3")),
+                "General" => assert_eq!(analysis.sync_word, None),
+                other => panic!("unexpected channel {other}"),
+            }
         }
     }
 
@@ -993,5 +1157,38 @@ mod tests {
             panic!("runtime should use raw decoding");
         };
         assert!(!raw.is_synchronized());
+    }
+
+    #[test]
+    fn a_burst_names_the_sync_word_of_its_decoder_while_it_runs_and_when_it_ends() {
+        let mut runtime =
+            RadioAnalyzerRuntime::new(profile(), raw_config_with_sync(0x91d3, 2)).unwrap();
+        let spectrum = |power_dbfs: f32| SpectrumFrame {
+            source_range: 0..8,
+            center_frequency_hz: 100_000_000,
+            bin_width_hz: 1_000.0,
+            power_dbfs: vec![power_dbfs; 8],
+        };
+        let silence = |first_sample_index: u64| IqBatch {
+            sample_rate_hz: 64_000,
+            center_frequency_hz: 100_000_000,
+            first_sample_index,
+            discontinuity: false,
+            samples: vec![Iq8 { i: 0, q: 0 }; 64],
+        };
+
+        let running = runtime
+            .push(&silence(0), &[spectrum(-10.0)], -50.0)
+            .unwrap();
+        assert!(running.telemetry.burst_active, "the burst is running");
+        assert!(!running.burst_ended);
+        assert_eq!(running.sync_word.as_deref(), Some("91 d3"));
+
+        let quiet = spectrum(-90.0);
+        let ended = runtime
+            .push(&silence(64), &[quiet.clone(), quiet.clone(), quiet], -50.0)
+            .unwrap();
+        assert!(ended.burst_ended);
+        assert_eq!(ended.sync_word.as_deref(), Some("91 d3"));
     }
 }

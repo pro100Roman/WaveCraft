@@ -932,6 +932,15 @@ The word is recorded per channel as `radio.analyzer.channel.<n>.sync_word`, and
 only when the channel has one; recordings and settings without the key load with
 the general word for that channel.
 
+The popup that opens when a channel is clicked in RAW DATA shows the word the
+channel was decoded with. Each analyzer output carries it (`sync_word` of
+`RadioAnalyzerOutput`: hexadecimal bytes such as `91 d3`, or `None` when the
+decoder has no sync word), the analysis store keeps the latest word of each
+channel, and a message takes the word its channel had when the message started.
+The popup shows `none` for a channel decoded without a sync word and no row at
+all for a message that does not know it, such as one read from a decoded data
+file, which does not record the word.
+
 The setup panel is 300 px wide for every instrument, and an element that does
 not fit pushes its edge out, so the radio panel would be wider than the logic
 analyzer and oscilloscope ones. The sections of the radio card are therefore
