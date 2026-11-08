@@ -521,3 +521,77 @@ fn a_radio_capture_is_refused_when_a_channel_sync_word_is_not_valid() {
 
     assert!(error.starts_with("Channel 1: "), "{error}");
 }
+
+/// A capture whose radio store holds `count` raw messages with the sync word
+/// `91 d3`.
+fn radio_capture_with_sync_word_messages(count: u64) -> CompletedCapture {
+    let mut analysis = RadioAnalysisStore::new(1_000).unwrap();
+    for index in 0..count {
+        let mut values = vec![0xaa; 10];
+        values.extend([0x91, 0xd3, 0xee, 0x10]);
+        let start = index * 1_000;
+        analysis.ingest_raw(
+            RawRadioOutput {
+                bytes: values
+                    .iter()
+                    .enumerate()
+                    .map(|(position, value)| TimedByte {
+                        value: *value,
+                        range: SampleRange {
+                            start: start + position as u64 * 8,
+                            end: start + position as u64 * 8 + 8,
+                        },
+                        status: ByteStatus::default(),
+                    })
+                    .collect(),
+                message_starts: vec![RawRadioMessageStart {
+                    sample_index: start,
+                    preamble_bytes: 10,
+                    maximum_uncertain_bits: usize::MAX,
+                }],
+                diagnostics: Vec::new(),
+                synchronized: false,
+            },
+            0,
+            Arc::from("Channel 1"),
+        );
+        analysis.finish_channel_capture(0);
+    }
+    CompletedCapture {
+        waveforms: WaveformStore {
+            radio_analysis: analysis,
+            ..WaveformStore::default()
+        },
+        protocol_decode: ProtocolCaptureDecoder::new(&[]),
+        has_logic: false,
+        has_scope: false,
+        has_radio: true,
+    }
+}
+
+#[test]
+fn the_sync_words_of_the_last_radio_capture_are_offered_in_the_settings() {
+    let mut app = app_with_every_instrument();
+    assert!(app.displayed_sync_word_suggestions().is_empty());
+
+    app.radio_capture = Some(radio_capture_with_sync_word_messages(6));
+
+    let suggestions = app.displayed_sync_word_suggestions();
+    assert_eq!(suggestions.len(), 1, "{suggestions:?}");
+    assert_eq!(suggestions[0].word, 0x91d3);
+    assert_eq!(suggestions[0].messages, 6);
+}
+
+#[test]
+fn the_settings_with_detected_sync_words_paint() {
+    let mut app = app_with_every_instrument();
+    let context = context();
+    app.radio_capture = Some(radio_capture_with_sync_word_messages(6));
+    app.select_waveform_tab(WaveformTab::RadioReceiver);
+    app.radio_settings.analyzer.demodulation = RadioDemodulation::BinaryGfsk;
+    app.settings_open = true;
+
+    run_frames(&mut app, &context, 3);
+
+    assert!(app.settings_open);
+}

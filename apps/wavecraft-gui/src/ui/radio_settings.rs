@@ -6,10 +6,10 @@ use crate::{
     paint_capture_settings_save_button, selected_radio, Color32, DiscoveredRadio, FontId, Pos2,
     RadioAnalyzerChannelSettings, RadioAnalyzerSettings, RadioDataMode, RadioDemodulation,
     RadioProvider, RadioProviderFailure, RadioSettings, RadioWhiteningPreset, RangeInclusive,
-    RichText, SavedCaptureSettingsKind, SelectableHoverText, SyncWordSetting, ValueDomain,
-    WhiteningDirection, AUTOMATIC_CHANNEL_BANDWIDTH_HZ, AUTOMATIC_FILTER_TAP_COUNT, BACKGROUND,
-    MAX_RADIO_ANALYZER_CHANNELS, RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS, RAW_AUTOMATIC_PREAMBLE_BITS,
-    TEXT_MUTED,
+    RichText, SavedCaptureSettingsKind, SelectableHoverText, SyncWordSetting, SyncWordSuggestion,
+    ValueDomain, WhiteningDirection, AUTOMATIC_CHANNEL_BANDWIDTH_HZ, AUTOMATIC_FILTER_TAP_COUNT,
+    BACKGROUND, MAX_RADIO_ANALYZER_CHANNELS, RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS,
+    RAW_AUTOMATIC_PREAMBLE_BITS, TEXT_MUTED,
 };
 use std::collections::BTreeMap;
 use wavecraft_sdr::GainControlDescriptor;
@@ -208,15 +208,30 @@ pub(crate) fn paint_radio_bandwidth_value(
     *value = nearest_domain_value(domain, *value);
 }
 
+/// What [`paint_radio_capture_settings`] needs besides the settings: which
+/// controls may be used, and what the capture on display has to offer.
+pub(crate) struct RadioPanelState<'a> {
+    pub(crate) enabled: bool,
+    pub(crate) runtime_enabled: bool,
+    pub(crate) trigger_runtime_enabled: bool,
+    pub(crate) show_save_button: bool,
+    /// Sync words that the raw messages on display have in common.
+    pub(crate) sync_word_suggestions: &'a [SyncWordSuggestion],
+}
+
 pub(crate) fn paint_radio_capture_settings(
     ui: &mut egui::Ui,
     radio: &DiscoveredRadio,
     settings: &mut RadioSettings,
-    enabled: bool,
-    runtime_enabled: bool,
-    trigger_runtime_enabled: bool,
-    show_save_button: bool,
+    state: RadioPanelState<'_>,
 ) -> bool {
+    let RadioPanelState {
+        enabled,
+        runtime_enabled,
+        trigger_runtime_enabled,
+        show_save_button,
+        sync_word_suggestions,
+    } = state;
     ui.add_space(10.0);
     let card_width = ui.available_width();
     egui::Frame::none()
@@ -250,6 +265,7 @@ pub(crate) fn paint_radio_capture_settings(
                         &mut settings.analyzer,
                         settings.capture.sample_rate_hz,
                         enabled,
+                        sync_word_suggestions,
                     );
                 });
             if settings.analyzer.is_enabled() {
@@ -341,6 +357,7 @@ pub(crate) fn paint_radio_analyzer_configuration(
     settings: &mut RadioAnalyzerSettings,
     capture_sample_rate_hz: u64,
     enabled: bool,
+    sync_word_suggestions: &[SyncWordSuggestion],
 ) {
     ui.set_max_width(ui.available_width());
     paint_radio_analyzer_modulation(ui, settings, enabled);
@@ -357,7 +374,7 @@ pub(crate) fn paint_radio_analyzer_configuration(
             paint_radio_analyzer_filter_rows(ui, settings, capture_sample_rate_hz, enabled);
             paint_radio_analyzer_symbol_rows(ui, settings, enabled);
             paint_radio_analyzer_preamble_rows(ui, settings, enabled);
-            paint_radio_analyzer_sync_word_rows(ui, settings, enabled);
+            paint_radio_analyzer_sync_word_rows(ui, settings, enabled, sync_word_suggestions);
             paint_radio_analyzer_timing_rows(ui, settings, enabled);
             paint_radio_analyzer_acquisition_rows(ui, settings, enabled);
             paint_radio_analyzer_data_mode_row(ui, settings, enabled);
@@ -693,6 +710,7 @@ fn paint_radio_analyzer_sync_word_rows(
     ui: &mut egui::Ui,
     settings: &mut RadioAnalyzerSettings,
     enabled: bool,
+    sync_word_suggestions: &[SyncWordSuggestion],
 ) {
     paint_radio_parameter_label(
         ui,
@@ -747,6 +765,54 @@ fn paint_radio_analyzer_sync_word_rows(
     if settings.data_mode == RadioDataMode::Packets {
         settings.sync_word_bytes = settings.sync_word_bytes.max(1);
     }
+    ui.end_row();
+
+    paint_radio_sync_word_suggestions(ui, settings, enabled, sync_word_suggestions);
+}
+
+/// The sync words found in the captured messages, each a button that makes it
+/// the general sync word. A word already in use is not offered again.
+fn paint_radio_sync_word_suggestions(
+    ui: &mut egui::Ui,
+    settings: &mut RadioAnalyzerSettings,
+    enabled: bool,
+    sync_word_suggestions: &[SyncWordSuggestion],
+) {
+    let offered = sync_word_suggestions
+        .iter()
+        .filter(|suggestion| {
+            settings.sync_word_bytes != suggestion.bytes || settings.sync_word != suggestion.word
+        })
+        .collect::<Vec<_>>();
+    if offered.is_empty() {
+        return;
+    }
+    paint_radio_parameter_label(
+        ui,
+        "Detected sync words",
+        Some("Words that follow the preamble in the captured messages, with how many messages have them. They are found without a sync word being set; use one to decode with it"),
+    );
+    ui.vertical(|ui| {
+        for suggestion in offered {
+            let word = SyncWordSetting {
+                word: suggestion.word,
+                bytes: suggestion.bytes,
+            };
+            let response = ui
+                .add_enabled(
+                    enabled,
+                    egui::Button::new(format!("{}  ×{}", word.text(), suggestion.messages)).small(),
+                )
+                .on_hover_selectable_text(format!(
+                    "Seen after the preamble in {} messages, {} of them cut into bytes the way it is shown here. Click to use it as the general sync word",
+                    suggestion.messages, suggestion.aligned
+                ));
+            if response.clicked() {
+                settings.sync_word = suggestion.word;
+                settings.sync_word_bytes = suggestion.bytes;
+            }
+        }
+    });
     ui.end_row();
 }
 
@@ -1763,7 +1829,7 @@ mod tests {
 
         let _ = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                paint_radio_analyzer_configuration(ui, &mut settings, 0, true);
+                paint_radio_analyzer_configuration(ui, &mut settings, 0, true, &[]);
             });
         });
 
@@ -1778,7 +1844,7 @@ mod tests {
         let context = egui::Context::default();
         let _ = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                paint_radio_analyzer_configuration(ui, settings, 20_000_000, true);
+                paint_radio_analyzer_configuration(ui, settings, 20_000_000, true, &[]);
             });
         });
     }
@@ -2051,6 +2117,8 @@ mod tests {
         analyzer_section: bool,
         /// Paint the list of analyzer channels instead of the receive section.
         channels_section: bool,
+        /// Sync words offered in the analyzer section.
+        sync_word_suggestions: Vec<SyncWordSuggestion>,
         frames: u32,
     }
 
@@ -2065,6 +2133,7 @@ mod tests {
                 trigger_runtime_enabled: false,
                 analyzer_section: false,
                 channels_section: false,
+                sync_word_suggestions: Vec::new(),
                 frames: 0,
             };
             // The grid only knows its column widths after its first frame.
@@ -2080,6 +2149,19 @@ mod tests {
         fn analyzer_section(mut self) -> Self {
             self.analyzer_section = true;
             self.frame(Vec::new());
+            self
+        }
+
+        fn with_sync_word_suggestions(mut self, suggestions: &[(u64, usize)]) -> Self {
+            self.sync_word_suggestions = suggestions
+                .iter()
+                .map(|&(word, messages)| SyncWordSuggestion {
+                    word,
+                    bytes: 2,
+                    messages,
+                    aligned: messages - 1,
+                })
+                .collect();
             self
         }
 
@@ -2118,6 +2200,7 @@ mod tests {
                             &mut self.settings.analyzer,
                             self.settings.capture.sample_rate_hz,
                             self.enabled,
+                            &self.sync_word_suggestions,
                         );
                     } else {
                         paint_radio_receive_configuration(
@@ -2558,6 +2641,65 @@ mod tests {
             ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings).analyzer_section();
 
         assert!(panel.painted().starts_with("Channel 1: sync word"));
+    }
+
+    #[test]
+    fn a_detected_sync_word_is_a_button_that_makes_it_the_general_sync_word() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+                .with_sync_word_suggestions(&[(0x91d3, 152), (0x2dd4, 7)])
+                .analyzer_section();
+
+        let painted = panel.painted();
+        assert!(painted.has("Detected sync words"));
+        assert!(painted.has("91 d3  ×152"));
+        assert!(painted.has("2d d4  ×7"));
+        assert_eq!(panel.settings.analyzer.sync_word_bytes, 0);
+
+        let button = painted.center_of("2d d4  ×7");
+        panel.click(button);
+
+        assert_eq!(panel.settings.analyzer.sync_word, 0x2dd4);
+        assert_eq!(panel.settings.analyzer.sync_word_bytes, 2);
+        // The word now in use is not offered again; the other one still is.
+        let painted = panel.painted();
+        assert!(!painted.has("2d d4  ×7"));
+        assert!(painted.has("91 d3  ×152"));
+    }
+
+    #[test]
+    fn nothing_is_offered_when_no_sync_word_was_detected() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+                .analyzer_section();
+
+        assert!(!panel.painted().has("Detected sync words"));
+    }
+
+    #[test]
+    fn the_only_detected_sync_word_is_not_offered_once_it_is_in_use() {
+        let mut settings = analyzer_settings();
+        settings.analyzer.sync_word = 0x91d3;
+        settings.analyzer.sync_word_bytes = 2;
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings)
+            .with_sync_word_suggestions(&[(0x91d3, 152)])
+            .analyzer_section();
+
+        assert!(!panel.painted().has("Detected sync words"));
+    }
+
+    #[test]
+    fn a_detected_sync_word_cannot_be_used_while_capturing() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+                .with_sync_word_suggestions(&[(0x91d3, 152)])
+                .stopped()
+                .analyzer_section();
+        let button = panel.painted().center_of("91 d3  ×152");
+
+        panel.click(button);
+
+        assert_eq!(panel.settings.analyzer.sync_word_bytes, 0);
     }
 
     #[test]

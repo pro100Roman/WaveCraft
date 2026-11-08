@@ -6,7 +6,8 @@ use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, TextureHand
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use wavecraft_decode::{
-    DecodeDiagnostic, RadioPacketPipelineOutput, RawRadioMessageStart, RawRadioOutput, TimedByte,
+    DecodeDiagnostic, RadioPacketPipelineOutput, RawRadioMessageStart, RawRadioOutput,
+    SyncWordSuggestion, SyncWordSurvey, TimedByte,
 };
 use wavecraft_dsp::{
     DemodulatedBatch, SpectrumFrame, TimedAnalogSample, TimedSoftSymbol, TimedSparseSymbol,
@@ -15,6 +16,8 @@ use wavecraft_dsp::{
 const DEFAULT_WATERFALL_CAPACITY: usize = 256;
 const DEFAULT_ANALYSIS_CAPACITY: usize = 100_000;
 const MAX_RAW_MESSAGE_COUNT: usize = 10_000;
+/// Sync words offered for use at most.
+const MAX_SYNC_WORD_SUGGESTIONS: usize = 3;
 const MAX_WATERFALL_TEXTURE_WIDTH: usize = 512;
 const MIN_POWER_DBFS: f32 = -120.0;
 const MAX_POWER_DBFS: f32 = 0.0;
@@ -85,6 +88,10 @@ impl RawRadioMessage {
     fn is_accepted(&self) -> bool {
         self.uncertain_bits() <= self.maximum_uncertain_bits
     }
+
+    fn byte_values(&self) -> Vec<u8> {
+        self.bytes.iter().map(|byte| byte.value).collect()
+    }
 }
 
 /// Bounded, modulation-neutral output retained for analyzer rendering.
@@ -108,6 +115,13 @@ pub struct RadioAnalysisStore {
     raw_synchronized_channels: HashSet<i64>,
     raw_dropped_bytes: u64,
     raw_diagnostics: VecDeque<DecodeDiagnostic>,
+    /// The sync words in the completed raw messages. Unlike the messages it is
+    /// not bounded by what is kept for display: it counts every message once.
+    sync_survey: SyncWordSurvey,
+    /// Whether the messages are raw data, which have a sync word to find; a
+    /// packet carries only what follows its sync word, so a store that only
+    /// ever received packets never looks for one.
+    surveys_messages: bool,
     telemetry: RadioAnalyzerTelemetry,
 }
 
@@ -132,6 +146,8 @@ impl Default for RadioAnalysisStore {
             raw_synchronized_channels: HashSet::new(),
             raw_dropped_bytes: 0,
             raw_diagnostics: VecDeque::new(),
+            sync_survey: SyncWordSurvey::new(),
+            surveys_messages: false,
             telemetry: RadioAnalyzerTelemetry::default(),
         }
     }
@@ -203,6 +219,7 @@ impl RadioAnalysisStore {
                 self.sparse_symbol_alphabet_size = None;
                 self.raw_bytes.clear();
                 self.raw_messages.clear();
+                self.sync_survey.clear();
                 self.raw_synchronized_channels.clear();
                 self.analog_samples.extend(batch.samples);
                 self.trim_analog_samples();
@@ -224,6 +241,7 @@ impl RadioAnalysisStore {
             diagnostics,
             synchronized,
         } = output;
+        self.surveys_messages = true;
         if synchronized {
             self.raw_synchronized_channels
                 .insert(channel_frequency_offset_hz);
@@ -406,6 +424,13 @@ impl RadioAnalysisStore {
             .any(|message| !message.is_complete())
     }
 
+    /// The sync words that most completed raw messages have after their
+    /// preamble, the most common first. Empty until a word has been seen in a
+    /// few messages.
+    pub fn sync_word_suggestions(&self) -> Vec<SyncWordSuggestion> {
+        self.sync_survey.suggestions(MAX_SYNC_WORD_SUGGESTIONS)
+    }
+
     pub fn raw_dropped_messages(&self) -> u64 {
         self.raw_dropped_messages
     }
@@ -424,7 +449,12 @@ impl RadioAnalysisStore {
 
     pub fn finish_raw_capture(&mut self) {
         for message in &mut self.raw_messages {
-            message.complete = true;
+            if !message.complete {
+                message.complete = true;
+                if self.surveys_messages && message.is_accepted() {
+                    self.sync_survey.add(&message.byte_values());
+                }
+            }
         }
         let before = self.raw_messages.len();
         self.raw_messages.retain(RawRadioMessage::is_accepted);
@@ -509,6 +539,8 @@ impl RadioAnalysisStore {
         if !message.is_accepted() {
             self.raw_messages.remove(message_index);
             self.raw_rejected_messages = self.raw_rejected_messages.saturating_add(1);
+        } else if self.surveys_messages {
+            self.sync_survey.add(&message.byte_values());
         }
     }
 }
@@ -2805,6 +2837,185 @@ mod tests {
 
         assert!(store.raw_messages().is_empty());
         assert_eq!(store.raw_rejected_messages(), 1);
+    }
+
+    /// A raw message of `values` that starts at `start` and carries
+    /// `uncertain_bits` low-confidence bits in each byte.
+    fn raw_message_output(
+        values: &[u8],
+        start: u64,
+        maximum_uncertain_bits: usize,
+        uncertain_bits: u8,
+    ) -> RawRadioOutput {
+        RawRadioOutput {
+            bytes: values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| TimedByte {
+                    value: *value,
+                    range: SampleRange {
+                        start: start + index as u64 * 8,
+                        end: start + index as u64 * 8 + 8,
+                    },
+                    status: ByteStatus {
+                        low_confidence_bits: uncertain_bits,
+                        ..ByteStatus::default()
+                    },
+                })
+                .collect(),
+            message_starts: vec![RawRadioMessageStart {
+                sample_index: start,
+                preamble_bytes: 4,
+                maximum_uncertain_bits,
+            }],
+            diagnostics: vec![],
+            synchronized: false,
+        }
+    }
+
+    /// The bytes of a message as the raw decoder reports it.
+    fn message_with_sync_word(sync: [u8; 2], frame: u8) -> Vec<u8> {
+        let mut values = vec![0xaa; 10];
+        values.extend(sync);
+        values.extend([frame, 0x12, 0x34]);
+        values
+    }
+
+    #[test]
+    fn analysis_store_suggests_the_sync_word_most_raw_messages_share() {
+        let mut store = RadioAnalysisStore::new(64).unwrap();
+        for index in 0..5u64 {
+            let values = message_with_sync_word([0x91, 0xd3], 0xee + index as u8);
+            store.ingest_raw(
+                raw_message_output(&values, index * 1_000, usize::MAX, 0),
+                0,
+                Arc::from("Channel 1"),
+            );
+            store.finish_channel_capture(0);
+        }
+
+        let suggestions = store.sync_word_suggestions();
+
+        assert_eq!(suggestions.len(), 1, "{suggestions:?}");
+        assert_eq!(suggestions[0].word, 0x91d3);
+        assert_eq!(suggestions[0].messages, 5);
+    }
+
+    #[test]
+    fn analysis_store_waits_for_a_few_messages_before_suggesting_a_sync_word() {
+        let mut store = RadioAnalysisStore::new(64).unwrap();
+        for index in 0..2u64 {
+            let values = message_with_sync_word([0x91, 0xd3], 0xee);
+            store.ingest_raw(
+                raw_message_output(&values, index * 1_000, usize::MAX, 0),
+                0,
+                Arc::from("Channel 1"),
+            );
+            store.finish_channel_capture(0);
+        }
+
+        assert!(store.sync_word_suggestions().is_empty());
+    }
+
+    #[test]
+    fn analysis_store_counts_every_raw_message_not_only_the_ones_it_keeps() {
+        // The capacity is also the number of messages kept for display: the
+        // list holds twenty of the forty, the survey has seen all of them.
+        let mut store = RadioAnalysisStore::new(20).unwrap();
+        for index in 0..40u64 {
+            let values = message_with_sync_word([0x2d, 0xd4], 0xc3);
+            store.ingest_raw(
+                raw_message_output(&values, index * 1_000, usize::MAX, 0),
+                0,
+                Arc::from("Channel 1"),
+            );
+            store.finish_channel_capture(0);
+        }
+
+        assert_eq!(store.raw_messages().len(), 20);
+        assert_eq!(store.sync_word_suggestions()[0].messages, 40);
+    }
+
+    #[test]
+    fn analysis_store_counts_the_message_still_open_when_the_capture_ends() {
+        let mut store = RadioAnalysisStore::new(64).unwrap();
+        for index in 0..3u64 {
+            let values = message_with_sync_word([0x91, 0xd3], 0xee);
+            store.ingest_raw(
+                raw_message_output(&values, index * 1_000, usize::MAX, 0),
+                0,
+                Arc::from("Channel 1"),
+            );
+            if index < 2 {
+                store.finish_channel_capture(0);
+            }
+        }
+        assert!(store.sync_word_suggestions().is_empty());
+
+        store.finish_raw_capture();
+
+        assert_eq!(store.sync_word_suggestions()[0].messages, 3);
+        // Finishing again does not count the messages twice.
+        store.finish_raw_capture();
+        assert_eq!(store.sync_word_suggestions()[0].messages, 3);
+    }
+
+    #[test]
+    fn analysis_store_leaves_rejected_messages_out_of_the_sync_word_count() {
+        let mut store = RadioAnalysisStore::new(64).unwrap();
+        for index in 0..5u64 {
+            let values = message_with_sync_word([0x91, 0xd3], 0xee);
+            // Every byte has an uncertain bit, and none is allowed.
+            store.ingest_raw(
+                raw_message_output(&values, index * 1_000, 0, 1),
+                0,
+                Arc::from("Channel 1"),
+            );
+            store.finish_channel_capture(0);
+        }
+
+        assert!(store.sync_word_suggestions().is_empty());
+        assert_eq!(store.raw_rejected_messages(), 5);
+    }
+
+    #[test]
+    fn analysis_store_does_not_look_for_a_sync_word_in_packets() {
+        // A packet holds what follows its sync word, not the word itself.
+        let mut store = RadioAnalysisStore::new(64).unwrap();
+        let timed = |values: &[u8]| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| TimedByte {
+                    value: *value,
+                    range: SampleRange {
+                        start: index as u64 * 8,
+                        end: index as u64 * 8 + 8,
+                    },
+                    status: ByteStatus::default(),
+                })
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..5 {
+            let values = message_with_sync_word([0x91, 0xd3], 0xee);
+            store.ingest_packets(
+                RadioPacketPipelineOutput {
+                    packets: vec![RadioPacket {
+                        preamble: timed(&values[..10]),
+                        bytes: timed(&values[10..]),
+                        range: SampleRange { start: 0, end: 128 },
+                        confidence: 1.0,
+                        diagnostics: vec![],
+                    }],
+                    diagnostics: vec![],
+                },
+                0,
+                Arc::from("Channel 1"),
+            );
+        }
+
+        assert!(!store.raw_messages().is_empty());
+        assert!(store.sync_word_suggestions().is_empty());
     }
 
     #[test]

@@ -931,6 +931,45 @@ The word is recorded per channel as `radio.analyzer.channel.<n>.sync_word`, and
 only when the channel has one; recordings and settings without the key load with
 the general word for that channel.
 
+#### Finding the sync word of a transmitter
+
+Without a sync word the raw decoder cannot tell where the bytes of a message
+begin, and a sync word is what makes decoding accurate: on the two captures
+used above, decoding with `91 d3` and a preamble of four bytes found 7 more
+messages in 170 (and 2 more in 65) than the preamble-only mode, nearly all with
+the exact length of their frame, and with a preamble of two bytes 25 more
+(195 messages). The **Detected sync words** rows of the **Signal analyzer**
+section offer the word without it having to be known beforehand.
+
+`SyncWordSurvey` (`wavecraft-decode`) takes in every completed raw message once
+and does not keep it. A message must start, within its first eight bits, with at
+least sixteen alternating bits, a preamble; the first bit that does not
+alternate is where the sync word starts. That bit does not depend on how the
+bits were cut into bytes, so the messages of one transmitter are recognised
+together by the bit before the break and the nine bits after it, whatever their
+alignment, and whatever frame type follows the word. Within such a group the
+cut that most messages share (the bit of a byte the break falls on) is taken for
+the right one, and the two bytes read that way are the word. A word is offered
+once it has been seen in three messages, three words at most, the most common
+first, with the count of all the messages in its group and of those that were
+cut the way it is shown. The same word after a preamble of `55` instead of `aa`
+breaks on another bit and is a group of its own, and the counts are added.
+
+On the two captures the survey finds `91 d3` in 168 of 170 messages (152 cut as
+shown) and in 65 of 65 (64 cut as shown), and nothing else. Messages decoded
+with the sync word set give the same word in 175 of 177.
+
+A button with the word, `91 d3  ×152`, sets it as the general sync word, and
+the word in use is not offered again. The survey follows the capture on display,
+the running one or the last, including a loaded recording, and counts messages
+that the list of RAW DATA no longer keeps. It is not a decoder setting: a
+capture is decoded the same way with or without it, and nothing in it depends on
+earlier messages. It looks for a sync word in raw messages only, since a packet
+holds only what follows its sync word, and when two transmitters share the first
+nine bits after the break only the more common of the two is offered. Settings
+are locked while a capture runs, so a word detected during a capture is used
+after it.
+
 These operations are not application-field parsing. Their output is a
 `RadioPacket` containing timed bytes, source range, RSSI/power estimate,
 frequency-error estimate, confidence, and diagnostics. CRC failure does not

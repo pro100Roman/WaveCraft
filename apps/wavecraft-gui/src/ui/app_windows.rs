@@ -3,8 +3,8 @@
 
 use crate::{
     egui, paint_instrument_settings, paint_radio_capture_settings, paint_radio_settings,
-    selected_radio, ui::frame_state::FrameState, Color32, DsCopeCalibrationValues, RichText, Sense,
-    Vec2, WaveCraftApp, ACCENT, DSCOPE_VOLTS_PER_DIV_MV, TEXT_MUTED,
+    selected_radio, ui::frame_state::FrameState, Color32, DsCopeCalibrationValues, RadioPanelState,
+    RichText, Sense, Vec2, WaveCraftApp, ACCENT, DSCOPE_VOLTS_PER_DIV_MV, TEXT_MUTED,
 };
 
 impl WaveCraftApp {
@@ -26,6 +26,7 @@ impl WaveCraftApp {
         let mut settings_open = self.settings_open;
         let mut close_settings = false;
         let settings_locked = self.is_busy();
+        let sync_word_suggestions = self.displayed_sync_word_suggestions();
         if settings_open {
             let screen_rect = context.input(|input| input.screen_rect());
             egui::Area::new(egui::Id::new("settings_modal_backdrop"))
@@ -84,10 +85,13 @@ impl WaveCraftApp {
                             ui,
                             &radio,
                             &mut self.radio_settings,
-                            !settings_locked,
-                            radio_runtime_controls_enabled,
-                            radio_trigger_runtime_controls_enabled,
-                            false,
+                            RadioPanelState {
+                                enabled: !settings_locked,
+                                runtime_enabled: radio_runtime_controls_enabled,
+                                trigger_runtime_enabled: radio_trigger_runtime_controls_enabled,
+                                show_save_button: false,
+                                sync_word_suggestions: &sync_word_suggestions,
+                            },
                         );
                     }
 

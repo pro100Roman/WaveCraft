@@ -102,8 +102,8 @@ use wavecraft_core::{
 use wavecraft_decode::{
     AdditiveWhiteningConfig, BitOrder, BitTransformConfig, ByteStatus, RadioPacketFramerConfig,
     RadioPacketLength, RadioPacketPipelineConfig, RadioPacketPipelineOutput, RawRadioConfig,
-    RawRadioMessageStart, RawRadioOutput, SampleRange, SyncWordConfig, TimedByte,
-    WhiteningDirection,
+    RawRadioMessageStart, RawRadioOutput, SampleRange, SyncWordConfig, SyncWordSuggestion,
+    TimedByte, WhiteningDirection,
 };
 use wavecraft_dsp::{
     automatic_filter_tap_count, recommended_fsk_channel_bandwidth_hz, BinaryFskProfile,

@@ -11,8 +11,8 @@ use crate::{
     CaptureEvent, CaptureFrame, CaptureReady, CaptureTarget, CompletedCapture, CompletionStatus,
     DsLogicOperationMode, FileDecodedDataRecorder, Instant, PathBuf, ProtocolAnalyzerInstance,
     ProtocolCaptureDecoder, ProtocolDecodeCache, RadioCaptureRequest, RadioDspWorker,
-    RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache, WaveformStore,
-    WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
+    RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache, SyncWordSuggestion,
+    WaveformStore, WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
 };
 
 use crate::WaveCraftApp;
@@ -879,6 +879,22 @@ impl WaveCraftApp {
             Some(WaveformTab::Combined) => self.combined_capture.as_ref(),
             None => None,
         }
+    }
+
+    /// The sync words that the raw messages of the radio capture on display
+    /// have in common: of the running capture, or else of the last one.
+    pub(crate) fn displayed_sync_word_suggestions(&self) -> Vec<SyncWordSuggestion> {
+        self.capture_for_target(CaptureTarget::RadioReceiver)
+            .filter(|active| !active.preserve_display_until_complete)
+            .map(|active| &active.waveforms)
+            .or_else(|| {
+                self.radio_capture
+                    .as_ref()
+                    .or(self.combined_capture.as_ref())
+                    .map(|capture| &capture.waveforms)
+            })
+            .map(|waveforms| waveforms.radio_analysis.sync_word_suggestions())
+            .unwrap_or_default()
     }
 
     pub(crate) fn has_displayed_completed_capture(&self) -> bool {

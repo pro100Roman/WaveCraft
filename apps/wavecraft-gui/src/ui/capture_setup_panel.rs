@@ -4,8 +4,8 @@ use crate::{
     egui, paint_capture_settings, paint_radio_capture_settings, paint_radio_device_selector,
     selected_device_for_role, selected_radio, ui::frame_state::FrameState,
     CaptureSettingsAvailability, CaptureSettingsTab, DeviceEntry, DeviceRole,
-    LogicCaptureSettingsEditor, RichText, SavedCaptureSettingsKind, ScopeCaptureSettingsEditor,
-    ScopeVisualizationSettingsEditor, WaveformTab, PANEL, TEXT_MUTED,
+    LogicCaptureSettingsEditor, RadioPanelState, RichText, SavedCaptureSettingsKind,
+    ScopeCaptureSettingsEditor, ScopeVisualizationSettingsEditor, WaveformTab, PANEL, TEXT_MUTED,
 };
 
 use crate::{ui::frame_actions::FrameActions, WaveCraftApp};
@@ -37,6 +37,8 @@ impl WaveCraftApp {
             })
             .map(|waveforms| (waveforms.logic_sample_count, waveforms.logic_rate_hz))
             .unwrap_or((0, 0));
+
+        let sync_word_suggestions = self.displayed_sync_word_suggestions();
 
         egui::SidePanel::left("capture_setup_fixed")
             .resizable(false)
@@ -85,10 +87,14 @@ impl WaveCraftApp {
                                     ui,
                                     &radio,
                                     &mut self.radio_settings,
-                                    capture_settings_enabled,
-                                    radio_runtime_controls_enabled,
-                                    radio_trigger_runtime_controls_enabled,
-                                    true,
+                                    RadioPanelState {
+                                        enabled: capture_settings_enabled,
+                                        runtime_enabled: radio_runtime_controls_enabled,
+                                        trigger_runtime_enabled:
+                                            radio_trigger_runtime_controls_enabled,
+                                        show_save_button: true,
+                                        sync_word_suggestions: &sync_word_suggestions,
+                                    },
                                 ) {
                                     actions.save_capture_settings_kind =
                                         Some(SavedCaptureSettingsKind::RadioFrequency);
