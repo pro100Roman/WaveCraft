@@ -932,6 +932,14 @@ The word is recorded per channel as `radio.analyzer.channel.<n>.sync_word`, and
 only when the channel has one; recordings and settings without the key load with
 the general word for that channel.
 
+The setup panel is 300 px wide for every instrument, and an element that does
+not fit pushes its edge out, so the radio panel would be wider than the logic
+analyzer and oscilloscope ones. The sections of the radio card are therefore
+indented by 10 px instead of the default 18, and the channel list has three
+narrow columns (name, offset, remove) with the sync word under them. Tests paint
+each section in exactly the room it has, and compare the edge of the panel in
+every tab.
+
 #### Finding the sync word of a transmitter
 
 Without a sync word the raw decoder cannot tell where the bytes of a message

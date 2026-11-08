@@ -595,3 +595,37 @@ fn the_settings_with_detected_sync_words_paint() {
 
     assert!(app.settings_open);
 }
+
+/// The right edge of the setup panel on the left, in the last frame.
+fn setup_panel_right_edge(tab: WaveformTab, configure: impl FnOnce(&mut WaveCraftApp)) -> f32 {
+    let mut app = app_with_every_instrument();
+    let context = context();
+    configure(&mut app);
+    app.select_waveform_tab(tab);
+    run_frames(&mut app, &context, 4);
+    context.available_rect().left()
+}
+
+#[test]
+fn the_setup_panel_is_as_wide_with_the_radio_as_with_the_logic_analyzer_and_scope() {
+    // A radio card with everything in it: the analyzer on, so that its channel
+    // list is shown, with several channels that have a sync word each.
+    let radio_settings = |app: &mut WaveCraftApp| {
+        app.radio_settings.analyzer.demodulation = RadioDemodulation::BinaryGfsk;
+        app.radio_settings.analyzer.channels = (0..12)
+            .map(|index| {
+                let mut channel = RadioAnalyzerChannelSettings::numbered(index, 0);
+                channel.sync_word = "2d d4 aa bb cc dd ee ff".to_owned();
+                channel
+            })
+            .collect();
+    };
+    let logic = setup_panel_right_edge(WaveformTab::LogicAnalyzer, |_| {});
+    let scope = setup_panel_right_edge(WaveformTab::Oscilloscope, |_| {});
+    let radio = setup_panel_right_edge(WaveformTab::RadioReceiver, radio_settings);
+    let combined = setup_panel_right_edge(WaveformTab::Combined, radio_settings);
+
+    assert_eq!(logic, scope, "the logic and scope panels agree");
+    assert_eq!(radio, logic, "the radio panel");
+    assert_eq!(combined, logic, "the combined view's panel");
+}

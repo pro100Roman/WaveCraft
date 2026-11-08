@@ -68,6 +68,11 @@ pub(crate) fn format_radio_mhz_number(value_hz: u64) -> String {
 }
 
 pub(crate) const RADIO_VALUE_WIDTH: f32 = 80.0;
+/// How far the body of a collapsible section is indented in the radio card.
+/// The default indent leaves the settings grids a few pixels too little room
+/// in the 300 px setup panel, which then grows past the width of the logic
+/// and scope panels.
+const RADIO_SECTION_INDENT: f32 = 10.0;
 /// Width of the sync word box of an analyzer channel: up to eight bytes.
 const RADIO_CHANNEL_SYNC_WORD_WIDTH: f32 = 72.0;
 /// Most characters of a channel's sync word: eight bytes with a space between.
@@ -242,6 +247,7 @@ pub(crate) fn paint_radio_capture_settings(
             let content_width = (card_width - 20.0).max(0.0);
             ui.set_width(content_width);
             ui.set_max_width(content_width);
+            ui.spacing_mut().indent = RADIO_SECTION_INDENT;
             egui::CollapsingHeader::new(RichText::new("Receive configuration").strong())
                 .id_salt("radio_receive_configuration_section")
                 .default_open(true)
@@ -1231,7 +1237,9 @@ pub(crate) fn paint_radio_analyzer_channels(
     };
     egui::Grid::new("radio_analyzer_channels")
         .num_columns(3)
-        .spacing([8.0, 6.0])
+        // The remove button column is narrower than a default column.
+        .min_col_width(20.0)
+        .spacing([4.0, 6.0])
         .show(ui, |ui| {
             for (index, channel) in settings.channels.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
@@ -2061,7 +2069,11 @@ mod tests {
                         ));
                     }
                     egui::Shape::Rect(rect) => {
-                        painted.right_edge = painted.right_edge.max(rect.rect.right());
+                        // A rectangle with neither fill nor outline, such as the
+                        // background of the panel, is not something to see.
+                        if rect.fill != Color32::TRANSPARENT || !rect.stroke.is_empty() {
+                            painted.right_edge = painted.right_edge.max(rect.rect.right());
+                        }
                         let size = rect.rect.size();
                         if (size.x - size.y).abs() < 1.0 && (10.0..24.0).contains(&size.x) {
                             painted.squares.push(rect.rect.center());
@@ -2128,8 +2140,10 @@ mod tests {
         channels_section: bool,
         /// Sync words offered in the analyzer section.
         sync_word_suggestions: Vec<SyncWordSuggestion>,
-        /// Width of the screen the panel is painted on.
-        width: f32,
+        /// The width the sections are painted in, when it is limited.
+        content_width: Option<f32>,
+        /// The right edge of the room the sections had in the last frame.
+        content_right: f32,
         frames: u32,
     }
 
@@ -2145,7 +2159,8 @@ mod tests {
                 analyzer_section: false,
                 channels_section: false,
                 sync_word_suggestions: Vec::new(),
-                width: 400.0,
+                content_width: None,
+                content_right: 0.0,
                 frames: 0,
             };
             // The grid only knows its column widths after its first frame.
@@ -2177,9 +2192,11 @@ mod tests {
             self
         }
 
-        /// As wide as the setup panel on the left of the window.
+        /// With as much room as a section has in the setup panel on the left
+        /// of the window: the panel, less its margins, the margins of the radio
+        /// card and the indent of the section body.
         fn in_the_setup_panel(mut self) -> Self {
-            self.width = 300.0;
+            self.content_width = Some(300.0 - 2.0 * 14.0 - 2.0 * 10.0 - RADIO_SECTION_INDENT);
             self
         }
 
@@ -2198,42 +2215,46 @@ mod tests {
         fn frame(&mut self, events: Vec<egui::Event>) -> Painted {
             self.frames += 1;
             let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(
-                    Pos2::ZERO,
-                    Vec2::new(self.width, 900.0),
-                )),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 6000.0))),
                 time: Some(f64::from(self.frames) / 60.0),
                 events,
                 ..egui::RawInput::default()
             };
             let output = self.context.run(input, |context| {
-                egui::CentralPanel::default().show(context, |ui| {
-                    if self.channels_section {
-                        paint_radio_analyzer_channels(
-                            ui,
-                            &mut self.settings.analyzer,
-                            self.settings.capture.sample_rate_hz,
-                            self.enabled,
-                        );
-                    } else if self.analyzer_section {
-                        paint_radio_analyzer_configuration(
-                            ui,
-                            &mut self.settings.analyzer,
-                            self.settings.capture.sample_rate_hz,
-                            self.enabled,
-                            &self.sync_word_suggestions,
-                        );
-                    } else {
-                        paint_radio_receive_configuration(
-                            ui,
-                            &self.radio,
-                            &mut self.settings,
-                            self.enabled,
-                            self.runtime_enabled,
-                            self.trigger_runtime_enabled,
-                        );
-                    }
-                });
+                // No background: it would be the widest thing painted.
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(context, |ui| {
+                        let width = self.content_width.unwrap_or(ui.available_width());
+                        self.content_right = ui.max_rect().left() + width;
+                        ui.allocate_ui(Vec2::new(width, ui.available_height()), |ui| {
+                            if self.channels_section {
+                                paint_radio_analyzer_channels(
+                                    ui,
+                                    &mut self.settings.analyzer,
+                                    self.settings.capture.sample_rate_hz,
+                                    self.enabled,
+                                );
+                            } else if self.analyzer_section {
+                                paint_radio_analyzer_configuration(
+                                    ui,
+                                    &mut self.settings.analyzer,
+                                    self.settings.capture.sample_rate_hz,
+                                    self.enabled,
+                                    &self.sync_word_suggestions,
+                                );
+                            } else {
+                                paint_radio_receive_configuration(
+                                    ui,
+                                    &self.radio,
+                                    &mut self.settings,
+                                    self.enabled,
+                                    self.runtime_enabled,
+                                    self.trigger_runtime_enabled,
+                                );
+                            }
+                        });
+                    });
             });
             Painted::new(&output.shapes)
         }
@@ -2619,7 +2640,7 @@ mod tests {
             ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings).channels_section();
 
         let painted = panel.painted();
-        assert!(painted.has("Sync word"), "the column has a heading");
+        assert!(painted.has("Sync word"), "the box has a label");
         assert!(painted.has("91 d3"), "the general word is the hint");
 
         panel.type_into("91 d3", "2dd4");
@@ -2653,29 +2674,64 @@ mod tests {
         assert!(sync_word.x > sync_label.x, "the box follows the label");
     }
 
+    /// Nothing painted reaches past the room the section has.
+    fn assert_fits(panel: &ReceivePanel, painted: &Painted, what: &str) {
+        // A widget outline can reach a pixel past the room its layout takes.
+        assert!(
+            painted.right_edge <= panel.content_right + 1.5,
+            "{what}: painted up to {} where there is room up to {}",
+            painted.right_edge,
+            panel.content_right
+        );
+    }
+
+    #[test]
+    fn the_receive_rows_fit_the_width_of_the_setup_panel() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+                .in_the_setup_panel();
+
+        let painted = panel.painted();
+
+        assert!(painted.has("Antenna port power (3.3 V)"));
+        assert_fits(&panel, &painted, "receive configuration");
+    }
+
+    #[test]
+    fn the_analyzer_rows_fit_the_width_of_the_setup_panel() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+                .with_sync_word_suggestions(&[(0x91d3, 12), (0x2dd4, 5), (0xaaaa, 3)])
+                .in_the_setup_panel()
+                .analyzer_section();
+
+        let painted = panel.painted();
+
+        assert!(painted.has("Detected sync words"));
+        assert_fits(&panel, &painted, "signal analyzer");
+    }
+
     #[test]
     fn the_channel_rows_fit_the_width_of_the_setup_panel() {
         let mut settings = analyzer_settings();
         settings.analyzer.sync_word = 0x91d3;
         settings.analyzer.sync_word_bytes = 2;
-        settings.analyzer.channels = vec![
-            RadioAnalyzerChannelSettings::numbered(0, -200_000),
-            RadioAnalyzerChannelSettings::numbered(1, 300_000),
-        ];
-        settings.analyzer.channels[1].sync_word = "2d d4 aa bb".to_owned();
+        // Enough channels for a three-digit index to be painted.
+        settings.analyzer.channels = (0..MAX_RADIO_ANALYZER_CHANNELS)
+            .map(|index| RadioAnalyzerChannelSettings::numbered(index, 0))
+            .collect();
+        for channel in &mut settings.analyzer.channels {
+            channel.sync_word = "2d d4 aa bb cc dd ee ff".to_owned();
+        }
         let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings)
             .in_the_setup_panel()
             .channels_section();
 
         let painted = panel.painted();
 
-        assert!(painted.has("2d d4 aa bb"));
-        assert!(
-            painted.right_edge <= panel.width,
-            "painted up to {} in a panel {} wide",
-            painted.right_edge,
-            panel.width
-        );
+        assert!(painted.has("100."), "the last channel is painted");
+        assert!(painted.has("2d d4 aa bb cc dd ee ff"));
+        assert_fits(&panel, &painted, "analyzer channels");
     }
 
     #[test]
