@@ -292,16 +292,7 @@ mod tests {
             iq_correction_enabled: true,
             analyzer_profiles: Vec::new(),
             analyzer_channel_names: Vec::new(),
-            decoder_config: RadioDataDecoderConfig::Raw(RawRadioConfig {
-                preamble_byte: 0xaa,
-                preamble_bytes: 4,
-                sync_word: 0,
-                sync_word_bytes: 0,
-                maximum_preamble_bit_errors: 0,
-                bit_order: BitOrder::MostSignificantFirst,
-                minimum_bit_confidence_milli: 500,
-                maximum_uncertain_bits: 0,
-            }),
+            decoder_configs: Vec::new(),
         };
         let started = start_capture(
             Vec::new(),

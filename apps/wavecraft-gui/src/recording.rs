@@ -4,21 +4,21 @@
 use crate::{
     channel_names_from_recording_metadata, coupling_label, empty_logic_channel_names,
     empty_scope_channel_names, format_capture_timestamp, ingest_radio_iq,
-    insert_channel_name_metadata, logic_settings_from_recording_metadata,
-    logic_trigger_condition_key, normalized_channel_name, radio_settings_from_recording_metadata,
-    read_saleae, scope_settings_from_recording_metadata, waveform::radio::RawRadioMessage, Arc,
-    BTreeMap, BufReader, ByteStatus, CaptureBatch, CaptureEvent, CaptureTarget, CompletedCapture,
-    DeviceDescriptor, DsCopeCaptureConfig, DsCopeTriggerSlope, DsCopeTriggerSource,
-    DsLogicCaptureConfig, DsLogicInputFilter, DsLogicOperationMode, DsLogicStopOption,
-    DsLogicTriggerConfig, Duration, FileRecorder, InstrumentKind, LogicCaptureSettings,
-    ProtocolAnalyzerInstance, ProtocolCaptureDecoder, RadioAnalysisStore, RadioAnalyzerBank,
-    RadioAnalyzerChannelSettings, RadioAnalyzerRuntime, RadioDataMode, RadioDemodulation,
-    RadioPacketPipelineOutput, RadioSettings, RawRadioMessageStart, RawRadioOutput, Read,
-    RecordingReader, RecordingWriter, SaleaeAnalogChannel, SaleaeCapture, SaleaeChannel,
-    SaleaeDigitalCapture, SampleRange, ScopeBatch, ScopeCaptureSettings, Seek, SpectrumProcessor,
-    SpectrumWindow, TimedByte, WaveformStore, WaveformTab, WhiteningDirection,
-    DSCOPE_SAMPLE_RATES_HZ, DSLOGIC_SAMPLE_RATES_HZ, LOGIC_CHANNEL_COUNT, MAX_WAVEFORM_SAMPLES,
-    RADIO_SPECTRUM_FFT_LENGTH,
+    insert_channel_name_metadata, insert_radio_analyzer_channels_metadata,
+    logic_settings_from_recording_metadata, logic_trigger_condition_key, normalized_channel_name,
+    radio_settings_from_recording_metadata, read_saleae, scope_settings_from_recording_metadata,
+    waveform::radio::RawRadioMessage, Arc, BTreeMap, BufReader, ByteStatus, CaptureBatch,
+    CaptureEvent, CaptureTarget, CompletedCapture, DeviceDescriptor, DsCopeCaptureConfig,
+    DsCopeTriggerSlope, DsCopeTriggerSource, DsLogicCaptureConfig, DsLogicInputFilter,
+    DsLogicOperationMode, DsLogicStopOption, DsLogicTriggerConfig, Duration, FileRecorder,
+    InstrumentKind, LogicCaptureSettings, ProtocolAnalyzerInstance, ProtocolCaptureDecoder,
+    RadioAnalysisStore, RadioAnalyzerBank, RadioAnalyzerChannelSettings, RadioAnalyzerRuntime,
+    RadioDataMode, RadioDemodulation, RadioPacketPipelineOutput, RadioSettings,
+    RawRadioMessageStart, RawRadioOutput, Read, RecordingReader, RecordingWriter,
+    SaleaeAnalogChannel, SaleaeCapture, SaleaeChannel, SaleaeDigitalCapture, SampleRange,
+    ScopeBatch, ScopeCaptureSettings, Seek, SpectrumProcessor, SpectrumWindow, TimedByte,
+    WaveformStore, WaveformTab, WhiteningDirection, DSCOPE_SAMPLE_RATES_HZ,
+    DSLOGIC_SAMPLE_RATES_HZ, LOGIC_CHANNEL_COUNT, MAX_WAVEFORM_SAMPLES, RADIO_SPECTRUM_FFT_LENGTH,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -748,7 +748,7 @@ fn insert_radio_analyzer_metadata(
     insert_radio_analyzer_signal_metadata(metadata, radio_settings);
     insert_radio_analyzer_data_metadata(metadata, radio_settings);
     insert_radio_analyzer_whitening_metadata(metadata, radio_settings);
-    insert_radio_analyzer_channel_metadata(metadata, radio_settings);
+    insert_radio_analyzer_channels_metadata(metadata, &radio_settings.analyzer.channels);
 }
 
 fn insert_radio_analyzer_fields<const COUNT: usize>(
@@ -935,26 +935,6 @@ fn insert_radio_analyzer_whitening_metadata(
             ),
         ],
     );
-}
-
-fn insert_radio_analyzer_channel_metadata(
-    metadata: &mut BTreeMap<String, String>,
-    radio_settings: &RadioSettings,
-) {
-    metadata.insert(
-        "radio.analyzer.channel_count".to_owned(),
-        radio_settings.analyzer.channels.len().to_string(),
-    );
-    for (index, channel) in radio_settings.analyzer.channels.iter().enumerate() {
-        metadata.insert(
-            format!("radio.analyzer.channel.{index}.offset_hz"),
-            channel.frequency_offset_hz.to_string(),
-        );
-        metadata.insert(
-            format!("radio.analyzer.channel.{index}.name"),
-            channel.name.clone(),
-        );
-    }
 }
 
 fn insert_logic_capture_metadata(
@@ -1254,14 +1234,15 @@ pub(crate) fn read_gui_recording_with_analyzers(
             .with_iq_correction(radio_settings.iq_correction_enabled);
     let radio_analyzers = match radio_settings.analyzer.signal_profiles() {
         Ok(profiles) if profiles.is_empty() => Vec::new(),
-        Ok(profiles) => match radio_settings.analyzer.decoder_config() {
-            Ok(config) => match profiles
+        Ok(profiles) => match radio_settings.analyzer.decoder_configs() {
+            Ok(configs) => match profiles
                 .into_iter()
+                .zip(configs)
                 .enumerate()
-                .map(|(index, profile)| {
+                .map(|(index, (profile, config))| {
                     RadioAnalyzerRuntime::new_named(
                         profile,
-                        config.clone(),
+                        config,
                         radio_settings.analyzer.channel_name(index),
                     )
                 })
@@ -1472,6 +1453,7 @@ pub(crate) fn read_gui_decoded_data(input: impl BufRead) -> Result<LoadedRecordi
             .map(|channel| RadioAnalyzerChannelSettings {
                 name: channel.name,
                 frequency_offset_hz: channel.frequency_offset_hz,
+                sync_word: String::new(),
             })
             .collect();
     }
@@ -2750,10 +2732,12 @@ mod tests {
             RadioAnalyzerChannelSettings {
                 name: "Uplink".to_owned(),
                 frequency_offset_hz: -200_000,
+                sync_word: "91 d3".to_owned(),
             },
             RadioAnalyzerChannelSettings {
                 name: "Downlink".to_owned(),
                 frequency_offset_hz: 200_000,
+                sync_word: String::new(),
             },
         ];
 
@@ -2765,12 +2749,21 @@ mod tests {
                 ("radio.analyzer.channel_count", "2"),
                 ("radio.analyzer.channel.0.offset_hz", "-200000"),
                 ("radio.analyzer.channel.0.name", "Uplink"),
+                ("radio.analyzer.channel.0.sync_word", "91 d3"),
                 ("radio.analyzer.channel.1.offset_hz", "200000"),
                 ("radio.analyzer.channel.1.name", "Downlink"),
                 ("radio.analyzer.channel_offset_hz", "-200000"),
             ],
         );
-        assert_not_recorded(&metadata, &["radio.analyzer.channel.2.name"]);
+        // A channel without a sync word of its own uses the general one, and
+        // records nothing.
+        assert_not_recorded(
+            &metadata,
+            &[
+                "radio.analyzer.channel.1.sync_word",
+                "radio.analyzer.channel.2.name",
+            ],
+        );
 
         case.radio_settings.analyzer.channels.clear();
         let metadata = case.recorded_metadata("gui-recording-analyzer-no-channels");

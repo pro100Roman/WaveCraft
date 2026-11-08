@@ -18,7 +18,9 @@ pub(crate) struct RadioCaptureRequest {
     pub(crate) iq_correction_enabled: bool,
     pub(crate) analyzer_profiles: Vec<SignalAnalyzerProfile>,
     pub(crate) analyzer_channel_names: Vec<String>,
-    pub(crate) decoder_config: RadioDataDecoderConfig,
+    /// One decoder configuration per analyzer channel, in channel order: the
+    /// channels differ in their sync word.
+    pub(crate) decoder_configs: Vec<RadioDataDecoderConfig>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,6 +89,11 @@ pub(crate) const AUTOMATIC_FILTER_TAP_COUNT: usize = 0;
 pub(crate) struct RadioAnalyzerChannelSettings {
     pub(crate) name: String,
     pub(crate) frequency_offset_hz: i64,
+    /// Sync word of this channel as hexadecimal text, one to eight bytes. Empty
+    /// uses the general sync word of [`RadioAnalyzerSettings`]. Kept as the
+    /// text typed so that a half-typed word is not lost; see
+    /// [`SyncWordSetting::parse`].
+    pub(crate) sync_word: String,
 }
 
 impl RadioAnalyzerChannelSettings {
@@ -94,7 +101,57 @@ impl RadioAnalyzerChannelSettings {
         Self {
             name: format!("Channel {}", index + 1),
             frequency_offset_hz,
+            sync_word: String::new(),
         }
+    }
+}
+
+/// A sync word and its length in bytes, as in [`RawRadioConfig`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SyncWordSetting {
+    pub(crate) word: u64,
+    pub(crate) bytes: u8,
+}
+
+impl SyncWordSetting {
+    /// Reads a sync word typed as hexadecimal digits, big-endian as on the air
+    /// (`91 d3` is the bytes 0x91, 0xd3). Spaces and a leading `0x` are
+    /// accepted. Empty text is no sync word.
+    pub(crate) fn parse(text: &str) -> Result<Option<Self>, String> {
+        let digits = text.split_whitespace().collect::<String>();
+        let digits = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+            .unwrap_or(&digits);
+        if digits.is_empty() {
+            return Ok(None);
+        }
+        if !digits.chars().all(|digit| digit.is_ascii_hexdigit()) {
+            return Err("sync word must be hexadecimal, for example 91 d3".to_owned());
+        }
+        if digits.len() % 2 != 0 {
+            return Err("sync word must be whole bytes: two hex digits per byte".to_owned());
+        }
+        if digits.len() > 16 {
+            return Err("sync word must be at most 8 bytes".to_owned());
+        }
+        let word = u64::from_str_radix(digits, 16)
+            .map_err(|_| "sync word must be hexadecimal, for example 91 d3".to_owned())?;
+        Ok(Some(Self {
+            word,
+            bytes: (digits.len() / 2) as u8,
+        }))
+    }
+
+    /// The word as bytes in hexadecimal, such as `91 d3`.
+    pub(crate) fn text(self) -> String {
+        (0..self.bytes)
+            .map(|index| {
+                let shift = u32::from(self.bytes - index - 1) * 8;
+                format!("{:02x}", (self.word >> shift) & 0xff)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -201,13 +258,43 @@ impl RadioAnalyzerSettings {
             .unwrap_or_else(|| format!("Channel {}", index + 1))
     }
 
-    pub(crate) fn raw_config(&self) -> RawRadioConfig {
+    /// The sync word shared by the channels that have none of their own.
+    pub(crate) fn general_sync_word(&self) -> SyncWordSetting {
+        SyncWordSetting {
+            word: self.sync_word,
+            bytes: self.sync_word_bytes,
+        }
+    }
+
+    /// The sync word of channel `index`: its own if one is set, otherwise the
+    /// general one.
+    pub(crate) fn sync_word_for_channel(&self, index: usize) -> Result<SyncWordSetting, String> {
+        let own = match self.channels.get(index) {
+            Some(channel) => SyncWordSetting::parse(&channel.sync_word)
+                .map_err(|error| format!("{}: {error}", self.channel_name(index)))?,
+            None => None,
+        };
+        Ok(own.unwrap_or_else(|| self.general_sync_word()))
+    }
+
+    /// Acceptable bit errors in the acquisition pattern, kept below the length
+    /// of a sync word: a short sync word of one channel cannot take the limit
+    /// set for a longer general one.
+    fn bit_errors_for(&self, sync: SyncWordSetting) -> usize {
+        if sync.bytes == 0 {
+            return self.maximum_preamble_bit_errors;
+        }
+        self.maximum_preamble_bit_errors
+            .min((usize::from(sync.bytes) * 8).saturating_sub(1))
+    }
+
+    fn raw_config_with(&self, sync: SyncWordSetting) -> RawRadioConfig {
         RawRadioConfig {
             preamble_byte: self.preamble_byte,
             preamble_bytes: self.preamble_bytes,
-            sync_word: self.sync_word,
-            sync_word_bytes: self.sync_word_bytes,
-            maximum_preamble_bit_errors: self.maximum_preamble_bit_errors,
+            sync_word: sync.word,
+            sync_word_bytes: sync.bytes,
+            maximum_preamble_bit_errors: self.bit_errors_for(sync),
             bit_order: BitOrder::MostSignificantFirst,
             minimum_bit_confidence_milli: self.minimum_bit_confidence_milli,
             maximum_uncertain_bits: self.maximum_uncertain_bits,
@@ -239,15 +326,32 @@ impl RadioAnalyzerSettings {
         }
     }
 
+    /// The decoder of the channels that have no sync word of their own.
+    #[cfg(test)]
     pub(crate) fn decoder_config(&self) -> Result<RadioDataDecoderConfig, String> {
+        self.decoder_config_with(self.general_sync_word())
+    }
+
+    /// One decoder configuration per channel, each with its own sync word or
+    /// the general one.
+    pub(crate) fn decoder_configs(&self) -> Result<Vec<RadioDataDecoderConfig>, String> {
+        (0..self.channels.len())
+            .map(|index| {
+                self.decoder_config_with(self.sync_word_for_channel(index)?)
+                    .map_err(|error| format!("{}: {error}", self.channel_name(index)))
+            })
+            .collect()
+    }
+
+    fn decoder_config_with(&self, sync: SyncWordSetting) -> Result<RadioDataDecoderConfig, String> {
         match self.data_mode {
             RadioDataMode::Raw => {
-                let config = self.raw_config();
+                let config = self.raw_config_with(sync);
                 config.validate().map_err(|error| error.to_string())?;
                 Ok(RadioDataDecoderConfig::Raw(config))
             }
             RadioDataMode::Packets => {
-                if self.sync_word_bytes == 0 {
+                if sync.bytes == 0 {
                     return Err("packet decoding requires a sync word".to_owned());
                 }
                 let preamble_bits = std::iter::repeat(self.preamble_byte)
@@ -256,10 +360,10 @@ impl RadioAnalyzerSettings {
                         (0..8).map(move |bit_index| byte & (1 << (7 - bit_index)) != 0)
                     })
                     .collect();
-                let sync_bits = (0..self.sync_word_bytes)
+                let sync_bits = (0..sync.bytes)
                     .flat_map(|byte_index| {
-                        let shift = u32::from(self.sync_word_bytes - byte_index - 1) * 8;
-                        let byte = ((self.sync_word >> shift) & 0xff) as u8;
+                        let shift = u32::from(sync.bytes - byte_index - 1) * 8;
+                        let byte = ((sync.word >> shift) & 0xff) as u8;
                         (0..8).map(move |bit_index| byte & (1 << (7 - bit_index)) != 0)
                     })
                     .collect();
@@ -271,7 +375,7 @@ impl RadioAnalyzerSettings {
                         preamble: preamble_bits,
                         sync: SyncWordConfig {
                             bits: sync_bits,
-                            max_bit_errors: self.maximum_preamble_bit_errors,
+                            max_bit_errors: self.bit_errors_for(sync),
                         },
                         whitening,
                         bit_order: BitOrder::MostSignificantFirst,
@@ -915,6 +1019,170 @@ mod tests {
                 advance_excluded_bits: false,
             })
         );
+    }
+
+    #[test]
+    fn a_sync_word_is_read_from_hexadecimal_text() {
+        let parse = |text| SyncWordSetting::parse(text);
+
+        assert_eq!(parse(""), Ok(None));
+        assert_eq!(parse("   "), Ok(None));
+        assert_eq!(
+            parse("91 d3"),
+            Ok(Some(SyncWordSetting {
+                word: 0x91d3,
+                bytes: 2
+            }))
+        );
+        assert_eq!(parse("91d3"), parse("0x91D3"));
+        assert_eq!(parse(" 9 1 d 3 "), parse("91d3"));
+        // A leading zero byte is part of the word.
+        assert_eq!(
+            parse("00 2d"),
+            Ok(Some(SyncWordSetting {
+                word: 0x2d,
+                bytes: 2
+            }))
+        );
+        assert_eq!(parse("0123456789abcdef").unwrap().unwrap().bytes, 8);
+        assert!(parse("91d").unwrap_err().contains("whole bytes"));
+        assert!(parse("91 g3").unwrap_err().contains("hexadecimal"));
+        assert!(parse("0123456789abcdef01")
+            .unwrap_err()
+            .contains("at most 8 bytes"));
+    }
+
+    #[test]
+    fn a_sync_word_is_shown_as_bytes_in_hexadecimal() {
+        let word = SyncWordSetting::parse("0x00 2D d4").unwrap().unwrap();
+
+        assert_eq!(word.text(), "00 2d d4");
+        assert_eq!(SyncWordSetting::parse(&word.text()), Ok(Some(word)));
+    }
+
+    fn two_channels(own: &str) -> RadioAnalyzerSettings {
+        let mut channels = vec![
+            RadioAnalyzerChannelSettings::numbered(0, -200_000),
+            RadioAnalyzerChannelSettings::numbered(1, 200_000),
+        ];
+        channels[1].sync_word = own.to_owned();
+        RadioAnalyzerSettings {
+            demodulation: RadioDemodulation::BinaryGfsk,
+            channels,
+            sync_word: 0x91d3,
+            sync_word_bytes: 2,
+            ..RadioAnalyzerSettings::default()
+        }
+    }
+
+    fn raw_sync_words(configs: Vec<RadioDataDecoderConfig>) -> Vec<(u64, u8)> {
+        configs
+            .into_iter()
+            .map(|config| match config {
+                RadioDataDecoderConfig::Raw(raw) => (raw.sync_word, raw.sync_word_bytes),
+                RadioDataDecoderConfig::Packets(_) => panic!("raw settings build raw decoders"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_channel_without_a_sync_word_uses_the_general_one() {
+        let settings = two_channels("");
+
+        assert_eq!(
+            raw_sync_words(settings.decoder_configs().unwrap()),
+            [(0x91d3, 2), (0x91d3, 2)]
+        );
+    }
+
+    #[test]
+    fn a_channel_with_a_sync_word_uses_its_own_and_the_others_keep_the_general_one() {
+        let settings = two_channels("2d d4 aa");
+
+        assert_eq!(
+            raw_sync_words(settings.decoder_configs().unwrap()),
+            [(0x91d3, 2), (0x2dd4aa, 3)]
+        );
+    }
+
+    #[test]
+    fn a_channel_can_have_a_sync_word_when_there_is_no_general_one() {
+        let mut settings = two_channels("2dd4");
+        settings.sync_word = 0;
+        settings.sync_word_bytes = 0;
+
+        assert_eq!(
+            raw_sync_words(settings.decoder_configs().unwrap()),
+            [(0, 0), (0x2dd4, 2)]
+        );
+    }
+
+    #[test]
+    fn a_channel_sync_word_reaches_the_packet_decoder_of_that_channel_only() {
+        let mut settings = two_channels("2d d4");
+        settings.data_mode = RadioDataMode::Packets;
+
+        let sync_bits = settings
+            .decoder_configs()
+            .unwrap()
+            .into_iter()
+            .map(|config| match config {
+                RadioDataDecoderConfig::Packets(config) => config.framing.sync.bits,
+                RadioDataDecoderConfig::Raw(_) => panic!("packet settings build packet decoders"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sync_bits.len(), 2);
+        assert_eq!(sync_bits[0].len(), 16);
+        assert_ne!(sync_bits[0], sync_bits[1]);
+        // 0x2d = 0010_1101, 0xd4 = 1101_0100.
+        assert_eq!(
+            sync_bits[1],
+            [
+                false, false, true, false, true, true, false, true, true, true, false, true, false,
+                true, false, false
+            ]
+        );
+    }
+
+    #[test]
+    fn packet_decoding_asks_for_a_sync_word_of_each_channel_that_has_none() {
+        let mut settings = two_channels("2d d4");
+        settings.data_mode = RadioDataMode::Packets;
+        settings.sync_word_bytes = 0;
+
+        let error = settings.decoder_configs().unwrap_err();
+
+        assert_eq!(error, "Channel 1: packet decoding requires a sync word");
+    }
+
+    #[test]
+    fn a_bad_channel_sync_word_is_reported_with_the_channel_name() {
+        let mut settings = two_channels("2d d");
+        settings.channels[1].name = "Downlink".to_owned();
+
+        let error = settings.decoder_configs().unwrap_err();
+
+        assert!(error.starts_with("Downlink: "), "{error}");
+        assert!(error.contains("whole bytes"), "{error}");
+    }
+
+    #[test]
+    fn the_bit_error_limit_stays_below_the_length_of_a_short_channel_sync_word() {
+        let mut settings = two_channels("2d");
+        settings.maximum_preamble_bit_errors = 12;
+
+        let limits = settings
+            .decoder_configs()
+            .unwrap()
+            .into_iter()
+            .map(|config| match config {
+                RadioDataDecoderConfig::Raw(raw) => raw.maximum_preamble_bit_errors,
+                RadioDataDecoderConfig::Packets(_) => panic!("raw settings build raw decoders"),
+            })
+            .collect::<Vec<_>>();
+
+        // The general word has 16 bits, the one byte of channel two only 8.
+        assert_eq!(limits, [12, 7]);
     }
 
     #[test]

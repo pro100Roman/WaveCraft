@@ -906,6 +906,31 @@ list and its names; legacy recordings without names receive numbered defaults,
 and a legacy `channel_offset_hz` loads as a one-channel list. RAW DATA and
 PACKETS rows show the configured channel name and an unprefixed byte count.
 
+#### A sync word for each channel
+
+The sync word in the **Signal analyzer** section is the general one. Every
+channel row also has a **Sync word** box: hexadecimal bytes, big-endian as on the
+air, one to eight of them (`91 d3`, `0x91D3` and `91d3` are the same word).
+A channel with a word of its own decodes with it; a channel with the box empty
+uses the general word, which the empty box shows as its hint (`none` if there is
+none). Devices that use different sync words on one band can therefore be
+decoded in the same capture, each on its own channel, and a channel may have a
+sync word while the general one is off.
+
+Each channel has its own decoder, so the capture request carries one decoder
+configuration per channel, built from the shared preamble, bit-error, whitening
+and confidence settings and the channel's sync word. The limit on bit errors in
+the preamble and sync word is kept below the length of a channel's sync word in
+bits, so a short word does not inherit the limit set for a longer general one.
+A word that is not whole hexadecimal bytes is shown in red, is reported in the
+analyzer section as `<channel name>: ...`, and stops the capture from starting
+and a recording from being decoded. In packet mode, where a sync word is
+required, every channel needs a word of its own or a general one.
+
+The word is recorded per channel as `radio.analyzer.channel.<n>.sync_word`, and
+only when the channel has one; recordings and settings without the key load with
+the general word for that channel.
+
 These operations are not application-field parsing. Their output is a
 `RadioPacket` containing timed bytes, source range, RSSI/power estimate,
 frequency-error estimate, confidence, and diagnostics. CRC failure does not

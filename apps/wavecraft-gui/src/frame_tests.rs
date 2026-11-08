@@ -472,3 +472,52 @@ fn the_scope_plot_fills_the_whole_oscilloscope_card() {
         }
     }
 }
+
+#[test]
+fn a_radio_capture_gives_each_analyzer_channel_the_decoder_of_its_own_sync_word() {
+    let mut app = app_with_every_instrument();
+    let context = context();
+    run_frames(&mut app, &context, 1);
+    app.radio_settings.analyzer.demodulation = RadioDemodulation::BinaryGfsk;
+    app.radio_settings.analyzer.sync_word = 0x91d3;
+    app.radio_settings.analyzer.sync_word_bytes = 2;
+    let mut own = RadioAnalyzerChannelSettings::numbered(1, 300_000);
+    own.sync_word = "2d d4 aa".to_owned();
+    app.radio_settings.analyzer.channels = vec![
+        RadioAnalyzerChannelSettings::numbered(0, -300_000),
+        own,
+        RadioAnalyzerChannelSettings::numbered(2, 0),
+    ];
+
+    let request = app
+        .radio_capture_request(AcquisitionMode::Run)
+        .expect("the settings are valid");
+
+    let sync_words = request
+        .decoder_configs
+        .iter()
+        .map(|config| match config {
+            RadioDataDecoderConfig::Raw(raw) => (raw.sync_word, raw.sync_word_bytes),
+            RadioDataDecoderConfig::Packets(_) => panic!("the settings are for raw data"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sync_words, [(0x91d3, 2), (0x2dd4aa, 3), (0x91d3, 2)]);
+    assert_eq!(request.analyzer_profiles.len(), 3);
+    assert_eq!(request.analyzer_channel_names.len(), 3);
+}
+
+#[test]
+fn a_radio_capture_is_refused_when_a_channel_sync_word_is_not_valid() {
+    let mut app = app_with_every_instrument();
+    let context = context();
+    run_frames(&mut app, &context, 1);
+    app.radio_settings.analyzer.demodulation = RadioDemodulation::BinaryGfsk;
+    app.radio_settings.analyzer.channels[0].sync_word = "91 d".to_owned();
+
+    let error = app
+        .radio_capture_request(AcquisitionMode::Run)
+        .err()
+        .expect("a half-typed sync word is not a capture setting");
+
+    assert!(error.starts_with("Channel 1: "), "{error}");
+}

@@ -399,12 +399,9 @@ pub(crate) fn start_capture(
                 .iter()
                 .cloned()
                 .zip(request.analyzer_channel_names.iter())
-                .map(|(profile, name)| {
-                    RadioAnalyzerRuntime::new_named(
-                        profile,
-                        request.decoder_config.clone(),
-                        name.clone(),
-                    )
+                .zip(request.decoder_configs.iter())
+                .map(|((profile, name), decoder_config)| {
+                    RadioAnalyzerRuntime::new_named(profile, decoder_config.clone(), name.clone())
                 })
                 .collect::<Result<Vec<_>, _>>()
         })

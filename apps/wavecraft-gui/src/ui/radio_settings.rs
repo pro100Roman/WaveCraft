@@ -6,8 +6,8 @@ use crate::{
     paint_capture_settings_save_button, selected_radio, Color32, DiscoveredRadio, FontId, Pos2,
     RadioAnalyzerChannelSettings, RadioAnalyzerSettings, RadioDataMode, RadioDemodulation,
     RadioProvider, RadioProviderFailure, RadioSettings, RadioWhiteningPreset, RangeInclusive,
-    RichText, SavedCaptureSettingsKind, SelectableHoverText, ValueDomain, WhiteningDirection,
-    AUTOMATIC_CHANNEL_BANDWIDTH_HZ, AUTOMATIC_FILTER_TAP_COUNT, BACKGROUND,
+    RichText, SavedCaptureSettingsKind, SelectableHoverText, SyncWordSetting, ValueDomain,
+    WhiteningDirection, AUTOMATIC_CHANNEL_BANDWIDTH_HZ, AUTOMATIC_FILTER_TAP_COUNT, BACKGROUND,
     MAX_RADIO_ANALYZER_CHANNELS, RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS, RAW_AUTOMATIC_PREAMBLE_BITS,
     TEXT_MUTED,
 };
@@ -68,6 +68,10 @@ pub(crate) fn format_radio_mhz_number(value_hz: u64) -> String {
 }
 
 pub(crate) const RADIO_VALUE_WIDTH: f32 = 80.0;
+/// Width of the sync word box of an analyzer channel: up to eight bytes.
+const RADIO_CHANNEL_SYNC_WORD_WIDTH: f32 = 72.0;
+/// Most characters of a channel's sync word: eight bytes with a space between.
+const RADIO_CHANNEL_SYNC_WORD_CHARACTERS: usize = 24;
 
 pub(crate) const RADIO_GAIN_HANDLE_ASPECT_RATIO: f32 = 1.8;
 
@@ -696,7 +700,7 @@ fn paint_radio_analyzer_sync_word_rows(
         Some(if settings.data_mode == RadioDataMode::Packets {
             "Required 1-to-8-byte unwhitened word that establishes the packet and whitening boundary"
         } else {
-            "Optional 1-to-8-byte word after the repeated preamble; unlike 0xAA, it establishes an unambiguous byte boundary"
+            "Optional 1-to-8-byte word after the repeated preamble; unlike 0xAA, it establishes an unambiguous byte boundary. Used by every channel that has no sync word of its own"
         }),
     );
     ui.add_enabled_ui(enabled, |ui| {
@@ -1133,7 +1137,7 @@ fn paint_radio_analyzer_configuration_error(ui: &mut egui::Ui, settings: &RadioA
                 egui::Label::new(RichText::new(error).small().color(Color32::LIGHT_RED))
                     .selectable(true),
             );
-        } else if let Err(error) = settings.decoder_config() {
+        } else if let Err(error) = settings.decoder_configs() {
             ui.add(
                 egui::Label::new(RichText::new(error).small().color(Color32::LIGHT_RED))
                     .selectable(true),
@@ -1153,10 +1157,20 @@ pub(crate) fn paint_radio_analyzer_channels(
     let half_span_mhz = capture_sample_rate_hz as f64 / 2_000_000.0;
     let can_remove = settings.channels.len() > 1;
     let mut remove_index = None;
+    // What a channel without a sync word of its own uses, shown as its hint.
+    let general_sync_hint = if settings.sync_word_bytes > 0 {
+        settings.general_sync_word().text()
+    } else {
+        "none".to_owned()
+    };
     egui::Grid::new("radio_analyzer_channels")
-        .num_columns(3)
+        .num_columns(4)
         .spacing([8.0, 6.0])
         .show(ui, |ui| {
+            for heading in ["Channel", "Offset", "Sync word"] {
+                ui.label(RichText::new(heading).small().color(TEXT_MUTED));
+            }
+            ui.end_row();
             for (index, channel) in settings.channels.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -1177,6 +1191,19 @@ pub(crate) fn paint_radio_analyzer_channels(
                         -half_span_mhz..=half_span_mhz,
                         "MHz",
                     );
+                });
+                ui.add_enabled_ui(controls_enabled, |ui| {
+                    let invalid = SyncWordSetting::parse(&channel.sync_word).is_err();
+                    let mut edit = egui::TextEdit::singleline(&mut channel.sync_word)
+                        .hint_text(general_sync_hint.as_str())
+                        .char_limit(RADIO_CHANNEL_SYNC_WORD_CHARACTERS);
+                    if invalid {
+                        edit = edit.text_color(Color32::LIGHT_RED);
+                    }
+                    ui.add_sized([RADIO_CHANNEL_SYNC_WORD_WIDTH, ui.spacing().interact_size.y], edit)
+                        .on_hover_selectable_text(
+                            "Sync word of this channel in hexadecimal, one to eight bytes, such as 91 d3. Leave empty to use the general sync word.",
+                        );
                 });
                 if ui
                     .add_enabled(
@@ -1247,7 +1274,7 @@ pub(crate) fn paint_radio_analyzer_channels(
     }
     ui.label(
         RichText::new(
-            "All modulation, framing, and whitening settings above are shared by every channel.",
+            "All modulation, framing, and whitening settings above are shared by every channel, except that a channel can have a sync word of its own.",
         )
         .small()
         .color(TEXT_MUTED),
@@ -2022,6 +2049,8 @@ mod tests {
         trigger_runtime_enabled: bool,
         /// Paint the signal analyzer section instead of the receive one.
         analyzer_section: bool,
+        /// Paint the list of analyzer channels instead of the receive section.
+        channels_section: bool,
         frames: u32,
     }
 
@@ -2035,6 +2064,7 @@ mod tests {
                 runtime_enabled: false,
                 trigger_runtime_enabled: false,
                 analyzer_section: false,
+                channels_section: false,
                 frames: 0,
             };
             // The grid only knows its column widths after its first frame.
@@ -2049,6 +2079,12 @@ mod tests {
 
         fn analyzer_section(mut self) -> Self {
             self.analyzer_section = true;
+            self.frame(Vec::new());
+            self
+        }
+
+        fn channels_section(mut self) -> Self {
+            self.channels_section = true;
             self.frame(Vec::new());
             self
         }
@@ -2069,7 +2105,14 @@ mod tests {
             };
             let output = self.context.run(input, |context| {
                 egui::CentralPanel::default().show(context, |ui| {
-                    if self.analyzer_section {
+                    if self.channels_section {
+                        paint_radio_analyzer_channels(
+                            ui,
+                            &mut self.settings.analyzer,
+                            self.settings.capture.sample_rate_hz,
+                            self.enabled,
+                        );
+                    } else if self.analyzer_section {
                         paint_radio_analyzer_configuration(
                             ui,
                             &mut self.settings.analyzer,
@@ -2461,6 +2504,60 @@ mod tests {
         let mut settings = receive_settings();
         settings.analyzer.demodulation = RadioDemodulation::BinaryGfsk;
         settings
+    }
+
+    #[test]
+    fn a_channel_shows_the_general_sync_word_until_it_is_given_one_of_its_own() {
+        let mut settings = analyzer_settings();
+        settings.analyzer.sync_word = 0x91d3;
+        settings.analyzer.sync_word_bytes = 2;
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings).channels_section();
+
+        let painted = panel.painted();
+        assert!(painted.has("Sync word"), "the column has a heading");
+        assert!(painted.has("91 d3"), "the general word is the hint");
+
+        panel.type_into("91 d3", "2dd4");
+
+        assert_eq!(panel.settings.analyzer.channels[0].sync_word, "2dd4");
+        // Only that channel changed; the general word is left alone.
+        assert_eq!(panel.settings.analyzer.sync_word, 0x91d3);
+        let painted = panel.painted();
+        assert!(painted.has("2dd4"));
+        assert!(!painted.has("91 d3"));
+    }
+
+    #[test]
+    fn a_channel_hint_says_none_when_there_is_no_general_sync_word() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+                .channels_section();
+
+        assert!(panel.painted().has("none"));
+    }
+
+    #[test]
+    fn a_channel_sync_word_cannot_be_changed_while_capturing() {
+        let mut settings = analyzer_settings();
+        settings.analyzer.channels[0].sync_word = "91 d3".to_owned();
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings)
+            .stopped()
+            .channels_section();
+
+        panel.type_into("91 d3", "ff");
+
+        assert_eq!(panel.settings.analyzer.channels[0].sync_word, "91 d3");
+    }
+
+    #[test]
+    fn a_bad_channel_sync_word_is_reported_in_the_analyzer_configuration() {
+        let mut settings = analyzer_settings();
+        settings.analyzer.channels[0].sync_word = "91 d".to_owned();
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings).analyzer_section();
+
+        assert!(panel.painted().starts_with("Channel 1: sync word"));
     }
 
     #[test]

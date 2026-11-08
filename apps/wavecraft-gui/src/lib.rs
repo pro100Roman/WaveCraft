@@ -62,8 +62,8 @@ use recording::{
 };
 use recording_metadata::{
     channel_names_from_recording_metadata, insert_channel_name_metadata,
-    logic_settings_from_recording_metadata, parse_color, parse_logic_acquisition_mode,
-    radio_settings_from_recording_metadata, recording_metadata_value,
+    insert_radio_analyzer_channels_metadata, logic_settings_from_recording_metadata, parse_color,
+    parse_logic_acquisition_mode, radio_settings_from_recording_metadata, recording_metadata_value,
     saved_logic_settings_metadata, saved_radio_settings_metadata, saved_scope_settings_metadata,
     scope_settings_from_recording_metadata,
 };

@@ -10,9 +10,9 @@ use crate::{
     should_rearm_acquisition, start_capture, thread, AcquisitionMode, ActiveCapture, CaptureBatch,
     CaptureEvent, CaptureFrame, CaptureReady, CaptureTarget, CompletedCapture, CompletionStatus,
     DsLogicOperationMode, FileDecodedDataRecorder, Instant, PathBuf, ProtocolAnalyzerInstance,
-    ProtocolCaptureDecoder, ProtocolDecodeCache, RadioCaptureRequest, RadioDataDecoderConfig,
-    RadioDspWorker, RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache,
-    WaveformStore, WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
+    ProtocolCaptureDecoder, ProtocolDecodeCache, RadioCaptureRequest, RadioDspWorker,
+    RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache, WaveformStore,
+    WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
 };
 
 use crate::WaveCraftApp;
@@ -420,10 +420,10 @@ impl WaveCraftApp {
                 "signal analyzer channel offset lies outside the captured RF span".to_owned(),
             );
         }
-        let decoder_config = if analyzer_profiles.is_empty() {
-            RadioDataDecoderConfig::Raw(self.radio_settings.analyzer.raw_config())
+        let decoder_configs = if analyzer_profiles.is_empty() {
+            Vec::new()
         } else {
-            self.radio_settings.analyzer.decoder_config()?
+            self.radio_settings.analyzer.decoder_configs()?
         };
         Ok(RadioCaptureRequest {
             device,
@@ -432,7 +432,7 @@ impl WaveCraftApp {
             iq_correction_enabled: self.radio_settings.iq_correction_enabled,
             analyzer_profiles,
             analyzer_channel_names,
-            decoder_config,
+            decoder_configs,
         })
     }
 
