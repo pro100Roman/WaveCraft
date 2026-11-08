@@ -626,10 +626,31 @@ and its retransmissions on the other channel agree on exactly those 63 bytes.
 Over the two captures 6 messages were found that were hidden before, and none
 was lost.
 
-Which byte boundary the raw decoder aligns to still depends on bits before the
-burst, because the alternating preamble matches itself shifted by two bits: the
-sync word `91 d3` also appears as `a4 74`, `a9 1d` and `47 4f` with the same
-bits. About one message in four is affected whatever the segmentation.
+#### Byte alignment without a sync word
+
+When the raw decoder has no sync word to align to (`sync_word_bytes` 0) it
+starts a message at the first window of preamble bytes it finds. The alternating
+preamble matches itself shifted by two bits, so the earliest matching window
+may start two bits before the real preamble and every byte after it is then
+shifted: the sync word `91 d3` shows up as `a4 74`, `a9 1d` or `47 4f` with the
+same bits.
+
+The two bits that slide the window are the first two symbols of a burst. They
+come out of a receive filter that is not filled yet, and have a low confidence
+(0.05 to 0.54 in the captures), while bits inside the burst have a confidence
+close to 1. A preamble window therefore must start on confident bits: the first
+`PREAMBLE_HEAD_BITS` (2) bits of the window need a confidence of at least
+`PREAMBLE_HEAD_CONFIDENCE` (0.6). A window that starts on doubtful bits is
+skipped and the search moves on by one bit. The rule applies only to the
+preamble-only acquisition, a configured sync word is matched as before, and it
+does not drop a message: the window starts two bits later and still holds the
+whole gate.
+
+On the two captures the `91 d3` sync word is now byte aligned in 152 of 170
+messages (it was 121) and in 64 of 65 (it was 52); the message count is the same
+and no message is lost. What is left are weak bursts without a detectable
+rise (see above). Their first bits are junk with a confidence close to 1, so the
+rule cannot tell them from a real preamble.
 
 ### FSK and GFSK demodulation
 
