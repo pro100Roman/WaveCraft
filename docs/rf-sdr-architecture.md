@@ -614,8 +614,32 @@ to the demodulator separately. At a step it
 
 A drop is the end of the carrier, so the noise after it is not decoded as part
 of the message (it reaches an idle demodulator, which does not acquire noise).
-A rise starts a transmission. A signal less than 6 dB above the noise has no
-edge that stands out, and is left to the squelch as before.
+A rise starts a transmission.
+
+The envelope is constant only before the channel filter. A tone away from the
+channel centre is attenuated, so a strong burst swings by about 5 dB inside
+itself, every millisecond or so (seen at 12 to 17 dB over the noise). A
+threshold below 6 dB applied everywhere therefore tears bursts apart: lowering
+it to 5, 4.5 and 4 dB lost 1, 3 and 7 of 170 messages, and a longer window (up
+to eight symbols) changes nothing, because the swing is real and not noise in
+the estimate.
+
+An edge to or from the noise floor has no such swing, so a change of 4 dB
+counts there. The segmenter remembers the quietest window mean it has seen on
+the channel as the floor, and a change of at least 4 dB is a step if its quieter
+side is within 4.5 dB of it. The quietest of many windows of noise lies a little
+below their mean, which the margin allows for. The floor is trusted only once a
+window 6 dB above it has been seen, since a stream that starts inside a strong
+burst would otherwise take the burst's lower swing level for noise and tear it
+at every swing. It is learned from the channel, survives a gap in the stream
+and rises by at most 2 dB per second of samples, and a change of sample rate
+forgets it. A carrier that never stands out above the noise by 4 dB is left to
+the squelch as before.
+
+On the two captures (235 messages) this ends six more weak bursts where the
+carrier ends, with no message lost and none new: a frame that read 36 bytes
+(32 after the preamble) now reads 32. Which of the bursts it helps is limited by
+how far above the noise they are, not by the window length.
 
 On a 61 s capture with two channels and 63 messages, the message end was a
 median 4.9 bytes (at most 6.9) past the end of the carrier and now is 0.0 (at

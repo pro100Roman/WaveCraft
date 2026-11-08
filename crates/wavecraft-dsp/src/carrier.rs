@@ -6,6 +6,12 @@
 //! stops, but the level of the filtered channel shows both as a step. The
 //! FSK/GFSK envelope is constant, so a step of several dB is a different
 //! signal, not modulation.
+//!
+//! The envelope is not perfectly constant after the channel filter: a tone
+//! away from the channel centre is attenuated, so a strong burst can swing by
+//! four to five dB inside itself. A step that small is therefore only trusted
+//! at the noise floor, where a carrier begins or ends; see
+//! [`LevelStepSegmenter`].
 
 use crate::{ChannelizedBatch, TimedComplexSample};
 use std::collections::VecDeque;
@@ -21,8 +27,26 @@ const MIN_STEP_DB: f64 = 6.0;
 /// How far below its peak the level ratio falls before the step is taken to be
 /// at the peak. For an ideal step the ratio peaks exactly at the step.
 const PEAK_FALL_DB: f64 = 1.5;
+/// Smallest power ratio that counts as a step when one side of it is at the
+/// noise floor. Swings inside a carrier stay well above the floor, so they
+/// cannot reach this; a carrier a few dB over the noise can.
+const FLOOR_STEP_DB: f64 = 4.0;
+/// How far above the quietest window seen a window may be and still count as
+/// at the noise floor. The quietest of many windows of noise lies a little
+/// below their mean, which this allows for.
+const FLOOR_MARGIN_DB: f64 = 4.5;
+/// A window this far above the quietest one shows that the quietest is the
+/// noise floor and not a weak carrier: only a carrier stands that far over it.
+const FLOOR_TRUST_DB: f64 = 6.0;
+/// How fast the remembered floor may rise, so that a change of gain is
+/// followed without a burst's own level being taken for it.
+const FLOOR_RISE_DB_PER_S: f64 = 2.0;
 /// Added to window powers so silence compares as no change instead of 0/0.
 const POWER_EPSILON: f64 = 1e-30;
+
+fn db_to_power(db: f64) -> f64 {
+    10f64.powf(db / 10.0)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LevelStep {
@@ -58,6 +82,13 @@ struct Candidate {
 /// symbols and the sharpest change is reported at its exact sample. Deciding
 /// needs the window after the step, so samples are released with a delay of
 /// one window; they are neither dropped nor changed.
+///
+/// A change of [`MIN_STEP_DB`] is a step anywhere. A change of
+/// [`FLOOR_STEP_DB`] is one if the quieter side is at the noise floor, the
+/// quietest level seen on the channel, once that is known to be noise:
+/// a window [`FLOOR_TRUST_DB`] above it has been seen. This finds the edges of
+/// weak carriers without taking the swings inside a strong one for steps.
+/// The floor is a property of the channel, so it survives a gap in the stream.
 pub struct LevelStepSegmenter {
     symbol_rate_hz: u64,
     sample_rate_hz: u64,
@@ -75,6 +106,12 @@ pub struct LevelStepSegmenter {
     /// Sum of the newer window of `powers`.
     sum_after: f64,
     candidate: Option<Candidate>,
+    /// Mean power of the quietest window seen on the channel.
+    floor: Option<f64>,
+    /// Whether a window far above `floor` has been seen, so that it is noise.
+    floor_trusted: bool,
+    /// Factor by which `floor` may rise per sample.
+    floor_growth: f64,
     pending_step: Option<LevelStep>,
     pending_discontinuity: bool,
 }
@@ -92,13 +129,24 @@ impl LevelStepSegmenter {
             sum_before: 0.0,
             sum_after: 0.0,
             candidate: None,
+            floor: None,
+            floor_trusted: false,
+            floor_growth: 1.0,
             pending_step: None,
             pending_discontinuity: false,
         }
     }
 
-    /// Forgets the stream, including samples still held back.
+    /// Forgets the stream, including samples still held back, and what was
+    /// learned about the channel's noise floor.
     pub fn reset(&mut self) {
+        self.forget_stream();
+        self.floor = None;
+        self.floor_trusted = false;
+    }
+
+    /// Forgets the stream and keeps the noise floor.
+    fn forget_stream(&mut self) {
         self.sample_rate_hz = 0;
         self.window = 0;
         self.held.clear();
@@ -116,8 +164,14 @@ impl LevelStepSegmenter {
     /// before the next step, split at every step found.
     pub fn push(&mut self, batch: &ChannelizedBatch) -> Vec<ChannelSegment> {
         if batch.discontinuity || batch.sample_rate_hz != self.sample_rate_hz {
-            self.reset();
+            if batch.sample_rate_hz != self.sample_rate_hz {
+                self.reset();
+            } else {
+                self.forget_stream();
+            }
             self.sample_rate_hz = batch.sample_rate_hz;
+            self.floor_growth =
+                10f64.powf(FLOOR_RISE_DB_PER_S / 10.0 / batch.sample_rate_hz.max(1) as f64);
             self.window = ((WINDOW_SYMBOLS * batch.sample_rate_hz as f64
                 / self.symbol_rate_hz as f64)
                 .ceil() as usize)
@@ -200,12 +254,14 @@ impl LevelStepSegmenter {
             return None;
         }
 
+        let at_floor = self.track_floor();
         let position = self.pushed - window as u64;
         let step_db =
             10.0 * ((self.sum_after + POWER_EPSILON) / (self.sum_before + POWER_EPSILON)).log10();
         match &mut self.candidate {
             None => {
-                if step_db.abs() >= MIN_STEP_DB {
+                let step = if at_floor { FLOOR_STEP_DB } else { MIN_STEP_DB };
+                if step_db.abs() >= step {
                     self.candidate = Some(Candidate {
                         position,
                         step_db,
@@ -241,6 +297,23 @@ impl LevelStepSegmenter {
                 Some((position, step))
             }
         }
+    }
+
+    /// Updates the noise floor from the two windows and tells whether the
+    /// quieter of them is at a floor that is known to be noise.
+    fn track_floor(&mut self) -> bool {
+        let window = self.window as f64;
+        let (before, after) = (self.sum_before / window, self.sum_after / window);
+        let quietest = before.min(after);
+        let floor = match self.floor {
+            Some(floor) => (floor * self.floor_growth).min(quietest),
+            None => quietest,
+        };
+        self.floor = Some(floor);
+        if before.max(after) >= floor * db_to_power(FLOOR_TRUST_DB) + POWER_EPSILON {
+            self.floor_trusted = true;
+        }
+        self.floor_trusted && quietest <= floor * db_to_power(FLOOR_MARGIN_DB) + POWER_EPSILON
     }
 
     /// Makes the samples from `position` on the whole history, so the level
@@ -445,6 +518,126 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(inside.is_empty(), "{inside:?}");
+    }
+
+    const NOISE: f64 = 0.05;
+
+    /// Amplitude of a carrier that makes the channel `db` louder than noise.
+    fn carrier_over_noise(db: f64) -> f64 {
+        NOISE * (2.0 * (10f64.powf(db / 10.0) - 1.0)).sqrt()
+    }
+
+    /// Noise, a strong burst that shows the noise is noise, and noise again.
+    fn learn_the_floor(random: &mut Noise) -> Vec<TimedComplexSample> {
+        let mut samples = signal(0, 3_000, 0.0, NOISE, random);
+        samples.extend(signal(
+            3_000,
+            2_000,
+            carrier_over_noise(15.0),
+            NOISE,
+            random,
+        ));
+        samples.extend(signal(5_000, 3_000, 0.0, NOISE, random));
+        samples
+    }
+
+    #[test]
+    fn the_edges_of_a_burst_a_few_db_over_the_noise_are_found_at_the_floor() {
+        let mut random = Noise(9);
+        let mut samples = learn_the_floor(&mut random);
+        samples.extend(signal(
+            8_000,
+            6_000,
+            carrier_over_noise(5.0),
+            NOISE,
+            &mut random,
+        ));
+        samples.extend(signal(14_000, 3_000, 0.0, NOISE, &mut random));
+
+        let found = steps(&run(samples, 700));
+
+        let weak = found
+            .into_iter()
+            .filter(|(_, index)| *index > 6_000)
+            .collect::<Vec<_>>();
+        assert_eq!(weak.len(), 2, "{weak:?}");
+        assert_eq!(weak[0].0, LevelStep::Rise);
+        assert!(weak[0].1.abs_diff(8_000) <= 40, "{weak:?}");
+        assert_eq!(weak[1].0, LevelStep::Drop);
+        assert!(weak[1].1.abs_diff(14_000) <= 40, "{weak:?}");
+    }
+
+    #[test]
+    fn swings_inside_a_strong_carrier_are_not_steps() {
+        // A tone away from the channel centre is attenuated: the level of a
+        // burst alternates by 5 dB although the carrier is constant.
+        let mut random = Noise(10);
+        let mut samples = learn_the_floor(&mut random);
+        let mut at = 8_000;
+        for level in [14.0, 19.0, 14.0, 19.0, 14.0, 19.0, 14.0] {
+            samples.extend(signal(
+                at,
+                700,
+                carrier_over_noise(level),
+                NOISE,
+                &mut random,
+            ));
+            at += 700;
+        }
+        samples.extend(signal(at, 3_000, 0.0, NOISE, &mut random));
+
+        let found = steps(&run(samples, 512));
+
+        let inside = found
+            .into_iter()
+            .filter(|(_, index)| (8_300..8_000 + 7 * 700 - 300).contains(index))
+            .collect::<Vec<_>>();
+        assert!(inside.is_empty(), "{inside:?}");
+    }
+
+    #[test]
+    fn the_noise_floor_survives_a_gap_in_the_stream() {
+        let mut random = Noise(11);
+        let mut segmenter = LevelStepSegmenter::new(SYMBOL_RATE_HZ);
+        segmenter.push(&batch(learn_the_floor(&mut random), false));
+
+        // The channel is opened again later with a weak burst in it.
+        let mut later = signal(100_000, 3_000, 0.0, NOISE, &mut random);
+        later.extend(signal(
+            103_000,
+            6_000,
+            carrier_over_noise(5.0),
+            NOISE,
+            &mut random,
+        ));
+        later.extend(signal(109_000, 3_000, 0.0, NOISE, &mut random));
+        let found = steps(&segmenter.push(&batch(later, true)));
+
+        let kinds = found.iter().map(|(kind, _)| *kind).collect::<Vec<_>>();
+        assert_eq!(kinds, vec![LevelStep::Rise, LevelStep::Drop], "{found:?}");
+    }
+
+    #[test]
+    fn a_quiet_level_that_is_not_known_to_be_noise_is_not_a_floor() {
+        // A stream that starts inside a strong carrier never shows the noise.
+        // Its lower swing level is the quietest level seen, but it is a
+        // carrier, so a 5 dB swing is not a step.
+        let mut random = Noise(12);
+        let mut samples = Vec::new();
+        for (block, level) in [14.0, 19.0, 14.0, 19.0, 14.0, 19.0, 14.0, 19.0]
+            .into_iter()
+            .enumerate()
+        {
+            samples.extend(signal(
+                block * 700,
+                700,
+                carrier_over_noise(level),
+                NOISE,
+                &mut random,
+            ));
+        }
+
+        assert!(steps(&run(samples, 700)).is_empty());
     }
 
     #[test]
