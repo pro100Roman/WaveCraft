@@ -1230,13 +1230,9 @@ pub(crate) fn paint_radio_analyzer_channels(
         "none".to_owned()
     };
     egui::Grid::new("radio_analyzer_channels")
-        .num_columns(4)
+        .num_columns(3)
         .spacing([8.0, 6.0])
         .show(ui, |ui| {
-            for heading in ["Channel", "Offset", "Sync word"] {
-                ui.label(RichText::new(heading).small().color(TEXT_MUTED));
-            }
-            ui.end_row();
             for (index, channel) in settings.channels.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -1258,6 +1254,21 @@ pub(crate) fn paint_radio_analyzer_channels(
                         "MHz",
                     );
                 });
+                if ui
+                    .add_enabled(
+                        controls_enabled && can_remove,
+                        egui::Button::new("×").small(),
+                    )
+                    .on_hover_selectable_text("Remove channel")
+                    .clicked()
+                {
+                    remove_index = Some(index);
+                }
+                ui.end_row();
+
+                // The sync word is on a row of its own: a fourth column does
+                // not fit in the width of the setup panel.
+                ui.label(RichText::new("Sync word").small().color(TEXT_MUTED));
                 ui.add_enabled_ui(controls_enabled, |ui| {
                     let invalid = SyncWordSetting::parse(&channel.sync_word).is_err();
                     let mut edit = egui::TextEdit::singleline(&mut channel.sync_word)
@@ -1271,16 +1282,6 @@ pub(crate) fn paint_radio_analyzer_channels(
                             "Sync word of this channel in hexadecimal, one to eight bytes, such as 91 d3. Leave empty to use the general sync word.",
                         );
                 });
-                if ui
-                    .add_enabled(
-                        controls_enabled && can_remove,
-                        egui::Button::new("×").small(),
-                    )
-                    .on_hover_selectable_text("Remove channel")
-                    .clicked()
-                {
-                    remove_index = Some(index);
-                }
                 ui.end_row();
             }
         });
@@ -2040,6 +2041,8 @@ mod tests {
     struct Painted {
         texts: Vec<(String, Pos2)>,
         squares: Vec<Pos2>,
+        /// The rightmost point of any text or box that was painted.
+        right_edge: f32,
     }
 
     impl Painted {
@@ -2049,11 +2052,16 @@ mod tests {
                     egui::Shape::Vec(shapes) => {
                         shapes.iter().for_each(|shape| collect(shape, painted));
                     }
-                    egui::Shape::Text(text) => painted.texts.push((
-                        text.galley.text().replace('\u{2212}', "-"),
-                        text.visual_bounding_rect().center(),
-                    )),
+                    egui::Shape::Text(text) => {
+                        painted.right_edge =
+                            painted.right_edge.max(text.visual_bounding_rect().right());
+                        painted.texts.push((
+                            text.galley.text().replace('\u{2212}', "-"),
+                            text.visual_bounding_rect().center(),
+                        ));
+                    }
                     egui::Shape::Rect(rect) => {
+                        painted.right_edge = painted.right_edge.max(rect.rect.right());
                         let size = rect.rect.size();
                         if (size.x - size.y).abs() < 1.0 && (10.0..24.0).contains(&size.x) {
                             painted.squares.push(rect.rect.center());
@@ -2065,6 +2073,7 @@ mod tests {
             let mut painted = Self {
                 texts: Vec::new(),
                 squares: Vec::new(),
+                right_edge: 0.0,
             };
             for clipped in shapes {
                 collect(&clipped.shape, &mut painted);
@@ -2119,6 +2128,8 @@ mod tests {
         channels_section: bool,
         /// Sync words offered in the analyzer section.
         sync_word_suggestions: Vec<SyncWordSuggestion>,
+        /// Width of the screen the panel is painted on.
+        width: f32,
         frames: u32,
     }
 
@@ -2134,6 +2145,7 @@ mod tests {
                 analyzer_section: false,
                 channels_section: false,
                 sync_word_suggestions: Vec::new(),
+                width: 400.0,
                 frames: 0,
             };
             // The grid only knows its column widths after its first frame.
@@ -2165,6 +2177,12 @@ mod tests {
             self
         }
 
+        /// As wide as the setup panel on the left of the window.
+        fn in_the_setup_panel(mut self) -> Self {
+            self.width = 300.0;
+            self
+        }
+
         fn channels_section(mut self) -> Self {
             self.channels_section = true;
             self.frame(Vec::new());
@@ -2180,7 +2198,10 @@ mod tests {
         fn frame(&mut self, events: Vec<egui::Event>) -> Painted {
             self.frames += 1;
             let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 900.0))),
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(self.width, 900.0),
+                )),
                 time: Some(f64::from(self.frames) / 60.0),
                 events,
                 ..egui::RawInput::default()
@@ -2609,6 +2630,52 @@ mod tests {
         let painted = panel.painted();
         assert!(painted.has("2dd4"));
         assert!(!painted.has("91 d3"));
+    }
+
+    #[test]
+    fn the_sync_word_of_a_channel_is_on_the_row_below_its_name_and_offset() {
+        let mut settings = analyzer_settings();
+        settings.analyzer.sync_word = 0x91d3;
+        settings.analyzer.sync_word_bytes = 2;
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings).channels_section();
+
+        let painted = panel.painted();
+
+        let name = painted.center_of("Channel 1");
+        let sync_label = painted.center_of("Sync word");
+        let sync_word = painted.center_of("91 d3");
+        assert!(sync_label.y > name.y + 10.0, "the label is below the name");
+        assert!(
+            (sync_word.y - sync_label.y).abs() < 6.0,
+            "the box is beside the label"
+        );
+        assert!(sync_word.x > sync_label.x, "the box follows the label");
+    }
+
+    #[test]
+    fn the_channel_rows_fit_the_width_of_the_setup_panel() {
+        let mut settings = analyzer_settings();
+        settings.analyzer.sync_word = 0x91d3;
+        settings.analyzer.sync_word_bytes = 2;
+        settings.analyzer.channels = vec![
+            RadioAnalyzerChannelSettings::numbered(0, -200_000),
+            RadioAnalyzerChannelSettings::numbered(1, 300_000),
+        ];
+        settings.analyzer.channels[1].sync_word = "2d d4 aa bb".to_owned();
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), settings)
+            .in_the_setup_panel()
+            .channels_section();
+
+        let painted = panel.painted();
+
+        assert!(painted.has("2d d4 aa bb"));
+        assert!(
+            painted.right_edge <= panel.width,
+            "painted up to {} in a panel {} wide",
+            painted.right_edge,
+            panel.width
+        );
     }
 
     #[test]

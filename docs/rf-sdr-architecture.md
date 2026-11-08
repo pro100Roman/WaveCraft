@@ -909,8 +909,9 @@ PACKETS rows show the configured channel name and an unprefixed byte count.
 #### A sync word for each channel
 
 The sync word in the **Signal analyzer** section is the general one. Every
-channel row also has a **Sync word** box: hexadecimal bytes, big-endian as on the
-air, one to eight of them (`91 d3`, `0x91D3` and `91d3` are the same word).
+channel also has a **Sync word** box, on a row of its own under the channel's name
+and offset so that the list fits the width of the setup panel: hexadecimal bytes,
+big-endian as on the air, one to eight of them (`91 d3`, `0x91D3` and `91d3` are the same word).
 A channel with a word of its own decodes with it; a channel with the box empty
 uses the general word, which the empty box shows as its hint (`none` if there is
 none). Devices that use different sync words on one band can therefore be
