@@ -1276,7 +1276,7 @@ pub(crate) fn paint_radio_analyzer_channels(
 
                 // The sync word is on a row of its own: a fourth column does
                 // not fit in the width of the setup panel.
-                ui.label(RichText::new("Sync word").small().color(TEXT_MUTED));
+                paint_radio_parameter_label(ui, "Sync word", None);
                 ui.add_enabled_ui(controls_enabled, |ui| {
                     let invalid = SyncWordSetting::parse(&channel.sync_word).is_err();
                     let mut edit = egui::TextEdit::singleline(&mut channel.sync_word)
@@ -2048,6 +2048,8 @@ mod tests {
     /// What one frame of the receive panel painted.
     struct Painted {
         texts: Vec<(String, Pos2)>,
+        /// The font each text was laid out with, in the order of `texts`.
+        fonts: Vec<FontId>,
         squares: Vec<Pos2>,
         /// The rightmost point of any text or box that was painted.
         right_edge: f32,
@@ -2067,6 +2069,15 @@ mod tests {
                             text.galley.text().replace('\u{2212}', "-"),
                             text.visual_bounding_rect().center(),
                         ));
+                        painted.fonts.push(
+                            text.galley
+                                .job
+                                .sections
+                                .first()
+                                .map_or_else(FontId::default, |section| {
+                                    section.format.font_id.clone()
+                                }),
+                        );
                     }
                     egui::Shape::Rect(rect) => {
                         // A rectangle with neither fill nor outline, such as the
@@ -2084,6 +2095,7 @@ mod tests {
             }
             let mut painted = Self {
                 texts: Vec::new(),
+                fonts: Vec::new(),
                 squares: Vec::new(),
                 right_edge: 0.0,
             };
@@ -2095,6 +2107,16 @@ mod tests {
 
         fn has(&self, text: &str) -> bool {
             self.texts.iter().any(|(painted, _)| painted == text)
+        }
+
+        /// The font of the first text painted as `text`.
+        fn font_of(&self, text: &str) -> &FontId {
+            let index = self
+                .texts
+                .iter()
+                .position(|(painted, _)| painted == text)
+                .unwrap_or_else(|| panic!("{text:?} was not painted"));
+            &self.fonts[index]
         }
 
         fn starts_with(&self, prefix: &str) -> bool {
@@ -2709,6 +2731,21 @@ mod tests {
 
         assert!(painted.has("Detected sync words"));
         assert_fits(&panel, &painted, "signal analyzer");
+    }
+
+    #[test]
+    fn the_sync_word_label_of_a_channel_is_painted_like_the_other_parameter_labels() {
+        let analyzer = ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+            .analyzer_section()
+            .painted();
+        let channels = ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+            .channels_section()
+            .painted();
+
+        assert_eq!(
+            channels.font_of("Sync word"),
+            analyzer.font_of("Channel filter taps")
+        );
     }
 
     #[test]
