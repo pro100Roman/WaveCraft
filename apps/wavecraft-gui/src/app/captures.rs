@@ -10,8 +10,8 @@ use crate::{
     should_rearm_acquisition, start_capture, thread, AcquisitionMode, ActiveCapture, CaptureBatch,
     CaptureEvent, CaptureFrame, CaptureReady, CaptureTarget, CompletedCapture, CompletionStatus,
     DsLogicOperationMode, FileDecodedDataRecorder, Instant, PathBuf, ProtocolAnalyzerInstance,
-    ProtocolCaptureDecoder, ProtocolDecodeCache, RadioCaptureRequest, RadioDataDecoderConfig,
-    RadioDspWorker, RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache,
+    ProtocolCaptureDecoder, ProtocolDecodeCache, RadioCaptureRequest, RadioDspWorker,
+    RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache, SyncWordSuggestion,
     WaveformStore, WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
 };
 
@@ -420,10 +420,10 @@ impl WaveCraftApp {
                 "signal analyzer channel offset lies outside the captured RF span".to_owned(),
             );
         }
-        let decoder_config = if analyzer_profiles.is_empty() {
-            RadioDataDecoderConfig::Raw(self.radio_settings.analyzer.raw_config())
+        let decoder_configs = if analyzer_profiles.is_empty() {
+            Vec::new()
         } else {
-            self.radio_settings.analyzer.decoder_config()?
+            self.radio_settings.analyzer.decoder_configs()?
         };
         Ok(RadioCaptureRequest {
             device,
@@ -432,7 +432,7 @@ impl WaveCraftApp {
             iq_correction_enabled: self.radio_settings.iq_correction_enabled,
             analyzer_profiles,
             analyzer_channel_names,
-            decoder_config,
+            decoder_configs,
         })
     }
 
@@ -879,6 +879,22 @@ impl WaveCraftApp {
             Some(WaveformTab::Combined) => self.combined_capture.as_ref(),
             None => None,
         }
+    }
+
+    /// The sync words that the raw messages of the radio capture on display
+    /// have in common: of the running capture, or else of the last one.
+    pub(crate) fn displayed_sync_word_suggestions(&self) -> Vec<SyncWordSuggestion> {
+        self.capture_for_target(CaptureTarget::RadioReceiver)
+            .filter(|active| !active.preserve_display_until_complete)
+            .map(|active| &active.waveforms)
+            .or_else(|| {
+                self.radio_capture
+                    .as_ref()
+                    .or(self.combined_capture.as_ref())
+                    .map(|capture| &capture.waveforms)
+            })
+            .map(|waveforms| waveforms.radio_analysis.sync_word_suggestions())
+            .unwrap_or_default()
     }
 
     pub(crate) fn has_displayed_completed_capture(&self) -> bool {

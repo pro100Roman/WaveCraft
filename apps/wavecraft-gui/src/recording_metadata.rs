@@ -765,6 +765,35 @@ pub(crate) fn saved_scope_settings_metadata(
     metadata
 }
 
+/// The analyzer channel list: how many there are, and the offset, name and, if
+/// it has one of its own, the sync word of each.
+pub(crate) fn insert_radio_analyzer_channels_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    channels: &[RadioAnalyzerChannelSettings],
+) {
+    metadata.insert(
+        "radio.analyzer.channel_count".to_owned(),
+        channels.len().to_string(),
+    );
+    for (index, channel) in channels.iter().enumerate() {
+        metadata.insert(
+            format!("radio.analyzer.channel.{index}.offset_hz"),
+            channel.frequency_offset_hz.to_string(),
+        );
+        metadata.insert(
+            format!("radio.analyzer.channel.{index}.name"),
+            channel.name.clone(),
+        );
+        let sync_word = channel.sync_word.trim();
+        if !sync_word.is_empty() {
+            metadata.insert(
+                format!("radio.analyzer.channel.{index}.sync_word"),
+                sync_word.to_owned(),
+            );
+        }
+    }
+}
+
 pub(crate) fn saved_radio_settings_metadata(settings: &RadioSettings) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     write_fields(&mut metadata, settings, RADIO_FIELDS);
@@ -783,20 +812,7 @@ pub(crate) fn saved_radio_settings_metadata(settings: &RadioSettings) -> BTreeMa
             .map_or(0, |channel| channel.frequency_offset_hz)
             .to_string(),
     );
-    metadata.insert(
-        "radio.analyzer.channel_count".to_owned(),
-        settings.analyzer.channels.len().to_string(),
-    );
-    for (index, channel) in settings.analyzer.channels.iter().enumerate() {
-        metadata.insert(
-            format!("radio.analyzer.channel.{index}.offset_hz"),
-            channel.frequency_offset_hz.to_string(),
-        );
-        metadata.insert(
-            format!("radio.analyzer.channel.{index}.name"),
-            channel.name.clone(),
-        );
-    }
+    insert_radio_analyzer_channels_metadata(&mut metadata, &settings.analyzer.channels);
     for (id, gain_db) in &settings.gains_db {
         metadata.insert(format!("radio.gain.{id}_db"), gain_db.to_string());
     }
@@ -1008,9 +1024,14 @@ pub(crate) fn radio_settings_from_recording_metadata(
                     .get(&format!("radio.analyzer.channel.{index}.name"))
                     .cloned()
                     .unwrap_or_else(|| format!("Channel {}", index + 1));
+                let sync_word = metadata
+                    .get(&format!("radio.analyzer.channel.{index}.sync_word"))
+                    .cloned()
+                    .unwrap_or_default();
                 Some(RadioAnalyzerChannelSettings {
                     name,
                     frequency_offset_hz,
+                    sync_word,
                 })
             })
             .collect::<Vec<_>>();
@@ -1217,10 +1238,12 @@ mod tests {
                     RadioAnalyzerChannelSettings {
                         name: "Weather".to_owned(),
                         frequency_offset_hz: 125_000,
+                        sync_word: "91 d3".to_owned(),
                     },
                     RadioAnalyzerChannelSettings {
                         name: "Control".to_owned(),
                         frequency_offset_hz: -250_000,
+                        sync_word: String::new(),
                     },
                 ],
                 channel_bandwidth_hz: 250_000,
@@ -1280,10 +1303,12 @@ mod tests {
             RadioAnalyzerChannelSettings {
                 name: "Weather".to_owned(),
                 frequency_offset_hz: 125_000,
+                sync_word: "2d d4".to_owned(),
             },
             RadioAnalyzerChannelSettings {
                 name: "Control".to_owned(),
                 frequency_offset_hz: -250_000,
+                sync_word: String::new(),
             },
         ];
         settings.analyzer.sync_word = 0xd391;

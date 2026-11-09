@@ -331,6 +331,9 @@ pub(crate) fn ingest_radio_dsp_output(waveforms: &mut WaveformStore, output: Rad
         let analysis = analysis.and_then(|output| {
             let channel_offset_hz = output.channel_frequency_offset_hz;
             let channel_name = output.channel_name;
+            waveforms
+                .radio_analysis
+                .set_channel_sync_word(channel_offset_hz, output.sync_word);
             waveforms.radio_analysis.set_telemetry(output.telemetry);
             if let Some(demodulated) = output.demodulated {
                 waveforms
@@ -431,7 +434,13 @@ mod tests {
         // Keep the FFT shorter than this focused synthetic burst so the
         // analyzer's burst gate receives a channel-power observation.
         let mut spectrum = SpectrumProcessor::new(256, SpectrumWindow::Hann).unwrap();
-        let bits = [true, false, true, true, false, false, true];
+        // The carrier keeps going after the symbols checked below: the channel
+        // is only handed to the demodulator a few symbols behind the newest
+        // sample, so that a change of level is seen before the samples around
+        // it are decoded.
+        let bits = [
+            true, false, true, true, false, false, true, true, false, true, false,
+        ];
         let mut phase: f64 = 0.0;
         let samples = bits
             .into_iter()
@@ -469,7 +478,7 @@ mod tests {
             waveforms.radio_analysis.soft_symbol_alphabet_size(),
             Some(2)
         );
-        assert_eq!(waveforms.radio_analysis.soft_symbols().len(), 5);
+        assert_eq!(waveforms.radio_analysis.soft_symbols().len(), 6);
         assert_eq!(
             waveforms
                 .radio_analysis
@@ -477,9 +486,76 @@ mod tests {
                 .iter()
                 .map(|symbol| symbol.decision())
                 .collect::<Vec<_>>(),
-            vec![Some(0), Some(1), Some(1), Some(0), Some(0)]
+            vec![Some(0), Some(1), Some(1), Some(0), Some(0), Some(1)]
         );
         assert_eq!(waveforms.radio_analysis.error(), None);
+    }
+
+    #[test]
+    fn the_sync_word_of_an_analyzer_output_reaches_the_messages_of_its_channel() {
+        use crate::waveform::radio::ChannelSyncWord;
+        use wavecraft_decode::{
+            ByteStatus, RadioPacketPipelineOutput, RawRadioMessageStart, RawRadioOutput,
+            SampleRange, TimedByte,
+        };
+        use wavecraft_radio::{RadioAnalyzerOutput, RadioAnalyzerTelemetry};
+        let output = |offset_hz: i64, name: &str, sync_word: Option<&str>| RadioAnalyzerOutput {
+            channel_frequency_offset_hz: offset_hz,
+            channel_name: Arc::from(name),
+            sync_word: sync_word.map(Arc::from),
+            demodulated: None,
+            raw: RawRadioOutput {
+                bytes: vec![TimedByte {
+                    value: 0xaa,
+                    range: SampleRange { start: 0, end: 8 },
+                    status: ByteStatus::default(),
+                }],
+                message_starts: vec![RawRadioMessageStart {
+                    sample_index: 0,
+                    preamble_bytes: 1,
+                    maximum_uncertain_bits: usize::MAX,
+                }],
+                diagnostics: Vec::new(),
+                synchronized: false,
+            },
+            packets: RadioPacketPipelineOutput::default(),
+            burst_ended: false,
+            telemetry: RadioAnalyzerTelemetry::default(),
+        };
+        let mut waveforms = WaveformStore::default();
+
+        ingest_radio_dsp_output(
+            &mut waveforms,
+            RadioDspOutput {
+                spectrum: Vec::new(),
+                analyses: vec![
+                    Ok(output(-200_000, "Lower", Some("91 d3"))),
+                    Ok(output(200_000, "Upper", None)),
+                ],
+            },
+        );
+
+        let words = waveforms
+            .radio_analysis
+            .raw_messages()
+            .iter()
+            .map(|message| {
+                (
+                    message.channel_name().to_owned(),
+                    message.channel_sync_word().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            vec![
+                (
+                    "Lower".to_owned(),
+                    ChannelSyncWord::Word(Arc::from("91 d3"))
+                ),
+                ("Upper".to_owned(), ChannelSyncWord::None),
+            ]
+        );
     }
 
     #[test]

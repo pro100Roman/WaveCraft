@@ -573,6 +573,109 @@ until its squelch opens, so a bank of channels pays only for those with an
 active burst. A shared first decimation stage would add cost and coupling for
 no gain in that model.
 
+The squelch decides per spectrum window (2,048 samples, about 20 symbols at
+19.2 kbit/s), so a burst is noticed in the window in which its energy crosses
+the threshold, and its first symbols can lie in the window before. The radio
+bank therefore prepares every window, keeps the last two, and starts a channel
+that has just opened on those windows joined to the current one
+(`PreparedIqBatch::join`, contiguous windows only). The channel filter is also
+full when the burst arrives. On a 154 s capture of a 19.2 kbit/s link with a
+10 byte preamble, requiring all ten preamble bytes found 133 bursts without the
+pre-roll and 166 with it, against 174 when requiring eight. More than two windows of
+lead-in noise is harmless only because of the noise gate described under
+*Symbol timing and soft symbols*.
+
+### Transmissions that follow each other
+
+The squelch cannot see where a burst ends or that a second one began. It holds
+a channel open for three quiet windows (about 3 ms, seven bytes at
+19.2 kbit/s) after the carrier, and everything in that time reached the
+demodulator and the decoder: a message grew by about five bytes of noise, a
+63 byte frame read as 70, and a weak transmission starting 1.3 to 1.6 ms after
+a strong one (a repeater answering) was decoded as part of the first, with the
+tone and clock settings of the strong one and a damaged second preamble and
+sync word.
+
+The filtered channel shows both events as steps in level: the envelope of FSK
+and GFSK is constant, so a change of 6 dB or more is a different signal, not
+modulation. `LevelStepSegmenter` (`wavecraft-dsp`) compares the mean power of
+the three symbols before and after every channel sample and reports the sharpest
+step at its exact sample. A step needs the window after it, so the samples are
+released three symbols late, unchanged. The radio runtime hands each steady run
+to the demodulator separately. At a step it
+
+1. finishes the demodulator (`FskDemodulator::finish`), which continues the
+   carrier at its last frequency for half a receive-filter span so that the
+   symbols the filter still holds, two for GFSK, are not lost,
+2. ends the decoder's message (`finish`, then `reset`), and
+3. starts the next run with `discontinuity` set, so a transmission is acquired
+   from its own first sample and not from what the noise before it left in the
+   tone tracker and clock loop.
+
+A drop is the end of the carrier, so the noise after it is not decoded as part
+of the message (it reaches an idle demodulator, which does not acquire noise).
+A rise starts a transmission.
+
+The envelope is constant only before the channel filter. A tone away from the
+channel centre is attenuated, so a strong burst swings by about 5 dB inside
+itself, every millisecond or so (seen at 12 to 17 dB over the noise). A
+threshold below 6 dB applied everywhere therefore tears bursts apart: lowering
+it to 5, 4.5 and 4 dB lost 1, 3 and 7 of 170 messages, and a longer window (up
+to eight symbols) changes nothing, because the swing is real and not noise in
+the estimate.
+
+An edge to or from the noise floor has no such swing, so a change of 4 dB
+counts there. The segmenter remembers the quietest window mean it has seen on
+the channel as the floor, and a change of at least 4 dB is a step if its quieter
+side is within 4.5 dB of it. The quietest of many windows of noise lies a little
+below their mean, which the margin allows for. The floor is trusted only once a
+window 6 dB above it has been seen, since a stream that starts inside a strong
+burst would otherwise take the burst's lower swing level for noise and tear it
+at every swing. It is learned from the channel, survives a gap in the stream
+and rises by at most 2 dB per second of samples, and a change of sample rate
+forgets it. A carrier that never stands out above the noise by 4 dB is left to
+the squelch as before.
+
+On the two captures (235 messages) this ends six more weak bursts where the
+carrier ends, with no message lost and none new: a frame that read 36 bytes
+(32 after the preamble) now reads 32. Which of the bursts it helps is limited by
+how far above the noise they are, not by the window length.
+
+On a 61 s capture with two channels and 63 messages, the message end was a
+median 4.9 bytes (at most 6.9) past the end of the carrier and now is 0.0 (at
+most 0.4); transmissions merged into one message fell from 10 to 1. Frames now
+have the lengths the transmitter sends: a long frame is 63 bytes after the sync
+word in all seven cases (it was 67 to 71, and 101 where two followed each other),
+and its retransmissions on the other channel agree on exactly those 63 bytes.
+Over the two captures 6 messages were found that were hidden before, and none
+was lost.
+
+#### Byte alignment without a sync word
+
+When the raw decoder has no sync word to align to (`sync_word_bytes` 0) it
+starts a message at the first window of preamble bytes it finds. The alternating
+preamble matches itself shifted by two bits, so the earliest matching window
+may start two bits before the real preamble and every byte after it is then
+shifted: the sync word `91 d3` shows up as `a4 74`, `a9 1d` or `47 4f` with the
+same bits.
+
+The two bits that slide the window are the first two symbols of a burst. They
+come out of a receive filter that is not filled yet, and have a low confidence
+(0.05 to 0.54 in the captures), while bits inside the burst have a confidence
+close to 1. A preamble window therefore must start on confident bits: the first
+`PREAMBLE_HEAD_BITS` (2) bits of the window need a confidence of at least
+`PREAMBLE_HEAD_CONFIDENCE` (0.6). A window that starts on doubtful bits is
+skipped and the search moves on by one bit. The rule applies only to the
+preamble-only acquisition, a configured sync word is matched as before, and it
+does not drop a message: the window starts two bits later and still holds the
+whole gate.
+
+On the two captures the `91 d3` sync word is now byte aligned in 152 of 170
+messages (it was 121) and in 64 of 65 (it was 52); the message count is the same
+and no message is lost. What is left are weak bursts without a detectable
+rise (see above). Their first bits are junk with a confidence close to 1, so the
+rule cannot tell them from a real preamble.
+
 ### FSK and GFSK demodulation
 
 The first demodulator supports binary 2-FSK. After channel filtering it uses a
@@ -652,9 +755,17 @@ burst:
 
 - Tone acquisition judges the *unfiltered* discriminator as well as the
   filtered one. Filtering narrows the spread of pure noise until it resembles
-  two tones, so a noise window is rejected when its raw spread exceeds
-  `max(4, 0.4 * sample_rate / deviation)` deviations. The filtered samples still
-  provide the tone centres.
+  two tones, so a noise window is rejected when its raw spread exceeds a limit
+  in deviations. The filtered samples still provide the tone centres. The limit
+  is the smaller of `max(4, 0.4 * sample_rate / deviation)`, for noise that
+  fills the whole sample rate, and `max(4, 1.3 * channel_bandwidth / deviation)`,
+  because the channel filter keeps noise inside its passband: a 120 kHz channel
+  around a 35 kHz deviation signal spreads noise over about 5.5 deviations, not
+  the 14.6 of the 512 kS/s sample rate. With the sample-rate limit alone 31% of
+  24-symbol noise windows on that link were accepted as tones and the tones
+  tracked from them ruined the burst that followed; at 1.3 it is 1 of 600 and
+  every burst at 8 dB Eb/N0 is still acquired. The demodulator learns the
+  bandwidth from `ChannelizedBatch::bandwidth_hz`.
 - The tone centres are committed only after they stay put for a whole
   acquisition window, so a window straddling the burst edge never supplies
   them. Consecutive windows count as the same candidate when their centres
@@ -673,9 +784,18 @@ burst:
   instead of 53 to 71.
 
 The centred filter needs look-ahead: the last two symbols of a GFSK burst (half
-a symbol for FSK) are decided only when later samples arrive. A real burst is
-followed by a quiet channel until the squelch releases, which supplies them.
-The filter's start is extended backwards so the first preamble symbols are kept.
+a symbol for FSK) are decided only when later samples arrive. When the burst's
+end is found (see *Transmissions that follow each other*), `finish` supplies
+them by continuing the carrier; otherwise the quiet channel until the squelch
+releases does.
+The filter's start is extended backwards so the first preamble symbols are kept,
+and the first symbol of a burst is still decided from the first sample when its
+centre lies up to 0.3 of a symbol before it. The channel filter outputs its first
+sample half a filter length into the stream, which for a 257-tap filter at
+2 MS/s is 1.2 symbols, so a burst that starts a few dozen samples after the
+analyzer does has its first symbol centred just before the first output.
+Dropping that symbol also moved a byte-aligned preamble search to the next `1`
+bit, so a 10 byte preamble read as nine `aa` bytes and `a8`.
 
 Digital demodulators emit soft symbols rather than immediately packing bytes.
 The generic contract retains likelihoods for every member of the configured
@@ -785,6 +905,88 @@ Capture profiles and recording metadata retain the bounded ordered channel
 list and its names; legacy recordings without names receive numbered defaults,
 and a legacy `channel_offset_hz` loads as a one-channel list. RAW DATA and
 PACKETS rows show the configured channel name and an unprefixed byte count.
+
+#### A sync word for each channel
+
+The sync word in the **Signal analyzer** section is the general one. Every
+channel also has a **Sync word** box, on a row of its own under the channel's name
+and offset so that the list fits the width of the setup panel: hexadecimal bytes,
+big-endian as on the air, one to eight of them (`91 d3`, `0x91D3` and `91d3` are the same word).
+A channel with a word of its own decodes with it; a channel with the box empty
+uses the general word, which the empty box shows as its hint (`none` if there is
+none). Devices that use different sync words on one band can therefore be
+decoded in the same capture, each on its own channel, and a channel may have a
+sync word while the general one is off.
+
+Each channel has its own decoder, so the capture request carries one decoder
+configuration per channel, built from the shared preamble, bit-error, whitening
+and confidence settings and the channel's sync word. The limit on bit errors in
+the preamble and sync word is kept below the length of a channel's sync word in
+bits, so a short word does not inherit the limit set for a longer general one.
+A word that is not whole hexadecimal bytes is shown in red, is reported in the
+analyzer section as `<channel name>: ...`, and stops the capture from starting
+and a recording from being decoded. In packet mode, where a sync word is
+required, every channel needs a word of its own or a general one.
+
+The word is recorded per channel as `radio.analyzer.channel.<n>.sync_word`, and
+only when the channel has one; recordings and settings without the key load with
+the general word for that channel.
+
+The popup that opens when a channel is clicked in RAW DATA shows the word the
+channel was decoded with. Each analyzer output carries it (`sync_word` of
+`RadioAnalyzerOutput`: hexadecimal bytes such as `91 d3`, or `None` when the
+decoder has no sync word), the analysis store keeps the latest word of each
+channel, and a message takes the word its channel had when the message started.
+The popup shows `none` for a channel decoded without a sync word and no row at
+all for a message that does not know it, such as one read from a decoded data
+file, which does not record the word.
+
+The setup panel is 300 px wide for every instrument, and an element that does
+not fit pushes its edge out, so the radio panel would be wider than the logic
+analyzer and oscilloscope ones. The sections of the radio card are therefore
+indented by 10 px instead of the default 18, and the channel list has three
+narrow columns (name, offset, remove) with the sync word under them. Tests paint
+each section in exactly the room it has, and compare the edge of the panel in
+every tab.
+
+#### Finding the sync word of a transmitter
+
+Without a sync word the raw decoder cannot tell where the bytes of a message
+begin, and a sync word is what makes decoding accurate: on the two captures
+used above, decoding with `91 d3` and a preamble of four bytes found 7 more
+messages in 170 (and 2 more in 65) than the preamble-only mode, nearly all with
+the exact length of their frame, and with a preamble of two bytes 25 more
+(195 messages). The **Detected sync words** rows of the **Signal analyzer**
+section offer the word without it having to be known beforehand.
+
+`SyncWordSurvey` (`wavecraft-decode`) takes in every completed raw message once
+and does not keep it. A message must start, within its first eight bits, with at
+least sixteen alternating bits, a preamble; the first bit that does not
+alternate is where the sync word starts. That bit does not depend on how the
+bits were cut into bytes, so the messages of one transmitter are recognised
+together by the bit before the break and the nine bits after it, whatever their
+alignment, and whatever frame type follows the word. Within such a group the
+cut that most messages share (the bit of a byte the break falls on) is taken for
+the right one, and the two bytes read that way are the word. A word is offered
+once it has been seen in three messages, three words at most, the most common
+first, with the count of all the messages in its group and of those that were
+cut the way it is shown. The same word after a preamble of `55` instead of `aa`
+breaks on another bit and is a group of its own, and the counts are added.
+
+On the two captures the survey finds `91 d3` in 168 of 170 messages (152 cut as
+shown) and in 65 of 65 (64 cut as shown), and nothing else. Messages decoded
+with the sync word set give the same word in 175 of 177.
+
+A button with the word, `91 d3  ×152`, sets it as the general sync word, and
+the word in use is not offered again. The survey follows the capture on display,
+the running one or the last, including a loaded recording, and counts messages
+that the list of RAW DATA no longer keeps. It is not a decoder setting: a
+capture is decoded the same way with or without it, and nothing in it depends on
+earlier messages. It looks for a sync word in raw messages only, since a packet
+holds only what follows its sync word, and when two transmitters share the first
+nine bits after the break only the more common of the two is offered. Settings
+are locked while a capture runs, so a word detected during a capture is used
+after it.
 
 These operations are not application-field parsing. Their output is a
 `RadioPacket` containing timed bytes, source range, RSSI/power estimate,

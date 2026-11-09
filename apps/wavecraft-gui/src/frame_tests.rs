@@ -472,3 +472,160 @@ fn the_scope_plot_fills_the_whole_oscilloscope_card() {
         }
     }
 }
+
+#[test]
+fn a_radio_capture_gives_each_analyzer_channel_the_decoder_of_its_own_sync_word() {
+    let mut app = app_with_every_instrument();
+    let context = context();
+    run_frames(&mut app, &context, 1);
+    app.radio_settings.analyzer.demodulation = RadioDemodulation::BinaryGfsk;
+    app.radio_settings.analyzer.sync_word = 0x91d3;
+    app.radio_settings.analyzer.sync_word_bytes = 2;
+    let mut own = RadioAnalyzerChannelSettings::numbered(1, 300_000);
+    own.sync_word = "2d d4 aa".to_owned();
+    app.radio_settings.analyzer.channels = vec![
+        RadioAnalyzerChannelSettings::numbered(0, -300_000),
+        own,
+        RadioAnalyzerChannelSettings::numbered(2, 0),
+    ];
+
+    let request = app
+        .radio_capture_request(AcquisitionMode::Run)
+        .expect("the settings are valid");
+
+    let sync_words = request
+        .decoder_configs
+        .iter()
+        .map(|config| match config {
+            RadioDataDecoderConfig::Raw(raw) => (raw.sync_word, raw.sync_word_bytes),
+            RadioDataDecoderConfig::Packets(_) => panic!("the settings are for raw data"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sync_words, [(0x91d3, 2), (0x2dd4aa, 3), (0x91d3, 2)]);
+    assert_eq!(request.analyzer_profiles.len(), 3);
+    assert_eq!(request.analyzer_channel_names.len(), 3);
+}
+
+#[test]
+fn a_radio_capture_is_refused_when_a_channel_sync_word_is_not_valid() {
+    let mut app = app_with_every_instrument();
+    let context = context();
+    run_frames(&mut app, &context, 1);
+    app.radio_settings.analyzer.demodulation = RadioDemodulation::BinaryGfsk;
+    app.radio_settings.analyzer.channels[0].sync_word = "91 d".to_owned();
+
+    let error = app
+        .radio_capture_request(AcquisitionMode::Run)
+        .err()
+        .expect("a half-typed sync word is not a capture setting");
+
+    assert!(error.starts_with("Channel 1: "), "{error}");
+}
+
+/// A capture whose radio store holds `count` raw messages with the sync word
+/// `91 d3`.
+fn radio_capture_with_sync_word_messages(count: u64) -> CompletedCapture {
+    let mut analysis = RadioAnalysisStore::new(1_000).unwrap();
+    for index in 0..count {
+        let mut values = vec![0xaa; 10];
+        values.extend([0x91, 0xd3, 0xee, 0x10]);
+        let start = index * 1_000;
+        analysis.ingest_raw(
+            RawRadioOutput {
+                bytes: values
+                    .iter()
+                    .enumerate()
+                    .map(|(position, value)| TimedByte {
+                        value: *value,
+                        range: SampleRange {
+                            start: start + position as u64 * 8,
+                            end: start + position as u64 * 8 + 8,
+                        },
+                        status: ByteStatus::default(),
+                    })
+                    .collect(),
+                message_starts: vec![RawRadioMessageStart {
+                    sample_index: start,
+                    preamble_bytes: 10,
+                    maximum_uncertain_bits: usize::MAX,
+                }],
+                diagnostics: Vec::new(),
+                synchronized: false,
+            },
+            0,
+            Arc::from("Channel 1"),
+        );
+        analysis.finish_channel_capture(0);
+    }
+    CompletedCapture {
+        waveforms: WaveformStore {
+            radio_analysis: analysis,
+            ..WaveformStore::default()
+        },
+        protocol_decode: ProtocolCaptureDecoder::new(&[]),
+        has_logic: false,
+        has_scope: false,
+        has_radio: true,
+    }
+}
+
+#[test]
+fn the_sync_words_of_the_last_radio_capture_are_offered_in_the_settings() {
+    let mut app = app_with_every_instrument();
+    assert!(app.displayed_sync_word_suggestions().is_empty());
+
+    app.radio_capture = Some(radio_capture_with_sync_word_messages(6));
+
+    let suggestions = app.displayed_sync_word_suggestions();
+    assert_eq!(suggestions.len(), 1, "{suggestions:?}");
+    assert_eq!(suggestions[0].word, 0x91d3);
+    assert_eq!(suggestions[0].messages, 6);
+}
+
+#[test]
+fn the_settings_with_detected_sync_words_paint() {
+    let mut app = app_with_every_instrument();
+    let context = context();
+    app.radio_capture = Some(radio_capture_with_sync_word_messages(6));
+    app.select_waveform_tab(WaveformTab::RadioReceiver);
+    app.radio_settings.analyzer.demodulation = RadioDemodulation::BinaryGfsk;
+    app.settings_open = true;
+
+    run_frames(&mut app, &context, 3);
+
+    assert!(app.settings_open);
+}
+
+/// The right edge of the setup panel on the left, in the last frame.
+fn setup_panel_right_edge(tab: WaveformTab, configure: impl FnOnce(&mut WaveCraftApp)) -> f32 {
+    let mut app = app_with_every_instrument();
+    let context = context();
+    configure(&mut app);
+    app.select_waveform_tab(tab);
+    run_frames(&mut app, &context, 4);
+    context.available_rect().left()
+}
+
+#[test]
+fn the_setup_panel_is_as_wide_with_the_radio_as_with_the_logic_analyzer_and_scope() {
+    // A radio card with everything in it: the analyzer on, so that its channel
+    // list is shown, with several channels that have a sync word each.
+    let radio_settings = |app: &mut WaveCraftApp| {
+        app.radio_settings.analyzer.demodulation = RadioDemodulation::BinaryGfsk;
+        app.radio_settings.analyzer.channels = (0..12)
+            .map(|index| {
+                let mut channel = RadioAnalyzerChannelSettings::numbered(index, 0);
+                channel.sync_word = "2d d4 aa bb cc dd ee ff".to_owned();
+                channel
+            })
+            .collect();
+    };
+    let logic = setup_panel_right_edge(WaveformTab::LogicAnalyzer, |_| {});
+    let scope = setup_panel_right_edge(WaveformTab::Oscilloscope, |_| {});
+    let radio = setup_panel_right_edge(WaveformTab::RadioReceiver, radio_settings);
+    let combined = setup_panel_right_edge(WaveformTab::Combined, radio_settings);
+
+    assert_eq!(logic, scope, "the logic and scope panels agree");
+    assert_eq!(radio, logic, "the radio panel");
+    assert_eq!(combined, logic, "the combined view's panel");
+}

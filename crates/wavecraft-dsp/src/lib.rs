@@ -1,6 +1,7 @@
 //! Device-independent signal processing for radio IQ captures.
 
 mod analyzer;
+mod carrier;
 mod channelizer;
 mod demodulation;
 mod fsk;
@@ -10,6 +11,7 @@ mod timing;
 pub use analyzer::{
     BinaryFskProfile, BinaryGfskProfile, DemodulationProfile, SignalAnalyzer, SignalAnalyzerProfile,
 };
+pub use carrier::{ChannelSegment, LevelStep, LevelStepSegmenter};
 pub use channelizer::{
     automatic_filter_tap_count, ChannelizedBatch, Channelizer, ChannelizerConfig, PreparedIqBatch,
     TimedComplexSample, WidebandIqPreprocessor, MAX_FILTER_TAP_COUNT,

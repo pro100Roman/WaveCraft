@@ -6,6 +6,15 @@ use crate::{
 const MAX_PREAMBLE_BYTES: usize = 256;
 const MAX_UNCERTAIN_BITS: usize = 1_000_000;
 const AUTOMATIC_PREAMBLE_BYTES: usize = 3;
+/// Bits at the start of a preamble window that must be confident, and how
+/// confident. Without a sync word the earliest window of alternating bits is
+/// taken as the start of the message, and an alternating preamble matches
+/// itself two bits further on. The first symbols of a burst come out of a
+/// receive filter that has not filled yet and are the least reliable ones; a
+/// window that began on them moved the byte boundary by two bits in a third
+/// of the messages of a real link, whatever the sync word.
+const PREAMBLE_HEAD_BITS: usize = 2;
+const PREAMBLE_HEAD_CONFIDENCE: f32 = 0.6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawRadioConfig {
@@ -338,7 +347,8 @@ impl RawRadioDecoder {
         if self.config.sync_word_bytes == 0 {
             return (self.search_bits.len() == self.preamble_bits.len()
                 && self.pattern_matches(0, &self.preamble_bits)
-                && self.confidence_acceptable(0, self.search_bits.len()))
+                && self.confidence_acceptable(0, self.search_bits.len())
+                && self.head_is_confident())
             .then_some(0);
         }
 
@@ -386,6 +396,15 @@ impl RawRadioDecoder {
     fn pattern_matches(&self, start: usize, expected: &[bool]) -> bool {
         self.pattern_error_count(start, expected)
             .is_some_and(|errors| errors <= self.config.maximum_preamble_bit_errors)
+    }
+
+    /// Whether the search window starts on bits worth trusting; see
+    /// [`PREAMBLE_HEAD_BITS`].
+    fn head_is_confident(&self) -> bool {
+        self.search_bits
+            .iter()
+            .take(PREAMBLE_HEAD_BITS)
+            .all(|bit| bit.confidence >= PREAMBLE_HEAD_CONFIDENCE)
     }
 
     fn confidence_acceptable(&self, start: usize, end: usize) -> bool {
@@ -584,6 +603,48 @@ mod tests {
             minimum_bit_confidence_milli: 500,
             maximum_uncertain_bits: 0,
         }
+    }
+
+    #[test]
+    fn a_preamble_window_does_not_start_on_doubtful_bits() {
+        // Two unreliable bits from the edge of a burst happen to continue the
+        // alternation of the preamble. Starting the message on them would move
+        // the byte boundary by two bits.
+        let mut input = vec![true, false];
+        input.extend(byte_bits(&[0xaa, 0xaa, 0xaa, 0x12, 0x34]));
+        let mut batch = bits(&input, 10, false);
+        batch.bits[0].confidence = 0.5;
+        batch.bits[1].confidence = 0.1;
+        // No confidence limit of its own, as in the default settings.
+        let mut decoder = RawRadioDecoder::new(RawRadioConfig {
+            minimum_bit_confidence_milli: 0,
+            ..config()
+        })
+        .unwrap();
+
+        let mut output = decoder.push(&batch).unwrap();
+        output.bytes.extend(decoder.finish().bytes);
+
+        assert_eq!(output.message_starts[0].sample_index, 14);
+        assert_eq!(
+            output
+                .bytes
+                .iter()
+                .map(|byte| byte.value)
+                .collect::<Vec<_>>(),
+            [0xaa, 0xaa, 0xaa, 0x12, 0x34]
+        );
+    }
+
+    #[test]
+    fn a_confident_start_is_the_start_of_the_message() {
+        let mut input = vec![true, false];
+        input.extend(byte_bits(&[0xaa, 0xaa, 0xaa, 0x12, 0x34]));
+        let mut decoder = RawRadioDecoder::new(config()).unwrap();
+
+        let output = decoder.push(&bits(&input, 10, false)).unwrap();
+
+        assert_eq!(output.message_starts[0].sample_index, 10);
     }
 
     #[test]

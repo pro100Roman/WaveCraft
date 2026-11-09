@@ -279,6 +279,13 @@ pub trait Demodulator: Send {
 
     fn push(&mut self, input: &ChannelizedBatch) -> Result<DemodulatedBatch, DspError>;
 
+    /// Ends the current burst: returns what the demodulator still holds back
+    /// and resets it. Demodulators without such a delay return nothing.
+    fn finish(&mut self) -> Result<Option<DemodulatedBatch>, DspError> {
+        self.reset();
+        Ok(None)
+    }
+
     fn telemetry(&self) -> DemodulatorTelemetry {
         DemodulatorTelemetry::default()
     }
