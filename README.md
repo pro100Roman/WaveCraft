@@ -1,6 +1,8 @@
 # WaveCraft
 
-A Rust reimplementation of [DSView](https://github.com/DreamSourceLab/DSView) designed to capture from a logic analyzer and an oscilloscope concurrently.
+A Rust reimplementation of [DSView](https://github.com/DreamSourceLab/DSView)
+designed to capture concurrently from logic analyzers (DSLogic), oscilloscopes
+(DSCope), and SDR radio receivers (HackRF One).
 
 ## Application views
 
@@ -11,6 +13,10 @@ A Rust reimplementation of [DSView](https://github.com/DreamSourceLab/DSView) de
 ### Oscilloscope (OSC)
 
 ![WaveCraft Oscilloscope view with two analog channels and measurements](docs/images/wavecraft-oscilloscope.png)
+
+### Radio Receiver (RF)
+
+![WaveCraft RF view with spectrum, waterfall, and decoded raw data](docs/images/wavecraft-rf-spectrum.png)
 
 ### Combined view
 
@@ -39,6 +45,10 @@ In project discussions and feature requests, these abbreviations are used:
 
 - **LA** — Logic Analyzer
 - **OSC** — Oscilloscope
+- **RF** — Radio Frequency
+- **SDR** — Software-Defined Radio
+- **IQ** — In-phase and Quadrature radio samples
+- **FSK/GFSK** — Frequency-Shift Keying / Gaussian Frequency-Shift Keying
 
 ## Current milestone
 
@@ -52,6 +62,11 @@ The repository contains a working vertical slice of the new capture engine:
 - device-independent RF channelization and incremental binary FSK/GFSK
   demodulation with source-sample ranges preserved across arbitrary IQ batch
   boundaries;
+- a generic RF Spectrum workbench with live spectrum and waterfall views,
+  Run/Single acquisition, spectrum-level triggering, and raw-IQ recording;
+- multi-channel FSK/GFSK analysis with adaptive timing, raw-message and packet
+  views, per-channel sync words, detected-sync-word suggestions, and robust
+  separation of consecutive bursts near the noise floor;
 - coordinated cancellation and worker cleanup;
 - simulated instruments and a CLI demonstrating simultaneous capture;
 - capture support for the complete upstream DSLogic profile matrix, including
@@ -68,8 +83,9 @@ The repository contains a working vertical slice of the new capture engine:
 - versioned, lossless full-capture recording from the GUI and CLI;
 - Saleae Logic 2 `.sal` import and export.
 
-Broader DSCope sample-rate validation, the external protocol-decoder plugin
-host, and versioned automation scenarios are the next milestones.
+Broader DSCope sample-rate validation, additional SDR backends and modulation
+families, the external protocol-decoder plugin host, and versioned automation
+scenarios are the next milestones.
 
 The required end state includes a cross-platform decoder plugin system. SPI
 and I2C are first-party decoders, while third-party decoders will run through a
@@ -276,15 +292,16 @@ window when launched normally. Linux desktop packages should install a
 launcher with `Terminal=false`; running the binary from a shell remains useful
 for diagnostics.
 
-The application discovers supported USB instruments without blocking the UI,
-then prepares and captures from the selected sources concurrently. Instrument
-discovery, refresh, and selection are managed from **App → Settings…**. Required
-FPGA and firmware resources are selected automatically from the application
-bundle or workspace resource directory. The application displays all 16 digital
-channels, both calibrated scope channels, per-device sample totals, errors, and
-shared-timeline start skew. Independent logic-analyzer and oscilloscope session
-tabs retain captured waveforms and their settings while you work with another
-session. Capture Setup provides separate DSLogic and DSCope settings tabs while
+The application discovers supported USB and SDR instruments without blocking
+the UI, then prepares and captures from the selected sources concurrently.
+Instrument discovery, refresh, and selection are managed from **App →
+Settings…**. Required FPGA and firmware resources are selected automatically
+from the application bundle or workspace resource directory. The application
+displays all 16 digital channels, both calibrated scope channels, radio spectrum
+and waterfall data, per-device sample totals, errors, and shared-timeline start
+skew. Independent logic-analyzer, oscilloscope, and radio-receiver session tabs
+retain captured data and their settings while you work with another session.
+Capture Setup provides separate DSLogic, DSCope, and radio settings tabs while
 recording controls remain shared across the synchronized session in a
 fixed-width sidebar. DSCope settings provide a common sample rate and capture
 buffer plus independent volts/div, AC/DC coupling, probe attenuation, and
@@ -343,9 +360,35 @@ bytes into read/write transactions, lists SPI transfers, and renders decoded
 UART bytes as human-readable text when ASCII is selected. Clicking a decoded
 operation focuses its range in the waveform.
 
+The **Radio Receiver** tab provides a live RF spectrum and waterfall with
+frequency/power hover readouts and adjustable pane heights. HackRF controls
+cover center frequency, sample rate, baseband bandwidth, LNA/VGA gain, RF
+amplifier state, and signed reference-frequency correction. **Run** streams
+continuously; **Single** captures an exact duration and can wait for a draggable
+spectrum-power trigger before retaining its configured post-trigger interval.
+The same threshold acts as the analyzer squelch and remains adjustable while a
+Run capture is active.
+
+The optional **Signal analyzer** channelizes the captured band into as many as
+100 named frequency offsets and runs an independent binary FSK or GFSK decoder
+for every active channel. Automatic channel bandwidth and filter design,
+adaptive timing and tone acquisition, pre-roll, and sample-accurate carrier
+level segmentation preserve weak burst starts and keep consecutive
+transmissions separate. **RAW DATA** groups bytes by repeated preamble;
+**PACKETS** adds sync-word framing and optional custom or PN9 dewhitening.
+Channels may override the general sync word, and raw captures suggest detected
+two-byte sync words after repeated observations. Channel popups report the sync
+word used for decoding. Analyzer settings and channel-specific sync words are
+stored in recording metadata and applied when recorded IQ is replayed.
+
 Enable **Record complete capture** and enter a `.dsv` path before starting to
 write the full session to disk. The GUI uses the same streaming recorder as the
-CLI and refuses to replace an existing file.
+CLI and refuses to replace an existing file. Radio `.dsv` recordings preserve
+raw signed 8-bit IQ so spectrum and decoding can be reproduced with different
+settings. During a radio Run session, **Data** can instead stream completed RAW
+messages or PACKETS to a smaller newline-delimited `.jsonl` file. Select the RF
+view before reopening decoded `.jsonl` data; it restores the bounded decoded
+history but cannot recreate IQ, spectrum, or waterfall content.
 
 The GUI uses native window backends on macOS and Windows and enables both
 Wayland and X11 on Linux. Vendored libusb keeps the USB transport consistent
@@ -379,8 +422,9 @@ cargo test -p wavecraft-hackrf --test hardware -- --ignored --nocapture
 ```
 
 Close other HackRF applications before running the check. The generic RF GUI
-acquisition controls and provider aggregation are tracked separately from the
-backend implementation.
+uses the same backend for discovery, live Run/Single acquisition, spectrum and
+waterfall display, FSK/GFSK analysis, and raw-IQ recording. The provider-neutral
+SDR facade keeps additional radio backends separate from GUI and DSP code.
 
 The numeric shorthand (for example, `wavecraft-cli -- 2`) is the simulated
 capture duration in seconds.
@@ -444,6 +488,8 @@ same method, live status/progress callbacks, and structured exceptions. See
 - `docs/custom-protocols.md`: custom protocol decoding architecture and future
   direction.
 - `docs/recording-format.md`: native `.dsv` framing and Saleae interoperability.
+- `docs/rf-sdr-architecture.md`: RF capture, spectrum, channelization,
+  FSK/GFSK analysis, framing, and recording architecture.
 - `docs/automation-and-mcp.md`: proposed CLI, service, SCPI, Saleae API, and MCP automation architecture.
 - `docs/saleae-logic-device-support.md`: feasibility and integration paths for Saleae Logic devices (excluding Logic MSO).
 - `docs/code-health-review.md`: ranked code-health findings and improvement backlog.
