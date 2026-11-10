@@ -3,16 +3,17 @@
 
 use crate::{
     align_waveform_chrome, analyzer_transport_name, channel_label, default_logic_channel_colors,
-    egui, format_duration, format_frequency, marker_text_color, paint_empty, paint_plot_background,
-    paint_plot_grid, paint_waveform_status, paint_waveform_time_scale, protocol_stack,
-    scope_marker_color, split_waveform_chrome, update_waveform_viewport, waveform_sample_x,
-    Color32, Duration, FontId, LogicChannelSettingsDraft, LogicSampleBucket, LogicWaveformOptions,
-    Pos2, ProtocolAnalyzerInstance, ProtocolAnalyzerSettings, ProtocolDecodeCache,
-    ProtocolDecodeOutcome, ProtocolDecodeSnapshot, Range, Rect, RichText, SelectableHoverText,
-    Sense, Stroke, Vec2, VecDeque, WaveformStore, WaveformViewport, WaveformViewportOptions,
-    WaveformZoomAnchor, ACCENT, BACKGROUND, GRID, LOGIC_CHANNEL_COUNT,
-    LOGIC_CHANNEL_NAME_MAX_CHARS, LOGIC_MARKER_EDGE_SNAP_DISTANCE, LOGIC_MARKER_LIMIT, PANEL,
-    SAMPLE_COUNT, SAMPLE_RATE_HZ, TEXT_MUTED,
+    egui, format_duration, format_frequency, half_transparent_plate, marker_text_color,
+    paint_empty, paint_plot_background, paint_plot_grid, paint_waveform_status,
+    paint_waveform_time_scale, protocol_stack, scope_marker_color, split_waveform_chrome,
+    update_waveform_viewport, waveform_sample_x, Color32, Duration, FontId,
+    LogicChannelSettingsDraft, LogicSampleBucket, LogicWaveformOptions, Pos2,
+    ProtocolAnalyzerInstance, ProtocolAnalyzerSettings, ProtocolDecodeCache, ProtocolDecodeOutcome,
+    ProtocolDecodeSnapshot, Range, Rect, RichText, SelectableHoverText, Sense, Stroke, Vec2,
+    VecDeque, WaveformStore, WaveformViewport, WaveformViewportOptions, WaveformZoomAnchor, ACCENT,
+    BACKGROUND, GRID, LOGIC_CHANNEL_COUNT, LOGIC_CHANNEL_NAME_MAX_CHARS,
+    LOGIC_MARKER_EDGE_SNAP_DISTANCE, LOGIC_MARKER_LIMIT, PANEL, SAMPLE_COUNT, SAMPLE_RATE_HZ,
+    TEXT_MUTED,
 };
 
 pub(crate) fn paint_logic_zero_reference(
@@ -1016,7 +1017,7 @@ pub(crate) fn paint_logic_timing_hint(
         Pos2::new(plot.right() - width - 8.0, plot.top() + 26.0),
         Vec2::new(width, height),
     );
-    painter.rect_filled(hint, 5.0, PANEL.gamma_multiply(0.88));
+    painter.rect_filled(hint, 5.0, half_transparent_plate(PANEL));
     let border = Stroke::new(0.75_f32, color.gamma_multiply(0.65));
     painter.line_segment([hint.left_top(), hint.right_top()], border);
     painter.line_segment([hint.right_top(), hint.right_bottom()], border);
@@ -1362,6 +1363,7 @@ pub(crate) fn paint_logic(
             primary_pan_enabled: !marker_settings.adding,
             zoom_anchor: WaveformZoomAnchor::Pointer,
             timebase_basis: None,
+            timebase_controls_capture: false,
         },
     );
     update_logic_marker_gesture(

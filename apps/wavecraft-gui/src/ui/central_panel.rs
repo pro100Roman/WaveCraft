@@ -456,7 +456,8 @@ impl WaveCraftApp {
                     &mut edits.scope_fft_viewport,
                     ScopeWaveformOptions {
                         settings: scope_settings,
-                        auto_sample_rate: self.scope_auto_sample_rate,
+                        timebase_reconfigures_capture: self.scope_auto_sample_rate
+                            && frame.scope_capture_requested,
                         smart_timing_enabled: self.scope_smart_timing_enabled,
                         function_settings: self.scope_function_settings,
                         channel_names: &self.scope_channel_names,
@@ -593,7 +594,8 @@ impl WaveCraftApp {
             },
             ScopeWaveformOptions {
                 settings: scope_settings,
-                auto_sample_rate: self.scope_auto_sample_rate,
+                timebase_reconfigures_capture: self.scope_auto_sample_rate
+                    && frame.scope_capture_requested,
                 smart_timing_enabled: self.scope_smart_timing_enabled,
                 function_settings: self.scope_function_settings,
                 channel_names: &self.scope_channel_names,
@@ -665,7 +667,10 @@ impl WaveCraftApp {
             || self.scope_settings.sample_count != scope_settings_before_ui.sample_count
             || self.scope_settings.enabled_channel_count()
                 != scope_settings_before_ui.enabled_channel_count();
-        if self.scope_auto_sample_rate && automatic_sample_rate_inputs_changed {
+        if frame.scope_capture_requested
+            && self.scope_auto_sample_rate
+            && automatic_sample_rate_inputs_changed
+        {
             if let Some(time_per_division) = scope_time_per_division_seconds {
                 self.scope_settings.sample_rate_hz = self
                     .scope_settings
@@ -824,9 +829,11 @@ mod tests {
     }
 
     #[test]
-    fn a_timebase_change_recomputes_the_automatic_sample_rate() {
+    fn a_running_timebase_change_recomputes_the_automatic_sample_rate() {
         let (mut app, recomputed) = app_at_the_lowest_scope_rate();
-        apply(&mut app, |edits| {
+        let mut frame = app.frame_state();
+        frame.scope_capture_requested = true;
+        apply_in_frame(&mut app, &frame, |edits| {
             edits.scope_timebase_changed = true;
             edits.scope_time_per_division_seconds = Some(FAST_TIMEBASE);
         });
@@ -834,10 +841,24 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_timebase_change_only_changes_the_display_span() {
+        let (mut app, _) = app_at_the_lowest_scope_rate();
+        apply(&mut app, |edits| {
+            edits.scope_timebase_changed = true;
+            edits.scope_time_per_division_seconds = Some(FAST_TIMEBASE);
+        });
+
+        assert_eq!(app.scope_time_per_division_seconds, Some(FAST_TIMEBASE));
+        assert_eq!(app.scope_settings.sample_rate_hz, DSCOPE_SAMPLE_RATES_HZ[0]);
+    }
+
+    #[test]
     fn a_timebase_change_leaves_a_manual_sample_rate_alone() {
         let (mut app, _) = app_at_the_lowest_scope_rate();
         app.scope_auto_sample_rate = false;
-        apply(&mut app, |edits| {
+        let mut frame = app.frame_state();
+        frame.scope_capture_requested = true;
+        apply_in_frame(&mut app, &frame, |edits| {
             edits.scope_timebase_changed = true;
             edits.scope_time_per_division_seconds = Some(FAST_TIMEBASE);
         });
@@ -858,6 +879,7 @@ mod tests {
         let (mut app, recomputed) = app_at_the_lowest_scope_rate();
         let mut frame = app.frame_state();
         frame.scope_auto_sample_rate_before_ui = false;
+        frame.scope_capture_requested = true;
         apply_in_frame(&mut app, &frame, |edits| {
             edits.scope_time_per_division_seconds = Some(FAST_TIMEBASE);
         });
@@ -869,6 +891,7 @@ mod tests {
         let (mut app, recomputed) = app_at_the_lowest_scope_rate();
 
         let mut frame = app.frame_state();
+        frame.scope_capture_requested = true;
         frame.scope_settings_before_ui.sample_count += 1;
         apply_in_frame(&mut app, &frame, |edits| {
             edits.scope_time_per_division_seconds = Some(FAST_TIMEBASE);
@@ -877,6 +900,7 @@ mod tests {
 
         app.scope_settings.sample_rate_hz = DSCOPE_SAMPLE_RATES_HZ[0];
         let mut frame = app.frame_state();
+        frame.scope_capture_requested = true;
         frame.scope_settings_before_ui.channels[1].enabled =
             !frame.scope_settings_before_ui.channels[1].enabled;
         apply_in_frame(&mut app, &frame, |edits| {

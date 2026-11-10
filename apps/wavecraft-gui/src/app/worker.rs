@@ -98,6 +98,13 @@ fn started_capture_status(facts: &StartedCaptureFacts) -> String {
                 )
             }
         }
+        (AcquisitionMode::Repetitive, _) if target == CaptureTarget::Oscilloscope => {
+            if scope_trigger_is_auto {
+                "Re-Arm · acquiring".to_owned()
+            } else {
+                "Re-Arm · waiting for trigger".to_owned()
+            }
+        }
         (AcquisitionMode::Repetitive, _) => format!(
             "{} Repetitive acquisition from {count} instrument(s)",
             target.label()
@@ -113,9 +120,9 @@ fn started_capture_status(facts: &StartedCaptureFacts) -> String {
         ),
         (AcquisitionMode::Run, None) => {
             if has_scope_trigger && scope_trigger_is_auto {
-                "Run · Auto".to_owned()
+                "Auto · continuous".to_owned()
             } else if has_scope_trigger {
-                "Run · waiting for trigger".to_owned()
+                "Update · waiting for trigger".to_owned()
             } else {
                 format!(
                     "{} Run acquisition from {count} instrument(s)",
@@ -778,6 +785,27 @@ mod tests {
                 "Logic Analyzer Repetitive acquisition from 2 instrument(s)",
             ),
             (
+                "scope re-arm with auto source",
+                StartedCaptureFacts {
+                    mode: AcquisitionMode::Repetitive,
+                    target: CaptureTarget::Oscilloscope,
+                    has_scope_trigger: true,
+                    scope_trigger_is_auto: true,
+                    ..run
+                },
+                "Re-Arm · acquiring",
+            ),
+            (
+                "scope re-arm with edge trigger",
+                StartedCaptureFacts {
+                    mode: AcquisitionMode::Repetitive,
+                    target: CaptureTarget::Oscilloscope,
+                    has_scope_trigger: true,
+                    ..run
+                },
+                "Re-Arm · waiting for trigger",
+            ),
+            (
                 "loop",
                 StartedCaptureFacts {
                     mode: AcquisitionMode::Loop,
@@ -802,7 +830,7 @@ mod tests {
                     scope_trigger_is_auto: true,
                     ..run
                 },
-                "Run · Auto",
+                "Auto · continuous",
             ),
             (
                 "run, scope trigger",
@@ -810,7 +838,7 @@ mod tests {
                     has_scope_trigger: true,
                     ..run
                 },
-                "Run · waiting for trigger",
+                "Update · waiting for trigger",
             ),
             (
                 "run",
@@ -1368,7 +1396,7 @@ mod tests {
             app.captures[0].scope_config.trigger().source(),
             DsCopeTriggerSource::ChannelZero
         );
-        assert_eq!(app.status, "Run · waiting for trigger");
+        assert_eq!(app.status, "Update · waiting for trigger");
     }
 
     #[test]
@@ -1377,12 +1405,12 @@ mod tests {
             (
                 AcquisitionMode::Run,
                 DsCopeTriggerSource::Auto,
-                "Run · Auto",
+                "Auto · continuous",
             ),
             (
                 AcquisitionMode::Run,
                 DsCopeTriggerSource::ChannelOne,
-                "Run · waiting for trigger",
+                "Update · waiting for trigger",
             ),
             (
                 AcquisitionMode::Single,

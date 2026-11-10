@@ -301,6 +301,7 @@ mod tests {
             LogicCaptureSettings::default().capture_config().unwrap(),
             ScopeCaptureSettings::default().capture_config().unwrap(),
             None,
+            false,
         )
         .expect("GUI radio capture should start");
         let mut trigger = RadioSingleTrigger::new(RadioSingleTriggerConfig {

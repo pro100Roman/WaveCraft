@@ -117,6 +117,21 @@ pub(crate) fn repetitive_interval(
     Duration::from_millis(tenths * 100)
 }
 
+pub(crate) fn uses_repetitive_interval(mode: AcquisitionMode, target: CaptureTarget) -> bool {
+    mode == AcquisitionMode::Repetitive && target == CaptureTarget::LogicAnalyzer
+}
+
+pub(crate) fn acquisition_mode_is_supported(mode: AcquisitionMode, target: CaptureTarget) -> bool {
+    match mode {
+        AcquisitionMode::Repetitive => matches!(
+            target,
+            CaptureTarget::LogicAnalyzer | CaptureTarget::Oscilloscope
+        ),
+        AcquisitionMode::Loop => target == CaptureTarget::LogicAnalyzer,
+        AcquisitionMode::Single | AcquisitionMode::Run => true,
+    }
+}
+
 pub(crate) fn should_rearm_acquisition(
     mode: AcquisitionMode,
     run_requested: bool,
@@ -163,11 +178,28 @@ pub(crate) fn uses_rolling_scope_buffer(
     _has_scope: bool,
     _trigger_source: DsCopeTriggerSource,
 ) -> bool {
-    // Original DSView enters Roll only when the FPGA measurement footer sets
-    // its stream-mode bit. Auto is a trigger source, not a request to append
-    // independent acquisitions into one waveform. ScopeBatch does not expose
-    // hardware stream mode yet, so keep every run acquisition frame-based.
+    // Auto is continuously acquired, but each hardware frame is displayed as
+    // a trigger-synchronized sweep. Appending frames into a rolling timeline
+    // would make the waveform drift past the trigger marker.
     false
+}
+
+/// A scope-only Run uses the driver's continuously queued USB capture. Auto
+/// frames continuously replace the synchronized display, while edge-triggered
+/// frames replace it only when a trigger arrives. Combined captures stay
+/// finite because their logic source must complete in step with the scope source.
+pub(crate) fn uses_continuous_scope_capture(mode: AcquisitionMode, target: CaptureTarget) -> bool {
+    mode == AcquisitionMode::Run && target == CaptureTarget::Oscilloscope
+}
+
+/// Update mode keeps the last completed trace visible until the next hardware
+/// trigger starts delivering a replacement frame.
+pub(crate) fn scope_updates_on_trigger(
+    mode: AcquisitionMode,
+    target: CaptureTarget,
+    trigger_source: DsCopeTriggerSource,
+) -> bool {
+    uses_continuous_scope_capture(mode, target) && trigger_source != DsCopeTriggerSource::Auto
 }
 
 pub(crate) fn is_scope_frame_start(sequence: u64) -> bool {
@@ -259,6 +291,13 @@ pub(crate) fn ingest_active_capture_frame(
         active
             .waveforms
             .mark_scope_capture_start(enabled_scope_channels);
+    }
+    if uses_continuous_scope_capture(active.mode, active.target)
+        && !active.waveforms.scope_rolling
+        && is_scope_frame_start(frame.sequence)
+        && matches!(&frame.payload, CaptureBatch::Scope(_))
+    {
+        active.waveforms.begin_scope_frame();
     }
     active
         .waveforms
@@ -387,6 +426,7 @@ pub(crate) fn start_capture(
     logic_config: DsLogicCaptureConfig,
     scope_config: DsCopeCaptureConfig,
     calibration_values: Option<DsCopeCalibrationValues>,
+    continuous_scope_capture: bool,
 ) -> Result<StartedCapture, String> {
     let iq_correction_enabled = radio_request
         .as_ref()
@@ -436,6 +476,11 @@ pub(crate) fn start_capture(
                 let source = match calibration_values {
                     Some(values) => source.with_calibration_values(values),
                     None => source,
+                };
+                let source = if continuous_scope_capture {
+                    source.with_continuous_capture()
+                } else {
+                    source
                 };
                 let (source, calibration_control) = source.with_runtime_calibration_control();
                 sources.push(Box::new(source));
@@ -621,6 +666,34 @@ mod tests {
             repetitive_interval(DsLogicOperationMode::Buffer, 20.0),
             Duration::from_secs(10)
         );
+        assert!(uses_repetitive_interval(
+            AcquisitionMode::Repetitive,
+            CaptureTarget::LogicAnalyzer,
+        ));
+        assert!(!uses_repetitive_interval(
+            AcquisitionMode::Repetitive,
+            CaptureTarget::Oscilloscope,
+        ));
+    }
+
+    #[test]
+    fn repetitive_mode_is_logic_repetitive_or_scope_re_arm() {
+        assert!(acquisition_mode_is_supported(
+            AcquisitionMode::Repetitive,
+            CaptureTarget::LogicAnalyzer,
+        ));
+        assert!(acquisition_mode_is_supported(
+            AcquisitionMode::Repetitive,
+            CaptureTarget::Oscilloscope,
+        ));
+        assert!(!acquisition_mode_is_supported(
+            AcquisitionMode::Repetitive,
+            CaptureTarget::Combined,
+        ));
+        assert!(!acquisition_mode_is_supported(
+            AcquisitionMode::Loop,
+            CaptureTarget::Oscilloscope,
+        ));
     }
 
     #[test]

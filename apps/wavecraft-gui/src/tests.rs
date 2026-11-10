@@ -514,6 +514,7 @@ fn gui_hackrf_capture_pipeline_receives_and_spectrally_processes_iq() {
         logic_config,
         scope_config,
         None,
+        false,
     )
     .expect("GUI radio capture should start");
     let StartedCapture {
@@ -1055,7 +1056,7 @@ fn rolling_scope_uses_the_full_span_as_its_sample_domain() {
 }
 
 #[test]
-fn auto_trigger_does_not_imply_hardware_roll_mode() {
+fn scope_run_uses_synchronized_frames_for_auto_and_update() {
     assert!(!uses_rolling_scope_buffer(
         AcquisitionMode::Run,
         true,
@@ -1070,6 +1071,28 @@ fn auto_trigger_does_not_imply_hardware_roll_mode() {
         AcquisitionMode::Run,
         true,
         DsCopeTriggerSource::ChannelZero,
+    ));
+    assert!(uses_continuous_scope_capture(
+        AcquisitionMode::Run,
+        CaptureTarget::Oscilloscope,
+    ));
+    assert!(!uses_continuous_scope_capture(
+        AcquisitionMode::Single,
+        CaptureTarget::Oscilloscope,
+    ));
+    assert!(!uses_continuous_scope_capture(
+        AcquisitionMode::Run,
+        CaptureTarget::Combined,
+    ));
+    assert!(scope_updates_on_trigger(
+        AcquisitionMode::Run,
+        CaptureTarget::Oscilloscope,
+        DsCopeTriggerSource::ChannelZero,
+    ));
+    assert!(!scope_updates_on_trigger(
+        AcquisitionMode::Run,
+        CaptureTarget::Oscilloscope,
+        DsCopeTriggerSource::Auto,
     ));
 
     let config = ScopeCaptureSettings::default().capture_config().unwrap();
@@ -1407,9 +1430,9 @@ fn scope_trigger_position_maps_between_percent_and_plot_x() {
 
     let mut full_span = WaveformViewport::default();
     full_span.align_trigger_to_screen(0.75, 0.5);
-    assert_eq!(full_span.start, 0.0);
+    assert_eq!(full_span.start, 0.25);
     assert_eq!(full_span.span, 1.0);
-    assert!(((0.75 - full_span.start) / full_span.span - 0.75).abs() < f32::EPSILON);
+    assert!(((0.75 - full_span.start) / full_span.span - 0.5).abs() < f32::EPSILON);
 
     let mut hardware_anchored = WaveformViewport {
         start: 0.25,

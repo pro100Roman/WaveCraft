@@ -1,18 +1,20 @@
 //! Starting, stopping, and polling captures, and the completed captures kept for display.
 
 use crate::{
-    append_error, capture_devices_for_target, capture_recording_is_supported,
-    clears_completed_capture_on_start, decoded_data_recording_is_supported,
-    finish_decoded_data_recording, finish_gui_recording, finish_logic_decode,
-    ingest_active_capture_frame, ingest_logic_decode_output, ingest_radio_dsp_output, mpsc,
-    radio_microsecond_sample_count, radio_provider_settings, radio_single_sample_limit,
-    record_decoded_radio_packets, record_decoded_raw_messages, repetitive_interval, selected_radio,
-    should_rearm_acquisition, start_capture, thread, AcquisitionMode, ActiveCapture, CaptureBatch,
-    CaptureEvent, CaptureFrame, CaptureReady, CaptureTarget, CompletedCapture, CompletionStatus,
-    DsLogicOperationMode, FileDecodedDataRecorder, Instant, PathBuf, ProtocolAnalyzerInstance,
-    ProtocolCaptureDecoder, ProtocolDecodeCache, RadioCaptureRequest, RadioDspWorker,
-    RadioSingleTrigger, ScheduledRepetitiveCapture, ScopeMeasurementCache, SyncWordSuggestion,
-    WaveformStore, WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
+    acquisition_mode_is_supported, append_error, capture_devices_for_target,
+    capture_recording_is_supported, clears_completed_capture_on_start,
+    decoded_data_recording_is_supported, finish_decoded_data_recording, finish_gui_recording,
+    finish_logic_decode, ingest_active_capture_frame, ingest_logic_decode_output,
+    ingest_radio_dsp_output, mpsc, radio_microsecond_sample_count, radio_provider_settings,
+    radio_single_sample_limit, record_decoded_radio_packets, record_decoded_raw_messages,
+    repetitive_interval, scope_updates_on_trigger, selected_radio, should_rearm_acquisition,
+    start_capture, thread, uses_continuous_scope_capture, uses_repetitive_interval,
+    AcquisitionMode, ActiveCapture, CaptureBatch, CaptureEvent, CaptureFrame, CaptureReady,
+    CaptureTarget, CompletedCapture, CompletionStatus, DsLogicOperationMode,
+    FileDecodedDataRecorder, Instant, PathBuf, ProtocolAnalyzerInstance, ProtocolCaptureDecoder,
+    ProtocolDecodeCache, RadioCaptureRequest, RadioDspWorker, RadioSingleTrigger,
+    ScheduledRepetitiveCapture, ScopeMeasurementCache, SyncWordSuggestion, WaveformStore,
+    WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
 };
 
 use crate::WaveCraftApp;
@@ -181,6 +183,16 @@ fn handle_capture_frame(
     radio_trigger: &RadioTriggerSettings,
     poll: &mut CapturePoll,
 ) -> ControlFlow<()> {
+    if active.preserve_display_until_complete
+        && active.mode == AcquisitionMode::Run
+        && active.target == CaptureTarget::Oscilloscope
+        && !active.waveforms.scope_rolling
+        && matches!(&frame.payload, CaptureBatch::Scope(_))
+    {
+        // Update mode holds the previous trace while it waits. The first batch
+        // proves that a new hardware trigger fired, so reveal its replacement.
+        active.preserve_display_until_complete = false;
+    }
     if let Some(trigger) = active.radio_trigger.as_mut() {
         let update_result = radio_trigger
             .posttrigger_samples
@@ -436,6 +448,27 @@ impl WaveCraftApp {
         })
     }
 
+    /// Restores trigger-locked positioning and applies the selected horizontal
+    /// resolution only when a scope acquisition is about to run. While
+    /// stopped, the same selection is a display-only zoom and must not mutate
+    /// the configured sample rate.
+    fn prepare_scope_capture_view(&mut self, target: CaptureTarget) {
+        if !target.includes_oscilloscope() {
+            return;
+        }
+        // A new acquisition returns to trigger-locked positioning. Panning a
+        // stopped trace must not leave Auto sweeps drifting between frames.
+        self.scope_viewport.anchor_locked = true;
+        if !self.scope_auto_sample_rate {
+            return;
+        }
+        if let Some(time_per_division) = self.scope_time_per_division_seconds {
+            self.scope_settings.sample_rate_hz = self
+                .scope_settings
+                .sample_rate_for_timebase(time_per_division);
+        }
+    }
+
     pub(crate) fn begin_capture(&mut self, mode: AcquisitionMode, target: CaptureTarget) {
         let continuing_request = self.capture_is_requested(target);
         if self.pending.is_some()
@@ -505,6 +538,7 @@ impl WaveCraftApp {
             self.last_error = Some("Enter a decoded data recording file path".to_owned());
             return;
         }
+        self.prepare_scope_capture_view(target);
         let scope_config = match self.scope_settings.capture_config() {
             Ok(config) => config,
             Err(error) => {
@@ -524,15 +558,19 @@ impl WaveCraftApp {
             }
         }
         .with_loop_mode(mode == AcquisitionMode::Loop);
-        if matches!(mode, AcquisitionMode::Repetitive | AcquisitionMode::Loop)
-            && target != CaptureTarget::LogicAnalyzer
-        {
+        if !acquisition_mode_is_supported(mode, target) {
             self.record_capture = false;
             self.record_decoded_data = false;
-            self.last_error = Some(
-                "Repetitive and Loop modes are available for Logic Analyzer capture only"
-                    .to_owned(),
-            );
+            self.last_error = Some(match mode {
+                AcquisitionMode::Repetitive => {
+                    "Repetitive is available for Logic Analyzer and Re-Arm for Oscilloscope capture only"
+                }
+                AcquisitionMode::Loop => "Loop mode is available for Logic Analyzer capture only",
+                AcquisitionMode::Single | AcquisitionMode::Run => {
+                    "The selected acquisition mode is not available for this target"
+                }
+            }
+            .to_owned());
             return;
         }
         if mode == AcquisitionMode::Loop
@@ -554,7 +592,9 @@ impl WaveCraftApp {
         let (sender, receiver) = mpsc::channel();
         self.scope_configuration_due = None;
         self.pending = Some(receiver);
-        if clears_completed_capture_on_start(mode, continuing_request) {
+        let update_scope_display =
+            scope_updates_on_trigger(mode, target, scope_config.trigger().source());
+        if clears_completed_capture_on_start(mode, continuing_request) && !update_scope_display {
             self.clear_completed_capture_for_target(target);
         }
         self.status = match mode {
@@ -562,7 +602,11 @@ impl WaveCraftApp {
                 format!("Preparing {} single acquisition…", target.label())
             }
             AcquisitionMode::Repetitive => {
-                format!("Preparing {} repetitive acquisition…", target.label())
+                if target == CaptureTarget::Oscilloscope {
+                    "Preparing Oscilloscope Re-Arm acquisition…".to_owned()
+                } else {
+                    format!("Preparing {} repetitive acquisition…", target.label())
+                }
             }
             AcquisitionMode::Loop => {
                 format!("Preparing {} loop acquisition…", target.label())
@@ -572,6 +616,7 @@ impl WaveCraftApp {
             }
         };
         self.last_error = None;
+        let continuous_scope_capture = uses_continuous_scope_capture(mode, target);
         thread::spawn(move || {
             let result = start_capture(
                 devices,
@@ -580,6 +625,7 @@ impl WaveCraftApp {
                 logic_config,
                 scope_config,
                 calibration_values,
+                continuous_scope_capture,
             )
             .map(|started| {
                 WorkerSuccess::Capture(Box::new(CaptureReady {
@@ -796,16 +842,16 @@ impl WaveCraftApp {
         }
     }
 
-    /// Starts the capture that follows a finished one: a Repetitive capture is
-    /// scheduled after its interval, any other starts at once, or is queued when
-    /// a background operation is still running.
+    /// Starts the capture that follows a finished one: Logic Repetitive waits
+    /// for its interval, Oscilloscope Re-Arm re-arms immediately, and a
+    /// background operation queues either until it is ready.
     fn start_next_acquisition(
         &mut self,
         mode: AcquisitionMode,
         target: CaptureTarget,
         restart_for_frontend: bool,
     ) {
-        if mode == AcquisitionMode::Repetitive && !restart_for_frontend {
+        if uses_repetitive_interval(mode, target) && !restart_for_frontend {
             let interval = repetitive_interval(
                 self.logic_settings.operation_mode,
                 self.repetitive_interval_seconds,
@@ -999,6 +1045,35 @@ mod tests {
     use std::time::Duration;
     use wavecraft_core::{Iq8, IqBatch, LogicBatch};
 
+    #[test]
+    fn starting_an_automatic_scope_capture_applies_timebase_and_relocks_trigger() {
+        let mut app = app();
+        app.scope_auto_sample_rate = true;
+        app.scope_settings.sample_rate_hz = DSCOPE_SAMPLE_RATES_HZ[0];
+        app.scope_time_per_division_seconds = Some(1.0e-6);
+        app.scope_viewport.anchor_locked = false;
+        let expected_rate = app.scope_settings.sample_rate_for_timebase(1.0e-6);
+
+        app.prepare_scope_capture_view(CaptureTarget::Oscilloscope);
+
+        assert_eq!(app.scope_settings.sample_rate_hz, expected_rate);
+        assert!(app.scope_viewport.anchor_locked);
+    }
+
+    #[test]
+    fn starting_a_manual_rate_capture_relocks_without_changing_the_rate() {
+        let mut app = app();
+        app.scope_auto_sample_rate = false;
+        app.scope_settings.sample_rate_hz = DSCOPE_SAMPLE_RATES_HZ[0];
+        app.scope_time_per_division_seconds = Some(1.0e-6);
+        app.scope_viewport.anchor_locked = false;
+
+        app.prepare_scope_capture_view(CaptureTarget::Oscilloscope);
+
+        assert_eq!(app.scope_settings.sample_rate_hz, DSCOPE_SAMPLE_RATES_HZ[0]);
+        assert!(app.scope_viewport.anchor_locked);
+    }
+
     fn logic_batch(app: &WaveCraftApp, samples: Vec<u32>) -> CaptureBatch {
         let sample_rate_hz = app
             .logic_settings
@@ -1102,6 +1177,54 @@ mod tests {
         assert_eq!(app.captures.len(), 1);
         assert!(app.captures[0].stopped.is_empty());
         assert_eq!(app.status, status);
+    }
+
+    #[test]
+    fn scope_update_holds_the_old_trace_then_stays_active_with_the_triggered_frame() {
+        let mut app = app();
+        app.scope_settings.trigger.source = DsCopeTriggerSource::ChannelZero;
+        let previous = crate::app::test_support::completed_capture(&app, false, true, false);
+        app.set_completed_capture_for_target(CaptureTarget::Oscilloscope, previous);
+        request(&mut app, CaptureTarget::Oscilloscope);
+        let started = ready_scripted(
+            &app,
+            vec![(
+                InstrumentKind::Oscilloscope,
+                Script::sending(
+                    vec![CaptureBatch::Scope(ScopeBatch {
+                        sample_rate_hz: 1_000_000,
+                        trigger_sample_index: Some(1),
+                        channels: vec![vec![0.1, 0.2], vec![-0.1, -0.2]],
+                    })],
+                    SourceEnding::Idle,
+                ),
+            )],
+            AcquisitionMode::Run,
+            CaptureTarget::Oscilloscope,
+        );
+        app.handle_capture_ready(started);
+
+        assert!(app.captures[0].preserve_display_until_complete);
+        poll_until(&mut app, CaptureTarget::Oscilloscope, |app| {
+            app.capture_for_target(CaptureTarget::Oscilloscope)
+                .is_some_and(|capture| {
+                    !capture.preserve_display_until_complete
+                        && capture
+                            .waveforms
+                            .scope_channels
+                            .first()
+                            .is_some_and(|samples| samples.len() == 2)
+                })
+        });
+
+        for _ in 0..5 {
+            app.poll_capture_target(CaptureTarget::Oscilloscope);
+        }
+        assert!(app
+            .capture_for_target(CaptureTarget::Oscilloscope)
+            .is_some());
+        assert!(app.capture_is_requested(CaptureTarget::Oscilloscope));
+        app.stop_capture(CaptureTarget::Oscilloscope);
     }
 
     #[test]

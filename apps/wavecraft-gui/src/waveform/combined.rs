@@ -13,7 +13,10 @@ use crate::{
 
 pub(crate) struct ScopeWaveformOptions<'a> {
     pub(crate) settings: ScopeCaptureSettings,
-    pub(crate) auto_sample_rate: bool,
+    /// A timebase edit changes the next hardware capture as well as the view.
+    /// This is true only while a scope acquisition is requested with automatic
+    /// sample rate enabled; stopped traces remain display-only.
+    pub(crate) timebase_reconfigures_capture: bool,
     pub(crate) smart_timing_enabled: bool,
     pub(crate) function_settings: ScopeFunctionSettings,
     pub(crate) channel_names: &'a [String; 2],

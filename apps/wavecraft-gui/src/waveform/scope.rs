@@ -3,21 +3,22 @@
 
 use crate::{
     align_waveform_chrome, apply_time_per_division, egui, format_duration, format_frequency,
-    format_trigger_voltage, marker_text_color, paint_dashed_line, paint_empty, paint_marker_handle,
-    paint_marker_readout, paint_plot_background, paint_scope_fft, paint_waveform_status,
-    paint_waveform_time_scale, resolve_scope_timebase, scope_channel_label, split_waveform_chrome,
-    update_waveform_viewport, waveform_sample_x, Color32, DsCopeTriggerSlope, DsCopeTriggerSource,
-    Duration, FontId, HashSet, Pos2, Range, Rect, ScopeCaptureSettings, ScopeChannelSettings,
-    ScopeFftPaintOptions, ScopeFftViewport, ScopeFunctionSettings, ScopeMarkerSettings,
-    ScopeMathOperation, ScopeMathSettings, ScopeMeasurementCache, ScopeQuickTimeMeasurement,
-    ScopeTriggerSettings, ScopeWaveformOptions, SelectableHoverText, Sense, Stroke, Vec2, VecDeque,
-    WaveformPlotClick, WaveformStore, WaveformViewport, WaveformViewportOptions,
-    WaveformZoomAnchor, BACKGROUND, DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX,
-    DSCOPE_TRIGGER_LEVEL_MIN, DSCOPE_TRIGGER_POSITION_MAX_PERCENT,
-    DSCOPE_TRIGGER_POSITION_MIN_PERCENT, DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX,
-    DSCOPE_VERTICAL_OFFSET_MIN, GRID, MATH_COLOR, PANEL, SCOPE_ADC_VERTICAL_DIVISIONS,
-    SCOPE_DOWNSAMPLE_MIN_SAMPLES_PER_PIXEL, SCOPE_HORIZONTAL_DIVISIONS, SCOPE_MARKER_LIMIT,
-    SCOPE_MEASUREMENT_KINDS, SCOPE_VERTICAL_DIVISIONS, TEXT_MUTED,
+    format_trigger_voltage, half_transparent_plate, marker_text_color, paint_dashed_line,
+    paint_empty, paint_marker_handle, paint_marker_readout, paint_plot_background, paint_scope_fft,
+    paint_waveform_status, paint_waveform_time_scale, resolve_scope_timebase, scope_channel_label,
+    split_waveform_chrome, update_waveform_viewport, waveform_sample_x, Color32,
+    DsCopeTriggerSlope, DsCopeTriggerSource, Duration, FontId, HashSet, Pos2, Range, Rect,
+    ScopeCaptureSettings, ScopeChannelSettings, ScopeFftPaintOptions, ScopeFftViewport,
+    ScopeFunctionSettings, ScopeMarkerSettings, ScopeMathOperation, ScopeMathSettings,
+    ScopeMeasurementCache, ScopeQuickTimeMeasurement, ScopeTriggerSettings, ScopeWaveformOptions,
+    SelectableHoverText, Sense, Stroke, Vec2, VecDeque, WaveformPlotClick, WaveformStore,
+    WaveformViewport, WaveformViewportOptions, WaveformZoomAnchor, BACKGROUND,
+    DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
+    DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
+    DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN, GRID,
+    MATH_COLOR, PANEL, SCOPE_ADC_VERTICAL_DIVISIONS, SCOPE_DOWNSAMPLE_MIN_SAMPLES_PER_PIXEL,
+    SCOPE_HORIZONTAL_DIVISIONS, SCOPE_MARKER_LIMIT, SCOPE_MEASUREMENT_KINDS,
+    SCOPE_VERTICAL_DIVISIONS, TEXT_MUTED,
 };
 
 pub(crate) fn paint_scope_graticule(painter: &egui::Painter, rect: Rect) {
@@ -562,7 +563,7 @@ pub(crate) fn paint_scope_timing_hint(
         Pos2::new(plot.right() - width - 8.0, plot.top() + 26.0),
         Vec2::new(width, 42.0),
     );
-    painter.rect_filled(hint, 5.0, PANEL.gamma_multiply(0.88));
+    painter.rect_filled(hint, 5.0, half_transparent_plate(PANEL));
     let border = Stroke::new(0.75_f32, color.gamma_multiply(0.65));
     painter.line_segment([hint.left_top(), hint.right_top()], border);
     painter.line_segment([hint.right_top(), hint.right_bottom()], border);
@@ -1059,7 +1060,7 @@ pub(crate) fn paint_scope_measurements(
         painter.rect_filled(
             panel,
             egui::Rounding::same(5.0),
-            Color32::from_rgba_unmultiplied(8, 12, 18, 230),
+            half_transparent_plate(Color32::from_rgb(8, 12, 18)),
         );
         painter.rect_filled(
             Rect::from_min_size(panel.min, Vec2::new(panel.width(), HEADER_HEIGHT)),
@@ -1878,6 +1879,7 @@ fn update_scope_viewport(
                     screen_fraction: trigger_screen_fraction,
                 },
                 timebase_basis: *options.time_per_division_seconds,
+                timebase_controls_capture: options.timebase_reconfigures_capture,
             },
         );
     if let Some(click) = waveform_click {
@@ -1908,7 +1910,7 @@ fn update_scope_viewport(
         displayed_timebase,
         requested_timebase,
         viewport.span,
-        options.auto_sample_rate,
+        options.timebase_reconfigures_capture,
     );
 }
 
@@ -2383,6 +2385,25 @@ mod tests {
         assert!(!should_align_scope_trigger(true, true, false));
         assert!(should_align_scope_trigger(true, false, false));
         assert!(!should_align_scope_trigger(false, true, true));
+    }
+
+    #[test]
+    fn auto_scope_finds_the_edge_used_to_synchronize_each_sweep() {
+        let waveforms = WaveformStore {
+            scope_channels: vec![VecDeque::from([-0.5, -0.25, 0.25, 0.5]), VecDeque::new()],
+            ..WaveformStore::default()
+        };
+        let mut settings = ScopeCaptureSettings::default();
+        settings.channels[1].enabled = false;
+        settings.trigger.source = DsCopeTriggerSource::Auto;
+        settings.trigger.auto_channel = 0;
+        settings.trigger.levels[0] = DSCOPE_TRIGGER_LEVEL_CENTER;
+
+        let crossing = scope_trigger_crossing_sample(&waveforms, settings, settings.trigger)
+            .expect("the Auto sweep contains the configured rising edge");
+
+        assert_eq!(crossing.channel_index, 0);
+        assert!((crossing.sample - 1.5).abs() < 1.0e-6);
     }
 
     #[test]

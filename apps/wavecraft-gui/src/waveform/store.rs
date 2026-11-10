@@ -233,6 +233,19 @@ impl WaveformStore {
         }
     }
 
+    /// Starts a frame-based continuous scope sweep. Auto and Update both use
+    /// one long-lived USB session, but the display contains only the current
+    /// hardware frame so its trigger stays at a stable horizontal position.
+    pub(crate) fn begin_scope_frame(&mut self) {
+        for samples in &mut self.scope_channels {
+            samples.clear();
+        }
+        self.scope_captured_at = None;
+        self.scope_sample_offset = 0;
+        self.scope_trigger_sample_index = None;
+        self.scope_capture_boundaries.clear();
+    }
+
     pub(crate) fn ingest_frame(&mut self, frame: &CaptureFrame, scope_channels: [bool; 2]) {
         match &frame.payload {
             CaptureBatch::Logic(_) => {
@@ -660,6 +673,33 @@ mod tests {
         assert_eq!(store.scope_trigger_sample_index, Some(1));
         assert_eq!(store.scope_channels[0].back(), Some(&0.2));
         assert_eq!(store.scope_channels[1].back(), Some(&-0.2));
+    }
+
+    #[test]
+    fn a_new_continuous_scope_frame_replaces_the_previous_sweep() {
+        let mut store = WaveformStore::default();
+        store.ingest(
+            &CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000_000,
+                trigger_sample_index: Some(1),
+                channels: vec![vec![0.1, 0.2], vec![-0.1, -0.2]],
+            }),
+            [true, true],
+        );
+
+        store.begin_scope_frame();
+        store.ingest(
+            &CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000_000,
+                trigger_sample_index: Some(0),
+                channels: vec![vec![0.3, 0.4], vec![-0.3, -0.4]],
+            }),
+            [true, true],
+        );
+
+        assert_eq!(store.scope_channels[0], VecDeque::from([0.3, 0.4]));
+        assert_eq!(store.scope_trigger_sample_index, Some(0));
+        assert_eq!(store.scope_sample_offset, 0);
     }
 
     #[test]

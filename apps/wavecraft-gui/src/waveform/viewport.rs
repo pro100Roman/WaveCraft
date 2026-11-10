@@ -179,8 +179,11 @@ impl WaveformViewport {
     }
 
     pub(crate) fn align_trigger_to_screen(&mut self, sample_fraction: f32, screen_fraction: f32) {
-        self.start =
-            self.clamp_start(sample_fraction - screen_fraction.clamp(0.0, 1.0) * self.span);
+        // Trigger alignment may expose a small empty margin at either end of
+        // the acquired buffer. Clamping a full-span viewport to zero would
+        // leave the real threshold crossing at a different horizontal pixel
+        // on every Auto sweep, defeating oscilloscope trigger synchronization.
+        self.start = sample_fraction - screen_fraction.clamp(0.0, 1.0) * self.span;
     }
 
     pub(crate) fn clamp_start(self, start: f32) -> f32 {
@@ -311,6 +314,47 @@ pub(crate) struct WaveformViewportOptions {
     pub(crate) primary_pan_enabled: bool,
     pub(crate) zoom_anchor: WaveformZoomAnchor,
     pub(crate) timebase_basis: Option<f64>,
+    /// The wheel selects a new capture span instead of zooming within the
+    /// samples already held. The scope enables this with automatic sample rate.
+    pub(crate) timebase_controls_capture: bool,
+}
+
+fn apply_timebase_scroll(
+    viewport: &mut WaveformViewport,
+    sample_count: usize,
+    sample_rate_hz: u64,
+    options: WaveformViewportOptions,
+    scroll_delta: f32,
+    pointer_fraction: f32,
+) -> (bool, Option<f64>) {
+    let requested_timebase = options
+        .timebase_basis
+        .or_else(|| viewport.time_per_division(sample_count, sample_rate_hz))
+        .and_then(|current| adjacent_timebase(current, scroll_delta > 0.0));
+    if options.timebase_controls_capture {
+        if requested_timebase.is_some() {
+            // Auto sample rate will make the requested timebase fill the next
+            // hardware frame, so keep the view on the complete capture span.
+            viewport.reset();
+        }
+        return (requested_timebase.is_some(), requested_timebase);
+    }
+    let changed = match options.zoom_anchor {
+        WaveformZoomAnchor::Pointer => {
+            viewport.step_timebase(scroll_delta, sample_count, sample_rate_hz, pointer_fraction)
+        }
+        WaveformZoomAnchor::Sample {
+            domain_fraction,
+            screen_fraction,
+        } => viewport.step_timebase_at_sample(
+            scroll_delta,
+            sample_count,
+            sample_rate_hz,
+            domain_fraction,
+            screen_fraction,
+        ),
+    };
+    (changed, requested_timebase)
 }
 
 pub(crate) fn update_waveform_viewport(
@@ -372,32 +416,18 @@ pub(crate) fn update_waveform_viewport(
     if response.hovered() {
         let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
         if scroll_delta != 0.0 {
-            requested_timebase = options
-                .timebase_basis
-                .or_else(|| viewport.time_per_division(sample_count, sample_rate_hz))
-                .and_then(|current| adjacent_timebase(current, scroll_delta > 0.0));
             let pointer_fraction = response
                 .hover_pos()
                 .map(|pointer| (pointer.x - rect.left()) / rect.width().max(1.0))
                 .unwrap_or(0.5);
-            timebase_changed = match options.zoom_anchor {
-                WaveformZoomAnchor::Pointer => viewport.step_timebase(
-                    scroll_delta,
-                    sample_count,
-                    sample_rate_hz,
-                    pointer_fraction,
-                ),
-                WaveformZoomAnchor::Sample {
-                    domain_fraction,
-                    screen_fraction,
-                } => viewport.step_timebase_at_sample(
-                    scroll_delta,
-                    sample_count,
-                    sample_rate_hz,
-                    domain_fraction,
-                    screen_fraction,
-                ),
-            };
+            (timebase_changed, requested_timebase) = apply_timebase_scroll(
+                viewport,
+                sample_count,
+                sample_rate_hz,
+                options,
+                scroll_delta,
+                pointer_fraction,
+            );
             ui.ctx().request_repaint();
         }
     }
@@ -639,6 +669,33 @@ mod tests {
         assert_eq!(viewport.span, 1.0);
         assert_eq!(viewport.sample_range(1_000_000), 0..1_000_000);
         assert!(!viewport.step_timebase(-1.0, 1_000_000, 1_000_000, 0.5));
+    }
+
+    #[test]
+    fn automatic_sample_rate_scroll_changes_capture_span_without_viewport_zoom() {
+        let mut viewport = WaveformViewport {
+            start: 0.2,
+            span: 0.5,
+            anchor_locked: false,
+        };
+        let (changed, requested) = apply_timebase_scroll(
+            &mut viewport,
+            1_000_000,
+            1_000_000,
+            WaveformViewportOptions {
+                reset_on_double_click: false,
+                primary_pan_enabled: true,
+                zoom_anchor: WaveformZoomAnchor::Pointer,
+                timebase_basis: Some(0.05),
+                timebase_controls_capture: true,
+            },
+            -1.0,
+            0.75,
+        );
+
+        assert!(changed);
+        assert_eq!(requested, Some(0.1));
+        assert_eq!(viewport, WaveformViewport::default());
     }
 
     #[test]

@@ -2,8 +2,8 @@
 
 use crate::{
     egui, toolbar_action_button, ui::frame_state::FrameState, AcquisitionMode, CaptureTarget,
-    Color32, RichText, SelectableHoverText, Vec2, ACCENT, CAPTURE_FILE_BUTTON_WIDTH, ORANGE, PANEL,
-    SCOPE_COLORS, TEXT_MUTED,
+    Color32, DsCopeTriggerSource, RichText, SelectableHoverText, Vec2, ACCENT,
+    CAPTURE_FILE_BUTTON_WIDTH, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
 };
 
 use crate::{ui::frame_actions::FrameActions, WaveCraftApp};
@@ -133,6 +133,17 @@ impl WaveCraftApp {
                         } else {
                             AcquisitionMode::Run
                         };
+                        let scope_auto = control_target == Some(CaptureTarget::Oscilloscope)
+                            && self.scope_settings.trigger.source == DsCopeTriggerSource::Auto;
+                        let scope_update = control_target == Some(CaptureTarget::Oscilloscope)
+                            && !scope_auto;
+                        let start_label = if scope_auto {
+                            "▶ Auto"
+                        } else if scope_update {
+                            "▶ Update"
+                        } else {
+                            "▶ Run"
+                        };
                         let run_stop_clicked = ui
                             .add_enabled(
                                 acquisition_active
@@ -145,7 +156,7 @@ impl WaveCraftApp {
                                 if acquisition_active {
                                     toolbar_action_button("■ Stop", Color32::LIGHT_RED)
                                 } else {
-                                    toolbar_action_button("▶ Run", ACCENT)
+                                    toolbar_action_button(start_label, ACCENT)
                                 },
                             )
                             .on_hover_selectable_text(if acquisition_active {
@@ -163,8 +174,12 @@ impl WaveCraftApp {
                                     }
                                     AcquisitionMode::Run => "Start the selected acquisition",
                                 }
+                            } else if scope_auto {
+                                "Continuously acquire trigger-synchronized oscilloscope sweeps"
+                            } else if scope_update {
+                                "Keep the current trace until the next trigger updates the display"
                             } else {
-                                "Run continuously; Auto trigger rolls, edge triggers update the display"
+                                "Run continuously"
                             })
                             .clicked();
                         if run_stop_clicked {
@@ -173,6 +188,25 @@ impl WaveCraftApp {
                             } else if let Some(target) = control_target {
                                 actions.start_request = Some((start_mode, target));
                             }
+                        }
+                        if control_target == Some(CaptureTarget::Oscilloscope)
+                            && ui
+                                .add_enabled(
+                                    self.capture_target_can_start(CaptureTarget::Oscilloscope)
+                                        && control_target_available
+                                        && !self.record_capture
+                                        && !self.record_decoded_data,
+                                    toolbar_action_button("▶ Re-Arm", SCOPE_COLORS[1]),
+                                )
+                                .on_hover_selectable_text(
+                                    "Acquire one complete sweep, then automatically re-arm for the next trigger",
+                                )
+                                .clicked()
+                        {
+                            actions.start_request = Some((
+                                AcquisitionMode::Repetitive,
+                                CaptureTarget::Oscilloscope,
+                            ));
                         }
                         if ui
                             .add_enabled(

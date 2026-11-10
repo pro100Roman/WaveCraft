@@ -16,6 +16,12 @@ const COLLAPSED_SIDE_PANEL_MARGIN: f32 = 4.0;
 pub(crate) const COLLAPSED_SIDE_PANEL_WIDTH: f32 =
     DECODED_PANEL_ACTION_BUTTON_SIZE[0] + 2.0 * (COLLAPSED_SIDE_PANEL_MARGIN + CARD_STROKE_WIDTH);
 
+/// A floating waveform plate that lets half of the trace beneath it remain
+/// visible while retaining the source color.
+pub(crate) fn half_transparent_plate(color: Color32) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 128)
+}
+
 /// The outline every block of the central area shares: the waveform cards and
 /// the side panels beside them, so they all have the same corners and edge.
 pub(crate) fn card_frame(inner_margin: f32) -> egui::Frame {
@@ -436,5 +442,12 @@ mod tests {
         assert_eq!(status.bottom(), ruler.top());
         assert_eq!(ruler.bottom(), plot.top());
         assert_eq!(plot.bottom(), rect.bottom());
+    }
+
+    #[test]
+    fn floating_waveform_plates_are_half_transparent() {
+        let fill = half_transparent_plate(Color32::from_rgb(8, 12, 18));
+
+        assert_eq!(fill.to_srgba_unmultiplied(), [8, 12, 18, 128]);
     }
 }
