@@ -4,16 +4,19 @@
 use crate::{egui, Range, Rect, Sense, SCOPE_HORIZONTAL_DIVISIONS, TIMEBASE_STEPS_SECONDS};
 
 const TRACKPAD_TIMEBASE_STEP_POINTS: f32 = 12.0;
+const TRACKPAD_TIMEBASE_REPEAT_POINTS: f32 = 24.0;
+const TRACKPAD_TIMEBASE_REPEAT_SECONDS: f64 = 0.15;
 const TRACKPAD_SCROLL_IDLE_SECONDS: f64 = 0.15;
 
-/// Turns one continuous trackpad scroll, including its macOS momentum tail,
-/// into one timebase step. A wheel reported in lines remains one step per
-/// input frame and bypasses this state.
+/// Turns a continuous trackpad scroll into deliberately paced timebase steps.
+/// A wheel reported in lines remains one step per input frame and bypasses
+/// this state.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct TrackpadTimebaseScroll {
     accumulated_points: f32,
     last_event_time: f64,
-    stepped: bool,
+    last_step_time: f64,
+    step_count: u32,
 }
 
 impl TrackpadTimebaseScroll {
@@ -25,18 +28,30 @@ impl TrackpadTimebaseScroll {
             return 0.0;
         }
         self.last_event_time = time;
-        if self.stepped {
-            return 0.0;
-        }
         if self.accumulated_points != 0.0 && self.accumulated_points.signum() != delta.signum() {
             self.accumulated_points = 0.0;
+            self.step_count = 0;
         }
         self.accumulated_points += delta;
-        if self.accumulated_points.abs() < TRACKPAD_TIMEBASE_STEP_POINTS {
+        let required_points = if self.step_count == 0 {
+            TRACKPAD_TIMEBASE_STEP_POINTS
+        } else {
+            TRACKPAD_TIMEBASE_REPEAT_POINTS
+        };
+        if self.accumulated_points.abs() < required_points {
             return 0.0;
         }
-        self.stepped = true;
-        self.accumulated_points.signum()
+        if self.step_count > 0 && time - self.last_step_time < TRACKPAD_TIMEBASE_REPEAT_SECONDS {
+            self.accumulated_points = self
+                .accumulated_points
+                .clamp(-required_points, required_points);
+            return 0.0;
+        }
+        let direction = self.accumulated_points.signum();
+        self.accumulated_points = 0.0;
+        self.last_step_time = time;
+        self.step_count += 1;
+        direction
     }
 }
 
@@ -392,9 +407,9 @@ fn apply_timebase_scroll(
 }
 
 /// Consumes vertical scrolling over a waveform and converts the high-frequency
-/// point events emitted by a Mac trackpad into a single detent. Without this,
-/// the momentum events that arrive after the fingers lift repeatedly step the
-/// discrete oscilloscope timebase.
+/// point events emitted by a Mac trackpad into paced detents. The distance and
+/// time gates allow a held gesture to repeat without letting its momentum tail
+/// race through the discrete oscilloscope timebase.
 fn take_timebase_scroll_step(ui: &egui::Ui, id: egui::Id) -> f32 {
     let (delta, discrete_wheel, time) = ui.input_mut(|input| {
         let discrete_wheel = input.events.iter().any(|event| {
@@ -764,14 +779,28 @@ mod tests {
     }
 
     #[test]
-    fn one_trackpad_gesture_produces_one_timebase_step_despite_momentum() {
+    fn a_continuous_trackpad_gesture_repeats_at_a_controlled_rate() {
         let mut scroll = TrackpadTimebaseScroll::default();
 
         assert_eq!(scroll.update(4.0, 1.00), 0.0);
         assert_eq!(scroll.update(5.0, 1.01), 0.0);
         assert_eq!(scroll.update(4.0, 1.02), 1.0);
-        assert_eq!(scroll.update(20.0, 1.03), 0.0);
-        assert_eq!(scroll.update(8.0, 1.10), 0.0);
+        assert_eq!(scroll.update(12.0, 1.10), 0.0);
+        assert_eq!(scroll.update(12.0, 1.14), 0.0);
+        assert_eq!(scroll.update(1.0, 1.16), 0.0);
+        assert_eq!(scroll.update(1.0, 1.18), 1.0);
+    }
+
+    #[test]
+    fn a_short_trackpad_momentum_tail_does_not_repeat_the_timebase_step() {
+        let mut scroll = TrackpadTimebaseScroll::default();
+
+        assert_eq!(scroll.update(12.0, 1.00), 1.0);
+        assert_eq!(scroll.update(8.0, 1.04), 0.0);
+        assert_eq!(scroll.update(6.0, 1.08), 0.0);
+        assert_eq!(scroll.update(4.0, 1.12), 0.0);
+        assert_eq!(scroll.update(2.0, 1.16), 0.0);
+        assert_eq!(scroll.update(1.0, 1.20), 0.0);
     }
 
     #[test]
