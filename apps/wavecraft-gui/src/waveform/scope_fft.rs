@@ -2,10 +2,10 @@
 //! rendering.
 
 use crate::{
-    egui, format_frequency, paint_empty, paint_plot_background, paint_plot_grid,
-    scope_channel_label, FontId, Pos2, Range, Rect, ScopeFftSettings, ScopeFftWindow,
+    egui, format_frequency, paint_dashed_line, paint_empty, paint_plot_background, paint_plot_grid,
+    scope_channel_label, Color32, FontId, Pos2, Range, Rect, ScopeFftSettings, ScopeFftWindow,
     SelectableHoverText, Sense, Stroke, Vec2, VecDeque, WaveformStore, WaveformViewport, ACCENT,
-    SCOPE_COLORS, TEXT_MUTED,
+    ORANGE, SCOPE_COLORS, TEXT_MUTED,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -186,6 +186,72 @@ pub(crate) struct ScopeFftPaintOptions<'a> {
     pub(crate) fft_viewport: &'a mut ScopeFftViewport,
     pub(crate) settings: ScopeFftSettings,
     pub(crate) channel_names: &'a [String; 2],
+    pub(crate) analog_bandwidth_hz: u64,
+}
+
+fn fft_out_of_band_start_fraction(
+    start_frequency_hz: f64,
+    end_frequency_hz: f64,
+    analog_bandwidth_hz: u64,
+) -> Option<f32> {
+    if end_frequency_hz <= start_frequency_hz || analog_bandwidth_hz as f64 >= end_frequency_hz {
+        return None;
+    }
+    Some(
+        ((analog_bandwidth_hz as f64 - start_frequency_hz)
+            / (end_frequency_hz - start_frequency_hz))
+            .clamp(0.0, 1.0) as f32,
+    )
+}
+
+fn paint_scope_fft_bandwidth_limit(
+    painter: &egui::Painter,
+    rect: Rect,
+    start_frequency_hz: f64,
+    end_frequency_hz: f64,
+    analog_bandwidth_hz: u64,
+) {
+    let Some(boundary_fraction) =
+        fft_out_of_band_start_fraction(start_frequency_hz, end_frequency_hz, analog_bandwidth_hz)
+    else {
+        return;
+    };
+    let boundary_x = egui::lerp(rect.x_range(), boundary_fraction);
+    let out_of_band = Rect::from_min_max(
+        Pos2::new(boundary_x, rect.top()),
+        Pos2::new(rect.right(), rect.bottom()),
+    );
+    painter.rect_filled(out_of_band, 0.0, Color32::from_black_alpha(96));
+
+    let bandwidth = format_frequency(analog_bandwidth_hz as f64);
+    if boundary_fraction > f32::EPSILON {
+        paint_dashed_line(
+            painter,
+            Pos2::new(boundary_x, rect.top()),
+            Pos2::new(boundary_x, rect.bottom()),
+            Stroke::new(1.25_f32, ORANGE),
+        );
+        let (label_x, alignment) = if boundary_x + 135.0 <= rect.right() {
+            (boundary_x + 5.0, egui::Align2::LEFT_TOP)
+        } else {
+            (boundary_x - 5.0, egui::Align2::RIGHT_TOP)
+        };
+        painter.text(
+            Pos2::new(label_x, rect.top() + 23.0),
+            alignment,
+            format!("ANALOG BW · {bandwidth}"),
+            FontId::monospace(9.0),
+            ORANGE,
+        );
+    } else {
+        painter.text(
+            rect.left_top() + Vec2::new(8.0, 23.0),
+            egui::Align2::LEFT_TOP,
+            format!("OUTSIDE {bandwidth} ANALOG BW"),
+            FontId::monospace(9.0),
+            ORANGE,
+        );
+    }
 }
 
 pub(crate) fn paint_scope_fft(
@@ -199,6 +265,7 @@ pub(crate) fn paint_scope_fft(
         fft_viewport,
         settings,
         channel_names,
+        analog_bandwidth_hz,
     } = options;
     const MIN_DBV: f32 = -120.0;
     const MAX_DBV: f32 = 20.0;
@@ -261,6 +328,13 @@ pub(crate) fn paint_scope_fft(
     let fft_length = (spectrum.len() - 1) * 2;
     let start_frequency_hz = nyquist * fft_viewport.start as f64;
     let end_frequency_hz = nyquist * (fft_viewport.start + fft_viewport.span) as f64;
+    paint_scope_fft_bandwidth_limit(
+        &painter,
+        rect,
+        start_frequency_hz,
+        end_frequency_hz,
+        analog_bandwidth_hz,
+    );
     painter.text(
         rect.left_top() + Vec2::new(8.0, 7.0),
         egui::Align2::LEFT_TOP,
@@ -331,6 +405,26 @@ mod tests {
     use super::*;
 
     use crate::*;
+
+    #[test]
+    fn fft_marks_only_the_region_beyond_the_analog_bandwidth() {
+        assert_eq!(
+            fft_out_of_band_start_fraction(0.0, 250_000_000.0, 100_000_000),
+            Some(0.4)
+        );
+        assert_eq!(
+            fft_out_of_band_start_fraction(0.0, 250_000_000.0, 20_000_000),
+            Some(0.08)
+        );
+        assert_eq!(
+            fft_out_of_band_start_fraction(150_000_000.0, 250_000_000.0, 100_000_000),
+            Some(0.0)
+        );
+        assert_eq!(
+            fft_out_of_band_start_fraction(0.0, 50_000_000.0, 100_000_000),
+            None
+        );
+    }
 
     #[test]
     fn scope_fft_finds_the_input_tone() {

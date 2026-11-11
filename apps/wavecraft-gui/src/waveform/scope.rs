@@ -7,19 +7,22 @@ use crate::{
     paint_empty, paint_marker_handle, paint_marker_readout, paint_plot_background, paint_scope_fft,
     paint_waveform_status, paint_waveform_time_scale, resolve_scope_timebase, scope_channel_label,
     split_waveform_chrome, update_waveform_viewport, waveform_sample_x, Color32,
-    DsCopeTriggerSlope, DsCopeTriggerSource, Duration, FontId, HashSet, Pos2, Range, Rect,
-    ScopeCaptureSettings, ScopeChannelSettings, ScopeFftPaintOptions, ScopeFftViewport,
-    ScopeFunctionSettings, ScopeMarkerSettings, ScopeMathOperation, ScopeMathSettings,
-    ScopeMeasurementCache, ScopeQuickTimeMeasurement, ScopeTriggerSettings, ScopeWaveformOptions,
-    SelectableHoverText, Sense, Stroke, Vec2, VecDeque, WaveformPlotClick, WaveformStore,
-    WaveformTimeAxis, WaveformViewport, WaveformViewportOptions, WaveformZoomAnchor, BACKGROUND,
-    DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
+    DsCopeBandwidthLimit, DsCopeTriggerSlope, DsCopeTriggerSource, Duration, FontId, HashSet, Pos2,
+    Range, Rect, ScopeCaptureSettings, ScopeChannelSettings, ScopeFftPaintOptions,
+    ScopeFftViewport, ScopeFunctionSettings, ScopeMarkerSettings, ScopeMathOperation,
+    ScopeMathSettings, ScopeMeasurementCache, ScopeQuickTimeMeasurement, ScopeTriggerSettings,
+    ScopeWaveformOptions, SelectableHoverText, Sense, Stroke, Vec2, VecDeque, WaveformPlotClick,
+    WaveformStore, WaveformTimeAxis, WaveformViewport, WaveformViewportOptions, WaveformZoomAnchor,
+    BACKGROUND, DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
     DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
     DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN, GRID,
     MATH_COLOR, PANEL, SCOPE_ADC_VERTICAL_DIVISIONS, SCOPE_DOWNSAMPLE_MIN_SAMPLES_PER_PIXEL,
     SCOPE_HORIZONTAL_DIVISIONS, SCOPE_MARKER_LIMIT, SCOPE_MEASUREMENT_KINDS,
     SCOPE_VERTICAL_DIVISIONS, TEXT_MUTED,
 };
+
+const DSCOPE_U3P100_FULL_ANALOG_BANDWIDTH_HZ: u64 = 100_000_000;
+const DSCOPE_LIMITED_ANALOG_BANDWIDTH_HZ: u64 = 20_000_000;
 
 pub(crate) fn paint_scope_graticule(painter: &egui::Painter, rect: Rect) {
     for index in 0..=SCOPE_HORIZONTAL_DIVISIONS {
@@ -1613,6 +1616,10 @@ pub(crate) fn paint_scope(
 ) {
     let fft_settings = scope_options.function_settings.fft;
     let channel_names = scope_options.channel_names;
+    let analog_bandwidth_hz = match scope_options.settings.bandwidth_limit {
+        DsCopeBandwidthLimit::Full => DSCOPE_U3P100_FULL_ANALOG_BANDWIDTH_HZ,
+        DsCopeBandwidthLimit::Mhz20 => DSCOPE_LIMITED_ANALOG_BANDWIDTH_HZ,
+    };
     if !fft_settings.enabled {
         paint_scope_time_domain(ui, rect, waveforms, viewport, scope_options);
         return;
@@ -1637,6 +1644,7 @@ pub(crate) fn paint_scope(
             fft_viewport,
             settings: fft_settings,
             channel_names,
+            analog_bandwidth_hz,
         },
     );
 }
