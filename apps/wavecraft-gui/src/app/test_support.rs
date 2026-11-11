@@ -174,8 +174,10 @@ fn ready_from_sources(
         scope_trigger_controls: Vec::new(),
         scope_calibration_controls: Vec::new(),
         radio_runtime_control: None,
-        radio_spectrum: spectrum(),
-        radio_dsp: RadioDspWorker::start(spectrum(), Vec::new()),
+        radio_spectrum: target.includes_radio_receiver().then(spectrum),
+        radio_dsp: target
+            .includes_radio_receiver()
+            .then(|| RadioDspWorker::start(spectrum(), Vec::new())),
     }
 }
 

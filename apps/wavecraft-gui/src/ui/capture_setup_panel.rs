@@ -100,24 +100,6 @@ impl WaveCraftApp {
                                         Some(SavedCaptureSettingsKind::RadioFrequency);
                                 }
                             }
-                        } else if self.active_waveform_tab == Some(WaveformTab::Combined)
-                            && !self.radios.is_empty()
-                        {
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new("Radio receiver · included")
-                                    .small()
-                                    .color(TEXT_MUTED),
-                            );
-                            actions.radio_device_selection_changed |= paint_radio_device_selector(
-                                ui,
-                                &self.radios,
-                                &mut self.selected_radio_id,
-                                capture_settings_enabled,
-                            );
-                            if actions.radio_device_selection_changed {
-                                self.reconcile_radio_settings();
-                            }
                         }
                         if self.active_waveform_tab.is_some() {
                             ui.add_space(12.0);

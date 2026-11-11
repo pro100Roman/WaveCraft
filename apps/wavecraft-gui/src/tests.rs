@@ -519,10 +519,11 @@ fn gui_hackrf_capture_pipeline_receives_and_spectrally_processes_iq() {
     .expect("GUI radio capture should start");
     let StartedCapture {
         session,
-        mut radio_dsp,
+        radio_dsp,
         radio_runtime_control,
         ..
     } = started;
+    let mut radio_dsp = radio_dsp.expect("an RF capture starts its DSP worker");
     assert!(
         radio_runtime_control.is_some(),
         "a HackRF capture can be retuned while it runs"

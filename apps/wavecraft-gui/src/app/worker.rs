@@ -1288,7 +1288,12 @@ mod tests {
                 true,
                 false,
             ),
-            (CaptureTarget::Combined, AcquisitionMode::Single, true, true),
+            (
+                CaptureTarget::Combined,
+                AcquisitionMode::Single,
+                true,
+                false,
+            ),
         ] {
             let mut app = app();
             request(&mut app, target);

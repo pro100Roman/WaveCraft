@@ -56,20 +56,13 @@ impl CaptureTarget {
     }
 
     pub(crate) fn includes_radio_receiver(self) -> bool {
-        matches!(self, Self::RadioReceiver | Self::Combined)
-    }
-
-    pub(crate) fn captures_selected_radio(self, has_selected_radio: bool) -> bool {
-        self == Self::RadioReceiver || (self == Self::Combined && has_selected_radio)
+        self == Self::RadioReceiver
     }
 
     pub(crate) fn includes(self, target: Self) -> bool {
         self == target
             || (self == Self::Combined
-                && matches!(
-                    target,
-                    Self::LogicAnalyzer | Self::Oscilloscope | Self::RadioReceiver
-                ))
+                && matches!(target, Self::LogicAnalyzer | Self::Oscilloscope))
     }
 
     pub(crate) fn overlaps(self, other: Self) -> bool {
@@ -279,6 +272,8 @@ pub(crate) fn ingest_active_capture_frame(
     if let CaptureBatch::Iq(iq) = &frame.payload {
         active
             .radio_dsp
+            .as_mut()
+            .ok_or_else(|| "RF samples arrived without an RF display worker".to_owned())?
             .push(iq.clone(), radio_squelch_threshold_dbfs)?;
     }
     let enabled_scope_channels = active
@@ -359,8 +354,8 @@ pub(crate) struct ActiveCapture {
     pub(crate) protocol_decode_snapshot: ProtocolDecodeSnapshot,
     pub(crate) protocol_analyzers: Vec<ProtocolAnalyzerInstance>,
     pub(crate) logic_decode: LogicDecodeWorker,
-    pub(crate) radio_spectrum: SpectrumProcessor,
-    pub(crate) radio_dsp: RadioDspWorker,
+    pub(crate) radio_spectrum: Option<SpectrumProcessor>,
+    pub(crate) radio_dsp: Option<RadioDspWorker>,
     pub(crate) radio_trigger: Option<RadioSingleTrigger>,
     pub(crate) recorder: Option<FileRecorder>,
     pub(crate) recording_path: Option<PathBuf>,
@@ -419,8 +414,8 @@ pub(crate) struct CaptureReady {
     pub(crate) scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     pub(crate) scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
     pub(crate) radio_runtime_control: Option<RadioRuntimeControl>,
-    pub(crate) radio_spectrum: SpectrumProcessor,
-    pub(crate) radio_dsp: RadioDspWorker,
+    pub(crate) radio_spectrum: Option<SpectrumProcessor>,
+    pub(crate) radio_dsp: Option<RadioDspWorker>,
 }
 
 pub(crate) enum WorkerSuccess {
@@ -448,8 +443,8 @@ pub(crate) struct StartedCapture {
     pub(crate) scope_trigger_controls: Vec<DsCopeRuntimeTriggerControl>,
     pub(crate) scope_calibration_controls: Vec<DsCopeRuntimeCalibrationControl>,
     pub(crate) radio_runtime_control: Option<RadioRuntimeControl>,
-    pub(crate) radio_spectrum: SpectrumProcessor,
-    pub(crate) radio_dsp: RadioDspWorker,
+    pub(crate) radio_spectrum: Option<SpectrumProcessor>,
+    pub(crate) radio_dsp: Option<RadioDspWorker>,
 }
 
 pub(crate) fn start_capture(
@@ -461,6 +456,7 @@ pub(crate) fn start_capture(
     calibration_values: Option<DsCopeCalibrationValues>,
     continuous_scope_capture: bool,
 ) -> Result<StartedCapture, String> {
+    let has_radio = radio_request.is_some();
     let iq_correction_enabled = radio_request
         .as_ref()
         .is_some_and(|request| request.iq_correction_enabled);
@@ -534,12 +530,18 @@ pub(crate) fn start_capture(
         radio_runtime_control = control;
         sources.push(source);
     }
-    let radio_spectrum = SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?
-        .with_iq_correction(iq_correction_enabled);
-    let radio_dsp_spectrum =
-        SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?
+    let (radio_spectrum, radio_dsp) = if has_radio {
+        let display = SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?
             .with_iq_correction(iq_correction_enabled);
-    let radio_dsp = RadioDspWorker::start(radio_dsp_spectrum, radio_analyzers);
+        let analysis = SpectrumProcessor::new(RADIO_SPECTRUM_FFT_LENGTH, SpectrumWindow::Hann)?
+            .with_iq_correction(iq_correction_enabled);
+        (
+            Some(display),
+            Some(RadioDspWorker::start(analysis, radio_analyzers)),
+        )
+    } else {
+        (None, None)
+    };
     let session = CaptureCoordinator::start(sources).map_err(|error| error.to_string())?;
     Ok(StartedCapture {
         session,
@@ -789,13 +791,11 @@ mod tests {
         assert!(!CaptureTarget::Combined.is_available(true, false, false));
         assert!(!CaptureTarget::Combined.is_available(false, true, false));
         assert!(CaptureTarget::Combined.is_available(true, true, false));
-        assert!(CaptureTarget::Combined.includes_radio_receiver());
-        assert!(CaptureTarget::Combined.captures_selected_radio(true));
-        assert!(!CaptureTarget::Combined.captures_selected_radio(false));
-        assert!(CaptureTarget::RadioReceiver.captures_selected_radio(false));
+        assert!(!CaptureTarget::Combined.includes_radio_receiver());
+        assert!(CaptureTarget::RadioReceiver.includes_radio_receiver());
         assert!(CaptureTarget::Combined.includes(CaptureTarget::LogicAnalyzer));
         assert!(CaptureTarget::Combined.includes(CaptureTarget::Oscilloscope));
-        assert!(CaptureTarget::Combined.includes(CaptureTarget::RadioReceiver));
+        assert!(!CaptureTarget::Combined.includes(CaptureTarget::RadioReceiver));
         assert!(!CaptureTarget::LogicAnalyzer.includes(CaptureTarget::RadioReceiver));
     }
 
@@ -807,6 +807,6 @@ mod tests {
         assert!(CaptureTarget::LogicAnalyzer.overlaps(CaptureTarget::LogicAnalyzer));
         assert!(CaptureTarget::Combined.overlaps(CaptureTarget::LogicAnalyzer));
         assert!(CaptureTarget::Combined.overlaps(CaptureTarget::Oscilloscope));
-        assert!(CaptureTarget::Combined.overlaps(CaptureTarget::RadioReceiver));
+        assert!(!CaptureTarget::Combined.overlaps(CaptureTarget::RadioReceiver));
     }
 }

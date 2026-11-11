@@ -14,7 +14,7 @@ use crate::{
     FileDecodedDataRecorder, Instant, PathBuf, ProtocolAnalyzerInstance, ProtocolCaptureDecoder,
     ProtocolDecodeCache, RadioCaptureRequest, RadioDspWorker, RadioSingleTrigger,
     ScheduledRepetitiveCapture, ScopeMeasurementCache, SyncWordSuggestion, WaveformStore,
-    WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL,
+    WaveformTab, WorkerSuccess, MAX_CAPTURE_EVENTS_PER_POLL, MAX_RADIO_DSP_OUTPUTS_PER_POLL,
 };
 
 use crate::WaveCraftApp;
@@ -89,9 +89,10 @@ fn completed_capture_replaces_display(
     }
 }
 
-/// Reads what a running capture has produced since the last poll: at most
-/// `MAX_CAPTURE_EVENTS_PER_POLL` events, then the output of the logic decoder
-/// and the radio DSP worker.
+/// Reads what a running capture has produced since the last poll. Processing
+/// normally stops at `MAX_CAPTURE_EVENTS_PER_POLL`, but a scope frame already
+/// in progress is drained to its boundary so it can be published atomically.
+/// The logic decoder and RF DSP worker use their own budgets.
 fn poll_running_capture(
     active: &mut ActiveCapture,
     analyzers: &[ProtocolAnalyzerInstance],
@@ -99,9 +100,14 @@ fn poll_running_capture(
 ) -> CapturePoll {
     let mut poll = CapturePoll::default();
     reconfigure_logic_decoder(active, analyzers, &mut poll);
-    for _ in 0..MAX_CAPTURE_EVENTS_PER_POLL {
+    let mut event_count = 0;
+    loop {
+        if event_count >= MAX_CAPTURE_EVENTS_PER_POLL && !scope_frame_is_in_progress(active) {
+            break;
+        }
         match active.session.try_recv() {
             Ok(event) => {
+                event_count += 1;
                 if handle_capture_event(active, event, radio_trigger, &mut poll).is_break() {
                     break;
                 }
@@ -116,6 +122,26 @@ fn poll_running_capture(
     drain_logic_decode(active, &mut poll);
     drain_radio_dsp(active, &mut poll);
     poll
+}
+
+/// Scope USB batches are pieces of one hardware frame. Once the first piece is
+/// received, finish that frame in the same UI poll instead of applying the RF
+/// event budget in its middle.
+fn scope_frame_is_in_progress(active: &ActiveCapture) -> bool {
+    if !active.has_scope {
+        return false;
+    }
+    let enabled_channels = active
+        .scope_config
+        .channels()
+        .map(|channel| channel.enabled());
+    let expected = active.scope_config.sample_count() as usize;
+    let received = active
+        .pending_scope_waveforms
+        .as_ref()
+        .unwrap_or(&active.waveforms)
+        .scope_sample_count(enabled_channels);
+    received > 0 && received < expected
 }
 
 /// Sends the protocol analyzers the user edited to the running logic decoder.
@@ -205,7 +231,14 @@ fn handle_capture_frame(
         .is_some_and(RadioSingleTrigger::is_armed);
     if trigger_armed {
         if let CaptureBatch::Iq(iq) = &frame.payload {
-            for spectrum in active.radio_spectrum.push(iq) {
+            let Some(radio_spectrum) = active.radio_spectrum.as_mut() else {
+                poll.fail(
+                    active,
+                    "RF trigger is armed without an RF display processor",
+                );
+                return ControlFlow::Break(());
+            };
+            for spectrum in radio_spectrum.push(iq) {
                 active.waveforms.radio.ingest(spectrum);
             }
         }
@@ -224,7 +257,9 @@ fn handle_capture_frame(
             (vec![frame], None, false)
         };
     if let Some(event) = trigger_event {
-        active.radio_spectrum.reset();
+        if let Some(radio_spectrum) = active.radio_spectrum.as_mut() {
+            radio_spectrum.reset();
+        }
         poll.status = Some(format!(
             "RF trigger · {:.3} MHz at {:.1} dBFS; capturing…",
             event.frequency_hz / 1_000_000.0,
@@ -283,8 +318,11 @@ fn drain_logic_decode(active: &mut ActiveCapture, poll: &mut CapturePoll) {
 
 /// Takes the output the radio DSP worker has ready and records the decoded data.
 fn drain_radio_dsp(active: &mut ActiveCapture, poll: &mut CapturePoll) {
-    loop {
-        match active.radio_dsp.try_recv() {
+    for _ in 0..MAX_RADIO_DSP_OUTPUTS_PER_POLL {
+        let Some(radio_dsp) = active.radio_dsp.as_mut() else {
+            return;
+        };
+        match radio_dsp.try_recv() {
             Ok(output) => {
                 if let Err(error) =
                     record_decoded_radio_packets(&mut active.decoded_data_recorder, &output)
@@ -364,29 +402,32 @@ fn shut_down_capture(
 /// capture, and adds the logic decoder's error, in that order. Every way a
 /// capture ends goes through it, after the session has stopped.
 fn finish_decoding(
-    radio_dsp: &mut RadioDspWorker,
+    radio_dsp: &mut Option<RadioDspWorker>,
     decoded_data_recorder: &mut Option<FileDecodedDataRecorder>,
     waveforms: &mut WaveformStore,
     logic_decode_error: Option<String>,
     error: &mut Option<String>,
 ) {
-    match radio_dsp.finish() {
-        Ok(outputs) => {
-            for output in outputs {
-                if let Err(recording_error) =
-                    record_decoded_radio_packets(decoded_data_recorder, &output)
-                {
-                    append_error(error, recording_error);
-                }
-                ingest_radio_dsp_output(waveforms, output);
-                if let Err(recording_error) =
-                    record_decoded_raw_messages(decoded_data_recorder, &waveforms.radio_analysis)
-                {
-                    append_error(error, recording_error);
+    if let Some(radio_dsp) = radio_dsp.as_mut() {
+        match radio_dsp.finish() {
+            Ok(outputs) => {
+                for output in outputs {
+                    if let Err(recording_error) =
+                        record_decoded_radio_packets(decoded_data_recorder, &output)
+                    {
+                        append_error(error, recording_error);
+                    }
+                    ingest_radio_dsp_output(waveforms, output);
+                    if let Err(recording_error) = record_decoded_raw_messages(
+                        decoded_data_recorder,
+                        &waveforms.radio_analysis,
+                    ) {
+                        append_error(error, recording_error);
+                    }
                 }
             }
+            Err(dsp_error) => append_error(error, dsp_error),
         }
-        Err(dsp_error) => append_error(error, dsp_error),
     }
     if let Some(logic_decode_error) = logic_decode_error {
         append_error(error, logic_decode_error);
@@ -518,9 +559,7 @@ impl WaveCraftApp {
                 return;
             }
         };
-        let radio_request = if target.captures_selected_radio(
-            selected_radio(&self.radios, self.selected_radio_id.as_deref()).is_some(),
-        ) {
+        let radio_request = if target == CaptureTarget::RadioReceiver {
             match self.radio_capture_request(mode) {
                 Ok(request) => Some(request),
                 Err(error) => {
@@ -1250,6 +1289,8 @@ mod tests {
         let active = app
             .capture_for_target_mut(CaptureTarget::Oscilloscope)
             .unwrap();
+        assert!(active.radio_spectrum.is_none());
+        assert!(active.radio_dsp.is_none());
         active.waveforms.ingest(
             &CaptureBatch::Scope(ScopeBatch {
                 sample_rate_hz: 1_000_000,
@@ -1295,6 +1336,44 @@ mod tests {
         assert_eq!(active.waveforms.scope_channels[0].len(), 1_024);
         assert_eq!(active.waveforms.scope_channels[0][0], 1.0);
         assert_eq!(active.waveforms.scope_channels[0][1_023], 2.0);
+    }
+
+    #[test]
+    fn one_poll_finishes_a_scope_frame_larger_than_the_shared_event_budget() {
+        let mut app = app();
+        app.scope_settings.sample_count = 1_000_000;
+        let mut remaining = app.scope_settings.sample_count as usize;
+        let mut batches = Vec::new();
+        while remaining > 0 {
+            let count = remaining.min(65_536);
+            batches.push(CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000_000,
+                trigger_sample_index: batches.is_empty().then_some(500_000),
+                channels: vec![vec![1.0; count], vec![-1.0; count]],
+            }));
+            remaining -= count;
+        }
+        assert!(batches.len() > MAX_CAPTURE_EVENTS_PER_POLL);
+
+        request(&mut app, CaptureTarget::Oscilloscope);
+        let started = ready_scripted(
+            &app,
+            vec![(
+                InstrumentKind::Oscilloscope,
+                Script::sending(batches, SourceEnding::Idle),
+            )],
+            AcquisitionMode::Run,
+            CaptureTarget::Oscilloscope,
+        );
+        app.handle_capture_ready(started);
+        std::thread::sleep(Duration::from_millis(100));
+
+        app.poll_capture_target(CaptureTarget::Oscilloscope);
+
+        let active = app.capture_for_target(CaptureTarget::Oscilloscope).unwrap();
+        assert!(active.pending_scope_waveforms.is_none());
+        assert_eq!(active.waveforms.scope_sample_count([true, true]), 1_000_000);
+        app.stop_capture(CaptureTarget::Oscilloscope);
     }
 
     #[test]
