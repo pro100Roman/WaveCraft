@@ -231,11 +231,14 @@ fn handle_capture_frame(
             event.power_dbfs
         ));
     }
+    let mut scope_frame_published = false;
     for frame in frames {
-        if let Err(error) = ingest_active_capture_frame(active, frame, radio_trigger.threshold_dbfs)
-        {
-            poll.fail(active, error);
-            break;
+        match ingest_active_capture_frame(active, frame, radio_trigger.threshold_dbfs) {
+            Ok(published) => scope_frame_published |= published,
+            Err(error) => {
+                poll.fail(active, error);
+                break;
+            }
         }
     }
     if active.preserve_display_until_complete
@@ -243,9 +246,12 @@ fn handle_capture_frame(
         && active.target == CaptureTarget::Oscilloscope
         && !active.waveforms.scope_rolling
         && frame_is_scope
+        && scope_frame_published
     {
-        // Reveal after the first new chunk has been ingested. Later chunks grow
-        // the replacement sweep continuously from left to right.
+        // Reveal only a coherent hardware sweep. Before RF introduced bounded
+        // event polling, v0.7 effectively ingested every scope chunk before a
+        // repaint; publishing a partial frame here recreates old-waveform
+        // artifacts at extreme time scales.
         active.preserve_display_until_complete = false;
     }
     if poll.finish.is_some() {
@@ -1037,8 +1043,8 @@ impl WaveCraftApp {
 mod tests {
     use super::*;
     use crate::app::test_support::{
-        app, poll_until, poll_until_finished, ready_scripted, request, scratch_directory, Script,
-        SourceEnding,
+        app, poll_until, poll_until_finished, ready, ready_scripted, request, scratch_directory,
+        Script, SourceEnding,
     };
     use crate::*;
 
@@ -1227,6 +1233,68 @@ mod tests {
             .is_some());
         assert!(app.capture_is_requested(CaptureTarget::Oscilloscope));
         app.stop_capture(CaptureTarget::Oscilloscope);
+    }
+
+    #[test]
+    fn continuous_scope_publishes_only_complete_instrument_frames() {
+        let mut app = app();
+        app.scope_settings.sample_count = 1_024;
+        request(&mut app, CaptureTarget::Oscilloscope);
+        let started = ready(
+            &app,
+            InstrumentKind::Oscilloscope,
+            AcquisitionMode::Run,
+            CaptureTarget::Oscilloscope,
+        );
+        app.handle_capture_ready(started);
+        let active = app
+            .capture_for_target_mut(CaptureTarget::Oscilloscope)
+            .unwrap();
+        active.waveforms.ingest(
+            &CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000_000,
+                trigger_sample_index: Some(512),
+                channels: vec![vec![9.0; 1_024], vec![-9.0; 1_024]],
+            }),
+            [true, true],
+        );
+
+        let first = CaptureFrame {
+            device_id: DeviceId::new("scope"),
+            sequence: 0,
+            captured_at: Duration::ZERO,
+            payload: CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000_000,
+                trigger_sample_index: Some(512),
+                channels: vec![vec![1.0; 512], vec![-1.0; 512]],
+            }),
+        };
+        assert!(!ingest_active_capture_frame(active, first, -100.0).unwrap());
+        assert_eq!(active.waveforms.scope_channels[0][0], 9.0);
+        assert_eq!(
+            active
+                .pending_scope_waveforms
+                .as_ref()
+                .unwrap()
+                .scope_sample_count([true, true]),
+            512
+        );
+
+        let second = CaptureFrame {
+            device_id: DeviceId::new("scope"),
+            sequence: 1,
+            captured_at: Duration::from_micros(512),
+            payload: CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000_000,
+                trigger_sample_index: None,
+                channels: vec![vec![2.0; 512], vec![-2.0; 512]],
+            }),
+        };
+        assert!(ingest_active_capture_frame(active, second, -100.0).unwrap());
+        assert!(active.pending_scope_waveforms.is_none());
+        assert_eq!(active.waveforms.scope_channels[0].len(), 1_024);
+        assert_eq!(active.waveforms.scope_channels[0][0], 1.0);
+        assert_eq!(active.waveforms.scope_channels[0][1_023], 2.0);
     }
 
     #[test]

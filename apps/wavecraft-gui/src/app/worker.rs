@@ -286,6 +286,7 @@ impl WaveCraftApp {
             radio_runtime_control,
             stopped: HashSet::new(),
             waveforms: display.waveforms,
+            pending_scope_waveforms: None,
             protocol_decode_snapshot: display.protocol_decode_snapshot,
             protocol_analyzers: display.protocol_analyzers,
             logic_decode: display.logic_decode,

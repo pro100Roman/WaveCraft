@@ -179,11 +179,8 @@ impl WaveformViewport {
     }
 
     pub(crate) fn align_trigger_to_screen(&mut self, sample_fraction: f32, screen_fraction: f32) {
-        // Trigger alignment may expose a small empty margin at either end of
-        // the acquired buffer. Clamping a full-span viewport to zero would
-        // leave the real threshold crossing at a different horizontal pixel
-        // on every Auto sweep, defeating oscilloscope trigger synchronization.
-        self.start = sample_fraction - screen_fraction.clamp(0.0, 1.0) * self.span;
+        self.start =
+            self.clamp_start(sample_fraction - screen_fraction.clamp(0.0, 1.0) * self.span);
     }
 
     pub(crate) fn clamp_start(self, start: f32) -> f32 {

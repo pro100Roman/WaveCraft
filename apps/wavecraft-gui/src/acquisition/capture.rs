@@ -262,7 +262,7 @@ pub(crate) fn ingest_active_capture_frame(
     active: &mut ActiveCapture,
     frame: CaptureFrame,
     radio_squelch_threshold_dbfs: f32,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let event = CaptureEvent::Frame(frame);
     if let Some(recorder) = active.recorder.as_mut() {
         recorder
@@ -273,7 +273,8 @@ pub(crate) fn ingest_active_capture_frame(
         return Err("capture frame event changed variant".to_owned());
     };
     if matches!(&frame.payload, CaptureBatch::Logic(_)) {
-        return active.logic_decode.push(frame);
+        active.logic_decode.push(frame)?;
+        return Ok(false);
     }
     if let CaptureBatch::Iq(iq) = &frame.payload {
         active
@@ -292,17 +293,45 @@ pub(crate) fn ingest_active_capture_frame(
             .waveforms
             .mark_scope_capture_start(enabled_scope_channels);
     }
-    if uses_continuous_scope_capture(active.mode, active.target)
+    let stages_scope_frame = uses_continuous_scope_capture(active.mode, active.target)
         && !active.waveforms.scope_rolling
-        && is_scope_frame_start(frame.sequence)
-        && matches!(&frame.payload, CaptureBatch::Scope(_))
-    {
-        active.waveforms.begin_scope_frame();
+        && matches!(&frame.payload, CaptureBatch::Scope(_));
+    if stages_scope_frame {
+        let mut published = false;
+        if is_scope_frame_start(frame.sequence) {
+            if let Some(previous) = active.pending_scope_waveforms.take() {
+                if previous.scope_sample_count(enabled_scope_channels) > 0 {
+                    active.waveforms = previous;
+                    published = true;
+                }
+            }
+            let pending = WaveformStore {
+                scope_capacity: active.scope_config.sample_count() as usize,
+                ..WaveformStore::default()
+            };
+            active.pending_scope_waveforms = Some(pending);
+        }
+        let pending = active
+            .pending_scope_waveforms
+            .get_or_insert_with(|| WaveformStore {
+                scope_capacity: active.scope_config.sample_count() as usize,
+                ..WaveformStore::default()
+            });
+        pending.ingest_frame(&frame, enabled_scope_channels);
+        if pending.scope_sample_count(enabled_scope_channels)
+            >= active.scope_config.sample_count() as usize
+        {
+            if let Some(complete) = active.pending_scope_waveforms.take() {
+                active.waveforms = complete;
+                published = true;
+            }
+        }
+        return Ok(published);
     }
     active
         .waveforms
         .ingest_frame(&frame, enabled_scope_channels);
-    Ok(())
+    Ok(matches!(&frame.payload, CaptureBatch::Scope(_)))
 }
 
 pub(crate) fn ingest_logic_decode_output(active: &mut ActiveCapture, output: LogicDecodeOutput) {
@@ -323,6 +352,10 @@ pub(crate) struct ActiveCapture {
     pub(crate) radio_runtime_control: Option<RadioRuntimeControl>,
     pub(crate) stopped: HashSet<DeviceId>,
     pub(crate) waveforms: WaveformStore,
+    /// A non-rolling continuous OSC frame is assembled away from the visible
+    /// store. This preserves the last coherent sweep across the RF-era bounded
+    /// event polls, matching the effective behavior of the v0.7 GUI.
+    pub(crate) pending_scope_waveforms: Option<WaveformStore>,
     pub(crate) protocol_decode_snapshot: ProtocolDecodeSnapshot,
     pub(crate) protocol_analyzers: Vec<ProtocolAnalyzerInstance>,
     pub(crate) logic_decode: LogicDecodeWorker,

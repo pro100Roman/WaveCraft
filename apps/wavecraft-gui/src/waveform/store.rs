@@ -220,30 +220,20 @@ impl WaveformStore {
     }
 
     pub(crate) fn mark_scope_capture_start(&mut self, scope_channels: [bool; 2]) {
-        let sample_count = self
-            .scope_channels
-            .iter()
-            .zip(scope_channels)
-            .filter_map(|(samples, enabled)| enabled.then_some(samples.len() as u64))
-            .min()
-            .unwrap_or(0);
+        let sample_count = self.scope_sample_count(scope_channels) as u64;
         if sample_count > 0 {
             self.scope_capture_boundaries
                 .push_back(self.scope_sample_offset + sample_count);
         }
     }
 
-    /// Starts a frame-based continuous scope sweep. Clear the prior frame at
-    /// the hardware boundary, then let incoming USB chunks grow the trace from
-    /// left to right like the reference DSView application.
-    pub(crate) fn begin_scope_frame(&mut self) {
-        for samples in &mut self.scope_channels {
-            samples.clear();
-        }
-        self.scope_captured_at = None;
-        self.scope_sample_offset = 0;
-        self.scope_trigger_sample_index = None;
-        self.scope_capture_boundaries.clear();
+    pub(crate) fn scope_sample_count(&self, scope_channels: [bool; 2]) -> usize {
+        self.scope_channels
+            .iter()
+            .zip(scope_channels)
+            .filter_map(|(samples, enabled)| enabled.then_some(samples.len()))
+            .min()
+            .unwrap_or(0)
     }
 
     pub(crate) fn ingest_frame(&mut self, frame: &CaptureFrame, scope_channels: [bool; 2]) {
@@ -673,49 +663,8 @@ mod tests {
         assert_eq!(store.scope_trigger_sample_index, Some(1));
         assert_eq!(store.scope_channels[0].back(), Some(&0.2));
         assert_eq!(store.scope_channels[1].back(), Some(&-0.2));
-    }
-
-    #[test]
-    fn a_new_continuous_scope_frame_replaces_the_previous_sweep() {
-        let mut store = WaveformStore::default();
-        store.ingest(
-            &CaptureBatch::Scope(ScopeBatch {
-                sample_rate_hz: 1_000_000,
-                trigger_sample_index: Some(1),
-                channels: vec![vec![0.1, 0.2], vec![-0.1, -0.2]],
-            }),
-            [true, true],
-        );
-
-        store.begin_scope_frame();
-        assert!(store.scope_channels.iter().all(VecDeque::is_empty));
-        let first_chunk = CaptureFrame {
-            device_id: DeviceId::new("scope"),
-            sequence: 0,
-            captured_at: Duration::ZERO,
-            payload: CaptureBatch::Scope(ScopeBatch {
-                sample_rate_hz: 1_000_000,
-                trigger_sample_index: Some(0),
-                channels: vec![vec![0.3], vec![-0.3]],
-            }),
-        };
-        store.ingest_frame(&first_chunk, [true, true]);
-        assert_eq!(store.scope_channels[0], VecDeque::from([0.3]));
-
-        let second_chunk = CaptureFrame {
-            sequence: 1,
-            payload: CaptureBatch::Scope(ScopeBatch {
-                sample_rate_hz: 1_000_000,
-                trigger_sample_index: None,
-                channels: vec![vec![0.4], vec![-0.4]],
-            }),
-            ..first_chunk
-        };
-        store.ingest_frame(&second_chunk, [true, true]);
-
-        assert_eq!(store.scope_channels[0], VecDeque::from([0.3, 0.4]));
-        assert_eq!(store.scope_trigger_sample_index, Some(0));
-        assert_eq!(store.scope_sample_offset, 0);
+        assert_eq!(store.scope_sample_count([true, true]), 2);
+        assert_eq!(store.scope_sample_count([true, false]), 2);
     }
 
     #[test]

@@ -1664,14 +1664,12 @@ fn scope_display_extent(
         .map(VecDeque::len)
         .min()
         .unwrap_or(0);
-    // DSView allocates the full capture domain on the first payload and then
-    // repaints as the received sample count grows. Keeping that fixed domain
-    // makes a partial sweep fill the plate from left to right instead of
-    // stretching every incoming USB chunk across the entire width.
     let display_sample_count = if waveforms.scope_rolling {
         waveforms.scope_capacity
-    } else {
+    } else if sample_count == 0 {
         settings.sample_count as usize
+    } else {
+        sample_count
     };
     let display_sample_rate_hz = if waveforms.scope_rate_hz == 0 {
         settings.sample_rate_hz
@@ -1706,38 +1704,6 @@ fn scope_trigger_fractions(
         .unwrap_or_else(|| f32::from(settings.trigger.position_percent) / 100.0);
     let trigger_screen_fraction = f32::from(trigger_settings.position_percent) / 100.0;
     (trigger_sample_fraction, trigger_screen_fraction)
-}
-
-/// A growing frame uses the configured or hardware trigger position until all
-/// samples have arrived. The software edge search can change as each chunk is
-/// appended, so using it early would move already painted samples. DSView keeps
-/// one sample-to-pixel transform for the frame and applies its small trigger
-/// correction only after the relevant data is available.
-fn stable_scope_trigger_crossing(
-    trigger_crossing: Option<ScopeTriggerCrossing>,
-    scope_rolling: bool,
-    received_sample_count: usize,
-    display_sample_count: usize,
-) -> Option<ScopeTriggerCrossing> {
-    (scope_rolling || received_sample_count >= display_sample_count)
-        .then_some(trigger_crossing)
-        .flatten()
-}
-
-/// DSView derives its trace/envelope resolution from the selected scale, not
-/// from how much of the current frame has arrived. Keeping this step fixed
-/// prevents the renderer from changing shape midway through a growing sweep.
-fn scope_plot_step(
-    viewport: WaveformViewport,
-    display_sample_count: usize,
-    plot_width: f32,
-) -> usize {
-    let visible_domain_count = viewport
-        .sample_range_in_domain(display_sample_count, display_sample_count)
-        .len();
-    (visible_domain_count as f32 / plot_width.max(1.0))
-        .floor()
-        .max(1.0) as usize
 }
 
 /// Geometry and sample extent shared by the parts of the time-domain view.
@@ -1788,27 +1754,18 @@ pub(crate) fn paint_scope_time_domain(
     paint_scope_graticule(&scope_painter, plot);
     let trigger_crossing =
         scope_trigger_crossing_sample(waveforms, options.settings, *options.trigger_settings);
-    let alignment_crossing = stable_scope_trigger_crossing(
-        trigger_crossing,
-        waveforms.scope_rolling,
-        sample_count,
-        display_sample_count,
-    );
     let (trigger_sample_fraction, trigger_screen_fraction) = scope_trigger_fractions(
         waveforms,
         options.settings,
-        alignment_crossing,
+        trigger_crossing,
         *options.trigger_settings,
         display_sample_count,
     );
     if should_align_scope_trigger(
         viewport.anchor_locked,
         waveforms.scope_rolling,
-        alignment_crossing.is_some(),
+        trigger_crossing.is_some(),
     ) {
-        // Keep the same transform while a frame grows. Its received prefix is
-        // then revealed monotonically from lower to higher sample indices,
-        // exactly as the pre-sized DSView snapshot is painted.
         viewport.align_trigger_to_screen(trigger_sample_fraction, trigger_screen_fraction);
     }
     update_scope_viewport(
@@ -1831,6 +1788,7 @@ pub(crate) fn paint_scope_time_domain(
     options.settings.trigger = *options.trigger_settings;
 
     let visible_range = viewport.sample_range_in_domain(sample_count, display_sample_count);
+    let visible_count = visible_range.len();
     let view = ScopeTimeDomainView {
         plot,
         time_ruler,
@@ -1838,14 +1796,16 @@ pub(crate) fn paint_scope_time_domain(
         extent,
         viewport: *viewport,
     };
-    if visible_range.is_empty() {
+    if visible_count == 0 {
         paint_empty(&scope_painter, plot, "Waiting for oscilloscope samples");
         paint_scope_references(ui, &scope_painter, &view, &mut options);
         paint_scope_footer(ui, painter, &view, waveforms, &mut options, viewport);
         return;
     }
 
-    let step = scope_plot_step(*viewport, display_sample_count, plot.width());
+    let step = (visible_count as f32 / plot.width().max(1.0))
+        .floor()
+        .max(1.0) as usize;
 
     paint_scope_traces(
         &scope_painter,
@@ -2239,7 +2199,7 @@ mod tests {
     }
 
     #[test]
-    fn a_growing_scope_sweep_keeps_the_configured_horizontal_domain() {
+    fn the_display_extent_follows_the_shortest_enabled_channel() {
         let waveforms = WaveformStore {
             scope_channels: scope_channels([500, 300]),
             scope_rate_hz: 2_000_000,
@@ -2250,14 +2210,14 @@ mod tests {
             scope_display_extent(&waveforms, capture_settings([true, true])),
             ScopeDisplayExtent {
                 sample_count: 300,
-                display_sample_count: 10_000,
+                display_sample_count: 300,
                 display_sample_rate_hz: 2_000_000,
             }
         );
         // A disabled channel does not shorten the view.
         let extent = scope_display_extent(&waveforms, capture_settings([true, false]));
         assert_eq!(extent.sample_count, 500);
-        assert_eq!(extent.display_sample_count, 10_000);
+        assert_eq!(extent.display_sample_count, 500);
     }
 
     #[test]
@@ -2425,60 +2385,6 @@ mod tests {
         assert!(!should_align_scope_trigger(true, true, false));
         assert!(should_align_scope_trigger(true, false, false));
         assert!(!should_align_scope_trigger(false, true, true));
-    }
-
-    #[test]
-    fn a_growing_scope_sweep_delays_software_trigger_correction_until_complete() {
-        let crossing = ScopeTriggerCrossing {
-            sample: 750.0,
-            channel_index: 0,
-        };
-
-        assert_eq!(
-            stable_scope_trigger_crossing(Some(crossing), false, 250, 1_000),
-            None
-        );
-        assert_eq!(
-            stable_scope_trigger_crossing(Some(crossing), false, 1_000, 1_000),
-            Some(crossing)
-        );
-        assert_eq!(
-            stable_scope_trigger_crossing(Some(crossing), true, 250, 1_000),
-            Some(crossing)
-        );
-    }
-
-    #[test]
-    fn a_partial_scope_sweep_keeps_the_nominal_trigger_transform_at_any_span() {
-        let mut viewport = WaveformViewport {
-            start: 0.25,
-            span: 0.001,
-            anchor_locked: true,
-        };
-        viewport.align_trigger_to_screen(0.75, 0.5);
-        assert!((viewport.start - 0.7495).abs() < 0.000_001);
-
-        viewport.span = 1.0;
-        viewport.align_trigger_to_screen(0.75, 0.5);
-        assert_eq!(viewport.start, 0.25);
-    }
-
-    #[test]
-    fn scope_render_resolution_depends_on_time_scale_not_received_prefix() {
-        let wide = WaveformViewport::default();
-        let narrow = WaveformViewport {
-            start: 0.7495,
-            span: 0.001,
-            anchor_locked: true,
-        };
-
-        assert_eq!(scope_plot_step(wide, 1_000_000, 1_000.0), 1_000);
-        assert_eq!(scope_plot_step(narrow, 1_000_000, 1_000.0), 1);
-        assert_eq!(wide.sample_range_in_domain(250_000, 1_000_000), 0..250_000);
-        assert!(narrow.sample_range_in_domain(250_000, 1_000_000).is_empty());
-        let visible = narrow.sample_range_in_domain(800_000, 1_000_000);
-        assert!((749_499..=749_500).contains(&visible.start));
-        assert_eq!(visible.end, 750_500);
     }
 
     #[test]

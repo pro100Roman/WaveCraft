@@ -1430,9 +1430,9 @@ fn scope_trigger_position_maps_between_percent_and_plot_x() {
 
     let mut full_span = WaveformViewport::default();
     full_span.align_trigger_to_screen(0.75, 0.5);
-    assert_eq!(full_span.start, 0.25);
+    assert_eq!(full_span.start, 0.0);
     assert_eq!(full_span.span, 1.0);
-    assert!(((0.75 - full_span.start) / full_span.span - 0.5).abs() < f32::EPSILON);
+    assert!(((0.75 - full_span.start) / full_span.span - 0.75).abs() < f32::EPSILON);
 
     let mut hardware_anchored = WaveformViewport {
         start: 0.25,
