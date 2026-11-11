@@ -348,9 +348,9 @@ pub(crate) struct WaveformViewportOptions {
     pub(crate) primary_pan_enabled: bool,
     pub(crate) zoom_anchor: WaveformZoomAnchor,
     pub(crate) timebase_basis: Option<f64>,
-    /// The wheel selects a new capture span instead of zooming within the
-    /// samples already held. The scope enables this with automatic sample rate.
-    pub(crate) timebase_controls_capture: bool,
+    /// The wheel requests a new hardware timebase instead of zooming within
+    /// the samples already held. The scope enables this with automatic rate.
+    pub(crate) timebase_reconfigures_capture: bool,
 }
 
 fn apply_timebase_scroll(
@@ -365,10 +365,10 @@ fn apply_timebase_scroll(
         .timebase_basis
         .or_else(|| viewport.time_per_division(sample_count, sample_rate_hz))
         .and_then(|current| adjacent_timebase(current, scroll_delta > 0.0));
-    if options.timebase_controls_capture {
+    if options.timebase_reconfigures_capture {
         if requested_timebase.is_some() {
-            // Auto sample rate will make the requested timebase fill the next
-            // hardware frame, so keep the view on the complete capture span.
+            // The requested time/div is applied to the next hardware frame,
+            // so keep the viewport geometry on the complete sweep.
             viewport.reset();
         }
         return (requested_timebase.is_some(), requested_timebase);
@@ -737,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_sample_rate_scroll_changes_capture_span_without_viewport_zoom() {
+    fn automatic_sample_rate_scroll_requests_a_timebase_without_viewport_zoom() {
         let mut viewport = WaveformViewport {
             start: 0.2,
             span: 0.5,
@@ -752,7 +752,7 @@ mod tests {
                 primary_pan_enabled: true,
                 zoom_anchor: WaveformZoomAnchor::Pointer,
                 timebase_basis: Some(0.05),
-                timebase_controls_capture: true,
+                timebase_reconfigures_capture: true,
             },
             -1.0,
             0.75,

@@ -12,7 +12,7 @@ use crate::{
     ScopeFunctionSettings, ScopeMarkerSettings, ScopeMathOperation, ScopeMathSettings,
     ScopeMeasurementCache, ScopeQuickTimeMeasurement, ScopeTriggerSettings, ScopeWaveformOptions,
     SelectableHoverText, Sense, Stroke, Vec2, VecDeque, WaveformPlotClick, WaveformStore,
-    WaveformViewport, WaveformViewportOptions, WaveformZoomAnchor, BACKGROUND,
+    WaveformTimeAxis, WaveformViewport, WaveformViewportOptions, WaveformZoomAnchor, BACKGROUND,
     DSCOPE_TRIGGER_LEVEL_CENTER, DSCOPE_TRIGGER_LEVEL_MAX, DSCOPE_TRIGGER_LEVEL_MIN,
     DSCOPE_TRIGGER_POSITION_MAX_PERCENT, DSCOPE_TRIGGER_POSITION_MIN_PERCENT,
     DSCOPE_VERTICAL_OFFSET_CENTER, DSCOPE_VERTICAL_OFFSET_MAX, DSCOPE_VERTICAL_OFFSET_MIN, GRID,
@@ -1880,7 +1880,7 @@ fn update_scope_viewport(
                     screen_fraction: trigger_screen_fraction,
                 },
                 timebase_basis: *options.time_per_division_seconds,
-                timebase_controls_capture: options.timebase_reconfigures_capture,
+                timebase_reconfigures_capture: options.timebase_reconfigures_capture,
             },
         );
     if let Some(click) = waveform_click {
@@ -2128,6 +2128,15 @@ fn paint_scope_analysis_overlays(
 }
 
 /// The time ruler, the status line, and the trigger position handle.
+fn scope_timebase_axis(time_per_division: f64, viewport: WaveformViewport) -> WaveformTimeAxis {
+    let duration_seconds = time_per_division * SCOPE_HORIZONTAL_DIVISIONS as f64
+        / f64::from(viewport.span).max(f64::EPSILON);
+    WaveformTimeAxis {
+        start_seconds: -f64::from(viewport.start) * duration_seconds,
+        duration_seconds,
+    }
+}
+
 fn paint_scope_footer(
     ui: &egui::Ui,
     painter: &egui::Painter,
@@ -2148,6 +2157,13 @@ fn paint_scope_footer(
         display_sample_rate_hz,
         ..
     } = extent;
+    let selected_timebase = (options.time_axis.is_none() && options.timebase_reconfigures_capture)
+        .then_some(*options.time_per_division_seconds)
+        .flatten()
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0);
+    let time_axis = options
+        .time_axis
+        .or_else(|| selected_timebase.map(|timebase| scope_timebase_axis(timebase, *viewport)));
     paint_waveform_time_scale(
         painter,
         time_ruler,
@@ -2155,7 +2171,7 @@ fn paint_scope_footer(
         display_sample_rate_hz,
         waveforms.scope_sample_offset,
         *viewport,
-        options.time_axis,
+        time_axis,
     );
     paint_waveform_status(
         painter,
@@ -2163,6 +2179,7 @@ fn paint_scope_footer(
         display_sample_count,
         display_sample_rate_hz,
         *viewport,
+        selected_timebase,
     );
     paint_scope_trigger_position(
         ui,
@@ -2249,6 +2266,23 @@ mod tests {
 
         assert_eq!(extent.sample_count, 500);
         assert_eq!(extent.display_sample_count, 4_096);
+    }
+
+    #[test]
+    fn automatic_capture_timebase_changes_the_plate_divisions_not_its_viewport_span() {
+        let viewport = WaveformViewport {
+            start: 0.25,
+            span: 0.5,
+            anchor_locked: true,
+        };
+        let time_per_division = 0.2;
+        let axis = scope_timebase_axis(time_per_division, viewport);
+        let visible_start = axis.start_seconds + f64::from(viewport.start) * axis.duration_seconds;
+        let visible_duration = f64::from(viewport.span) * axis.duration_seconds;
+
+        assert_eq!(visible_start, 0.0);
+        assert_eq!(visible_duration, 2.0);
+        assert_eq!(viewport.span, 0.5);
     }
 
     #[test]

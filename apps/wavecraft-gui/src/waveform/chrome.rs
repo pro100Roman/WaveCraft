@@ -287,13 +287,15 @@ pub(crate) fn paint_waveform_status(
     total_sample_count: usize,
     sample_rate_hz: u64,
     viewport: WaveformViewport,
+    time_per_division_override: Option<f64>,
 ) {
     painter.rect_filled(rect, 4.0, PANEL.gamma_multiply(0.9));
     painter.line_segment(
         [rect.left_bottom(), rect.right_bottom()],
         Stroke::new(1.0_f32, GRID),
     );
-    if let Some(time_per_division) = viewport.time_per_division(total_sample_count, sample_rate_hz)
+    if let Some(time_per_division) = time_per_division_override
+        .or_else(|| viewport.time_per_division(total_sample_count, sample_rate_hz))
     {
         let per_division = Duration::from_secs_f64(time_per_division);
         let span = Duration::from_secs_f64(time_per_division * SCOPE_HORIZONTAL_DIVISIONS as f64);

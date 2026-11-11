@@ -1363,7 +1363,7 @@ pub(crate) fn paint_logic(
             primary_pan_enabled: !marker_settings.adding,
             zoom_anchor: WaveformZoomAnchor::Pointer,
             timebase_basis: None,
-            timebase_controls_capture: false,
+            timebase_reconfigures_capture: false,
         },
     );
     update_logic_marker_gesture(
@@ -1460,6 +1460,7 @@ pub(crate) fn paint_logic(
         display_sample_count,
         display_sample_rate_hz,
         *viewport,
+        None,
     );
 }
 
