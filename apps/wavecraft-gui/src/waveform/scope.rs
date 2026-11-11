@@ -1757,6 +1757,36 @@ fn scope_trigger_fractions(
     (trigger_sample_fraction, trigger_screen_fraction)
 }
 
+fn scope_timebase_preview_viewport(
+    viewport: WaveformViewport,
+    display_sample_count: usize,
+    display_sample_rate_hz: u64,
+    selected_timebase: Option<f64>,
+    timebase_reconfigures_capture: bool,
+    trigger_sample_fraction: f32,
+    trigger_screen_fraction: f32,
+) -> WaveformViewport {
+    if !timebase_reconfigures_capture || display_sample_count == 0 || display_sample_rate_hz == 0 {
+        return viewport;
+    }
+    let Some(selected_timebase) =
+        selected_timebase.filter(|timebase| timebase.is_finite() && *timebase > 0.0)
+    else {
+        return viewport;
+    };
+    let capture_duration = display_sample_count as f64 / display_sample_rate_hz as f64;
+    let requested_duration = selected_timebase * SCOPE_HORIZONTAL_DIVISIONS as f64;
+    let preview_span = (requested_duration / capture_duration) as f32;
+    if !preview_span.is_finite() || preview_span <= viewport.span * (1.0 + f32::EPSILON) {
+        return viewport;
+    }
+    WaveformViewport {
+        start: trigger_sample_fraction - trigger_screen_fraction * preview_span,
+        span: preview_span,
+        anchor_locked: viewport.anchor_locked,
+    }
+}
+
 /// Geometry and sample extent shared by the parts of the time-domain view.
 #[derive(Clone, Copy)]
 struct ScopeTimeDomainView {
@@ -1838,14 +1868,23 @@ pub(crate) fn paint_scope_time_domain(
     }
     options.settings.trigger = *options.trigger_settings;
 
-    let visible_range = viewport.sample_range_in_domain(sample_count, display_sample_count);
+    let display_viewport = scope_timebase_preview_viewport(
+        *viewport,
+        display_sample_count,
+        display_sample_rate_hz,
+        *options.time_per_division_seconds,
+        options.timebase_reconfigures_capture,
+        trigger_sample_fraction,
+        trigger_screen_fraction,
+    );
+    let visible_range = display_viewport.sample_range_in_domain(sample_count, display_sample_count);
     let visible_count = visible_range.len();
     let view = ScopeTimeDomainView {
         plot,
         time_ruler,
         status_bar,
         extent,
-        viewport: *viewport,
+        viewport: display_viewport,
     };
     if visible_count == 0 {
         paint_empty(&scope_painter, plot, "Waiting for oscilloscope samples");
@@ -1854,9 +1893,8 @@ pub(crate) fn paint_scope_time_domain(
         return;
     }
 
-    let step = (visible_count as f32 / plot.width().max(1.0))
-        .floor()
-        .max(1.0) as usize;
+    let occupied_width = (plot.width() / display_viewport.span.max(1.0)).max(1.0);
+    let step = (visible_count as f32 / occupied_width).floor().max(1.0) as usize;
 
     paint_scope_traces(
         &scope_painter,
@@ -2348,6 +2386,41 @@ mod tests {
         assert_eq!(visible_start, 0.0);
         assert_eq!(visible_duration, 2.0);
         assert_eq!(viewport.span, 0.5);
+    }
+
+    #[test]
+    fn pending_automatic_timebase_change_previews_the_wider_window_immediately() {
+        let preview = scope_timebase_preview_viewport(
+            WaveformViewport::default(),
+            1_000_000,
+            1_000_000,
+            Some(0.2),
+            true,
+            0.4,
+            0.5,
+        );
+
+        assert_eq!(preview.span, 2.0);
+        assert!((preview.start + 0.6).abs() < f32::EPSILON);
+        assert!((preview.screen_fraction_at_domain(0.4) - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn manual_timebase_does_not_preview_outside_the_captured_window() {
+        let viewport = WaveformViewport::default();
+
+        assert_eq!(
+            scope_timebase_preview_viewport(
+                viewport,
+                1_000_000,
+                1_000_000,
+                Some(0.2),
+                false,
+                0.4,
+                0.5,
+            ),
+            viewport
+        );
     }
 
     #[test]
