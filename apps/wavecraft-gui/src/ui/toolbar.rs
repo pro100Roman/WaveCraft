@@ -9,6 +9,13 @@ use crate::{
 use crate::{ui::frame_actions::FrameActions, WaveCraftApp};
 
 impl WaveCraftApp {
+    /// File operations stay disabled for the whole acquisition request, not
+    /// only while a worker or source happens to be active. Re-Arm briefly has
+    /// neither between sweeps, which previously made Open and Export blink.
+    fn capture_file_actions_enabled(&self) -> bool {
+        !self.is_busy() && self.capture_requests.is_empty()
+    }
+
     /// Paints the toolbar and records the user's requests in `actions`.
     pub(crate) fn paint_toolbar(
         &mut self,
@@ -23,6 +30,7 @@ impl WaveCraftApp {
             can_attach_run_decoded_recording,
             ..
         } = *frame;
+        let capture_file_actions_enabled = self.capture_file_actions_enabled();
         egui::TopBottomPanel::top("toolbar")
             .frame(
                 egui::Frame::none()
@@ -87,7 +95,7 @@ impl WaveCraftApp {
                     }
                     if ui
                         .add_enabled(
-                            self.pending.is_none(),
+                            capture_file_actions_enabled,
                             toolbar_action_button("📂 Open", TEXT_MUTED)
                                 .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
                         )
@@ -98,7 +106,8 @@ impl WaveCraftApp {
                     }
                     if ui
                         .add_enabled(
-                            self.pending.is_none() && self.has_displayed_completed_capture(),
+                            capture_file_actions_enabled
+                                && self.has_displayed_completed_capture(),
                             toolbar_action_button("Export", TEXT_MUTED)
                                 .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
                         )
@@ -225,5 +234,24 @@ impl WaveCraftApp {
                     });
                 });
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::app::test_support::{app, request};
+
+    #[test]
+    fn capture_file_actions_stay_disabled_between_rearmed_sweeps() {
+        let mut app = app();
+        assert!(app.capture_file_actions_enabled());
+
+        request(&mut app, CaptureTarget::Oscilloscope);
+
+        assert!(app.pending.is_none());
+        assert!(app.captures.is_empty());
+        assert!(!app.capture_file_actions_enabled());
     }
 }
