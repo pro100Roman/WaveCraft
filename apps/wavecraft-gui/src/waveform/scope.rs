@@ -674,7 +674,8 @@ pub(crate) fn scope_plot_sample_segments(
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScopeDisplayBucket {
     pub(crate) center_index: f64,
-    pub(crate) average: f32,
+    pub(crate) minimum: f32,
+    pub(crate) maximum: f32,
 }
 
 pub(crate) fn scope_downsampled_segments(
@@ -700,13 +701,17 @@ pub(crate) fn scope_downsampled_segments(
             Vec::with_capacity(segment_end.saturating_sub(segment_start).div_ceil(step));
         for bucket_start in (segment_start..segment_end).step_by(step.max(1)) {
             let bucket_end = bucket_start.saturating_add(step).min(segment_end);
-            let sum = samples
-                .range(bucket_start..bucket_end)
-                .map(|value| f64::from(*value))
-                .sum::<f64>();
+            let mut values = samples.range(bucket_start..bucket_end).copied();
+            let Some(first) = values.next() else {
+                continue;
+            };
+            let (minimum, maximum) = values.fold((first, first), |(minimum, maximum), value| {
+                (minimum.min(value), maximum.max(value))
+            });
             buckets.push(ScopeDisplayBucket {
                 center_index: (bucket_start as f64 + (bucket_end - 1) as f64) * 0.5,
-                average: (sum / (bucket_end - bucket_start) as f64) as f32,
+                minimum,
+                maximum,
             });
         }
         if !buckets.is_empty() {
@@ -727,23 +732,19 @@ pub(crate) fn paint_scope_downsampled_segments(
     color: Color32,
 ) {
     for segment in segments {
-        let points = segment
-            .iter()
-            .map(|bucket| {
-                Pos2::new(
-                    waveform_sample_x(plot, viewport, bucket.center_index, sample_count),
-                    scope_sample_y(plot, channel, bucket.average),
-                )
-            })
-            .collect::<Vec<_>>();
-        if points.len() == 1 {
-            painter.circle_filled(points[0], 0.75, color);
-        } else if points.len() > 1 {
-            painter.add(egui::Shape::line(
-                points.clone(),
-                Stroke::new(4.0_f32, color.gamma_multiply(0.16)),
-            ));
-            painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, color)));
+        for (index, bucket) in segment.iter().enumerate() {
+            let next = segment.get(index + 1).unwrap_or(bucket);
+            // Overlap neighbouring envelopes like DSView so steep edges do
+            // not leave vertical gaps between adjacent screen columns.
+            let minimum = bucket.minimum.min(next.maximum);
+            let maximum = bucket.maximum.max(next.minimum);
+            let x = waveform_sample_x(plot, viewport, bucket.center_index, sample_count);
+            let line = [
+                Pos2::new(x, scope_sample_y(plot, channel, maximum)),
+                Pos2::new(x, scope_sample_y(plot, channel, minimum)),
+            ];
+            painter.line_segment(line, Stroke::new(4.0_f32, color.gamma_multiply(0.16)));
+            painter.line_segment(line, Stroke::new(1.5_f32, color));
         }
     }
 }
@@ -2447,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_downsampling_averages_each_screen_bucket() {
+    fn scope_downsampling_preserves_each_screen_buckets_extrema() {
         let samples = VecDeque::from(vec![
             0.0, 4.0, -3.0, 1.0, 0.5, 0.25, -0.5, 0.0, 1.0, -5.0, 6.0, 2.0, 1.5, 0.75, 0.5, 1.0,
         ]);
@@ -2457,8 +2458,42 @@ mod tests {
 
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].len(), 2);
-        assert_eq!(segments[0][0].average, 0.28125);
-        assert_eq!(segments[0][1].average, 0.96875);
+        assert_eq!(segments[0][0].minimum, -3.0);
+        assert_eq!(segments[0][0].maximum, 4.0);
+        assert_eq!(segments[0][1].minimum, -5.0);
+        assert_eq!(segments[0][1].maximum, 6.0);
+    }
+
+    #[test]
+    fn wide_time_span_keeps_a_one_kilohertz_signal_at_full_amplitude() {
+        const SAMPLE_RATE_HZ: f32 = 1_000_000.0;
+        const SIGNAL_FREQUENCY_HZ: f32 = 1_000.0;
+        const SAMPLE_COUNT: usize = 200_000;
+        const DISPLAY_BUCKET_SAMPLES: usize = 200;
+        let samples = (0..SAMPLE_COUNT)
+            .map(|index| {
+                (std::f32::consts::TAU * SIGNAL_FREQUENCY_HZ * index as f32 / SAMPLE_RATE_HZ).sin()
+            })
+            .collect::<VecDeque<_>>();
+
+        let segments = scope_downsampled_segments(
+            &samples,
+            0..samples.len(),
+            DISPLAY_BUCKET_SAMPLES,
+            0,
+            &VecDeque::new(),
+        );
+        let minimum = segments[0]
+            .iter()
+            .map(|bucket| bucket.minimum)
+            .fold(f32::INFINITY, f32::min);
+        let maximum = segments[0]
+            .iter()
+            .map(|bucket| bucket.maximum)
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        assert!(minimum < -0.999);
+        assert!(maximum > 0.999);
     }
 
     #[test]
@@ -2468,8 +2503,10 @@ mod tests {
         let segments = scope_downsampled_segments(&samples, 0..4, 4, 100, &VecDeque::from([102]));
 
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0][0].average, -0.75);
-        assert_eq!(segments[1][0].average, 4.5);
+        assert_eq!(segments[0][0].minimum, -1.0);
+        assert_eq!(segments[0][0].maximum, -0.5);
+        assert_eq!(segments[1][0].minimum, 4.0);
+        assert_eq!(segments[1][0].maximum, 5.0);
     }
 
     #[test]
