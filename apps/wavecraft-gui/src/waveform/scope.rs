@@ -326,6 +326,48 @@ pub(crate) struct ScopeSmartTimingMeasurement {
     pub(crate) end_voltage: f32,
 }
 
+const SCOPE_SMART_TIMING_VOLTAGE_FILTER_BLEND: f32 = 0.06;
+const SCOPE_SMART_TIMING_POINTER_RESET_DISTANCE: f32 = 4.0;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ScopeSmartTimingVoltageFilter {
+    initialized: bool,
+    channel_index: usize,
+    pointer_anchor_x: f32,
+    waveform_revision: u64,
+    voltage: f32,
+}
+
+impl ScopeSmartTimingVoltageFilter {
+    fn update(
+        &mut self,
+        channel_index: usize,
+        pointer_x: f32,
+        waveform_revision: u64,
+        voltage: f32,
+    ) -> f32 {
+        let should_reset = !self.initialized
+            || self.channel_index != channel_index
+            || (self.pointer_anchor_x - pointer_x).abs()
+                > SCOPE_SMART_TIMING_POINTER_RESET_DISTANCE
+            || !self.voltage.is_finite()
+            || !voltage.is_finite();
+        if should_reset {
+            *self = Self {
+                initialized: true,
+                channel_index,
+                pointer_anchor_x: pointer_x,
+                waveform_revision,
+                voltage,
+            };
+        } else if self.waveform_revision != waveform_revision {
+            self.waveform_revision = waveform_revision;
+            self.voltage += (voltage - self.voltage) * SCOPE_SMART_TIMING_VOLTAGE_FILTER_BLEND;
+        }
+        self.voltage
+    }
+}
+
 impl ScopeSmartTimingMeasurement {
     pub(crate) fn duration(self, sample_rate_hz: u64) -> Option<Duration> {
         (sample_rate_hz != 0).then(|| {
@@ -2117,8 +2159,19 @@ fn paint_scope_analysis_overlays(
                 display_sample_count,
                 pointer,
             )
+            .map(|measurement| (measurement, pointer))
         });
-    if let Some(measurement) = smart_timing {
+    let voltage_filter_id = ui.make_persistent_id("scope_smart_timing_voltage_filter");
+    if let Some((mut measurement, pointer)) = smart_timing {
+        measurement.end_voltage = ui.data_mut(|data| {
+            data.get_temp_mut_or_default::<ScopeSmartTimingVoltageFilter>(voltage_filter_id)
+                .update(
+                    measurement.channel_index,
+                    pointer.x,
+                    waveforms.scope_revision,
+                    measurement.end_voltage,
+                )
+        });
         paint_scope_timing_hint(
             scope_painter,
             plot,
@@ -2132,6 +2185,10 @@ fn paint_scope_analysis_overlays(
                 color: channel_colors[measurement.channel_index],
             },
         );
+    } else {
+        ui.data_mut(|data| {
+            data.remove_temp::<ScopeSmartTimingVoltageFilter>(voltage_filter_id);
+        });
     }
 }
 
@@ -2461,6 +2518,18 @@ mod tests {
 
         settings.trigger.levels[0] = 104;
         assert!(scope_smart_timing_has_nonzero_trigger(settings, crossing));
+    }
+
+    #[test]
+    fn scope_smart_timing_filters_voltage_between_waveform_updates() {
+        let mut filter = ScopeSmartTimingVoltageFilter::default();
+
+        assert_eq!(filter.update(0, 100.0, 1, 1.0), 1.0);
+        let filtered = filter.update(0, 100.0, 2, 3.0);
+        assert!((filtered - 1.12).abs() < 0.000_001);
+        assert_eq!(filter.update(0, 100.0, 2, -3.0), filtered);
+        assert_eq!(filter.update(0, 105.0, 3, -2.0), -2.0);
+        assert_eq!(filter.update(1, 105.0, 4, 0.5), 0.5);
     }
 
     #[test]
