@@ -233,9 +233,9 @@ impl WaveformStore {
         }
     }
 
-    /// Starts a frame-based continuous scope sweep. Auto and Update both use
-    /// one long-lived USB session, but the display contains only the current
-    /// hardware frame so its trigger stays at a stable horizontal position.
+    /// Starts a frame-based continuous scope sweep. Clear the prior frame at
+    /// the hardware boundary, then let incoming USB chunks grow the trace from
+    /// left to right like the reference DSView application.
     pub(crate) fn begin_scope_frame(&mut self) {
         for samples in &mut self.scope_channels {
             samples.clear();
@@ -688,14 +688,30 @@ mod tests {
         );
 
         store.begin_scope_frame();
-        store.ingest(
-            &CaptureBatch::Scope(ScopeBatch {
+        assert!(store.scope_channels.iter().all(VecDeque::is_empty));
+        let first_chunk = CaptureFrame {
+            device_id: DeviceId::new("scope"),
+            sequence: 0,
+            captured_at: Duration::ZERO,
+            payload: CaptureBatch::Scope(ScopeBatch {
                 sample_rate_hz: 1_000_000,
                 trigger_sample_index: Some(0),
-                channels: vec![vec![0.3, 0.4], vec![-0.3, -0.4]],
+                channels: vec![vec![0.3], vec![-0.3]],
             }),
-            [true, true],
-        );
+        };
+        store.ingest_frame(&first_chunk, [true, true]);
+        assert_eq!(store.scope_channels[0], VecDeque::from([0.3]));
+
+        let second_chunk = CaptureFrame {
+            sequence: 1,
+            payload: CaptureBatch::Scope(ScopeBatch {
+                sample_rate_hz: 1_000_000,
+                trigger_sample_index: None,
+                channels: vec![vec![0.4], vec![-0.4]],
+            }),
+            ..first_chunk
+        };
+        store.ingest_frame(&second_chunk, [true, true]);
 
         assert_eq!(store.scope_channels[0], VecDeque::from([0.3, 0.4]));
         assert_eq!(store.scope_trigger_sample_index, Some(0));

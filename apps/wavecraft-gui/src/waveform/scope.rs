@@ -598,6 +598,30 @@ pub(crate) fn should_align_scope_trigger(
     anchor_locked && (!scope_rolling || has_trigger_crossing)
 }
 
+pub(crate) fn align_scope_sweep(
+    viewport: &mut WaveformViewport,
+    scope_rolling: bool,
+    received_sample_count: usize,
+    display_sample_count: usize,
+    trigger_sample_fraction: f32,
+    trigger_screen_fraction: f32,
+    has_trigger_crossing: bool,
+) {
+    if viewport.anchor_locked && !scope_rolling && received_sample_count < display_sample_count {
+        // A partial hardware sweep should reveal samples in acquisition order:
+        // left edge first, then continuously toward the right. Trigger
+        // centering before the sweep is complete makes the growing trace look
+        // as though it expands outward from the trigger position.
+        viewport.start = 0.0;
+    } else if should_align_scope_trigger(
+        viewport.anchor_locked,
+        scope_rolling,
+        has_trigger_crossing,
+    ) {
+        viewport.align_trigger_to_screen(trigger_sample_fraction, trigger_screen_fraction);
+    }
+}
+
 pub(crate) fn scope_plot_sample_indices(
     visible_range: Range<usize>,
     step: usize,
@@ -1664,12 +1688,14 @@ fn scope_display_extent(
         .map(VecDeque::len)
         .min()
         .unwrap_or(0);
+    // DSView allocates the full capture domain on the first payload and then
+    // repaints as the received sample count grows. Keeping that fixed domain
+    // makes a partial sweep fill the plate from left to right instead of
+    // stretching every incoming USB chunk across the entire width.
     let display_sample_count = if waveforms.scope_rolling {
         waveforms.scope_capacity
-    } else if sample_count == 0 {
-        settings.sample_count as usize
     } else {
-        sample_count
+        settings.sample_count as usize
     };
     let display_sample_rate_hz = if waveforms.scope_rate_hz == 0 {
         settings.sample_rate_hz
@@ -1761,13 +1787,15 @@ pub(crate) fn paint_scope_time_domain(
         *options.trigger_settings,
         display_sample_count,
     );
-    if should_align_scope_trigger(
-        viewport.anchor_locked,
+    align_scope_sweep(
+        viewport,
         waveforms.scope_rolling,
+        sample_count,
+        display_sample_count,
+        trigger_sample_fraction,
+        trigger_screen_fraction,
         trigger_crossing.is_some(),
-    ) {
-        viewport.align_trigger_to_screen(trigger_sample_fraction, trigger_screen_fraction);
-    }
+    );
     update_scope_viewport(
         ui,
         plot,
@@ -2199,7 +2227,7 @@ mod tests {
     }
 
     #[test]
-    fn the_display_extent_follows_the_shortest_enabled_channel() {
+    fn a_growing_scope_sweep_keeps_the_configured_horizontal_domain() {
         let waveforms = WaveformStore {
             scope_channels: scope_channels([500, 300]),
             scope_rate_hz: 2_000_000,
@@ -2210,14 +2238,14 @@ mod tests {
             scope_display_extent(&waveforms, capture_settings([true, true])),
             ScopeDisplayExtent {
                 sample_count: 300,
-                display_sample_count: 300,
+                display_sample_count: 10_000,
                 display_sample_rate_hz: 2_000_000,
             }
         );
         // A disabled channel does not shorten the view.
         let extent = scope_display_extent(&waveforms, capture_settings([true, false]));
         assert_eq!(extent.sample_count, 500);
-        assert_eq!(extent.display_sample_count, 500);
+        assert_eq!(extent.display_sample_count, 10_000);
     }
 
     #[test]
@@ -2385,6 +2413,26 @@ mod tests {
         assert!(!should_align_scope_trigger(true, true, false));
         assert!(should_align_scope_trigger(true, false, false));
         assert!(!should_align_scope_trigger(false, true, true));
+    }
+
+    #[test]
+    fn a_growing_scope_sweep_stays_at_the_left_edge_until_complete() {
+        let mut viewport = WaveformViewport {
+            start: 0.25,
+            span: 1.0,
+            anchor_locked: true,
+        };
+
+        align_scope_sweep(&mut viewport, false, 250, 1_000, 0.75, 0.5, true);
+        assert_eq!(viewport.start, 0.0);
+
+        align_scope_sweep(&mut viewport, false, 1_000, 1_000, 0.75, 0.5, true);
+        assert_eq!(viewport.start, 0.25);
+
+        viewport.start = 0.1;
+        viewport.anchor_locked = false;
+        align_scope_sweep(&mut viewport, false, 250, 1_000, 0.75, 0.5, true);
+        assert_eq!(viewport.start, 0.1);
     }
 
     #[test]

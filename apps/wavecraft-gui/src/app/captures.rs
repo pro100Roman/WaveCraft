@@ -183,16 +183,7 @@ fn handle_capture_frame(
     radio_trigger: &RadioTriggerSettings,
     poll: &mut CapturePoll,
 ) -> ControlFlow<()> {
-    if active.preserve_display_until_complete
-        && active.mode == AcquisitionMode::Run
-        && active.target == CaptureTarget::Oscilloscope
-        && !active.waveforms.scope_rolling
-        && matches!(&frame.payload, CaptureBatch::Scope(_))
-    {
-        // Update mode holds the previous trace while it waits. The first batch
-        // proves that a new hardware trigger fired, so reveal its replacement.
-        active.preserve_display_until_complete = false;
-    }
+    let frame_is_scope = matches!(&frame.payload, CaptureBatch::Scope(_));
     if let Some(trigger) = active.radio_trigger.as_mut() {
         let update_result = radio_trigger
             .posttrigger_samples
@@ -246,6 +237,16 @@ fn handle_capture_frame(
             poll.fail(active, error);
             break;
         }
+    }
+    if active.preserve_display_until_complete
+        && active.mode == AcquisitionMode::Run
+        && active.target == CaptureTarget::Oscilloscope
+        && !active.waveforms.scope_rolling
+        && frame_is_scope
+    {
+        // Reveal after the first new chunk has been ingested. Later chunks grow
+        // the replacement sweep continuously from left to right.
+        active.preserve_display_until_complete = false;
     }
     if poll.finish.is_some() {
         return ControlFlow::Break(());
@@ -1182,6 +1183,7 @@ mod tests {
     #[test]
     fn scope_update_holds_the_old_trace_then_stays_active_with_the_triggered_frame() {
         let mut app = app();
+        app.scope_settings.sample_count = 1_024;
         app.scope_settings.trigger.source = DsCopeTriggerSource::ChannelZero;
         let previous = crate::app::test_support::completed_capture(&app, false, true, false);
         app.set_completed_capture_for_target(CaptureTarget::Oscilloscope, previous);
@@ -1194,7 +1196,7 @@ mod tests {
                     vec![CaptureBatch::Scope(ScopeBatch {
                         sample_rate_hz: 1_000_000,
                         trigger_sample_index: Some(1),
-                        channels: vec![vec![0.1, 0.2], vec![-0.1, -0.2]],
+                        channels: vec![vec![0.1; 1_024], vec![-0.1; 1_024]],
                     })],
                     SourceEnding::Idle,
                 ),
@@ -1213,7 +1215,7 @@ mod tests {
                             .waveforms
                             .scope_channels
                             .first()
-                            .is_some_and(|samples| samples.len() == 2)
+                            .is_some_and(|samples| samples.len() == 1_024)
                 })
         });
 

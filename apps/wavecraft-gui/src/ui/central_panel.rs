@@ -90,6 +90,16 @@ struct WaveformViewEdits {
     scope_trigger_settings: ScopeTriggerSettings,
 }
 
+fn scope_waveform_is_current(
+    waveforms: &WaveformStore,
+    require_current_rate: bool,
+    configured_sample_rate_hz: u64,
+) -> bool {
+    !require_current_rate
+        || waveforms.scope_rate_hz == 0
+        || waveforms.scope_rate_hz == configured_sample_rate_hz
+}
+
 impl WaveformViewEdits {
     fn copy_from(app: &WaveCraftApp) -> Self {
         Self {
@@ -205,9 +215,21 @@ impl WaveCraftApp {
         state: &mut PanelState,
     ) {
         let empty_waveforms = WaveformStore::default();
+        let configured_scope_rate_hz = self.scope_settings.sample_rate_hz;
+        let require_current_scope_rate = frame.scope_capture_requested
+            && self
+                .active_waveform_tab
+                .is_some_and(|tab| tab.capture_target().includes_oscilloscope());
         let waveforms = self
             .active_capture_for_view()
-            .filter(|active| !active.preserve_display_until_complete)
+            .filter(|active| {
+                !active.preserve_display_until_complete
+                    && scope_waveform_is_current(
+                        &active.waveforms,
+                        require_current_scope_rate,
+                        configured_scope_rate_hz,
+                    )
+            })
             .map(|active| &active.waveforms)
             .or_else(|| {
                 self.calibration_active
@@ -217,6 +239,13 @@ impl WaveCraftApp {
             })
             .or_else(|| {
                 self.displayed_completed_capture()
+                    .filter(|capture| {
+                        scope_waveform_is_current(
+                            &capture.waveforms,
+                            require_current_scope_rate,
+                            configured_scope_rate_hz,
+                        )
+                    })
                     .map(|capture| &capture.waveforms)
             })
             .unwrap_or(&empty_waveforms);
@@ -768,6 +797,22 @@ mod tests {
     }
 
     const FAST_TIMEBASE: f64 = 1.0e-6;
+
+    #[test]
+    fn running_scope_hides_a_waveform_from_the_previous_sample_rate() {
+        let old_waveform = WaveformStore {
+            scope_rate_hz: 100_000_000,
+            ..WaveformStore::default()
+        };
+
+        assert!(!scope_waveform_is_current(&old_waveform, true, 125_000_000));
+        assert!(scope_waveform_is_current(&old_waveform, false, 125_000_000));
+        assert!(scope_waveform_is_current(
+            &WaveformStore::default(),
+            true,
+            125_000_000
+        ));
+    }
 
     #[test]
     fn copying_and_applying_unchanged_edits_leaves_the_app_as_it_was() {
