@@ -3,6 +3,43 @@
 
 use crate::{egui, Range, Rect, Sense, SCOPE_HORIZONTAL_DIVISIONS, TIMEBASE_STEPS_SECONDS};
 
+const TRACKPAD_TIMEBASE_STEP_POINTS: f32 = 12.0;
+const TRACKPAD_SCROLL_IDLE_SECONDS: f64 = 0.15;
+
+/// Turns one continuous trackpad scroll, including its macOS momentum tail,
+/// into one timebase step. A wheel reported in lines remains one step per
+/// input frame and bypasses this state.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct TrackpadTimebaseScroll {
+    accumulated_points: f32,
+    last_event_time: f64,
+    stepped: bool,
+}
+
+impl TrackpadTimebaseScroll {
+    fn update(&mut self, delta: f32, time: f64) -> f32 {
+        if time - self.last_event_time > TRACKPAD_SCROLL_IDLE_SECONDS {
+            *self = Self::default();
+        }
+        if delta == 0.0 {
+            return 0.0;
+        }
+        self.last_event_time = time;
+        if self.stepped {
+            return 0.0;
+        }
+        if self.accumulated_points != 0.0 && self.accumulated_points.signum() != delta.signum() {
+            self.accumulated_points = 0.0;
+        }
+        self.accumulated_points += delta;
+        if self.accumulated_points.abs() < TRACKPAD_TIMEBASE_STEP_POINTS {
+            return 0.0;
+        }
+        self.stepped = true;
+        self.accumulated_points.signum()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WaveformViewport {
     pub(crate) start: f32,
@@ -354,6 +391,37 @@ fn apply_timebase_scroll(
     (changed, requested_timebase)
 }
 
+/// Consumes vertical scrolling over a waveform and converts the high-frequency
+/// point events emitted by a Mac trackpad into a single detent. Without this,
+/// the momentum events that arrive after the fingers lift repeatedly step the
+/// discrete oscilloscope timebase.
+fn take_timebase_scroll_step(ui: &egui::Ui, id: egui::Id) -> f32 {
+    let (delta, discrete_wheel, time) = ui.input_mut(|input| {
+        let discrete_wheel = input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page,
+                    delta,
+                    ..
+                } if delta.y != 0.0
+            )
+        });
+        let delta = input.raw_scroll_delta.y;
+        input.raw_scroll_delta.y = 0.0;
+        input.smooth_scroll_delta.y = 0.0;
+        (delta, discrete_wheel, input.time)
+    });
+    if discrete_wheel {
+        ui.data_mut(|data| data.remove_temp::<TrackpadTimebaseScroll>(id));
+        return delta.signum();
+    }
+    ui.data_mut(|data| {
+        data.get_temp_mut_or_default::<TrackpadTimebaseScroll>(id)
+            .update(delta, time)
+    })
+}
+
 pub(crate) fn update_waveform_viewport(
     ui: &egui::Ui,
     rect: Rect,
@@ -411,7 +479,7 @@ pub(crate) fn update_waveform_viewport(
         }
     }
     if response.hovered() {
-        let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
+        let scroll_delta = take_timebase_scroll_step(ui, response.id.with("timebase_scroll"));
         if scroll_delta != 0.0 {
             let pointer_fraction = response
                 .hover_pos()
@@ -693,6 +761,27 @@ mod tests {
         assert!(changed);
         assert_eq!(requested, Some(0.1));
         assert_eq!(viewport, WaveformViewport::default());
+    }
+
+    #[test]
+    fn one_trackpad_gesture_produces_one_timebase_step_despite_momentum() {
+        let mut scroll = TrackpadTimebaseScroll::default();
+
+        assert_eq!(scroll.update(4.0, 1.00), 0.0);
+        assert_eq!(scroll.update(5.0, 1.01), 0.0);
+        assert_eq!(scroll.update(4.0, 1.02), 1.0);
+        assert_eq!(scroll.update(20.0, 1.03), 0.0);
+        assert_eq!(scroll.update(8.0, 1.10), 0.0);
+    }
+
+    #[test]
+    fn trackpad_timebase_step_rearms_after_scroll_becomes_idle() {
+        let mut scroll = TrackpadTimebaseScroll::default();
+
+        assert_eq!(scroll.update(-12.0, 1.00), -1.0);
+        assert_eq!(scroll.update(-12.0, 1.05), 0.0);
+        assert_eq!(scroll.update(0.0, 1.30), 0.0);
+        assert_eq!(scroll.update(-12.0, 1.31), -1.0);
     }
 
     #[test]
