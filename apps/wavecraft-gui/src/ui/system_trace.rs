@@ -502,23 +502,11 @@ fn paint_vertical_resize_handle(
     current_height: f32,
 ) -> Option<f32> {
     ui.push_id(id_salt, |ui| {
-        let (rect, response) =
+        let (_, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::drag());
         let response = response
             .on_hover_cursor(egui::CursorIcon::ResizeVertical)
             .on_hover_text("Drag vertically to resize");
-        let grip_color = if response.hovered() || response.dragged() {
-            ACCENT
-        } else {
-            GRID
-        };
-        ui.painter().line_segment(
-            [
-                egui::pos2(rect.center().x - 32.0, rect.center().y),
-                egui::pos2(rect.center().x + 32.0, rect.center().y),
-            ],
-            egui::Stroke::new(2.0_f32, grip_color),
-        );
         response.dragged().then(|| {
             let pointer_delta = ui.input(|input| input.pointer.delta().y);
             current_height + pointer_delta
