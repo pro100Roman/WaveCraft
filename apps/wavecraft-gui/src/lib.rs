@@ -82,7 +82,7 @@ use std::io::{BufReader, BufWriter, Read, Seek};
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -335,6 +335,9 @@ struct WaveCraftApp {
     system_trace_settings: SystemTraceSettings,
     system_trace: system_trace::SystemTraceDisplayState,
     system_trace_events: Option<Receiver<wavecraft_trace::TraceEvent>>,
+    system_trace_connection: system_trace::SystemTraceConnectionState,
+    system_trace_worker_commands: Option<Sender<system_trace::SystemTraceWorkerCommand>>,
+    system_trace_worker_events: Option<Receiver<system_trace::SystemTraceWorkerEvent>>,
     debug_probes: Vec<wavecraft_debug_probe::ProbeDescriptor>,
     debug_probe_discovery_error: Option<String>,
     combined_logic_ratio: f32,
@@ -457,6 +460,9 @@ impl WaveCraftApp {
             system_trace_settings: SystemTraceSettings::default(),
             system_trace: system_trace::SystemTraceDisplayState::default(),
             system_trace_events: None,
+            system_trace_connection: system_trace::SystemTraceConnectionState::default(),
+            system_trace_worker_commands: None,
+            system_trace_worker_events: None,
             debug_probes: Vec::new(),
             debug_probe_discovery_error: None,
             combined_logic_ratio: 0.55,
@@ -572,6 +578,7 @@ impl WaveCraftApp {
         self.poll_calibration_progress();
         self.poll_worker();
         self.poll_system_trace_events();
+        self.poll_system_trace_connection();
         self.reconcile_capture_settings_tab();
         self.reconcile_waveform_tab();
         self.reconcile_device_selections();
@@ -590,7 +597,7 @@ impl WaveCraftApp {
         self.paint_waveform_tabs(context);
 
         if self.system_trace_view_is_active() {
-            self.paint_system_trace_setup_panel(context);
+            self.paint_system_trace_setup_panel(context, &mut actions);
         } else {
             self.paint_capture_setup_panel(context, &frame, &mut actions);
         }
@@ -656,6 +663,7 @@ impl WaveCraftApp {
         }
 
         self.apply_toolbar_actions(&mut actions, &frame);
+        self.apply_system_trace_action(actions.system_trace_action);
         match actions.calibration_action {
             Some(ScopeCalibrationAction::Auto) => {
                 self.auto_calibration_confirmation_open = true;

@@ -1,11 +1,17 @@
 //! Independent System Trace workspace and decoded-event instruments.
 
+use crate::system_trace::{
+    SystemTraceAction, SystemTraceConnectionConfiguration, SystemTraceConnectionState,
+};
 use crate::system_trace::{SystemTraceDisplayState, TraceEventView};
 use crate::{
     egui, toolbar_action_button, ui::frame_actions::FrameActions, RichText, WaveCraftApp, ACCENT,
     BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
 };
-use wavecraft_debug_probe::{ProbeDescriptor, ProbeProvider};
+use wavecraft_debug_probe::{
+    AttachConfiguration, ProbeDescriptor, ProbeProvider, ProbeSelector, RttConfiguration,
+    RttControlBlockLocation, TargetSelector, WireProtocol,
+};
 use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
 
 const TIMELINE_LABEL_WIDTH: f32 = 150.0;
@@ -32,6 +38,35 @@ impl Default for SystemTraceSettings {
             up_channel: 1,
             down_channel: 1,
         }
+    }
+}
+
+impl SystemTraceSettings {
+    fn connection_configuration(&self) -> Result<SystemTraceConnectionConfiguration, String> {
+        let connection_id = self
+            .probe_connection_id
+            .clone()
+            .ok_or_else(|| "Select a debug probe before connecting".to_owned())?;
+        let target_name = self.target_name.trim();
+        let target = if target_name.is_empty() {
+            TargetSelector::Auto
+        } else {
+            TargetSelector::Name(target_name.to_owned())
+        };
+        let control_block = parse_rtt_control_block(&self.control_block_address)?;
+        Ok(SystemTraceConnectionConfiguration {
+            probe: ProbeSelector::connection_id(connection_id),
+            attach: AttachConfiguration {
+                target,
+                wire_protocol: Some(WireProtocol::Swd),
+                speed_khz: Some(self.speed_khz),
+                core_index: 0,
+            },
+            rtt: RttConfiguration {
+                control_block,
+                timeout: std::time::Duration::from_secs(2),
+            },
+        })
     }
 }
 
@@ -63,7 +98,7 @@ impl WaveCraftApp {
                         ui.add_enabled(false, egui::Button::new("▶ Start"));
                         actions.refresh_clicked = ui
                             .add_enabled(
-                                !self.is_busy(),
+                                !self.is_busy() && self.system_trace_connection.is_disconnected(),
                                 toolbar_action_button("↻ Scan devices", SCOPE_COLORS[1]),
                             )
                             .on_hover_text(
@@ -75,7 +110,11 @@ impl WaveCraftApp {
             });
     }
 
-    pub(crate) fn paint_system_trace_setup_panel(&mut self, context: &egui::Context) {
+    pub(crate) fn paint_system_trace_setup_panel(
+        &mut self,
+        context: &egui::Context,
+        actions: &mut FrameActions,
+    ) {
         egui::SidePanel::left("system_trace_setup")
             .resizable(false)
             .exact_width(300.0)
@@ -173,13 +212,37 @@ impl WaveCraftApp {
                         });
 
                         ui.add_space(16.0);
-                        ui.add_enabled_ui(false, |ui| {
-                            let _ = ui.button("Connect and attach");
-                        });
+                        paint_connection_control(
+                            ui,
+                            &self.system_trace_connection,
+                            self.system_trace_settings.probe_connection_id.is_some(),
+                            actions,
+                        );
+                        if let SystemTraceConnectionState::Attached { channels } =
+                            &self.system_trace_connection
+                        {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Attached with {} RTT channel(s)",
+                                    channels.len()
+                                ))
+                                .small()
+                                .color(ACCENT),
+                            );
+                        }
+                        if let SystemTraceConnectionState::Error(error) =
+                            &self.system_trace_connection
+                        {
+                            ui.label(
+                                RichText::new(error)
+                                    .small()
+                                    .color(egui::Color32::from_rgb(245, 96, 96)),
+                            );
+                        }
                         ui.add_space(8.0);
                         ui.label(
                             RichText::new(
-                                "Probe discovery runs through the isolated probe-rs helper. Target attachment remains disabled until the capture worker is connected.",
+                                "Attach uses the isolated probe-rs helper and never resets or flashes the target.",
                             )
                             .small()
                             .color(TEXT_MUTED),
@@ -203,10 +266,69 @@ impl WaveCraftApp {
                 paint_event_instrument(ui, &mut self.system_trace);
             });
     }
+
+    pub(crate) fn apply_system_trace_action(&mut self, action: Option<SystemTraceAction>) {
+        match action {
+            Some(SystemTraceAction::Connect) => {
+                match self.system_trace_settings.connection_configuration() {
+                    Ok(configuration) => self.begin_system_trace_connection(configuration),
+                    Err(error) => {
+                        self.system_trace_connection = SystemTraceConnectionState::Error(error)
+                    }
+                }
+            }
+            Some(SystemTraceAction::Disconnect) => self.request_system_trace_disconnect(),
+            None => {}
+        }
+    }
 }
 
 fn setup_label(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).small().color(TEXT_MUTED));
+}
+
+fn paint_connection_control(
+    ui: &mut egui::Ui,
+    state: &SystemTraceConnectionState,
+    probe_selected: bool,
+    actions: &mut FrameActions,
+) {
+    match state {
+        SystemTraceConnectionState::Disconnected | SystemTraceConnectionState::Error(_) => {
+            if ui
+                .add_enabled(probe_selected, egui::Button::new("Connect and attach"))
+                .clicked()
+            {
+                actions.system_trace_action = Some(SystemTraceAction::Connect);
+            }
+        }
+        SystemTraceConnectionState::Connecting => {
+            ui.add_enabled(false, egui::Button::new("Connecting…"));
+        }
+        SystemTraceConnectionState::Attached { .. } => {
+            if ui.button("Disconnect").clicked() {
+                actions.system_trace_action = Some(SystemTraceAction::Disconnect);
+            }
+        }
+        SystemTraceConnectionState::Disconnecting => {
+            ui.add_enabled(false, egui::Button::new("Disconnecting…"));
+        }
+    }
+}
+
+fn parse_rtt_control_block(text: &str) -> Result<RttControlBlockLocation, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(RttControlBlockLocation::Ram);
+    }
+    let address =
+        if let Some(hexadecimal) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+            u64::from_str_radix(hexadecimal, 16)
+        } else {
+            text.parse::<u64>()
+        }
+        .map_err(|_| format!("RTT control-block address {text:?} is not valid"))?;
+    Ok(RttControlBlockLocation::Exact(address))
 }
 
 fn probe_label(probe: &ProbeDescriptor) -> String {
@@ -783,5 +905,48 @@ mod tests {
         );
 
         assert!(actions.refresh_clicked);
+    }
+
+    #[test]
+    fn connection_settings_use_non_reset_swd_attach_and_rtt_scan() {
+        let settings = SystemTraceSettings {
+            probe_connection_id: Some("1366:0105:1234".to_owned()),
+            target_name: "STM32F407VGTx".to_owned(),
+            speed_khz: 8_000,
+            control_block_address: String::new(),
+            up_channel: 1,
+            down_channel: 1,
+        };
+
+        let configuration = settings
+            .connection_configuration()
+            .expect("settings are valid");
+
+        assert_eq!(
+            configuration.probe,
+            ProbeSelector::connection_id("1366:0105:1234")
+        );
+        assert_eq!(
+            configuration.attach.target,
+            TargetSelector::Name("STM32F407VGTx".to_owned())
+        );
+        assert_eq!(configuration.attach.wire_protocol, Some(WireProtocol::Swd));
+        assert_eq!(configuration.attach.speed_khz, Some(8_000));
+        assert_eq!(
+            configuration.rtt.control_block,
+            RttControlBlockLocation::Ram
+        );
+    }
+
+    #[test]
+    fn exact_rtt_control_block_accepts_hexadecimal_and_rejects_bad_text() {
+        assert_eq!(
+            parse_rtt_control_block("0x2000_0100"),
+            Err("RTT control-block address \"0x2000_0100\" is not valid".to_owned())
+        );
+        assert_eq!(
+            parse_rtt_control_block("0x20000100"),
+            Ok(RttControlBlockLocation::Exact(0x2000_0100))
+        );
     }
 }

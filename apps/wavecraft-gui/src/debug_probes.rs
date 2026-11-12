@@ -1,10 +1,13 @@
 //! Discovery bridge for the separately built current-`probe-rs` helper.
 
 use std::env;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use wavecraft_debug_probe::ProbeDescriptor;
+use wavecraft_debug_probe::{
+    DebugProbeCommand, DebugProbeError, DebugProbeProtocolClient, DebugProbeReply, ProbeDescriptor,
+};
 
 const HELPER_ENVIRONMENT_VARIABLE: &str = "WAVECRAFT_PROBE_HELPER";
 #[cfg(windows)]
@@ -28,7 +31,7 @@ impl DebugProbeDiscoveryReport {
 }
 
 pub(crate) fn discover_debug_probes() -> DebugProbeDiscoveryReport {
-    let mut command = match helper_command() {
+    let mut command = match helper_command(HelperInvocation::List) {
         Ok(command) => command,
         Err(error) => return DebugProbeDiscoveryReport::failed(error),
     };
@@ -58,14 +61,79 @@ pub(crate) fn discover_debug_probes() -> DebugProbeDiscoveryReport {
     }
 }
 
-fn helper_command() -> Result<Command, String> {
+pub(crate) struct DebugProbeHelperProcess {
+    child: Option<Child>,
+    client: DebugProbeProtocolClient<BufReader<ChildStdout>, ChildStdin>,
+}
+
+impl DebugProbeHelperProcess {
+    pub(crate) fn spawn() -> Result<Self, String> {
+        let mut command = helper_command(HelperInvocation::Serve)?;
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("failed to start debug-probe helper: {error}"))?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("debug-probe helper pipes are unavailable".to_owned());
+        };
+        Ok(Self {
+            child: Some(child),
+            client: DebugProbeProtocolClient::new(BufReader::new(stdout), stdin),
+        })
+    }
+
+    pub(crate) fn send(
+        &mut self,
+        command: DebugProbeCommand,
+    ) -> Result<DebugProbeReply, DebugProbeError> {
+        self.client.send(command)
+    }
+
+    pub(crate) fn shutdown(mut self) -> Result<(), DebugProbeError> {
+        let result = self.client.send(DebugProbeCommand::Shutdown).map(|_| ());
+        if let Some(mut child) = self.child.take() {
+            if result.is_err() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+        result
+    }
+}
+
+impl Drop for DebugProbeHelperProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HelperInvocation {
+    List,
+    Serve,
+}
+
+fn helper_command(invocation: HelperInvocation) -> Result<Command, String> {
     if let Some(configured) = env::var_os(HELPER_ENVIRONMENT_VARIABLE) {
-        return Ok(Command::new(configured));
+        let mut command = Command::new(configured);
+        add_helper_arguments(&mut command, invocation, false);
+        return Ok(command);
     }
 
     for candidate in helper_candidates() {
         if candidate.is_file() {
-            return Ok(Command::new(candidate));
+            let mut command = Command::new(candidate);
+            add_helper_arguments(&mut command, invocation, false);
+            return Ok(command);
         }
     }
 
@@ -81,6 +149,7 @@ fn helper_command() -> Result<Command, String> {
                 .arg(manifest)
                 .arg("--bin")
                 .arg("wavecraft-probe-helper");
+            add_helper_arguments(&mut command, invocation, true);
             return Ok(command);
         }
     }
@@ -88,6 +157,15 @@ fn helper_command() -> Result<Command, String> {
     Err(format!(
         "debug-probe helper was not found; set {HELPER_ENVIRONMENT_VARIABLE} or install {HELPER_EXECUTABLE} next to WaveCraft"
     ))
+}
+
+fn add_helper_arguments(command: &mut Command, invocation: HelperInvocation, through_cargo: bool) {
+    if matches!(invocation, HelperInvocation::Serve) {
+        if through_cargo {
+            command.arg("--");
+        }
+        command.arg("serve");
+    }
 }
 
 fn helper_candidates() -> Vec<PathBuf> {
