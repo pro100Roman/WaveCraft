@@ -1025,12 +1025,16 @@ dependencies = [
 [[package]]
 name = "wavecraft-debug-probe"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "wavecraft-probe-rs"
 version = "0.1.0"
 dependencies = [
  "probe-rs",
+ "serde_json",
  "wavecraft-debug-probe",
 ]
 

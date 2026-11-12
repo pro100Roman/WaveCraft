@@ -13,4 +13,5 @@ expect_used = "warn"
 
 [dependencies]
 probe-rs = { version = "0.32.0", default-features = false, features = ["builtin-targets"] }
+serde_json = "1.0.154"
 wavecraft-debug-probe = { path = "../wavecraft-debug-probe" }

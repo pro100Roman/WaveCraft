@@ -5,8 +5,10 @@ use std::fmt;
 use std::ops::Range;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// Debug-probe implementation family.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ProbeProvider {
     JLink,
     StLink,
@@ -16,7 +18,7 @@ pub enum ProbeProvider {
 }
 
 /// A discoverable physical debug probe.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProbeDescriptor {
     /// Stable selector produced by the backend, including serial number when available.
     pub connection_id: String,
