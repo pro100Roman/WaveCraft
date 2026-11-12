@@ -522,9 +522,23 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
             ui.label(
                 RichText::new("Task, ISR, timer, scheduler, and idle execution").color(TEXT_MUTED),
             );
-            ui.separator();
+        });
+        ui.horizontal(|ui| {
             if ui.small_button("−").on_hover_text("Zoom out").clicked() {
                 trace.scale_timeline_zoom(1.0 / TIMELINE_ZOOM_STEP);
+            }
+            let mut zoom = trace.timeline_zoom();
+            if ui
+                .add_sized(
+                    [110.0, 18.0],
+                    egui::Slider::new(&mut zoom, 1.0..=64.0)
+                        .logarithmic(true)
+                        .show_value(false),
+                )
+                .on_hover_text("Drag to set timeline zoom")
+                .changed()
+            {
+                trace.set_timeline_zoom(zoom);
             }
             ui.label(
                 RichText::new(format!("{:.1}×", trace.timeline_zoom()))
@@ -542,7 +556,7 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 trace.set_timeline_zoom(1.0);
             }
             ui.label(
-                RichText::new("Ctrl/⌘ + wheel to zoom · drag to pan")
+                RichText::new("Pinch, ⌘-scroll, or ⌥-scroll to zoom · drag to pan")
                     .small()
                     .color(TEXT_MUTED),
             );
@@ -577,15 +591,29 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                     timeline_canvas_width(ui.available_width(), trace.timeline_zoom());
                 let canvas_height =
                     TIMELINE_HEADER_HEIGHT + lanes.len() as f32 * TIMELINE_ROW_HEIGHT;
-                let (canvas, response) = ui.allocate_exact_size(
+                let (canvas, _) = ui.allocate_exact_size(
                     egui::vec2(canvas_width, canvas_height),
-                    egui::Sense::click_and_drag(),
+                    egui::Sense::hover(),
                 );
                 paint_timeline_canvas(ui, canvas, trace.model(), &lanes, start_ticks, end_ticks);
-                response.hovered() || response.dragged()
             });
-        if timeline.inner {
-            let zoom_delta = ui.input(egui::InputState::zoom_delta);
+        let pointer_over_timeline = ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|position| timeline.inner_rect.contains(position))
+        });
+        if pointer_over_timeline {
+            let zoom_delta = ui.input(|input| {
+                let native_zoom = input.zoom_delta();
+                if (native_zoom - 1.0).abs() > f32::EPSILON {
+                    native_zoom
+                } else if input.modifiers.alt {
+                    (input.raw_scroll_delta.y * 0.01).exp()
+                } else {
+                    1.0
+                }
+            });
             if (zoom_delta - 1.0).abs() > f32::EPSILON {
                 trace.scale_timeline_zoom(zoom_delta);
             }
@@ -1413,6 +1441,19 @@ mod tests {
         assert_eq!(timeline_canvas_width(600.0, 1.0), 720.0);
         assert_eq!(timeline_canvas_width(900.0, 1.0), 900.0);
         assert_eq!(timeline_canvas_width(900.0, 4.0), 3_600.0);
+    }
+
+    #[test]
+    fn timeline_exposes_zoom_controls_without_trace_data() {
+        let context = egui::Context::default();
+        let mut app = app();
+
+        let texts = paint_central_texts(&context, &mut app);
+
+        assert!(texts.iter().any(|text| text == "1.0×"));
+        assert!(texts.iter().any(|text| text == "Fit"));
+        assert!(texts.iter().any(|text| text == "+"));
+        assert!(texts.iter().any(|text| text == "−"));
     }
 
     #[test]
