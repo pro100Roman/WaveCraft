@@ -27,6 +27,93 @@ pub const MAX_DEBUG_PROBE_HELPER_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Upper bound for one memory or RTT transfer across the helper boundary.
 pub const MAX_DEBUG_PROBE_TRANSFER_BYTES: usize = 64 * 1024;
 
+/// Default maximum bytes retained for one unterminated RTT terminal line.
+pub const DEFAULT_RTT_TERMINAL_LINE_BYTES: usize = 16 * 1024;
+
+/// One line or bounded fragment decoded from a plain RTT up-channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RttTerminalLine {
+    pub sequence: u64,
+    pub text: String,
+    /// False when the line was emitted only to enforce the configured bound.
+    pub complete: bool,
+}
+
+/// Incremental, bounded decoder for UTF-8 text carried by a plain RTT channel.
+#[derive(Clone, Debug)]
+pub struct RttTerminalDecoder {
+    pending: Vec<u8>,
+    maximum_line_bytes: usize,
+    next_sequence: u64,
+}
+
+impl RttTerminalDecoder {
+    pub fn new() -> Self {
+        Self::with_maximum_line_bytes(DEFAULT_RTT_TERMINAL_LINE_BYTES)
+    }
+
+    pub fn with_maximum_line_bytes(maximum_line_bytes: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            maximum_line_bytes: maximum_line_bytes.max(1),
+            next_sequence: 0,
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<RttTerminalLine> {
+        let mut lines = Vec::new();
+        for byte in bytes {
+            if *byte == b'\n' {
+                if self.pending.last() == Some(&b'\r') {
+                    self.pending.pop();
+                }
+                lines.push(self.take_line(true));
+                continue;
+            }
+            self.pending.push(*byte);
+            if self.pending.len() == self.maximum_line_bytes {
+                lines.push(self.take_line(false));
+            }
+        }
+        lines
+    }
+
+    /// Emits a final unterminated line, if one is pending.
+    pub fn finish(&mut self) -> Option<RttTerminalLine> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            Some(self.take_line(false))
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.pending.clear();
+        self.next_sequence = 0;
+    }
+
+    pub fn pending_bytes(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn take_line(&mut self, complete: bool) -> RttTerminalLine {
+        let bytes = std::mem::take(&mut self.pending);
+        let line = RttTerminalLine {
+            sequence: self.next_sequence,
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            complete,
+        };
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        line
+    }
+}
+
+impl Default for RttTerminalDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A discoverable physical debug probe.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProbeDescriptor {
@@ -747,5 +834,74 @@ mod tests {
 
         assert_eq!(error.kind, DebugProbeErrorKind::Transport);
         assert!(error.message.contains("does not match"));
+    }
+
+    #[test]
+    fn rtt_terminal_lines_decode_across_every_chunk_boundary() {
+        let input = "boot ✓\r\nready\n".as_bytes();
+
+        for split in 0..=input.len() {
+            let mut decoder = RttTerminalDecoder::new();
+            let lines = decoder
+                .push(&input[..split])
+                .into_iter()
+                .chain(decoder.push(&input[split..]))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                lines,
+                [
+                    RttTerminalLine {
+                        sequence: 0,
+                        text: "boot ✓".to_owned(),
+                        complete: true,
+                    },
+                    RttTerminalLine {
+                        sequence: 1,
+                        text: "ready".to_owned(),
+                        complete: true,
+                    },
+                ],
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtt_terminal_bounds_unterminated_output_and_flushes_the_tail() {
+        let mut decoder = RttTerminalDecoder::with_maximum_line_bytes(4);
+
+        let lines = decoder.push(b"abcdefghij");
+        let tail = decoder.finish().expect("tail is pending");
+
+        assert_eq!(
+            lines,
+            [
+                RttTerminalLine {
+                    sequence: 0,
+                    text: "abcd".to_owned(),
+                    complete: false,
+                },
+                RttTerminalLine {
+                    sequence: 1,
+                    text: "efgh".to_owned(),
+                    complete: false,
+                },
+            ]
+        );
+        assert_eq!(tail.sequence, 2);
+        assert_eq!(tail.text, "ij");
+        assert!(!tail.complete);
+        assert_eq!(decoder.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn rtt_terminal_replaces_invalid_utf8_without_failing_the_stream() {
+        let mut decoder = RttTerminalDecoder::new();
+        let lines = decoder.push(&[b'o', b'k', 0xff, b'\n']);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "ok�");
+        assert!(lines[0].complete);
     }
 }
