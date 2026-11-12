@@ -332,7 +332,7 @@ impl WaveCraftApp {
                         paint_trace_summary(ui, &self.system_trace);
                         ui.add_space(10.0);
                         paint_timeline_instrument(ui, &mut self.system_trace);
-                        ui.add_space(10.0);
+                        paint_trace_instrument_splitter(ui, &mut self.system_trace);
                         paint_event_instrument(ui, &mut self.system_trace);
                     });
             });
@@ -496,23 +496,26 @@ fn instrument_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(12.0))
 }
 
-fn paint_vertical_resize_handle(
-    ui: &mut egui::Ui,
-    id_salt: &str,
-    current_height: f32,
-) -> Option<f32> {
-    ui.push_id(id_salt, |ui| {
-        let (_, response) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::drag());
-        let response = response
-            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-            .on_hover_text("Drag vertically to resize");
-        response.dragged().then(|| {
-            let pointer_delta = ui.input(|input| input.pointer.delta().y);
-            current_height + pointer_delta
-        })
-    })
-    .inner
+fn paint_trace_instrument_splitter(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::drag());
+    let response = response
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+        .on_hover_text("Drag to resize Timeline and Events");
+    let active = response.hovered() || response.dragged();
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left() + 8.0, rect.center().y),
+            egui::pos2(rect.right() - 8.0, rect.center().y),
+        ],
+        egui::Stroke::new(
+            if active { 2.0_f32 } else { 1.0_f32 },
+            if active { ACCENT } else { GRID },
+        ),
+    );
+    if response.dragged() {
+        trace.move_trace_instrument_splitter(ui.input(|input| input.pointer.delta().y));
+    }
 }
 
 fn paint_trace_summary(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
@@ -597,11 +600,6 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 "Decoded task and interrupt intervals will appear here.",
                 timeline_height,
             );
-            if let Some(height) =
-                paint_vertical_resize_handle(ui, "timeline_height", timeline_height)
-            {
-                trace.set_timeline_view_height(height);
-            }
             return;
         };
         if lanes.is_empty() {
@@ -611,11 +609,6 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 "Trace metadata and non-execution events are available in the event stream below.",
                 timeline_height,
             );
-            if let Some(height) =
-                paint_vertical_resize_handle(ui, "timeline_height", timeline_height)
-            {
-                trace.set_timeline_view_height(height);
-            }
             return;
         }
 
@@ -664,9 +657,6 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
             trace.model(),
             &lanes,
         );
-        if let Some(height) = paint_vertical_resize_handle(ui, "timeline_height", timeline_height) {
-            trace.set_timeline_view_height(height);
-        }
     });
 }
 
@@ -946,9 +936,6 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
                     paint_selected_event(ui, trace);
                 }
             }
-        }
-        if let Some(height) = paint_vertical_resize_handle(ui, "event_height", event_height) {
-            trace.set_event_view_height(height);
         }
         if clear_requested {
             trace.clear();

@@ -830,16 +830,21 @@ impl SystemTraceDisplayState {
         self.timeline_view_height
     }
 
-    pub(crate) fn set_timeline_view_height(&mut self, height: f32) {
-        self.timeline_view_height = clamp_trace_instrument_height(height);
-    }
-
     pub(crate) fn event_view_height(&self) -> f32 {
         self.event_view_height
     }
 
-    pub(crate) fn set_event_view_height(&mut self, height: f32) {
-        self.event_view_height = clamp_trace_instrument_height(height);
+    pub(crate) fn move_trace_instrument_splitter(&mut self, delta: f32) {
+        if !delta.is_finite() {
+            return;
+        }
+        let minimum_delta = (MIN_TRACE_INSTRUMENT_HEIGHT - self.timeline_view_height)
+            .max(self.event_view_height - MAX_TRACE_INSTRUMENT_HEIGHT);
+        let maximum_delta = (MAX_TRACE_INSTRUMENT_HEIGHT - self.timeline_view_height)
+            .min(self.event_view_height - MIN_TRACE_INSTRUMENT_HEIGHT);
+        let delta = delta.clamp(minimum_delta, maximum_delta);
+        self.timeline_view_height += delta;
+        self.event_view_height -= delta;
     }
 
     pub(crate) fn ingest(&mut self, event: TraceEvent) {
@@ -928,14 +933,6 @@ impl SystemTraceDisplayState {
             event_capacity,
             ..Self::default()
         }
-    }
-}
-
-fn clamp_trace_instrument_height(height: f32) -> f32 {
-    if height.is_finite() {
-        height.clamp(MIN_TRACE_INSTRUMENT_HEIGHT, MAX_TRACE_INSTRUMENT_HEIGHT)
-    } else {
-        MIN_TRACE_INSTRUMENT_HEIGHT
     }
 }
 
@@ -1221,18 +1218,29 @@ mod tests {
     }
 
     #[test]
-    fn trace_instrument_heights_are_independent_and_bounded() {
-        let mut state = SystemTraceDisplayState::default();
-
-        state.set_timeline_view_height(480.0);
-        state.set_event_view_height(360.0);
+    fn trace_splitter_preserves_combined_height_and_bounds() {
+        let mut state = SystemTraceDisplayState {
+            timeline_view_height: 480.0,
+            event_view_height: 360.0,
+            ..SystemTraceDisplayState::default()
+        };
         assert_eq!(state.timeline_view_height(), 480.0);
         assert_eq!(state.event_view_height(), 360.0);
 
-        state.set_timeline_view_height(f32::INFINITY);
-        state.set_event_view_height(10_000.0);
-        assert_eq!(state.timeline_view_height(), MIN_TRACE_INSTRUMENT_HEIGHT);
-        assert_eq!(state.event_view_height(), MAX_TRACE_INSTRUMENT_HEIGHT);
+        state.move_trace_instrument_splitter(50.0);
+        assert_eq!(state.timeline_view_height(), 530.0);
+        assert_eq!(state.event_view_height(), 310.0);
+        state.move_trace_instrument_splitter(1_000.0);
+        assert_eq!(state.timeline_view_height(), 740.0);
+        assert_eq!(state.event_view_height(), MIN_TRACE_INSTRUMENT_HEIGHT);
+        assert_eq!(
+            state.timeline_view_height() + state.event_view_height(),
+            840.0
+        );
+
+        state.move_trace_instrument_splitter(f32::NAN);
+        assert_eq!(state.timeline_view_height(), 740.0);
+        assert_eq!(state.event_view_height(), MIN_TRACE_INSTRUMENT_HEIGHT);
     }
 
     #[test]
