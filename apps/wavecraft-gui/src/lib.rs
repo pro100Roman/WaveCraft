@@ -94,6 +94,7 @@ use ui::frame_actions::FrameActions;
 use ui::protocol_analyzer_dialog::*;
 use ui::radio_settings::*;
 use ui::scope_settings::*;
+use ui::system_trace::*;
 use ui::view_tabs::*;
 use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
@@ -326,7 +327,9 @@ struct WaveCraftApp {
     scope_marker_settings: ScopeMarkerSettings,
     scope_quick_time_measurement: ScopeQuickTimeMeasurement,
     scope_marker_editor: Option<ScopeMarkerEditor>,
+    active_workspace_view: Option<WorkspaceView>,
     active_waveform_tab: Option<WaveformTab>,
+    system_trace_settings: SystemTraceSettings,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
     logic_channel_marker_opacities: [u8; LOGIC_CHANNEL_COUNT],
@@ -442,7 +445,9 @@ impl WaveCraftApp {
             scope_marker_settings: ScopeMarkerSettings::default(),
             scope_quick_time_measurement: ScopeQuickTimeMeasurement::default(),
             scope_marker_editor: None,
+            active_workspace_view: None,
             active_waveform_tab: None,
+            system_trace_settings: SystemTraceSettings::default(),
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
             logic_channel_marker_opacities: default_logic_channel_marker_opacities(),
@@ -553,7 +558,11 @@ impl WaveCraftApp {
 
         self.paint_waveform_tabs(context);
 
-        self.paint_capture_setup_panel(context, &frame, &mut actions);
+        if self.system_trace_view_is_active() {
+            self.paint_system_trace_setup_panel(context);
+        } else {
+            self.paint_capture_setup_panel(context, &frame, &mut actions);
+        }
 
         if let Some(kind) = actions.save_capture_settings_kind {
             self.save_capture_settings(kind);

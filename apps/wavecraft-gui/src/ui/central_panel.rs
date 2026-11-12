@@ -130,6 +130,10 @@ impl WaveCraftApp {
         frame: &FrameState,
         snapshot_clicked: bool,
     ) {
+        if self.system_trace_view_is_active() {
+            self.paint_system_trace_central_panel(context);
+            return;
+        }
         let mut state = PanelState::take_from(self);
         egui::CentralPanel::default()
             .frame(

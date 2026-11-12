@@ -7,7 +7,7 @@ use crate::{
     saved_logic_settings_metadata, saved_radio_settings_metadata, saved_scope_settings_metadata,
     scope_settings_from_recording_metadata, waveform_tabs, AcquisitionMode, CaptureSettingsProfile,
     CaptureSettingsTab, CombinedSessionSettings, DeviceModel, LogicSessionSettings,
-    SavedCaptureSettingsKind, ScopeSessionSettings, WaveformTab,
+    SavedCaptureSettingsKind, ScopeSessionSettings, WaveformTab, WorkspaceView,
 };
 
 use crate::WaveCraftApp;
@@ -296,8 +296,28 @@ impl WaveCraftApp {
             self.apply_waveform_view_settings(tab);
         }
         self.active_waveform_tab = Some(tab);
+        self.active_workspace_view = Some(WorkspaceView::Waveform(tab));
         if let Some(settings_tab) = tab.capture_settings_tab() {
             self.active_capture_settings_tab = settings_tab;
+        }
+    }
+
+    pub(crate) fn select_system_trace_view(&mut self) {
+        if let Some(active) = self.active_waveform_tab {
+            self.save_waveform_view_settings(active);
+        }
+        self.active_workspace_view = Some(WorkspaceView::SystemTrace);
+        self.snapshot_plot_rect = None;
+    }
+
+    pub(crate) fn system_trace_view_is_active(&self) -> bool {
+        self.active_workspace_view == Some(WorkspaceView::SystemTrace)
+    }
+
+    pub(crate) fn active_waveform_view(&self) -> Option<WaveformTab> {
+        match self.active_workspace_view {
+            Some(WorkspaceView::Waveform(tab)) => Some(tab),
+            Some(WorkspaceView::SystemTrace) | None => None,
         }
     }
 
@@ -347,6 +367,9 @@ impl WaveCraftApp {
             .active_waveform_tab
             .is_some_and(|active| available.contains(&active))
         {
+            if self.active_workspace_view.is_none() {
+                self.active_workspace_view = self.active_waveform_tab.map(WorkspaceView::Waveform);
+            }
             return;
         }
         let selected = if available.contains(&WaveformTab::Combined) {
@@ -355,9 +378,16 @@ impl WaveCraftApp {
             available.first().copied()
         };
         if let Some(tab) = selected {
-            self.select_waveform_tab(tab);
+            if self.system_trace_view_is_active() {
+                self.active_waveform_tab = Some(tab);
+            } else {
+                self.select_waveform_tab(tab);
+            }
         } else {
             self.active_waveform_tab = None;
+            if !self.system_trace_view_is_active() {
+                self.active_workspace_view = Some(WorkspaceView::SystemTrace);
+            }
         }
     }
 }

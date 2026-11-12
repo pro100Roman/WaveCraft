@@ -80,8 +80,29 @@ fn an_app_without_instruments_paints_and_stays_idle() {
     let context = context();
     run_frames(&mut app, &context, 3);
     assert_eq!(app.active_waveform_tab, None);
+    assert_eq!(app.active_workspace_view, Some(WorkspaceView::SystemTrace));
     assert!(app.captures.is_empty());
     assert!(app.pending.is_none());
+}
+
+#[test]
+fn system_trace_is_independent_of_the_last_waveform_view() {
+    let mut app = app_with_every_instrument();
+    app.select_waveform_tab(WaveformTab::Oscilloscope);
+    assert_eq!(
+        app.active_workspace_view,
+        Some(WorkspaceView::Waveform(WaveformTab::Oscilloscope))
+    );
+    assert_eq!(
+        app.frame_state().control_target,
+        Some(CaptureTarget::Oscilloscope)
+    );
+
+    app.select_system_trace_view();
+
+    assert_eq!(app.active_waveform_tab, Some(WaveformTab::Oscilloscope));
+    assert_eq!(app.active_workspace_view, Some(WorkspaceView::SystemTrace));
+    assert_eq!(app.frame_state().control_target, None);
 }
 
 #[test]

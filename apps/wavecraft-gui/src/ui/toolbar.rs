@@ -23,6 +23,10 @@ impl WaveCraftApp {
         frame: &FrameState,
         actions: &mut FrameActions,
     ) {
+        if self.system_trace_view_is_active() {
+            self.paint_system_trace_toolbar(context);
+            return;
+        }
         let FrameState {
             control_target,
             control_target_available,

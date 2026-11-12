@@ -3,6 +3,21 @@
 use crate::CaptureTarget;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceView {
+    Waveform(WaveformTab),
+    SystemTrace,
+}
+
+impl WorkspaceView {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Waveform(tab) => tab.label(),
+            Self::SystemTrace => "System Trace",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CaptureSettingsTab {
     DsLogic,
     DsCope,
@@ -132,6 +147,15 @@ pub(crate) fn waveform_tabs(
     tabs
 }
 
+pub(crate) fn workspace_views(waveform_tabs: &[WaveformTab]) -> Vec<WorkspaceView> {
+    waveform_tabs
+        .iter()
+        .copied()
+        .map(WorkspaceView::Waveform)
+        .chain(std::iter::once(WorkspaceView::SystemTrace))
+        .collect()
+}
+
 pub(crate) fn scope_tools_panel_is_visible(active_tab: Option<WaveformTab>) -> bool {
     matches!(
         active_tab,
@@ -178,6 +202,18 @@ mod tests {
         assert_eq!(
             waveform_tabs(false, false, true, false),
             vec![WaveformTab::RadioReceiver]
+        );
+    }
+
+    #[test]
+    fn system_trace_is_a_workspace_view_not_a_waveform() {
+        assert_eq!(workspace_views(&[]), vec![WorkspaceView::SystemTrace]);
+        assert_eq!(
+            workspace_views(&[WaveformTab::LogicAnalyzer]),
+            vec![
+                WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
+                WorkspaceView::SystemTrace,
+            ]
         );
     }
 
