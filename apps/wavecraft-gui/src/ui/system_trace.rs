@@ -24,6 +24,7 @@ const EVENT_TABLE_MINIMUM_WIDTH: f32 = 760.0;
 const TERMINAL_TABLE_MINIMUM_WIDTH: f32 = 720.0;
 const TRACE_SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 92);
 const TRACE_SELECTION_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(32, 27, 12, 32);
+const TRACE_EVENT_SELECTION_FILL: egui::Color32 = egui::Color32::from_rgb(62, 52, 18);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SystemTraceSettings {
@@ -1332,26 +1333,53 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
             let event_selected = selected_sequence == Some(event.sequence);
             let row = egui::Frame::none()
                 .fill(if event_selected {
-                    TRACE_SELECTION_FILL
+                    TRACE_EVENT_SELECTION_FILL
                 } else {
                     egui::Color32::TRANSPARENT
                 })
+                .stroke(if event_selected {
+                    egui::Stroke::new(1.0_f32, TRACE_SELECTION_COLOR)
+                } else {
+                    egui::Stroke::NONE
+                })
                 .show(ui, |ui| {
+                    ui.set_min_width(EVENT_TABLE_MINIMUM_WIDTH);
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [90.0, 20.0],
                             egui::Label::new(
-                                RichText::new(event.timestamp_ticks.to_string()).monospace(),
+                                RichText::new(event.timestamp_ticks.to_string())
+                                    .monospace()
+                                    .color(if event_selected {
+                                        TRACE_SELECTION_COLOR
+                                    } else {
+                                        ui.visuals().text_color()
+                                    }),
                             ),
                         );
-                        ui.add_sized([45.0, 20.0], egui::Label::new(event.core_id.to_string()));
+                        ui.add_sized(
+                            [45.0, 20.0],
+                            egui::Label::new(RichText::new(event.core_id.to_string()).color(
+                                if event_selected {
+                                    TRACE_SELECTION_COLOR
+                                } else {
+                                    ui.visuals().text_color()
+                                },
+                            )),
+                        );
                         let clicked = ui
                             .add_sized(
                                 [170.0, 20.0],
                                 egui::SelectableLabel::new(event_selected, event_name(&event.kind)),
                             )
                             .clicked();
-                        ui.label(RichText::new(event_summary(&event.kind)).color(TEXT_MUTED));
+                        ui.label(RichText::new(event_summary(&event.kind)).color(
+                            if event_selected {
+                                TRACE_SELECTION_COLOR
+                            } else {
+                                TEXT_MUTED
+                            },
+                        ));
                         clicked
                     })
                 });
