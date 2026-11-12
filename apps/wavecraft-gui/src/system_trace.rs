@@ -21,6 +21,10 @@ const DEFAULT_EVENT_CAPACITY: usize = 100_000;
 const DEFAULT_TERMINAL_LINE_CAPACITY: usize = 20_000;
 const MIN_TIMELINE_ZOOM: f32 = 1.0;
 const MAX_TIMELINE_ZOOM: f32 = 64.0;
+const DEFAULT_TIMELINE_VIEW_HEIGHT: f32 = 260.0;
+const DEFAULT_EVENT_VIEW_HEIGHT: f32 = 230.0;
+const MIN_TRACE_INSTRUMENT_HEIGHT: f32 = 100.0;
+const MAX_TRACE_INSTRUMENT_HEIGHT: f32 = 900.0;
 const RTT_READ_SIZE: usize = 16 * 1024;
 const IDLE_RTT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const SYSTEMVIEW_FILE_READ_SIZE: usize = 64 * 1024;
@@ -770,6 +774,8 @@ pub(crate) struct SystemTraceDisplayState {
     pub(crate) event_filter: String,
     pub(crate) follow_latest: bool,
     timeline_zoom: f32,
+    timeline_view_height: f32,
+    event_view_height: f32,
 }
 
 impl Default for SystemTraceDisplayState {
@@ -785,6 +791,8 @@ impl Default for SystemTraceDisplayState {
             event_filter: String::new(),
             follow_latest: true,
             timeline_zoom: MIN_TIMELINE_ZOOM,
+            timeline_view_height: DEFAULT_TIMELINE_VIEW_HEIGHT,
+            event_view_height: DEFAULT_EVENT_VIEW_HEIGHT,
         }
     }
 }
@@ -816,6 +824,22 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn scale_timeline_zoom(&mut self, factor: f32) {
         self.set_timeline_zoom(self.timeline_zoom * factor);
+    }
+
+    pub(crate) fn timeline_view_height(&self) -> f32 {
+        self.timeline_view_height
+    }
+
+    pub(crate) fn set_timeline_view_height(&mut self, height: f32) {
+        self.timeline_view_height = clamp_trace_instrument_height(height);
+    }
+
+    pub(crate) fn event_view_height(&self) -> f32 {
+        self.event_view_height
+    }
+
+    pub(crate) fn set_event_view_height(&mut self, height: f32) {
+        self.event_view_height = clamp_trace_instrument_height(height);
     }
 
     pub(crate) fn ingest(&mut self, event: TraceEvent) {
@@ -904,6 +928,14 @@ impl SystemTraceDisplayState {
             event_capacity,
             ..Self::default()
         }
+    }
+}
+
+fn clamp_trace_instrument_height(height: f32) -> f32 {
+    if height.is_finite() {
+        height.clamp(MIN_TRACE_INSTRUMENT_HEIGHT, MAX_TRACE_INSTRUMENT_HEIGHT)
+    } else {
+        MIN_TRACE_INSTRUMENT_HEIGHT
     }
 }
 
@@ -1186,6 +1218,21 @@ mod tests {
         state.clear_trace_events();
 
         assert_eq!(state.timeline_zoom(), MIN_TIMELINE_ZOOM);
+    }
+
+    #[test]
+    fn trace_instrument_heights_are_independent_and_bounded() {
+        let mut state = SystemTraceDisplayState::default();
+
+        state.set_timeline_view_height(480.0);
+        state.set_event_view_height(360.0);
+        assert_eq!(state.timeline_view_height(), 480.0);
+        assert_eq!(state.event_view_height(), 360.0);
+
+        state.set_timeline_view_height(f32::INFINITY);
+        state.set_event_view_height(10_000.0);
+        assert_eq!(state.timeline_view_height(), MIN_TRACE_INSTRUMENT_HEIGHT);
+        assert_eq!(state.event_view_height(), MAX_TRACE_INSTRUMENT_HEIGHT);
     }
 
     #[test]

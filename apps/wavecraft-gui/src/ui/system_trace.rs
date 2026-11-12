@@ -324,11 +324,17 @@ impl WaveCraftApp {
                     .inner_margin(egui::Margin::same(16.0)),
             )
             .show(context, |ui| {
-                paint_trace_summary(ui, &self.system_trace);
-                ui.add_space(10.0);
-                paint_timeline_instrument(ui, &mut self.system_trace);
-                ui.add_space(10.0);
-                paint_event_instrument(ui, &mut self.system_trace);
+                egui::ScrollArea::vertical()
+                    .id_salt("system_trace_workspace")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        paint_trace_summary(ui, &self.system_trace);
+                        ui.add_space(10.0);
+                        paint_timeline_instrument(ui, &mut self.system_trace);
+                        ui.add_space(10.0);
+                        paint_event_instrument(ui, &mut self.system_trace);
+                    });
             });
     }
 
@@ -490,6 +496,37 @@ fn instrument_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(12.0))
 }
 
+fn paint_vertical_resize_handle(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    current_height: f32,
+) -> Option<f32> {
+    ui.push_id(id_salt, |ui| {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::drag());
+        let response = response
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text("Drag vertically to resize");
+        let grip_color = if response.hovered() || response.dragged() {
+            ACCENT
+        } else {
+            GRID
+        };
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.center().x - 32.0, rect.center().y),
+                egui::pos2(rect.center().x + 32.0, rect.center().y),
+            ],
+            egui::Stroke::new(2.0_f32, grip_color),
+        );
+        response.dragged().then(|| {
+            let pointer_delta = ui.input(|input| input.pointer.delta().y);
+            current_height + pointer_delta
+        })
+    })
+    .inner
+}
+
 fn paint_trace_summary(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("SYSTEM TRACE").strong().color(ACCENT));
@@ -517,6 +554,7 @@ fn paint_trace_summary(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
 
 fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     instrument_frame().show(ui, |ui| {
+        let timeline_height = trace.timeline_view_height();
         ui.horizontal(|ui| {
             ui.label(RichText::new("TIMELINE").strong().color(ACCENT));
             ui.label(
@@ -569,7 +607,13 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 ui,
                 "No execution data",
                 "Decoded task and interrupt intervals will appear here.",
+                timeline_height,
             );
+            if let Some(height) =
+                paint_vertical_resize_handle(ui, "timeline_height", timeline_height)
+            {
+                trace.set_timeline_view_height(height);
+            }
             return;
         };
         if lanes.is_empty() {
@@ -577,13 +621,19 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 ui,
                 "No execution intervals yet",
                 "Trace metadata and non-execution events are available in the event stream below.",
+                timeline_height,
             );
+            if let Some(height) =
+                paint_vertical_resize_handle(ui, "timeline_height", timeline_height)
+            {
+                trace.set_timeline_view_height(height);
+            }
             return;
         }
 
         let timeline = egui::ScrollArea::both()
             .id_salt("system_trace_timeline")
-            .max_height(260.0)
+            .max_height(timeline_height)
             .drag_to_scroll(true)
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -626,6 +676,9 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
             trace.model(),
             &lanes,
         );
+        if let Some(height) = paint_vertical_resize_handle(ui, "timeline_height", timeline_height) {
+            trace.set_timeline_view_height(height);
+        }
     });
 }
 
@@ -852,6 +905,7 @@ fn context_color(context: ExecutionContext) -> egui::Color32 {
 
 fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     instrument_frame().show(ui, |ui| {
+        let event_height = trace.event_view_height();
         let mut clear_requested = false;
         ui.horizontal(|ui| {
             ui.selectable_value(&mut trace.event_view, TraceEventView::Events, "EVENTS");
@@ -885,9 +939,10 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
                         ui,
                         "No plain RTT terminal output yet",
                         "Text from the configured RTT up-channel will appear here after connecting.",
+                        event_height,
                     );
                 } else {
-                    paint_terminal_table(ui, trace);
+                    paint_terminal_table(ui, trace, event_height);
                 }
             }
             TraceEventView::Events | TraceEventView::Logs => {
@@ -896,12 +951,16 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
                         ui,
                         "Connect a debug probe to begin",
                         "Task, interrupt, timer, marker, log, and data events will appear here.",
+                        event_height,
                     );
                 } else {
-                    paint_event_table(ui, trace);
+                    paint_event_table(ui, trace, event_height);
                     paint_selected_event(ui, trace);
                 }
             }
+        }
+        if let Some(height) = paint_vertical_resize_handle(ui, "event_height", event_height) {
+            trace.set_event_view_height(height);
         }
         if clear_requested {
             trace.clear();
@@ -909,7 +968,7 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
     });
 }
 
-fn paint_terminal_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
+fn paint_terminal_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, view_height: f32) {
     let filter = trace.event_filter.trim().to_lowercase();
     let visible_lines = trace
         .terminal_lines()
@@ -928,7 +987,7 @@ fn paint_terminal_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
     ui.separator();
     egui::ScrollArea::vertical()
         .id_salt("system_trace_rtt_terminal")
-        .max_height(250.0)
+        .max_height(view_height)
         .auto_shrink([false, false])
         .show_rows(ui, 22.0, line_count, |ui, row_range| {
             for row in row_range {
@@ -1087,7 +1146,7 @@ fn dim_terminal_color(color: egui::Color32) -> egui::Color32 {
     )
 }
 
-fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
+fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, view_height: f32) {
     let filter = trace.event_filter.trim().to_lowercase();
     let visible_indices = trace
         .events()
@@ -1126,7 +1185,7 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     ui.separator();
     egui::ScrollArea::vertical()
         .id_salt("system_trace_events")
-        .max_height(230.0)
+        .max_height(view_height)
         .auto_shrink([false, false])
         .show_rows(ui, 22.0, event_count, |ui, row_range| {
             for visible_row in row_range {
@@ -1180,12 +1239,12 @@ fn paint_selected_event(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
     });
 }
 
-fn paint_trace_empty_state(ui: &mut egui::Ui, title: &str, description: &str) {
+fn paint_trace_empty_state(ui: &mut egui::Ui, title: &str, description: &str, minimum_height: f32) {
     egui::Frame::none()
         .fill(BACKGROUND)
         .inner_margin(egui::Margin::same(12.0))
         .show(ui, |ui| {
-            ui.set_min_height(56.0);
+            ui.set_min_height(minimum_height.max(56.0));
             ui.label(RichText::new(title).strong());
             ui.label(RichText::new(description).color(TEXT_MUTED));
         });
