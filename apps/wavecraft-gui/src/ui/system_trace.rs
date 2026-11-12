@@ -1,7 +1,10 @@
 //! Independent System Trace workspace and decoded-event instruments.
 
 use crate::system_trace::{SystemTraceDisplayState, TraceEventView};
-use crate::{egui, RichText, WaveCraftApp, ACCENT, BACKGROUND, GRID, ORANGE, PANEL, TEXT_MUTED};
+use crate::{
+    egui, toolbar_action_button, ui::frame_actions::FrameActions, RichText, WaveCraftApp, ACCENT,
+    BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
+};
 use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
 
 const TIMELINE_LABEL_WIDTH: f32 = 150.0;
@@ -30,7 +33,11 @@ impl Default for SystemTraceSettings {
 }
 
 impl WaveCraftApp {
-    pub(crate) fn paint_system_trace_toolbar(&mut self, context: &egui::Context) {
+    pub(crate) fn paint_system_trace_toolbar(
+        &mut self,
+        context: &egui::Context,
+        actions: &mut FrameActions,
+    ) {
         egui::TopBottomPanel::top("toolbar")
             .frame(
                 egui::Frame::none()
@@ -51,7 +58,13 @@ impl WaveCraftApp {
                     ui.label(RichText::new("System and RTOS trace").color(TEXT_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_enabled(false, egui::Button::new("▶ Start"));
-                        ui.add_enabled(false, egui::Button::new("↻ Scan probes"));
+                        actions.refresh_clicked = ui
+                            .add_enabled(
+                                !self.is_busy(),
+                                toolbar_action_button("↻ Scan devices", SCOPE_COLORS[1]),
+                            )
+                            .on_hover_text("Scan for DSLogic, DSCope, and radio devices")
+                            .clicked();
                     });
                 });
             });
@@ -641,5 +654,85 @@ fn event_summary(kind: &TraceEventKind) -> String {
         | TraceEventKind::IsrExitedToScheduler
         | TraceEventKind::TimerExited
         | TraceEventKind::Idle => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::app::test_support::app;
+
+    fn paint_toolbar(
+        context: &egui::Context,
+        app: &mut WaveCraftApp,
+        events: Vec<egui::Event>,
+    ) -> (FrameActions, Vec<(String, egui::Pos2)>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 300.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        };
+        let mut actions = FrameActions::default();
+        let output = context.run(input, |context| {
+            app.paint_system_trace_toolbar(context, &mut actions);
+        });
+        let mut texts = Vec::new();
+        fn collect(shape: &egui::Shape, texts: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| collect(shape, texts));
+                }
+                egui::Shape::Text(text) => texts.push((
+                    text.galley.text().to_owned(),
+                    text.visual_bounding_rect().center(),
+                )),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        (actions, texts)
+    }
+
+    fn pointer_button(position: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    #[test]
+    fn system_trace_toolbar_can_request_an_application_device_scan() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
+        let scan_position = texts
+            .iter()
+            .find(|(text, _)| text == "↻ Scan devices")
+            .map(|(_, position)| *position)
+            .expect("scan button is painted");
+
+        let _ = paint_toolbar(
+            &context,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(scan_position),
+                pointer_button(scan_position, true),
+            ],
+        );
+        let (actions, _) = paint_toolbar(
+            &context,
+            &mut app,
+            vec![pointer_button(scan_position, false)],
+        );
+
+        assert!(actions.refresh_clicked);
     }
 }
