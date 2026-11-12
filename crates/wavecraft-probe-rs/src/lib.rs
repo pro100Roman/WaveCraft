@@ -1,5 +1,7 @@
 //! `probe-rs` adapter for WaveCraft's provider-neutral debug-probe interface.
 
+pub mod helper;
+
 use probe_rs::probe::blackmagic::BlackMagicProbeFactory;
 use probe_rs::probe::cmsisdap::CmsisDapFactory;
 use probe_rs::probe::jlink::JLinkFactory;
