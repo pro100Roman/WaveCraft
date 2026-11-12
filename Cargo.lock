@@ -3024,6 +3024,7 @@ dependencies = [
  "wavecraft-core",
  "wavecraft-recording",
  "wavecraft-sim",
+ "wavecraft-systemview",
  "wavecraft-trace",
  "wavecraft-usb",
 ]
@@ -3107,6 +3108,13 @@ name = "wavecraft-sim"
 version = "0.1.0"
 dependencies = [
  "wavecraft-core",
+]
+
+[[package]]
+name = "wavecraft-systemview"
+version = "0.1.0"
+dependencies = [
+ "wavecraft-trace",
 ]
 
 [[package]]

@@ -14,7 +14,8 @@ use wavecraft_recording::{
     RecordingWriter, FORMAT_VERSION,
 };
 use wavecraft_sim::{SimulatedLogicAnalyzer, SimulatedOscilloscope};
-use wavecraft_trace::{systemview::SystemViewDecoder, TraceModel};
+use wavecraft_systemview::SystemViewDecoder;
+use wavecraft_trace::TraceModel;
 use wavecraft_usb::{
     discover_supported_devices, load_device_fpga, prepare_device, probe_device, DeviceModel,
     DsCopeCaptureConfig, DsCopeCaptureSource, DsLogicCaptureConfig, DsLogicCaptureSource, FpgaLoad,

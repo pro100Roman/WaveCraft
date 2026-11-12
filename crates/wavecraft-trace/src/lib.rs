@@ -2,8 +2,6 @@
 
 use std::collections::BTreeMap;
 
-pub mod systemview;
-
 /// Stable target-provided identifier for a task or another execution context.
 pub type ContextId = u64;
 

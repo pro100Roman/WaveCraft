@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::{TraceEvent, TraceEventKind};
+use wavecraft_trace::{TraceEvent, TraceEventKind};
 
 const FIRST_LENGTH_PREFIXED_EVENT_ID: u64 = 24;
 const MAX_VARINT_BYTES: usize = 5;
