@@ -142,6 +142,17 @@ impl WaveCraftApp {
                         {
                             actions.system_trace_action = Some(SystemTraceAction::Open);
                         }
+                        if ui
+                            .add_enabled(
+                                !self.system_trace.events().is_empty()
+                                    || !self.system_trace.terminal_lines().is_empty(),
+                                egui::Button::new("Clear"),
+                            )
+                            .on_hover_text("Clear trace events and RTT terminal output")
+                            .clicked()
+                        {
+                            self.system_trace.clear();
+                        }
                     });
                 });
             });
@@ -1043,7 +1054,6 @@ fn context_color(context: ExecutionContext) -> egui::Color32 {
 
 fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     instrument_frame().show(ui, |ui| {
-        let mut clear_requested = false;
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut trace.event_view, TraceEventView::Events, "EVENTS");
             ui.selectable_value(&mut trace.event_view, TraceEventView::Logs, "LOGS");
@@ -1059,12 +1069,6 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
                     .desired_width(180.0),
             );
             ui.checkbox(&mut trace.follow_latest, "Follow latest");
-            clear_requested = ui
-                .add_enabled(
-                    !trace.events().is_empty() || !trace.terminal_lines().is_empty(),
-                    egui::Button::new("Clear"),
-                )
-                .clicked();
         });
         ui.add_space(5.0);
         let footer_height = if matches!(
@@ -1103,9 +1107,6 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
                     paint_selected_event(ui, trace);
                 }
             }
-        }
-        if clear_requested {
-            trace.clear();
         }
     });
 }
@@ -1770,6 +1771,45 @@ mod tests {
 
         assert!(texts.iter().any(|(text, _)| text == "● Record…"));
         assert!(texts.iter().any(|(text, _)| text == "▶ Start"));
+    }
+
+    #[test]
+    fn system_trace_toolbar_clears_trace_and_terminal_data() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace.ingest(TraceEvent {
+            sequence: 1,
+            core_id: 0,
+            timestamp_ticks: 10,
+            kind: TraceEventKind::TraceStarted,
+        });
+        app.system_trace
+            .ingest_terminal_line(wavecraft_debug_probe::RttTerminalLine::plain(
+                0, "booted", true,
+            ));
+        let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
+        let clear_position = texts
+            .iter()
+            .find(|(text, _)| text == "Clear")
+            .map(|(_, position)| *position)
+            .expect("clear button is painted");
+
+        let _ = paint_toolbar(
+            &context,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(clear_position),
+                pointer_button(clear_position, true),
+            ],
+        );
+        let _ = paint_toolbar(
+            &context,
+            &mut app,
+            vec![pointer_button(clear_position, false)],
+        );
+
+        assert!(app.system_trace.events().is_empty());
+        assert!(app.system_trace.terminal_lines().is_empty());
     }
 
     #[test]
