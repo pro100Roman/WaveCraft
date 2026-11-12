@@ -8,6 +8,7 @@ use wavecraft_trace::{TraceEvent, TraceEventKind};
 const FIRST_LENGTH_PREFIXED_EVENT_ID: u64 = 24;
 const MAX_VARINT_BYTES: usize = 5;
 const DEFAULT_MAX_PACKET_SIZE: usize = 64 * 1024;
+const SYNC_PACKET: [u8; 10] = [0; 10];
 
 /// Host-to-target command that enables SystemView recording.
 pub const SYSTEMVIEW_COMMAND_START: u8 = 1;
@@ -59,6 +60,7 @@ impl Error for DecodeError {}
 #[derive(Clone, Debug)]
 pub struct SystemViewDecoder {
     buffer: Vec<u8>,
+    awaiting_sync: bool,
     core_id: u32,
     next_sequence: u64,
     timestamp_ticks: u64,
@@ -73,6 +75,7 @@ impl SystemViewDecoder {
     pub fn with_max_packet_size(core_id: u32, max_packet_size: usize) -> Self {
         Self {
             buffer: Vec::new(),
+            awaiting_sync: true,
             core_id,
             next_sequence: 0,
             timestamp_ticks: 0,
@@ -83,6 +86,7 @@ impl SystemViewDecoder {
     /// Discards buffered bytes and starts a new timestamp and sequence epoch.
     pub fn reset(&mut self) {
         self.buffer.clear();
+        self.awaiting_sync = true;
         self.next_sequence = 0;
         self.timestamp_ticks = 0;
     }
@@ -108,12 +112,27 @@ impl SystemViewDecoder {
 
     /// Decodes all complete packets in `bytes` and retains a partial tail.
     ///
-    /// A malformed packet clears the partial buffer because the wire format has
-    /// no synchronization marker. The decoder can accept a fresh packet on the
-    /// next call; use [`Self::reset`] when a new capture epoch begins.
+    /// A leading ten-zero SystemView synchronization packet starts a new
+    /// timestamp epoch. A malformed packet otherwise clears the partial buffer;
+    /// use [`Self::reset`] when a new capture begins without an on-wire
+    /// synchronization packet.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<TraceEvent>, DecodeError> {
         self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
+
+        if self.awaiting_sync {
+            if self.buffer.starts_with(&SYNC_PACKET) {
+                self.buffer.drain(..SYNC_PACKET.len());
+                self.timestamp_ticks = 0;
+                self.awaiting_sync = false;
+            } else if self.buffer.len() < SYNC_PACKET.len()
+                && self.buffer.iter().all(|byte| *byte == 0)
+            {
+                return Ok(events);
+            } else {
+                self.awaiting_sync = false;
+            }
+        }
 
         loop {
             let packet = match parse_packet(&self.buffer, self.max_packet_size) {
@@ -536,6 +555,39 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn discards_a_leading_sync_packet_across_every_chunk_boundary() {
+        let mut stream = SYNC_PACKET.to_vec();
+        stream.extend(compact_packet(10, &[], 3));
+
+        for split in 0..=stream.len() {
+            let mut decoder = SystemViewDecoder::default();
+            let first = decoder.push(&stream[..split]).expect("prefix is valid");
+            let second = decoder.push(&stream[split..]).expect("suffix is valid");
+            let events: Vec<_> = first.into_iter().chain(second).collect();
+
+            assert_eq!(events.len(), 1, "split at {split}");
+            assert_eq!(events[0].kind, TraceEventKind::TraceStarted);
+            assert_eq!(events[0].timestamp_ticks, 3);
+        }
+    }
+
+    #[test]
+    fn decodes_a_zero_event_when_the_prefix_is_not_sync() {
+        let packet = compact_packet(0, &[], 5);
+        let mut decoder = SystemViewDecoder::default();
+
+        assert!(decoder
+            .push(&packet[..1])
+            .expect("prefix is valid")
+            .is_empty());
+        let events = decoder.push(&packet[1..]).expect("packet is valid");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, TraceEventKind::NoOp);
+        assert_eq!(events[0].timestamp_ticks, 5);
     }
 
     #[test]
