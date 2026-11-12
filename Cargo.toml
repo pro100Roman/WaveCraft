@@ -5,6 +5,7 @@ members = [
     "crates/wavecraft-automation",
     "crates/wavecraft-core",
     "crates/wavecraft-decode",
+    "crates/wavecraft-debug-probe",
     "crates/wavecraft-dsp",
     "crates/wavecraft-hackrf",
     "crates/wavecraft-recording",
