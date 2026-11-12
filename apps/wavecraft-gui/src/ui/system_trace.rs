@@ -614,23 +614,48 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
             return;
         }
 
-        let timeline = egui::ScrollArea::both()
+        let timeline_focus = trace.take_timeline_focus();
+        let timeline_focus_timestamp = timeline_focus.and_then(|sequence| {
+            trace
+                .events()
+                .iter()
+                .find(|event| event.sequence == sequence)
+                .map(|event| event.timestamp_ticks)
+        });
+        let selected_timestamp = trace.selected_event().map(|event| event.timestamp_ticks);
+        let viewport_width = ui.available_width();
+        let mut timeline_scroll = egui::ScrollArea::both()
             .id_salt("system_trace_timeline")
             .max_height(timeline_height)
             .drag_to_scroll(true)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let canvas_width =
-                    timeline_canvas_width(ui.available_width(), trace.timeline_zoom());
-                let canvas_height =
-                    TIMELINE_HEADER_HEIGHT + lanes.len() as f32 * TIMELINE_ROW_HEIGHT;
-                let (canvas, _) = ui.allocate_exact_size(
-                    egui::vec2(canvas_width, canvas_height),
-                    egui::Sense::hover(),
-                );
-                paint_timeline_canvas(ui, canvas, trace.model(), &lanes, start_ticks, end_ticks);
-                canvas.top()
-            });
+            .auto_shrink([false, false]);
+        if let Some(timestamp) = timeline_focus_timestamp {
+            timeline_scroll = timeline_scroll.horizontal_scroll_offset(timeline_focus_offset(
+                viewport_width,
+                trace.timeline_zoom(),
+                start_ticks,
+                end_ticks,
+                timestamp,
+            ));
+        }
+        let timeline = timeline_scroll.show(ui, |ui| {
+            let canvas_width = timeline_canvas_width(ui.available_width(), trace.timeline_zoom());
+            let canvas_height = TIMELINE_HEADER_HEIGHT + lanes.len() as f32 * TIMELINE_ROW_HEIGHT;
+            let (canvas, _) = ui.allocate_exact_size(
+                egui::vec2(canvas_width, canvas_height),
+                egui::Sense::hover(),
+            );
+            let clicked_sequence = paint_timeline_canvas(
+                ui,
+                canvas,
+                trace,
+                &lanes,
+                start_ticks,
+                end_ticks,
+                selected_timestamp,
+            );
+            (canvas.top(), clicked_sequence)
+        });
         let pointer_over_timeline = ui.input(|input| {
             input
                 .pointer
@@ -655,15 +680,35 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
         paint_sticky_timeline_labels(
             ui,
             timeline.inner_rect,
-            timeline.inner,
+            timeline.inner.0,
             trace.model(),
             &lanes,
         );
+        if let Some(sequence) = timeline.inner.1 {
+            trace.select_from_timeline(sequence);
+        }
     });
 }
 
 fn timeline_canvas_width(available_width: f32, zoom: f32) -> f32 {
     available_width.max(TIMELINE_MINIMUM_WIDTH) * zoom
+}
+
+fn timeline_focus_offset(
+    viewport_width: f32,
+    zoom: f32,
+    start_ticks: u64,
+    end_ticks: u64,
+    timestamp: u64,
+) -> f32 {
+    let canvas_width = timeline_canvas_width(viewport_width, zoom);
+    let plot_width = (canvas_width - TIMELINE_LABEL_WIDTH).max(1.0);
+    let duration = end_ticks.saturating_sub(start_ticks).max(1);
+    let target_x = TIMELINE_LABEL_WIDTH
+        + timestamp.saturating_sub(start_ticks).min(duration) as f32 / duration as f32 * plot_width;
+    let visible_plot_center =
+        TIMELINE_LABEL_WIDTH + (viewport_width - TIMELINE_LABEL_WIDTH).max(1.0) * 0.5;
+    (target_x - visible_plot_center).clamp(0.0, (canvas_width - viewport_width).max(0.0))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -691,11 +736,13 @@ fn timeline_lanes(model: &TraceModel) -> Vec<TimelineLane> {
 fn paint_timeline_canvas(
     ui: &egui::Ui,
     canvas: egui::Rect,
-    model: &TraceModel,
+    trace: &SystemTraceDisplayState,
     lanes: &[TimelineLane],
     start_ticks: u64,
     end_ticks: u64,
-) {
+    selected_timestamp: Option<u64>,
+) -> Option<u64> {
+    let model = trace.model();
     let painter = ui.painter().with_clip_rect(canvas);
     let plot_left = canvas.left() + TIMELINE_LABEL_WIDTH;
     let plot_right = canvas.right();
@@ -719,6 +766,7 @@ fn paint_timeline_canvas(
         duration,
     );
 
+    let mut clicked_sequence = None;
     for (lane_index, lane) in lanes.iter().enumerate() {
         let row_top =
             canvas.top() + TIMELINE_HEADER_HEIGHT + lane_index as f32 * TIMELINE_ROW_HEIGHT;
@@ -733,10 +781,11 @@ fn paint_timeline_canvas(
         let Some(core) = model.core(lane.core_id) else {
             continue;
         };
-        for interval in core
+        for (interval_index, interval) in core
             .intervals()
             .iter()
-            .filter(|interval| interval.context == lane.context)
+            .enumerate()
+            .filter(|(_, interval)| interval.context == lane.context)
         {
             let interval_end = interval
                 .end_ticks
@@ -755,6 +804,28 @@ fn paint_timeline_canvas(
                 egui::pos2((x_end.max(x_start + 2.0)).min(plot_right), row_bottom - 4.0),
             );
             painter.rect_filled(interval_rect, 2.0, context_color(lane.context));
+            let response = ui
+                .interact(
+                    interval_rect,
+                    ui.id().with(("trace_interval", lane_index, interval_index)),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(format!(
+                    "{} · {}–{} ticks",
+                    context_label(model, *lane),
+                    interval.start_ticks,
+                    interval_end
+                ));
+            if response.hovered() {
+                painter.rect_stroke(
+                    interval_rect,
+                    2.0,
+                    egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
+                );
+            }
+            if response.clicked() {
+                clicked_sequence = interval_event_sequence(trace, *lane, interval.start_ticks);
+            }
             if !interval.complete {
                 painter.rect_stroke(
                     interval_rect,
@@ -763,6 +834,62 @@ fn paint_timeline_canvas(
                 );
             }
         }
+    }
+    if let Some(timestamp) = selected_timestamp {
+        let x = tick_x(timestamp, start_ticks, duration, plot_left, plot_width);
+        painter.line_segment(
+            [egui::pos2(x, canvas.top()), egui::pos2(x, canvas.bottom())],
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 214, 92)),
+        );
+        painter.circle_filled(
+            egui::pos2(x, canvas.top() + 5.0),
+            4.0,
+            egui::Color32::from_rgb(255, 214, 92),
+        );
+    }
+    clicked_sequence
+}
+
+fn interval_event_sequence(
+    trace: &SystemTraceDisplayState,
+    lane: TimelineLane,
+    timestamp_ticks: u64,
+) -> Option<u64> {
+    let events_at_timestamp = || {
+        trace.events().iter().filter(|event| {
+            event.core_id == lane.core_id && event.timestamp_ticks == timestamp_ticks
+        })
+    };
+    events_at_timestamp()
+        .find(|event| event_starts_context(&event.kind, lane.context))
+        .or_else(|| events_at_timestamp().next())
+        .map(|event| event.sequence)
+}
+
+fn event_starts_context(kind: &TraceEventKind, context: ExecutionContext) -> bool {
+    match (context, kind) {
+        (ExecutionContext::Task(expected), TraceEventKind::TaskStarted { task_id }) => {
+            expected == *task_id
+        }
+        (ExecutionContext::Task(_), TraceEventKind::IsrExited | TraceEventKind::TimerExited) => {
+            true
+        }
+        (ExecutionContext::Isr(expected), TraceEventKind::IsrEntered { isr_id }) => {
+            expected == *isr_id
+        }
+        (ExecutionContext::Isr(_), TraceEventKind::IsrExited) => true,
+        (ExecutionContext::Timer(expected), TraceEventKind::TimerEntered { timer_id }) => {
+            expected == *timer_id
+        }
+        (ExecutionContext::Timer(_), TraceEventKind::IsrExited) => true,
+        (
+            ExecutionContext::Scheduler,
+            TraceEventKind::TaskStopped
+            | TraceEventKind::IsrExitedToScheduler
+            | TraceEventKind::TaskTerminated { .. },
+        ) => true,
+        (ExecutionContext::Idle, TraceEventKind::Idle) => true,
+        _ => false,
     }
 }
 
@@ -1146,66 +1273,81 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let mut selected_sequence = trace.selected_sequence;
-    let follow_latest = trace.follow_latest;
+    let event_table_focus = trace.take_event_table_focus();
+    let follow_latest = trace.follow_latest && event_table_focus.is_none();
     let event_count = visible_indices.len();
     let table_row_count = event_count + 1;
+    let focus_row = event_table_focus.and_then(|sequence| {
+        visible_indices
+            .iter()
+            .position(|index| trace.events()[*index].sequence == sequence)
+            .map(|row| row + 1)
+    });
 
-    egui::ScrollArea::both()
+    let mut event_scroll = egui::ScrollArea::both()
         .id_salt("system_trace_events")
         .max_height(view_height)
-        .auto_shrink([false, false])
-        .show_rows(ui, 22.0, table_row_count, |ui, row_range| {
-            ui.set_min_width(EVENT_TABLE_MINIMUM_WIDTH);
-            for table_row in row_range {
-                if table_row == 0 {
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [90.0, 20.0],
-                            egui::Label::new(RichText::new("TICKS").small().color(TEXT_MUTED)),
-                        );
-                        ui.add_sized(
-                            [45.0, 20.0],
-                            egui::Label::new(RichText::new("CORE").small().color(TEXT_MUTED)),
-                        );
-                        ui.add_sized(
-                            [170.0, 20.0],
-                            egui::Label::new(RichText::new("EVENT").small().color(TEXT_MUTED)),
-                        );
-                        ui.label(RichText::new("DETAILS").small().color(TEXT_MUTED));
-                    });
-                    continue;
-                }
-                let visible_row = table_row - 1;
-                let event = &trace.events()[visible_indices[visible_row]];
-                let response = ui.horizontal(|ui| {
+        .auto_shrink([false, false]);
+    if let Some(row) = focus_row {
+        event_scroll =
+            event_scroll.vertical_scroll_offset((row as f32 * 22.0 - view_height * 0.5).max(0.0));
+    }
+    let mut clicked_sequence = None;
+    event_scroll.show_rows(ui, 22.0, table_row_count, |ui, row_range| {
+        ui.set_min_width(EVENT_TABLE_MINIMUM_WIDTH);
+        for table_row in row_range {
+            if table_row == 0 {
+                ui.horizontal(|ui| {
                     ui.add_sized(
                         [90.0, 20.0],
-                        egui::Label::new(
-                            RichText::new(event.timestamp_ticks.to_string()).monospace(),
-                        ),
+                        egui::Label::new(RichText::new("TICKS").small().color(TEXT_MUTED)),
                     );
-                    ui.add_sized([45.0, 20.0], egui::Label::new(event.core_id.to_string()));
-                    let clicked = ui
-                        .add_sized(
-                            [170.0, 20.0],
-                            egui::SelectableLabel::new(
-                                selected_sequence == Some(event.sequence),
-                                event_name(&event.kind),
-                            ),
-                        )
-                        .clicked();
-                    ui.label(RichText::new(event_summary(&event.kind)).color(TEXT_MUTED));
-                    clicked
+                    ui.add_sized(
+                        [45.0, 20.0],
+                        egui::Label::new(RichText::new("CORE").small().color(TEXT_MUTED)),
+                    );
+                    ui.add_sized(
+                        [170.0, 20.0],
+                        egui::Label::new(RichText::new("EVENT").small().color(TEXT_MUTED)),
+                    );
+                    ui.label(RichText::new("DETAILS").small().color(TEXT_MUTED));
                 });
-                if response.inner {
-                    selected_sequence = Some(event.sequence);
-                }
-                if follow_latest && visible_row + 1 == event_count {
-                    response.response.scroll_to_me(Some(egui::Align::BOTTOM));
-                }
+                continue;
             }
-        });
-    trace.selected_sequence = selected_sequence;
+            let visible_row = table_row - 1;
+            let event = &trace.events()[visible_indices[visible_row]];
+            let response = ui.horizontal(|ui| {
+                ui.add_sized(
+                    [90.0, 20.0],
+                    egui::Label::new(RichText::new(event.timestamp_ticks.to_string()).monospace()),
+                );
+                ui.add_sized([45.0, 20.0], egui::Label::new(event.core_id.to_string()));
+                let clicked = ui
+                    .add_sized(
+                        [170.0, 20.0],
+                        egui::SelectableLabel::new(
+                            selected_sequence == Some(event.sequence),
+                            event_name(&event.kind),
+                        ),
+                    )
+                    .clicked();
+                ui.label(RichText::new(event_summary(&event.kind)).color(TEXT_MUTED));
+                clicked
+            });
+            if response.inner {
+                selected_sequence = Some(event.sequence);
+                clicked_sequence = Some(event.sequence);
+            }
+            if follow_latest && visible_row + 1 == event_count {
+                response.response.scroll_to_me(Some(egui::Align::BOTTOM));
+            }
+        }
+    });
+    if let Some(sequence) = clicked_sequence {
+        trace.select_from_event_table(sequence);
+    } else {
+        trace.selected_sequence = selected_sequence;
+    }
 }
 
 fn paint_selected_event(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
@@ -1539,6 +1681,38 @@ mod tests {
         assert_eq!(timeline_canvas_width(600.0, 1.0), 720.0);
         assert_eq!(timeline_canvas_width(900.0, 1.0), 900.0);
         assert_eq!(timeline_canvas_width(900.0, 4.0), 3_600.0);
+    }
+
+    #[test]
+    fn timeline_focus_centers_selected_timestamp_within_scroll_bounds() {
+        assert_eq!(timeline_focus_offset(900.0, 1.0, 0, 1_000, 500), 0.0);
+        let offset = timeline_focus_offset(900.0, 8.0, 0, 1_000, 500);
+        assert!(offset > 2_000.0);
+        assert!(offset < 4_000.0);
+        assert_eq!(timeline_focus_offset(900.0, 8.0, 0, 1_000, 0), 0.0);
+    }
+
+    #[test]
+    fn timeline_intervals_resolve_their_originating_events() {
+        let mut trace = SystemTraceDisplayState::default();
+        trace.ingest(TraceEvent {
+            sequence: 41,
+            core_id: 0,
+            timestamp_ticks: 120,
+            kind: TraceEventKind::TaskStarted { task_id: 7 },
+        });
+
+        assert_eq!(
+            interval_event_sequence(
+                &trace,
+                TimelineLane {
+                    core_id: 0,
+                    context: ExecutionContext::Task(7),
+                },
+                120,
+            ),
+            Some(41)
+        );
     }
 
     #[test]

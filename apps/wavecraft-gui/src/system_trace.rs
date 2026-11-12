@@ -770,6 +770,8 @@ pub(crate) struct SystemTraceDisplayState {
     event_capacity: usize,
     terminal_line_capacity: usize,
     pub(crate) selected_sequence: Option<u64>,
+    event_table_focus_sequence: Option<u64>,
+    timeline_focus_sequence: Option<u64>,
     pub(crate) event_view: TraceEventView,
     pub(crate) event_filter: String,
     pub(crate) follow_latest: bool,
@@ -787,6 +789,8 @@ impl Default for SystemTraceDisplayState {
             event_capacity: DEFAULT_EVENT_CAPACITY,
             terminal_line_capacity: DEFAULT_TERMINAL_LINE_CAPACITY,
             selected_sequence: None,
+            event_table_focus_sequence: None,
+            timeline_focus_sequence: None,
             event_view: TraceEventView::Events,
             event_filter: String::new(),
             follow_latest: true,
@@ -847,6 +851,28 @@ impl SystemTraceDisplayState {
         self.event_view_height -= delta;
     }
 
+    pub(crate) fn select_from_timeline(&mut self, sequence: u64) {
+        self.selected_sequence = Some(sequence);
+        self.event_table_focus_sequence = Some(sequence);
+        self.timeline_focus_sequence = None;
+        self.event_view = TraceEventView::Events;
+        self.event_filter.clear();
+    }
+
+    pub(crate) fn select_from_event_table(&mut self, sequence: u64) {
+        self.selected_sequence = Some(sequence);
+        self.timeline_focus_sequence = Some(sequence);
+        self.event_table_focus_sequence = None;
+    }
+
+    pub(crate) fn take_event_table_focus(&mut self) -> Option<u64> {
+        self.event_table_focus_sequence.take()
+    }
+
+    pub(crate) fn take_timeline_focus(&mut self) -> Option<u64> {
+        self.timeline_focus_sequence.take()
+    }
+
     pub(crate) fn ingest(&mut self, event: TraceEvent) {
         self.model.apply(&event);
         if self.events.len() == self.event_capacity
@@ -856,6 +882,8 @@ impl SystemTraceDisplayState {
                 .is_some_and(|discarded| Some(discarded.sequence) == self.selected_sequence)
         {
             self.selected_sequence = None;
+            self.event_table_focus_sequence = None;
+            self.timeline_focus_sequence = None;
         }
         self.events.push_back(event);
     }
@@ -892,6 +920,8 @@ impl SystemTraceDisplayState {
         self.events.clear();
         self.model = TraceModel::new();
         self.selected_sequence = None;
+        self.event_table_focus_sequence = None;
+        self.timeline_focus_sequence = None;
         self.timeline_zoom = MIN_TIMELINE_ZOOM;
     }
 
@@ -1241,6 +1271,29 @@ mod tests {
         state.move_trace_instrument_splitter(f32::NAN);
         assert_eq!(state.timeline_view_height(), 740.0);
         assert_eq!(state.event_view_height(), MIN_TRACE_INSTRUMENT_HEIGHT);
+    }
+
+    #[test]
+    fn timeline_and_event_selections_request_reciprocal_focus() {
+        let mut state = SystemTraceDisplayState {
+            event_view: TraceEventView::Logs,
+            event_filter: "filtered".to_owned(),
+            ..SystemTraceDisplayState::default()
+        };
+
+        state.select_from_timeline(17);
+
+        assert_eq!(state.selected_sequence, Some(17));
+        assert_eq!(state.event_view, TraceEventView::Events);
+        assert!(state.event_filter.is_empty());
+        assert_eq!(state.take_event_table_focus(), Some(17));
+        assert_eq!(state.take_event_table_focus(), None);
+
+        state.select_from_event_table(23);
+
+        assert_eq!(state.selected_sequence, Some(23));
+        assert_eq!(state.take_timeline_focus(), Some(23));
+        assert_eq!(state.take_timeline_focus(), None);
     }
 
     #[test]
