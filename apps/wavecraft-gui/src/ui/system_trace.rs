@@ -1,8 +1,8 @@
 //! Independent System Trace workspace and decoded-event instruments.
 
 use crate::system_trace::{
-    choose_systemview_trace_to_open, SystemTraceAction, SystemTraceConnectionConfiguration,
-    SystemTraceConnectionState,
+    choose_systemview_recording_path, choose_systemview_trace_to_open, SystemTraceAction,
+    SystemTraceConnectionConfiguration, SystemTraceConnectionState,
 };
 use crate::system_trace::{SystemTraceDisplayState, TraceEventView};
 use crate::{
@@ -337,6 +337,11 @@ impl WaveCraftApp {
                     self.begin_open_system_trace(path);
                 }
             }
+            Some(SystemTraceAction::Record) => {
+                if let Some(path) = choose_systemview_recording_path() {
+                    self.request_system_trace_recording(path);
+                }
+            }
             Some(SystemTraceAction::Connect) => {
                 match self.system_trace_settings.connection_configuration() {
                     Ok(configuration) => self.begin_system_trace_connection(configuration),
@@ -399,6 +404,16 @@ fn paint_trace_run_control(
             systemview_enabled: true,
             ..
         } => {
+            if ui
+                .add(toolbar_action_button(
+                    "● Record…",
+                    egui::Color32::from_rgb(245, 96, 96),
+                ))
+                .on_hover_text("Record the raw SystemView stream to an .SVDat file")
+                .clicked()
+            {
+                actions.system_trace_action = Some(SystemTraceAction::Record);
+            }
             if ui.button("▶ Start").clicked() {
                 actions.system_trace_action = Some(SystemTraceAction::Start);
             }
@@ -412,9 +427,14 @@ fn paint_trace_run_control(
         SystemTraceConnectionState::Starting { .. } => {
             ui.add_enabled(false, egui::Button::new("Starting…"));
         }
-        SystemTraceConnectionState::Tracing { .. } => {
+        SystemTraceConnectionState::Tracing { recording_path, .. } => {
             if ui.button("■ Stop").clicked() {
                 actions.system_trace_action = Some(SystemTraceAction::Stop);
+            }
+            if recording_path.is_some() {
+                ui.label(
+                    RichText::new("● Recording .SVDat").color(egui::Color32::from_rgb(245, 96, 96)),
+                );
             }
         }
         SystemTraceConnectionState::Stopping { .. } => {
@@ -1256,6 +1276,21 @@ mod tests {
         let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
 
         assert!(texts.iter().any(|(text, _)| text == "Open .SVDat…"));
+    }
+
+    #[test]
+    fn attached_system_trace_toolbar_exposes_raw_recording() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace_connection = SystemTraceConnectionState::Attached {
+            channels: Vec::new(),
+            systemview_enabled: true,
+        };
+
+        let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
+
+        assert!(texts.iter().any(|(text, _)| text == "● Record…"));
+        assert!(texts.iter().any(|(text, _)| text == "▶ Start"));
     }
 
     #[test]

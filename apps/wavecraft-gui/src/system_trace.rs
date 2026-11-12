@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
@@ -54,12 +54,15 @@ pub(crate) enum SystemTraceConnectionState {
     },
     Starting {
         channels: Vec<RttChannelDescriptor>,
+        recording_path: Option<PathBuf>,
     },
     Tracing {
         channels: Vec<RttChannelDescriptor>,
+        recording_path: Option<PathBuf>,
     },
     Stopping {
         channels: Vec<RttChannelDescriptor>,
+        recording_path: Option<PathBuf>,
     },
     Disconnecting,
     Error(String),
@@ -73,9 +76,9 @@ impl SystemTraceConnectionState {
     fn channels(&self) -> Option<&[RttChannelDescriptor]> {
         match self {
             Self::Attached { channels, .. }
-            | Self::Starting { channels }
-            | Self::Tracing { channels }
-            | Self::Stopping { channels } => Some(channels),
+            | Self::Starting { channels, .. }
+            | Self::Tracing { channels, .. }
+            | Self::Stopping { channels, .. } => Some(channels),
             Self::Disconnected | Self::Connecting | Self::Disconnecting | Self::Error(_) => None,
         }
     }
@@ -93,9 +96,9 @@ impl SystemTraceConnectionState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SystemTraceWorkerCommand {
-    Start,
+    Start { recording_path: Option<PathBuf> },
     Stop,
     Disconnect,
 }
@@ -103,6 +106,7 @@ pub(crate) enum SystemTraceWorkerCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SystemTraceAction {
     Open,
+    Record,
     Connect,
     Start,
     Stop,
@@ -115,8 +119,11 @@ pub(crate) enum SystemTraceWorkerEvent {
         channels: Vec<RttChannelDescriptor>,
         systemview_enabled: bool,
     },
-    Tracing,
+    Tracing {
+        recording_path: Option<PathBuf>,
+    },
     Stopped,
+    RecordingSaved(PathBuf),
     Disconnected,
     Error(String),
 }
@@ -201,6 +208,7 @@ fn run_connection_worker(
 
     let mut decoder = SystemViewDecoder::new(configuration.attach.core_index as u32);
     let mut terminal_decoder = RttTerminalDecoder::new();
+    let mut raw_recording: Option<(PathBuf, BufWriter<File>)> = None;
     let mut tracing = false;
     loop {
         let polling = tracing || configuration.terminal_up_channel.is_some();
@@ -218,10 +226,20 @@ fn run_connection_worker(
         };
 
         match command {
-            Some(SystemTraceWorkerCommand::Start)
+            Some(SystemTraceWorkerCommand::Start { recording_path })
                 if !tracing && configuration.systemview_enabled =>
             {
                 decoder.reset();
+                raw_recording = match recording_path.as_ref() {
+                    Some(path) => match create_systemview_recording(path) {
+                        Ok(recording) => Some((path.clone(), recording)),
+                        Err(error) => {
+                            let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 match write_systemview_command(
                     &mut transport,
                     configuration.down_channel,
@@ -229,7 +247,7 @@ fn run_connection_worker(
                 ) {
                     Ok(()) => {
                         tracing = true;
-                        let _ = events.send(SystemTraceWorkerEvent::Tracing);
+                        let _ = events.send(SystemTraceWorkerEvent::Tracing { recording_path });
                     }
                     Err(error) => {
                         let _ = close_connection(transport);
@@ -246,6 +264,13 @@ fn run_connection_worker(
                 ) {
                     Ok(()) => {
                         tracing = false;
+                        if let Err(error) =
+                            finish_systemview_recording(raw_recording.take(), &events)
+                        {
+                            let _ = close_connection(transport);
+                            let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+                            return;
+                        }
                         let _ = events.send(SystemTraceWorkerEvent::Stopped);
                     }
                     Err(error) => {
@@ -263,6 +288,11 @@ fn run_connection_worker(
                         SYSTEMVIEW_COMMAND_STOP,
                     );
                 }
+                if let Err(error) = finish_systemview_recording(raw_recording.take(), &events) {
+                    let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+                    let _ = close_connection(transport);
+                    return;
+                }
                 if let Some(line) = terminal_decoder.finish() {
                     let _ = terminal_lines.send(line);
                 }
@@ -276,7 +306,8 @@ fn run_connection_worker(
                 }
                 return;
             }
-            Some(SystemTraceWorkerCommand::Start | SystemTraceWorkerCommand::Stop) | None => {}
+            Some(SystemTraceWorkerCommand::Start { .. } | SystemTraceWorkerCommand::Stop)
+            | None => {}
         }
 
         let mut bytes_read = 0;
@@ -286,6 +317,7 @@ fn run_connection_worker(
                 configuration.up_channel,
                 &mut decoder,
                 &trace_events,
+                raw_recording.as_mut().map(|(_, recording)| recording),
             ) {
                 Ok(count) => bytes_read += count,
                 Err(error) => {
@@ -339,6 +371,7 @@ fn read_and_decode_rtt(
     channel_number: usize,
     decoder: &mut SystemViewDecoder,
     trace_events: &Sender<TraceEvent>,
+    raw_recording: Option<&mut BufWriter<File>>,
 ) -> Result<usize, DebugProbeError> {
     let data = match transport.send(DebugProbeCommand::ReadRttUp {
         channel_number,
@@ -348,6 +381,14 @@ fn read_and_decode_rtt(
         _ => return Err(unexpected_reply("read SystemView RTT data")),
     };
     let byte_count = data.len();
+    if let Some(recording) = raw_recording {
+        recording.write_all(&data).map_err(|error| {
+            DebugProbeError::new(
+                DebugProbeErrorKind::Transport,
+                format!("failed to write raw SystemView recording: {error}"),
+            )
+        })?;
+    }
     let decoded = decoder.push(&data).map_err(|error| {
         DebugProbeError::new(
             DebugProbeErrorKind::Transport,
@@ -363,6 +404,38 @@ fn read_and_decode_rtt(
         })?;
     }
     Ok(byte_count)
+}
+
+fn create_systemview_recording(path: &Path) -> Result<BufWriter<File>, DebugProbeError> {
+    File::create(path).map(BufWriter::new).map_err(|error| {
+        DebugProbeError::new(
+            DebugProbeErrorKind::Transport,
+            format!(
+                "failed to create raw SystemView recording {}: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn finish_systemview_recording(
+    recording: Option<(PathBuf, BufWriter<File>)>,
+    events: &Sender<SystemTraceWorkerEvent>,
+) -> Result<(), DebugProbeError> {
+    let Some((path, mut recording)) = recording else {
+        return Ok(());
+    };
+    recording.flush().map_err(|error| {
+        DebugProbeError::new(
+            DebugProbeErrorKind::Transport,
+            format!(
+                "failed to finish raw SystemView recording {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let _ = events.send(SystemTraceWorkerEvent::RecordingSaved(path));
+    Ok(())
 }
 
 fn read_rtt_terminal(
@@ -529,6 +602,14 @@ impl crate::WaveCraftApp {
     }
 
     pub(crate) fn request_system_trace_start(&mut self) {
+        self.request_system_trace_start_with_recording(None);
+    }
+
+    pub(crate) fn request_system_trace_recording(&mut self, path: PathBuf) {
+        self.request_system_trace_start_with_recording(Some(path));
+    }
+
+    fn request_system_trace_start_with_recording(&mut self, recording_path: Option<PathBuf>) {
         let SystemTraceConnectionState::Attached {
             channels,
             systemview_enabled: true,
@@ -537,19 +618,32 @@ impl crate::WaveCraftApp {
             return;
         };
         let channels = channels.clone();
-        if self.send_system_trace_worker_command(SystemTraceWorkerCommand::Start) {
+        if self.send_system_trace_worker_command(SystemTraceWorkerCommand::Start {
+            recording_path: recording_path.clone(),
+        }) {
             self.system_trace.clear_trace_events();
-            self.system_trace_connection = SystemTraceConnectionState::Starting { channels };
+            self.system_trace_connection = SystemTraceConnectionState::Starting {
+                channels,
+                recording_path,
+            };
         }
     }
 
     pub(crate) fn request_system_trace_stop(&mut self) {
-        let SystemTraceConnectionState::Tracing { channels } = &self.system_trace_connection else {
+        let SystemTraceConnectionState::Tracing {
+            channels,
+            recording_path,
+        } = &self.system_trace_connection
+        else {
             return;
         };
         let channels = channels.clone();
+        let recording_path = recording_path.clone();
         if self.send_system_trace_worker_command(SystemTraceWorkerCommand::Stop) {
-            self.system_trace_connection = SystemTraceConnectionState::Stopping { channels };
+            self.system_trace_connection = SystemTraceConnectionState::Stopping {
+                channels,
+                recording_path,
+            };
         }
     }
 
@@ -599,14 +693,16 @@ impl crate::WaveCraftApp {
                             systemview_enabled,
                         };
                     }
-                    Ok(SystemTraceWorkerEvent::Tracing) => {
+                    Ok(SystemTraceWorkerEvent::Tracing { recording_path }) => {
                         let channels = self
                             .system_trace_connection
                             .channels()
                             .map(<[RttChannelDescriptor]>::to_vec)
                             .unwrap_or_default();
-                        self.system_trace_connection =
-                            SystemTraceConnectionState::Tracing { channels };
+                        self.system_trace_connection = SystemTraceConnectionState::Tracing {
+                            channels,
+                            recording_path,
+                        };
                     }
                     Ok(SystemTraceWorkerEvent::Stopped) => {
                         let channels = self
@@ -618,6 +714,10 @@ impl crate::WaveCraftApp {
                             channels,
                             systemview_enabled: true,
                         };
+                    }
+                    Ok(SystemTraceWorkerEvent::RecordingSaved(path)) => {
+                        self.status = format!("SystemView recording saved to {}", path.display());
+                        self.last_error = None;
                     }
                     Ok(SystemTraceWorkerEvent::Disconnected) => {
                         self.system_trace_connection = SystemTraceConnectionState::Disconnected;
@@ -791,6 +891,26 @@ pub(crate) fn choose_systemview_trace_to_open() -> Option<PathBuf> {
         .set_title("Open raw SystemView trace")
         .add_filter("SystemView data", &["SVDat", "svdat"])
         .pick_file()
+}
+
+pub(crate) fn choose_systemview_recording_path() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Record raw SystemView trace")
+        .add_filter("SystemView data", &["SVDat"])
+        .set_file_name("system-trace.SVDat")
+        .save_file()
+        .map(normalize_systemview_recording_path)
+}
+
+fn normalize_systemview_recording_path(mut path: PathBuf) -> PathBuf {
+    let has_systemview_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svdat"));
+    if !has_systemview_extension {
+        path.set_extension("SVDat");
+    }
+    path
 }
 
 fn read_systemview_trace_file(path: &Path) -> Result<Vec<TraceEvent>, String> {
@@ -1199,6 +1319,8 @@ mod tests {
 
     #[test]
     fn tracing_writes_start_and_stop_and_decodes_incremental_rtt_data() {
+        let recording_path =
+            crate::app::test_support::scratch_directory("systemview-recording").join("trace.SVDat");
         let up_channel = RttChannelDescriptor {
             number: 1,
             direction: RttChannelDirection::Up,
@@ -1234,7 +1356,9 @@ mod tests {
         let (trace_event_sender, trace_event_receiver) = mpsc::channel();
         let (terminal_line_sender, _terminal_line_receiver) = mpsc::channel();
         for command in [
-            SystemTraceWorkerCommand::Start,
+            SystemTraceWorkerCommand::Start {
+                recording_path: Some(recording_path.clone()),
+            },
             SystemTraceWorkerCommand::Stop,
             SystemTraceWorkerCommand::Disconnect,
         ] {
@@ -1257,7 +1381,10 @@ mod tests {
                     channels: vec![up_channel, down_channel],
                     systemview_enabled: true,
                 },
-                SystemTraceWorkerEvent::Tracing,
+                SystemTraceWorkerEvent::Tracing {
+                    recording_path: Some(recording_path.clone()),
+                },
+                SystemTraceWorkerEvent::RecordingSaved(recording_path.clone()),
                 SystemTraceWorkerEvent::Stopped,
                 SystemTraceWorkerEvent::Disconnected,
             ]
@@ -1266,6 +1393,10 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].kind, TraceEventKind::TraceStarted);
         assert_eq!(decoded[1].kind, TraceEventKind::TaskStarted { task_id: 7 });
+        assert_eq!(
+            std::fs::read(&recording_path).expect("raw recording was saved"),
+            [10, 3, 4, 7, 2]
+        );
         let commands = commands.lock().expect("commands are available");
         assert!(commands.iter().any(|command| {
             matches!(
@@ -1282,5 +1413,17 @@ mod tests {
             )
         }));
         assert!(*shutdown.lock().expect("shutdown flag is available"));
+    }
+
+    #[test]
+    fn systemview_recording_paths_use_svdat_extension() {
+        assert_eq!(
+            normalize_systemview_recording_path(PathBuf::from("trace")),
+            PathBuf::from("trace.SVDat")
+        );
+        assert_eq!(
+            normalize_systemview_recording_path(PathBuf::from("trace.svdat")),
+            PathBuf::from("trace.svdat")
+        );
     }
 }
