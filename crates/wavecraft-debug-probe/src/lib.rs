@@ -29,6 +29,247 @@ pub const MAX_DEBUG_PROBE_TRANSFER_BYTES: usize = 64 * 1024;
 
 /// Default maximum bytes retained for one unterminated RTT terminal line.
 pub const DEFAULT_RTT_TERMINAL_LINE_BYTES: usize = 16 * 1024;
+const MAX_RTT_ANSI_SEQUENCE_BYTES: usize = 128;
+
+/// ANSI color carried by a plain RTT terminal stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RttTerminalColor {
+    /// One of the eight ANSI colors, optionally using its bright variant.
+    Basic {
+        index: u8,
+        bright: bool,
+    },
+    Indexed(u8),
+    Rgb {
+        red: u8,
+        green: u8,
+        blue: u8,
+    },
+}
+
+/// ANSI text attributes active for a terminal span.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RttTerminalStyle {
+    pub foreground: Option<RttTerminalColor>,
+    pub background: Option<RttTerminalColor>,
+    pub bold: bool,
+    pub dim: bool,
+}
+
+/// Visible terminal text sharing one ANSI style.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RttTerminalSpan {
+    pub text: String,
+    pub style: RttTerminalStyle,
+}
+
+/// Stateful parser for ANSI SGR color and intensity escape sequences.
+#[derive(Clone, Debug)]
+pub struct RttAnsiParser {
+    style: RttTerminalStyle,
+    state: RttAnsiState,
+}
+
+impl RttAnsiParser {
+    pub fn new() -> Self {
+        Self {
+            style: RttTerminalStyle::default(),
+            state: RttAnsiState::Text,
+        }
+    }
+
+    /// Parses one text fragment, retaining style and partial escape state.
+    pub fn push(&mut self, text: &str) -> Vec<RttTerminalSpan> {
+        let mut spans = Vec::new();
+        let mut visible = String::new();
+        let mut visible_style = self.style;
+
+        for character in text.chars() {
+            match &mut self.state {
+                RttAnsiState::Text => {
+                    if character == '\u{1b}' {
+                        push_terminal_span(&mut spans, &mut visible, visible_style);
+                        self.state = RttAnsiState::Escape;
+                    } else {
+                        if visible.is_empty() {
+                            visible_style = self.style;
+                        }
+                        visible.push(character);
+                    }
+                }
+                RttAnsiState::Escape => {
+                    self.state = match character {
+                        '[' => RttAnsiState::Csi(String::new()),
+                        ']' => RttAnsiState::Osc,
+                        _ => RttAnsiState::Text,
+                    };
+                }
+                RttAnsiState::Csi(parameters) => {
+                    if ('@'..='~').contains(&character) {
+                        if character == 'm' {
+                            apply_sgr(&mut self.style, parameters);
+                        }
+                        self.state = RttAnsiState::Text;
+                    } else if parameters.len() < MAX_RTT_ANSI_SEQUENCE_BYTES
+                        && (character.is_ascii_digit() || matches!(character, ';' | ':' | '?'))
+                    {
+                        parameters.push(character);
+                    } else {
+                        self.state = RttAnsiState::Text;
+                    }
+                }
+                RttAnsiState::Osc => {
+                    self.state = match character {
+                        '\u{7}' => RttAnsiState::Text,
+                        '\u{1b}' => RttAnsiState::OscEscape,
+                        _ => RttAnsiState::Osc,
+                    };
+                }
+                RttAnsiState::OscEscape => {
+                    self.state = if character == '\\' {
+                        RttAnsiState::Text
+                    } else {
+                        RttAnsiState::Osc
+                    };
+                }
+            }
+        }
+
+        push_terminal_span(&mut spans, &mut visible, visible_style);
+        spans
+    }
+
+    pub fn reset(&mut self) {
+        self.style = RttTerminalStyle::default();
+        self.state = RttAnsiState::Text;
+    }
+
+    pub fn style(&self) -> RttTerminalStyle {
+        self.style
+    }
+}
+
+impl Default for RttAnsiParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug)]
+enum RttAnsiState {
+    Text,
+    Escape,
+    Csi(String),
+    Osc,
+    OscEscape,
+}
+
+fn push_terminal_span(
+    spans: &mut Vec<RttTerminalSpan>,
+    visible: &mut String,
+    style: RttTerminalStyle,
+) {
+    if !visible.is_empty() {
+        spans.push(RttTerminalSpan {
+            text: std::mem::take(visible),
+            style,
+        });
+    }
+}
+
+fn apply_sgr(style: &mut RttTerminalStyle, parameters: &str) {
+    let values = if parameters.is_empty() {
+        vec![0]
+    } else {
+        let values = parameters
+            .split(';')
+            .map(|value| {
+                if value.is_empty() {
+                    Ok(0)
+                } else {
+                    value.parse::<u16>()
+                }
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(values) = values else {
+            return;
+        };
+        values
+    };
+
+    let mut index = 0;
+    while index < values.len() {
+        match values[index] {
+            0 => *style = RttTerminalStyle::default(),
+            1 => {
+                style.bold = true;
+                style.dim = false;
+            }
+            2 => {
+                style.dim = true;
+                style.bold = false;
+            }
+            22 => {
+                style.bold = false;
+                style.dim = false;
+            }
+            30..=37 => {
+                style.foreground = Some(RttTerminalColor::Basic {
+                    index: (values[index] - 30) as u8,
+                    bright: false,
+                });
+            }
+            39 => style.foreground = None,
+            40..=47 => {
+                style.background = Some(RttTerminalColor::Basic {
+                    index: (values[index] - 40) as u8,
+                    bright: false,
+                });
+            }
+            49 => style.background = None,
+            90..=97 => {
+                style.foreground = Some(RttTerminalColor::Basic {
+                    index: (values[index] - 90) as u8,
+                    bright: true,
+                });
+            }
+            100..=107 => {
+                style.background = Some(RttTerminalColor::Basic {
+                    index: (values[index] - 100) as u8,
+                    bright: true,
+                });
+            }
+            38 | 48 => {
+                let foreground = values[index] == 38;
+                if let Some((color, consumed)) = extended_ansi_color(&values[index + 1..]) {
+                    if foreground {
+                        style.foreground = Some(color);
+                    } else {
+                        style.background = Some(color);
+                    }
+                    index = index.saturating_add(consumed);
+                }
+            }
+            _ => {}
+        }
+        index = index.saturating_add(1);
+    }
+}
+
+fn extended_ansi_color(values: &[u16]) -> Option<(RttTerminalColor, usize)> {
+    match values {
+        [5, color, ..] => Some((RttTerminalColor::Indexed(u8::try_from(*color).ok()?), 2)),
+        [2, red, green, blue, ..] => Some((
+            RttTerminalColor::Rgb {
+                red: u8::try_from(*red).ok()?,
+                green: u8::try_from(*green).ok()?,
+                blue: u8::try_from(*blue).ok()?,
+            },
+            4,
+        )),
+        _ => None,
+    }
+}
 
 /// One line or bounded fragment decoded from a plain RTT up-channel.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -919,5 +1160,88 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text, "ok�");
         assert!(lines[0].complete);
+    }
+
+    #[test]
+    fn ansi_parser_applies_and_resets_standard_message_colors() {
+        let mut parser = RttAnsiParser::new();
+
+        let spans = parser.push("plain \u{1b}[31;1merror\u{1b}[0m done");
+
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].text, "plain ");
+        assert_eq!(spans[0].style, RttTerminalStyle::default());
+        assert_eq!(spans[1].text, "error");
+        assert_eq!(
+            spans[1].style.foreground,
+            Some(RttTerminalColor::Basic {
+                index: 1,
+                bright: false,
+            })
+        );
+        assert!(spans[1].style.bold);
+        assert_eq!(spans[2].text, " done");
+        assert_eq!(spans[2].style, RttTerminalStyle::default());
+    }
+
+    #[test]
+    fn ansi_parser_preserves_partial_sequences_and_style_between_fragments() {
+        let mut parser = RttAnsiParser::new();
+
+        assert!(parser.push("\u{1b}[3").is_empty());
+        let first = parser.push("2mgreen");
+        let second = parser.push(" still green\u{1b}[39m default");
+
+        let green = RttTerminalStyle {
+            foreground: Some(RttTerminalColor::Basic {
+                index: 2,
+                bright: false,
+            }),
+            ..RttTerminalStyle::default()
+        };
+        assert_eq!(
+            first,
+            [RttTerminalSpan {
+                text: "green".to_owned(),
+                style: green,
+            }]
+        );
+        assert_eq!(second[0].style, green);
+        assert_eq!(second[1].style, RttTerminalStyle::default());
+    }
+
+    #[test]
+    fn ansi_parser_supports_indexed_and_true_colors() {
+        let mut parser = RttAnsiParser::new();
+
+        let spans = parser.push("\u{1b}[38;5;196mindexed\u{1b}[38;2;1;2;3mrgb");
+
+        assert_eq!(
+            spans[0].style.foreground,
+            Some(RttTerminalColor::Indexed(196))
+        );
+        assert_eq!(
+            spans[1].style.foreground,
+            Some(RttTerminalColor::Rgb {
+                red: 1,
+                green: 2,
+                blue: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn ansi_parser_removes_terminal_title_sequences() {
+        let mut parser = RttAnsiParser::new();
+
+        let spans = parser.push("before\u{1b}]0;ignored title\u{7}after");
+
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "beforeafter"
+        );
     }
 }
