@@ -18,6 +18,8 @@ use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
 const TIMELINE_LABEL_WIDTH: f32 = 150.0;
 const TIMELINE_HEADER_HEIGHT: f32 = 24.0;
 const TIMELINE_ROW_HEIGHT: f32 = 25.0;
+const TIMELINE_MINIMUM_WIDTH: f32 = 720.0;
+const TIMELINE_ZOOM_STEP: f32 = 1.5;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SystemTraceSettings {
@@ -324,7 +326,7 @@ impl WaveCraftApp {
             .show(context, |ui| {
                 paint_trace_summary(ui, &self.system_trace);
                 ui.add_space(10.0);
-                paint_timeline_instrument(ui, &self.system_trace);
+                paint_timeline_instrument(ui, &mut self.system_trace);
                 ui.add_space(10.0);
                 paint_event_instrument(ui, &mut self.system_trace);
             });
@@ -513,12 +515,36 @@ fn paint_trace_summary(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
     });
 }
 
-fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
+fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     instrument_frame().show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("TIMELINE").strong().color(ACCENT));
             ui.label(
                 RichText::new("Task, ISR, timer, scheduler, and idle execution").color(TEXT_MUTED),
+            );
+            ui.separator();
+            if ui.small_button("−").on_hover_text("Zoom out").clicked() {
+                trace.scale_timeline_zoom(1.0 / TIMELINE_ZOOM_STEP);
+            }
+            ui.label(
+                RichText::new(format!("{:.1}×", trace.timeline_zoom()))
+                    .monospace()
+                    .color(TEXT_MUTED),
+            );
+            if ui.small_button("+").on_hover_text("Zoom in").clicked() {
+                trace.scale_timeline_zoom(TIMELINE_ZOOM_STEP);
+            }
+            if ui
+                .small_button("Fit")
+                .on_hover_text("Fit the entire trace")
+                .clicked()
+            {
+                trace.set_timeline_zoom(1.0);
+            }
+            ui.label(
+                RichText::new("Ctrl/⌘ + wheel to zoom · drag to pan")
+                    .small()
+                    .color(TEXT_MUTED),
             );
         });
         ui.add_space(6.0);
@@ -541,21 +567,34 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &SystemTraceDisplayState)
             return;
         }
 
-        egui::ScrollArea::both()
+        let timeline = egui::ScrollArea::both()
             .id_salt("system_trace_timeline")
             .max_height(260.0)
+            .drag_to_scroll(true)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let canvas_width = ui.available_width().max(720.0);
+                let canvas_width =
+                    timeline_canvas_width(ui.available_width(), trace.timeline_zoom());
                 let canvas_height =
                     TIMELINE_HEADER_HEIGHT + lanes.len() as f32 * TIMELINE_ROW_HEIGHT;
-                let (canvas, _) = ui.allocate_exact_size(
+                let (canvas, response) = ui.allocate_exact_size(
                     egui::vec2(canvas_width, canvas_height),
-                    egui::Sense::hover(),
+                    egui::Sense::click_and_drag(),
                 );
                 paint_timeline_canvas(ui, canvas, trace.model(), &lanes, start_ticks, end_ticks);
+                response.hovered() || response.dragged()
             });
+        if timeline.inner {
+            let zoom_delta = ui.input(egui::InputState::zoom_delta);
+            if (zoom_delta - 1.0).abs() > f32::EPSILON {
+                trace.scale_timeline_zoom(zoom_delta);
+            }
+        }
     });
+}
+
+fn timeline_canvas_width(available_width: f32, zoom: f32) -> f32 {
+    available_width.max(TIMELINE_MINIMUM_WIDTH) * zoom
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -602,19 +641,13 @@ fn paint_timeline_canvas(
         ],
         egui::Stroke::new(1.0_f32, GRID),
     );
-    painter.text(
-        egui::pos2(plot_left, canvas.top() + 2.0),
-        egui::Align2::LEFT_TOP,
-        format!("{start_ticks} ticks"),
-        egui::FontId::monospace(11.0),
-        TEXT_MUTED,
-    );
-    painter.text(
-        egui::pos2(plot_right, canvas.top() + 2.0),
-        egui::Align2::RIGHT_TOP,
-        format!("{end_ticks} ticks"),
-        egui::FontId::monospace(11.0),
-        TEXT_MUTED,
+    paint_timeline_time_grid(
+        &painter,
+        canvas,
+        plot_left,
+        plot_right,
+        start_ticks,
+        duration,
     );
 
     for (lane_index, lane) in lanes.iter().enumerate() {
@@ -669,6 +702,41 @@ fn paint_timeline_canvas(
                 );
             }
         }
+    }
+}
+
+fn paint_timeline_time_grid(
+    painter: &egui::Painter,
+    canvas: egui::Rect,
+    plot_left: f32,
+    plot_right: f32,
+    start_ticks: u64,
+    duration: u64,
+) {
+    let plot_width = (plot_right - plot_left).max(1.0);
+    let divisions = ((plot_width / 120.0).floor() as usize).clamp(2, 512);
+    for index in 0..=divisions {
+        let fraction = index as f32 / divisions as f32;
+        let x = plot_left + plot_width * fraction;
+        let tick_offset = (u128::from(duration) * index as u128 / divisions as u128) as u64;
+        painter.line_segment(
+            [
+                egui::pos2(x, canvas.top() + TIMELINE_HEADER_HEIGHT),
+                egui::pos2(x, canvas.bottom()),
+            ],
+            egui::Stroke::new(0.5_f32, GRID),
+        );
+        painter.text(
+            egui::pos2(x, canvas.top() + 2.0),
+            if index == divisions {
+                egui::Align2::RIGHT_TOP
+            } else {
+                egui::Align2::LEFT_TOP
+            },
+            format!("{}", start_ticks.saturating_add(tick_offset)),
+            egui::FontId::monospace(11.0),
+            TEXT_MUTED,
+        );
     }
 }
 
@@ -1338,6 +1406,13 @@ mod tests {
             ),
             egui::Color32::from_rgb(12, 34, 56)
         );
+    }
+
+    #[test]
+    fn timeline_zoom_expands_the_scrollable_time_canvas() {
+        assert_eq!(timeline_canvas_width(600.0, 1.0), 720.0);
+        assert_eq!(timeline_canvas_width(900.0, 1.0), 900.0);
+        assert_eq!(timeline_canvas_width(900.0, 4.0), 3_600.0);
     }
 
     #[test]

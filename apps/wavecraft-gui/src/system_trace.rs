@@ -19,6 +19,8 @@ use wavecraft_trace::{TraceEvent, TraceEventKind, TraceModel};
 
 const DEFAULT_EVENT_CAPACITY: usize = 100_000;
 const DEFAULT_TERMINAL_LINE_CAPACITY: usize = 20_000;
+const MIN_TIMELINE_ZOOM: f32 = 1.0;
+const MAX_TIMELINE_ZOOM: f32 = 64.0;
 const RTT_READ_SIZE: usize = 16 * 1024;
 const IDLE_RTT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const SYSTEMVIEW_FILE_READ_SIZE: usize = 64 * 1024;
@@ -767,6 +769,7 @@ pub(crate) struct SystemTraceDisplayState {
     pub(crate) event_view: TraceEventView,
     pub(crate) event_filter: String,
     pub(crate) follow_latest: bool,
+    timeline_zoom: f32,
 }
 
 impl Default for SystemTraceDisplayState {
@@ -781,6 +784,7 @@ impl Default for SystemTraceDisplayState {
             event_view: TraceEventView::Events,
             event_filter: String::new(),
             follow_latest: true,
+            timeline_zoom: MIN_TIMELINE_ZOOM,
         }
     }
 }
@@ -796,6 +800,22 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn terminal_lines(&self) -> &VecDeque<RttTerminalLine> {
         &self.terminal_lines
+    }
+
+    pub(crate) fn timeline_zoom(&self) -> f32 {
+        self.timeline_zoom
+    }
+
+    pub(crate) fn set_timeline_zoom(&mut self, zoom: f32) {
+        self.timeline_zoom = if zoom.is_finite() {
+            zoom.clamp(MIN_TIMELINE_ZOOM, MAX_TIMELINE_ZOOM)
+        } else {
+            MIN_TIMELINE_ZOOM
+        };
+    }
+
+    pub(crate) fn scale_timeline_zoom(&mut self, factor: f32) {
+        self.set_timeline_zoom(self.timeline_zoom * factor);
     }
 
     pub(crate) fn ingest(&mut self, event: TraceEvent) {
@@ -843,6 +863,7 @@ impl SystemTraceDisplayState {
         self.events.clear();
         self.model = TraceModel::new();
         self.selected_sequence = None;
+        self.timeline_zoom = MIN_TIMELINE_ZOOM;
     }
 
     pub(crate) fn time_bounds(&self) -> Option<(u64, u64)> {
@@ -1147,6 +1168,23 @@ mod tests {
         assert!(state.terminal_lines().is_empty());
         assert!(state.model().cores().is_empty());
         assert_eq!(state.selected_sequence, None);
+    }
+
+    #[test]
+    fn timeline_zoom_is_bounded_and_resets_with_trace_data() {
+        let mut state = SystemTraceDisplayState::default();
+
+        state.set_timeline_zoom(8.0);
+        assert_eq!(state.timeline_zoom(), 8.0);
+        state.scale_timeline_zoom(100.0);
+        assert_eq!(state.timeline_zoom(), MAX_TIMELINE_ZOOM);
+        state.set_timeline_zoom(f32::NAN);
+        assert_eq!(state.timeline_zoom(), MIN_TIMELINE_ZOOM);
+        state.set_timeline_zoom(4.0);
+
+        state.clear_trace_events();
+
+        assert_eq!(state.timeline_zoom(), MIN_TIMELINE_ZOOM);
     }
 
     #[test]
