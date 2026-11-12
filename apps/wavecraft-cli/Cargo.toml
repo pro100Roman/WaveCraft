@@ -14,4 +14,5 @@ wavecraft-automation = { path = "../../crates/wavecraft-automation" }
 wavecraft-core = { path = "../../crates/wavecraft-core" }
 wavecraft-recording = { path = "../../crates/wavecraft-recording" }
 wavecraft-sim = { path = "../../crates/wavecraft-sim" }
+wavecraft-trace = { path = "../../crates/wavecraft-trace" }
 wavecraft-usb = { path = "../../crates/wavecraft-usb" }

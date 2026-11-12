@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use wavecraft_automation::{
@@ -14,13 +14,14 @@ use wavecraft_recording::{
     RecordingWriter, FORMAT_VERSION,
 };
 use wavecraft_sim::{SimulatedLogicAnalyzer, SimulatedOscilloscope};
+use wavecraft_trace::{systemview::SystemViewDecoder, TraceModel};
 use wavecraft_usb::{
     discover_supported_devices, load_device_fpga, prepare_device, probe_device, DeviceModel,
     DsCopeCaptureConfig, DsCopeCaptureSource, DsLogicCaptureConfig, DsLogicCaptureSource, FpgaLoad,
     LinkStatus,
 };
 
-const USAGE: &str = "usage: wavecraft-cli [devices list [--format json] | devices probe --id <connection-id> [--format json] | capture run --device <connection-id> --sample-rate <hz> --samples <count> --channels <0,1,...> --output <capture.dsv> [--resource-directory <resources/fpga>] [--timeout-ms <ms>] [--events ndjson] | list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
+const USAGE: &str = "usage: wavecraft-cli [devices list [--format json] | devices probe --id <connection-id> [--format json] | capture run --device <connection-id> --sample-rate <hz> --samples <count> --channels <0,1,...> --output <capture.dsv> [--resource-directory <resources/fpga>] [--timeout-ms <ms>] [--events ndjson] | trace decode <systemview.bin> | list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
 
 type FileRecorder = RecordingWriter<BufWriter<File>>;
 
@@ -64,6 +65,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 && value == "json" =>
         {
             return automation_probe_device(id, true);
+        }
+        [group, command, path] if group == "trace" && command == "decode" => {
+            return decode_systemview_trace(Path::new(path));
         }
         [command] if command == "list" => return list_devices(),
         [command] if command == "probe" => return probe_devices(),
@@ -130,6 +134,53 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     run_simulation(run_seconds, None)
+}
+
+fn decode_systemview_trace(path: &Path) -> Result<(), Box<dyn Error>> {
+    let mut input = BufReader::new(File::open(path)?);
+    let mut decoder = SystemViewDecoder::default();
+    let mut model = TraceModel::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut event_count = 0_u64;
+    let mut first_timestamp = None;
+    let mut last_timestamp = None;
+
+    loop {
+        let bytes_read = input.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        for event in decoder.push(&buffer[..bytes_read])? {
+            first_timestamp.get_or_insert(event.timestamp_ticks);
+            last_timestamp = Some(event.timestamp_ticks);
+            event_count = event_count.saturating_add(1);
+            model.apply(&event);
+        }
+    }
+    decoder.finish()?;
+
+    println!("SystemView trace: {}", path.display());
+    println!("events: {event_count}");
+    match (first_timestamp, last_timestamp) {
+        (Some(first), Some(last)) => {
+            println!("timestamp ticks: {first}..{last}");
+        }
+        _ => println!("timestamp ticks: none"),
+    }
+    for (core_id, core) in model.cores() {
+        println!(
+            "core {core_id}: {} task(s), {} execution interval(s), {} dropped event(s), continuity {}",
+            core.tasks().len(),
+            core.intervals().len(),
+            core.dropped_events(),
+            if core.continuity_known() {
+                "known"
+            } else {
+                "unknown"
+            }
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

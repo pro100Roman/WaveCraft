@@ -3024,6 +3024,7 @@ dependencies = [
  "wavecraft-core",
  "wavecraft-recording",
  "wavecraft-sim",
+ "wavecraft-trace",
  "wavecraft-usb",
 ]
 

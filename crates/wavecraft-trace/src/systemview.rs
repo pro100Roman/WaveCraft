@@ -21,6 +21,9 @@ pub enum DecodeError {
         event_id: u32,
         reason: &'static str,
     },
+    TruncatedPacket {
+        pending_bytes: usize,
+    },
 }
 
 impl fmt::Display for DecodeError {
@@ -37,6 +40,10 @@ impl fmt::Display for DecodeError {
             Self::MalformedPayload { event_id, reason } => {
                 write!(formatter, "malformed SystemView event {event_id}: {reason}")
             }
+            Self::TruncatedPacket { pending_bytes } => write!(
+                formatter,
+                "SystemView stream ended with {pending_bytes} byte(s) of a partial packet"
+            ),
         }
     }
 }
@@ -81,6 +88,17 @@ impl SystemViewDecoder {
 
     pub fn timestamp_ticks(&self) -> u64 {
         self.timestamp_ticks
+    }
+
+    /// Validates that an input stream ended on a packet boundary.
+    pub fn finish(&self) -> Result<(), DecodeError> {
+        if self.buffer.is_empty() {
+            Ok(())
+        } else {
+            Err(DecodeError::TruncatedPacket {
+                pending_bytes: self.buffer.len(),
+            })
+        }
     }
 
     /// Decodes all complete packets in `bytes` and retains a partial tail.
@@ -602,6 +620,17 @@ mod tests {
                 declared_size: 9,
                 maximum_size: 8,
             }
+        );
+    }
+
+    #[test]
+    fn finish_rejects_a_partial_final_packet() {
+        let mut decoder = SystemViewDecoder::default();
+        let events = decoder.push(&[9, 7]).expect("prefix is valid");
+        assert!(events.is_empty());
+        assert_eq!(
+            decoder.finish(),
+            Err(DecodeError::TruncatedPacket { pending_bytes: 2 })
         );
     }
 }
