@@ -130,6 +130,26 @@ impl WaveCraftApp {
                         .on_hover_text("Scan for debug probes, DSLogic, DSCope, and radio devices")
                         .clicked();
                     ui.separator();
+                    let can_record = matches!(
+                        self.system_trace_connection,
+                        SystemTraceConnectionState::Attached {
+                            systemview_enabled: true,
+                            ..
+                        }
+                    );
+                    if ui
+                        .add_enabled(
+                            can_record,
+                            toolbar_action_button(
+                                "● Record…",
+                                egui::Color32::from_rgb(245, 96, 96),
+                            ),
+                        )
+                        .on_hover_text("Record the raw SystemView stream to an .SVDat file")
+                        .clicked()
+                    {
+                        actions.system_trace_action = Some(SystemTraceAction::Record);
+                    }
                     if ui
                         .add_enabled(
                             !self.is_busy() && self.system_trace_connection.is_disconnected(),
@@ -443,16 +463,6 @@ fn paint_trace_run_control(
             systemview_enabled: true,
             ..
         } => {
-            if ui
-                .add(toolbar_action_button(
-                    "● Record…",
-                    egui::Color32::from_rgb(245, 96, 96),
-                ))
-                .on_hover_text("Record the raw SystemView stream to an .SVDat file")
-                .clicked()
-            {
-                actions.system_trace_action = Some(SystemTraceAction::Record);
-            }
             if ui.button("▶ Start").clicked() {
                 actions.system_trace_action = Some(SystemTraceAction::Start);
             }
@@ -1789,10 +1799,12 @@ mod tests {
 
         let title = position("System and RTOS trace");
         let scan = position("↻ Scan devices");
+        let record = position("● Record…");
         let open = position("Open .SVDat…");
 
         assert!(title.x < scan.x);
-        assert!(scan.x < open.x);
+        assert!(scan.x < record.x);
+        assert!(record.x < open.x);
     }
 
     #[test]
