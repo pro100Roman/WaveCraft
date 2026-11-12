@@ -1306,6 +1306,7 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
     );
     let body_height = (view_height - EVENT_TABLE_ROW_HEIGHT - ui.spacing().item_spacing.y)
         .max(EVENT_TABLE_ROW_HEIGHT);
+    let event_row_stride = EVENT_TABLE_ROW_HEIGHT + ui.spacing().item_spacing.y;
 
     let mut event_scroll = egui::ScrollArea::both()
         .id_salt("system_trace_events")
@@ -1313,7 +1314,7 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
         .auto_shrink([false, false]);
     if let Some(row) = focus_row {
         event_scroll = event_scroll.vertical_scroll_offset(
-            (row as f32 * EVENT_TABLE_ROW_HEIGHT - body_height * 0.5).max(0.0),
+            (row as f32 * event_row_stride + event_row_stride * 0.5 - body_height * 0.5).max(0.0),
         );
     }
     let mut clicked_sequence = None;
@@ -1680,6 +1681,16 @@ mod tests {
         texts
     }
 
+    fn shape_contains_fill(shape: &egui::Shape, expected: egui::Color32) -> bool {
+        match shape {
+            egui::Shape::Rect(rect) => rect.fill == expected,
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| shape_contains_fill(shape, expected)),
+            _ => false,
+        }
+    }
+
     #[test]
     fn system_trace_toolbar_can_request_an_application_device_scan() {
         let context = egui::Context::default();
@@ -1817,6 +1828,40 @@ mod tests {
             ),
             Some(41)
         );
+    }
+
+    #[test]
+    fn timeline_selection_paints_event_table_highlight() {
+        let context = egui::Context::default();
+        let mut trace = SystemTraceDisplayState::default();
+        for sequence in 0..100 {
+            trace.ingest(TraceEvent {
+                sequence,
+                core_id: 0,
+                timestamp_ticks: sequence * 10,
+                kind: TraceEventKind::TaskStarted { task_id: 7 },
+            });
+        }
+        trace.select_from_timeline(80);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 400.0),
+            )),
+            ..egui::RawInput::default()
+        };
+
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_event_table(ui, &mut trace, 300.0);
+            });
+        });
+
+        assert_eq!(trace.selected_sequence, Some(80));
+        assert!(output
+            .shapes
+            .iter()
+            .any(|clipped| shape_contains_fill(&clipped.shape, TRACE_EVENT_SELECTION_FILL)));
     }
 
     #[test]
