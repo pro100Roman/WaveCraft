@@ -121,27 +121,27 @@ impl WaveCraftApp {
                     });
                     ui.separator();
                     ui.label(RichText::new("System and RTOS trace").color(TEXT_MUTED));
+                    ui.separator();
+                    actions.refresh_clicked = ui
+                        .add_enabled(
+                            !self.is_busy() && self.system_trace_connection.is_disconnected(),
+                            toolbar_action_button("↻ Scan devices", SCOPE_COLORS[1]),
+                        )
+                        .on_hover_text("Scan for debug probes, DSLogic, DSCope, and radio devices")
+                        .clicked();
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            !self.is_busy() && self.system_trace_connection.is_disconnected(),
+                            toolbar_action_button("Open .SVDat…", TEXT_MUTED),
+                        )
+                        .on_hover_text("Open a raw SEGGER SystemView event stream")
+                        .clicked()
+                    {
+                        actions.system_trace_action = Some(SystemTraceAction::Open);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         paint_trace_run_control(ui, &self.system_trace_connection, actions);
-                        actions.refresh_clicked = ui
-                            .add_enabled(
-                                !self.is_busy() && self.system_trace_connection.is_disconnected(),
-                                toolbar_action_button("↻ Scan devices", SCOPE_COLORS[1]),
-                            )
-                            .on_hover_text(
-                                "Scan for debug probes, DSLogic, DSCope, and radio devices",
-                            )
-                            .clicked();
-                        if ui
-                            .add_enabled(
-                                !self.is_busy() && self.system_trace_connection.is_disconnected(),
-                                egui::Button::new("Open .SVDat…"),
-                            )
-                            .on_hover_text("Open a raw SEGGER SystemView event stream")
-                            .clicked()
-                        {
-                            actions.system_trace_action = Some(SystemTraceAction::Open);
-                        }
                         if ui
                             .add_enabled(
                                 !self.system_trace.events().is_empty()
@@ -1772,6 +1772,27 @@ mod tests {
         let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
 
         assert!(texts.iter().any(|(text, _)| text == "Open .SVDat…"));
+    }
+
+    #[test]
+    fn system_trace_scan_and_open_follow_left_toolbar_order() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
+        let position = |label: &str| {
+            texts
+                .iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, position)| *position)
+                .unwrap_or_else(|| panic!("{label} is painted"))
+        };
+
+        let title = position("System and RTOS trace");
+        let scan = position("↻ Scan devices");
+        let open = position("Open .SVDat…");
+
+        assert!(title.x < scan.x);
+        assert!(scan.x < open.x);
     }
 
     #[test]
