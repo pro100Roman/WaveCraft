@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+pub mod systemview;
+
 /// Stable target-provided identifier for a task or another execution context.
 pub type ContextId = u64;
 
@@ -17,6 +19,7 @@ pub struct TraceEvent {
 /// Device-independent trace events used to reconstruct target execution.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TraceEventKind {
+    NoOp,
     TraceStarted,
     TraceStopped,
     Overflow {
@@ -61,6 +64,49 @@ pub enum TraceEventKind {
         marker_id: u64,
     },
     SystemDescription(String),
+    ClockSyncCycles {
+        cycles: u64,
+    },
+    ClockSyncMicros {
+        micros: u64,
+    },
+    TargetInfo {
+        system_frequency_hz: u64,
+        cpu_frequency_hz: u64,
+        ram_base: u64,
+        id_shift: u64,
+    },
+    StackInfo {
+        task_id: ContextId,
+        stack_base: u64,
+        stack_size: u64,
+        stack_usage: u64,
+    },
+    ModuleDescription {
+        module_id: u64,
+        event_offset: u64,
+        name: String,
+    },
+    ModuleCount {
+        count: u64,
+    },
+    ResourceName {
+        resource_id: ContextId,
+        name: String,
+    },
+    DataSample {
+        sample_id: u64,
+        value: f32,
+    },
+    FormattedPrint {
+        format: String,
+        options: u64,
+        arguments: Vec<u64>,
+    },
+    ApiCallEnded {
+        event_id: u64,
+        return_value: Option<u64>,
+    },
     Unknown {
         event_id: u32,
         payload: Vec<u8>,
@@ -301,9 +347,20 @@ impl CoreTraceState {
                 self.switch_context(Some(ExecutionContext::Idle), timestamp, true);
                 self.continuity_known = true;
             }
-            TraceEventKind::MarkerStarted { .. }
+            TraceEventKind::NoOp
+            | TraceEventKind::MarkerStarted { .. }
             | TraceEventKind::MarkerStopped { .. }
             | TraceEventKind::SystemDescription(_)
+            | TraceEventKind::ClockSyncCycles { .. }
+            | TraceEventKind::ClockSyncMicros { .. }
+            | TraceEventKind::TargetInfo { .. }
+            | TraceEventKind::StackInfo { .. }
+            | TraceEventKind::ModuleDescription { .. }
+            | TraceEventKind::ModuleCount { .. }
+            | TraceEventKind::ResourceName { .. }
+            | TraceEventKind::DataSample { .. }
+            | TraceEventKind::FormattedPrint { .. }
+            | TraceEventKind::ApiCallEnded { .. }
             | TraceEventKind::Unknown { .. } => {}
         }
     }
