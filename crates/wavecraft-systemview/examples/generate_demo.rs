@@ -102,42 +102,62 @@ fn demo_stream() -> io::Result<Vec<u8>> {
     task_info(&mut output, 2, 4, "sensor", 0)?;
     task_info(&mut output, 3, 3, "ble_radio", 0)?;
 
-    compact_packet(&mut output, 4, &values(&[1]), 1_000);
-    formatted_print(&mut output, "application initialized", &[], 450)?;
-    compact_packet(&mut output, 2, &values(&[15]), 620);
-    compact_packet(&mut output, 3, &[], 180);
-    compact_packet(&mut output, 19, &values(&[4]), 520);
-    compact_packet(&mut output, 20, &[], 120);
-    compact_packet(&mut output, 7, &values(&[1, 1]), 400);
-    compact_packet(&mut output, 5, &[], 1);
+    formatted_print(&mut output, "application initialized", &[], 1_000)?;
+    for cycle in 0_u64..64 {
+        compact_packet(&mut output, 4, &values(&[1]), 620 + cycle % 7 * 15);
+        if cycle % 16 == 0 {
+            formatted_print(
+                &mut output,
+                "battery=%u mV",
+                &[3_986_u64.saturating_sub(cycle * 3)],
+                80,
+            )?;
+        }
+        compact_packet(&mut output, 2, &values(&[15]), 240);
+        compact_packet(&mut output, 3, &[], 35);
+        compact_packet(&mut output, 19, &values(&[4]), 110);
+        compact_packet(&mut output, 20, &[], 45);
+        compact_packet(&mut output, 7, &values(&[1, 1]), 190);
+        compact_packet(&mut output, 5, &[], 1);
 
-    compact_packet(&mut output, 4, &values(&[2]), 90);
-    compact_packet(
-        &mut output,
-        23,
-        &values(&[1, u64::from(24.7_f32.to_bits())]),
-        350,
-    );
-    compact_packet(&mut output, 2, &values(&[17]), 400);
-    compact_packet(&mut output, 3, &[], 75);
-    formatted_print(&mut output, "temperature=%u C", &[25], 260)?;
-    compact_packet(&mut output, 7, &values(&[2, 2]), 300);
-    compact_packet(&mut output, 5, &[], 1);
+        compact_packet(&mut output, 4, &values(&[2]), 40);
+        let temperature = 22.0_f32 + (cycle % 12) as f32 * 0.25;
+        compact_packet(
+            &mut output,
+            23,
+            &values(&[1, u64::from(temperature.to_bits())]),
+            135,
+        );
+        compact_packet(&mut output, 2, &values(&[17]), 90);
+        compact_packet(&mut output, 3, &[], 25);
+        if cycle % 8 == 0 {
+            formatted_print(
+                &mut output,
+                "temperature=%u C",
+                &[temperature.round() as u64],
+                30,
+            )?;
+        }
+        compact_packet(&mut output, 7, &values(&[2, 2]), 160);
+        compact_packet(&mut output, 5, &[], 1);
 
-    compact_packet(&mut output, 4, &values(&[3]), 80);
-    compact_packet(&mut output, 15, &values(&[1]), 120);
-    compact_packet(&mut output, 2, &values(&[16]), 180);
-    compact_packet(&mut output, 3, &[], 90);
-    compact_packet(&mut output, 16, &values(&[1]), 250);
-    formatted_print(&mut output, "BLE packet sent, channel=%u", &[37], 100)?;
-    compact_packet(&mut output, 7, &values(&[3, 3]), 310);
-    compact_packet(&mut output, 5, &[], 1);
-
-    compact_packet(&mut output, 17, &[], 100);
-    compact_packet(&mut output, 2, &values(&[15]), 850);
-    compact_packet(&mut output, 18, &[], 120);
-    compact_packet(&mut output, 4, &values(&[1]), 90);
-    formatted_print(&mut output, "battery=%u mV", &[3_986], 340)?;
+        compact_packet(&mut output, 4, &values(&[3]), 55);
+        compact_packet(&mut output, 15, &values(&[cycle % 4 + 1]), 80);
+        compact_packet(&mut output, 2, &values(&[16]), 120);
+        compact_packet(&mut output, 3, &[], 30);
+        compact_packet(&mut output, 16, &values(&[cycle % 4 + 1]), 95);
+        if cycle % 10 == 0 {
+            formatted_print(
+                &mut output,
+                "BLE packet sent, channel=%u",
+                &[37 + cycle % 3],
+                20,
+            )?;
+        }
+        compact_packet(&mut output, 7, &values(&[3, 3]), 140);
+        compact_packet(&mut output, 5, &[], 1);
+        compact_packet(&mut output, 17, &[], 65);
+    }
     compact_packet(&mut output, 11, &[], 900);
 
     Ok(output)

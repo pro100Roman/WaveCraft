@@ -1082,8 +1082,8 @@ mod tests {
 
         state.replace_trace_events(events);
 
-        assert!(state.events().len() >= 30);
-        assert_eq!(state.log_count(), 4);
+        assert!(state.events().len() >= 1_200);
+        assert!(state.log_count() >= 20);
         let core = state.model().core(0).expect("demo contains core 0");
         assert_eq!(
             core.tasks().get(&2).and_then(|task| task.name.as_deref()),
@@ -1097,6 +1097,7 @@ mod tests {
             interval.context,
             wavecraft_trace::ExecutionContext::Timer(4)
         )));
+        assert!(core.intervals().len() >= 700);
     }
 
     #[test]
