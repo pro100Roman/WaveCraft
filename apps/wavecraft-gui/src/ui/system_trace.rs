@@ -146,7 +146,7 @@ impl WaveCraftApp {
                             .add_enabled(
                                 !self.system_trace.events().is_empty()
                                     || !self.system_trace.terminal_lines().is_empty(),
-                                egui::Button::new("Clear"),
+                                toolbar_action_button("Clear", TEXT_MUTED),
                             )
                             .on_hover_text("Clear trace events and RTT terminal output")
                             .clicked()
