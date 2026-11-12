@@ -22,6 +22,8 @@ const TIMELINE_MINIMUM_WIDTH: f32 = 720.0;
 const TIMELINE_ZOOM_STEP: f32 = 1.5;
 const EVENT_TABLE_MINIMUM_WIDTH: f32 = 760.0;
 const TERMINAL_TABLE_MINIMUM_WIDTH: f32 = 720.0;
+const TRACE_SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 92);
+const TRACE_SELECTION_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(32, 27, 12, 32);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SystemTraceSettings {
@@ -803,7 +805,12 @@ fn paint_timeline_canvas(
                 egui::pos2(x_start, row_top + 4.0),
                 egui::pos2((x_end.max(x_start + 2.0)).min(plot_right), row_bottom - 4.0),
             );
+            let interval_sequence = interval_event_sequence(trace, *lane, interval.start_ticks);
+            let interval_selected = interval_sequence == trace.selected_sequence;
             painter.rect_filled(interval_rect, 2.0, context_color(lane.context));
+            if interval_selected {
+                painter.rect_filled(interval_rect, 2.0, TRACE_SELECTION_FILL);
+            }
             let response = ui
                 .interact(
                     interval_rect,
@@ -816,15 +823,8 @@ fn paint_timeline_canvas(
                     interval.start_ticks,
                     interval_end
                 ));
-            if response.hovered() {
-                painter.rect_stroke(
-                    interval_rect,
-                    2.0,
-                    egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
-                );
-            }
             if response.clicked() {
-                clicked_sequence = interval_event_sequence(trace, *lane, interval.start_ticks);
+                clicked_sequence = interval_sequence;
             }
             if !interval.complete {
                 painter.rect_stroke(
@@ -833,18 +833,31 @@ fn paint_timeline_canvas(
                     egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(245, 96, 96)),
                 );
             }
+            if interval_selected {
+                painter.rect_stroke(
+                    interval_rect,
+                    2.0,
+                    egui::Stroke::new(3.0_f32, TRACE_SELECTION_COLOR),
+                );
+            } else if response.hovered() {
+                painter.rect_stroke(
+                    interval_rect,
+                    2.0,
+                    egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
+                );
+            }
         }
     }
     if let Some(timestamp) = selected_timestamp {
         let x = tick_x(timestamp, start_ticks, duration, plot_left, plot_width);
         painter.line_segment(
             [egui::pos2(x, canvas.top()), egui::pos2(x, canvas.bottom())],
-            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 214, 92)),
+            egui::Stroke::new(2.0_f32, TRACE_SELECTION_COLOR),
         );
         painter.circle_filled(
             egui::pos2(x, canvas.top() + 5.0),
             4.0,
-            egui::Color32::from_rgb(255, 214, 92),
+            TRACE_SELECTION_COLOR,
         );
     }
     clicked_sequence
@@ -1316,30 +1329,45 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
             }
             let visible_row = table_row - 1;
             let event = &trace.events()[visible_indices[visible_row]];
-            let response = ui.horizontal(|ui| {
-                ui.add_sized(
-                    [90.0, 20.0],
-                    egui::Label::new(RichText::new(event.timestamp_ticks.to_string()).monospace()),
-                );
-                ui.add_sized([45.0, 20.0], egui::Label::new(event.core_id.to_string()));
-                let clicked = ui
-                    .add_sized(
-                        [170.0, 20.0],
-                        egui::SelectableLabel::new(
-                            selected_sequence == Some(event.sequence),
-                            event_name(&event.kind),
-                        ),
-                    )
-                    .clicked();
-                ui.label(RichText::new(event_summary(&event.kind)).color(TEXT_MUTED));
-                clicked
-            });
-            if response.inner {
+            let event_selected = selected_sequence == Some(event.sequence);
+            let row = egui::Frame::none()
+                .fill(if event_selected {
+                    TRACE_SELECTION_FILL
+                } else {
+                    egui::Color32::TRANSPARENT
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [90.0, 20.0],
+                            egui::Label::new(
+                                RichText::new(event.timestamp_ticks.to_string()).monospace(),
+                            ),
+                        );
+                        ui.add_sized([45.0, 20.0], egui::Label::new(event.core_id.to_string()));
+                        let clicked = ui
+                            .add_sized(
+                                [170.0, 20.0],
+                                egui::SelectableLabel::new(event_selected, event_name(&event.kind)),
+                            )
+                            .clicked();
+                        ui.label(RichText::new(event_summary(&event.kind)).color(TEXT_MUTED));
+                        clicked
+                    })
+                });
+            let row_clicked = ui
+                .interact(
+                    row.response.rect,
+                    ui.id().with(("trace_event_row", event.sequence)),
+                    egui::Sense::click(),
+                )
+                .clicked();
+            if row.inner.inner || row_clicked {
                 selected_sequence = Some(event.sequence);
                 clicked_sequence = Some(event.sequence);
             }
             if follow_latest && visible_row + 1 == event_count {
-                response.response.scroll_to_me(Some(egui::Align::BOTTOM));
+                row.response.scroll_to_me(Some(egui::Align::BOTTOM));
             }
         }
     });
