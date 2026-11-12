@@ -1,9 +1,9 @@
 //! Device refresh and the selection of the logic analyzer, oscilloscope, and radio.
 
 use crate::{
-    discover_supported_devices, first_device_id_for_role, first_radio_id, mpsc,
-    normalize_radio_settings, radio_registry, selected_device_for_role, selected_radio, thread,
-    DeviceRole, DiscoveredDevice, WorkerSuccess,
+    discover_debug_probes, discover_supported_devices, first_device_id_for_role, first_radio_id,
+    mpsc, normalize_radio_settings, radio_registry, selected_device_for_role, selected_radio,
+    thread, DeviceRole, DiscoveredDevice, WorkerSuccess,
 };
 
 use crate::WaveCraftApp;
@@ -27,10 +27,12 @@ impl WaveCraftApp {
         self.last_error = None;
         thread::spawn(move || {
             let radio = radio_registry().discover();
+            let debug_probes = discover_debug_probes();
             let result = discover_supported_devices()
                 .map(|report| WorkerSuccess::Devices {
                     usb: report.devices,
                     radio,
+                    debug_probes,
                 })
                 .map_err(|error| error.to_string());
             let _ = sender.send(result);

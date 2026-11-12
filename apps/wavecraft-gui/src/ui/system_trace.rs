@@ -5,6 +5,7 @@ use crate::{
     egui, toolbar_action_button, ui::frame_actions::FrameActions, RichText, WaveCraftApp, ACCENT,
     BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
 };
+use wavecraft_debug_probe::{ProbeDescriptor, ProbeProvider};
 use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
 
 const TIMELINE_LABEL_WIDTH: f32 = 150.0;
@@ -13,6 +14,7 @@ const TIMELINE_ROW_HEIGHT: f32 = 25.0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SystemTraceSettings {
+    pub(crate) probe_connection_id: Option<String>,
     pub(crate) target_name: String,
     pub(crate) speed_khz: u32,
     pub(crate) control_block_address: String,
@@ -23,6 +25,7 @@ pub(crate) struct SystemTraceSettings {
 impl Default for SystemTraceSettings {
     fn default() -> Self {
         Self {
+            probe_connection_id: None,
             target_name: String::new(),
             speed_khz: 4_000,
             control_block_address: String::new(),
@@ -63,7 +66,9 @@ impl WaveCraftApp {
                                 !self.is_busy(),
                                 toolbar_action_button("↻ Scan devices", SCOPE_COLORS[1]),
                             )
-                            .on_hover_text("Scan for DSLogic, DSCope, and radio devices")
+                            .on_hover_text(
+                                "Scan for debug probes, DSLogic, DSCope, and radio devices",
+                            )
                             .clicked();
                     });
                 });
@@ -88,12 +93,40 @@ impl WaveCraftApp {
                         ui.add_space(12.0);
 
                         setup_label(ui, "Debug probe");
+                        let selected_probe = self
+                            .system_trace_settings
+                            .probe_connection_id
+                            .as_deref()
+                            .and_then(|connection_id| {
+                                self.debug_probes.iter().find(|probe| {
+                                    probe.connection_id.as_str() == connection_id
+                                })
+                            })
+                            .map(probe_label)
+                            .unwrap_or_else(|| "No debug probe found".to_owned());
                         egui::ComboBox::from_id_salt("system_trace_probe")
                             .width(ui.available_width())
-                            .selected_text("No probe backend in this build")
+                            .selected_text(selected_probe)
                             .show_ui(ui, |ui| {
-                                ui.add_enabled(false, egui::Label::new("No probes found"));
+                                if self.debug_probes.is_empty() {
+                                    ui.add_enabled(false, egui::Label::new("No probes found"));
+                                }
+                                for probe in &self.debug_probes {
+                                    ui.selectable_value(
+                                        &mut self.system_trace_settings.probe_connection_id,
+                                        Some(probe.connection_id.clone()),
+                                        probe_label(probe),
+                                    )
+                                    .on_hover_text(&probe.connection_id);
+                                }
                             });
+                        if let Some(error) = &self.debug_probe_discovery_error {
+                            ui.label(
+                                RichText::new(error)
+                                    .small()
+                                    .color(egui::Color32::from_rgb(245, 96, 96)),
+                            );
+                        }
 
                         ui.add_space(10.0);
                         setup_label(ui, "Target MCU");
@@ -146,7 +179,7 @@ impl WaveCraftApp {
                         ui.add_space(8.0);
                         ui.label(
                             RichText::new(
-                                "Probe discovery is isolated behind wavecraft-debug-probe. Enable a compatible backend to connect hardware.",
+                                "Probe discovery runs through the isolated probe-rs helper. Target attachment remains disabled until the capture worker is connected.",
                             )
                             .small()
                             .color(TEXT_MUTED),
@@ -174,6 +207,22 @@ impl WaveCraftApp {
 
 fn setup_label(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).small().color(TEXT_MUTED));
+}
+
+fn probe_label(probe: &ProbeDescriptor) -> String {
+    let provider = match &probe.provider {
+        ProbeProvider::JLink => "J-Link",
+        ProbeProvider::StLink => "ST-Link",
+        ProbeProvider::BlackMagicProbe => "Black Magic Probe",
+        ProbeProvider::CmsisDap => "CMSIS-DAP",
+        ProbeProvider::Other(provider) => provider,
+    };
+    let serial = probe
+        .serial_number
+        .as_deref()
+        .map(|serial| format!(" · {serial}"))
+        .unwrap_or_default();
+    format!("{provider} · {}{serial}", probe.model)
 }
 
 fn instrument_frame() -> egui::Frame {

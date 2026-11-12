@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 wavecraft-core = { path = "../../crates/wavecraft-core" }
 wavecraft-decode = { path = "../../crates/wavecraft-decode" }
+wavecraft-debug-probe = { path = "../../crates/wavecraft-debug-probe" }
 wavecraft-dsp = { path = "../../crates/wavecraft-dsp" }
 wavecraft-hackrf = { path = "../../crates/wavecraft-hackrf" }
 wavecraft-recording = { path = "../../crates/wavecraft-recording" }

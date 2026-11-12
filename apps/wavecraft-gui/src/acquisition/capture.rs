@@ -3,16 +3,16 @@
 
 use crate::{
     open_radio_source, prepare_device, BufWriter, CaptureBatch, CaptureCoordinator, CaptureEvent,
-    CaptureFrame, CaptureSession, CaptureSource, CompletionStatus, DeviceId, DeviceModel,
-    DiscoveredDevice, DsCopeCalibrationValues, DsCopeCaptureConfig, DsCopeCaptureSource,
-    DsCopeRuntimeCalibrationControl, DsCopeRuntimeTriggerControl, DsCopeTriggerSource,
-    DsLogicCaptureConfig, DsLogicCaptureSource, DsLogicOperationMode, Duration, File,
-    FileDecodedDataRecorder, HashSet, Instant, LinkStatus, LoadedRecording, LogicDecodeOutput,
-    LogicDecodeWorker, Path, PathBuf, ProtocolAnalyzerInstance, ProtocolCaptureDecoder,
-    ProtocolDecodeSnapshot, RadioAnalyzerRuntime, RadioCaptureRequest, RadioDiscoveryReport,
-    RadioDspWorker, RadioRuntimeControl, RadioSingleTrigger, RecordingWriter, SpectrumProcessor,
-    SpectrumWindow, WaveformStore, DSCOPE_FRAME_SEQUENCE_STRIDE, RADIO_SPECTRUM_FFT_LENGTH,
-    SCOPE_HORIZONTAL_DIVISIONS, SCOPE_ROLLING_MEMORY_BUDGET_BYTES,
+    CaptureFrame, CaptureSession, CaptureSource, CompletionStatus, DebugProbeDiscoveryReport,
+    DeviceId, DeviceModel, DiscoveredDevice, DsCopeCalibrationValues, DsCopeCaptureConfig,
+    DsCopeCaptureSource, DsCopeRuntimeCalibrationControl, DsCopeRuntimeTriggerControl,
+    DsCopeTriggerSource, DsLogicCaptureConfig, DsLogicCaptureSource, DsLogicOperationMode,
+    Duration, File, FileDecodedDataRecorder, HashSet, Instant, LinkStatus, LoadedRecording,
+    LogicDecodeOutput, LogicDecodeWorker, Path, PathBuf, ProtocolAnalyzerInstance,
+    ProtocolCaptureDecoder, ProtocolDecodeSnapshot, RadioAnalyzerRuntime, RadioCaptureRequest,
+    RadioDiscoveryReport, RadioDspWorker, RadioRuntimeControl, RadioSingleTrigger, RecordingWriter,
+    SpectrumProcessor, SpectrumWindow, WaveformStore, DSCOPE_FRAME_SEQUENCE_STRIDE,
+    RADIO_SPECTRUM_FFT_LENGTH, SCOPE_HORIZONTAL_DIVISIONS, SCOPE_ROLLING_MEMORY_BUDGET_BYTES,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -422,6 +422,7 @@ pub(crate) enum WorkerSuccess {
     Devices {
         usb: Vec<DiscoveredDevice>,
         radio: RadioDiscoveryReport,
+        debug_probes: DebugProbeDiscoveryReport,
     },
     Capture(Box<CaptureReady>),
     ScopeConfigured,

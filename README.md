@@ -281,9 +281,11 @@ open target/release/bundle/osx/WaveCraft.app
 ```
 
 Double-clicking `WaveCraft.app` launches the GUI without opening Terminal. The
-bundle includes the FPGA resources and the scoped macOS `libhackrf` workaround,
-and the application locates both relative to its executable. This lets HackRF
-One open as a normal user without `sudo`. Double-clicking the raw
+bundle includes the FPGA resources, the scoped macOS `libhackrf` workaround,
+and the separately built `probe-rs` debug-probe helper. The application locates
+these relative to its executable. This lets HackRF One open as a normal user
+without `sudo` and keeps the helper's newer Rust requirement out of the main
+WaveCraft binary. Double-clicking the raw
 `target/release/wavecraft-gui` Unix binary will still open Terminal because it
 is not an application bundle and does not use the bundle launcher.
 

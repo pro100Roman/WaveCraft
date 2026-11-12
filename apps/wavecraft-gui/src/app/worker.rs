@@ -5,10 +5,10 @@ use crate::{
     recording_capture_target, recording_completion_label, scope_rolling_sample_capacity,
     start_gui_recording, usb_speed_warning, uses_rolling_scope_buffer, AcquisitionMode,
     ActiveCapture, CaptureReady, CaptureSession, CaptureSettingsTab, CaptureTarget,
-    CompletionStatus, DeviceDescriptor, DeviceEntry, DiscoveredDevice, DsCopeCalibrationValues,
-    DsCopeCaptureConfig, DsCopeRuntimeTriggerControl, DsCopeTriggerSource, DsLogicCaptureConfig,
-    FileDecodedDataRecorder, FileRecorder, GuiRecordingSettings, HashSet, InstrumentKind,
-    LoadedRecording, LogicDecodeWorker, ManualCalibrationEditor, Path, PathBuf,
+    CompletionStatus, DebugProbeDiscoveryReport, DeviceDescriptor, DeviceEntry, DiscoveredDevice,
+    DsCopeCalibrationValues, DsCopeCaptureConfig, DsCopeRuntimeTriggerControl, DsCopeTriggerSource,
+    DsLogicCaptureConfig, FileDecodedDataRecorder, FileRecorder, GuiRecordingSettings, HashSet,
+    InstrumentKind, LoadedRecording, LogicDecodeWorker, ManualCalibrationEditor, Path, PathBuf,
     ProtocolAnalyzerInstance, ProtocolCaptureDecoder, ProtocolDecodeSnapshot, RadioDiscoveryReport,
     RadioSingleTrigger, ScopeMeasurementCache, TryRecvError, WaveformStore, WaveformTab,
     WorkerSuccess, DSCOPE_VOLTS_PER_DIV_MV,
@@ -147,7 +147,11 @@ impl WaveCraftApp {
         };
         self.pending = None;
         match result {
-            Ok(WorkerSuccess::Devices { usb, radio }) => self.handle_devices_found(usb, radio),
+            Ok(WorkerSuccess::Devices {
+                usb,
+                radio,
+                debug_probes,
+            }) => self.handle_devices_found(usb, radio, debug_probes),
             Ok(WorkerSuccess::Capture(ready)) => self.handle_capture_ready(*ready),
             Ok(WorkerSuccess::RecordingLoaded { path, recording }) => {
                 self.handle_recording_loaded(path, recording)
@@ -182,6 +186,7 @@ impl WaveCraftApp {
         &mut self,
         usb: Vec<DiscoveredDevice>,
         radio: RadioDiscoveryReport,
+        debug_probes: DebugProbeDiscoveryReport,
     ) {
         self.usb_speed_warning = usb_speed_warning(&usb);
         self.devices = usb
@@ -190,8 +195,25 @@ impl WaveCraftApp {
             .collect();
         self.radios = radio.devices;
         self.radio_discovery_failures = radio.failures;
+        self.debug_probes = debug_probes.probes;
+        self.debug_probe_discovery_error = debug_probes.error;
+        let selected_probe_is_available = self
+            .system_trace_settings
+            .probe_connection_id
+            .as_ref()
+            .is_some_and(|selected| {
+                self.debug_probes
+                    .iter()
+                    .any(|probe| probe.connection_id == *selected)
+            });
+        if !selected_probe_is_available {
+            self.system_trace_settings.probe_connection_id = self
+                .debug_probes
+                .first()
+                .map(|probe| probe.connection_id.clone());
+        }
         self.reconcile_device_selections();
-        let detected_count = self.devices.len() + self.radios.len();
+        let detected_count = self.devices.len() + self.radios.len() + self.debug_probes.len();
         self.status = if detected_count == 0 {
             "No supported instruments detected".to_owned()
         } else {
@@ -939,6 +961,7 @@ mod tests {
             Ok(WorkerSuccess::Devices {
                 usb: Vec::new(),
                 radio: RadioDiscoveryReport::default(),
+                debug_probes: DebugProbeDiscoveryReport::default(),
             }),
         );
 
@@ -961,7 +984,11 @@ mod tests {
         let slow = device("usb:1-2", UsbSpeedClass::HighSpeed);
         let first_id = fast.location.stable_id();
 
-        app.handle_devices_found(vec![fast, slow], RadioDiscoveryReport::default());
+        app.handle_devices_found(
+            vec![fast, slow],
+            RadioDiscoveryReport::default(),
+            DebugProbeDiscoveryReport::default(),
+        );
 
         assert_eq!(app.devices.len(), 2);
         assert_eq!(app.status, "Detected 2 supported instrument(s)");
@@ -971,6 +998,34 @@ mod tests {
             .expect("one link is slower than USB 3");
         assert_eq!(warning.devices.len(), 1);
         assert_eq!(warning.devices[0].location.platform_path, "usb:1-2");
+    }
+
+    #[test]
+    fn found_debug_probe_is_listed_selected_and_counted() {
+        let mut app = app();
+        let probe = wavecraft_debug_probe::ProbeDescriptor {
+            connection_id: "1366:0105:000261009815".to_owned(),
+            provider: wavecraft_debug_probe::ProbeProvider::JLink,
+            vendor: Some("SEGGER".to_owned()),
+            model: "J-Link_RH".to_owned(),
+            serial_number: Some("000261009815".to_owned()),
+        };
+
+        app.handle_devices_found(
+            Vec::new(),
+            RadioDiscoveryReport::default(),
+            DebugProbeDiscoveryReport {
+                probes: vec![probe.clone()],
+                error: None,
+            },
+        );
+
+        assert_eq!(app.debug_probes, [probe]);
+        assert_eq!(
+            app.system_trace_settings.probe_connection_id.as_deref(),
+            Some("1366:0105:000261009815")
+        );
+        assert_eq!(app.status, "Detected 1 supported instrument(s)");
     }
 
     #[test]

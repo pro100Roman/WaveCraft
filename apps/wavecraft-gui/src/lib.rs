@@ -1,6 +1,7 @@
 mod acquisition;
 mod app;
 mod capture_settings;
+mod debug_probes;
 mod devices;
 mod format;
 #[cfg(test)]
@@ -30,6 +31,7 @@ use acquisition::scope::*;
 use capture_settings::{
     CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository,
 };
+use debug_probes::*;
 use devices::{
     capture_devices_for_target, default_resource_directory, first_device_id_for_role,
     first_radio_id, selected_device_for_role, selected_radio, usb_speed_warning, DeviceEntry,
@@ -333,6 +335,8 @@ struct WaveCraftApp {
     system_trace_settings: SystemTraceSettings,
     system_trace: system_trace::SystemTraceDisplayState,
     system_trace_events: Option<Receiver<wavecraft_trace::TraceEvent>>,
+    debug_probes: Vec<wavecraft_debug_probe::ProbeDescriptor>,
+    debug_probe_discovery_error: Option<String>,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
     logic_channel_marker_opacities: [u8; LOGIC_CHANNEL_COUNT],
@@ -453,6 +457,8 @@ impl WaveCraftApp {
             system_trace_settings: SystemTraceSettings::default(),
             system_trace: system_trace::SystemTraceDisplayState::default(),
             system_trace_events: None,
+            debug_probes: Vec::new(),
+            debug_probe_discovery_error: None,
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
             logic_channel_marker_opacities: default_logic_channel_marker_opacities(),

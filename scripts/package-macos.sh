@@ -8,6 +8,9 @@ contents="$bundle/Contents"
 shim_source="$script_directory/macos-libhackrf-no-detach.c"
 shim_build_directory="$project_root/target/release/macos-shim"
 shim_library="$shim_build_directory/libwavecraft-libusb-no-detach.dylib"
+probe_helper_manifest="$project_root/crates/wavecraft-probe-rs/Cargo.toml"
+probe_helper_target_directory="$project_root/target/probe-helper"
+probe_helper_binary="$probe_helper_target_directory/release/wavecraft-probe-helper"
 universal=false
 
 if [[ $# -gt 1 ]]; then
@@ -58,6 +61,22 @@ if "$universal"; then
         target/x86_64-apple-darwin/release/wavecraft-gui \
         -output target/release/wavecraft-gui
 
+    cargo build --release --locked \
+        --manifest-path "$probe_helper_manifest" \
+        --target-dir "$probe_helper_target_directory" \
+        --bin wavecraft-probe-helper \
+        --target aarch64-apple-darwin
+    cargo build --release --locked \
+        --manifest-path "$probe_helper_manifest" \
+        --target-dir "$probe_helper_target_directory" \
+        --bin wavecraft-probe-helper \
+        --target x86_64-apple-darwin
+    mkdir -p "$probe_helper_target_directory/release"
+    lipo -create \
+        "$probe_helper_target_directory/aarch64-apple-darwin/release/wavecraft-probe-helper" \
+        "$probe_helper_target_directory/x86_64-apple-darwin/release/wavecraft-probe-helper" \
+        -output "$probe_helper_binary"
+
     mkdir -p "$shim_build_directory"
     xcrun clang -arch arm64 \
         -dynamiclib \
@@ -75,6 +94,10 @@ if "$universal"; then
         -output "$shim_library"
 else
     cargo build --release --locked -p wavecraft-gui
+    cargo build --release --locked \
+        --manifest-path "$probe_helper_manifest" \
+        --target-dir "$probe_helper_target_directory" \
+        --bin wavecraft-probe-helper
     mkdir -p "$shim_build_directory"
     xcrun clang \
         -dynamiclib \
@@ -87,6 +110,7 @@ rm -rf "$bundle"
 mkdir -p "$contents/Frameworks" "$contents/MacOS" "$contents/Resources"
 install -m 755 packaging/macos/WaveCraft "$contents/MacOS/WaveCraft"
 install -m 755 target/release/wavecraft-gui "$contents/MacOS/WaveCraft-bin"
+install -m 755 "$probe_helper_binary" "$contents/MacOS/wavecraft-probe-helper"
 install -m 755 "$shim_library" \
     "$contents/Frameworks/libwavecraft-libusb-no-detach.dylib"
 cp packaging/macos/Info.plist "$contents/Info.plist"
@@ -98,6 +122,7 @@ cp -R resources/fpga "$contents/Resources/fpga"
 if command -v codesign >/dev/null 2>&1; then
     codesign --force --sign - \
         "$contents/Frameworks/libwavecraft-libusb-no-detach.dylib"
+    codesign --force --sign - "$contents/MacOS/wavecraft-probe-helper"
     codesign --force --sign - "$contents/MacOS/WaveCraft-bin"
     codesign --force --deep --sign - "$bundle"
 fi
