@@ -1,11 +1,14 @@
 //! Bounded GUI state for decoded system trace events.
 
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
-use crate::debug_probes::DebugProbeHelperProcess;
+use crate::{debug_probes::DebugProbeHelperProcess, WorkerSuccess};
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugProbeCommand, DebugProbeError, DebugProbeErrorKind, DebugProbeReply,
     ProbeSelector, RttChannelDescriptor, RttChannelDirection, RttConfiguration, RttTerminalDecoder,
@@ -18,6 +21,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 100_000;
 const DEFAULT_TERMINAL_LINE_CAPACITY: usize = 20_000;
 const RTT_READ_SIZE: usize = 16 * 1024;
 const IDLE_RTT_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const SYSTEMVIEW_FILE_READ_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum TraceEventView {
@@ -98,6 +102,7 @@ pub(crate) enum SystemTraceWorkerCommand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SystemTraceAction {
+    Open,
     Connect,
     Start,
     Stop,
@@ -493,6 +498,21 @@ fn unexpected_reply(operation: &str) -> DebugProbeError {
 }
 
 impl crate::WaveCraftApp {
+    pub(crate) fn begin_open_system_trace(&mut self, path: PathBuf) {
+        if self.pending.is_some() || !self.system_trace_connection.is_disconnected() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.pending = Some(receiver);
+        self.status = format!("Opening SystemView trace {}…", path.display());
+        self.last_error = None;
+        thread::spawn(move || {
+            let result = read_systemview_trace_file(&path)
+                .map(|events| WorkerSuccess::SystemTraceLoaded { path, events });
+            let _ = sender.send(result);
+        });
+    }
+
     pub(crate) fn begin_system_trace_connection(
         &mut self,
         configuration: SystemTraceConnectionConfiguration,
@@ -698,6 +718,15 @@ impl SystemTraceDisplayState {
         self.terminal_lines.push_back(line);
     }
 
+    pub(crate) fn replace_trace_events(&mut self, events: impl IntoIterator<Item = TraceEvent>) {
+        self.clear_trace_events();
+        self.event_filter.clear();
+        self.event_view = TraceEventView::Events;
+        for event in events {
+            self.ingest(event);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn ingest_all(&mut self, events: impl IntoIterator<Item = TraceEvent>) {
         for event in events {
@@ -755,6 +784,52 @@ impl SystemTraceDisplayState {
             ..Self::default()
         }
     }
+}
+
+pub(crate) fn choose_systemview_trace_to_open() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Open raw SystemView trace")
+        .add_filter("SystemView data", &["SVDat", "svdat"])
+        .pick_file()
+}
+
+fn read_systemview_trace_file(path: &Path) -> Result<Vec<TraceEvent>, String> {
+    let file = File::open(path).map_err(|error| {
+        format!(
+            "failed to open SystemView trace {}: {error}",
+            path.display()
+        )
+    })?;
+    decode_systemview_stream(BufReader::new(file)).map_err(|error| {
+        format!(
+            "failed to read SystemView trace {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn decode_systemview_stream(mut input: impl Read) -> Result<Vec<TraceEvent>, String> {
+    let mut decoder = SystemViewDecoder::default();
+    let mut buffer = vec![0_u8; SYSTEMVIEW_FILE_READ_SIZE];
+    let mut events = Vec::new();
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to read trace bytes: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        events.extend(
+            decoder
+                .push(&buffer[..count])
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    decoder.finish().map_err(|error| error.to_string())?;
+    if events.is_empty() {
+        return Err("the file contains no SystemView events".to_owned());
+    }
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -821,6 +896,40 @@ mod tests {
             timestamp_ticks,
             kind,
         }
+    }
+
+    #[test]
+    fn imports_raw_systemview_event_streams() {
+        let bytes = [
+            10, 1, // Trace started.
+            9, 7, 3, 6, b'w', b'o', b'r', b'k', b'e', b'r', 2, // Task metadata.
+            4, 7, 3, // Task started.
+            11, 4, // Trace stopped.
+        ];
+
+        let events = decode_systemview_stream(std::io::Cursor::new(bytes))
+            .expect("raw SystemView data imports");
+
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].kind, TraceEventKind::TraceStarted);
+        assert_eq!(
+            events[1].kind,
+            TraceEventKind::TaskInfo {
+                task_id: 7,
+                priority: 3,
+                name: "worker".to_owned(),
+            }
+        );
+        assert_eq!(events[2].timestamp_ticks, 6);
+        assert_eq!(events[3].kind, TraceEventKind::TraceStopped);
+    }
+
+    #[test]
+    fn rejects_empty_systemview_files() {
+        assert_eq!(
+            decode_systemview_stream(std::io::Cursor::new([])),
+            Err("the file contains no SystemView events".to_owned())
+        );
     }
 
     #[test]

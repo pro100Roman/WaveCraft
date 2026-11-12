@@ -434,6 +434,10 @@ pub(crate) enum WorkerSuccess {
         path: PathBuf,
         recording: Box<LoadedRecording>,
     },
+    SystemTraceLoaded {
+        path: PathBuf,
+        events: Vec<wavecraft_trace::TraceEvent>,
+    },
     SaleaeExported(PathBuf),
 }
 

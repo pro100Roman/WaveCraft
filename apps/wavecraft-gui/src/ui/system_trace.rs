@@ -1,7 +1,8 @@
 //! Independent System Trace workspace and decoded-event instruments.
 
 use crate::system_trace::{
-    SystemTraceAction, SystemTraceConnectionConfiguration, SystemTraceConnectionState,
+    choose_systemview_trace_to_open, SystemTraceAction, SystemTraceConnectionConfiguration,
+    SystemTraceConnectionState,
 };
 use crate::system_trace::{SystemTraceDisplayState, TraceEventView};
 use crate::{
@@ -121,6 +122,16 @@ impl WaveCraftApp {
                                 "Scan for debug probes, DSLogic, DSCope, and radio devices",
                             )
                             .clicked();
+                        if ui
+                            .add_enabled(
+                                !self.is_busy() && self.system_trace_connection.is_disconnected(),
+                                egui::Button::new("Open .SVDat…"),
+                            )
+                            .on_hover_text("Open a raw SEGGER SystemView event stream")
+                            .clicked()
+                        {
+                            actions.system_trace_action = Some(SystemTraceAction::Open);
+                        }
                     });
                 });
             });
@@ -321,6 +332,11 @@ impl WaveCraftApp {
 
     pub(crate) fn apply_system_trace_action(&mut self, action: Option<SystemTraceAction>) {
         match action {
+            Some(SystemTraceAction::Open) => {
+                if let Some(path) = choose_systemview_trace_to_open() {
+                    self.begin_open_system_trace(path);
+                }
+            }
             Some(SystemTraceAction::Connect) => {
                 match self.system_trace_settings.connection_configuration() {
                     Ok(configuration) => self.begin_system_trace_connection(configuration),
@@ -1230,6 +1246,16 @@ mod tests {
         );
 
         assert!(actions.refresh_clicked);
+    }
+
+    #[test]
+    fn system_trace_toolbar_exposes_systemview_file_import() {
+        let context = egui::Context::default();
+        let mut app = app();
+
+        let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
+
+        assert!(texts.iter().any(|(text, _)| text == "Open .SVDat…"));
     }
 
     #[test]

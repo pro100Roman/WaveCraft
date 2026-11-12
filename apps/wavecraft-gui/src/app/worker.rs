@@ -156,6 +156,16 @@ impl WaveCraftApp {
             Ok(WorkerSuccess::RecordingLoaded { path, recording }) => {
                 self.handle_recording_loaded(path, recording)
             }
+            Ok(WorkerSuccess::SystemTraceLoaded { path, events }) => {
+                let event_count = events.len();
+                self.system_trace.replace_trace_events(events);
+                self.select_system_trace_view();
+                self.status = format!(
+                    "Opened SystemView trace {} · {event_count} events",
+                    path.display()
+                );
+                self.last_error = None;
+            }
             Ok(WorkerSuccess::SaleaeExported(path)) => {
                 self.status = format!("Exported Saleae capture to {}", path.display());
                 self.last_error = None;
