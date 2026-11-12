@@ -9,6 +9,11 @@ const FIRST_LENGTH_PREFIXED_EVENT_ID: u64 = 24;
 const MAX_VARINT_BYTES: usize = 5;
 const DEFAULT_MAX_PACKET_SIZE: usize = 64 * 1024;
 
+/// Host-to-target command that enables SystemView recording.
+pub const SYSTEMVIEW_COMMAND_START: u8 = 1;
+/// Host-to-target command that disables SystemView recording.
+pub const SYSTEMVIEW_COMMAND_STOP: u8 = 2;
+
 /// A SystemView wire-format decoding failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecodeError {
