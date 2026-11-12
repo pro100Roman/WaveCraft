@@ -2,11 +2,13 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 /// Stable target-provided identifier for a task or another execution context.
 pub type ContextId = u64;
 
 /// One decoded trace event on a target core's monotonic clock.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TraceEvent {
     pub sequence: u64,
     pub core_id: u32,
@@ -15,7 +17,8 @@ pub struct TraceEvent {
 }
 
 /// Device-independent trace events used to reconstruct target execution.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum TraceEventKind {
     NoOp,
     TraceStarted,
@@ -573,6 +576,42 @@ mod tests {
         assert_eq!(
             model.core(1).and_then(CoreTraceState::active_context),
             Some(ExecutionContext::Idle)
+        );
+    }
+
+    #[test]
+    fn normalized_events_have_a_stable_tagged_representation() {
+        let event = TraceEvent {
+            sequence: 17,
+            core_id: 2,
+            timestamp_ticks: 99,
+            kind: TraceEventKind::FormattedPrint {
+                format: "value=%u".to_owned(),
+                options: 3,
+                arguments: vec![4, 5],
+            },
+        };
+
+        let value = serde_json::to_value(&event).expect("event serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "sequence": 17,
+                "core_id": 2,
+                "timestamp_ticks": 99,
+                "kind": {
+                    "type": "formatted_print",
+                    "data": {
+                        "format": "value=%u",
+                        "options": 3,
+                        "arguments": [4, 5]
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<TraceEvent>(value).expect("event deserializes"),
+            event
         );
     }
 }
