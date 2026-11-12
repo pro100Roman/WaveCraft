@@ -842,20 +842,18 @@ impl SystemTraceDisplayState {
         if !available_height.is_finite() {
             return;
         }
-        let target_height = available_height.clamp(
-            MIN_TRACE_INSTRUMENT_HEIGHT * 2.0,
-            MAX_TRACE_INSTRUMENT_HEIGHT * 2.0,
-        );
+        let target_height = available_height.clamp(0.0, MAX_TRACE_INSTRUMENT_HEIGHT * 2.0);
         let current_height = self.timeline_view_height + self.event_view_height;
         let timeline_fraction = if current_height > 0.0 {
             self.timeline_view_height / current_height
         } else {
             0.5
         };
+        let effective_minimum = MIN_TRACE_INSTRUMENT_HEIGHT.min(target_height * 0.5);
         let minimum_timeline_height =
-            MIN_TRACE_INSTRUMENT_HEIGHT.max(target_height - MAX_TRACE_INSTRUMENT_HEIGHT);
+            effective_minimum.max(target_height - MAX_TRACE_INSTRUMENT_HEIGHT);
         let maximum_timeline_height =
-            MAX_TRACE_INSTRUMENT_HEIGHT.min(target_height - MIN_TRACE_INSTRUMENT_HEIGHT);
+            MAX_TRACE_INSTRUMENT_HEIGHT.min(target_height - effective_minimum);
         self.timeline_view_height = (target_height * timeline_fraction)
             .clamp(minimum_timeline_height, maximum_timeline_height);
         self.event_view_height = target_height - self.timeline_view_height;
@@ -865,13 +863,15 @@ impl SystemTraceDisplayState {
         if !delta.is_finite() {
             return;
         }
-        let minimum_delta = (MIN_TRACE_INSTRUMENT_HEIGHT - self.timeline_view_height)
-            .max(self.event_view_height - MAX_TRACE_INSTRUMENT_HEIGHT);
-        let maximum_delta = (MAX_TRACE_INSTRUMENT_HEIGHT - self.timeline_view_height)
-            .min(self.event_view_height - MIN_TRACE_INSTRUMENT_HEIGHT);
-        let delta = delta.clamp(minimum_delta, maximum_delta);
-        self.timeline_view_height += delta;
-        self.event_view_height -= delta;
+        let total_height = self.timeline_view_height + self.event_view_height;
+        let effective_minimum = MIN_TRACE_INSTRUMENT_HEIGHT.min(total_height * 0.5);
+        let minimum_timeline_height =
+            effective_minimum.max(total_height - MAX_TRACE_INSTRUMENT_HEIGHT);
+        let maximum_timeline_height =
+            MAX_TRACE_INSTRUMENT_HEIGHT.min(total_height - effective_minimum);
+        self.timeline_view_height = (self.timeline_view_height + delta)
+            .clamp(minimum_timeline_height, maximum_timeline_height);
+        self.event_view_height = total_height - self.timeline_view_height;
     }
 
     pub(crate) fn select_from_timeline(&mut self, sequence: u64) {
@@ -1311,10 +1311,10 @@ mod tests {
         state.fit_trace_instruments_to_height(100.0);
         assert_eq!(
             state.timeline_view_height() + state.event_view_height(),
-            MIN_TRACE_INSTRUMENT_HEIGHT * 2.0
+            100.0
         );
-        assert!(state.timeline_view_height() >= MIN_TRACE_INSTRUMENT_HEIGHT);
-        assert!(state.event_view_height() >= MIN_TRACE_INSTRUMENT_HEIGHT);
+        assert_eq!(state.timeline_view_height(), 50.0);
+        assert_eq!(state.event_view_height(), 50.0);
     }
 
     #[test]

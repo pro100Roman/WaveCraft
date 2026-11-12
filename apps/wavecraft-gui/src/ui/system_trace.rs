@@ -567,13 +567,13 @@ fn paint_trace_summary(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
 
 fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     instrument_frame().show(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("TIMELINE").strong().color(ACCENT));
             ui.label(
                 RichText::new("Task, ISR, timer, scheduler, and idle execution").color(TEXT_MUTED),
             );
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.small_button("−").on_hover_text("Zoom out").clicked() {
                 trace.scale_timeline_zoom(1.0 / TIMELINE_ZOOM_STEP);
             }
@@ -606,11 +606,9 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 trace.set_timeline_zoom(1.0);
             }
             ui.label(
-                RichText::new(
-                    "Pinch, Command/Ctrl-scroll, or Option/Alt-scroll to zoom; drag to pan",
-                )
-                .small()
-                .color(TEXT_MUTED),
+                RichText::new("Zoom: pinch or modifier-scroll; pan: drag")
+                    .small()
+                    .color(TEXT_MUTED),
             );
         });
         ui.add_space(6.0);
@@ -1046,7 +1044,7 @@ fn context_color(context: ExecutionContext) -> egui::Color32 {
 fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     instrument_frame().show(ui, |ui| {
         let mut clear_requested = false;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut trace.event_view, TraceEventView::Events, "EVENTS");
             ui.selectable_value(&mut trace.event_view, TraceEventView::Logs, "LOGS");
             ui.selectable_value(
@@ -1061,14 +1059,12 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
                     .desired_width(180.0),
             );
             ui.checkbox(&mut trace.follow_latest, "Follow latest");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                clear_requested = ui
-                    .add_enabled(
-                        !trace.events().is_empty() || !trace.terminal_lines().is_empty(),
-                        egui::Button::new("Clear"),
-                    )
-                    .clicked();
-            });
+            clear_requested = ui
+                .add_enabled(
+                    !trace.events().is_empty() || !trace.terminal_lines().is_empty(),
+                    egui::Button::new("Clear"),
+                )
+                .clicked();
         });
         ui.add_space(5.0);
         let footer_height = if matches!(
@@ -1485,25 +1481,32 @@ fn paint_selected_event(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
         return;
     };
     ui.separator();
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("SELECTED").strong().color(ACCENT));
-        ui.label(format!("sequence {}", event.sequence));
-        ui.label(format!("core {}", event.core_id));
-        ui.label(format!("{} ticks", event.timestamp_ticks));
-        ui.label(
-            RichText::new(format!("{:?}", event.kind))
-                .monospace()
-                .color(TEXT_MUTED),
-        );
-    });
+    egui::ScrollArea::horizontal()
+        .id_salt("system_trace_selected_event")
+        .max_height(SELECTED_EVENT_FOOTER_HEIGHT)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("SELECTED").strong().color(ACCENT));
+                ui.label(format!("sequence {}", event.sequence));
+                ui.label(format!("core {}", event.core_id));
+                ui.label(format!("{} ticks", event.timestamp_ticks));
+                ui.label(
+                    RichText::new(format!("{:?}", event.kind))
+                        .monospace()
+                        .color(TEXT_MUTED),
+                );
+            });
+        });
 }
 
 fn paint_trace_empty_state(ui: &mut egui::Ui, title: &str, description: &str, minimum_height: f32) {
+    const EMPTY_STATE_VERTICAL_MARGIN: f32 = 24.0;
     egui::Frame::none()
         .fill(BACKGROUND)
         .inner_margin(egui::Margin::same(12.0))
         .show(ui, |ui| {
-            ui.set_min_height(minimum_height.max(56.0));
+            ui.set_min_height((minimum_height - EMPTY_STATE_VERTICAL_MARGIN).max(0.0));
             ui.label(RichText::new(title).strong());
             ui.label(RichText::new(description).color(TEXT_MUTED));
         });
@@ -1900,6 +1903,28 @@ mod tests {
         assert!(texts.iter().any(|text| text == "Fit"));
         assert!(texts.iter().any(|text| text == "+"));
         assert!(texts.iter().any(|text| text == "−"));
+    }
+
+    #[test]
+    fn trace_panes_shrink_to_a_compact_main_window() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 420.0),
+            )),
+            ..egui::RawInput::default()
+        };
+
+        let _ = context.run(input, |context| {
+            app.paint_system_trace_central_panel(context);
+        });
+
+        let pane_height =
+            app.system_trace.timeline_view_height() + app.system_trace.event_view_height();
+        assert!(pane_height > 0.0);
+        assert!(pane_height < 420.0);
     }
 
     #[test]
