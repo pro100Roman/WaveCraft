@@ -113,6 +113,10 @@ impl<D: DebugProbeDriver> HelperServer<D> {
                 self.state = HelperState::Session(session);
                 Ok(DebugProbeReply::TargetAttached)
             }
+            DebugProbeCommand::ResetTarget => {
+                self.session_mut()?.reset_target()?;
+                Ok(DebugProbeReply::TargetReset)
+            }
             DebugProbeCommand::ReadMemory { address, length } => {
                 validate_transfer_length(length)?;
                 let session = self.session_mut()?;
@@ -319,6 +323,11 @@ mod tests {
     }
 
     impl DebugSession for FakeSession {
+        fn reset_target(&mut self) -> Result<(), DebugProbeError> {
+            self.rtt_attached = false;
+            Ok(())
+        }
+
         fn read_memory(
             &mut self,
             address: u64,
@@ -435,6 +444,7 @@ mod tests {
             DebugProbeCommand::Attach {
                 configuration: AttachConfiguration::default(),
             },
+            DebugProbeCommand::ResetTarget,
             DebugProbeCommand::WriteMemory {
                 address: 4,
                 data: vec![9, 8, 7],
@@ -458,7 +468,7 @@ mod tests {
             DebugProbeCommand::Shutdown,
         ]);
 
-        assert_eq!(responses.len(), 10);
+        assert_eq!(responses.len(), 11);
         assert_eq!(
             responses[0].outcome,
             wavecraft_debug_probe::DebugProbeResponseOutcome::Success(DebugProbeReply::Probes(
@@ -466,25 +476,31 @@ mod tests {
             ))
         );
         assert_eq!(
-            responses[4].outcome,
+            responses[3].outcome,
+            wavecraft_debug_probe::DebugProbeResponseOutcome::Success(
+                DebugProbeReply::TargetReset
+            )
+        );
+        assert_eq!(
+            responses[5].outcome,
             wavecraft_debug_probe::DebugProbeResponseOutcome::Success(DebugProbeReply::MemoryData(
                 vec![9, 8, 7]
             ))
         );
         assert_eq!(
-            responses[6].outcome,
+            responses[7].outcome,
             wavecraft_debug_probe::DebugProbeResponseOutcome::Success(DebugProbeReply::RttData(
                 vec![1, 2, 3]
             ))
         );
         assert_eq!(
-            responses[7].outcome,
+            responses[8].outcome,
             wavecraft_debug_probe::DebugProbeResponseOutcome::Success(
                 DebugProbeReply::RttBytesWritten(2)
             )
         );
         assert_eq!(
-            responses[9].outcome,
+            responses[10].outcome,
             wavecraft_debug_probe::DebugProbeResponseOutcome::Success(
                 DebugProbeReply::ShuttingDown
             )

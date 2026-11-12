@@ -23,6 +23,7 @@ pub(crate) struct SystemTraceSettings {
     pub(crate) probe_connection_id: Option<String>,
     pub(crate) target_name: String,
     pub(crate) speed_khz: u32,
+    pub(crate) reset_after_attach: bool,
     pub(crate) control_block_address: String,
     pub(crate) up_channel: usize,
     pub(crate) down_channel: usize,
@@ -34,6 +35,7 @@ impl Default for SystemTraceSettings {
             probe_connection_id: None,
             target_name: String::new(),
             speed_khz: 4_000,
+            reset_after_attach: false,
             control_block_address: String::new(),
             up_channel: 1,
             down_channel: 1,
@@ -62,6 +64,7 @@ impl SystemTraceSettings {
                 speed_khz: Some(self.speed_khz),
                 core_index: 0,
             },
+            reset_after_attach: self.reset_after_attach,
             rtt: RttConfiguration {
                 control_block,
                 timeout: std::time::Duration::from_secs(2),
@@ -187,6 +190,15 @@ impl WaveCraftApp {
                         );
 
                         ui.add_space(10.0);
+                        ui.checkbox(
+                            &mut self.system_trace_settings.reset_after_attach,
+                            "Reset target after attach",
+                        )
+                        .on_hover_text(
+                            "Enable when a sleeping target must restart before RTT can be found",
+                        );
+
+                        ui.add_space(10.0);
                         setup_label(ui, "RTT control block");
                         ui.add(
                             egui::TextEdit::singleline(
@@ -244,7 +256,7 @@ impl WaveCraftApp {
                         ui.add_space(8.0);
                         ui.label(
                             RichText::new(
-                                "Attach uses the isolated probe-rs helper and never resets or flashes the target.",
+                                "Attach uses the isolated probe-rs helper and never flashes the target. Reset is applied only when selected above.",
                             )
                             .small()
                             .color(TEXT_MUTED),
@@ -946,11 +958,12 @@ mod tests {
     }
 
     #[test]
-    fn connection_settings_use_non_reset_swd_attach_and_rtt_scan() {
+    fn connection_settings_apply_optional_reset_and_rtt_scan() {
         let settings = SystemTraceSettings {
             probe_connection_id: Some("1366:0105:1234".to_owned()),
             target_name: "STM32F407VGTx".to_owned(),
             speed_khz: 8_000,
+            reset_after_attach: true,
             control_block_address: String::new(),
             up_channel: 1,
             down_channel: 1,
@@ -970,6 +983,7 @@ mod tests {
         );
         assert_eq!(configuration.attach.wire_protocol, Some(WireProtocol::Swd));
         assert_eq!(configuration.attach.speed_khz, Some(8_000));
+        assert!(configuration.reset_after_attach);
         assert_eq!(
             configuration.rtt.control_block,
             RttControlBlockLocation::Ram

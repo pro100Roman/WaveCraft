@@ -110,6 +110,16 @@ struct ProbeRsSession {
 }
 
 impl DebugSession for ProbeRsSession {
+    fn reset_target(&mut self) -> Result<(), DebugProbeError> {
+        self.rtt = None;
+        let mut core = self
+            .session
+            .core(self.core_index)
+            .map_err(|error| target_error("target core is unavailable", error))?;
+        core.reset()
+            .map_err(|error| target_error("failed to reset target", error))
+    }
+
     fn read_memory(&mut self, address: u64, destination: &mut [u8]) -> Result<(), DebugProbeError> {
         let mut core = self
             .session

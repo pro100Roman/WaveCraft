@@ -28,6 +28,7 @@ pub(crate) enum TraceEventView {
 pub(crate) struct SystemTraceConnectionConfiguration {
     pub(crate) probe: ProbeSelector,
     pub(crate) attach: AttachConfiguration,
+    pub(crate) reset_after_attach: bool,
     pub(crate) rtt: RttConfiguration,
     pub(crate) up_channel: usize,
     pub(crate) down_channel: usize,
@@ -334,6 +335,13 @@ fn establish_connection(
         |reply| reply == &DebugProbeReply::TargetAttached,
         "attach target",
     )?;
+    if configuration.reset_after_attach {
+        expect_reply(
+            transport.send(DebugProbeCommand::ResetTarget)?,
+            |reply| reply == &DebugProbeReply::TargetReset,
+            "reset target",
+        )?;
+    }
     match transport.send(DebugProbeCommand::AttachRtt {
         configuration: configuration.rtt.clone(),
     })? {
@@ -668,6 +676,7 @@ mod tests {
                 speed_khz: Some(4_000),
                 core_index: 0,
             },
+            reset_after_attach: false,
             rtt: RttConfiguration::default(),
             up_channel: 1,
             down_channel: 1,
@@ -763,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_worker_opens_attaches_rtt_and_disconnects() {
+    fn connection_worker_optionally_resets_before_rtt_attach() {
         let up_channel = RttChannelDescriptor {
             number: 1,
             direction: RttChannelDirection::Up,
@@ -782,6 +791,7 @@ mod tests {
             replies: VecDeque::from([
                 Ok(DebugProbeReply::ProbeOpened(probe_descriptor())),
                 Ok(DebugProbeReply::TargetAttached),
+                Ok(DebugProbeReply::TargetReset),
                 Ok(DebugProbeReply::RttAttached(vec![
                     up_channel.clone(),
                     down_channel.clone(),
@@ -798,9 +808,11 @@ mod tests {
             .send(SystemTraceWorkerCommand::Disconnect)
             .expect("disconnect is queued");
 
+        let mut configuration = connection_configuration();
+        configuration.reset_after_attach = true;
         run_connection_worker(
             transport,
-            connection_configuration(),
+            configuration,
             command_receiver,
             event_sender,
             trace_event_sender,
@@ -818,6 +830,7 @@ mod tests {
             [
                 DebugProbeCommand::OpenProbe { .. },
                 DebugProbeCommand::Attach { .. },
+                DebugProbeCommand::ResetTarget,
                 DebugProbeCommand::AttachRtt { .. },
                 DebugProbeCommand::CloseSession,
             ]

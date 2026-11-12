@@ -19,7 +19,7 @@ pub enum ProbeProvider {
 }
 
 /// Version of the newline-delimited helper protocol shared with probe adapters.
-pub const DEBUG_PROBE_HELPER_PROTOCOL_VERSION: u32 = 1;
+pub const DEBUG_PROBE_HELPER_PROTOCOL_VERSION: u32 = 2;
 
 /// Upper bound for one encoded helper request or response.
 pub const MAX_DEBUG_PROBE_HELPER_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -189,6 +189,7 @@ pub enum DebugProbeCommand {
     Attach {
         configuration: AttachConfiguration,
     },
+    ResetTarget,
     ReadMemory {
         address: u64,
         length: usize,
@@ -252,6 +253,7 @@ pub enum DebugProbeReply {
     Probes(Vec<ProbeDescriptor>),
     ProbeOpened(ProbeDescriptor),
     TargetAttached,
+    TargetReset,
     MemoryData(Vec<u8>),
     MemoryWritten,
     RttAttached(Vec<RttChannelDescriptor>),
@@ -391,6 +393,9 @@ pub trait DebugProbeHandle: Send {
 
 /// Attached target session used by System Trace acquisition.
 pub trait DebugSession: Send {
+    /// Resets the attached target and allows it to resume running.
+    fn reset_target(&mut self) -> Result<(), DebugProbeError>;
+
     fn read_memory(&mut self, address: u64, destination: &mut [u8]) -> Result<(), DebugProbeError>;
 
     fn write_memory(&mut self, address: u64, source: &[u8]) -> Result<(), DebugProbeError>;
@@ -480,6 +485,11 @@ mod tests {
     }
 
     impl DebugSession for FakeSession {
+        fn reset_target(&mut self) -> Result<(), DebugProbeError> {
+            self.rtt_attached = false;
+            Ok(())
+        }
+
         fn read_memory(
             &mut self,
             address: u64,
@@ -615,6 +625,7 @@ mod tests {
         let mut session = probe
             .attach(&AttachConfiguration::default())
             .expect("target attaches");
+        session.reset_target().expect("target resets");
 
         session
             .write_memory(4, &[9, 8, 7])
@@ -652,7 +663,7 @@ mod tests {
 
         assert_eq!(
             encoded,
-            r#"{"protocol_version":1,"request_id":7,"command":{"command":"list_probes"}}"#
+            r#"{"protocol_version":2,"request_id":7,"command":{"command":"list_probes"}}"#
         );
         assert_eq!(
             serde_json::from_str::<DebugProbeRequest>(&encoded).expect("request deserializes"),
