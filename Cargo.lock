@@ -3068,6 +3068,7 @@ dependencies = [
  "wavecraft-radio",
  "wavecraft-recording",
  "wavecraft-sdr",
+ "wavecraft-trace",
  "wavecraft-usb",
  "windows-sys 0.61.2",
 ]

@@ -15,6 +15,7 @@ mod recording;
 mod recording_metadata;
 mod sessions;
 mod snapshot;
+mod system_trace;
 #[cfg(test)]
 mod tests;
 mod theme;
@@ -330,6 +331,8 @@ struct WaveCraftApp {
     active_workspace_view: Option<WorkspaceView>,
     active_waveform_tab: Option<WaveformTab>,
     system_trace_settings: SystemTraceSettings,
+    system_trace: system_trace::SystemTraceDisplayState,
+    system_trace_events: Option<Receiver<wavecraft_trace::TraceEvent>>,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
     logic_channel_marker_opacities: [u8; LOGIC_CHANNEL_COUNT],
@@ -448,6 +451,8 @@ impl WaveCraftApp {
             active_workspace_view: None,
             active_waveform_tab: None,
             system_trace_settings: SystemTraceSettings::default(),
+            system_trace: system_trace::SystemTraceDisplayState::default(),
+            system_trace_events: None,
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
             logic_channel_marker_opacities: default_logic_channel_marker_opacities(),
@@ -532,6 +537,25 @@ impl eframe::App for WaveCraftApp {
 }
 
 impl WaveCraftApp {
+    fn poll_system_trace_events(&mut self) {
+        let mut disconnected = false;
+        if let Some(events) = &self.system_trace_events {
+            loop {
+                match events.try_recv() {
+                    Ok(event) => self.system_trace.ingest(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.system_trace_events = None;
+        }
+    }
+
     /// Runs one frame: polls workers, paints every panel, and applies what the
     /// user asked for. It does not use the `eframe::Frame`, so tests can call it
     /// with a bare `egui::Context`.
@@ -541,6 +565,7 @@ impl WaveCraftApp {
         context.request_repaint_after(CPU_LOAD_SAMPLE_INTERVAL);
         self.poll_calibration_progress();
         self.poll_worker();
+        self.poll_system_trace_events();
         self.reconcile_capture_settings_tab();
         self.reconcile_waveform_tab();
         self.reconcile_device_selections();

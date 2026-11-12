@@ -10,6 +10,7 @@ use super::*;
 use crate::ui::frame_actions::FrameActions;
 use wavecraft_core::{DeviceDescriptor, DeviceId, InstrumentKind};
 use wavecraft_sdr::{ConnectionBackend, RadioModel, RadioProvider};
+use wavecraft_trace::{TraceEvent, TraceEventKind};
 use wavecraft_usb::{DeviceLocation, DeviceProfile, DSCOPE_U3P100, DSLOGIC_U3PRO16};
 
 fn app() -> WaveCraftApp {
@@ -103,6 +104,86 @@ fn system_trace_is_independent_of_the_last_waveform_view() {
     assert_eq!(app.active_waveform_tab, Some(WaveformTab::Oscilloscope));
     assert_eq!(app.active_workspace_view, Some(WorkspaceView::SystemTrace));
     assert_eq!(app.frame_state().control_target, None);
+}
+
+#[test]
+fn system_trace_paints_reconstructed_execution_and_loss() {
+    let mut app = app();
+    app.system_trace.ingest_all([
+        TraceEvent {
+            sequence: 0,
+            core_id: 0,
+            timestamp_ticks: 10,
+            kind: TraceEventKind::TaskInfo {
+                task_id: 1,
+                priority: 4,
+                name: "worker".to_owned(),
+            },
+        },
+        TraceEvent {
+            sequence: 1,
+            core_id: 0,
+            timestamp_ticks: 12,
+            kind: TraceEventKind::TaskStarted { task_id: 1 },
+        },
+        TraceEvent {
+            sequence: 2,
+            core_id: 0,
+            timestamp_ticks: 20,
+            kind: TraceEventKind::IsrEntered { isr_id: 15 },
+        },
+        TraceEvent {
+            sequence: 3,
+            core_id: 0,
+            timestamp_ticks: 24,
+            kind: TraceEventKind::Overflow { dropped_events: 3 },
+        },
+    ]);
+    app.select_system_trace_view();
+
+    run_frames(&mut app, &context(), 3);
+
+    assert_eq!(app.system_trace.events().len(), 4);
+    assert_eq!(app.system_trace.dropped_event_count(), 3);
+    assert_eq!(
+        app.system_trace
+            .model()
+            .core(0)
+            .map(|core| core.intervals().len()),
+        Some(2)
+    );
+}
+
+#[test]
+fn decoded_trace_events_reach_the_gui_through_the_worker_channel() {
+    let mut app = app();
+    let (sender, receiver) = mpsc::channel();
+    app.system_trace_events = Some(receiver);
+    sender
+        .send(TraceEvent {
+            sequence: 9,
+            core_id: 1,
+            timestamp_ticks: 42,
+            kind: TraceEventKind::Idle,
+        })
+        .expect("test receiver remains connected");
+
+    run_frames(&mut app, &context(), 1);
+
+    assert_eq!(
+        app.system_trace
+            .events()
+            .front()
+            .map(|event| event.sequence),
+        Some(9)
+    );
+    assert_eq!(
+        app.system_trace
+            .model()
+            .core(1)
+            .and_then(|core| core.active_context()),
+        Some(wavecraft_trace::ExecutionContext::Idle)
+    );
 }
 
 #[test]
