@@ -1053,6 +1053,32 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_systemview_demo_exercises_trace_instruments() {
+        let bytes = include_bytes!("../../../docs/examples/nrf52832-freertos.SVDat");
+        let events = decode_systemview_stream(std::io::Cursor::new(bytes.as_slice()))
+            .expect("checked-in demo is valid raw SystemView data");
+        let mut state = SystemTraceDisplayState::default();
+
+        state.replace_trace_events(events);
+
+        assert!(state.events().len() >= 30);
+        assert_eq!(state.log_count(), 4);
+        let core = state.model().core(0).expect("demo contains core 0");
+        assert_eq!(
+            core.tasks().get(&2).and_then(|task| task.name.as_deref()),
+            Some("sensor")
+        );
+        assert!(core.intervals().iter().any(|interval| matches!(
+            interval.context,
+            wavecraft_trace::ExecutionContext::Isr(15)
+        )));
+        assert!(core.intervals().iter().any(|interval| matches!(
+            interval.context,
+            wavecraft_trace::ExecutionContext::Timer(4)
+        )));
+    }
+
+    #[test]
     fn bounds_display_events_without_losing_reconstructed_state() {
         let mut state = SystemTraceDisplayState::with_capacity(2);
         state.ingest_all([
