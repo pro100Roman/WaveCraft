@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::io::{BufRead, Write};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -260,6 +261,113 @@ pub enum DebugProbeReply {
     ShuttingDown,
 }
 
+/// Synchronous client for one persistent helper process.
+///
+/// Process creation and lifetime stay with the application; this type owns
+/// only the helper's buffered stdout and stdin streams.
+pub struct DebugProbeProtocolClient<R, W> {
+    reader: R,
+    writer: W,
+    next_request_id: u64,
+}
+
+impl<R: BufRead, W: Write> DebugProbeProtocolClient<R, W> {
+    pub fn new(reader: R, writer: W) -> Self {
+        Self {
+            reader,
+            writer,
+            next_request_id: 1,
+        }
+    }
+
+    pub fn send(&mut self, command: DebugProbeCommand) -> Result<DebugProbeReply, DebugProbeError> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        let encoded = serde_json::to_vec(&DebugProbeRequest::new(request_id, command))
+            .map_err(|error| protocol_transport_error("failed to encode helper request", error))?;
+        if encoded.len() > MAX_DEBUG_PROBE_HELPER_MESSAGE_BYTES {
+            return Err(DebugProbeError::new(
+                DebugProbeErrorKind::InvalidConfiguration,
+                "debug-probe helper request is too large",
+            ));
+        }
+        self.writer
+            .write_all(&encoded)
+            .and_then(|()| self.writer.write_all(b"\n"))
+            .and_then(|()| self.writer.flush())
+            .map_err(|error| protocol_transport_error("failed to send helper request", error))?;
+
+        let encoded_response = read_bounded_protocol_message(&mut self.reader)?;
+        let response = serde_json::from_slice::<DebugProbeResponse>(&encoded_response)
+            .map_err(|error| protocol_transport_error("invalid helper response", error))?;
+        if response.protocol_version != DEBUG_PROBE_HELPER_PROTOCOL_VERSION {
+            return Err(DebugProbeError::new(
+                DebugProbeErrorKind::Unsupported,
+                format!(
+                    "helper uses protocol version {}; expected {}",
+                    response.protocol_version, DEBUG_PROBE_HELPER_PROTOCOL_VERSION
+                ),
+            ));
+        }
+        if response.request_id != request_id {
+            return Err(DebugProbeError::new(
+                DebugProbeErrorKind::Transport,
+                format!(
+                    "helper response ID {} does not match request ID {request_id}",
+                    response.request_id
+                ),
+            ));
+        }
+        match response.outcome {
+            DebugProbeResponseOutcome::Success(reply) => Ok(reply),
+            DebugProbeResponseOutcome::Error(error) => Err(error),
+        }
+    }
+
+    pub fn into_parts(self) -> (R, W) {
+        (self.reader, self.writer)
+    }
+}
+
+fn read_bounded_protocol_message(reader: &mut impl BufRead) -> Result<Vec<u8>, DebugProbeError> {
+    let mut message = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .map_err(|error| protocol_transport_error("failed to read helper response", error))?;
+        if available.is_empty() {
+            return Err(DebugProbeError::new(
+                DebugProbeErrorKind::Disconnected,
+                "debug-probe helper closed its response stream",
+            ));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        let content_length = newline.unwrap_or(consumed);
+        if message.len().saturating_add(content_length) > MAX_DEBUG_PROBE_HELPER_MESSAGE_BYTES {
+            return Err(DebugProbeError::new(
+                DebugProbeErrorKind::Transport,
+                "debug-probe helper response is too large",
+            ));
+        }
+        message.extend_from_slice(&available[..content_length]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            if message.last() == Some(&b'\r') {
+                message.pop();
+            }
+            return Ok(message);
+        }
+    }
+}
+
+fn protocol_transport_error(context: &str, error: impl fmt::Display) -> DebugProbeError {
+    DebugProbeError::new(
+        DebugProbeErrorKind::Transport,
+        format!("{context}: {error}"),
+    )
+}
+
 /// Discovers and opens probes implemented by one or more providers.
 pub trait DebugProbeDriver: Send + Sync {
     fn list_probes(&self) -> Result<Vec<ProbeDescriptor>, DebugProbeError>;
@@ -310,6 +418,7 @@ pub trait DebugSession: Send {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -567,5 +676,65 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn protocol_client_correlates_requests_and_responses() {
+        let responses = [
+            DebugProbeResponse::success(1, DebugProbeReply::Probes(vec![fake_driver().descriptor])),
+            DebugProbeResponse::error(
+                2,
+                DebugProbeError::new(DebugProbeErrorKind::Busy, "probe is busy"),
+            ),
+        ];
+        let mut input = Vec::new();
+        for response in responses {
+            serde_json::to_writer(&mut input, &response).expect("response serializes");
+            input.push(b'\n');
+        }
+        let mut client = DebugProbeProtocolClient::new(Cursor::new(input), Vec::new());
+
+        assert!(matches!(
+            client.send(DebugProbeCommand::ListProbes),
+            Ok(DebugProbeReply::Probes(probes)) if probes.len() == 1
+        ));
+        assert_eq!(
+            client
+                .send(DebugProbeCommand::OpenProbe {
+                    selector: ProbeSelector::connection_id("black-magic:ABC123"),
+                })
+                .expect_err("helper error is returned"),
+            DebugProbeError::new(DebugProbeErrorKind::Busy, "probe is busy")
+        );
+
+        let (_, output) = client.into_parts();
+        let requests = String::from_utf8(output).expect("requests are UTF-8");
+        let request_ids = requests
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<DebugProbeRequest>(line)
+                    .expect("request deserializes")
+                    .request_id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(request_ids, [1, 2]);
+    }
+
+    #[test]
+    fn protocol_client_rejects_a_response_for_another_request() {
+        let mut input = serde_json::to_vec(&DebugProbeResponse::success(
+            99,
+            DebugProbeReply::SessionClosed,
+        ))
+        .expect("response serializes");
+        input.push(b'\n');
+        let mut client = DebugProbeProtocolClient::new(Cursor::new(input), Vec::new());
+
+        let error = client
+            .send(DebugProbeCommand::CloseSession)
+            .expect_err("mismatched response is rejected");
+
+        assert_eq!(error.kind, DebugProbeErrorKind::Transport);
+        assert!(error.message.contains("does not match"));
     }
 }
