@@ -591,9 +591,11 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 trace.set_timeline_zoom(1.0);
             }
             ui.label(
-                RichText::new("Pinch, ⌘-scroll, or ⌥-scroll to zoom · drag to pan")
-                    .small()
-                    .color(TEXT_MUTED),
+                RichText::new(
+                    "Pinch, Command/Ctrl-scroll, or Option/Alt-scroll to zoom; drag to pan",
+                )
+                .small()
+                .color(TEXT_MUTED),
             );
         });
         ui.add_space(6.0);
