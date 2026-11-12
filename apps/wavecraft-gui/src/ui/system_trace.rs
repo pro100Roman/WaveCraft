@@ -289,7 +289,6 @@ impl WaveCraftApp {
                         {
                             ui.label(
                                 RichText::new(error)
-                                    .small()
                                     .color(egui::Color32::from_rgb(245, 96, 96)),
                             );
                         }
@@ -298,7 +297,6 @@ impl WaveCraftApp {
                             RichText::new(
                                 "Attach uses the isolated probe-rs helper and never flashes the target. Reset is applied only when selected above.",
                             )
-                            .small()
                             .color(TEXT_MUTED),
                         );
                     });
