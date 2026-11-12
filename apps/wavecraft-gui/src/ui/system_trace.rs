@@ -578,6 +578,7 @@ fn paint_trace_summary(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
 
 fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     instrument_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("TIMELINE").strong().color(ACCENT));
             ui.label(
@@ -1054,6 +1055,7 @@ fn context_color(context: ExecutionContext) -> egui::Color32 {
 
 fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     instrument_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut trace.event_view, TraceEventView::Events, "EVENTS");
             ui.selectable_value(&mut trace.event_view, TraceEventView::Logs, "LOGS");
@@ -1720,6 +1722,20 @@ mod tests {
         }
     }
 
+    fn collect_rects_with_stroke(
+        shape: &egui::Shape,
+        expected: egui::Color32,
+        rects: &mut Vec<egui::Rect>,
+    ) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.stroke.color == expected => rects.push(rect.rect),
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .for_each(|shape| collect_rects_with_stroke(shape, expected, rects)),
+            _ => {}
+        }
+    }
+
     #[test]
     fn system_trace_toolbar_can_request_an_application_device_scan() {
         let context = egui::Context::default();
@@ -1965,6 +1981,39 @@ mod tests {
             app.system_trace.timeline_view_height() + app.system_trace.event_view_height();
         assert!(pane_height > 0.0);
         assert!(pane_height < 420.0);
+    }
+
+    #[test]
+    fn empty_trace_panes_stay_within_compact_window_width() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 420.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..egui::RawInput::default()
+        };
+
+        let output = context.run(input, |context| {
+            app.paint_system_trace_central_panel(context);
+        });
+        let mut bordered_rects = Vec::new();
+        output.shapes.iter().for_each(|clipped| {
+            collect_rects_with_stroke(&clipped.shape, GRID, &mut bordered_rects);
+        });
+
+        assert!(!bordered_rects.is_empty());
+        assert!(bordered_rects
+            .iter()
+            .all(|rect| rect.right() <= screen_rect.right() - 16.0));
+        let expected_width = screen_rect.width() - 32.0;
+        assert!(
+            bordered_rects
+                .iter()
+                .filter(|rect| (rect.width() - expected_width).abs() < 1.0)
+                .count()
+                >= 2,
+            "expected both trace panes to fill the available width: {bordered_rects:?}"
+        );
     }
 
     #[test]
