@@ -21,6 +21,7 @@ const TIMELINE_ROW_HEIGHT: f32 = 25.0;
 const TIMELINE_MINIMUM_WIDTH: f32 = 720.0;
 const TIMELINE_ZOOM_STEP: f32 = 1.5;
 const EVENT_TABLE_MINIMUM_WIDTH: f32 = 760.0;
+const EVENT_TABLE_ROW_HEIGHT: f32 = 22.0;
 const TERMINAL_TABLE_MINIMUM_WIDTH: f32 = 720.0;
 const TRACE_SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 92);
 const TRACE_SELECTION_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(32, 27, 12, 32);
@@ -1290,120 +1291,165 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
     let event_table_focus = trace.take_event_table_focus();
     let follow_latest = trace.follow_latest && event_table_focus.is_none();
     let event_count = visible_indices.len();
-    let table_row_count = event_count + 1;
     let focus_row = event_table_focus.and_then(|sequence| {
         visible_indices
             .iter()
             .position(|index| trace.events()[*index].sequence == sequence)
-            .map(|row| row + 1)
     });
+
+    let header_width = ui.available_width();
+    let (header_rect, _) = ui.allocate_exact_size(
+        egui::vec2(header_width, EVENT_TABLE_ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let body_height = (view_height - EVENT_TABLE_ROW_HEIGHT - ui.spacing().item_spacing.y)
+        .max(EVENT_TABLE_ROW_HEIGHT);
 
     let mut event_scroll = egui::ScrollArea::both()
         .id_salt("system_trace_events")
-        .max_height(view_height)
+        .max_height(body_height)
         .auto_shrink([false, false]);
     if let Some(row) = focus_row {
-        event_scroll =
-            event_scroll.vertical_scroll_offset((row as f32 * 22.0 - view_height * 0.5).max(0.0));
+        event_scroll = event_scroll.vertical_scroll_offset(
+            (row as f32 * EVENT_TABLE_ROW_HEIGHT - body_height * 0.5).max(0.0),
+        );
     }
     let mut clicked_sequence = None;
-    event_scroll.show_rows(ui, 22.0, table_row_count, |ui, row_range| {
-        ui.set_min_width(EVENT_TABLE_MINIMUM_WIDTH);
-        for table_row in row_range {
-            if table_row == 0 {
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [90.0, 20.0],
-                        egui::Label::new(RichText::new("TICKS").small().color(TEXT_MUTED)),
-                    );
-                    ui.add_sized(
-                        [45.0, 20.0],
-                        egui::Label::new(RichText::new("CORE").small().color(TEXT_MUTED)),
-                    );
-                    ui.add_sized(
-                        [170.0, 20.0],
-                        egui::Label::new(RichText::new("EVENT").small().color(TEXT_MUTED)),
-                    );
-                    ui.label(RichText::new("DETAILS").small().color(TEXT_MUTED));
-                });
-                continue;
-            }
-            let visible_row = table_row - 1;
-            let event = &trace.events()[visible_indices[visible_row]];
-            let event_selected = selected_sequence == Some(event.sequence);
-            let row = egui::Frame::none()
-                .fill(if event_selected {
-                    TRACE_EVENT_SELECTION_FILL
-                } else {
-                    egui::Color32::TRANSPARENT
-                })
-                .stroke(if event_selected {
-                    egui::Stroke::new(1.0_f32, TRACE_SELECTION_COLOR)
-                } else {
-                    egui::Stroke::NONE
-                })
-                .show(ui, |ui| {
-                    ui.set_min_width(EVENT_TABLE_MINIMUM_WIDTH);
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [90.0, 20.0],
-                            egui::Label::new(
-                                RichText::new(event.timestamp_ticks.to_string())
-                                    .monospace()
-                                    .color(if event_selected {
+    let event_scroll =
+        event_scroll.show_rows(ui, EVENT_TABLE_ROW_HEIGHT, event_count, |ui, row_range| {
+            ui.set_min_width(EVENT_TABLE_MINIMUM_WIDTH);
+            for visible_row in row_range {
+                let event = &trace.events()[visible_indices[visible_row]];
+                let event_selected = selected_sequence == Some(event.sequence);
+                let row = egui::Frame::none()
+                    .fill(if event_selected {
+                        TRACE_EVENT_SELECTION_FILL
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(if event_selected {
+                        egui::Stroke::new(1.0_f32, TRACE_SELECTION_COLOR)
+                    } else {
+                        egui::Stroke::NONE
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_width(EVENT_TABLE_MINIMUM_WIDTH);
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [90.0, 20.0],
+                                egui::Label::new(
+                                    RichText::new(event.timestamp_ticks.to_string())
+                                        .monospace()
+                                        .color(if event_selected {
+                                            TRACE_SELECTION_COLOR
+                                        } else {
+                                            ui.visuals().text_color()
+                                        }),
+                                ),
+                            );
+                            ui.add_sized(
+                                [45.0, 20.0],
+                                egui::Label::new(RichText::new(event.core_id.to_string()).color(
+                                    if event_selected {
                                         TRACE_SELECTION_COLOR
                                     } else {
                                         ui.visuals().text_color()
-                                    }),
-                            ),
-                        );
-                        ui.add_sized(
-                            [45.0, 20.0],
-                            egui::Label::new(RichText::new(event.core_id.to_string()).color(
+                                    },
+                                )),
+                            );
+                            let clicked = ui
+                                .add_sized(
+                                    [170.0, 20.0],
+                                    egui::SelectableLabel::new(
+                                        event_selected,
+                                        event_name(&event.kind),
+                                    ),
+                                )
+                                .clicked();
+                            ui.label(RichText::new(event_summary(&event.kind)).color(
                                 if event_selected {
                                     TRACE_SELECTION_COLOR
                                 } else {
-                                    ui.visuals().text_color()
+                                    TEXT_MUTED
                                 },
-                            )),
-                        );
-                        let clicked = ui
-                            .add_sized(
-                                [170.0, 20.0],
-                                egui::SelectableLabel::new(event_selected, event_name(&event.kind)),
-                            )
-                            .clicked();
-                        ui.label(RichText::new(event_summary(&event.kind)).color(
-                            if event_selected {
-                                TRACE_SELECTION_COLOR
-                            } else {
-                                TEXT_MUTED
-                            },
-                        ));
-                        clicked
-                    })
-                });
-            let row_clicked = ui
-                .interact(
-                    row.response.rect,
-                    ui.id().with(("trace_event_row", event.sequence)),
-                    egui::Sense::click(),
-                )
-                .clicked();
-            if row.inner.inner || row_clicked {
-                selected_sequence = Some(event.sequence);
-                clicked_sequence = Some(event.sequence);
+                            ));
+                            clicked
+                        })
+                    });
+                let row_clicked = ui
+                    .interact(
+                        row.response.rect,
+                        ui.id().with(("trace_event_row", event.sequence)),
+                        egui::Sense::click(),
+                    )
+                    .clicked();
+                if row.inner.inner || row_clicked {
+                    selected_sequence = Some(event.sequence);
+                    clicked_sequence = Some(event.sequence);
+                }
+                if follow_latest && visible_row + 1 == event_count {
+                    row.response.scroll_to_me(Some(egui::Align::BOTTOM));
+                }
             }
-            if follow_latest && visible_row + 1 == event_count {
-                row.response.scroll_to_me(Some(egui::Align::BOTTOM));
-            }
-        }
-    });
+        });
+    paint_event_table_header(
+        ui,
+        header_rect,
+        event_scroll.inner_rect.right(),
+        event_scroll.state.offset.x,
+    );
     if let Some(sequence) = clicked_sequence {
         trace.select_from_event_table(sequence);
     } else {
         trace.selected_sequence = selected_sequence;
     }
+}
+
+fn paint_event_table_header(
+    ui: &mut egui::Ui,
+    header_rect: egui::Rect,
+    body_right: f32,
+    horizontal_offset: f32,
+) {
+    let header_rect = egui::Rect::from_min_max(
+        header_rect.min,
+        egui::pos2(body_right, header_rect.bottom()),
+    );
+    let painter = ui.painter().with_clip_rect(header_rect);
+    painter.rect_filled(header_rect, 0.0, BACKGROUND);
+    painter.line_segment(
+        [header_rect.left_bottom(), header_rect.right_bottom()],
+        egui::Stroke::new(1.0_f32, GRID),
+    );
+
+    let content_rect = egui::Rect::from_min_size(
+        egui::pos2(header_rect.left() - horizontal_offset, header_rect.top()),
+        egui::vec2(
+            EVENT_TABLE_MINIMUM_WIDTH.max(header_rect.width()),
+            EVENT_TABLE_ROW_HEIGHT,
+        ),
+    );
+    let mut header_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("system_trace_events_header")
+            .max_rect(content_rect),
+    );
+    header_ui.set_clip_rect(header_rect);
+    header_ui.horizontal(|ui| {
+        ui.add_sized(
+            [90.0, 20.0],
+            egui::Label::new(RichText::new("TICKS").small().color(TEXT_MUTED)),
+        );
+        ui.add_sized(
+            [45.0, 20.0],
+            egui::Label::new(RichText::new("CORE").small().color(TEXT_MUTED)),
+        );
+        ui.add_sized(
+            [170.0, 20.0],
+            egui::Label::new(RichText::new("EVENT").small().color(TEXT_MUTED)),
+        );
+        ui.label(RichText::new("DETAILS").small().color(TEXT_MUTED));
+    });
 }
 
 fn paint_selected_event(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
