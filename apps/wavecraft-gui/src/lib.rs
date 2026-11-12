@@ -335,6 +335,7 @@ struct WaveCraftApp {
     system_trace_settings: SystemTraceSettings,
     system_trace: system_trace::SystemTraceDisplayState,
     system_trace_events: Option<Receiver<wavecraft_trace::TraceEvent>>,
+    system_trace_terminal_lines: Option<Receiver<wavecraft_debug_probe::RttTerminalLine>>,
     system_trace_connection: system_trace::SystemTraceConnectionState,
     system_trace_worker_commands: Option<Sender<system_trace::SystemTraceWorkerCommand>>,
     system_trace_worker_events: Option<Receiver<system_trace::SystemTraceWorkerEvent>>,
@@ -460,6 +461,7 @@ impl WaveCraftApp {
             system_trace_settings: SystemTraceSettings::default(),
             system_trace: system_trace::SystemTraceDisplayState::default(),
             system_trace_events: None,
+            system_trace_terminal_lines: None,
             system_trace_connection: system_trace::SystemTraceConnectionState::default(),
             system_trace_worker_commands: None,
             system_trace_worker_events: None,
@@ -565,6 +567,23 @@ impl WaveCraftApp {
         }
         if disconnected {
             self.system_trace_events = None;
+        }
+
+        let mut terminal_disconnected = false;
+        if let Some(lines) = &self.system_trace_terminal_lines {
+            loop {
+                match lines.try_recv() {
+                    Ok(line) => self.system_trace.ingest_terminal_line(line),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        terminal_disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if terminal_disconnected {
+            self.system_trace_terminal_lines = None;
         }
     }
 

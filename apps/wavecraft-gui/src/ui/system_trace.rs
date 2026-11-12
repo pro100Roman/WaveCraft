@@ -25,8 +25,11 @@ pub(crate) struct SystemTraceSettings {
     pub(crate) speed_khz: u32,
     pub(crate) reset_after_attach: bool,
     pub(crate) control_block_address: String,
+    pub(crate) systemview_enabled: bool,
     pub(crate) up_channel: usize,
     pub(crate) down_channel: usize,
+    pub(crate) terminal_enabled: bool,
+    pub(crate) terminal_up_channel: usize,
 }
 
 impl Default for SystemTraceSettings {
@@ -37,14 +40,20 @@ impl Default for SystemTraceSettings {
             speed_khz: 4_000,
             reset_after_attach: false,
             control_block_address: String::new(),
+            systemview_enabled: true,
             up_channel: 1,
             down_channel: 1,
+            terminal_enabled: true,
+            terminal_up_channel: 0,
         }
     }
 }
 
 impl SystemTraceSettings {
     fn connection_configuration(&self) -> Result<SystemTraceConnectionConfiguration, String> {
+        if !self.systemview_enabled && !self.terminal_enabled {
+            return Err("Enable SystemView trace or the plain RTT terminal".to_owned());
+        }
         let connection_id = self
             .probe_connection_id
             .clone()
@@ -69,8 +78,10 @@ impl SystemTraceSettings {
                 control_block,
                 timeout: std::time::Duration::from_secs(2),
             },
+            systemview_enabled: self.systemview_enabled,
             up_channel: self.up_channel,
             down_channel: self.down_channel,
+            terminal_up_channel: self.terminal_enabled.then_some(self.terminal_up_channel),
         })
     }
 }
@@ -208,20 +219,42 @@ impl WaveCraftApp {
                         );
 
                         ui.add_space(10.0);
+                        ui.checkbox(
+                            &mut self.system_trace_settings.systemview_enabled,
+                            "SystemView binary trace",
+                        );
                         ui.horizontal(|ui| {
-                            setup_label(ui, "Up channel");
-                            ui.add(
+                            setup_label(ui, "SystemView up");
+                            ui.add_enabled(
+                                self.system_trace_settings.systemview_enabled,
                                 egui::DragValue::new(
                                     &mut self.system_trace_settings.up_channel,
                                 )
                                 .range(0..=255),
                             );
                             setup_label(ui, "Down");
-                            ui.add(
+                            ui.add_enabled(
+                                self.system_trace_settings.systemview_enabled,
                                 egui::DragValue::new(
                                     &mut self.system_trace_settings.down_channel,
                                 )
                                 .range(0..=255),
+                            );
+                        });
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.checkbox(
+                                &mut self.system_trace_settings.terminal_enabled,
+                                "Plain RTT terminal",
+                            );
+                            ui.add_enabled(
+                                self.system_trace_settings.terminal_enabled,
+                                egui::DragValue::new(
+                                    &mut self.system_trace_settings.terminal_up_channel,
+                                )
+                                .range(0..=255)
+                                .prefix("Up "),
                             );
                         });
 
@@ -232,13 +265,20 @@ impl WaveCraftApp {
                             self.system_trace_settings.probe_connection_id.is_some(),
                             actions,
                         );
-                        if let SystemTraceConnectionState::Attached { channels } =
-                            &self.system_trace_connection
+                        if let SystemTraceConnectionState::Attached {
+                            channels,
+                            systemview_enabled,
+                        } = &self.system_trace_connection
                         {
                             ui.label(
                                 RichText::new(format!(
-                                    "Attached with {} RTT channel(s)",
-                                    channels.len()
+                                    "Attached with {} RTT channel(s); {}",
+                                    channels.len(),
+                                    if *systemview_enabled {
+                                        "SystemView ready"
+                                    } else {
+                                        "terminal only"
+                                    }
                                 ))
                                 .small()
                                 .color(ACCENT),
@@ -341,10 +381,19 @@ fn paint_trace_run_control(
     actions: &mut FrameActions,
 ) {
     match state {
-        SystemTraceConnectionState::Attached { .. } => {
+        SystemTraceConnectionState::Attached {
+            systemview_enabled: true,
+            ..
+        } => {
             if ui.button("▶ Start").clicked() {
                 actions.system_trace_action = Some(SystemTraceAction::Start);
             }
+        }
+        SystemTraceConnectionState::Attached {
+            systemview_enabled: false,
+            ..
+        } => {
+            ui.label(RichText::new("RTT terminal connected").color(ACCENT));
         }
         SystemTraceConnectionState::Starting { .. } => {
             ui.add_enabled(false, egui::Button::new("Starting…"));
@@ -625,6 +674,11 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
         ui.horizontal(|ui| {
             ui.selectable_value(&mut trace.event_view, TraceEventView::Events, "EVENTS");
             ui.selectable_value(&mut trace.event_view, TraceEventView::Logs, "LOGS");
+            ui.selectable_value(
+                &mut trace.event_view,
+                TraceEventView::Terminal,
+                "RTT TERMINAL",
+            );
             ui.separator();
             ui.add(
                 egui::TextEdit::singleline(&mut trace.event_filter)
@@ -634,25 +688,86 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
             ui.checkbox(&mut trace.follow_latest, "Follow latest");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 clear_requested = ui
-                    .add_enabled(!trace.events().is_empty(), egui::Button::new("Clear"))
+                    .add_enabled(
+                        !trace.events().is_empty() || !trace.terminal_lines().is_empty(),
+                        egui::Button::new("Clear"),
+                    )
                     .clicked();
             });
         });
         ui.add_space(5.0);
-        if trace.events().is_empty() {
-            paint_trace_empty_state(
-                ui,
-                "Connect a debug probe to begin",
-                "Task, interrupt, timer, marker, log, and data events will appear here.",
-            );
-        } else {
-            paint_event_table(ui, trace);
-            paint_selected_event(ui, trace);
+        match trace.event_view {
+            TraceEventView::Terminal => {
+                if trace.terminal_lines().is_empty() {
+                    paint_trace_empty_state(
+                        ui,
+                        "No plain RTT terminal output yet",
+                        "Text from the configured RTT up-channel will appear here after connecting.",
+                    );
+                } else {
+                    paint_terminal_table(ui, trace);
+                }
+            }
+            TraceEventView::Events | TraceEventView::Logs => {
+                if trace.events().is_empty() {
+                    paint_trace_empty_state(
+                        ui,
+                        "Connect a debug probe to begin",
+                        "Task, interrupt, timer, marker, log, and data events will appear here.",
+                    );
+                } else {
+                    paint_event_table(ui, trace);
+                    paint_selected_event(ui, trace);
+                }
+            }
         }
         if clear_requested {
             trace.clear();
         }
     });
+}
+
+fn paint_terminal_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
+    let filter = trace.event_filter.trim().to_lowercase();
+    let visible_lines = trace
+        .terminal_lines()
+        .iter()
+        .filter(|line| filter.is_empty() || line.text.to_lowercase().contains(filter.as_str()))
+        .collect::<Vec<_>>();
+    let line_count = visible_lines.len();
+
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [70.0, 18.0],
+            egui::Label::new(RichText::new("LINE").small().color(TEXT_MUTED)),
+        );
+        ui.label(RichText::new("TEXT").small().color(TEXT_MUTED));
+    });
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .id_salt("system_trace_rtt_terminal")
+        .max_height(250.0)
+        .auto_shrink([false, false])
+        .show_rows(ui, 22.0, line_count, |ui, row_range| {
+            for row in row_range {
+                let line = visible_lines[row];
+                let response = ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [70.0, 20.0],
+                        egui::Label::new(
+                            RichText::new(line.sequence.to_string())
+                                .monospace()
+                                .color(TEXT_MUTED),
+                        ),
+                    );
+                    let suffix = if line.complete { "" } else { " …" };
+                    ui.label(RichText::new(format!("{}{suffix}", line.text)).monospace());
+                });
+                if trace.follow_latest && row + 1 == line_count {
+                    response.response.scroll_to_me(Some(egui::Align::BOTTOM));
+                }
+            }
+        });
 }
 
 fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
@@ -929,6 +1044,33 @@ mod tests {
         }
     }
 
+    fn paint_central_texts(context: &egui::Context, app: &mut WaveCraftApp) -> Vec<String> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let output = context.run(input, |context| {
+            app.paint_system_trace_central_panel(context);
+        });
+        let mut texts = Vec::new();
+        fn collect(shape: &egui::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| collect(shape, texts));
+                }
+                egui::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
     #[test]
     fn system_trace_toolbar_can_request_an_application_device_scan() {
         let context = egui::Context::default();
@@ -958,6 +1100,24 @@ mod tests {
     }
 
     #[test]
+    fn rtt_terminal_tab_paints_plain_text_lines() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace.event_view = TraceEventView::Terminal;
+        app.system_trace
+            .ingest_terminal_line(wavecraft_debug_probe::RttTerminalLine {
+                sequence: 0,
+                text: "nRF52832 booted".to_owned(),
+                complete: true,
+            });
+
+        let texts = paint_central_texts(&context, &mut app);
+
+        assert!(texts.iter().any(|text| text == "RTT TERMINAL"));
+        assert!(texts.iter().any(|text| text == "nRF52832 booted"));
+    }
+
+    #[test]
     fn connection_settings_apply_optional_reset_and_rtt_scan() {
         let settings = SystemTraceSettings {
             probe_connection_id: Some("1366:0105:1234".to_owned()),
@@ -965,8 +1125,11 @@ mod tests {
             speed_khz: 8_000,
             reset_after_attach: true,
             control_block_address: String::new(),
+            systemview_enabled: true,
             up_channel: 1,
             down_channel: 1,
+            terminal_enabled: true,
+            terminal_up_channel: 0,
         };
 
         let configuration = settings
@@ -984,9 +1147,43 @@ mod tests {
         assert_eq!(configuration.attach.wire_protocol, Some(WireProtocol::Swd));
         assert_eq!(configuration.attach.speed_khz, Some(8_000));
         assert!(configuration.reset_after_attach);
+        assert!(configuration.systemview_enabled);
+        assert_eq!(configuration.terminal_up_channel, Some(0));
         assert_eq!(
             configuration.rtt.control_block,
             RttControlBlockLocation::Ram
+        );
+    }
+
+    #[test]
+    fn terminal_only_settings_do_not_require_systemview_channels() {
+        let settings = SystemTraceSettings {
+            probe_connection_id: Some("1366:0105:1234".to_owned()),
+            systemview_enabled: false,
+            terminal_enabled: true,
+            ..SystemTraceSettings::default()
+        };
+
+        let configuration = settings
+            .connection_configuration()
+            .expect("terminal-only settings are valid");
+
+        assert!(!configuration.systemview_enabled);
+        assert_eq!(configuration.terminal_up_channel, Some(0));
+    }
+
+    #[test]
+    fn connection_requires_at_least_one_rtt_instrument() {
+        let settings = SystemTraceSettings {
+            probe_connection_id: Some("1366:0105:1234".to_owned()),
+            systemview_enabled: false,
+            terminal_enabled: false,
+            ..SystemTraceSettings::default()
+        };
+
+        assert_eq!(
+            settings.connection_configuration(),
+            Err("Enable SystemView trace or the plain RTT terminal".to_owned())
         );
     }
 

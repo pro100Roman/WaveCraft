@@ -187,6 +187,25 @@ fn decoded_trace_events_reach_the_gui_through_the_worker_channel() {
 }
 
 #[test]
+fn plain_rtt_terminal_lines_reach_the_gui_through_the_worker_channel() {
+    let mut app = app();
+    let (sender, receiver) = mpsc::channel();
+    app.system_trace_terminal_lines = Some(receiver);
+    sender
+        .send(wavecraft_debug_probe::RttTerminalLine {
+            sequence: 3,
+            text: "nRF52832 booted".to_owned(),
+            complete: true,
+        })
+        .expect("test receiver remains connected");
+
+    run_frames(&mut app, &context(), 1);
+
+    assert_eq!(app.system_trace.terminal_lines().len(), 1);
+    assert_eq!(app.system_trace.terminal_lines()[0].text, "nRF52832 booted");
+}
+
+#[test]
 fn every_waveform_tab_paints_with_every_instrument_connected() {
     let mut app = app_with_every_instrument();
     let context = context();

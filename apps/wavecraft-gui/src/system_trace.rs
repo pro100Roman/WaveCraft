@@ -8,12 +8,14 @@ use std::time::Duration;
 use crate::debug_probes::DebugProbeHelperProcess;
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugProbeCommand, DebugProbeError, DebugProbeErrorKind, DebugProbeReply,
-    ProbeSelector, RttChannelDescriptor, RttChannelDirection, RttConfiguration,
+    ProbeSelector, RttChannelDescriptor, RttChannelDirection, RttConfiguration, RttTerminalDecoder,
+    RttTerminalLine,
 };
 use wavecraft_systemview::{SystemViewDecoder, SYSTEMVIEW_COMMAND_START, SYSTEMVIEW_COMMAND_STOP};
 use wavecraft_trace::{TraceEvent, TraceEventKind, TraceModel};
 
 const DEFAULT_EVENT_CAPACITY: usize = 100_000;
+const DEFAULT_TERMINAL_LINE_CAPACITY: usize = 20_000;
 const RTT_READ_SIZE: usize = 16 * 1024;
 const IDLE_RTT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -22,6 +24,7 @@ pub(crate) enum TraceEventView {
     #[default]
     Events,
     Logs,
+    Terminal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,8 +33,10 @@ pub(crate) struct SystemTraceConnectionConfiguration {
     pub(crate) attach: AttachConfiguration,
     pub(crate) reset_after_attach: bool,
     pub(crate) rtt: RttConfiguration,
+    pub(crate) systemview_enabled: bool,
     pub(crate) up_channel: usize,
     pub(crate) down_channel: usize,
+    pub(crate) terminal_up_channel: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -41,6 +46,7 @@ pub(crate) enum SystemTraceConnectionState {
     Connecting,
     Attached {
         channels: Vec<RttChannelDescriptor>,
+        systemview_enabled: bool,
     },
     Starting {
         channels: Vec<RttChannelDescriptor>,
@@ -62,7 +68,7 @@ impl SystemTraceConnectionState {
 
     fn channels(&self) -> Option<&[RttChannelDescriptor]> {
         match self {
-            Self::Attached { channels }
+            Self::Attached { channels, .. }
             | Self::Starting { channels }
             | Self::Tracing { channels }
             | Self::Stopping { channels } => Some(channels),
@@ -74,6 +80,7 @@ impl SystemTraceConnectionState {
         matches!(
             self,
             Self::Connecting
+                | Self::Attached { .. }
                 | Self::Starting { .. }
                 | Self::Tracing { .. }
                 | Self::Stopping { .. }
@@ -99,7 +106,10 @@ pub(crate) enum SystemTraceAction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SystemTraceWorkerEvent {
-    Attached(Vec<RttChannelDescriptor>),
+    Attached {
+        channels: Vec<RttChannelDescriptor>,
+        systemview_enabled: bool,
+    },
     Tracing,
     Stopped,
     Disconnected,
@@ -110,6 +120,7 @@ pub(crate) struct SystemTraceWorkerChannels {
     pub(crate) commands: Sender<SystemTraceWorkerCommand>,
     pub(crate) events: Receiver<SystemTraceWorkerEvent>,
     pub(crate) trace_events: Receiver<TraceEvent>,
+    pub(crate) terminal_lines: Receiver<RttTerminalLine>,
 }
 
 pub(crate) fn spawn_system_trace_connection(
@@ -118,6 +129,7 @@ pub(crate) fn spawn_system_trace_connection(
     let (command_sender, command_receiver) = mpsc::channel();
     let (event_sender, event_receiver) = mpsc::channel();
     let (trace_event_sender, trace_event_receiver) = mpsc::channel();
+    let (terminal_line_sender, terminal_line_receiver) = mpsc::channel();
     thread::spawn(move || match DebugProbeHelperProcess::spawn() {
         Ok(helper) => run_connection_worker(
             helper,
@@ -125,6 +137,7 @@ pub(crate) fn spawn_system_trace_connection(
             command_receiver,
             event_sender,
             trace_event_sender,
+            terminal_line_sender,
         ),
         Err(error) => {
             let _ = event_sender.send(SystemTraceWorkerEvent::Error(error));
@@ -134,6 +147,7 @@ pub(crate) fn spawn_system_trace_connection(
         commands: command_sender,
         events: event_receiver,
         trace_events: trace_event_receiver,
+        terminal_lines: terminal_line_receiver,
     }
 }
 
@@ -158,6 +172,7 @@ fn run_connection_worker(
     commands: Receiver<SystemTraceWorkerCommand>,
     events: Sender<SystemTraceWorkerEvent>,
     trace_events: Sender<TraceEvent>,
+    terminal_lines: Sender<RttTerminalLine>,
 ) {
     let connection = establish_connection(&mut transport, &configuration);
     let channels = match connection {
@@ -169,7 +184,10 @@ fn run_connection_worker(
         }
     };
     if events
-        .send(SystemTraceWorkerEvent::Attached(channels.clone()))
+        .send(SystemTraceWorkerEvent::Attached {
+            channels: channels.clone(),
+            systemview_enabled: configuration.systemview_enabled,
+        })
         .is_err()
     {
         let _ = close_connection(transport);
@@ -177,9 +195,11 @@ fn run_connection_worker(
     }
 
     let mut decoder = SystemViewDecoder::new(configuration.attach.core_index as u32);
+    let mut terminal_decoder = RttTerminalDecoder::new();
     let mut tracing = false;
     loop {
-        let command = if tracing {
+        let polling = tracing || configuration.terminal_up_channel.is_some();
+        let command = if polling {
             match commands.try_recv() {
                 Ok(command) => Some(command),
                 Err(TryRecvError::Empty) => None,
@@ -193,7 +213,9 @@ fn run_connection_worker(
         };
 
         match command {
-            Some(SystemTraceWorkerCommand::Start) if !tracing => {
+            Some(SystemTraceWorkerCommand::Start)
+                if !tracing && configuration.systemview_enabled =>
+            {
                 decoder.reset();
                 match write_systemview_command(
                     &mut transport,
@@ -236,6 +258,9 @@ fn run_connection_worker(
                         SYSTEMVIEW_COMMAND_STOP,
                     );
                 }
+                if let Some(line) = terminal_decoder.finish() {
+                    let _ = terminal_lines.send(line);
+                }
                 match close_connection(transport) {
                     Ok(()) => {
                         let _ = events.send(SystemTraceWorkerEvent::Disconnected);
@@ -249,6 +274,7 @@ fn run_connection_worker(
             Some(SystemTraceWorkerCommand::Start | SystemTraceWorkerCommand::Stop) | None => {}
         }
 
+        let mut bytes_read = 0;
         if tracing {
             match read_and_decode_rtt(
                 &mut transport,
@@ -256,14 +282,31 @@ fn run_connection_worker(
                 &mut decoder,
                 &trace_events,
             ) {
-                Ok(0) => thread::sleep(IDLE_RTT_POLL_INTERVAL),
-                Ok(_) => {}
+                Ok(count) => bytes_read += count,
                 Err(error) => {
                     let _ = close_connection(transport);
                     let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
                     return;
                 }
             }
+        }
+        if let Some(channel_number) = configuration.terminal_up_channel {
+            match read_rtt_terminal(
+                &mut transport,
+                channel_number,
+                &mut terminal_decoder,
+                &terminal_lines,
+            ) {
+                Ok(count) => bytes_read += count,
+                Err(error) => {
+                    let _ = close_connection(transport);
+                    let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+                    return;
+                }
+            }
+        }
+        if polling && bytes_read == 0 {
+            thread::sleep(IDLE_RTT_POLL_INTERVAL);
         }
     }
 }
@@ -317,6 +360,31 @@ fn read_and_decode_rtt(
     Ok(byte_count)
 }
 
+fn read_rtt_terminal(
+    transport: &mut impl ProbeCommandTransport,
+    channel_number: usize,
+    decoder: &mut RttTerminalDecoder,
+    terminal_lines: &Sender<RttTerminalLine>,
+) -> Result<usize, DebugProbeError> {
+    let data = match transport.send(DebugProbeCommand::ReadRttUp {
+        channel_number,
+        maximum_length: RTT_READ_SIZE,
+    })? {
+        DebugProbeReply::RttData(data) => data,
+        _ => return Err(unexpected_reply("read plain RTT terminal data")),
+    };
+    let byte_count = data.len();
+    for line in decoder.push(&data) {
+        terminal_lines.send(line).map_err(|_| {
+            DebugProbeError::new(
+                DebugProbeErrorKind::Disconnected,
+                "RTT terminal receiver is no longer available",
+            )
+        })?;
+    }
+    Ok(byte_count)
+}
+
 fn establish_connection(
     transport: &mut impl ProbeCommandTransport,
     configuration: &SystemTraceConnectionConfiguration,
@@ -357,21 +425,41 @@ fn validate_rtt_channels(
     channels: &[RttChannelDescriptor],
     configuration: &SystemTraceConnectionConfiguration,
 ) -> Result<(), DebugProbeError> {
-    let has_up = channels.iter().any(|channel| {
-        channel.direction == RttChannelDirection::Up && channel.number == configuration.up_channel
-    });
-    let has_down = channels.iter().any(|channel| {
-        channel.direction == RttChannelDirection::Down
-            && channel.number == configuration.down_channel
-    });
-    if !has_up || !has_down {
-        return Err(DebugProbeError::new(
-            DebugProbeErrorKind::InvalidConfiguration,
-            format!(
-                "target does not expose configured SystemView RTT up/down channels {}/{}",
-                configuration.up_channel, configuration.down_channel
-            ),
-        ));
+    if configuration.systemview_enabled {
+        let has_up = channels.iter().any(|channel| {
+            channel.direction == RttChannelDirection::Up
+                && channel.number == configuration.up_channel
+        });
+        let has_down = channels.iter().any(|channel| {
+            channel.direction == RttChannelDirection::Down
+                && channel.number == configuration.down_channel
+        });
+        if !has_up || !has_down {
+            return Err(DebugProbeError::new(
+                DebugProbeErrorKind::InvalidConfiguration,
+                format!(
+                    "target does not expose configured SystemView RTT up/down channels {}/{}",
+                    configuration.up_channel, configuration.down_channel
+                ),
+            ));
+        }
+    }
+    if let Some(terminal_channel) = configuration.terminal_up_channel {
+        if configuration.systemview_enabled && terminal_channel == configuration.up_channel {
+            return Err(DebugProbeError::new(
+                DebugProbeErrorKind::InvalidConfiguration,
+                "plain RTT terminal and SystemView must use different up-channels",
+            ));
+        }
+        let has_terminal = channels.iter().any(|channel| {
+            channel.direction == RttChannelDirection::Up && channel.number == terminal_channel
+        });
+        if !has_terminal {
+            return Err(DebugProbeError::new(
+                DebugProbeErrorKind::InvalidConfiguration,
+                format!("target does not expose RTT terminal up-channel {terminal_channel}"),
+            ));
+        }
     }
     Ok(())
 }
@@ -416,17 +504,21 @@ impl crate::WaveCraftApp {
         self.system_trace_worker_commands = Some(worker.commands);
         self.system_trace_worker_events = Some(worker.events);
         self.system_trace_events = Some(worker.trace_events);
+        self.system_trace_terminal_lines = Some(worker.terminal_lines);
         self.system_trace_connection = SystemTraceConnectionState::Connecting;
     }
 
     pub(crate) fn request_system_trace_start(&mut self) {
-        let SystemTraceConnectionState::Attached { channels } = &self.system_trace_connection
+        let SystemTraceConnectionState::Attached {
+            channels,
+            systemview_enabled: true,
+        } = &self.system_trace_connection
         else {
             return;
         };
         let channels = channels.clone();
         if self.send_system_trace_worker_command(SystemTraceWorkerCommand::Start) {
-            self.system_trace.clear();
+            self.system_trace.clear_trace_events();
             self.system_trace_connection = SystemTraceConnectionState::Starting { channels };
         }
     }
@@ -478,9 +570,14 @@ impl crate::WaveCraftApp {
         if let Some(events) = &self.system_trace_worker_events {
             loop {
                 match events.try_recv() {
-                    Ok(SystemTraceWorkerEvent::Attached(channels)) => {
-                        self.system_trace_connection =
-                            SystemTraceConnectionState::Attached { channels };
+                    Ok(SystemTraceWorkerEvent::Attached {
+                        channels,
+                        systemview_enabled,
+                    }) => {
+                        self.system_trace_connection = SystemTraceConnectionState::Attached {
+                            channels,
+                            systemview_enabled,
+                        };
                     }
                     Ok(SystemTraceWorkerEvent::Tracing) => {
                         let channels = self
@@ -497,8 +594,10 @@ impl crate::WaveCraftApp {
                             .channels()
                             .map(<[RttChannelDescriptor]>::to_vec)
                             .unwrap_or_default();
-                        self.system_trace_connection =
-                            SystemTraceConnectionState::Attached { channels };
+                        self.system_trace_connection = SystemTraceConnectionState::Attached {
+                            channels,
+                            systemview_enabled: true,
+                        };
                     }
                     Ok(SystemTraceWorkerEvent::Disconnected) => {
                         self.system_trace_connection = SystemTraceConnectionState::Disconnected;
@@ -540,8 +639,10 @@ impl crate::WaveCraftApp {
 #[derive(Debug)]
 pub(crate) struct SystemTraceDisplayState {
     events: VecDeque<TraceEvent>,
+    terminal_lines: VecDeque<RttTerminalLine>,
     model: TraceModel,
     event_capacity: usize,
+    terminal_line_capacity: usize,
     pub(crate) selected_sequence: Option<u64>,
     pub(crate) event_view: TraceEventView,
     pub(crate) event_filter: String,
@@ -552,8 +653,10 @@ impl Default for SystemTraceDisplayState {
     fn default() -> Self {
         Self {
             events: VecDeque::new(),
+            terminal_lines: VecDeque::new(),
             model: TraceModel::new(),
             event_capacity: DEFAULT_EVENT_CAPACITY,
+            terminal_line_capacity: DEFAULT_TERMINAL_LINE_CAPACITY,
             selected_sequence: None,
             event_view: TraceEventView::Events,
             event_filter: String::new(),
@@ -571,6 +674,10 @@ impl SystemTraceDisplayState {
         &self.model
     }
 
+    pub(crate) fn terminal_lines(&self) -> &VecDeque<RttTerminalLine> {
+        &self.terminal_lines
+    }
+
     pub(crate) fn ingest(&mut self, event: TraceEvent) {
         self.model.apply(&event);
         if self.events.len() == self.event_capacity
@@ -584,6 +691,13 @@ impl SystemTraceDisplayState {
         self.events.push_back(event);
     }
 
+    pub(crate) fn ingest_terminal_line(&mut self, line: RttTerminalLine) {
+        if self.terminal_lines.len() == self.terminal_line_capacity {
+            self.terminal_lines.pop_front();
+        }
+        self.terminal_lines.push_back(line);
+    }
+
     #[cfg(test)]
     pub(crate) fn ingest_all(&mut self, events: impl IntoIterator<Item = TraceEvent>) {
         for event in events {
@@ -592,6 +706,11 @@ impl SystemTraceDisplayState {
     }
 
     pub(crate) fn clear(&mut self) {
+        self.clear_trace_events();
+        self.terminal_lines.clear();
+    }
+
+    pub(crate) fn clear_trace_events(&mut self) {
         self.events.clear();
         self.model = TraceModel::new();
         self.selected_sequence = None;
@@ -678,8 +797,10 @@ mod tests {
             },
             reset_after_attach: false,
             rtt: RttConfiguration::default(),
+            systemview_enabled: true,
             up_channel: 1,
             down_channel: 1,
+            terminal_up_channel: None,
         }
     }
 
@@ -762,13 +883,112 @@ mod tests {
     fn clear_starts_a_fresh_trace_session() {
         let mut state = SystemTraceDisplayState::default();
         state.ingest(event(0, 1, TraceEventKind::TaskStarted { task_id: 1 }));
+        state.ingest_terminal_line(RttTerminalLine {
+            sequence: 0,
+            text: "boot".to_owned(),
+            complete: true,
+        });
         state.selected_sequence = Some(0);
 
         state.clear();
 
         assert!(state.events().is_empty());
+        assert!(state.terminal_lines().is_empty());
         assert!(state.model().cores().is_empty());
         assert_eq!(state.selected_sequence, None);
+    }
+
+    #[test]
+    fn starting_a_trace_keeps_terminal_output_collected_since_attach() {
+        let mut state = SystemTraceDisplayState::default();
+        state.ingest(event(0, 1, TraceEventKind::TraceStarted));
+        state.ingest_terminal_line(RttTerminalLine {
+            sequence: 0,
+            text: "boot before SystemView start".to_owned(),
+            complete: true,
+        });
+
+        state.clear_trace_events();
+
+        assert!(state.events().is_empty());
+        assert_eq!(state.terminal_lines().len(), 1);
+    }
+
+    #[test]
+    fn plain_rtt_terminal_decodes_incremental_reads() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(Mutex::new(false));
+        let mut transport = FakeTransport {
+            replies: VecDeque::from([
+                Ok(DebugProbeReply::RttData(b"boot ".to_vec())),
+                Ok(DebugProbeReply::RttData(b"ready\r\n".to_vec())),
+            ]),
+            commands: Arc::clone(&commands),
+            shutdown,
+        };
+        let mut decoder = RttTerminalDecoder::new();
+        let (line_sender, line_receiver) = mpsc::channel();
+
+        assert_eq!(
+            read_rtt_terminal(&mut transport, 0, &mut decoder, &line_sender)
+                .expect("first terminal read succeeds"),
+            5
+        );
+        assert!(line_receiver.try_recv().is_err());
+        assert_eq!(
+            read_rtt_terminal(&mut transport, 0, &mut decoder, &line_sender)
+                .expect("second terminal read succeeds"),
+            7
+        );
+        assert_eq!(
+            line_receiver.recv().expect("completed line is emitted"),
+            RttTerminalLine {
+                sequence: 0,
+                text: "boot ready".to_owned(),
+                complete: true,
+            }
+        );
+        assert!(matches!(
+            commands.lock().expect("commands are available").as_slice(),
+            [
+                DebugProbeCommand::ReadRttUp {
+                    channel_number: 0,
+                    ..
+                },
+                DebugProbeCommand::ReadRttUp {
+                    channel_number: 0,
+                    ..
+                },
+            ]
+        ));
+    }
+
+    #[test]
+    fn terminal_only_connection_needs_no_systemview_channels() {
+        let mut channels = vec![RttChannelDescriptor {
+            number: 0,
+            direction: RttChannelDirection::Up,
+            name: Some("Terminal".to_owned()),
+            buffer_size: 1024,
+        }];
+        let mut configuration = connection_configuration();
+        configuration.systemview_enabled = false;
+        configuration.terminal_up_channel = Some(0);
+
+        assert_eq!(validate_rtt_channels(&channels, &configuration), Ok(()));
+
+        channels.push(RttChannelDescriptor {
+            number: 1,
+            direction: RttChannelDirection::Down,
+            name: Some("SystemView".to_owned()),
+            buffer_size: 32,
+        });
+        configuration.systemview_enabled = true;
+        configuration.up_channel = 0;
+        let error = validate_rtt_channels(&channels, &configuration)
+            .expect_err("one up-channel cannot carry both streams");
+        assert_eq!(error.kind, DebugProbeErrorKind::InvalidConfiguration);
+        assert!(error.message.contains("different up-channels"));
     }
 
     #[test]
@@ -804,6 +1024,7 @@ mod tests {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
         let (trace_event_sender, _trace_event_receiver) = mpsc::channel();
+        let (terminal_line_sender, _terminal_line_receiver) = mpsc::channel();
         command_sender
             .send(SystemTraceWorkerCommand::Disconnect)
             .expect("disconnect is queued");
@@ -816,12 +1037,16 @@ mod tests {
             command_receiver,
             event_sender,
             trace_event_sender,
+            terminal_line_sender,
         );
 
         assert_eq!(
             event_receiver.try_iter().collect::<Vec<_>>(),
             [
-                SystemTraceWorkerEvent::Attached(vec![up_channel, down_channel]),
+                SystemTraceWorkerEvent::Attached {
+                    channels: vec![up_channel, down_channel],
+                    systemview_enabled: true,
+                },
                 SystemTraceWorkerEvent::Disconnected,
             ]
         );
@@ -853,6 +1078,7 @@ mod tests {
         let (_command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
         let (trace_event_sender, _trace_event_receiver) = mpsc::channel();
+        let (terminal_line_sender, _terminal_line_receiver) = mpsc::channel();
 
         run_connection_worker(
             transport,
@@ -860,6 +1086,7 @@ mod tests {
             command_receiver,
             event_sender,
             trace_event_sender,
+            terminal_line_sender,
         );
 
         assert_eq!(
@@ -904,6 +1131,7 @@ mod tests {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
         let (trace_event_sender, trace_event_receiver) = mpsc::channel();
+        let (terminal_line_sender, _terminal_line_receiver) = mpsc::channel();
         for command in [
             SystemTraceWorkerCommand::Start,
             SystemTraceWorkerCommand::Stop,
@@ -918,12 +1146,16 @@ mod tests {
             command_receiver,
             event_sender,
             trace_event_sender,
+            terminal_line_sender,
         );
 
         assert_eq!(
             event_receiver.try_iter().collect::<Vec<_>>(),
             [
-                SystemTraceWorkerEvent::Attached(vec![up_channel, down_channel]),
+                SystemTraceWorkerEvent::Attached {
+                    channels: vec![up_channel, down_channel],
+                    systemview_enabled: true,
+                },
                 SystemTraceWorkerEvent::Tracing,
                 SystemTraceWorkerEvent::Stopped,
                 SystemTraceWorkerEvent::Disconnected,

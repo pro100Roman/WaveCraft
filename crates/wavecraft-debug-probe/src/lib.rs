@@ -70,10 +70,10 @@ impl RttTerminalDecoder {
                 lines.push(self.take_line(true));
                 continue;
             }
-            self.pending.push(*byte);
             if self.pending.len() == self.maximum_line_bytes {
                 lines.push(self.take_line(false));
             }
+            self.pending.push(*byte);
         }
         lines
     }
@@ -893,6 +893,22 @@ mod tests {
         assert_eq!(tail.text, "ij");
         assert!(!tail.complete);
         assert_eq!(decoder.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn rtt_terminal_keeps_an_exactly_bounded_line_complete() {
+        let mut decoder = RttTerminalDecoder::with_maximum_line_bytes(4);
+
+        let lines = decoder.push(b"abcd\n");
+
+        assert_eq!(
+            lines,
+            [RttTerminalLine {
+                sequence: 0,
+                text: "abcd".to_owned(),
+                complete: true,
+            }]
+        );
     }
 
     #[test]
