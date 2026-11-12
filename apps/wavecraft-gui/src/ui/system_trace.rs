@@ -771,10 +771,12 @@ fn terminal_line_layout(ui: &egui::Ui, line: &RttTerminalLine) -> egui::text::La
     let mut layout = egui::text::LayoutJob::default();
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let default_color = ui.visuals().text_color();
+    let tagged_log_color = terminal_tagged_log_color(&line.text);
     for span in &line.spans {
-        let mut color = span.style.foreground.map_or(default_color, |color| {
-            terminal_color(color, span.style.bold)
-        });
+        let mut color = span.style.foreground.map_or_else(
+            || tagged_log_color.unwrap_or(default_color),
+            |color| terminal_color(color, span.style.bold),
+        );
         if span.style.dim {
             color = dim_terminal_color(color);
         }
@@ -807,6 +809,38 @@ fn terminal_line_layout(ui: &egui::Ui, line: &RttTerminalLine) -> egui::text::La
         );
     }
     layout
+}
+
+fn terminal_tagged_log_color(text: &str) -> Option<egui::Color32> {
+    let text = text.trim_start().to_ascii_lowercase();
+    if has_terminal_log_tag(&text, &["error", "err", "critical", "fatal"]) {
+        Some(egui::Color32::from_rgb(245, 96, 96))
+    } else if has_terminal_log_tag(&text, &["warning", "warn"]) {
+        Some(ORANGE)
+    } else if has_terminal_log_tag(&text, &["info", "information"]) {
+        Some(ACCENT)
+    } else if has_terminal_log_tag(&text, &["debug"]) {
+        Some(egui::Color32::from_rgb(105, 180, 255))
+    } else if has_terminal_log_tag(&text, &["trace", "verbose"]) {
+        Some(egui::Color32::from_rgb(187, 134, 252))
+    } else {
+        None
+    }
+}
+
+fn has_terminal_log_tag(text: &str, levels: &[&str]) -> bool {
+    levels.iter().any(|level| {
+        text.strip_prefix('<')
+            .and_then(|text| text.strip_prefix(level))
+            .is_some_and(|text| text.starts_with('>'))
+            || text
+                .strip_prefix('[')
+                .and_then(|text| text.strip_prefix(level))
+                .is_some_and(|text| text.starts_with(']'))
+            || text
+                .strip_prefix(level)
+                .is_some_and(|text| text.starts_with(':') || text.starts_with(char::is_whitespace))
+    })
 }
 
 fn terminal_color(color: RttTerminalColor, bold: bool) -> egui::Color32 {
@@ -1243,6 +1277,27 @@ mod tests {
             ),
             egui::Color32::from_rgb(12, 34, 56)
         );
+    }
+
+    #[test]
+    fn rtt_terminal_colors_plain_severity_tags() {
+        assert_eq!(
+            terminal_tagged_log_color("<debug> nrf_sdh: initialized"),
+            Some(egui::Color32::from_rgb(105, 180, 255))
+        );
+        assert_eq!(
+            terminal_tagged_log_color("  <INFO> app: started"),
+            Some(ACCENT)
+        );
+        assert_eq!(
+            terminal_tagged_log_color("[warn] low battery"),
+            Some(ORANGE)
+        );
+        assert_eq!(
+            terminal_tagged_log_color("ERROR: transport failed"),
+            Some(egui::Color32::from_rgb(245, 96, 96))
+        );
+        assert_eq!(terminal_tagged_log_color("ordinary RTT output"), None);
     }
 
     #[test]
