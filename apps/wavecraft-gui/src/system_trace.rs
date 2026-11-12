@@ -23,7 +23,7 @@ const MIN_TIMELINE_ZOOM: f32 = 1.0;
 const MAX_TIMELINE_ZOOM: f32 = 64.0;
 const DEFAULT_TIMELINE_VIEW_HEIGHT: f32 = 260.0;
 const DEFAULT_EVENT_VIEW_HEIGHT: f32 = 230.0;
-const MIN_TRACE_INSTRUMENT_HEIGHT: f32 = 100.0;
+const MIN_TRACE_INSTRUMENT_HEIGHT: f32 = 140.0;
 const MAX_TRACE_INSTRUMENT_HEIGHT: f32 = 900.0;
 const RTT_READ_SIZE: usize = 16 * 1024;
 const IDLE_RTT_POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -838,6 +838,29 @@ impl SystemTraceDisplayState {
         self.event_view_height
     }
 
+    pub(crate) fn fit_trace_instruments_to_height(&mut self, available_height: f32) {
+        if !available_height.is_finite() {
+            return;
+        }
+        let target_height = available_height.clamp(
+            MIN_TRACE_INSTRUMENT_HEIGHT * 2.0,
+            MAX_TRACE_INSTRUMENT_HEIGHT * 2.0,
+        );
+        let current_height = self.timeline_view_height + self.event_view_height;
+        let timeline_fraction = if current_height > 0.0 {
+            self.timeline_view_height / current_height
+        } else {
+            0.5
+        };
+        let minimum_timeline_height =
+            MIN_TRACE_INSTRUMENT_HEIGHT.max(target_height - MAX_TRACE_INSTRUMENT_HEIGHT);
+        let maximum_timeline_height =
+            MAX_TRACE_INSTRUMENT_HEIGHT.min(target_height - MIN_TRACE_INSTRUMENT_HEIGHT);
+        self.timeline_view_height = (target_height * timeline_fraction)
+            .clamp(minimum_timeline_height, maximum_timeline_height);
+        self.event_view_height = target_height - self.timeline_view_height;
+    }
+
     pub(crate) fn move_trace_instrument_splitter(&mut self, delta: f32) {
         if !delta.is_finite() {
             return;
@@ -1261,7 +1284,7 @@ mod tests {
         assert_eq!(state.timeline_view_height(), 530.0);
         assert_eq!(state.event_view_height(), 310.0);
         state.move_trace_instrument_splitter(1_000.0);
-        assert_eq!(state.timeline_view_height(), 740.0);
+        assert_eq!(state.timeline_view_height(), 700.0);
         assert_eq!(state.event_view_height(), MIN_TRACE_INSTRUMENT_HEIGHT);
         assert_eq!(
             state.timeline_view_height() + state.event_view_height(),
@@ -1269,8 +1292,29 @@ mod tests {
         );
 
         state.move_trace_instrument_splitter(f32::NAN);
-        assert_eq!(state.timeline_view_height(), 740.0);
+        assert_eq!(state.timeline_view_height(), 700.0);
         assert_eq!(state.event_view_height(), MIN_TRACE_INSTRUMENT_HEIGHT);
+    }
+
+    #[test]
+    fn trace_instruments_fit_available_height_and_preserve_split() {
+        let mut state = SystemTraceDisplayState {
+            timeline_view_height: 300.0,
+            event_view_height: 200.0,
+            ..SystemTraceDisplayState::default()
+        };
+
+        state.fit_trace_instruments_to_height(400.0);
+
+        assert!((state.timeline_view_height() - 240.0).abs() < 0.001);
+        assert!((state.event_view_height() - 160.0).abs() < 0.001);
+        state.fit_trace_instruments_to_height(100.0);
+        assert_eq!(
+            state.timeline_view_height() + state.event_view_height(),
+            MIN_TRACE_INSTRUMENT_HEIGHT * 2.0
+        );
+        assert!(state.timeline_view_height() >= MIN_TRACE_INSTRUMENT_HEIGHT);
+        assert!(state.event_view_height() >= MIN_TRACE_INSTRUMENT_HEIGHT);
     }
 
     #[test]

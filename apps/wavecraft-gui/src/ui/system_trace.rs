@@ -22,6 +22,8 @@ const TIMELINE_MINIMUM_WIDTH: f32 = 720.0;
 const TIMELINE_ZOOM_STEP: f32 = 1.5;
 const EVENT_TABLE_MINIMUM_WIDTH: f32 = 760.0;
 const EVENT_TABLE_ROW_HEIGHT: f32 = 22.0;
+const TRACE_SPLITTER_HEIGHT: f32 = 10.0;
+const SELECTED_EVENT_FOOTER_HEIGHT: f32 = 36.0;
 const TERMINAL_TABLE_MINIMUM_WIDTH: f32 = 720.0;
 const TRACE_SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 92);
 const TRACE_SELECTION_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(32, 27, 12, 32);
@@ -330,17 +332,29 @@ impl WaveCraftApp {
                     .inner_margin(egui::Margin::same(16.0)),
             )
             .show(context, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("system_trace_workspace")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        paint_trace_summary(ui, &self.system_trace);
-                        ui.add_space(10.0);
+                paint_trace_summary(ui, &self.system_trace);
+                ui.add_space(10.0);
+                let pane_spacing = ui.spacing().item_spacing.y * 2.0;
+                let available_pane_height =
+                    (ui.available_height() - TRACE_SPLITTER_HEIGHT - pane_spacing).max(0.0);
+                self.system_trace
+                    .fit_trace_instruments_to_height(available_pane_height);
+                let pane_width = ui.available_width();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(pane_width, self.system_trace.timeline_view_height()),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
                         paint_timeline_instrument(ui, &mut self.system_trace);
-                        paint_trace_instrument_splitter(ui, &mut self.system_trace);
+                    },
+                );
+                paint_trace_instrument_splitter(ui, &mut self.system_trace);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(pane_width, self.system_trace.event_view_height()),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
                         paint_event_instrument(ui, &mut self.system_trace);
-                    });
+                    },
+                );
             });
     }
 
@@ -503,8 +517,10 @@ fn instrument_frame() -> egui::Frame {
 }
 
 fn paint_trace_instrument_splitter(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::drag());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), TRACE_SPLITTER_HEIGHT),
+        egui::Sense::drag(),
+    );
     let response = response
         .on_hover_cursor(egui::CursorIcon::ResizeVertical)
         .on_hover_text("Drag to resize Timeline and Events");
@@ -551,7 +567,6 @@ fn paint_trace_summary(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
 
 fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     instrument_frame().show(ui, |ui| {
-        let timeline_height = trace.timeline_view_height();
         ui.horizontal(|ui| {
             ui.label(RichText::new("TIMELINE").strong().color(ACCENT));
             ui.label(
@@ -599,6 +614,7 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
             );
         });
         ui.add_space(6.0);
+        let timeline_height = ui.available_height().max(TIMELINE_HEADER_HEIGHT);
 
         let lanes = timeline_lanes(trace.model());
         let Some((start_ticks, end_ticks)) = trace.time_bounds() else {
@@ -1029,7 +1045,6 @@ fn context_color(context: ExecutionContext) -> egui::Color32 {
 
 fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     instrument_frame().show(ui, |ui| {
-        let event_height = trace.event_view_height();
         let mut clear_requested = false;
         ui.horizontal(|ui| {
             ui.selectable_value(&mut trace.event_view, TraceEventView::Events, "EVENTS");
@@ -1056,6 +1071,16 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
             });
         });
         ui.add_space(5.0);
+        let footer_height = if matches!(
+            trace.event_view,
+            TraceEventView::Events | TraceEventView::Logs
+        ) && trace.selected_event().is_some()
+        {
+            SELECTED_EVENT_FOOTER_HEIGHT
+        } else {
+            0.0
+        };
+        let event_height = (ui.available_height() - footer_height).max(EVENT_TABLE_ROW_HEIGHT * 2.0);
         match trace.event_view {
             TraceEventView::Terminal => {
                 if trace.terminal_lines().is_empty() {
