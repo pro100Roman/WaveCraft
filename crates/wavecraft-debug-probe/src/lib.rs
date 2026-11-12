@@ -17,6 +17,15 @@ pub enum ProbeProvider {
     Other(String),
 }
 
+/// Version of the newline-delimited helper protocol shared with probe adapters.
+pub const DEBUG_PROBE_HELPER_PROTOCOL_VERSION: u32 = 1;
+
+/// Upper bound for one encoded helper request or response.
+pub const MAX_DEBUG_PROBE_HELPER_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// Upper bound for one memory or RTT transfer across the helper boundary.
+pub const MAX_DEBUG_PROBE_TRANSFER_BYTES: usize = 64 * 1024;
+
 /// A discoverable physical debug probe.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProbeDescriptor {
@@ -29,7 +38,7 @@ pub struct ProbeDescriptor {
 }
 
 /// Exact selector for opening one discovered probe.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProbeSelector {
     pub connection_id: String,
 }
@@ -42,21 +51,21 @@ impl ProbeSelector {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum WireProtocol {
     Swd,
     Jtag,
 }
 
 /// Target selection used when attaching without flashing or resetting it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TargetSelector {
     Auto,
     Name(String),
 }
 
 /// Non-destructive target attach settings.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AttachConfiguration {
     pub target: TargetSelector,
     pub wire_protocol: Option<WireProtocol>,
@@ -76,7 +85,7 @@ impl Default for AttachConfiguration {
 }
 
 /// Where to locate the `_SEGGER_RTT` control block in target memory.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RttControlBlockLocation {
     Exact(u64),
     Ranges(Vec<Range<u64>>),
@@ -84,7 +93,7 @@ pub enum RttControlBlockLocation {
 }
 
 /// RTT attachment settings shared by every probe backend.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RttConfiguration {
     pub control_block: RttControlBlockLocation,
     pub timeout: Duration,
@@ -99,14 +108,14 @@ impl Default for RttConfiguration {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RttChannelDirection {
     Up,
     Down,
 }
 
 /// One target-declared RTT ring buffer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RttChannelDescriptor {
     pub number: usize,
     pub direction: RttChannelDirection,
@@ -114,7 +123,7 @@ pub struct RttChannelDescriptor {
     pub buffer_size: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DebugProbeErrorKind {
     NotFound,
     Busy,
@@ -127,7 +136,7 @@ pub enum DebugProbeErrorKind {
 }
 
 /// Backend-independent error suitable for presentation in the System Trace view.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DebugProbeError {
     pub kind: DebugProbeErrorKind,
     pub message: String,
@@ -149,6 +158,107 @@ impl fmt::Display for DebugProbeError {
 }
 
 impl Error for DebugProbeError {}
+
+/// One request sent to a separately built debug-probe helper.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DebugProbeRequest {
+    pub protocol_version: u32,
+    pub request_id: u64,
+    pub command: DebugProbeCommand,
+}
+
+impl DebugProbeRequest {
+    pub fn new(request_id: u64, command: DebugProbeCommand) -> Self {
+        Self {
+            protocol_version: DEBUG_PROBE_HELPER_PROTOCOL_VERSION,
+            request_id,
+            command,
+        }
+    }
+}
+
+/// Stateful operation performed by the helper process.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "command", content = "arguments", rename_all = "snake_case")]
+pub enum DebugProbeCommand {
+    ListProbes,
+    OpenProbe {
+        selector: ProbeSelector,
+    },
+    Attach {
+        configuration: AttachConfiguration,
+    },
+    ReadMemory {
+        address: u64,
+        length: usize,
+    },
+    WriteMemory {
+        address: u64,
+        data: Vec<u8>,
+    },
+    AttachRtt {
+        configuration: RttConfiguration,
+    },
+    ReadRttUp {
+        channel_number: usize,
+        maximum_length: usize,
+    },
+    WriteRttDown {
+        channel_number: usize,
+        data: Vec<u8>,
+    },
+    CloseSession,
+    Shutdown,
+}
+
+/// One response emitted for exactly one helper request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DebugProbeResponse {
+    pub protocol_version: u32,
+    pub request_id: u64,
+    pub outcome: DebugProbeResponseOutcome,
+}
+
+impl DebugProbeResponse {
+    pub fn success(request_id: u64, reply: DebugProbeReply) -> Self {
+        Self {
+            protocol_version: DEBUG_PROBE_HELPER_PROTOCOL_VERSION,
+            request_id,
+            outcome: DebugProbeResponseOutcome::Success(reply),
+        }
+    }
+
+    pub fn error(request_id: u64, error: DebugProbeError) -> Self {
+        Self {
+            protocol_version: DEBUG_PROBE_HELPER_PROTOCOL_VERSION,
+            request_id,
+            outcome: DebugProbeResponseOutcome::Error(error),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", content = "result", rename_all = "snake_case")]
+pub enum DebugProbeResponseOutcome {
+    Success(DebugProbeReply),
+    Error(DebugProbeError),
+}
+
+/// Successful result of a helper command.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "reply", content = "value", rename_all = "snake_case")]
+pub enum DebugProbeReply {
+    Probes(Vec<ProbeDescriptor>),
+    ProbeOpened(ProbeDescriptor),
+    TargetAttached,
+    MemoryData(Vec<u8>),
+    MemoryWritten,
+    RttAttached(Vec<RttChannelDescriptor>),
+    RttData(Vec<u8>),
+    RttBytesWritten(usize),
+    SessionClosed,
+    ShuttingDown,
+}
 
 /// Discovers and opens probes implemented by one or more providers.
 pub trait DebugProbeDriver: Send + Sync {
@@ -424,5 +534,38 @@ mod tests {
                 .expect("down channel writes"),
             2
         );
+    }
+
+    #[test]
+    fn helper_requests_have_a_versioned_stable_envelope() {
+        let request = DebugProbeRequest::new(7, DebugProbeCommand::ListProbes);
+        let encoded = serde_json::to_string(&request).expect("request serializes");
+
+        assert_eq!(
+            encoded,
+            r#"{"protocol_version":1,"request_id":7,"command":{"command":"list_probes"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<DebugProbeRequest>(&encoded).expect("request deserializes"),
+            request
+        );
+    }
+
+    #[test]
+    fn helper_responses_round_trip_successes_and_errors() {
+        let success = DebugProbeResponse::success(4, DebugProbeReply::RttData(vec![0, 127, 255]));
+        let failure = DebugProbeResponse::error(
+            5,
+            DebugProbeError::new(DebugProbeErrorKind::Busy, "probe is already open"),
+        );
+
+        for response in [success, failure] {
+            let encoded = serde_json::to_vec(&response).expect("response serializes");
+            assert_eq!(
+                serde_json::from_slice::<DebugProbeResponse>(&encoded)
+                    .expect("response deserializes"),
+                response
+            );
+        }
     }
 }
