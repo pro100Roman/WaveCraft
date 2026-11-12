@@ -66,6 +66,8 @@ impl SystemTraceSettings {
                 control_block,
                 timeout: std::time::Duration::from_secs(2),
             },
+            up_channel: self.up_channel,
+            down_channel: self.down_channel,
         })
     }
 }
@@ -95,7 +97,7 @@ impl WaveCraftApp {
                     ui.separator();
                     ui.label(RichText::new("System and RTOS trace").color(TEXT_MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_enabled(false, egui::Button::new("▶ Start"));
+                        paint_trace_run_control(ui, &self.system_trace_connection, actions);
                         actions.refresh_clicked = ui
                             .add_enabled(
                                 !self.is_busy() && self.system_trace_connection.is_disconnected(),
@@ -277,6 +279,8 @@ impl WaveCraftApp {
                     }
                 }
             }
+            Some(SystemTraceAction::Start) => self.request_system_trace_start(),
+            Some(SystemTraceAction::Stop) => self.request_system_trace_stop(),
             Some(SystemTraceAction::Disconnect) => self.request_system_trace_disconnect(),
             None => {}
         }
@@ -305,13 +309,47 @@ fn paint_connection_control(
         SystemTraceConnectionState::Connecting => {
             ui.add_enabled(false, egui::Button::new("Connecting…"));
         }
-        SystemTraceConnectionState::Attached { .. } => {
+        SystemTraceConnectionState::Attached { .. }
+        | SystemTraceConnectionState::Starting { .. }
+        | SystemTraceConnectionState::Tracing { .. }
+        | SystemTraceConnectionState::Stopping { .. } => {
             if ui.button("Disconnect").clicked() {
                 actions.system_trace_action = Some(SystemTraceAction::Disconnect);
             }
         }
         SystemTraceConnectionState::Disconnecting => {
             ui.add_enabled(false, egui::Button::new("Disconnecting…"));
+        }
+    }
+}
+
+fn paint_trace_run_control(
+    ui: &mut egui::Ui,
+    state: &SystemTraceConnectionState,
+    actions: &mut FrameActions,
+) {
+    match state {
+        SystemTraceConnectionState::Attached { .. } => {
+            if ui.button("▶ Start").clicked() {
+                actions.system_trace_action = Some(SystemTraceAction::Start);
+            }
+        }
+        SystemTraceConnectionState::Starting { .. } => {
+            ui.add_enabled(false, egui::Button::new("Starting…"));
+        }
+        SystemTraceConnectionState::Tracing { .. } => {
+            if ui.button("■ Stop").clicked() {
+                actions.system_trace_action = Some(SystemTraceAction::Stop);
+            }
+        }
+        SystemTraceConnectionState::Stopping { .. } => {
+            ui.add_enabled(false, egui::Button::new("Stopping…"));
+        }
+        SystemTraceConnectionState::Disconnected
+        | SystemTraceConnectionState::Connecting
+        | SystemTraceConnectionState::Disconnecting
+        | SystemTraceConnectionState::Error(_) => {
+            ui.add_enabled(false, egui::Button::new("▶ Start"));
         }
     }
 }

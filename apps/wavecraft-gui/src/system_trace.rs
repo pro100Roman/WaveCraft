@@ -3,15 +3,19 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
+use std::time::Duration;
 
 use crate::debug_probes::DebugProbeHelperProcess;
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugProbeCommand, DebugProbeError, DebugProbeErrorKind, DebugProbeReply,
-    ProbeSelector, RttChannelDescriptor, RttConfiguration,
+    ProbeSelector, RttChannelDescriptor, RttChannelDirection, RttConfiguration,
 };
+use wavecraft_systemview::{SystemViewDecoder, SYSTEMVIEW_COMMAND_START, SYSTEMVIEW_COMMAND_STOP};
 use wavecraft_trace::{TraceEvent, TraceEventKind, TraceModel};
 
 const DEFAULT_EVENT_CAPACITY: usize = 100_000;
+const RTT_READ_SIZE: usize = 16 * 1024;
+const IDLE_RTT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum TraceEventView {
@@ -25,6 +29,8 @@ pub(crate) struct SystemTraceConnectionConfiguration {
     pub(crate) probe: ProbeSelector,
     pub(crate) attach: AttachConfiguration,
     pub(crate) rtt: RttConfiguration,
+    pub(crate) up_channel: usize,
+    pub(crate) down_channel: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -35,6 +41,15 @@ pub(crate) enum SystemTraceConnectionState {
     Attached {
         channels: Vec<RttChannelDescriptor>,
     },
+    Starting {
+        channels: Vec<RttChannelDescriptor>,
+    },
+    Tracing {
+        channels: Vec<RttChannelDescriptor>,
+    },
+    Stopping {
+        channels: Vec<RttChannelDescriptor>,
+    },
     Disconnecting,
     Error(String),
 }
@@ -43,22 +58,49 @@ impl SystemTraceConnectionState {
     pub(crate) fn is_disconnected(&self) -> bool {
         matches!(self, Self::Disconnected | Self::Error(_))
     }
+
+    fn channels(&self) -> Option<&[RttChannelDescriptor]> {
+        match self {
+            Self::Attached { channels }
+            | Self::Starting { channels }
+            | Self::Tracing { channels }
+            | Self::Stopping { channels } => Some(channels),
+            Self::Disconnected | Self::Connecting | Self::Disconnecting | Self::Error(_) => None,
+        }
+    }
+
+    pub(crate) fn needs_fast_poll(&self) -> bool {
+        matches!(
+            self,
+            Self::Connecting
+                | Self::Starting { .. }
+                | Self::Tracing { .. }
+                | Self::Stopping { .. }
+                | Self::Disconnecting
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SystemTraceWorkerCommand {
+    Start,
+    Stop,
     Disconnect,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SystemTraceAction {
     Connect,
+    Start,
+    Stop,
     Disconnect,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SystemTraceWorkerEvent {
     Attached(Vec<RttChannelDescriptor>),
+    Tracing,
+    Stopped,
     Disconnected,
     Error(String),
 }
@@ -66,6 +108,7 @@ pub(crate) enum SystemTraceWorkerEvent {
 pub(crate) struct SystemTraceWorkerChannels {
     pub(crate) commands: Sender<SystemTraceWorkerCommand>,
     pub(crate) events: Receiver<SystemTraceWorkerEvent>,
+    pub(crate) trace_events: Receiver<TraceEvent>,
 }
 
 pub(crate) fn spawn_system_trace_connection(
@@ -73,8 +116,15 @@ pub(crate) fn spawn_system_trace_connection(
 ) -> SystemTraceWorkerChannels {
     let (command_sender, command_receiver) = mpsc::channel();
     let (event_sender, event_receiver) = mpsc::channel();
+    let (trace_event_sender, trace_event_receiver) = mpsc::channel();
     thread::spawn(move || match DebugProbeHelperProcess::spawn() {
-        Ok(helper) => run_connection_worker(helper, configuration, command_receiver, event_sender),
+        Ok(helper) => run_connection_worker(
+            helper,
+            configuration,
+            command_receiver,
+            event_sender,
+            trace_event_sender,
+        ),
         Err(error) => {
             let _ = event_sender.send(SystemTraceWorkerEvent::Error(error));
         }
@@ -82,6 +132,7 @@ pub(crate) fn spawn_system_trace_connection(
     SystemTraceWorkerChannels {
         commands: command_sender,
         events: event_receiver,
+        trace_events: trace_event_receiver,
     }
 }
 
@@ -105,6 +156,7 @@ fn run_connection_worker(
     configuration: SystemTraceConnectionConfiguration,
     commands: Receiver<SystemTraceWorkerCommand>,
     events: Sender<SystemTraceWorkerEvent>,
+    trace_events: Sender<TraceEvent>,
 ) {
     let connection = establish_connection(&mut transport, &configuration);
     let channels = match connection {
@@ -116,23 +168,152 @@ fn run_connection_worker(
         }
     };
     if events
-        .send(SystemTraceWorkerEvent::Attached(channels))
+        .send(SystemTraceWorkerEvent::Attached(channels.clone()))
         .is_err()
     {
         let _ = close_connection(transport);
         return;
     }
 
-    match commands.recv() {
-        Ok(SystemTraceWorkerCommand::Disconnect) | Err(_) => match close_connection(transport) {
-            Ok(()) => {
-                let _ = events.send(SystemTraceWorkerEvent::Disconnected);
+    let mut decoder = SystemViewDecoder::new(configuration.attach.core_index as u32);
+    let mut tracing = false;
+    loop {
+        let command = if tracing {
+            match commands.try_recv() {
+                Ok(command) => Some(command),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(SystemTraceWorkerCommand::Disconnect),
             }
-            Err(error) => {
-                let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+        } else {
+            match commands.recv() {
+                Ok(command) => Some(command),
+                Err(_) => Some(SystemTraceWorkerCommand::Disconnect),
             }
-        },
+        };
+
+        match command {
+            Some(SystemTraceWorkerCommand::Start) if !tracing => {
+                decoder.reset();
+                match write_systemview_command(
+                    &mut transport,
+                    configuration.down_channel,
+                    SYSTEMVIEW_COMMAND_START,
+                ) {
+                    Ok(()) => {
+                        tracing = true;
+                        let _ = events.send(SystemTraceWorkerEvent::Tracing);
+                    }
+                    Err(error) => {
+                        let _ = close_connection(transport);
+                        let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+                        return;
+                    }
+                }
+            }
+            Some(SystemTraceWorkerCommand::Stop) if tracing => {
+                match write_systemview_command(
+                    &mut transport,
+                    configuration.down_channel,
+                    SYSTEMVIEW_COMMAND_STOP,
+                ) {
+                    Ok(()) => {
+                        tracing = false;
+                        let _ = events.send(SystemTraceWorkerEvent::Stopped);
+                    }
+                    Err(error) => {
+                        let _ = close_connection(transport);
+                        let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+                        return;
+                    }
+                }
+            }
+            Some(SystemTraceWorkerCommand::Disconnect) => {
+                if tracing {
+                    let _ = write_systemview_command(
+                        &mut transport,
+                        configuration.down_channel,
+                        SYSTEMVIEW_COMMAND_STOP,
+                    );
+                }
+                match close_connection(transport) {
+                    Ok(()) => {
+                        let _ = events.send(SystemTraceWorkerEvent::Disconnected);
+                    }
+                    Err(error) => {
+                        let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+                    }
+                }
+                return;
+            }
+            Some(SystemTraceWorkerCommand::Start | SystemTraceWorkerCommand::Stop) | None => {}
+        }
+
+        if tracing {
+            match read_and_decode_rtt(
+                &mut transport,
+                configuration.up_channel,
+                &mut decoder,
+                &trace_events,
+            ) {
+                Ok(0) => thread::sleep(IDLE_RTT_POLL_INTERVAL),
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = close_connection(transport);
+                    let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+                    return;
+                }
+            }
+        }
     }
+}
+
+fn write_systemview_command(
+    transport: &mut impl ProbeCommandTransport,
+    channel_number: usize,
+    command: u8,
+) -> Result<(), DebugProbeError> {
+    match transport.send(DebugProbeCommand::WriteRttDown {
+        channel_number,
+        data: vec![command],
+    })? {
+        DebugProbeReply::RttBytesWritten(1) => Ok(()),
+        DebugProbeReply::RttBytesWritten(count) => Err(DebugProbeError::new(
+            DebugProbeErrorKind::Transport,
+            format!("SystemView command wrote {count} bytes instead of 1"),
+        )),
+        _ => Err(unexpected_reply("write a SystemView command")),
+    }
+}
+
+fn read_and_decode_rtt(
+    transport: &mut impl ProbeCommandTransport,
+    channel_number: usize,
+    decoder: &mut SystemViewDecoder,
+    trace_events: &Sender<TraceEvent>,
+) -> Result<usize, DebugProbeError> {
+    let data = match transport.send(DebugProbeCommand::ReadRttUp {
+        channel_number,
+        maximum_length: RTT_READ_SIZE,
+    })? {
+        DebugProbeReply::RttData(data) => data,
+        _ => return Err(unexpected_reply("read SystemView RTT data")),
+    };
+    let byte_count = data.len();
+    let decoded = decoder.push(&data).map_err(|error| {
+        DebugProbeError::new(
+            DebugProbeErrorKind::Transport,
+            format!("failed to decode SystemView stream: {error}"),
+        )
+    })?;
+    for event in decoded {
+        trace_events.send(event).map_err(|_| {
+            DebugProbeError::new(
+                DebugProbeErrorKind::Disconnected,
+                "System Trace event receiver is no longer available",
+            )
+        })?;
+    }
+    Ok(byte_count)
 }
 
 fn establish_connection(
@@ -156,9 +337,35 @@ fn establish_connection(
     match transport.send(DebugProbeCommand::AttachRtt {
         configuration: configuration.rtt.clone(),
     })? {
-        DebugProbeReply::RttAttached(channels) => Ok(channels),
+        DebugProbeReply::RttAttached(channels) => {
+            validate_rtt_channels(&channels, configuration)?;
+            Ok(channels)
+        }
         _ => Err(unexpected_reply("attach RTT")),
     }
+}
+
+fn validate_rtt_channels(
+    channels: &[RttChannelDescriptor],
+    configuration: &SystemTraceConnectionConfiguration,
+) -> Result<(), DebugProbeError> {
+    let has_up = channels.iter().any(|channel| {
+        channel.direction == RttChannelDirection::Up && channel.number == configuration.up_channel
+    });
+    let has_down = channels.iter().any(|channel| {
+        channel.direction == RttChannelDirection::Down
+            && channel.number == configuration.down_channel
+    });
+    if !has_up || !has_down {
+        return Err(DebugProbeError::new(
+            DebugProbeErrorKind::InvalidConfiguration,
+            format!(
+                "target does not expose configured SystemView RTT up/down channels {}/{}",
+                configuration.up_channel, configuration.down_channel
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn close_connection(mut transport: impl ProbeCommandTransport) -> Result<(), DebugProbeError> {
@@ -200,7 +407,30 @@ impl crate::WaveCraftApp {
         let worker = spawn_system_trace_connection(configuration);
         self.system_trace_worker_commands = Some(worker.commands);
         self.system_trace_worker_events = Some(worker.events);
+        self.system_trace_events = Some(worker.trace_events);
         self.system_trace_connection = SystemTraceConnectionState::Connecting;
+    }
+
+    pub(crate) fn request_system_trace_start(&mut self) {
+        let SystemTraceConnectionState::Attached { channels } = &self.system_trace_connection
+        else {
+            return;
+        };
+        let channels = channels.clone();
+        if self.send_system_trace_worker_command(SystemTraceWorkerCommand::Start) {
+            self.system_trace.clear();
+            self.system_trace_connection = SystemTraceConnectionState::Starting { channels };
+        }
+    }
+
+    pub(crate) fn request_system_trace_stop(&mut self) {
+        let SystemTraceConnectionState::Tracing { channels } = &self.system_trace_connection else {
+            return;
+        };
+        let channels = channels.clone();
+        if self.send_system_trace_worker_command(SystemTraceWorkerCommand::Stop) {
+            self.system_trace_connection = SystemTraceConnectionState::Stopping { channels };
+        }
     }
 
     pub(crate) fn request_system_trace_disconnect(&mut self) {
@@ -220,12 +450,45 @@ impl crate::WaveCraftApp {
         }
     }
 
+    fn send_system_trace_worker_command(&mut self, command: SystemTraceWorkerCommand) -> bool {
+        let sent = self
+            .system_trace_worker_commands
+            .as_ref()
+            .is_some_and(|commands| commands.send(command).is_ok());
+        if !sent {
+            self.system_trace_connection = SystemTraceConnectionState::Error(
+                "debug-probe worker is no longer available".to_owned(),
+            );
+            self.system_trace_worker_commands = None;
+            self.system_trace_worker_events = None;
+        }
+        sent
+    }
+
     pub(crate) fn poll_system_trace_connection(&mut self) {
         let mut finished = false;
         if let Some(events) = &self.system_trace_worker_events {
             loop {
                 match events.try_recv() {
                     Ok(SystemTraceWorkerEvent::Attached(channels)) => {
+                        self.system_trace_connection =
+                            SystemTraceConnectionState::Attached { channels };
+                    }
+                    Ok(SystemTraceWorkerEvent::Tracing) => {
+                        let channels = self
+                            .system_trace_connection
+                            .channels()
+                            .map(<[RttChannelDescriptor]>::to_vec)
+                            .unwrap_or_default();
+                        self.system_trace_connection =
+                            SystemTraceConnectionState::Tracing { channels };
+                    }
+                    Ok(SystemTraceWorkerEvent::Stopped) => {
+                        let channels = self
+                            .system_trace_connection
+                            .channels()
+                            .map(<[RttChannelDescriptor]>::to_vec)
+                            .unwrap_or_default();
                         self.system_trace_connection =
                             SystemTraceConnectionState::Attached { channels };
                     }
@@ -242,6 +505,9 @@ impl crate::WaveCraftApp {
                         if matches!(
                             self.system_trace_connection,
                             SystemTraceConnectionState::Connecting
+                                | SystemTraceConnectionState::Starting { .. }
+                                | SystemTraceConnectionState::Tracing { .. }
+                                | SystemTraceConnectionState::Stopping { .. }
                                 | SystemTraceConnectionState::Disconnecting
                         ) {
                             self.system_trace_connection = SystemTraceConnectionState::Error(
@@ -403,6 +669,8 @@ mod tests {
                 core_index: 0,
             },
             rtt: RttConfiguration::default(),
+            up_channel: 1,
+            down_channel: 1,
         }
     }
 
@@ -496,11 +764,17 @@ mod tests {
 
     #[test]
     fn connection_worker_opens_attaches_rtt_and_disconnects() {
-        let channel = RttChannelDescriptor {
+        let up_channel = RttChannelDescriptor {
             number: 1,
-            direction: wavecraft_debug_probe::RttChannelDirection::Up,
+            direction: RttChannelDirection::Up,
             name: Some("SystemView".to_owned()),
             buffer_size: 1024,
+        };
+        let down_channel = RttChannelDescriptor {
+            number: 1,
+            direction: RttChannelDirection::Down,
+            name: Some("SystemView".to_owned()),
+            buffer_size: 8,
         };
         let commands = Arc::new(Mutex::new(Vec::new()));
         let shutdown = Arc::new(Mutex::new(false));
@@ -508,7 +782,10 @@ mod tests {
             replies: VecDeque::from([
                 Ok(DebugProbeReply::ProbeOpened(probe_descriptor())),
                 Ok(DebugProbeReply::TargetAttached),
-                Ok(DebugProbeReply::RttAttached(vec![channel.clone()])),
+                Ok(DebugProbeReply::RttAttached(vec![
+                    up_channel.clone(),
+                    down_channel.clone(),
+                ])),
                 Ok(DebugProbeReply::SessionClosed),
             ]),
             commands: Arc::clone(&commands),
@@ -516,6 +793,7 @@ mod tests {
         };
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
+        let (trace_event_sender, _trace_event_receiver) = mpsc::channel();
         command_sender
             .send(SystemTraceWorkerCommand::Disconnect)
             .expect("disconnect is queued");
@@ -525,12 +803,13 @@ mod tests {
             connection_configuration(),
             command_receiver,
             event_sender,
+            trace_event_sender,
         );
 
         assert_eq!(
             event_receiver.try_iter().collect::<Vec<_>>(),
             [
-                SystemTraceWorkerEvent::Attached(vec![channel]),
+                SystemTraceWorkerEvent::Attached(vec![up_channel, down_channel]),
                 SystemTraceWorkerEvent::Disconnected,
             ]
         );
@@ -560,18 +839,102 @@ mod tests {
         };
         let (_command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
+        let (trace_event_sender, _trace_event_receiver) = mpsc::channel();
 
         run_connection_worker(
             transport,
             connection_configuration(),
             command_receiver,
             event_sender,
+            trace_event_sender,
         );
 
         assert_eq!(
             event_receiver.recv().expect("error is reported"),
             SystemTraceWorkerEvent::Error("target was not found".to_owned())
         );
+        assert!(*shutdown.lock().expect("shutdown flag is available"));
+    }
+
+    #[test]
+    fn tracing_writes_start_and_stop_and_decodes_incremental_rtt_data() {
+        let up_channel = RttChannelDescriptor {
+            number: 1,
+            direction: RttChannelDirection::Up,
+            name: Some("SystemView".to_owned()),
+            buffer_size: 1024,
+        };
+        let down_channel = RttChannelDescriptor {
+            number: 1,
+            direction: RttChannelDirection::Down,
+            name: Some("SystemView".to_owned()),
+            buffer_size: 8,
+        };
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(Mutex::new(false));
+        let transport = FakeTransport {
+            replies: VecDeque::from([
+                Ok(DebugProbeReply::ProbeOpened(probe_descriptor())),
+                Ok(DebugProbeReply::TargetAttached),
+                Ok(DebugProbeReply::RttAttached(vec![
+                    up_channel.clone(),
+                    down_channel.clone(),
+                ])),
+                Ok(DebugProbeReply::RttBytesWritten(1)),
+                Ok(DebugProbeReply::RttData(vec![10, 3, 4, 7, 2])),
+                Ok(DebugProbeReply::RttBytesWritten(1)),
+                Ok(DebugProbeReply::SessionClosed),
+            ]),
+            commands: Arc::clone(&commands),
+            shutdown: Arc::clone(&shutdown),
+        };
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (trace_event_sender, trace_event_receiver) = mpsc::channel();
+        for command in [
+            SystemTraceWorkerCommand::Start,
+            SystemTraceWorkerCommand::Stop,
+            SystemTraceWorkerCommand::Disconnect,
+        ] {
+            command_sender.send(command).expect("command is queued");
+        }
+
+        run_connection_worker(
+            transport,
+            connection_configuration(),
+            command_receiver,
+            event_sender,
+            trace_event_sender,
+        );
+
+        assert_eq!(
+            event_receiver.try_iter().collect::<Vec<_>>(),
+            [
+                SystemTraceWorkerEvent::Attached(vec![up_channel, down_channel]),
+                SystemTraceWorkerEvent::Tracing,
+                SystemTraceWorkerEvent::Stopped,
+                SystemTraceWorkerEvent::Disconnected,
+            ]
+        );
+        let decoded = trace_event_receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].kind, TraceEventKind::TraceStarted);
+        assert_eq!(decoded[1].kind, TraceEventKind::TaskStarted { task_id: 7 });
+        let commands = commands.lock().expect("commands are available");
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DebugProbeCommand::WriteRttDown { data, .. }
+                    if data == &[SYSTEMVIEW_COMMAND_START]
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DebugProbeCommand::WriteRttDown { data, .. }
+                    if data == &[SYSTEMVIEW_COMMAND_STOP]
+            )
+        }));
         assert!(*shutdown.lock().expect("shutdown flag is available"));
     }
 }

@@ -707,7 +707,10 @@ impl WaveCraftApp {
             }
         }
         self.apply_scope_frontend_changes(&actions, &frame);
-        if self.pending.is_some() || !self.captures.is_empty() {
+        if self.pending.is_some()
+            || !self.captures.is_empty()
+            || self.system_trace_connection.needs_fast_poll()
+        {
             context.request_repaint_after(Duration::from_millis(16));
         } else if let Some(scheduled) = self.scheduled_repetitive_capture {
             context.request_repaint_after(scheduled.due.saturating_duration_since(Instant::now()));
