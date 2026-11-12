@@ -596,6 +596,7 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                     egui::Sense::hover(),
                 );
                 paint_timeline_canvas(ui, canvas, trace.model(), &lanes, start_ticks, end_ticks);
+                canvas.top()
             });
         let pointer_over_timeline = ui.input(|input| {
             input
@@ -618,6 +619,13 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 trace.scale_timeline_zoom(zoom_delta);
             }
         }
+        paint_sticky_timeline_labels(
+            ui,
+            timeline.inner_rect,
+            timeline.inner,
+            trace.model(),
+            &lanes,
+        );
     });
 }
 
@@ -689,14 +697,6 @@ fn paint_timeline_canvas(
             ],
             egui::Stroke::new(1.0_f32, GRID),
         );
-        painter.text(
-            egui::pos2(canvas.left() + 6.0, row_top + TIMELINE_ROW_HEIGHT * 0.5),
-            egui::Align2::LEFT_CENTER,
-            context_label(model, *lane),
-            egui::FontId::monospace(11.0),
-            TEXT_MUTED,
-        );
-
         let Some(core) = model.core(lane.core_id) else {
             continue;
         };
@@ -730,6 +730,58 @@ fn paint_timeline_canvas(
                 );
             }
         }
+    }
+}
+
+fn paint_sticky_timeline_labels(
+    ui: &egui::Ui,
+    viewport: egui::Rect,
+    canvas_top: f32,
+    model: &TraceModel,
+    lanes: &[TimelineLane],
+) {
+    let label_right = (viewport.left() + TIMELINE_LABEL_WIDTH).min(viewport.right());
+    let label_area =
+        egui::Rect::from_min_max(viewport.min, egui::pos2(label_right, viewport.bottom()));
+    let painter = ui.painter().with_clip_rect(label_area);
+    painter.rect_filled(label_area, 0.0, BACKGROUND);
+    painter.line_segment(
+        [
+            egui::pos2(label_right, viewport.top()),
+            egui::pos2(label_right, viewport.bottom()),
+        ],
+        egui::Stroke::new(1.0_f32, GRID),
+    );
+    painter.text(
+        egui::pos2(viewport.left() + 6.0, viewport.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        "CONTEXT",
+        egui::FontId::monospace(11.0),
+        TEXT_MUTED,
+    );
+
+    let lane_area = egui::Rect::from_min_max(
+        egui::pos2(viewport.left(), viewport.top() + TIMELINE_HEADER_HEIGHT),
+        egui::pos2(label_right, viewport.bottom()),
+    );
+    let lane_painter = ui.painter().with_clip_rect(lane_area);
+    for (lane_index, lane) in lanes.iter().enumerate() {
+        let row_top = canvas_top + TIMELINE_HEADER_HEIGHT + lane_index as f32 * TIMELINE_ROW_HEIGHT;
+        let row_bottom = row_top + TIMELINE_ROW_HEIGHT;
+        lane_painter.line_segment(
+            [
+                egui::pos2(viewport.left(), row_bottom),
+                egui::pos2(label_right, row_bottom),
+            ],
+            egui::Stroke::new(1.0_f32, GRID),
+        );
+        lane_painter.text(
+            egui::pos2(viewport.left() + 6.0, row_top + TIMELINE_ROW_HEIGHT * 0.5),
+            egui::Align2::LEFT_CENTER,
+            context_label(model, *lane),
+            egui::FontId::monospace(11.0),
+            TEXT_MUTED,
+        );
     }
 }
 
