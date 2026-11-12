@@ -192,11 +192,11 @@ fn plain_rtt_terminal_lines_reach_the_gui_through_the_worker_channel() {
     let (sender, receiver) = mpsc::channel();
     app.system_trace_terminal_lines = Some(receiver);
     sender
-        .send(wavecraft_debug_probe::RttTerminalLine {
-            sequence: 3,
-            text: "nRF52832 booted".to_owned(),
-            complete: true,
-        })
+        .send(wavecraft_debug_probe::RttTerminalLine::plain(
+            3,
+            "nRF52832 booted",
+            true,
+        ))
         .expect("test receiver remains connected");
 
     run_frames(&mut app, &context(), 1);

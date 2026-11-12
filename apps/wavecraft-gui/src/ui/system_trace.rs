@@ -10,7 +10,7 @@ use crate::{
 };
 use wavecraft_debug_probe::{
     AttachConfiguration, ProbeDescriptor, ProbeProvider, ProbeSelector, RttConfiguration,
-    RttControlBlockLocation, TargetSelector, WireProtocol,
+    RttControlBlockLocation, RttTerminalColor, RttTerminalLine, TargetSelector, WireProtocol,
 };
 use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
 
@@ -758,14 +758,115 @@ fn paint_terminal_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
                                 .color(TEXT_MUTED),
                         ),
                     );
-                    let suffix = if line.complete { "" } else { " …" };
-                    ui.label(RichText::new(format!("{}{suffix}", line.text)).monospace());
+                    ui.label(terminal_line_layout(ui, line));
                 });
                 if trace.follow_latest && row + 1 == line_count {
                     response.response.scroll_to_me(Some(egui::Align::BOTTOM));
                 }
             }
         });
+}
+
+fn terminal_line_layout(ui: &egui::Ui, line: &RttTerminalLine) -> egui::text::LayoutJob {
+    let mut layout = egui::text::LayoutJob::default();
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let default_color = ui.visuals().text_color();
+    for span in &line.spans {
+        let mut color = span.style.foreground.map_or(default_color, |color| {
+            terminal_color(color, span.style.bold)
+        });
+        if span.style.dim {
+            color = dim_terminal_color(color);
+        }
+        let background = span
+            .style
+            .background
+            .map_or(egui::Color32::TRANSPARENT, |color| {
+                terminal_color(color, false)
+            });
+        layout.append(
+            &span.text,
+            0.0,
+            egui::TextFormat {
+                font_id: font_id.clone(),
+                color,
+                background,
+                ..egui::TextFormat::default()
+            },
+        );
+    }
+    if !line.complete {
+        layout.append(
+            " …",
+            0.0,
+            egui::TextFormat {
+                font_id,
+                color: TEXT_MUTED,
+                ..egui::TextFormat::default()
+            },
+        );
+    }
+    layout
+}
+
+fn terminal_color(color: RttTerminalColor, bold: bool) -> egui::Color32 {
+    match color {
+        RttTerminalColor::Basic { index, bright } => terminal_basic_color(index, bright || bold),
+        RttTerminalColor::Indexed(index) if index < 16 => {
+            terminal_basic_color(index % 8, index >= 8)
+        }
+        RttTerminalColor::Indexed(index) if index < 232 => {
+            let cube_index = index - 16;
+            let levels = [0, 95, 135, 175, 215, 255];
+            let red = levels[usize::from(cube_index / 36)];
+            let green = levels[usize::from((cube_index % 36) / 6)];
+            let blue = levels[usize::from(cube_index % 6)];
+            egui::Color32::from_rgb(red, green, blue)
+        }
+        RttTerminalColor::Indexed(index) => {
+            let level = 8_u8.saturating_add((index - 232).saturating_mul(10));
+            egui::Color32::from_gray(level)
+        }
+        RttTerminalColor::Rgb { red, green, blue } => egui::Color32::from_rgb(red, green, blue),
+    }
+}
+
+fn terminal_basic_color(index: u8, bright: bool) -> egui::Color32 {
+    const STANDARD: [[u8; 3]; 8] = [
+        [0, 0, 0],
+        [205, 0, 0],
+        [0, 205, 0],
+        [205, 205, 0],
+        [0, 0, 238],
+        [205, 0, 205],
+        [0, 205, 205],
+        [229, 229, 229],
+    ];
+    const BRIGHT: [[u8; 3]; 8] = [
+        [127, 127, 127],
+        [255, 0, 0],
+        [0, 255, 0],
+        [255, 255, 0],
+        [92, 92, 255],
+        [255, 0, 255],
+        [0, 255, 255],
+        [255, 255, 255],
+    ];
+    let palette = if bright { BRIGHT } else { STANDARD };
+    let [red, green, blue] = palette
+        .get(usize::from(index))
+        .copied()
+        .unwrap_or(STANDARD[7]);
+    egui::Color32::from_rgb(red, green, blue)
+}
+
+fn dim_terminal_color(color: egui::Color32) -> egui::Color32 {
+    egui::Color32::from_rgba_premultiplied(
+        color.r().saturating_mul(2) / 3,
+        color.g().saturating_mul(2) / 3,
+        color.b().saturating_mul(2) / 3,
+        color.a(),
+    )
 }
 
 fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
@@ -1103,16 +1204,45 @@ mod tests {
         let mut app = app();
         app.system_trace.event_view = TraceEventView::Terminal;
         app.system_trace
-            .ingest_terminal_line(wavecraft_debug_probe::RttTerminalLine {
-                sequence: 0,
-                text: "nRF52832 booted".to_owned(),
-                complete: true,
-            });
+            .ingest_terminal_line(wavecraft_debug_probe::RttTerminalLine::plain(
+                0,
+                "nRF52832 booted",
+                true,
+            ));
 
         let texts = paint_central_texts(&context, &mut app);
 
         assert!(texts.iter().any(|text| text == "RTT TERMINAL"));
         assert!(texts.iter().any(|text| text == "nRF52832 booted"));
+    }
+
+    #[test]
+    fn rtt_terminal_maps_ansi_palettes_to_display_colors() {
+        assert_eq!(
+            terminal_color(
+                RttTerminalColor::Basic {
+                    index: 1,
+                    bright: false,
+                },
+                false,
+            ),
+            egui::Color32::from_rgb(205, 0, 0)
+        );
+        assert_eq!(
+            terminal_color(RttTerminalColor::Indexed(196), false),
+            egui::Color32::from_rgb(255, 0, 0)
+        );
+        assert_eq!(
+            terminal_color(
+                RttTerminalColor::Rgb {
+                    red: 12,
+                    green: 34,
+                    blue: 56,
+                },
+                false,
+            ),
+            egui::Color32::from_rgb(12, 34, 56)
+        );
     }
 
     #[test]

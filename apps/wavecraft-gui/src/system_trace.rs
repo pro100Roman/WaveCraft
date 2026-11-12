@@ -883,11 +883,7 @@ mod tests {
     fn clear_starts_a_fresh_trace_session() {
         let mut state = SystemTraceDisplayState::default();
         state.ingest(event(0, 1, TraceEventKind::TaskStarted { task_id: 1 }));
-        state.ingest_terminal_line(RttTerminalLine {
-            sequence: 0,
-            text: "boot".to_owned(),
-            complete: true,
-        });
+        state.ingest_terminal_line(RttTerminalLine::plain(0, "boot", true));
         state.selected_sequence = Some(0);
 
         state.clear();
@@ -902,11 +898,11 @@ mod tests {
     fn starting_a_trace_keeps_terminal_output_collected_since_attach() {
         let mut state = SystemTraceDisplayState::default();
         state.ingest(event(0, 1, TraceEventKind::TraceStarted));
-        state.ingest_terminal_line(RttTerminalLine {
-            sequence: 0,
-            text: "boot before SystemView start".to_owned(),
-            complete: true,
-        });
+        state.ingest_terminal_line(RttTerminalLine::plain(
+            0,
+            "boot before SystemView start",
+            true,
+        ));
 
         state.clear_trace_events();
 
@@ -942,11 +938,7 @@ mod tests {
         );
         assert_eq!(
             line_receiver.recv().expect("completed line is emitted"),
-            RttTerminalLine {
-                sequence: 0,
-                text: "boot ready".to_owned(),
-                complete: true,
-            }
+            RttTerminalLine::plain(0, "boot ready", true)
         );
         assert!(matches!(
             commands.lock().expect("commands are available").as_slice(),

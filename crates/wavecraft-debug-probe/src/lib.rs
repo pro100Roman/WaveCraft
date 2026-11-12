@@ -276,8 +276,29 @@ fn extended_ansi_color(values: &[u16]) -> Option<(RttTerminalColor, usize)> {
 pub struct RttTerminalLine {
     pub sequence: u64,
     pub text: String,
+    pub spans: Vec<RttTerminalSpan>,
     /// False when the line was emitted only to enforce the configured bound.
     pub complete: bool,
+}
+
+impl RttTerminalLine {
+    pub fn plain(sequence: u64, text: impl Into<String>, complete: bool) -> Self {
+        let text = text.into();
+        let spans = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![RttTerminalSpan {
+                text: text.clone(),
+                style: RttTerminalStyle::default(),
+            }]
+        };
+        Self {
+            sequence,
+            text,
+            spans,
+            complete,
+        }
+    }
 }
 
 /// Incremental, bounded decoder for UTF-8 text carried by a plain RTT channel.
@@ -286,6 +307,7 @@ pub struct RttTerminalDecoder {
     pending: Vec<u8>,
     maximum_line_bytes: usize,
     next_sequence: u64,
+    ansi: RttAnsiParser,
 }
 
 impl RttTerminalDecoder {
@@ -298,6 +320,7 @@ impl RttTerminalDecoder {
             pending: Vec::new(),
             maximum_line_bytes: maximum_line_bytes.max(1),
             next_sequence: 0,
+            ansi: RttAnsiParser::new(),
         }
     }
 
@@ -331,6 +354,7 @@ impl RttTerminalDecoder {
     pub fn reset(&mut self) {
         self.pending.clear();
         self.next_sequence = 0;
+        self.ansi.reset();
     }
 
     pub fn pending_bytes(&self) -> usize {
@@ -339,9 +363,13 @@ impl RttTerminalDecoder {
 
     fn take_line(&mut self, complete: bool) -> RttTerminalLine {
         let bytes = std::mem::take(&mut self.pending);
+        let decoded = String::from_utf8_lossy(&bytes);
+        let spans = self.ansi.push(&decoded);
+        let text = spans.iter().map(|span| span.text.as_str()).collect();
         let line = RttTerminalLine {
             sequence: self.next_sequence,
-            text: String::from_utf8_lossy(&bytes).into_owned(),
+            text,
+            spans,
             complete,
         };
         self.next_sequence = self.next_sequence.saturating_add(1);
@@ -1092,16 +1120,8 @@ mod tests {
             assert_eq!(
                 lines,
                 [
-                    RttTerminalLine {
-                        sequence: 0,
-                        text: "boot ✓".to_owned(),
-                        complete: true,
-                    },
-                    RttTerminalLine {
-                        sequence: 1,
-                        text: "ready".to_owned(),
-                        complete: true,
-                    },
+                    RttTerminalLine::plain(0, "boot ✓", true),
+                    RttTerminalLine::plain(1, "ready", true),
                 ],
                 "split at {split}"
             );
@@ -1118,16 +1138,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                RttTerminalLine {
-                    sequence: 0,
-                    text: "abcd".to_owned(),
-                    complete: false,
-                },
-                RttTerminalLine {
-                    sequence: 1,
-                    text: "efgh".to_owned(),
-                    complete: false,
-                },
+                RttTerminalLine::plain(0, "abcd", false),
+                RttTerminalLine::plain(1, "efgh", false),
             ]
         );
         assert_eq!(tail.sequence, 2);
@@ -1142,14 +1154,7 @@ mod tests {
 
         let lines = decoder.push(b"abcd\n");
 
-        assert_eq!(
-            lines,
-            [RttTerminalLine {
-                sequence: 0,
-                text: "abcd".to_owned(),
-                complete: true,
-            }]
-        );
+        assert_eq!(lines, [RttTerminalLine::plain(0, "abcd", true)]);
     }
 
     #[test]
@@ -1160,6 +1165,26 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text, "ok�");
         assert!(lines[0].complete);
+    }
+
+    #[test]
+    fn rtt_terminal_lines_strip_ansi_sequences_and_retain_color_spans() {
+        let mut decoder = RttTerminalDecoder::new();
+
+        let lines = decoder.push(b"\x1b[31merror\ncontinued\x1b[0m\n");
+
+        assert_eq!(lines[0].text, "error");
+        assert_eq!(lines[1].text, "continued");
+        for line in &lines {
+            assert_eq!(
+                line.spans[0].style.foreground,
+                Some(RttTerminalColor::Basic {
+                    index: 1,
+                    bright: false,
+                })
+            );
+        }
+        assert_eq!(decoder.ansi.style(), RttTerminalStyle::default());
     }
 
     #[test]
