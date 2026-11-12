@@ -14,6 +14,7 @@ members = [
     "crates/wavecraft-sim",
     "crates/wavecraft-systemview",
     "crates/wavecraft-trace",
+    "crates/wavecraft-trace-recording",
     "crates/wavecraft-usb",
 ]
 exclude = ["crates/wavecraft-probe-rs"]

@@ -3137,6 +3137,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wavecraft-trace-recording"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "serde_json",
+ "wavecraft-trace",
+]
+
+[[package]]
 name = "wavecraft-usb"
 version = "0.1.0"
 dependencies = [
