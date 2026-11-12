@@ -1132,13 +1132,14 @@ fn paint_terminal_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, view
         .collect::<Vec<_>>();
     let line_count = visible_lines.len();
     let table_row_count = line_count + 1;
+    let table_width = ui.available_width().max(TERMINAL_TABLE_MINIMUM_WIDTH);
 
     egui::ScrollArea::both()
         .id_salt("system_trace_rtt_terminal")
         .max_height(view_height)
         .auto_shrink([false, false])
         .show_rows(ui, 22.0, table_row_count, |ui, row_range| {
-            ui.set_min_width(TERMINAL_TABLE_MINIMUM_WIDTH);
+            ui.set_min_width(table_width);
             for table_row in row_range {
                 if table_row == 0 {
                     ui.horizontal(|ui| {
@@ -1327,6 +1328,7 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
     let event_table_focus = trace.take_event_table_focus();
     let follow_latest = trace.follow_latest && event_table_focus.is_none();
     let event_count = visible_indices.len();
+    let table_width = ui.available_width().max(EVENT_TABLE_MINIMUM_WIDTH);
     let focus_row = event_table_focus.and_then(|sequence| {
         visible_indices
             .iter()
@@ -1354,7 +1356,7 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
     let mut clicked_sequence = None;
     let event_scroll =
         event_scroll.show_rows(ui, EVENT_TABLE_ROW_HEIGHT, event_count, |ui, row_range| {
-            ui.set_min_width(EVENT_TABLE_MINIMUM_WIDTH);
+            ui.set_min_width(table_width);
             for visible_row in row_range {
                 let event = &trace.events()[visible_indices[visible_row]];
                 let event_selected = selected_sequence == Some(event.sequence);
@@ -1370,7 +1372,7 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
                         egui::Stroke::NONE
                     })
                     .show(ui, |ui| {
-                        ui.set_min_width(EVENT_TABLE_MINIMUM_WIDTH);
+                        ui.set_min_width(table_width);
                         ui.horizontal(|ui| {
                             ui.add_sized(
                                 [90.0, 20.0],
@@ -1519,6 +1521,7 @@ fn paint_trace_empty_state(ui: &mut egui::Ui, title: &str, description: &str, mi
         .fill(BACKGROUND)
         .inner_margin(egui::Margin::same(12.0))
         .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.set_min_height((minimum_height - EMPTY_STATE_VERTICAL_MARGIN).max(0.0));
             ui.label(RichText::new(title).strong());
             ui.label(RichText::new(description).color(TEXT_MUTED));
@@ -1742,6 +1745,20 @@ mod tests {
             egui::Shape::Vec(shapes) => shapes
                 .iter()
                 .for_each(|shape| collect_rects_with_stroke(shape, expected, rects)),
+            _ => {}
+        }
+    }
+
+    fn collect_rects_with_fill(
+        shape: &egui::Shape,
+        expected: egui::Color32,
+        rects: &mut Vec<egui::Rect>,
+    ) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.fill == expected => rects.push(rect.rect),
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .for_each(|shape| collect_rects_with_fill(shape, expected, rects)),
             _ => {}
         }
     }
@@ -2030,8 +2047,10 @@ mod tests {
             app.paint_system_trace_central_panel(context);
         });
         let mut bordered_rects = Vec::new();
+        let mut background_rects = Vec::new();
         output.shapes.iter().for_each(|clipped| {
             collect_rects_with_stroke(&clipped.shape, GRID, &mut bordered_rects);
+            collect_rects_with_fill(&clipped.shape, BACKGROUND, &mut background_rects);
         });
 
         assert!(!bordered_rects.is_empty());
@@ -2046,6 +2065,15 @@ mod tests {
                 .count()
                 >= 2,
             "expected both trace panes to fill the available width: {bordered_rects:?}"
+        );
+        let expected_content_width = expected_width - 24.0;
+        assert!(
+            background_rects
+                .iter()
+                .filter(|rect| (rect.width() - expected_content_width).abs() < 1.0)
+                .count()
+                >= 2,
+            "expected both empty surfaces to fill their pane width: {background_rects:?}"
         );
     }
 
