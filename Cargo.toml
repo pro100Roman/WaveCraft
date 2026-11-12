@@ -16,6 +16,7 @@ members = [
     "crates/wavecraft-trace",
     "crates/wavecraft-usb",
 ]
+exclude = ["crates/wavecraft-probe-rs"]
 resolver = "2"
 
 [workspace.package]

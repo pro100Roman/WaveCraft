@@ -1,0 +1,16 @@
+[package]
+name = "wavecraft-probe-rs"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+# probe-rs 0.32 requires Rust 1.95. Keeping that requirement in this adapter
+# prevents it from leaking into the provider-neutral interface crate.
+rust-version = "1.95"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[dependencies]
+probe-rs = { version = "0.32.0", default-features = false, features = ["builtin-targets"] }
+wavecraft-debug-probe = { path = "../wavecraft-debug-probe" }
