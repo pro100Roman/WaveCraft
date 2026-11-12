@@ -20,6 +20,8 @@ const TIMELINE_HEADER_HEIGHT: f32 = 24.0;
 const TIMELINE_ROW_HEIGHT: f32 = 25.0;
 const TIMELINE_MINIMUM_WIDTH: f32 = 720.0;
 const TIMELINE_ZOOM_STEP: f32 = 1.5;
+const EVENT_TABLE_MINIMUM_WIDTH: f32 = 760.0;
+const TERMINAL_TABLE_MINIMUM_WIDTH: f32 = 720.0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SystemTraceSettings {
@@ -951,21 +953,26 @@ fn paint_terminal_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, view
         .filter(|line| filter.is_empty() || line.text.to_lowercase().contains(filter.as_str()))
         .collect::<Vec<_>>();
     let line_count = visible_lines.len();
+    let table_row_count = line_count + 1;
 
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [70.0, 18.0],
-            egui::Label::new(RichText::new("LINE").small().color(TEXT_MUTED)),
-        );
-        ui.label(RichText::new("TEXT").small().color(TEXT_MUTED));
-    });
-    ui.separator();
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::both()
         .id_salt("system_trace_rtt_terminal")
         .max_height(view_height)
         .auto_shrink([false, false])
-        .show_rows(ui, 22.0, line_count, |ui, row_range| {
-            for row in row_range {
+        .show_rows(ui, 22.0, table_row_count, |ui, row_range| {
+            ui.set_min_width(TERMINAL_TABLE_MINIMUM_WIDTH);
+            for table_row in row_range {
+                if table_row == 0 {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [70.0, 20.0],
+                            egui::Label::new(RichText::new("LINE").small().color(TEXT_MUTED)),
+                        );
+                        ui.label(RichText::new("TEXT").small().color(TEXT_MUTED));
+                    });
+                    continue;
+                }
+                let row = table_row - 1;
                 let line = visible_lines[row];
                 let response = ui.horizontal(|ui| {
                     ui.add_sized(
@@ -1141,29 +1148,34 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
     let mut selected_sequence = trace.selected_sequence;
     let follow_latest = trace.follow_latest;
     let event_count = visible_indices.len();
+    let table_row_count = event_count + 1;
 
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [90.0, 18.0],
-            egui::Label::new(RichText::new("TICKS").small().color(TEXT_MUTED)),
-        );
-        ui.add_sized(
-            [45.0, 18.0],
-            egui::Label::new(RichText::new("CORE").small().color(TEXT_MUTED)),
-        );
-        ui.add_sized(
-            [170.0, 18.0],
-            egui::Label::new(RichText::new("EVENT").small().color(TEXT_MUTED)),
-        );
-        ui.label(RichText::new("DETAILS").small().color(TEXT_MUTED));
-    });
-    ui.separator();
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::both()
         .id_salt("system_trace_events")
         .max_height(view_height)
         .auto_shrink([false, false])
-        .show_rows(ui, 22.0, event_count, |ui, row_range| {
-            for visible_row in row_range {
+        .show_rows(ui, 22.0, table_row_count, |ui, row_range| {
+            ui.set_min_width(EVENT_TABLE_MINIMUM_WIDTH);
+            for table_row in row_range {
+                if table_row == 0 {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [90.0, 20.0],
+                            egui::Label::new(RichText::new("TICKS").small().color(TEXT_MUTED)),
+                        );
+                        ui.add_sized(
+                            [45.0, 20.0],
+                            egui::Label::new(RichText::new("CORE").small().color(TEXT_MUTED)),
+                        );
+                        ui.add_sized(
+                            [170.0, 20.0],
+                            egui::Label::new(RichText::new("EVENT").small().color(TEXT_MUTED)),
+                        );
+                        ui.label(RichText::new("DETAILS").small().color(TEXT_MUTED));
+                    });
+                    continue;
+                }
+                let visible_row = table_row - 1;
                 let event = &trace.events()[visible_indices[visible_row]];
                 let response = ui.horizontal(|ui| {
                     ui.add_sized(
