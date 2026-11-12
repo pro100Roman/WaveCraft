@@ -3109,6 +3109,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wavecraft-trace"
+version = "0.1.0"
+
+[[package]]
 name = "wavecraft-usb"
 version = "0.1.0"
 dependencies = [
