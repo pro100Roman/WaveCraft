@@ -255,13 +255,23 @@ impl WaveCraftApp {
                                         self.debug_probes.iter().find(|probe| {
                                             probe.connection_id.as_str() == connection_id
                                         })
-                                    })
+                                    });
+                                let selected_probe_label = selected_probe
                                     .map(probe_label)
                                     .unwrap_or_else(|| "No debug probe found".to_owned());
+                                let selected_probe_hover = selected_probe.map_or_else(
+                                    || "Select the connected J-Link, ST-Link, or Black Magic Probe used for this trace session".to_owned(),
+                                    |probe| {
+                                        format!(
+                                            "{}\nConnection: {}\n\nSelect the debug probe used for this trace session",
+                                            probe_full_label(probe), probe.connection_id
+                                        )
+                                    },
+                                );
                                 let mut probe_changed = false;
                                 egui::ComboBox::from_id_salt("system_trace_probe")
                                     .width(ui.available_width())
-                                    .selected_text(selected_probe)
+                                    .selected_text(selected_probe_label)
                                     .show_ui(ui, |ui| {
                                         if self.debug_probes.is_empty() {
                                             ui.add_enabled(
@@ -278,14 +288,15 @@ impl WaveCraftApp {
                                                     Some(probe.connection_id.clone()),
                                                     probe_label(probe),
                                                 )
-                                                .on_hover_text(&probe.connection_id)
+                                                .on_hover_text(format!(
+                                                    "{}\nConnection: {}",
+                                                    probe_full_label(probe), probe.connection_id
+                                                ))
                                                 .changed();
                                         }
                                     })
                                     .response
-                                    .on_hover_text(
-                                        "Select the connected J-Link, ST-Link, or Black Magic Probe used for this trace session",
-                                    );
+                                    .on_hover_text(selected_probe_hover);
                                 if probe_changed {
                                     self.system_trace_settings.target_name.clear();
                                 }
@@ -783,6 +794,20 @@ fn parse_rtt_control_block(text: &str) -> Result<RttControlBlockLocation, String
 }
 
 fn probe_label(probe: &ProbeDescriptor) -> String {
+    let provider = compact_probe_provider_label(&probe.provider);
+    if let Some(serial) = probe.serial_number.as_deref() {
+        format!("{provider} · {}", compact_probe_serial(serial))
+    } else if probe.model.eq_ignore_ascii_case(provider)
+        || matches!(probe.provider, ProbeProvider::BlackMagicProbe)
+            && probe.model.eq_ignore_ascii_case("Black Magic Probe")
+    {
+        provider.to_owned()
+    } else {
+        format!("{provider} · {}", ellipsize_end(&probe.model, 18))
+    }
+}
+
+fn probe_full_label(probe: &ProbeDescriptor) -> String {
     let provider = probe_provider_label(&probe.provider);
     let serial = probe
         .serial_number
@@ -790,6 +815,38 @@ fn probe_label(probe: &ProbeDescriptor) -> String {
         .map(|serial| format!(" · {serial}"))
         .unwrap_or_default();
     format!("{provider} · {}{serial}", probe.model)
+}
+
+fn compact_probe_provider_label(provider: &ProbeProvider) -> &str {
+    match provider {
+        ProbeProvider::BlackMagicProbe => "BMP",
+        _ => probe_provider_label(provider),
+    }
+}
+
+fn compact_probe_serial(serial: &str) -> String {
+    const MAX_SERIAL_CHARACTERS: usize = 12;
+    let character_count = serial.chars().count();
+    if character_count <= MAX_SERIAL_CHARACTERS {
+        return serial.to_owned();
+    }
+    let suffix = serial
+        .chars()
+        .skip(character_count - (MAX_SERIAL_CHARACTERS - 1))
+        .collect::<String>();
+    format!("…{suffix}")
+}
+
+fn ellipsize_end(text: &str, maximum_characters: usize) -> String {
+    let character_count = text.chars().count();
+    if character_count <= maximum_characters {
+        return text.to_owned();
+    }
+    let prefix = text
+        .chars()
+        .take(maximum_characters.saturating_sub(1))
+        .collect::<String>();
+    format!("{prefix}…")
 }
 
 fn probe_provider_label(provider: &ProbeProvider) -> &str {
@@ -3602,6 +3659,47 @@ mod tests {
         assert!(target_matches_query(&target, "NRF52 series"));
         assert!(target_matches_query(&target, "nrf 32"));
         assert!(!target_matches_query(&target, "stm32"));
+    }
+
+    #[test]
+    fn probe_labels_are_compact_and_full_identity_remains_available() {
+        let jlink = ProbeDescriptor {
+            connection_id: "1366:0105:000123456789".to_owned(),
+            provider: ProbeProvider::JLink,
+            vendor: Some("SEGGER".to_owned()),
+            model: "J-Link OB-SAM3U128-V2-NordicSemi".to_owned(),
+            serial_number: Some("0000123456789012".to_owned()),
+        };
+        let bmp = ProbeDescriptor {
+            connection_id: "1d50:6018".to_owned(),
+            provider: ProbeProvider::BlackMagicProbe,
+            vendor: None,
+            model: "Black Magic Probe".to_owned(),
+            serial_number: None,
+        };
+
+        assert_eq!(probe_label(&jlink), "J-Link · …23456789012");
+        assert_eq!(probe_label(&bmp), "BMP");
+        assert_eq!(
+            probe_full_label(&jlink),
+            "J-Link · J-Link OB-SAM3U128-V2-NordicSemi · 0000123456789012"
+        );
+    }
+
+    #[test]
+    fn probe_model_without_a_serial_is_ellipsized() {
+        let probe = ProbeDescriptor {
+            connection_id: "test".to_owned(),
+            provider: ProbeProvider::StLink,
+            vendor: Some("STMicroelectronics".to_owned()),
+            model: "ST-LINK/V3 very long model name".to_owned(),
+            serial_number: None,
+        };
+
+        let label = probe_label(&probe);
+
+        assert_eq!(label, "ST-Link · ST-LINK/V3 very l…");
+        assert!(label.chars().count() <= 28);
     }
 
     #[test]
