@@ -139,7 +139,7 @@ impl WaveCraftApp {
                     actions.refresh_clicked = ui
                         .add_enabled(
                             !self.is_busy() && self.system_trace_connection.is_disconnected(),
-                            toolbar_action_button("↻ Scan devices", SCOPE_COLORS[1]),
+                            toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
                         )
                         .on_hover_text("Scan for debug probes, DSLogic, DSCope, and radio devices")
                         .clicked();
@@ -167,7 +167,7 @@ impl WaveCraftApp {
                     if ui
                         .add_enabled(
                             !self.is_busy() && self.system_trace_connection.is_disconnected(),
-                            toolbar_action_button("Open .SVDat…", TEXT_MUTED),
+                            toolbar_action_button("📂 Open", TEXT_MUTED),
                         )
                         .on_hover_text("Open a raw SEGGER SystemView event stream")
                         .clicked()
@@ -2945,24 +2945,24 @@ mod tests {
         let context = egui::Context::default();
         let mut app = app();
         let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
-        let scan_position = texts
+        let refresh_position = texts
             .iter()
-            .find(|(text, _)| text == "↻ Scan devices")
+            .find(|(text, _)| text == "↻ Refresh")
             .map(|(_, position)| *position)
-            .expect("scan button is painted");
+            .expect("refresh button is painted");
 
         let _ = paint_toolbar(
             &context,
             &mut app,
             vec![
-                egui::Event::PointerMoved(scan_position),
-                pointer_button(scan_position, true),
+                egui::Event::PointerMoved(refresh_position),
+                pointer_button(refresh_position, true),
             ],
         );
         let (actions, _) = paint_toolbar(
             &context,
             &mut app,
-            vec![pointer_button(scan_position, false)],
+            vec![pointer_button(refresh_position, false)],
         );
 
         assert!(actions.refresh_clicked);
@@ -2975,11 +2975,11 @@ mod tests {
 
         let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
 
-        assert!(texts.iter().any(|(text, _)| text == "Open .SVDat…"));
+        assert!(texts.iter().any(|(text, _)| text == "📂 Open"));
     }
 
     #[test]
-    fn system_trace_scan_and_open_follow_left_toolbar_order() {
+    fn system_trace_refresh_and_open_follow_left_toolbar_order() {
         let context = egui::Context::default();
         let mut app = app();
         let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
@@ -2992,12 +2992,12 @@ mod tests {
         };
 
         let title = position("System and RTOS trace");
-        let scan = position("↻ Scan devices");
+        let refresh = position("↻ Refresh");
         let record = position("● Record…");
-        let open = position("Open .SVDat…");
+        let open = position("📂 Open");
 
-        assert!(title.x < scan.x);
-        assert!(scan.x < record.x);
+        assert!(title.x < refresh.x);
+        assert!(refresh.x < record.x);
         assert!(record.x < open.x);
     }
 
