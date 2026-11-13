@@ -251,6 +251,13 @@ impl WaveCraftApp {
                     {
                         actions.system_trace_action = Some(SystemTraceAction::Open);
                     }
+                    ui.separator();
+                    paint_connection_control(
+                        ui,
+                        &self.system_trace_connection,
+                        self.system_trace_settings.probe_connection_id.is_some(),
+                        actions,
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         paint_trace_run_control(ui, &self.system_trace_connection, actions);
                         if ui
@@ -526,12 +533,6 @@ impl WaveCraftApp {
                             });
 
                         ui.add_space(16.0);
-                        paint_connection_control(
-                            ui,
-                            &self.system_trace_connection,
-                            self.system_trace_settings.probe_connection_id.is_some(),
-                            actions,
-                        );
                         if let SystemTraceConnectionState::Attached {
                             channels,
                             systemview_enabled,
@@ -786,7 +787,10 @@ fn paint_connection_control(
     match state {
         SystemTraceConnectionState::Disconnected | SystemTraceConnectionState::Error(_) => {
             if ui
-                .add_enabled(probe_selected, egui::Button::new("Connect and attach"))
+                .add_enabled(
+                    probe_selected,
+                    toolbar_action_button("Connect and attach", ACCENT),
+                )
                 .on_hover_text(
                     "Attach uses the isolated probe-rs helper and never flashes the target. Reset is applied only when selected in Probe settings.",
                 )
@@ -796,7 +800,7 @@ fn paint_connection_control(
             }
         }
         SystemTraceConnectionState::Connecting => {
-            ui.add_enabled(false, egui::Button::new("Connecting…"))
+            ui.add_enabled(false, toolbar_action_button("Connecting…", ACCENT))
                 .on_hover_text("WaveCraft is opening the probe and attaching to the target");
         }
         SystemTraceConnectionState::Attached { .. }
@@ -804,7 +808,10 @@ fn paint_connection_control(
         | SystemTraceConnectionState::Tracing { .. }
         | SystemTraceConnectionState::Stopping { .. } => {
             if ui
-                .button("Disconnect")
+                .add(toolbar_action_button(
+                    "Disconnect",
+                    egui::Color32::LIGHT_RED,
+                ))
                 .on_hover_text("Close RTT and the current debug-probe session without flashing")
                 .clicked()
             {
@@ -812,7 +819,10 @@ fn paint_connection_control(
             }
         }
         SystemTraceConnectionState::Disconnecting => {
-            ui.add_enabled(false, egui::Button::new("Disconnecting…"))
+            ui.add_enabled(
+                false,
+                toolbar_action_button("Disconnecting…", egui::Color32::LIGHT_RED),
+            )
                 .on_hover_text("WaveCraft is stopping trace and closing the probe session");
         }
     }
@@ -2971,7 +2981,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_panel_groups_probe_and_rtt_above_connection_control() {
+    fn setup_panel_groups_probe_and_rtt_above_save_control() {
         let context = egui::Context::default();
         let mut app = app();
 
@@ -2990,14 +3000,15 @@ mod tests {
             .find(|(text, _)| text == "RTT")
             .map(|(_, position)| *position)
             .expect("RTT section header is painted");
-        let connect = texts
+        let save = texts
             .iter()
-            .find(|(text, _)| text == "Connect and attach")
+            .find(|(text, _)| text == "💾 Save TRACE settings")
             .map(|(_, position)| *position)
-            .expect("connection control is painted");
+            .expect("save settings control is painted");
 
         assert!(probe.y < rtt.y);
-        assert!(rtt.y < connect.y);
+        assert!(rtt.y < save.y);
+        assert!(!texts.iter().any(|(text, _)| text == "Connect and attach"));
     }
 
     #[test]
@@ -3088,7 +3099,7 @@ mod tests {
     }
 
     #[test]
-    fn system_trace_refresh_and_open_follow_left_toolbar_order() {
+    fn system_trace_file_and_connection_actions_follow_left_toolbar_order() {
         let context = egui::Context::default();
         let mut app = app();
         let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
@@ -3104,10 +3115,40 @@ mod tests {
         let refresh = position("↻ Refresh");
         let record = position("● Record…");
         let open = position("📂 Open");
+        let connect = position("Connect and attach");
 
         assert!(title.x < refresh.x);
         assert!(refresh.x < record.x);
         assert!(record.x < open.x);
+        assert!(open.x < connect.x);
+    }
+
+    #[test]
+    fn system_trace_toolbar_can_request_probe_connection() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace_settings.probe_connection_id = Some("probe-1".to_owned());
+        let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
+        let connect = texts
+            .iter()
+            .find(|(text, _)| text == "Connect and attach")
+            .map(|(_, position)| *position)
+            .expect("connection control is painted");
+
+        let _ = paint_toolbar(
+            &context,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(connect),
+                pointer_button(connect, true),
+            ],
+        );
+        let (actions, _) = paint_toolbar(&context, &mut app, vec![pointer_button(connect, false)]);
+
+        assert_eq!(
+            actions.system_trace_action,
+            Some(SystemTraceAction::Connect)
+        );
     }
 
     #[test]
@@ -3122,6 +3163,7 @@ mod tests {
         let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
 
         assert!(texts.iter().any(|(text, _)| text == "● Record…"));
+        assert!(texts.iter().any(|(text, _)| text == "Disconnect"));
         assert!(texts.iter().any(|(text, _)| text == "▶ Start"));
     }
 
