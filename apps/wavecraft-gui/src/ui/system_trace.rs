@@ -29,8 +29,8 @@ const TIMELINE_HEADER_HEIGHT: f32 = 24.0;
 const TIMELINE_ROW_HEIGHT: f32 = 25.0;
 const TIMELINE_MINIMUM_WIDTH: f32 = 720.0;
 const TIMELINE_ZOOM_STEP: f32 = 1.5;
-const TIMELINE_SMART_TIMING_HINT_WIDTH: f32 = 300.0;
 const TIMELINE_SMART_TIMING_HINT_HEIGHT: f32 = 58.0;
+const TIMELINE_SMART_TIMING_HINT_HORIZONTAL_PADDING: f32 = 16.0;
 const TIMELINE_EDGE_SNAP_DISTANCE: f32 = 10.0;
 const TIMELINE_SHORT_EVENT_HOVER_DISTANCE: f32 = 8.0;
 const EVENT_TABLE_MINIMUM_WIDTH: f32 = 760.0;
@@ -1592,7 +1592,40 @@ fn paint_timeline_smart_timing_hint(
         painter.circle_filled(egui::pos2(x, plot.top() + 3.0), 2.5, hover_color);
     }
 
-    let hint_width = TIMELINE_SMART_TIMING_HINT_WIDTH.min((plot.width() - 8.0).max(1.0));
+    let duration_ticks = first.timestamp_ticks.abs_diff(second.timestamp_ticks);
+    let duration = trace_system_frequency_hz(trace).map(|frequency_hz| {
+        format_duration(Duration::from_secs_f64(
+            duration_ticks as f64 / frequency_hz as f64,
+        ))
+    });
+    let context_line = format!(
+        "{} → {}",
+        timing_edge_label(trace.model(), first),
+        timing_edge_label(trace.model(), second)
+    );
+    let ticks_line = format!(
+        "{} → {} ticks",
+        first.timestamp_ticks, second.timestamp_ticks
+    );
+    let timing_line = duration.map_or_else(
+        || format!("Δ {duration_ticks} ticks"),
+        |duration| format!("Δ {duration_ticks} ticks · {duration}"),
+    );
+    let font_id = egui::FontId::monospace(10.0);
+    let content_width = [
+        (&context_line, color),
+        (&ticks_line, egui::Color32::WHITE),
+        (&timing_line, ACCENT),
+    ]
+    .into_iter()
+    .map(|(line, color)| {
+        painter
+            .layout_no_wrap(line.to_owned(), font_id.clone(), color)
+            .size()
+            .x
+    })
+    .fold(0.0_f32, f32::max);
+    let hint_width = timeline_smart_timing_hint_width(content_width, plot.width());
     let hint_height = TIMELINE_SMART_TIMING_HINT_HEIGHT.min((canvas.height() - 8.0).max(1.0));
     if hint_width < 120.0 || hint_height < 32.0 {
         return;
@@ -1612,44 +1645,31 @@ fn paint_timeline_smart_timing_hint(
     painter.rect_filled(hint, 5.0, half_transparent_plate(PANEL));
     painter.rect_stroke(hint, 5.0, egui::Stroke::new(0.75_f32, hover_color));
 
-    let duration_ticks = first.timestamp_ticks.abs_diff(second.timestamp_ticks);
-    let duration = trace_system_frequency_hz(trace).map(|frequency_hz| {
-        format_duration(Duration::from_secs_f64(
-            duration_ticks as f64 / frequency_hz as f64,
-        ))
-    });
-    let timing = duration.map_or_else(
-        || format!("Δ {duration_ticks} ticks"),
-        |duration| format!("Δ {duration_ticks} ticks · {duration}"),
-    );
     painter.text(
         hint.left_top() + egui::vec2(8.0, 5.0),
         egui::Align2::LEFT_TOP,
-        format!(
-            "{} → {}",
-            timing_edge_label(trace.model(), first),
-            timing_edge_label(trace.model(), second)
-        ),
-        egui::FontId::monospace(10.0),
+        context_line,
+        font_id.clone(),
         color,
     );
     painter.text(
         hint.left_top() + egui::vec2(8.0, 21.0),
         egui::Align2::LEFT_TOP,
-        format!(
-            "{} → {} ticks",
-            first.timestamp_ticks, second.timestamp_ticks
-        ),
-        egui::FontId::monospace(10.0),
+        ticks_line,
+        font_id.clone(),
         egui::Color32::WHITE,
     );
     painter.text(
         hint.left_top() + egui::vec2(8.0, 37.0),
         egui::Align2::LEFT_TOP,
-        timing,
-        egui::FontId::monospace(10.0),
+        timing_line,
+        font_id,
         ACCENT,
     );
+}
+
+fn timeline_smart_timing_hint_width(content_width: f32, plot_width: f32) -> f32 {
+    (content_width + TIMELINE_SMART_TIMING_HINT_HORIZONTAL_PADDING).min((plot_width - 8.0).max(1.0))
 }
 
 fn timing_edge_label(model: &TraceModel, edge: TimelineTimingEdge) -> String {
@@ -3293,6 +3313,13 @@ mod tests {
     }
 
     #[test]
+    fn smart_timing_hint_width_follows_text_and_stays_inside_the_plot() {
+        assert_eq!(timeline_smart_timing_hint_width(100.0, 500.0), 116.0);
+        assert_eq!(timeline_smart_timing_hint_width(220.0, 500.0), 236.0);
+        assert_eq!(timeline_smart_timing_hint_width(600.0, 300.0), 292.0);
+    }
+
+    #[test]
     fn timeline_smart_timing_snaps_to_interval_edges_with_half_transparent_hover() {
         let context = egui::Context::default();
         let mut trace = timing_trace();
@@ -3332,12 +3359,14 @@ mod tests {
             });
         });
         let hover_fill = half_transparent_plate(PANEL);
+        let mut timing_hint_rects = Vec::new();
+        for clipped in &output.shapes {
+            collect_rects_with_fill(&clipped.shape, hover_fill, &mut timing_hint_rects);
+        }
 
         assert_eq!(hover_fill.a(), 128);
-        assert!(output
-            .shapes
-            .iter()
-            .any(|clipped| shape_contains_fill(&clipped.shape, hover_fill)));
+        assert_eq!(timing_hint_rects.len(), 1);
+        assert!(timing_hint_rects[0].width() < 300.0);
         assert!(output
             .shapes
             .iter()
