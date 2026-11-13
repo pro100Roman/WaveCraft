@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use wavecraft_debug_probe::{
-    DebugProbeCommand, DebugProbeError, DebugProbeProtocolClient, DebugProbeReply, ProbeDescriptor,
+    DebugProbeCatalog, DebugProbeCommand, DebugProbeError, DebugProbeProtocolClient,
+    DebugProbeReply, ProbeDescriptor, ProbeTargetGroup,
 };
 
 const HELPER_ENVIRONMENT_VARIABLE: &str = "WAVECRAFT_PROBE_HELPER";
@@ -18,6 +19,7 @@ const HELPER_EXECUTABLE: &str = "wavecraft-probe-helper";
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DebugProbeDiscoveryReport {
     pub(crate) probes: Vec<ProbeDescriptor>,
+    pub(crate) target_groups: Vec<ProbeTargetGroup>,
     pub(crate) error: Option<String>,
 }
 
@@ -25,13 +27,14 @@ impl DebugProbeDiscoveryReport {
     fn failed(error: impl Into<String>) -> Self {
         Self {
             probes: Vec::new(),
+            target_groups: Vec::new(),
             error: Some(error.into()),
         }
     }
 }
 
 pub(crate) fn discover_debug_probes() -> DebugProbeDiscoveryReport {
-    let mut command = match helper_command(HelperInvocation::List) {
+    let mut command = match helper_command(HelperInvocation::Catalog) {
         Ok(command) => command,
         Err(error) => return DebugProbeDiscoveryReport::failed(error),
     };
@@ -52,9 +55,10 @@ pub(crate) fn discover_debug_probes() -> DebugProbeDiscoveryReport {
             format!("debug-probe scan failed: {detail}")
         });
     }
-    match parse_probe_list(&output.stdout) {
-        Ok(probes) => DebugProbeDiscoveryReport {
-            probes,
+    match parse_probe_catalog(&output.stdout) {
+        Ok(catalog) => DebugProbeDiscoveryReport {
+            probes: catalog.probes,
+            target_groups: catalog.target_groups,
             error: None,
         },
         Err(error) => DebugProbeDiscoveryReport::failed(error),
@@ -118,7 +122,7 @@ impl Drop for DebugProbeHelperProcess {
 
 #[derive(Clone, Copy)]
 enum HelperInvocation {
-    List,
+    Catalog,
     Serve,
 }
 
@@ -160,12 +164,13 @@ fn helper_command(invocation: HelperInvocation) -> Result<Command, String> {
 }
 
 fn add_helper_arguments(command: &mut Command, invocation: HelperInvocation, through_cargo: bool) {
-    if matches!(invocation, HelperInvocation::Serve) {
-        if through_cargo {
-            command.arg("--");
-        }
-        command.arg("serve");
+    if through_cargo {
+        command.arg("--");
     }
+    match invocation {
+        HelperInvocation::Catalog => command.arg("catalog"),
+        HelperInvocation::Serve => command.arg("serve"),
+    };
 }
 
 fn helper_candidates() -> Vec<PathBuf> {
@@ -190,7 +195,7 @@ fn probe_adapter_manifest() -> PathBuf {
     probe_adapter_directory().join("Cargo.toml")
 }
 
-fn parse_probe_list(bytes: &[u8]) -> Result<Vec<ProbeDescriptor>, String> {
+fn parse_probe_catalog(bytes: &[u8]) -> Result<DebugProbeCatalog, String> {
     serde_json::from_slice(bytes)
         .map_err(|error| format!("debug-probe helper returned invalid data: {error}"))
 }
@@ -202,13 +207,13 @@ mod tests {
 
     #[test]
     fn parses_provider_neutral_probe_descriptors() {
-        let probes = parse_probe_list(
-            br#"[{"connection_id":"1366:0105:1234","provider":"JLink","vendor":"SEGGER","model":"J-Link","serial_number":"1234"}]"#,
+        let catalog = parse_probe_catalog(
+            br#"{"probes":[{"connection_id":"1366:0105:1234","provider":"JLink","vendor":"SEGGER","model":"J-Link","serial_number":"1234"}],"target_groups":[{"provider":"JLink","targets":[{"name":"nRF52832_xxAA","family":"nRF52 Series"}]}]}"#,
         )
         .expect("valid helper output");
 
         assert_eq!(
-            probes,
+            catalog.probes,
             [ProbeDescriptor {
                 connection_id: "1366:0105:1234".to_owned(),
                 provider: ProbeProvider::JLink,
@@ -217,11 +222,13 @@ mod tests {
                 serial_number: Some("1234".to_owned()),
             }]
         );
+        assert_eq!(catalog.target_groups.len(), 1);
+        assert_eq!(catalog.target_groups[0].targets[0].name, "nRF52832_xxAA");
     }
 
     #[test]
     fn rejects_non_protocol_output() {
-        let error = parse_probe_list(b"J-Link").expect_err("human-readable output is not JSON");
+        let error = parse_probe_catalog(b"J-Link").expect_err("human-readable output is not JSON");
 
         assert!(error.contains("invalid data"));
     }
@@ -233,5 +240,6 @@ mod tests {
 
         assert_eq!(report.error, None);
         assert!(!report.probes.is_empty());
+        assert!(!report.target_groups.is_empty());
     }
 }

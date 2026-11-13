@@ -206,6 +206,7 @@ impl WaveCraftApp {
         self.radios = radio.devices;
         self.radio_discovery_failures = radio.failures;
         self.debug_probes = debug_probes.probes;
+        self.debug_probe_target_groups = debug_probes.target_groups;
         self.debug_probe_discovery_error = debug_probes.error;
         let selected_probe_is_available = self
             .system_trace_settings
@@ -1020,17 +1021,26 @@ mod tests {
             model: "J-Link_RH".to_owned(),
             serial_number: Some("000261009815".to_owned()),
         };
+        let target_group = wavecraft_debug_probe::ProbeTargetGroup {
+            provider: wavecraft_debug_probe::ProbeProvider::JLink,
+            targets: vec![wavecraft_debug_probe::DebugTargetDescriptor {
+                name: "nRF52832_xxAA".to_owned(),
+                family: "nRF52 Series".to_owned(),
+            }],
+        };
 
         app.handle_devices_found(
             Vec::new(),
             RadioDiscoveryReport::default(),
             DebugProbeDiscoveryReport {
                 probes: vec![probe.clone()],
+                target_groups: vec![target_group.clone()],
                 error: None,
             },
         );
 
         assert_eq!(app.debug_probes, [probe]);
+        assert_eq!(app.debug_probe_target_groups, [target_group]);
         assert_eq!(
             app.system_trace_settings.probe_connection_id.as_deref(),
             Some("1366:0105:000261009815")

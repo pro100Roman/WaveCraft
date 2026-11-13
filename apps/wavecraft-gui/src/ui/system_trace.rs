@@ -10,8 +10,9 @@ use crate::{
     BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
 };
 use wavecraft_debug_probe::{
-    AttachConfiguration, ProbeDescriptor, ProbeProvider, ProbeSelector, RttConfiguration,
-    RttControlBlockLocation, RttTerminalColor, RttTerminalLine, TargetSelector, WireProtocol,
+    AttachConfiguration, DebugTargetDescriptor, ProbeDescriptor, ProbeProvider, ProbeSelector,
+    RttConfiguration, RttControlBlockLocation, RttTerminalColor, RttTerminalLine, TargetSelector,
+    WireProtocol,
 };
 use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
 
@@ -28,6 +29,7 @@ const TERMINAL_TABLE_MINIMUM_WIDTH: f32 = 720.0;
 const TRACE_SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 92);
 const TRACE_SELECTION_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(32, 27, 12, 32);
 const TRACE_EVENT_SELECTION_FILL: egui::Color32 = egui::Color32::from_rgb(62, 52, 18);
+const TARGET_DROPDOWN_RESULT_LIMIT: usize = 200;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SystemTraceSettings {
@@ -211,6 +213,7 @@ impl WaveCraftApp {
                             })
                             .map(probe_label)
                             .unwrap_or_else(|| "No debug probe found".to_owned());
+                        let mut probe_changed = false;
                         egui::ComboBox::from_id_salt("system_trace_probe")
                             .width(ui.available_width())
                             .selected_text(selected_probe)
@@ -219,14 +222,19 @@ impl WaveCraftApp {
                                     ui.add_enabled(false, egui::Label::new("No probes found"));
                                 }
                                 for probe in &self.debug_probes {
-                                    ui.selectable_value(
-                                        &mut self.system_trace_settings.probe_connection_id,
-                                        Some(probe.connection_id.clone()),
-                                        probe_label(probe),
-                                    )
-                                    .on_hover_text(&probe.connection_id);
+                                    probe_changed |= ui
+                                        .selectable_value(
+                                            &mut self.system_trace_settings.probe_connection_id,
+                                            Some(probe.connection_id.clone()),
+                                            probe_label(probe),
+                                        )
+                                        .on_hover_text(&probe.connection_id)
+                                        .changed();
                                 }
                             });
+                        if probe_changed {
+                            self.system_trace_settings.target_name.clear();
+                        }
                         if let Some(error) = &self.debug_probe_discovery_error {
                             ui.label(
                                 RichText::new(error)
@@ -237,11 +245,29 @@ impl WaveCraftApp {
 
                         ui.add_space(10.0);
                         setup_label(ui, "Target MCU");
-                        ui.add(
-                            egui::TextEdit::singleline(
-                                &mut self.system_trace_settings.target_name,
-                            )
-                            .hint_text("e.g. STM32F407VGTx"),
+                        let selected_provider = self
+                            .system_trace_settings
+                            .probe_connection_id
+                            .as_deref()
+                            .and_then(|connection_id| {
+                                self.debug_probes.iter().find(|probe| {
+                                    probe.connection_id.as_str() == connection_id
+                                })
+                            })
+                            .map(|probe| &probe.provider);
+                        let targets = selected_provider
+                            .and_then(|provider| {
+                                self.debug_probe_target_groups
+                                    .iter()
+                                    .find(|group| &group.provider == provider)
+                            })
+                            .map(|group| group.targets.as_slice())
+                            .unwrap_or_default();
+                        paint_target_selector(
+                            ui,
+                            &mut self.system_trace_settings.target_name,
+                            selected_provider,
+                            targets,
                         );
 
                         ui.add_space(10.0);
@@ -421,6 +447,122 @@ fn setup_label(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).small().color(TEXT_MUTED));
 }
 
+fn paint_target_selector(
+    ui: &mut egui::Ui,
+    target_name: &mut String,
+    provider: Option<&ProbeProvider>,
+    targets: &[DebugTargetDescriptor],
+) {
+    let popup_id = ui.make_persistent_id("system_trace_target_popup");
+    let controls = ui.horizontal(|ui| {
+        let button_width = 24.0;
+        let text_width =
+            (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(button_width);
+        let text = ui.add_sized(
+            [text_width, 20.0],
+            egui::TextEdit::singleline(target_name).hint_text("Auto-detect or type a target"),
+        );
+        let dropdown = ui
+            .add_sized([button_width, 20.0], egui::Button::new("▾"))
+            .on_hover_text("Show supported targets for the selected probe");
+        (text, dropdown)
+    });
+    let (text_response, dropdown_response) = controls.inner;
+    let anchor_response = text_response.clone().union(dropdown_response.clone());
+    if dropdown_response.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+    } else if text_response.clicked() || text_response.gained_focus() || text_response.changed() {
+        ui.memory_mut(|memory| memory.open_popup(popup_id));
+    }
+
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &anchor_response,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |popup_ui| {
+            popup_ui.set_min_width(anchor_response.rect.width());
+            popup_ui.set_max_width(anchor_response.rect.width());
+            let provider_label = provider.map(probe_provider_label).unwrap_or("No probe");
+            let query = target_name.trim().to_ascii_lowercase();
+            let matching_targets = targets
+                .iter()
+                .filter(|target| target_matches_query(target, &query))
+                .collect::<Vec<_>>();
+            popup_ui.label(
+                RichText::new(format!(
+                    "{provider_label} · {} matching target(s)",
+                    matching_targets.len()
+                ))
+                .small()
+                .color(TEXT_MUTED),
+            );
+            popup_ui.separator();
+
+            let mut selected_target = None;
+            egui::ScrollArea::vertical()
+                .id_salt("system_trace_target_results")
+                .max_height(240.0)
+                .auto_shrink([false, false])
+                .show(popup_ui, |ui| {
+                    if ui
+                        .selectable_label(target_name.trim().is_empty(), "Auto-detect")
+                        .on_hover_text("Let probe-rs identify the connected target")
+                        .clicked()
+                    {
+                        selected_target = Some(String::new());
+                    }
+                    if provider.is_none() {
+                        ui.add_enabled(false, egui::Label::new("Select a debug probe first"));
+                    } else if targets.is_empty() {
+                        ui.add_enabled(
+                            false,
+                            egui::Label::new("No target catalog is available for this probe"),
+                        );
+                    } else {
+                        for target in matching_targets.iter().take(TARGET_DROPDOWN_RESULT_LIMIT) {
+                            if ui
+                                .selectable_label(
+                                    target.name.eq_ignore_ascii_case(target_name.trim()),
+                                    &target.name,
+                                )
+                                .on_hover_text(format!("Family: {}", target.family))
+                                .clicked()
+                            {
+                                selected_target = Some(target.name.clone());
+                            }
+                        }
+                        if matching_targets.len() > TARGET_DROPDOWN_RESULT_LIMIT {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Type more characters to narrow {} additional matches",
+                                    matching_targets.len() - TARGET_DROPDOWN_RESULT_LIMIT
+                                ))
+                                .small()
+                                .color(TEXT_MUTED),
+                            );
+                        }
+                    }
+                });
+            if let Some(selected_target) = selected_target {
+                *target_name = selected_target;
+                popup_ui.memory_mut(egui::Memory::close_popup);
+            }
+        },
+    );
+}
+
+fn target_matches_query(target: &DebugTargetDescriptor, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let searchable = format!("{} {}", target.name, target.family).to_ascii_lowercase();
+    query
+        .to_ascii_lowercase()
+        .split_ascii_whitespace()
+        .all(|term| searchable.contains(term))
+}
+
 fn paint_connection_control(
     ui: &mut egui::Ui,
     state: &SystemTraceConnectionState,
@@ -514,19 +656,23 @@ fn parse_rtt_control_block(text: &str) -> Result<RttControlBlockLocation, String
 }
 
 fn probe_label(probe: &ProbeDescriptor) -> String {
-    let provider = match &probe.provider {
-        ProbeProvider::JLink => "J-Link",
-        ProbeProvider::StLink => "ST-Link",
-        ProbeProvider::BlackMagicProbe => "Black Magic Probe",
-        ProbeProvider::CmsisDap => "CMSIS-DAP",
-        ProbeProvider::Other(provider) => provider,
-    };
+    let provider = probe_provider_label(&probe.provider);
     let serial = probe
         .serial_number
         .as_deref()
         .map(|serial| format!(" · {serial}"))
         .unwrap_or_default();
     format!("{provider} · {}{serial}", probe.model)
+}
+
+fn probe_provider_label(provider: &ProbeProvider) -> &str {
+    match provider {
+        ProbeProvider::JLink => "J-Link",
+        ProbeProvider::StLink => "ST-Link",
+        ProbeProvider::BlackMagicProbe => "Black Magic Probe",
+        ProbeProvider::CmsisDap => "CMSIS-DAP",
+        ProbeProvider::Other(provider) => provider,
+    }
 }
 
 fn instrument_frame() -> egui::Frame {
@@ -2151,6 +2297,20 @@ mod tests {
 
         assert!(!configuration.systemview_enabled);
         assert_eq!(configuration.terminal_up_channel, Some(0));
+    }
+
+    #[test]
+    fn target_filter_matches_names_and_family_tokens() {
+        let target = DebugTargetDescriptor {
+            name: "nRF52832_xxAA".to_owned(),
+            family: "nRF52 Series".to_owned(),
+        };
+
+        assert!(target_matches_query(&target, ""));
+        assert!(target_matches_query(&target, "52832"));
+        assert!(target_matches_query(&target, "NRF52 series"));
+        assert!(target_matches_query(&target, "nrf 32"));
+        assert!(!target_matches_query(&target, "stm32"));
     }
 
     #[test]
