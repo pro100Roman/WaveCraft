@@ -15,7 +15,7 @@ use wavecraft_debug_probe::{
     RttTerminalLine,
 };
 use wavecraft_systemview::{SystemViewDecoder, SYSTEMVIEW_COMMAND_START, SYSTEMVIEW_COMMAND_STOP};
-use wavecraft_trace::{TraceEvent, TraceEventKind, TraceModel};
+use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
 
 const DEFAULT_EVENT_CAPACITY: usize = 100_000;
 const DEFAULT_TERMINAL_LINE_CAPACITY: usize = 20_000;
@@ -35,6 +35,19 @@ pub(crate) enum TraceEventView {
     Events,
     Logs,
     Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TimelineTimingEdge {
+    pub(crate) core_id: u32,
+    pub(crate) context: ExecutionContext,
+    pub(crate) timestamp_ticks: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TimelineTimingMeasurement {
+    pub(crate) first: TimelineTimingEdge,
+    pub(crate) second: TimelineTimingEdge,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -777,6 +790,8 @@ pub(crate) struct SystemTraceDisplayState {
     pub(crate) follow_latest: bool,
     pub(crate) terminal_wrap: bool,
     pub(crate) timeline_smart_timing: bool,
+    timeline_timing_measurement: Option<TimelineTimingMeasurement>,
+    timeline_timing_dragging: bool,
     timeline_zoom: f32,
     timeline_view_height: f32,
     event_view_height: f32,
@@ -798,6 +813,8 @@ impl Default for SystemTraceDisplayState {
             follow_latest: true,
             terminal_wrap: true,
             timeline_smart_timing: true,
+            timeline_timing_measurement: None,
+            timeline_timing_dragging: false,
             timeline_zoom: MIN_TIMELINE_ZOOM,
             timeline_view_height: DEFAULT_TIMELINE_VIEW_HEIGHT,
             event_view_height: DEFAULT_EVENT_VIEW_HEIGHT,
@@ -820,6 +837,37 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn timeline_zoom(&self) -> f32 {
         self.timeline_zoom
+    }
+
+    pub(crate) fn timeline_timing_measurement(&self) -> Option<TimelineTimingMeasurement> {
+        self.timeline_timing_measurement
+    }
+
+    pub(crate) fn timeline_timing_dragging(&self) -> bool {
+        self.timeline_timing_dragging
+    }
+
+    pub(crate) fn start_timeline_timing(&mut self, edge: TimelineTimingEdge) {
+        self.timeline_timing_measurement = Some(TimelineTimingMeasurement {
+            first: edge,
+            second: edge,
+        });
+        self.timeline_timing_dragging = true;
+    }
+
+    pub(crate) fn update_timeline_timing(&mut self, edge: TimelineTimingEdge) {
+        if let Some(measurement) = &mut self.timeline_timing_measurement {
+            measurement.second = edge;
+        }
+    }
+
+    pub(crate) fn finish_timeline_timing(&mut self) {
+        self.timeline_timing_dragging = false;
+    }
+
+    pub(crate) fn clear_timeline_timing(&mut self) {
+        self.timeline_timing_measurement = None;
+        self.timeline_timing_dragging = false;
     }
 
     pub(crate) fn set_timeline_zoom(&mut self, zoom: f32) {
@@ -949,6 +997,7 @@ impl SystemTraceDisplayState {
         self.selected_sequence = None;
         self.event_table_focus_sequence = None;
         self.timeline_focus_sequence = None;
+        self.clear_timeline_timing();
         self.timeline_zoom = MIN_TIMELINE_ZOOM;
     }
 
@@ -1248,6 +1297,11 @@ mod tests {
         state.ingest(event(0, 1, TraceEventKind::TaskStarted { task_id: 1 }));
         state.ingest_terminal_line(RttTerminalLine::plain(0, "boot", true));
         state.selected_sequence = Some(0);
+        state.start_timeline_timing(TimelineTimingEdge {
+            core_id: 0,
+            context: ExecutionContext::Task(1),
+            timestamp_ticks: 1,
+        });
 
         state.clear();
 
@@ -1255,6 +1309,8 @@ mod tests {
         assert!(state.terminal_lines().is_empty());
         assert!(state.model().cores().is_empty());
         assert_eq!(state.selected_sequence, None);
+        assert_eq!(state.timeline_timing_measurement(), None);
+        assert!(!state.timeline_timing_dragging());
     }
 
     #[test]
