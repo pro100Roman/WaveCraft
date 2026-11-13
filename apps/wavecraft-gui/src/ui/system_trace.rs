@@ -1226,6 +1226,9 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
                     .hint_text("Filter")
                     .desired_width(180.0),
             );
+            if trace.event_view == TraceEventView::Terminal {
+                ui.checkbox(&mut trace.terminal_wrap, "Wrap text");
+            }
             ui.checkbox(&mut trace.follow_latest, "Follow latest");
         });
         ui.add_space(5.0);
@@ -1277,44 +1280,74 @@ fn paint_terminal_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, view
         .filter(|line| filter.is_empty() || line.text.to_lowercase().contains(filter.as_str()))
         .collect::<Vec<_>>();
     let line_count = visible_lines.len();
-    let table_row_count = line_count + 1;
-    let table_width = ui.available_width().max(TERMINAL_TABLE_MINIMUM_WIDTH);
 
-    egui::ScrollArea::both()
-        .id_salt("system_trace_rtt_terminal")
-        .max_height(view_height)
-        .auto_shrink([false, false])
-        .show_rows(ui, 22.0, table_row_count, |ui, row_range| {
-            ui.set_min_width(table_width);
-            for table_row in row_range {
-                if table_row == 0 {
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [70.0, 20.0],
-                            egui::Label::new(RichText::new("LINE").small().color(TEXT_MUTED)),
-                        );
-                        ui.label(RichText::new("TEXT").small().color(TEXT_MUTED));
-                    });
-                    continue;
-                }
-                let row = table_row - 1;
-                let line = visible_lines[row];
-                let response = ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [70.0, 20.0],
-                        egui::Label::new(
-                            RichText::new(line.sequence.to_string())
-                                .monospace()
-                                .color(TEXT_MUTED),
-                        ),
-                    );
-                    ui.label(terminal_line_layout(ui, line));
+    egui::Frame::none().fill(BACKGROUND).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.set_min_height(view_height);
+        if trace.terminal_wrap {
+            egui::ScrollArea::vertical()
+                .id_salt("system_trace_rtt_terminal")
+                .max_height(view_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    paint_terminal_header(ui);
+                    for (row, line) in visible_lines.iter().enumerate() {
+                        let response = paint_terminal_line(ui, line, true);
+                        if trace.follow_latest && row + 1 == line_count {
+                            response.scroll_to_me(Some(egui::Align::BOTTOM));
+                        }
+                    }
                 });
-                if trace.follow_latest && row + 1 == line_count {
-                    response.response.scroll_to_me(Some(egui::Align::BOTTOM));
-                }
-            }
-        });
+        } else {
+            let table_row_count = line_count + 1;
+            let table_width = ui.available_width().max(TERMINAL_TABLE_MINIMUM_WIDTH);
+            egui::ScrollArea::both()
+                .id_salt("system_trace_rtt_terminal")
+                .max_height(view_height)
+                .auto_shrink([false, false])
+                .show_rows(ui, 22.0, table_row_count, |ui, row_range| {
+                    ui.set_min_width(table_width);
+                    for table_row in row_range {
+                        if table_row == 0 {
+                            paint_terminal_header(ui);
+                            continue;
+                        }
+                        let row = table_row - 1;
+                        let response = paint_terminal_line(ui, visible_lines[row], false);
+                        if trace.follow_latest && row + 1 == line_count {
+                            response.scroll_to_me(Some(egui::Align::BOTTOM));
+                        }
+                    }
+                });
+        }
+    });
+}
+
+fn paint_terminal_header(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [70.0, 20.0],
+            egui::Label::new(RichText::new("LINE").small().color(TEXT_MUTED)),
+        );
+        ui.label(RichText::new("TEXT").small().color(TEXT_MUTED));
+    });
+}
+
+fn paint_terminal_line(ui: &mut egui::Ui, line: &RttTerminalLine, wrap: bool) -> egui::Response {
+    ui.horizontal_top(|ui| {
+        ui.add_sized(
+            [70.0, 20.0],
+            egui::Label::new(
+                RichText::new(line.sequence.to_string())
+                    .monospace()
+                    .color(TEXT_MUTED),
+            ),
+        );
+        let label = egui::Label::new(terminal_line_layout(ui, line));
+        ui.add(if wrap { label.wrap() } else { label.extend() });
+    })
+    .response
 }
 
 fn terminal_line_layout(ui: &egui::Ui, line: &RttTerminalLine) -> egui::text::LayoutJob {
@@ -1909,6 +1942,18 @@ mod tests {
         }
     }
 
+    fn text_row_count(shape: &egui::Shape, expected: &str) -> Option<usize> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == expected => {
+                Some(text.galley.rows.len())
+            }
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .find_map(|shape| text_row_count(shape, expected)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn system_trace_toolbar_can_request_an_application_device_scan() {
         let context = egui::Context::default();
@@ -2039,7 +2084,91 @@ mod tests {
         let texts = paint_central_texts(&context, &mut app);
 
         assert!(texts.iter().any(|text| text == "RTT TERMINAL"));
+        assert!(texts.iter().any(|text| text == "Wrap text"));
         assert!(texts.iter().any(|text| text == "nRF52832 booted"));
+    }
+
+    #[test]
+    fn rtt_terminal_output_uses_the_log_background() {
+        let context = egui::Context::default();
+        let mut trace = SystemTraceDisplayState::default();
+        trace.ingest_terminal_line(wavecraft_debug_probe::RttTerminalLine::plain(
+            0,
+            "nRF52832 booted",
+            true,
+        ));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 300.0),
+            )),
+            ..egui::RawInput::default()
+        };
+
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_terminal_table(ui, &trace, 180.0);
+            });
+        });
+        let mut background_rects = Vec::new();
+        output.shapes.iter().for_each(|clipped| {
+            collect_rects_with_fill(&clipped.shape, BACKGROUND, &mut background_rects);
+        });
+
+        assert!(background_rects
+            .iter()
+            .any(|rect| rect.width() > 700.0 && rect.height() >= 180.0));
+    }
+
+    #[test]
+    fn rtt_terminal_wrap_setting_wraps_long_messages() {
+        let context = egui::Context::default();
+        let message = "long RTT message that should wrap across several visual rows when the terminal is narrow";
+        let mut trace = SystemTraceDisplayState::default();
+        trace.ingest_terminal_line(wavecraft_debug_probe::RttTerminalLine::plain(
+            0, message, true,
+        ));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(320.0, 240.0),
+            )),
+            ..egui::RawInput::default()
+        };
+
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_terminal_table(ui, &trace, 160.0);
+            });
+        });
+        let wrapped_rows = output
+            .shapes
+            .iter()
+            .find_map(|clipped| text_row_count(&clipped.shape, message))
+            .expect("terminal message is painted");
+
+        assert!(wrapped_rows > 1);
+
+        trace.terminal_wrap = false;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(320.0, 240.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_terminal_table(ui, &trace, 160.0);
+            });
+        });
+        let unwrapped_rows = output
+            .shapes
+            .iter()
+            .find_map(|clipped| text_row_count(&clipped.shape, message))
+            .expect("terminal message is painted without wrapping");
+
+        assert_eq!(unwrapped_rows, 1);
     }
 
     #[test]
