@@ -232,11 +232,20 @@ impl WaveCraftApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        let probe_header =
-                            egui::CollapsingHeader::new(RichText::new("Probe").strong())
-                                .id_salt("system_trace_probe_settings")
-                                .default_open(true);
-                        let probe_section = probe_header.show(ui, |ui| {
+                        let menu_width = ui.available_width();
+                        egui::Frame::none()
+                            .fill(BACKGROUND)
+                            .rounding(egui::Rounding::same(6.0))
+                            .inner_margin(egui::Margin::same(10.0))
+                            .show(ui, |ui| {
+                                let content_width = (menu_width - 20.0).max(0.0);
+                                ui.set_width(content_width);
+                                ui.set_max_width(content_width);
+                                let probe_header =
+                                    egui::CollapsingHeader::new(RichText::new("Probe").strong())
+                                        .id_salt("system_trace_probe_settings")
+                                        .default_open(true);
+                                let probe_section = probe_header.show(ui, |ui| {
                                 setup_label(ui, "Debug probe");
                                 let selected_probe = self
                                     .system_trace_settings
@@ -337,16 +346,16 @@ impl WaveCraftApp {
                                     "Enable when a sleeping target must restart before RTT can be found",
                                 );
                             });
-                        probe_section.header_response.on_hover_text(
-                            "Configure the physical debug probe, target MCU, SWD speed, and optional reset",
-                        );
+                                probe_section.header_response.on_hover_text(
+                                    "Configure the physical debug probe, target MCU, SWD speed, and optional reset",
+                                );
 
-                        ui.add_space(8.0);
-                        let rtt_header =
-                            egui::CollapsingHeader::new(RichText::new("RTT").strong())
-                                .id_salt("system_trace_rtt_settings")
-                                .default_open(true);
-                        let rtt_section = rtt_header.show(ui, |ui| {
+                                ui.add_space(8.0);
+                                let rtt_header =
+                                    egui::CollapsingHeader::new(RichText::new("RTT").strong())
+                                        .id_salt("system_trace_rtt_settings")
+                                        .default_open(true);
+                                let rtt_section = rtt_header.show(ui, |ui| {
                                 setup_label(ui, "RTT control block");
                                 ui.add(
                                     egui::TextEdit::singleline(
@@ -415,9 +424,10 @@ impl WaveCraftApp {
                                     );
                                 });
                             });
-                        rtt_section.header_response.on_hover_text(
-                            "Configure RTT discovery, SystemView channels, and the plain-text terminal channel",
-                        );
+                                rtt_section.header_response.on_hover_text(
+                                    "Configure RTT discovery, SystemView channels, and the plain-text terminal channel",
+                                );
+                            });
 
                         ui.add_space(16.0);
                         paint_connection_control(
@@ -2826,6 +2836,31 @@ mod tests {
 
         assert!(probe.y < rtt.y);
         assert!(rtt.y < connect.y);
+    }
+
+    #[test]
+    fn setup_menus_use_the_dark_instrument_background() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let output = context.run(input, |context| {
+            let mut actions = FrameActions::default();
+            app.paint_system_trace_setup_panel(context, &mut actions);
+        });
+        let mut dark_rects = Vec::new();
+        for clipped in &output.shapes {
+            collect_rects_with_fill(&clipped.shape, BACKGROUND, &mut dark_rects);
+        }
+
+        assert!(dark_rects
+            .iter()
+            .any(|rect| rect.width() > 240.0 && rect.height() > 100.0));
     }
 
     #[test]
