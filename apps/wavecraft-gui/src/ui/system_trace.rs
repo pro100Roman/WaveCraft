@@ -232,140 +232,192 @@ impl WaveCraftApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        setup_label(ui, "Debug probe");
-                        let selected_probe = self
-                            .system_trace_settings
-                            .probe_connection_id
-                            .as_deref()
-                            .and_then(|connection_id| {
-                                self.debug_probes.iter().find(|probe| {
-                                    probe.connection_id.as_str() == connection_id
-                                })
-                            })
-                            .map(probe_label)
-                            .unwrap_or_else(|| "No debug probe found".to_owned());
-                        let mut probe_changed = false;
-                        egui::ComboBox::from_id_salt("system_trace_probe")
-                            .width(ui.available_width())
-                            .selected_text(selected_probe)
-                            .show_ui(ui, |ui| {
-                                if self.debug_probes.is_empty() {
-                                    ui.add_enabled(false, egui::Label::new("No probes found"));
+                        let probe_header =
+                            egui::CollapsingHeader::new(RichText::new("Probe").strong())
+                                .id_salt("system_trace_probe_settings")
+                                .default_open(true);
+                        let probe_section = probe_header.show(ui, |ui| {
+                                setup_label(ui, "Debug probe");
+                                let selected_probe = self
+                                    .system_trace_settings
+                                    .probe_connection_id
+                                    .as_deref()
+                                    .and_then(|connection_id| {
+                                        self.debug_probes.iter().find(|probe| {
+                                            probe.connection_id.as_str() == connection_id
+                                        })
+                                    })
+                                    .map(probe_label)
+                                    .unwrap_or_else(|| "No debug probe found".to_owned());
+                                let mut probe_changed = false;
+                                egui::ComboBox::from_id_salt("system_trace_probe")
+                                    .width(ui.available_width())
+                                    .selected_text(selected_probe)
+                                    .show_ui(ui, |ui| {
+                                        if self.debug_probes.is_empty() {
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Label::new("No probes found"),
+                                            );
+                                        }
+                                        for probe in &self.debug_probes {
+                                            probe_changed |= ui
+                                                .selectable_value(
+                                                    &mut self
+                                                        .system_trace_settings
+                                                        .probe_connection_id,
+                                                    Some(probe.connection_id.clone()),
+                                                    probe_label(probe),
+                                                )
+                                                .on_hover_text(&probe.connection_id)
+                                                .changed();
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Select the connected J-Link, ST-Link, or Black Magic Probe used for this trace session",
+                                    );
+                                if probe_changed {
+                                    self.system_trace_settings.target_name.clear();
                                 }
-                                for probe in &self.debug_probes {
-                                    probe_changed |= ui
-                                        .selectable_value(
-                                            &mut self.system_trace_settings.probe_connection_id,
-                                            Some(probe.connection_id.clone()),
-                                            probe_label(probe),
-                                        )
-                                        .on_hover_text(&probe.connection_id)
-                                        .changed();
+                                if let Some(error) = &self.debug_probe_discovery_error {
+                                    ui.label(
+                                        RichText::new(error)
+                                            .small()
+                                            .color(egui::Color32::from_rgb(245, 96, 96)),
+                                    );
                                 }
+
+                                ui.add_space(10.0);
+                                setup_label(ui, "Target MCU");
+                                let selected_provider = self
+                                    .system_trace_settings
+                                    .probe_connection_id
+                                    .as_deref()
+                                    .and_then(|connection_id| {
+                                        self.debug_probes.iter().find(|probe| {
+                                            probe.connection_id.as_str() == connection_id
+                                        })
+                                    })
+                                    .map(|probe| &probe.provider);
+                                let targets = selected_provider
+                                    .and_then(|provider| {
+                                        self.debug_probe_target_groups
+                                            .iter()
+                                            .find(|group| &group.provider == provider)
+                                    })
+                                    .map(|group| group.targets.as_slice())
+                                    .unwrap_or_default();
+                                paint_target_selector(
+                                    ui,
+                                    &mut self.system_trace_settings.target_name,
+                                    selected_provider,
+                                    targets,
+                                );
+
+                                ui.add_space(10.0);
+                                setup_label(ui, "SWD speed (kHz)");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut self.system_trace_settings.speed_khz,
+                                    )
+                                    .range(100..=50_000)
+                                    .speed(100),
+                                )
+                                .on_hover_text(
+                                    "Set the SWD clock in kHz. Reduce it if target communication is unreliable",
+                                );
+
+                                ui.add_space(10.0);
+                                ui.checkbox(
+                                    &mut self.system_trace_settings.reset_after_attach,
+                                    "Reset target after attach",
+                                )
+                                .on_hover_text(
+                                    "Enable when a sleeping target must restart before RTT can be found",
+                                );
                             });
-                        if probe_changed {
-                            self.system_trace_settings.target_name.clear();
-                        }
-                        if let Some(error) = &self.debug_probe_discovery_error {
-                            ui.label(
-                                RichText::new(error)
-                                    .small()
-                                    .color(egui::Color32::from_rgb(245, 96, 96)),
-                            );
-                        }
-
-                        ui.add_space(10.0);
-                        setup_label(ui, "Target MCU");
-                        let selected_provider = self
-                            .system_trace_settings
-                            .probe_connection_id
-                            .as_deref()
-                            .and_then(|connection_id| {
-                                self.debug_probes.iter().find(|probe| {
-                                    probe.connection_id.as_str() == connection_id
-                                })
-                            })
-                            .map(|probe| &probe.provider);
-                        let targets = selected_provider
-                            .and_then(|provider| {
-                                self.debug_probe_target_groups
-                                    .iter()
-                                    .find(|group| &group.provider == provider)
-                            })
-                            .map(|group| group.targets.as_slice())
-                            .unwrap_or_default();
-                        paint_target_selector(
-                            ui,
-                            &mut self.system_trace_settings.target_name,
-                            selected_provider,
-                            targets,
+                        probe_section.header_response.on_hover_text(
+                            "Configure the physical debug probe, target MCU, SWD speed, and optional reset",
                         );
 
-                        ui.add_space(10.0);
-                        setup_label(ui, "SWD speed (kHz)");
-                        ui.add(
-                            egui::DragValue::new(&mut self.system_trace_settings.speed_khz)
-                                .range(100..=50_000)
-                                .speed(100),
-                        );
-
-                        ui.add_space(10.0);
-                        ui.checkbox(
-                            &mut self.system_trace_settings.reset_after_attach,
-                            "Reset target after attach",
-                        )
-                        .on_hover_text(
-                            "Enable when a sleeping target must restart before RTT can be found",
-                        );
-
-                        ui.add_space(10.0);
-                        setup_label(ui, "RTT control block");
-                        ui.add(
-                            egui::TextEdit::singleline(
-                                &mut self.system_trace_settings.control_block_address,
-                            )
-                            .hint_text("Auto scan or 0x20000000"),
-                        );
-
-                        ui.add_space(10.0);
-                        ui.checkbox(
-                            &mut self.system_trace_settings.systemview_enabled,
-                            "SystemView binary trace",
-                        );
-                        ui.horizontal(|ui| {
-                            setup_label(ui, "SystemView up");
-                            ui.add_enabled(
-                                self.system_trace_settings.systemview_enabled,
-                                egui::DragValue::new(
-                                    &mut self.system_trace_settings.up_channel,
+                        ui.add_space(8.0);
+                        let rtt_header =
+                            egui::CollapsingHeader::new(RichText::new("RTT").strong())
+                                .id_salt("system_trace_rtt_settings")
+                                .default_open(true);
+                        let rtt_section = rtt_header.show(ui, |ui| {
+                                setup_label(ui, "RTT control block");
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.system_trace_settings.control_block_address,
+                                    )
+                                    .hint_text("Auto scan or 0x20000000"),
                                 )
-                                .range(0..=255),
-                            );
-                            setup_label(ui, "Down");
-                            ui.add_enabled(
-                                self.system_trace_settings.systemview_enabled,
-                                egui::DragValue::new(
-                                    &mut self.system_trace_settings.down_channel,
-                                )
-                                .range(0..=255),
-                            );
-                        });
+                                .on_hover_text(
+                                    "Leave empty to scan target RAM for the RTT control block, or enter its exact hexadecimal address",
+                                );
 
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            ui.checkbox(
-                                &mut self.system_trace_settings.terminal_enabled,
-                                "Plain RTT terminal",
-                            );
-                            ui.add_enabled(
-                                self.system_trace_settings.terminal_enabled,
-                                egui::DragValue::new(
-                                    &mut self.system_trace_settings.terminal_up_channel,
+                                ui.add_space(10.0);
+                                ui.checkbox(
+                                    &mut self.system_trace_settings.systemview_enabled,
+                                    "SystemView binary trace",
                                 )
-                                .range(0..=255)
-                                .prefix("Up "),
-                            );
-                        });
+                                .on_hover_text(
+                                    "Enable decoding of SEGGER SystemView binary events from RTT",
+                                );
+                                ui.horizontal(|ui| {
+                                    setup_label(ui, "SystemView up");
+                                    ui.add_enabled(
+                                        self.system_trace_settings.systemview_enabled,
+                                        egui::DragValue::new(
+                                            &mut self.system_trace_settings.up_channel,
+                                        )
+                                        .range(0..=255),
+                                    )
+                                    .on_hover_text(
+                                        "RTT up-channel on which the target sends SystemView event data",
+                                    );
+                                    setup_label(ui, "Down");
+                                    ui.add_enabled(
+                                        self.system_trace_settings.systemview_enabled,
+                                        egui::DragValue::new(
+                                            &mut self.system_trace_settings.down_channel,
+                                        )
+                                        .range(0..=255),
+                                    )
+                                    .on_hover_text(
+                                        "RTT down-channel used to send SystemView start and stop commands to the target",
+                                    );
+                                });
+
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(
+                                        &mut self.system_trace_settings.terminal_enabled,
+                                        "Plain RTT terminal",
+                                    )
+                                    .on_hover_text(
+                                        "Collect plain-text firmware output in the RTT TERMINAL tab",
+                                    );
+                                    ui.add_enabled(
+                                        self.system_trace_settings.terminal_enabled,
+                                        egui::DragValue::new(
+                                            &mut self
+                                                .system_trace_settings
+                                                .terminal_up_channel,
+                                        )
+                                        .range(0..=255)
+                                        .prefix("Up "),
+                                    )
+                                    .on_hover_text(
+                                        "RTT up-channel containing plain-text logs. When SystemView is enabled, select a different up-channel",
+                                    );
+                                });
+                            });
+                        rtt_section.header_response.on_hover_text(
+                            "Configure RTT discovery, SystemView channels, and the plain-text terminal channel",
+                        );
 
                         ui.add_space(16.0);
                         paint_connection_control(
@@ -401,13 +453,6 @@ impl WaveCraftApp {
                                     .color(egui::Color32::from_rgb(245, 96, 96)),
                             );
                         }
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(
-                                "Attach uses the isolated probe-rs helper and never flashes the target. Reset is applied only when selected above.",
-                            )
-                            .color(TEXT_MUTED),
-                        );
                     });
             });
         if collapse_clicked {
@@ -521,6 +566,9 @@ fn paint_target_selector(
         let text = ui.add_sized(
             [text_width, 20.0],
             egui::TextEdit::singleline(target_name).hint_text("Auto-detect or type a target"),
+        )
+        .on_hover_text(
+            "Type a target name to filter the selected probe's supported MCU list, or leave it empty for probe-rs auto-detection",
         );
         let dropdown = ui
             .add_sized([button_width, 20.0], egui::Button::new("▾"))
@@ -633,24 +681,33 @@ fn paint_connection_control(
         SystemTraceConnectionState::Disconnected | SystemTraceConnectionState::Error(_) => {
             if ui
                 .add_enabled(probe_selected, egui::Button::new("Connect and attach"))
+                .on_hover_text(
+                    "Attach uses the isolated probe-rs helper and never flashes the target. Reset is applied only when selected in Probe settings.",
+                )
                 .clicked()
             {
                 actions.system_trace_action = Some(SystemTraceAction::Connect);
             }
         }
         SystemTraceConnectionState::Connecting => {
-            ui.add_enabled(false, egui::Button::new("Connecting…"));
+            ui.add_enabled(false, egui::Button::new("Connecting…"))
+                .on_hover_text("WaveCraft is opening the probe and attaching to the target");
         }
         SystemTraceConnectionState::Attached { .. }
         | SystemTraceConnectionState::Starting { .. }
         | SystemTraceConnectionState::Tracing { .. }
         | SystemTraceConnectionState::Stopping { .. } => {
-            if ui.button("Disconnect").clicked() {
+            if ui
+                .button("Disconnect")
+                .on_hover_text("Close RTT and the current debug-probe session without flashing")
+                .clicked()
+            {
                 actions.system_trace_action = Some(SystemTraceAction::Disconnect);
             }
         }
         SystemTraceConnectionState::Disconnecting => {
-            ui.add_enabled(false, egui::Button::new("Disconnecting…"));
+            ui.add_enabled(false, egui::Button::new("Disconnecting…"))
+                .on_hover_text("WaveCraft is stopping trace and closing the probe session");
         }
     }
 }
@@ -2739,6 +2796,36 @@ mod tests {
         let _ = paint_setup_panel(&context, &mut app, vec![pointer_button(expand, false)]);
 
         assert!(app.system_trace_setup_panel_open);
+    }
+
+    #[test]
+    fn setup_panel_groups_probe_and_rtt_above_connection_control() {
+        let context = egui::Context::default();
+        let mut app = app();
+
+        let texts = paint_setup_panel(&context, &mut app, Vec::new());
+        assert!(texts.iter().any(|(text, _)| text == "Probe"));
+        assert!(texts.iter().any(|(text, _)| text == "Debug probe"));
+        assert!(texts.iter().any(|(text, _)| text == "RTT"));
+        assert!(texts.iter().any(|(text, _)| text == "RTT control block"));
+        let probe = texts
+            .iter()
+            .find(|(text, _)| text == "Probe")
+            .map(|(_, position)| *position)
+            .expect("probe section header is painted");
+        let rtt = texts
+            .iter()
+            .find(|(text, _)| text == "RTT")
+            .map(|(_, position)| *position)
+            .expect("RTT section header is painted");
+        let connect = texts
+            .iter()
+            .find(|(text, _)| text == "Connect and attach")
+            .map(|(_, position)| *position)
+            .expect("connection control is painted");
+
+        assert!(probe.y < rtt.y);
+        assert!(rtt.y < connect.y);
     }
 
     #[test]
