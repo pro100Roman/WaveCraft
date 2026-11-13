@@ -29,6 +29,7 @@ const TIMELINE_ZOOM_STEP: f32 = 1.5;
 const TIMELINE_SMART_TIMING_HINT_WIDTH: f32 = 300.0;
 const TIMELINE_SMART_TIMING_HINT_HEIGHT: f32 = 58.0;
 const TIMELINE_EDGE_SNAP_DISTANCE: f32 = 10.0;
+const TIMELINE_SHORT_EVENT_HOVER_DISTANCE: f32 = 8.0;
 const EVENT_TABLE_MINIMUM_WIDTH: f32 = 760.0;
 const EVENT_TABLE_ROW_HEIGHT: f32 = 22.0;
 const TRACE_SPLITTER_HEIGHT: f32 = 10.0;
@@ -948,6 +949,12 @@ struct TimelineEdgePosition {
     position: egui::Pos2,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TimelineIntervalPosition {
+    measurement: TimelineTimingMeasurement,
+    rect: egui::Rect,
+}
+
 fn timeline_lanes(model: &TraceModel) -> Vec<TimelineLane> {
     let mut lanes = Vec::new();
     for (core_id, core) in model.cores() {
@@ -1001,8 +1008,8 @@ fn paint_timeline_canvas(
     );
 
     let mut clicked_sequence = None;
-    let mut hovered_timing = None;
     let mut edge_positions = Vec::new();
+    let mut interval_positions = Vec::new();
     for (lane_index, lane) in lanes.iter().enumerate() {
         let row_top =
             canvas.top() + TIMELINE_HEADER_HEIGHT + lane_index as f32 * TIMELINE_ROW_HEIGHT;
@@ -1042,6 +1049,18 @@ fn paint_timeline_canvas(
             let interval_sequence = interval_event_sequence(trace, *lane, interval.start_ticks);
             let interval_selected = interval_sequence == trace.selected_sequence;
             if interval.end_ticks.is_some() {
+                let measurement = TimelineTimingMeasurement {
+                    first: TimelineTimingEdge {
+                        core_id: lane.core_id,
+                        context: lane.context,
+                        timestamp_ticks: interval.start_ticks,
+                    },
+                    second: TimelineTimingEdge {
+                        core_id: lane.core_id,
+                        context: lane.context,
+                        timestamp_ticks: interval_end,
+                    },
+                };
                 let edge_y = interval_rect.center().y;
                 edge_positions.extend(
                     [
@@ -1065,6 +1084,13 @@ fn paint_timeline_canvas(
                     .into_iter()
                     .filter(|edge| plot_clip.contains(edge.position)),
                 );
+                let visible_rect = interval_rect.intersect(plot_clip);
+                if visible_rect.is_positive() {
+                    interval_positions.push(TimelineIntervalPosition {
+                        measurement,
+                        rect: visible_rect,
+                    });
+                }
             }
             plot_painter.rect_filled(interval_rect, 2.0, context_color(lane.context));
             if interval_selected {
@@ -1076,25 +1102,7 @@ fn paint_timeline_canvas(
                 ui.id().with(("trace_interval", lane_index, interval_index)),
                 egui::Sense::click(),
             );
-            if trace.timeline_smart_timing && interval.end_ticks.is_some() {
-                if let Some(pointer) = response.hover_pos() {
-                    hovered_timing = Some(TimelineSmartTiming {
-                        measurement: TimelineTimingMeasurement {
-                            first: TimelineTimingEdge {
-                                core_id: lane.core_id,
-                                context: lane.context,
-                                timestamp_ticks: interval.start_ticks,
-                            },
-                            second: TimelineTimingEdge {
-                                core_id: lane.core_id,
-                                context: lane.context,
-                                timestamp_ticks: interval_end,
-                            },
-                        },
-                        pointer,
-                    });
-                }
-            } else {
+            if !trace.timeline_smart_timing || interval.end_ticks.is_none() {
                 response = response.on_hover_text(format!(
                     "{} · {}–{} ticks",
                     context_label(model, *lane),
@@ -1141,14 +1149,16 @@ fn paint_timeline_canvas(
             );
         }
     }
-    let (primary_pressed, primary_down, primary_released, pointer) = ui.input(|input| {
-        (
-            input.pointer.button_pressed(egui::PointerButton::Primary),
-            input.pointer.button_down(egui::PointerButton::Primary),
-            input.pointer.button_released(egui::PointerButton::Primary),
-            input.pointer.interact_pos(),
-        )
-    });
+    let (primary_pressed, primary_down, primary_released, pointer, hover_pointer) =
+        ui.input(|input| {
+            (
+                input.pointer.button_pressed(egui::PointerButton::Primary),
+                input.pointer.button_down(egui::PointerButton::Primary),
+                input.pointer.button_released(egui::PointerButton::Primary),
+                input.pointer.interact_pos(),
+                input.pointer.hover_pos(),
+            )
+        });
     let was_timing_dragging = trace.timeline_timing_dragging();
     let mut timing_gesture_active = false;
     if trace.timeline_smart_timing {
@@ -1196,6 +1206,37 @@ fn paint_timeline_canvas(
             4.0,
             egui::Stroke::new(1.5_f32, half_transparent_plate(egui::Color32::WHITE)),
         );
+    }
+
+    let hovered_timing = trace
+        .timeline_smart_timing
+        .then(|| {
+            hover_pointer
+                .filter(|pointer| plot_clip.contains(*pointer))
+                .and_then(|pointer| {
+                    nearest_timeline_interval(
+                        &interval_positions,
+                        pointer,
+                        TIMELINE_SHORT_EVENT_HOVER_DISTANCE,
+                    )
+                    .map(|interval| TimelineSmartTiming {
+                        measurement: interval.measurement,
+                        pointer,
+                    })
+                })
+        })
+        .flatten();
+    if let Some(hovered) = &hovered_timing {
+        if let Some(interval) = interval_positions
+            .iter()
+            .find(|interval| interval.measurement == hovered.measurement)
+        {
+            plot_painter.rect_stroke(
+                interval.rect,
+                2.0,
+                egui::Stroke::new(1.5_f32, half_transparent_plate(egui::Color32::WHITE)),
+            );
+        }
     }
 
     if let Some(timestamp) = selected_timestamp {
@@ -1253,6 +1294,42 @@ fn nearest_timeline_edge(
         Some(maximum) if nearest.position.distance(pointer) > maximum => None,
         _ => Some(nearest),
     }
+}
+
+fn nearest_timeline_interval(
+    intervals: &[TimelineIntervalPosition],
+    pointer: egui::Pos2,
+    maximum_horizontal_distance: f32,
+) -> Option<TimelineIntervalPosition> {
+    intervals
+        .iter()
+        .copied()
+        .filter(|interval| {
+            (interval.rect.top() - 4.0..=interval.rect.bottom() + 4.0).contains(&pointer.y)
+        })
+        .map(|interval| {
+            let distance = if pointer.x < interval.rect.left() {
+                interval.rect.left() - pointer.x
+            } else if pointer.x > interval.rect.right() {
+                pointer.x - interval.rect.right()
+            } else {
+                0.0
+            };
+            (interval, distance)
+        })
+        .filter(|(_, distance)| *distance <= maximum_horizontal_distance)
+        .min_by(
+            |(left_interval, left_distance), (right_interval, right_distance)| {
+                left_distance.total_cmp(right_distance).then_with(|| {
+                    left_interval
+                        .rect
+                        .center()
+                        .distance_sq(pointer)
+                        .total_cmp(&right_interval.rect.center().distance_sq(pointer))
+                })
+            },
+        )
+        .map(|(interval, _)| interval)
 }
 
 fn paint_timeline_smart_timing_hint(
@@ -2649,6 +2726,39 @@ mod tests {
                 120,
             ),
             Some(41)
+        );
+    }
+
+    #[test]
+    fn short_timeline_events_keep_a_minimum_smart_timing_hover_area() {
+        let edge = |ticks| TimelineTimingEdge {
+            core_id: 0,
+            context: ExecutionContext::Task(7),
+            timestamp_ticks: ticks,
+        };
+        let interval = TimelineIntervalPosition {
+            measurement: TimelineTimingMeasurement {
+                first: edge(100),
+                second: edge(101),
+            },
+            rect: egui::Rect::from_min_max(egui::pos2(100.0, 40.0), egui::pos2(102.0, 57.0)),
+        };
+
+        assert_eq!(
+            nearest_timeline_interval(
+                &[interval],
+                egui::pos2(109.5, 48.0),
+                TIMELINE_SHORT_EVENT_HOVER_DISTANCE,
+            ),
+            Some(interval)
+        );
+        assert_eq!(
+            nearest_timeline_interval(
+                &[interval],
+                egui::pos2(111.0, 48.0),
+                TIMELINE_SHORT_EVENT_HOVER_DISTANCE,
+            ),
+            None
         );
     }
 
