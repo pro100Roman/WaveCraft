@@ -7,7 +7,8 @@ use crate::system_trace::{
     SystemTraceConnectionConfiguration, SystemTraceConnectionState,
 };
 use crate::system_trace::{
-    SystemTraceDisplayState, TimelineTimingEdge, TimelineTimingMeasurement, TraceEventView,
+    ProbeLogEntry, ProbeLogLevel, SystemTraceDisplayState, TimelineTimingEdge,
+    TimelineTimingMeasurement, TraceEventView,
 };
 use crate::waveform::chrome::half_transparent_plate;
 use crate::{
@@ -1721,6 +1722,11 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
                 TraceEventView::Terminal,
                 "RTT TERMINAL",
             );
+            ui.selectable_value(
+                &mut trace.event_view,
+                TraceEventView::ProbeLog,
+                "PROBE LOG",
+            );
             ui.separator();
             ui.add(
                 egui::TextEdit::singleline(&mut trace.event_filter)
@@ -1756,6 +1762,18 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
                     paint_terminal_table(ui, trace, event_height);
                 }
             }
+            TraceEventView::ProbeLog => {
+                if trace.probe_logs().is_empty() {
+                    paint_trace_empty_state(
+                        ui,
+                        "No debug-probe diagnostics yet",
+                        "Attach a probe to see probe-rs session, target, RTT, and transport messages.",
+                        event_height,
+                    );
+                } else {
+                    paint_probe_log_table(ui, trace, event_height);
+                }
+            }
             TraceEventView::Events | TraceEventView::Logs => {
                 if trace.events().is_empty() {
                     paint_trace_empty_state(
@@ -1771,6 +1789,109 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
             }
         }
     });
+}
+
+fn paint_probe_log_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, view_height: f32) {
+    let filter = trace.event_filter.trim().to_lowercase();
+    let visible_entries = trace
+        .probe_logs()
+        .iter()
+        .filter(|entry| {
+            filter.is_empty()
+                || entry.message.to_lowercase().contains(filter.as_str())
+                || probe_log_level_label(entry.level)
+                    .to_ascii_lowercase()
+                    .contains(filter.as_str())
+        })
+        .collect::<Vec<_>>();
+    let entry_count = visible_entries.len();
+
+    egui::Frame::none().fill(BACKGROUND).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.set_min_height(view_height);
+        let table_row_count = entry_count + 1;
+        let table_width = ui.available_width().max(TERMINAL_TABLE_MINIMUM_WIDTH);
+        egui::ScrollArea::both()
+            .id_salt("system_trace_probe_log")
+            .max_height(view_height)
+            .auto_shrink([false, false])
+            .show_rows(
+                ui,
+                EVENT_TABLE_ROW_HEIGHT,
+                table_row_count,
+                |ui, row_range| {
+                    ui.set_min_width(table_width);
+                    for table_row in row_range {
+                        if table_row == 0 {
+                            paint_probe_log_header(ui);
+                            continue;
+                        }
+                        let row = table_row - 1;
+                        let response = paint_probe_log_entry(ui, visible_entries[row]);
+                        if trace.follow_latest && row + 1 == entry_count {
+                            response.scroll_to_me(Some(egui::Align::BOTTOM));
+                        }
+                    }
+                },
+            );
+    });
+}
+
+fn paint_probe_log_header(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [70.0, 20.0],
+            egui::Label::new(RichText::new("LINE").small().color(TEXT_MUTED)),
+        );
+        ui.add_sized(
+            [80.0, 20.0],
+            egui::Label::new(RichText::new("LEVEL").small().color(TEXT_MUTED)),
+        );
+        ui.label(RichText::new("MESSAGE").small().color(TEXT_MUTED));
+    });
+}
+
+fn paint_probe_log_entry(ui: &mut egui::Ui, entry: &ProbeLogEntry) -> egui::Response {
+    ui.horizontal_top(|ui| {
+        ui.add_sized(
+            [70.0, 20.0],
+            egui::Label::new(
+                RichText::new(entry.sequence.to_string())
+                    .monospace()
+                    .color(TEXT_MUTED),
+            ),
+        );
+        ui.add_sized(
+            [80.0, 20.0],
+            egui::Label::new(
+                RichText::new(probe_log_level_label(entry.level))
+                    .monospace()
+                    .color(probe_log_level_color(entry.level)),
+            ),
+        );
+        ui.add(egui::Label::new(RichText::new(&entry.message).monospace()).extend());
+    })
+    .response
+}
+
+fn probe_log_level_label(level: ProbeLogLevel) -> &'static str {
+    match level {
+        ProbeLogLevel::Debug => "DEBUG",
+        ProbeLogLevel::Info => "INFO",
+        ProbeLogLevel::Success => "OK",
+        ProbeLogLevel::Warning => "WARN",
+        ProbeLogLevel::Error => "ERROR",
+    }
+}
+
+fn probe_log_level_color(level: ProbeLogLevel) -> egui::Color32 {
+    match level {
+        ProbeLogLevel::Debug => egui::Color32::from_rgb(105, 180, 255),
+        ProbeLogLevel::Info => ACCENT,
+        ProbeLogLevel::Success => egui::Color32::from_rgb(72, 200, 116),
+        ProbeLogLevel::Warning => ORANGE,
+        ProbeLogLevel::Error => egui::Color32::from_rgb(245, 96, 96),
+    }
 }
 
 fn paint_terminal_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, view_height: f32) {
@@ -2710,6 +2831,11 @@ mod tests {
             .ingest_terminal_line(wavecraft_debug_probe::RttTerminalLine::plain(
                 0, "booted", true,
             ));
+        app.system_trace
+            .ingest_probe_log(crate::system_trace::ProbeLogMessage {
+                level: ProbeLogLevel::Info,
+                message: "target attached".to_owned(),
+            });
         let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
         let clear_position = texts
             .iter()
@@ -2733,6 +2859,7 @@ mod tests {
 
         assert!(app.system_trace.events().is_empty());
         assert!(app.system_trace.terminal_lines().is_empty());
+        assert!(app.system_trace.probe_logs().is_empty());
     }
 
     #[test]
@@ -2752,6 +2879,26 @@ mod tests {
         assert!(texts.iter().any(|text| text == "RTT TERMINAL"));
         assert!(texts.iter().any(|text| text == "Wrap text"));
         assert!(texts.iter().any(|text| text == "nRF52832 booted"));
+    }
+
+    #[test]
+    fn probe_log_tab_paints_probe_rs_diagnostics() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace.event_view = TraceEventView::ProbeLog;
+        app.system_trace
+            .ingest_probe_log(crate::system_trace::ProbeLogMessage {
+                level: ProbeLogLevel::Success,
+                message: "RTT attached with 2 channel(s)".to_owned(),
+            });
+
+        let texts = paint_central_texts(&context, &mut app);
+
+        assert!(texts.iter().any(|text| text == "PROBE LOG"));
+        assert!(texts.iter().any(|text| text == "OK"));
+        assert!(texts
+            .iter()
+            .any(|text| text == "RTT attached with 2 channel(s)"));
     }
 
     #[test]

@@ -19,6 +19,7 @@ use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
 
 const DEFAULT_EVENT_CAPACITY: usize = 100_000;
 const DEFAULT_TERMINAL_LINE_CAPACITY: usize = 20_000;
+const DEFAULT_PROBE_LOG_CAPACITY: usize = 10_000;
 const MIN_TIMELINE_ZOOM: f32 = 1.0;
 const MAX_TIMELINE_ZOOM: f32 = 64.0;
 const DEFAULT_TIMELINE_VIEW_HEIGHT: f32 = 260.0;
@@ -35,6 +36,29 @@ pub(crate) enum TraceEventView {
     Events,
     Logs,
     Terminal,
+    ProbeLog,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProbeLogLevel {
+    Debug,
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProbeLogMessage {
+    pub(crate) level: ProbeLogLevel,
+    pub(crate) message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProbeLogEntry {
+    pub(crate) sequence: u64,
+    pub(crate) level: ProbeLogLevel,
+    pub(crate) message: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +158,7 @@ pub(crate) enum SystemTraceAction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SystemTraceWorkerEvent {
+    ProbeLog(ProbeLogMessage),
     Attached {
         channels: Vec<RttChannelDescriptor>,
         systemview_enabled: bool,
@@ -162,14 +187,21 @@ pub(crate) fn spawn_system_trace_connection(
     let (trace_event_sender, trace_event_receiver) = mpsc::channel();
     let (terminal_line_sender, terminal_line_receiver) = mpsc::channel();
     thread::spawn(move || match DebugProbeHelperProcess::spawn() {
-        Ok(helper) => run_connection_worker(
-            helper,
-            configuration,
-            command_receiver,
-            event_sender,
-            trace_event_sender,
-            terminal_line_sender,
-        ),
+        Ok(helper) => {
+            send_probe_log(
+                &event_sender,
+                ProbeLogLevel::Success,
+                "probe-rs helper started",
+            );
+            run_connection_worker(
+                helper,
+                configuration,
+                command_receiver,
+                event_sender,
+                trace_event_sender,
+                terminal_line_sender,
+            );
+        }
         Err(error) => {
             let _ = event_sender.send(SystemTraceWorkerEvent::Error(error));
         }
@@ -205,7 +237,7 @@ fn run_connection_worker(
     trace_events: Sender<TraceEvent>,
     terminal_lines: Sender<RttTerminalLine>,
 ) {
-    let connection = establish_connection(&mut transport, &configuration);
+    let connection = establish_connection(&mut transport, &configuration, &events);
     let channels = match connection {
         Ok(channels) => channels,
         Err(error) => {
@@ -214,6 +246,13 @@ fn run_connection_worker(
             return;
         }
     };
+    if !configuration.systemview_enabled {
+        send_probe_log(
+            &events,
+            ProbeLogLevel::Warning,
+            "SystemView binary trace is disabled; session is RTT-terminal only",
+        );
+    }
     if events
         .send(SystemTraceWorkerEvent::Attached {
             channels: channels.clone(),
@@ -248,6 +287,14 @@ fn run_connection_worker(
             Some(SystemTraceWorkerCommand::Start { recording_path })
                 if !tracing && configuration.systemview_enabled =>
             {
+                send_probe_log(
+                    &events,
+                    ProbeLogLevel::Info,
+                    format!(
+                        "starting SystemView trace on RTT channels up {}/down {}",
+                        configuration.up_channel, configuration.down_channel
+                    ),
+                );
                 decoder.reset();
                 raw_recording = match recording_path.as_ref() {
                     Some(path) => match create_systemview_recording(path) {
@@ -266,6 +313,7 @@ fn run_connection_worker(
                 ) {
                     Ok(()) => {
                         tracing = true;
+                        send_probe_log(&events, ProbeLogLevel::Success, "SystemView trace started");
                         let _ = events.send(SystemTraceWorkerEvent::Tracing { recording_path });
                     }
                     Err(error) => {
@@ -276,6 +324,7 @@ fn run_connection_worker(
                 }
             }
             Some(SystemTraceWorkerCommand::Stop) if tracing => {
+                send_probe_log(&events, ProbeLogLevel::Info, "stopping SystemView trace");
                 match write_systemview_command(
                     &mut transport,
                     configuration.down_channel,
@@ -290,6 +339,7 @@ fn run_connection_worker(
                             let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
                             return;
                         }
+                        send_probe_log(&events, ProbeLogLevel::Success, "SystemView trace stopped");
                         let _ = events.send(SystemTraceWorkerEvent::Stopped);
                     }
                     Err(error) => {
@@ -300,6 +350,7 @@ fn run_connection_worker(
                 }
             }
             Some(SystemTraceWorkerCommand::Disconnect) => {
+                send_probe_log(&events, ProbeLogLevel::Info, "closing debug-probe session");
                 if tracing {
                     let _ = write_systemview_command(
                         &mut transport,
@@ -317,6 +368,11 @@ fn run_connection_worker(
                 }
                 match close_connection(transport) {
                     Ok(()) => {
+                        send_probe_log(
+                            &events,
+                            ProbeLogLevel::Success,
+                            "debug-probe session closed",
+                        );
                         let _ = events.send(SystemTraceWorkerEvent::Disconnected);
                     }
                     Err(error) => {
@@ -453,6 +509,11 @@ fn finish_systemview_recording(
             ),
         )
     })?;
+    send_probe_log(
+        events,
+        ProbeLogLevel::Success,
+        format!("SystemView recording saved to {}", path.display()),
+    );
     let _ = events.send(SystemTraceWorkerEvent::RecordingSaved(path));
     Ok(())
 }
@@ -485,7 +546,13 @@ fn read_rtt_terminal(
 fn establish_connection(
     transport: &mut impl ProbeCommandTransport,
     configuration: &SystemTraceConnectionConfiguration,
+    events: &Sender<SystemTraceWorkerEvent>,
 ) -> Result<Vec<RttChannelDescriptor>, DebugProbeError> {
+    send_probe_log(
+        events,
+        ProbeLogLevel::Info,
+        format!("opening debug probe {}", configuration.probe.connection_id),
+    );
     expect_reply(
         transport.send(DebugProbeCommand::OpenProbe {
             selector: configuration.probe.clone(),
@@ -493,6 +560,18 @@ fn establish_connection(
         |reply| matches!(reply, DebugProbeReply::ProbeOpened(_)),
         "open probe",
     )?;
+    send_probe_log(events, ProbeLogLevel::Success, "debug probe opened");
+    send_probe_log(
+        events,
+        ProbeLogLevel::Info,
+        format!(
+            "attaching to target {:?}, protocol {:?}, speed {:?} kHz, core {}",
+            configuration.attach.target,
+            configuration.attach.wire_protocol,
+            configuration.attach.speed_khz,
+            configuration.attach.core_index
+        ),
+    );
     expect_reply(
         transport.send(DebugProbeCommand::Attach {
             configuration: configuration.attach.clone(),
@@ -500,22 +579,65 @@ fn establish_connection(
         |reply| reply == &DebugProbeReply::TargetAttached,
         "attach target",
     )?;
+    send_probe_log(events, ProbeLogLevel::Success, "target attached");
     if configuration.reset_after_attach {
+        send_probe_log(events, ProbeLogLevel::Info, "resetting target after attach");
         expect_reply(
             transport.send(DebugProbeCommand::ResetTarget)?,
             |reply| reply == &DebugProbeReply::TargetReset,
             "reset target",
         )?;
+        send_probe_log(events, ProbeLogLevel::Success, "target reset completed");
     }
+    send_probe_log(
+        events,
+        ProbeLogLevel::Info,
+        format!(
+            "searching for RTT control block at {:?} (timeout {:?})",
+            configuration.rtt.control_block, configuration.rtt.timeout
+        ),
+    );
     match transport.send(DebugProbeCommand::AttachRtt {
         configuration: configuration.rtt.clone(),
     })? {
         DebugProbeReply::RttAttached(channels) => {
             validate_rtt_channels(&channels, configuration)?;
+            send_probe_log(
+                events,
+                ProbeLogLevel::Success,
+                format!("RTT attached with {} channel(s)", channels.len()),
+            );
+            for channel in &channels {
+                send_probe_log(
+                    events,
+                    ProbeLogLevel::Debug,
+                    format!(
+                        "RTT {:?} channel {}{}",
+                        channel.direction,
+                        channel.number,
+                        channel
+                            .name
+                            .as_deref()
+                            .map(|name| format!(" ({name})"))
+                            .unwrap_or_default()
+                    ),
+                );
+            }
             Ok(channels)
         }
         _ => Err(unexpected_reply("attach RTT")),
     }
+}
+
+fn send_probe_log(
+    events: &Sender<SystemTraceWorkerEvent>,
+    level: ProbeLogLevel,
+    message: impl Into<String>,
+) {
+    let _ = events.send(SystemTraceWorkerEvent::ProbeLog(ProbeLogMessage {
+        level,
+        message: message.into(),
+    }));
 }
 
 fn validate_rtt_channels(
@@ -703,6 +825,9 @@ impl crate::WaveCraftApp {
         if let Some(events) = &self.system_trace_worker_events {
             loop {
                 match events.try_recv() {
+                    Ok(SystemTraceWorkerEvent::ProbeLog(message)) => {
+                        self.system_trace.ingest_probe_log(message);
+                    }
                     Ok(SystemTraceWorkerEvent::Attached {
                         channels,
                         systemview_enabled,
@@ -743,6 +868,10 @@ impl crate::WaveCraftApp {
                         finished = true;
                     }
                     Ok(SystemTraceWorkerEvent::Error(error)) => {
+                        self.system_trace.ingest_probe_log(ProbeLogMessage {
+                            level: ProbeLogLevel::Error,
+                            message: error.clone(),
+                        });
                         self.system_trace_connection = SystemTraceConnectionState::Error(error);
                         finished = true;
                     }
@@ -756,9 +885,12 @@ impl crate::WaveCraftApp {
                                 | SystemTraceConnectionState::Stopping { .. }
                                 | SystemTraceConnectionState::Disconnecting
                         ) {
-                            self.system_trace_connection = SystemTraceConnectionState::Error(
-                                "debug-probe worker ended unexpectedly".to_owned(),
-                            );
+                            let error = "debug-probe worker ended unexpectedly".to_owned();
+                            self.system_trace.ingest_probe_log(ProbeLogMessage {
+                                level: ProbeLogLevel::Error,
+                                message: error.clone(),
+                            });
+                            self.system_trace_connection = SystemTraceConnectionState::Error(error);
                         }
                         finished = true;
                         break;
@@ -779,9 +911,12 @@ impl crate::WaveCraftApp {
 pub(crate) struct SystemTraceDisplayState {
     events: VecDeque<TraceEvent>,
     terminal_lines: VecDeque<RttTerminalLine>,
+    probe_logs: VecDeque<ProbeLogEntry>,
     model: TraceModel,
     event_capacity: usize,
     terminal_line_capacity: usize,
+    probe_log_capacity: usize,
+    next_probe_log_sequence: u64,
     pub(crate) selected_sequence: Option<u64>,
     event_table_focus_sequence: Option<u64>,
     timeline_focus_sequence: Option<u64>,
@@ -802,9 +937,12 @@ impl Default for SystemTraceDisplayState {
         Self {
             events: VecDeque::new(),
             terminal_lines: VecDeque::new(),
+            probe_logs: VecDeque::new(),
             model: TraceModel::new(),
             event_capacity: DEFAULT_EVENT_CAPACITY,
             terminal_line_capacity: DEFAULT_TERMINAL_LINE_CAPACITY,
+            probe_log_capacity: DEFAULT_PROBE_LOG_CAPACITY,
+            next_probe_log_sequence: 0,
             selected_sequence: None,
             event_table_focus_sequence: None,
             timeline_focus_sequence: None,
@@ -833,6 +971,22 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn terminal_lines(&self) -> &VecDeque<RttTerminalLine> {
         &self.terminal_lines
+    }
+
+    pub(crate) fn probe_logs(&self) -> &VecDeque<ProbeLogEntry> {
+        &self.probe_logs
+    }
+
+    pub(crate) fn ingest_probe_log(&mut self, message: ProbeLogMessage) {
+        if self.probe_logs.len() == self.probe_log_capacity {
+            self.probe_logs.pop_front();
+        }
+        self.probe_logs.push_back(ProbeLogEntry {
+            sequence: self.next_probe_log_sequence,
+            level: message.level,
+            message: message.message,
+        });
+        self.next_probe_log_sequence = self.next_probe_log_sequence.saturating_add(1);
     }
 
     pub(crate) fn timeline_zoom(&self) -> f32 {
@@ -989,6 +1143,7 @@ impl SystemTraceDisplayState {
     pub(crate) fn clear(&mut self) {
         self.clear_trace_events();
         self.terminal_lines.clear();
+        self.probe_logs.clear();
     }
 
     pub(crate) fn clear_trace_events(&mut self) {
@@ -1155,6 +1310,15 @@ mod tests {
         }
     }
 
+    fn lifecycle_events(
+        events: impl IntoIterator<Item = SystemTraceWorkerEvent>,
+    ) -> Vec<SystemTraceWorkerEvent> {
+        events
+            .into_iter()
+            .filter(|event| !matches!(event, SystemTraceWorkerEvent::ProbeLog(_)))
+            .collect()
+    }
+
     fn probe_descriptor() -> ProbeDescriptor {
         ProbeDescriptor {
             connection_id: "1366:0105:1234".to_owned(),
@@ -1296,6 +1460,10 @@ mod tests {
         let mut state = SystemTraceDisplayState::default();
         state.ingest(event(0, 1, TraceEventKind::TaskStarted { task_id: 1 }));
         state.ingest_terminal_line(RttTerminalLine::plain(0, "boot", true));
+        state.ingest_probe_log(ProbeLogMessage {
+            level: ProbeLogLevel::Info,
+            message: "probe attached".to_owned(),
+        });
         state.selected_sequence = Some(0);
         state.start_timeline_timing(TimelineTimingEdge {
             core_id: 0,
@@ -1307,6 +1475,7 @@ mod tests {
 
         assert!(state.events().is_empty());
         assert!(state.terminal_lines().is_empty());
+        assert!(state.probe_logs().is_empty());
         assert!(state.model().cores().is_empty());
         assert_eq!(state.selected_sequence, None);
         assert_eq!(state.timeline_timing_measurement(), None);
@@ -1538,8 +1707,16 @@ mod tests {
             terminal_line_sender,
         );
 
+        let events = event_receiver.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SystemTraceWorkerEvent::ProbeLog(ProbeLogMessage {
+                level: ProbeLogLevel::Success,
+                message,
+            }) if message == "target reset completed"
+        )));
         assert_eq!(
-            event_receiver.try_iter().collect::<Vec<_>>(),
+            lifecycle_events(events),
             [
                 SystemTraceWorkerEvent::Attached {
                     channels: vec![up_channel, down_channel],
@@ -1587,9 +1764,19 @@ mod tests {
             terminal_line_sender,
         );
 
+        let events = event_receiver.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SystemTraceWorkerEvent::ProbeLog(ProbeLogMessage {
+                level: ProbeLogLevel::Info,
+                message,
+            }) if message.starts_with("opening debug probe")
+        )));
         assert_eq!(
-            event_receiver.recv().expect("error is reported"),
-            SystemTraceWorkerEvent::Error("target was not found".to_owned())
+            lifecycle_events(events),
+            [SystemTraceWorkerEvent::Error(
+                "target was not found".to_owned()
+            )]
         );
         assert!(*shutdown.lock().expect("shutdown flag is available"));
     }
@@ -1651,8 +1838,16 @@ mod tests {
             terminal_line_sender,
         );
 
+        let events = event_receiver.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SystemTraceWorkerEvent::ProbeLog(ProbeLogMessage {
+                level: ProbeLogLevel::Success,
+                message,
+            }) if message.starts_with("SystemView recording saved to")
+        )));
         assert_eq!(
-            event_receiver.try_iter().collect::<Vec<_>>(),
+            lifecycle_events(events),
             [
                 SystemTraceWorkerEvent::Attached {
                     channels: vec![up_channel, down_channel],
