@@ -11,8 +11,10 @@ use crate::system_trace::{
 };
 use crate::waveform::chrome::half_transparent_plate;
 use crate::{
-    egui, format_duration, toolbar_action_button, ui::frame_actions::FrameActions, RichText,
-    WaveCraftApp, ACCENT, BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
+    collapsed_side_panel_frame, egui, fill_card_height, format_duration, toolbar_action_button,
+    ui::frame_actions::FrameActions, RichText, WaveCraftApp, ACCENT, BACKGROUND,
+    COLLAPSED_SIDE_PANEL_WIDTH, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, ORANGE, PANEL,
+    SCOPE_COLORS, TEXT_MUTED,
 };
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugTargetDescriptor, ProbeDescriptor, ProbeProvider, ProbeSelector,
@@ -194,6 +196,12 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
+        if !self.system_trace_setup_panel_open {
+            self.paint_collapsed_system_trace_setup_panel(context);
+            return;
+        }
+
+        let mut collapse_clicked = false;
         egui::SidePanel::left("system_trace_setup")
             .resizable(false)
             .exact_width(300.0)
@@ -203,13 +211,26 @@ impl WaveCraftApp {
                     .inner_margin(egui::Margin::same(14.0)),
             )
             .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("SYSTEM TRACE SETUP").strong().color(TEXT_MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_sized(
+                                DECODED_PANEL_ACTION_BUTTON_SIZE,
+                                toolbar_action_button("◀", ACCENT),
+                            )
+                            .on_hover_text("Collapse System Trace setup")
+                            .clicked()
+                        {
+                            collapse_clicked = true;
+                        }
+                    });
+                });
+                ui.add_space(12.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new("SYSTEM TRACE SETUP").strong().color(TEXT_MUTED));
-                        ui.add_space(12.0);
-
                         setup_label(ui, "Debug probe");
                         let selected_probe = self
                             .system_trace_settings
@@ -388,6 +409,35 @@ impl WaveCraftApp {
                         );
                     });
             });
+        if collapse_clicked {
+            self.system_trace_setup_panel_open = false;
+        }
+    }
+
+    fn paint_collapsed_system_trace_setup_panel(&mut self, context: &egui::Context) {
+        let mut expand_clicked = false;
+        egui::SidePanel::left("system_trace_setup_collapsed")
+            .resizable(false)
+            .exact_width(COLLAPSED_SIDE_PANEL_WIDTH)
+            .frame(egui::Frame::none().fill(BACKGROUND))
+            .show(context, |ui| {
+                collapsed_side_panel_frame().show(ui, |ui| {
+                    fill_card_height(ui);
+                    if ui
+                        .add_sized(
+                            DECODED_PANEL_ACTION_BUTTON_SIZE,
+                            toolbar_action_button("▶", ACCENT),
+                        )
+                        .on_hover_text("Expand System Trace setup")
+                        .clicked()
+                    {
+                        expand_clicked = true;
+                    }
+                });
+            });
+        if expand_clicked {
+            self.system_trace_setup_panel_open = true;
+        }
     }
 
     pub(crate) fn paint_system_trace_central_panel(&mut self, context: &egui::Context) {
@@ -2288,6 +2338,42 @@ mod tests {
         (actions, texts)
     }
 
+    fn paint_setup_panel(
+        context: &egui::Context,
+        app: &mut WaveCraftApp,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Pos2)> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        };
+        let mut actions = FrameActions::default();
+        let output = context.run(input, |context| {
+            app.paint_system_trace_setup_panel(context, &mut actions);
+        });
+        let mut texts = Vec::new();
+        fn collect(shape: &egui::Shape, texts: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| collect(shape, texts));
+                }
+                egui::Shape::Text(text) => texts.push((
+                    text.galley.text().to_owned(),
+                    text.visual_bounding_rect().center(),
+                )),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
     fn pointer_button(position: egui::Pos2, pressed: bool) -> egui::Event {
         egui::Event::PointerButton {
             pos: position,
@@ -2440,6 +2526,67 @@ mod tests {
                 .find_map(|shape| text_row_count(shape, expected)),
             _ => None,
         }
+    }
+
+    #[test]
+    fn system_trace_setup_panel_is_open_by_default_and_can_collapse() {
+        let context = egui::Context::default();
+        let mut app = app();
+
+        let texts = paint_setup_panel(&context, &mut app, Vec::new());
+        assert!(app.system_trace_setup_panel_open);
+        assert!(texts.iter().any(|(text, _)| text == "SYSTEM TRACE SETUP"));
+        let expanded_width = egui::containers::panel::PanelState::load(
+            &context,
+            egui::Id::new("system_trace_setup"),
+        )
+        .expect("expanded setup panel state is stored")
+        .rect
+        .width();
+        assert!((expanded_width - 300.0).abs() < 1.0);
+        let collapse = texts
+            .iter()
+            .find(|(text, _)| text == "◀")
+            .map(|(_, position)| *position)
+            .expect("collapse button is painted");
+
+        let _ = paint_setup_panel(
+            &context,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(collapse),
+                pointer_button(collapse, true),
+            ],
+        );
+        let _ = paint_setup_panel(&context, &mut app, vec![pointer_button(collapse, false)]);
+        assert!(!app.system_trace_setup_panel_open);
+
+        let texts = paint_setup_panel(&context, &mut app, Vec::new());
+        assert!(!texts.iter().any(|(text, _)| text == "SYSTEM TRACE SETUP"));
+        let collapsed_width = egui::containers::panel::PanelState::load(
+            &context,
+            egui::Id::new("system_trace_setup_collapsed"),
+        )
+        .expect("collapsed setup panel state is stored")
+        .rect
+        .width();
+        assert!((collapsed_width - COLLAPSED_SIDE_PANEL_WIDTH).abs() < 1.0);
+        let expand = texts
+            .iter()
+            .find(|(text, _)| text == "▶")
+            .map(|(_, position)| *position)
+            .expect("expand button is painted");
+        let _ = paint_setup_panel(
+            &context,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(expand),
+                pointer_button(expand, true),
+            ],
+        );
+        let _ = paint_setup_panel(&context, &mut app, vec![pointer_button(expand, false)]);
+
+        assert!(app.system_trace_setup_panel_open);
     }
 
     #[test]
