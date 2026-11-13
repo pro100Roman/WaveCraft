@@ -911,15 +911,15 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 end_ticks,
                 selected_timestamp,
             );
-            (canvas.top(), clicked_sequence)
+            (canvas.top(), canvas_width, clicked_sequence)
         });
-        let pointer_over_timeline = ui.input(|input| {
-            input
-                .pointer
-                .hover_pos()
-                .is_some_and(|position| timeline.inner_rect.contains(position))
+        let timeline_pointer = ui.input(|input| {
+            input.pointer.hover_pos().filter(|position| {
+                timeline.inner_rect.contains(*position)
+                    && position.x >= timeline.inner_rect.left() + TIMELINE_LABEL_WIDTH
+            })
         });
-        if pointer_over_timeline {
+        if let Some(pointer) = timeline_pointer {
             let zoom_delta = ui.input(|input| {
                 let native_zoom = input.zoom_delta();
                 if (native_zoom - 1.0).abs() > f32::EPSILON {
@@ -931,7 +931,18 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 }
             });
             if (zoom_delta - 1.0).abs() > f32::EPSILON {
+                let previous_zoom = trace.timeline_zoom();
                 trace.scale_timeline_zoom(zoom_delta);
+                let mut scroll_state = timeline.state;
+                scroll_state.offset.x = timeline_zoom_offset_at_pointer(
+                    scroll_state.offset.x,
+                    timeline.inner_rect.width(),
+                    pointer.x - timeline.inner_rect.left(),
+                    timeline.inner.1,
+                    previous_zoom,
+                    trace.timeline_zoom(),
+                );
+                scroll_state.store(ui.ctx(), timeline.id);
             }
         }
         paint_sticky_timeline_labels(
@@ -941,7 +952,7 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
             trace.model(),
             &lanes,
         );
-        if let Some(sequence) = timeline.inner.1 {
+        if let Some(sequence) = timeline.inner.2 {
             trace.select_from_timeline(sequence);
         }
     });
@@ -954,6 +965,26 @@ fn timeline_canvas_width(available_width: f32, zoom: f32) -> f32 {
 fn timeline_canvas_height(lane_count: usize) -> f32 {
     (TIMELINE_HEADER_HEIGHT + lane_count as f32 * TIMELINE_ROW_HEIGHT)
         .max(TIMELINE_SMART_TIMING_HINT_HEIGHT + 8.0)
+}
+
+fn timeline_zoom_offset_at_pointer(
+    current_offset: f32,
+    viewport_width: f32,
+    pointer_x_in_viewport: f32,
+    current_canvas_width: f32,
+    current_zoom: f32,
+    new_zoom: f32,
+) -> f32 {
+    let base_canvas_width = current_canvas_width / current_zoom.max(f32::EPSILON);
+    let current_plot_width = (current_canvas_width - TIMELINE_LABEL_WIDTH).max(1.0);
+    let content_x = current_offset + pointer_x_in_viewport;
+    let timeline_fraction =
+        ((content_x - TIMELINE_LABEL_WIDTH) / current_plot_width).clamp(0.0, 1.0);
+    let new_canvas_width = base_canvas_width * new_zoom;
+    let new_plot_width = (new_canvas_width - TIMELINE_LABEL_WIDTH).max(1.0);
+    let anchored_content_x = TIMELINE_LABEL_WIDTH + timeline_fraction * new_plot_width;
+    (anchored_content_x - pointer_x_in_viewport)
+        .clamp(0.0, (new_canvas_width - viewport_width).max(0.0))
 }
 
 fn timeline_plot_clip(canvas: egui::Rect, viewport: egui::Rect) -> egui::Rect {
@@ -2842,6 +2873,32 @@ mod tests {
         assert_eq!(timeline_canvas_width(900.0, 4.0), 3_600.0);
         assert_eq!(timeline_canvas_height(1), 66.0);
         assert_eq!(timeline_canvas_height(3), 99.0);
+    }
+
+    #[test]
+    fn timeline_zoom_keeps_the_timestamp_under_the_pointer() {
+        let current_offset = 420.0;
+        let viewport_width = 900.0;
+        let pointer_x = 560.0;
+        let current_canvas_width = 1_800.0;
+        let current_zoom = 2.0;
+        let new_zoom = 4.0;
+        let old_fraction = (current_offset + pointer_x - TIMELINE_LABEL_WIDTH)
+            / (current_canvas_width - TIMELINE_LABEL_WIDTH);
+
+        let new_offset = timeline_zoom_offset_at_pointer(
+            current_offset,
+            viewport_width,
+            pointer_x,
+            current_canvas_width,
+            current_zoom,
+            new_zoom,
+        );
+        let new_canvas_width = current_canvas_width / current_zoom * new_zoom;
+        let new_fraction = (new_offset + pointer_x - TIMELINE_LABEL_WIDTH)
+            / (new_canvas_width - TIMELINE_LABEL_WIDTH);
+
+        assert!((new_fraction - old_fraction).abs() < 0.000_001);
     }
 
     #[test]
