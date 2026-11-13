@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::io;
 
-use wavecraft_debug_probe::DebugProbeDriver;
+use wavecraft_debug_probe::{DebugProbeCatalog, DebugProbeDriver};
 use wavecraft_probe_rs::ProbeRsDriver;
 
 fn main() {
@@ -16,6 +16,7 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     match std::env::args().nth(1).as_deref() {
         None | Some("list") => list_probes(),
+        Some("catalog") => write_catalog(),
         Some("serve") => {
             wavecraft_probe_rs::helper::serve(
                 ProbeRsDriver,
@@ -24,8 +25,19 @@ fn run() -> Result<(), Box<dyn Error>> {
             )?;
             Ok(())
         }
-        Some(command) => Err(format!("unknown command {command:?}; expected list or serve").into()),
+        Some(command) => {
+            Err(format!("unknown command {command:?}; expected list, catalog, or serve").into())
+        }
     }
+}
+
+fn write_catalog() -> Result<(), Box<dyn Error>> {
+    let catalog = DebugProbeCatalog {
+        probes: ProbeRsDriver.list_probes()?,
+        target_groups: ProbeRsDriver::supported_target_groups(),
+    };
+    serde_json::to_writer(io::stdout().lock(), &catalog)?;
+    Ok(())
 }
 
 fn list_probes() -> Result<(), Box<dyn Error>> {

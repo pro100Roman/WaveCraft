@@ -394,6 +394,27 @@ pub struct ProbeDescriptor {
     pub serial_number: Option<String>,
 }
 
+/// One target name accepted by the selected debug backend.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct DebugTargetDescriptor {
+    pub name: String,
+    pub family: String,
+}
+
+/// Provider-specific target names exposed by the isolated debug-probe helper.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProbeTargetGroup {
+    pub provider: ProbeProvider,
+    pub targets: Vec<DebugTargetDescriptor>,
+}
+
+/// One discovery snapshot containing physical probes and backend target catalogs.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DebugProbeCatalog {
+    pub probes: Vec<ProbeDescriptor>,
+    pub target_groups: Vec<ProbeTargetGroup>,
+}
+
 /// Exact selector for opening one discovered probe.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProbeSelector {

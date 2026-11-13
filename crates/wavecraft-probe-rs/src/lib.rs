@@ -15,8 +15,9 @@ use probe_rs::rtt::{Rtt, ScanRegion, try_attach_to_rtt};
 use probe_rs::{MemoryInterface, Permissions, Session, config};
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugProbeDriver, DebugProbeError, DebugProbeErrorKind, DebugProbeHandle,
-    DebugSession, ProbeDescriptor, ProbeProvider, ProbeSelector, RttChannelDescriptor,
-    RttChannelDirection, RttConfiguration, RttControlBlockLocation, TargetSelector, WireProtocol,
+    DebugSession, DebugTargetDescriptor, ProbeDescriptor, ProbeProvider, ProbeSelector,
+    ProbeTargetGroup, RttChannelDescriptor, RttChannelDirection, RttConfiguration,
+    RttControlBlockLocation, TargetSelector, WireProtocol,
 };
 
 /// Minimum Rust release required by the pinned `probe-rs` adapter dependency.
@@ -25,6 +26,76 @@ pub const MINIMUM_RUST_VERSION: &str = "1.95";
 /// Discovers all probe families registered by `probe-rs`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProbeRsDriver;
+
+impl ProbeRsDriver {
+    /// Returns probe-rs target names grouped by the transport backend that can
+    /// communicate with their core architecture.
+    pub fn supported_target_groups() -> Vec<ProbeTargetGroup> {
+        let registry = config::Registry::from_builtin_families();
+        [
+            ProbeProvider::JLink,
+            ProbeProvider::StLink,
+            ProbeProvider::BlackMagicProbe,
+        ]
+        .into_iter()
+        .map(|provider| ProbeTargetGroup {
+            targets: target_descriptors(&registry, &provider),
+            provider,
+        })
+        .collect()
+    }
+}
+
+fn target_descriptors(
+    registry: &config::Registry,
+    provider: &ProbeProvider,
+) -> Vec<DebugTargetDescriptor> {
+    let mut targets = registry
+        .families()
+        .iter()
+        .flat_map(|family| {
+            family
+                .variants
+                .iter()
+                .filter(|chip| {
+                    chip.cores
+                        .iter()
+                        .all(|core| provider_supports_core(provider, core.core_type))
+                })
+                .flat_map(|chip| {
+                    chip.package_variants().map(|name| DebugTargetDescriptor {
+                        name: name.clone(),
+                        family: family.name.clone(),
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    targets.dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
+    targets
+}
+
+fn provider_supports_core(provider: &ProbeProvider, core_type: config::CoreType) -> bool {
+    match provider {
+        ProbeProvider::StLink => matches!(
+            core_type,
+            config::CoreType::Armv6m
+                | config::CoreType::Armv7a
+                | config::CoreType::Armv7r
+                | config::CoreType::Armv7m
+                | config::CoreType::Armv7em
+                | config::CoreType::Armv8a
+                | config::CoreType::Armv8m
+        ),
+        ProbeProvider::JLink | ProbeProvider::BlackMagicProbe => true,
+        ProbeProvider::CmsisDap | ProbeProvider::Other(_) => false,
+    }
+}
 
 impl DebugProbeDriver for ProbeRsDriver {
     fn list_probes(&self) -> Result<Vec<ProbeDescriptor>, DebugProbeError> {
@@ -390,6 +461,54 @@ mod tests {
                 descriptor.connection_id,
                 DebugProbeSelector::from(&information).to_string()
             );
+        }
+    }
+
+    #[test]
+    fn filters_target_architectures_by_probe_backend() {
+        for arm_core in [
+            config::CoreType::Armv6m,
+            config::CoreType::Armv7m,
+            config::CoreType::Armv7em,
+            config::CoreType::Armv8m,
+        ] {
+            assert!(provider_supports_core(&ProbeProvider::JLink, arm_core));
+            assert!(provider_supports_core(&ProbeProvider::StLink, arm_core));
+            assert!(provider_supports_core(
+                &ProbeProvider::BlackMagicProbe,
+                arm_core
+            ));
+        }
+        for non_arm_core in [
+            config::CoreType::Riscv,
+            config::CoreType::Riscv64,
+            config::CoreType::Xtensa,
+        ] {
+            assert!(provider_supports_core(&ProbeProvider::JLink, non_arm_core));
+            assert!(!provider_supports_core(
+                &ProbeProvider::StLink,
+                non_arm_core
+            ));
+            assert!(provider_supports_core(
+                &ProbeProvider::BlackMagicProbe,
+                non_arm_core
+            ));
+        }
+    }
+
+    #[test]
+    fn exposes_sorted_provider_specific_target_groups() {
+        let groups = ProbeRsDriver::supported_target_groups();
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].provider, ProbeProvider::JLink);
+        assert_eq!(groups[1].provider, ProbeProvider::StLink);
+        assert_eq!(groups[2].provider, ProbeProvider::BlackMagicProbe);
+        assert!(groups.iter().all(|group| !group.targets.is_empty()));
+        for group in groups {
+            assert!(group.targets.windows(2).all(|targets| {
+                targets[0].name.to_ascii_lowercase() <= targets[1].name.to_ascii_lowercase()
+            }));
         }
     }
 
