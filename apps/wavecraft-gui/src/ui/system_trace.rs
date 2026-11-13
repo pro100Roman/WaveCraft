@@ -1,13 +1,16 @@
 //! Independent System Trace workspace and decoded-event instruments.
 
+use std::time::Duration;
+
 use crate::system_trace::{
     choose_systemview_recording_path, choose_systemview_trace_to_open, SystemTraceAction,
     SystemTraceConnectionConfiguration, SystemTraceConnectionState,
 };
 use crate::system_trace::{SystemTraceDisplayState, TraceEventView};
+use crate::waveform::chrome::half_transparent_plate;
 use crate::{
-    egui, toolbar_action_button, ui::frame_actions::FrameActions, RichText, WaveCraftApp, ACCENT,
-    BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
+    egui, format_duration, toolbar_action_button, ui::frame_actions::FrameActions, RichText,
+    WaveCraftApp, ACCENT, BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
 };
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugTargetDescriptor, ProbeDescriptor, ProbeProvider, ProbeSelector,
@@ -21,6 +24,8 @@ const TIMELINE_HEADER_HEIGHT: f32 = 24.0;
 const TIMELINE_ROW_HEIGHT: f32 = 25.0;
 const TIMELINE_MINIMUM_WIDTH: f32 = 720.0;
 const TIMELINE_ZOOM_STEP: f32 = 1.5;
+const TIMELINE_SMART_TIMING_HINT_WIDTH: f32 = 300.0;
+const TIMELINE_SMART_TIMING_HINT_HEIGHT: f32 = 42.0;
 const EVENT_TABLE_MINIMUM_WIDTH: f32 = 760.0;
 const EVENT_TABLE_ROW_HEIGHT: f32 = 22.0;
 const TRACE_SPLITTER_HEIGHT: f32 = 10.0;
@@ -773,6 +778,8 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
             {
                 trace.set_timeline_zoom(1.0);
             }
+            ui.checkbox(&mut trace.timeline_smart_timing, "Smart timing")
+                .on_hover_text("Measure the hovered event from its exact start and end");
             ui.label(
                 RichText::new("Zoom: pinch or modifier-scroll; pan: drag")
                     .small()
@@ -905,6 +912,14 @@ struct TimelineLane {
     context: ExecutionContext,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct TimelineSmartTiming {
+    lane: TimelineLane,
+    start_ticks: u64,
+    end_ticks: u64,
+    pointer: egui::Pos2,
+}
+
 fn timeline_lanes(model: &TraceModel) -> Vec<TimelineLane> {
     let mut lanes = Vec::new();
     for (core_id, core) in model.cores() {
@@ -955,6 +970,7 @@ fn paint_timeline_canvas(
     );
 
     let mut clicked_sequence = None;
+    let mut smart_timing = None;
     for (lane_index, lane) in lanes.iter().enumerate() {
         let row_top =
             canvas.top() + TIMELINE_HEADER_HEIGHT + lane_index as f32 * TIMELINE_ROW_HEIGHT;
@@ -997,18 +1013,28 @@ fn paint_timeline_canvas(
             if interval_selected {
                 painter.rect_filled(interval_rect, 2.0, TRACE_SELECTION_FILL);
             }
-            let response = ui
-                .interact(
-                    interval_rect,
-                    ui.id().with(("trace_interval", lane_index, interval_index)),
-                    egui::Sense::click(),
-                )
-                .on_hover_text(format!(
+            let mut response = ui.interact(
+                interval_rect,
+                ui.id().with(("trace_interval", lane_index, interval_index)),
+                egui::Sense::click(),
+            );
+            if trace.timeline_smart_timing && interval.end_ticks.is_some() {
+                if let Some(pointer) = response.hover_pos() {
+                    smart_timing = Some(TimelineSmartTiming {
+                        lane: *lane,
+                        start_ticks: interval.start_ticks,
+                        end_ticks: interval_end,
+                        pointer,
+                    });
+                }
+            } else {
+                response = response.on_hover_text(format!(
                     "{} · {}–{} ticks",
                     context_label(model, *lane),
                     interval.start_ticks,
                     interval_end
                 ));
+            }
             if response.clicked() {
                 clicked_sequence = interval_sequence;
             }
@@ -1029,7 +1055,7 @@ fn paint_timeline_canvas(
                 painter.rect_stroke(
                     interval_rect,
                     2.0,
-                    egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
+                    egui::Stroke::new(1.5_f32, half_transparent_plate(egui::Color32::WHITE)),
                 );
             }
         }
@@ -1046,7 +1072,132 @@ fn paint_timeline_canvas(
             TRACE_SELECTION_COLOR,
         );
     }
+    if let Some(measurement) = smart_timing {
+        paint_timeline_smart_timing_hint(
+            &painter,
+            canvas,
+            start_ticks,
+            end_ticks,
+            trace,
+            measurement,
+        );
+    }
     clicked_sequence
+}
+
+fn paint_timeline_smart_timing_hint(
+    painter: &egui::Painter,
+    canvas: egui::Rect,
+    trace_start_ticks: u64,
+    trace_end_ticks: u64,
+    trace: &SystemTraceDisplayState,
+    measurement: TimelineSmartTiming,
+) {
+    let plot_left = canvas.left() + TIMELINE_LABEL_WIDTH;
+    let plot_right = canvas.right();
+    let plot_width = (plot_right - plot_left).max(1.0);
+    let trace_duration_ticks = trace_end_ticks.saturating_sub(trace_start_ticks).max(1);
+    let start_x = tick_x(
+        measurement.start_ticks,
+        trace_start_ticks,
+        trace_duration_ticks,
+        plot_left,
+        plot_width,
+    );
+    let end_x = tick_x(
+        measurement.end_ticks,
+        trace_start_ticks,
+        trace_duration_ticks,
+        plot_left,
+        plot_width,
+    );
+    let plot = egui::Rect::from_min_max(
+        egui::pos2(plot_left, canvas.top() + TIMELINE_HEADER_HEIGHT),
+        egui::pos2(plot_right, canvas.bottom()),
+    );
+    let color = context_color(measurement.lane.context);
+    let hover_color = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 128);
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(start_x.min(end_x), plot.top()),
+            egui::pos2(start_x.max(end_x), plot.bottom()),
+        ),
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 24),
+    );
+    for x in [start_x, end_x] {
+        painter.line_segment(
+            [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
+            egui::Stroke::new(1.5_f32, hover_color),
+        );
+        painter.circle_filled(egui::pos2(x, plot.top() + 3.0), 2.5, hover_color);
+    }
+
+    let hint_width = TIMELINE_SMART_TIMING_HINT_WIDTH.min((plot.width() - 8.0).max(1.0));
+    let hint_height = TIMELINE_SMART_TIMING_HINT_HEIGHT.min((canvas.height() - 8.0).max(1.0));
+    if hint_width < 120.0 || hint_height < 32.0 {
+        return;
+    }
+    let preferred_left = if measurement.pointer.x + 12.0 + hint_width <= plot.right() {
+        measurement.pointer.x + 12.0
+    } else {
+        measurement.pointer.x - hint_width - 12.0
+    };
+    let hint_left = preferred_left.clamp(plot.left() + 4.0, plot.right() - hint_width - 4.0);
+    let preferred_top = measurement.pointer.y + 12.0;
+    let hint_top = preferred_top.clamp(canvas.top() + 4.0, canvas.bottom() - hint_height - 4.0);
+    let hint = egui::Rect::from_min_size(
+        egui::pos2(hint_left, hint_top),
+        egui::vec2(hint_width, hint_height),
+    );
+    painter.rect_filled(hint, 5.0, half_transparent_plate(PANEL));
+    painter.rect_stroke(hint, 5.0, egui::Stroke::new(0.75_f32, hover_color));
+
+    let duration_ticks = measurement
+        .end_ticks
+        .saturating_sub(measurement.start_ticks);
+    let duration = trace_system_frequency_hz(trace).map(|frequency_hz| {
+        format_duration(Duration::from_secs_f64(
+            duration_ticks as f64 / frequency_hz as f64,
+        ))
+    });
+    let timing = duration.map_or_else(
+        || format!("Δ {duration_ticks} ticks"),
+        |duration| format!("Δ {duration_ticks} ticks · {duration}"),
+    );
+    painter.text(
+        hint.left_top() + egui::vec2(8.0, 5.0),
+        egui::Align2::LEFT_TOP,
+        format!(
+            "SMART TIMING · {}",
+            context_label(trace.model(), measurement.lane)
+        ),
+        egui::FontId::monospace(10.0),
+        color,
+    );
+    painter.text(
+        hint.left_top() + egui::vec2(8.0, 21.0),
+        egui::Align2::LEFT_TOP,
+        format!(
+            "{} → {} ticks · {timing}",
+            measurement.start_ticks, measurement.end_ticks
+        ),
+        egui::FontId::monospace(10.0),
+        egui::Color32::WHITE,
+    );
+}
+
+fn trace_system_frequency_hz(trace: &SystemTraceDisplayState) -> Option<u64> {
+    trace.events().iter().rev().find_map(|event| {
+        let TraceEventKind::TargetInfo {
+            system_frequency_hz,
+            ..
+        } = &event.kind
+        else {
+            return None;
+        };
+        (*system_frequency_hz > 0).then_some(*system_frequency_hz)
+    })
 }
 
 fn interval_event_sequence(
@@ -1914,6 +2065,16 @@ mod tests {
         }
     }
 
+    fn shape_contains_text(shape: &egui::Shape, expected: &str) -> bool {
+        match shape {
+            egui::Shape::Text(text) => text.galley.text().contains(expected),
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| shape_contains_text(shape, expected)),
+            _ => false,
+        }
+    }
+
     fn collect_rects_with_stroke(
         shape: &egui::Shape,
         expected: egui::Color32,
@@ -2240,6 +2401,99 @@ mod tests {
     }
 
     #[test]
+    fn timeline_smart_timing_snaps_to_interval_edges_with_half_transparent_hover() {
+        let context = egui::Context::default();
+        let mut trace = SystemTraceDisplayState::default();
+        for event in [
+            TraceEvent {
+                sequence: 0,
+                core_id: 0,
+                timestamp_ticks: 0,
+                kind: TraceEventKind::TargetInfo {
+                    system_frequency_hz: 1_000_000,
+                    cpu_frequency_hz: 64_000_000,
+                    ram_base: 0x2000_0000,
+                    id_shift: 0,
+                },
+            },
+            TraceEvent {
+                sequence: 1,
+                core_id: 0,
+                timestamp_ticks: 0,
+                kind: TraceEventKind::TaskInfo {
+                    task_id: 7,
+                    priority: 1,
+                    name: "app_main".to_owned(),
+                },
+            },
+            TraceEvent {
+                sequence: 2,
+                core_id: 0,
+                timestamp_ticks: 100,
+                kind: TraceEventKind::TaskStarted { task_id: 7 },
+            },
+            TraceEvent {
+                sequence: 3,
+                core_id: 0,
+                timestamp_ticks: 160,
+                kind: TraceEventKind::TaskStopped,
+            },
+        ] {
+            trace.ingest(event);
+        }
+        let lanes = timeline_lanes(trace.model());
+        let canvas = egui::Rect::from_min_size(
+            egui::pos2(10.0, 10.0),
+            egui::vec2(
+                700.0,
+                TIMELINE_HEADER_HEIGHT + lanes.len() as f32 * TIMELINE_ROW_HEIGHT,
+            ),
+        );
+        let pointer = egui::pos2(600.0, canvas.top() + TIMELINE_HEADER_HEIGHT + 12.0);
+        let warm_up = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(760.0, 180.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let _ = context.run(warm_up, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_timeline_canvas(ui, canvas, &trace, &lanes, 0, 160, None);
+            });
+        });
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(760.0, 180.0),
+            )),
+            events: vec![egui::Event::PointerMoved(pointer)],
+            ..egui::RawInput::default()
+        };
+
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_timeline_canvas(ui, canvas, &trace, &lanes, 0, 160, None);
+            });
+        });
+        let hover_fill = half_transparent_plate(PANEL);
+
+        assert_eq!(hover_fill.a(), 128);
+        assert!(output
+            .shapes
+            .iter()
+            .any(|clipped| shape_contains_fill(&clipped.shape, hover_fill)));
+        assert!(output
+            .shapes
+            .iter()
+            .any(|clipped| shape_contains_text(&clipped.shape, "SMART TIMING · C0  app_main")));
+        assert!(output
+            .shapes
+            .iter()
+            .any(|clipped| shape_contains_text(&clipped.shape, "100 → 160 ticks · Δ 60 ticks")));
+    }
+
+    #[test]
     fn timeline_selection_paints_event_table_highlight() {
         let context = egui::Context::default();
         let mut trace = SystemTraceDisplayState::default();
@@ -2282,6 +2536,7 @@ mod tests {
 
         assert!(texts.iter().any(|text| text == "1.0×"));
         assert!(texts.iter().any(|text| text == "Fit"));
+        assert!(texts.iter().any(|text| text == "Smart timing"));
         assert!(texts.iter().any(|text| text == "+"));
         assert!(texts.iter().any(|text| text == "−"));
     }
