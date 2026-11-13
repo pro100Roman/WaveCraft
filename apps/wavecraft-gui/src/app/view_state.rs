@@ -60,6 +60,10 @@ impl WaveCraftApp {
         {
             self.radio_settings = radio_settings_from_recording_metadata(&profile.values);
         }
+        if let Some(profile) = self.saved_capture_settings.profiles.system_trace.as_ref() {
+            self.system_trace_settings
+                .apply_saved_values(&profile.values);
+        }
     }
 
     pub(crate) fn save_capture_settings(&mut self, kind: SavedCaptureSettingsKind) {
@@ -86,6 +90,9 @@ impl WaveCraftApp {
             SavedCaptureSettingsKind::RadioFrequency => {
                 CaptureSettingsProfile::new(saved_radio_settings_metadata(&self.radio_settings))
             }
+            SavedCaptureSettingsKind::SystemTrace => {
+                CaptureSettingsProfile::new(self.system_trace_settings.saved_values())
+            }
         };
         match kind {
             SavedCaptureSettingsKind::LogicAnalyzer => {
@@ -97,6 +104,7 @@ impl WaveCraftApp {
             SavedCaptureSettingsKind::RadioFrequency => {
                 document.profiles.radio_frequency = Some(profile)
             }
+            SavedCaptureSettingsKind::SystemTrace => document.profiles.system_trace = Some(profile),
         }
 
         let Some(repository) = self.capture_settings_repository.as_ref() else {

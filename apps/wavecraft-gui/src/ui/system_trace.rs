@@ -1,5 +1,6 @@
 //! Independent System Trace workspace and decoded-event instruments.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::system_trace::{
@@ -12,8 +13,9 @@ use crate::system_trace::{
 };
 use crate::waveform::chrome::half_transparent_plate;
 use crate::{
-    collapsed_side_panel_frame, egui, fill_card_height, format_duration, toolbar_action_button,
-    ui::frame_actions::FrameActions, RichText, WaveCraftApp, ACCENT, BACKGROUND,
+    collapsed_side_panel_frame, egui, fill_card_height, format_duration,
+    paint_capture_settings_save_button, toolbar_action_button, ui::frame_actions::FrameActions,
+    RichText, SavedCaptureSettingsKind, WaveCraftApp, ACCENT, BACKGROUND,
     COLLAPSED_SIDE_PANEL_WIDTH, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, ORANGE, PANEL,
     SCOPE_COLORS, TEXT_MUTED,
 };
@@ -75,6 +77,74 @@ impl Default for SystemTraceSettings {
 }
 
 impl SystemTraceSettings {
+    pub(crate) fn saved_values(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "system_trace.target_name".to_owned(),
+                self.target_name.clone(),
+            ),
+            (
+                "system_trace.speed_khz".to_owned(),
+                self.speed_khz.to_string(),
+            ),
+            (
+                "system_trace.reset_after_attach".to_owned(),
+                self.reset_after_attach.to_string(),
+            ),
+            (
+                "system_trace.rtt_control_block".to_owned(),
+                self.control_block_address.clone(),
+            ),
+            (
+                "system_trace.systemview_enabled".to_owned(),
+                self.systemview_enabled.to_string(),
+            ),
+            (
+                "system_trace.systemview_up_channel".to_owned(),
+                self.up_channel.to_string(),
+            ),
+            (
+                "system_trace.systemview_down_channel".to_owned(),
+                self.down_channel.to_string(),
+            ),
+            (
+                "system_trace.terminal_enabled".to_owned(),
+                self.terminal_enabled.to_string(),
+            ),
+            (
+                "system_trace.terminal_up_channel".to_owned(),
+                self.terminal_up_channel.to_string(),
+            ),
+        ])
+    }
+
+    pub(crate) fn apply_saved_values(&mut self, values: &BTreeMap<String, String>) {
+        if let Some(target_name) = values.get("system_trace.target_name") {
+            self.target_name.clone_from(target_name);
+        }
+        self.speed_khz = saved_trace_value(values, "system_trace.speed_khz")
+            .unwrap_or(self.speed_khz)
+            .clamp(100, 50_000);
+        self.reset_after_attach = saved_trace_value(values, "system_trace.reset_after_attach")
+            .unwrap_or(self.reset_after_attach);
+        if let Some(address) = values.get("system_trace.rtt_control_block") {
+            self.control_block_address.clone_from(address);
+        }
+        self.systemview_enabled = saved_trace_value(values, "system_trace.systemview_enabled")
+            .unwrap_or(self.systemview_enabled);
+        self.up_channel = saved_trace_value(values, "system_trace.systemview_up_channel")
+            .unwrap_or(self.up_channel)
+            .min(255);
+        self.down_channel = saved_trace_value(values, "system_trace.systemview_down_channel")
+            .unwrap_or(self.down_channel)
+            .min(255);
+        self.terminal_enabled = saved_trace_value(values, "system_trace.terminal_enabled")
+            .unwrap_or(self.terminal_enabled);
+        self.terminal_up_channel = saved_trace_value(values, "system_trace.terminal_up_channel")
+            .unwrap_or(self.terminal_up_channel)
+            .min(255);
+    }
+
     fn connection_configuration(&self) -> Result<SystemTraceConnectionConfiguration, String> {
         if !self.systemview_enabled && !self.terminal_enabled {
             return Err("Enable SystemView trace or the plain RTT terminal".to_owned());
@@ -109,6 +179,13 @@ impl SystemTraceSettings {
             terminal_up_channel: self.terminal_enabled.then_some(self.terminal_up_channel),
         })
     }
+}
+
+fn saved_trace_value<T: std::str::FromStr>(
+    values: &BTreeMap<String, String>,
+    key: &str,
+) -> Option<T> {
+    values.get(key)?.parse().ok()
 }
 
 impl WaveCraftApp {
@@ -438,6 +515,14 @@ impl WaveCraftApp {
                                 rtt_section.header_response.on_hover_text(
                                     "Configure RTT discovery, SystemView channels, and the plain-text terminal channel",
                                 );
+                                if paint_capture_settings_save_button(
+                                    ui,
+                                    SavedCaptureSettingsKind::SystemTrace,
+                                    true,
+                                ) {
+                                    actions.save_capture_settings_kind =
+                                        Some(SavedCaptureSettingsKind::SystemTrace);
+                                }
                             });
 
                         ui.add_space(16.0);
@@ -2638,7 +2723,7 @@ mod tests {
         context: &egui::Context,
         app: &mut WaveCraftApp,
         events: Vec<egui::Event>,
-    ) -> Vec<(String, egui::Pos2)> {
+    ) -> (FrameActions, Vec<(String, egui::Pos2)>) {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -2667,7 +2752,7 @@ mod tests {
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut texts);
         }
-        texts
+        (actions, texts)
     }
 
     fn pointer_button(position: egui::Pos2, pressed: bool) -> egui::Event {
@@ -2829,7 +2914,7 @@ mod tests {
         let context = egui::Context::default();
         let mut app = app();
 
-        let texts = paint_setup_panel(&context, &mut app, Vec::new());
+        let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
         assert!(app.system_trace_setup_panel_open);
         assert!(texts.iter().any(|(text, _)| text == "SYSTEM TRACE SETUP"));
         let expanded_width = egui::containers::panel::PanelState::load(
@@ -2857,7 +2942,7 @@ mod tests {
         let _ = paint_setup_panel(&context, &mut app, vec![pointer_button(collapse, false)]);
         assert!(!app.system_trace_setup_panel_open);
 
-        let texts = paint_setup_panel(&context, &mut app, Vec::new());
+        let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
         assert!(!texts.iter().any(|(text, _)| text == "SYSTEM TRACE SETUP"));
         let collapsed_width = egui::containers::panel::PanelState::load(
             &context,
@@ -2890,7 +2975,7 @@ mod tests {
         let context = egui::Context::default();
         let mut app = app();
 
-        let texts = paint_setup_panel(&context, &mut app, Vec::new());
+        let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
         assert!(texts.iter().any(|(text, _)| text == "Probe"));
         assert!(texts.iter().any(|(text, _)| text == "Debug probe"));
         assert!(texts.iter().any(|(text, _)| text == "RTT"));
@@ -2913,6 +2998,30 @@ mod tests {
 
         assert!(probe.y < rtt.y);
         assert!(rtt.y < connect.y);
+    }
+
+    #[test]
+    fn setup_panel_requests_saving_system_trace_settings() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
+        let save = texts
+            .iter()
+            .find(|(text, _)| text == "💾 Save TRACE settings")
+            .map(|(_, position)| *position)
+            .expect("save settings button is painted");
+
+        let _ = paint_setup_panel(
+            &context,
+            &mut app,
+            vec![egui::Event::PointerMoved(save), pointer_button(save, true)],
+        );
+        let (actions, _) = paint_setup_panel(&context, &mut app, vec![pointer_button(save, false)]);
+
+        assert_eq!(
+            actions.save_capture_settings_kind,
+            Some(SavedCaptureSettingsKind::SystemTrace)
+        );
     }
 
     #[test]
@@ -3674,6 +3783,61 @@ mod tests {
 
         assert!(!configuration.systemview_enabled);
         assert_eq!(configuration.terminal_up_channel, Some(0));
+    }
+
+    #[test]
+    fn system_trace_settings_round_trip_through_saved_values() {
+        let expected = SystemTraceSettings {
+            probe_connection_id: None,
+            target_name: "nRF52832_xxAA".to_owned(),
+            speed_khz: 2_000,
+            reset_after_attach: true,
+            control_block_address: "0x20001000".to_owned(),
+            systemview_enabled: true,
+            up_channel: 2,
+            down_channel: 3,
+            terminal_enabled: true,
+            terminal_up_channel: 0,
+        };
+        let mut restored = SystemTraceSettings::default();
+
+        restored.apply_saved_values(&expected.saved_values());
+
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn loading_trace_settings_keeps_probe_selection_and_bounds_numbers() {
+        let mut restored = SystemTraceSettings {
+            probe_connection_id: Some("connected-probe".to_owned()),
+            ..SystemTraceSettings::default()
+        };
+        let values = BTreeMap::from([
+            ("system_trace.speed_khz".to_owned(), "999999".to_owned()),
+            (
+                "system_trace.systemview_up_channel".to_owned(),
+                "999".to_owned(),
+            ),
+            (
+                "system_trace.systemview_down_channel".to_owned(),
+                "999".to_owned(),
+            ),
+            (
+                "system_trace.terminal_up_channel".to_owned(),
+                "999".to_owned(),
+            ),
+        ]);
+
+        restored.apply_saved_values(&values);
+
+        assert_eq!(
+            restored.probe_connection_id.as_deref(),
+            Some("connected-probe")
+        );
+        assert_eq!(restored.speed_khz, 50_000);
+        assert_eq!(restored.up_channel, 255);
+        assert_eq!(restored.down_channel, 255);
+        assert_eq!(restored.terminal_up_channel, 255);
     }
 
     #[test]

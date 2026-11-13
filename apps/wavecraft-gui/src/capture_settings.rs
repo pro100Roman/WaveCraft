@@ -51,6 +51,8 @@ pub(crate) struct CaptureSettingsProfiles {
     pub(crate) oscilloscope: Option<CaptureSettingsProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) radio_frequency: Option<CaptureSettingsProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) system_trace: Option<CaptureSettingsProfile>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]

@@ -28,6 +28,7 @@ pub(crate) enum SavedCaptureSettingsKind {
     LogicAnalyzer,
     Oscilloscope,
     RadioFrequency,
+    SystemTrace,
 }
 
 impl SavedCaptureSettingsKind {
@@ -36,6 +37,7 @@ impl SavedCaptureSettingsKind {
             Self::LogicAnalyzer => "LA",
             Self::Oscilloscope => "OSC",
             Self::RadioFrequency => "RF",
+            Self::SystemTrace => "TRACE",
         }
     }
 }
