@@ -43,6 +43,10 @@ const TERMINAL_TABLE_MINIMUM_WIDTH: f32 = 720.0;
 const TRACE_SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 92);
 const TRACE_SELECTION_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(32, 27, 12, 32);
 const TRACE_EVENT_SELECTION_FILL: egui::Color32 = egui::Color32::from_rgb(62, 52, 18);
+const TRACE_EVENT_ROW_FILLS: [egui::Color32; 2] = [
+    egui::Color32::from_rgb(15, 21, 30),
+    egui::Color32::from_rgb(20, 27, 38),
+];
 const TARGET_DROPDOWN_RESULT_LIMIT: usize = 200;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2400,11 +2404,7 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
                 let event = &trace.events()[visible_indices[visible_row]];
                 let event_selected = selected_sequence == Some(event.sequence);
                 let row = egui::Frame::none()
-                    .fill(if event_selected {
-                        TRACE_EVENT_SELECTION_FILL
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    })
+                    .fill(event_row_fill(visible_row, event_selected))
                     .stroke(if event_selected {
                         egui::Stroke::new(1.0_f32, TRACE_SELECTION_COLOR)
                     } else {
@@ -2480,6 +2480,14 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
         trace.select_from_event_table(sequence);
     } else {
         trace.selected_sequence = selected_sequence;
+    }
+}
+
+fn event_row_fill(visible_row: usize, selected: bool) -> egui::Color32 {
+    if selected {
+        TRACE_EVENT_SELECTION_FILL
+    } else {
+        TRACE_EVENT_ROW_FILLS[visible_row % TRACE_EVENT_ROW_FILLS.len()]
     }
 }
 
@@ -3668,6 +3676,54 @@ mod tests {
             .shapes
             .iter()
             .any(|clipped| shape_contains_fill(&clipped.shape, TRACE_EVENT_SELECTION_FILL)));
+    }
+
+    #[test]
+    fn event_and_log_rows_alternate_between_two_background_colors() {
+        for event_view in [TraceEventView::Events, TraceEventView::Logs] {
+            let context = egui::Context::default();
+            let mut trace = SystemTraceDisplayState::default();
+            trace.event_view = event_view;
+            for sequence in 0..4 {
+                trace.ingest(TraceEvent {
+                    sequence,
+                    core_id: 0,
+                    timestamp_ticks: sequence * 10,
+                    kind: TraceEventKind::FormattedPrint {
+                        format: format!("message {sequence}"),
+                        options: 0,
+                        arguments: Vec::new(),
+                    },
+                });
+            }
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 400.0),
+                )),
+                ..egui::RawInput::default()
+            };
+
+            let output = context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    paint_event_table(ui, &mut trace, 300.0);
+                });
+            });
+
+            for fill in TRACE_EVENT_ROW_FILLS {
+                assert!(
+                    output
+                        .shapes
+                        .iter()
+                        .any(|clipped| shape_contains_fill(&clipped.shape, fill)),
+                    "{event_view:?} should paint rows with {fill:?}"
+                );
+            }
+            assert_eq!(event_row_fill(0, false), TRACE_EVENT_ROW_FILLS[0]);
+            assert_eq!(event_row_fill(1, false), TRACE_EVENT_ROW_FILLS[1]);
+            assert_eq!(event_row_fill(2, false), TRACE_EVENT_ROW_FILLS[0]);
+            assert_eq!(event_row_fill(0, true), TRACE_EVENT_SELECTION_FILL);
+        }
     }
 
     #[test]
