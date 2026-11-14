@@ -1,9 +1,16 @@
-//! Generates the raw SystemView demo stream checked into `docs/examples`.
+//! Generates the SystemView demo recording checked into `docs/examples`.
 
 use std::io;
 use std::path::PathBuf;
 
 const SYNC_PACKET: [u8; 10] = [0; 10];
+const FILE_HEADER: &str = ";\r\n\
+; Version     SEGGER SystemView V4.10b\r\n\
+; RecordTime  01 Jan 2026 00:00:00\r\n\
+; Author      WaveCraft\r\n\
+; Title       nRF52832 FreeRTOS demo\r\n\
+; Description Deterministic System Trace demo recording\r\n\
+;\r\n";
 
 fn append_varint(output: &mut Vec<u8>, mut value: u64) {
     loop {
@@ -168,8 +175,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("docs/examples/nrf52832-freertos.SVDat"));
-    let stream = demo_stream()?;
-    std::fs::write(&path, stream)?;
+    let mut recording = FILE_HEADER.as_bytes().to_vec();
+    recording.extend(demo_stream()?);
+    std::fs::write(&path, recording)?;
     println!("generated {}", path.display());
     Ok(())
 }

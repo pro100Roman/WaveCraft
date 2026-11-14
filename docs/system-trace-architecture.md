@@ -395,16 +395,21 @@ Keeping raw bytes allows a newer decoder to reinterpret an old recording.
 Keeping normalized events avoids reparsing an entire large capture every time
 it is opened.
 
-Later interoperability can include:
+Interoperability includes:
 
-- import of raw `.SVDat` streams;
-- export of raw SystemView-compatible streams; and
-- CSV export for events, CPU usage, contexts, and logs.
+- import of raw `.SVDat` streams and desktop recordings with the standard
+  text metadata preamble;
+- export of raw SystemView-compatible streams.
+
+Later interoperability can include CSV export for events, CPU usage, contexts,
+and logs.
 
 SEGGER documents that a raw single-shot RTT buffer can be saved with an
 `.SVDat` extension and opened by SystemView. Its richer desktop recording
-container should not be assumed to be a documented interchange format. See the
-[SystemView recording documentation][systemview-manual].
+container is not a documented interchange format, so WaveCraft only recognizes
+the metadata preamble observed in SEGGER recordings and then decodes the
+standard target event stream that follows it. See the [SystemView recording
+documentation][systemview-manual].
 
 WaveCraft's current `.dsv` format has fixed instrument IDs for logic, scope,
 and radio. A separate trace format avoids prematurely extending a sample-based

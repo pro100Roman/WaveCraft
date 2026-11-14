@@ -8,7 +8,10 @@ use wavecraft_trace::{TraceEvent, TraceEventKind};
 const FIRST_LENGTH_PREFIXED_EVENT_ID: u64 = 24;
 const MAX_VARINT_BYTES: usize = 5;
 const DEFAULT_MAX_PACKET_SIZE: usize = 64 * 1024;
+const MAX_FILE_HEADER_SIZE: usize = 64 * 1024;
 const SYNC_PACKET: [u8; 10] = [0; 10];
+const FILE_HEADER_PREFIXES: [&[u8]; 2] = [b";\n; Version", b";\r\n; Version"];
+const FILE_HEADER_TERMINATORS: [&[u8]; 2] = [b"\n;\n", b"\n;\r\n"];
 
 /// Host-to-target command that enables SystemView recording.
 pub const SYSTEMVIEW_COMMAND_START: u8 = 1;
@@ -21,6 +24,9 @@ pub enum DecodeError {
     VarintOverflow,
     PacketTooLarge {
         declared_size: usize,
+        maximum_size: usize,
+    },
+    FileHeaderTooLarge {
         maximum_size: usize,
     },
     MalformedPayload {
@@ -43,6 +49,10 @@ impl fmt::Display for DecodeError {
                 formatter,
                 "SystemView packet size {declared_size} exceeds limit {maximum_size}"
             ),
+            Self::FileHeaderTooLarge { maximum_size } => write!(
+                formatter,
+                "SystemView file header exceeds limit {maximum_size}"
+            ),
             Self::MalformedPayload { event_id, reason } => {
                 write!(formatter, "malformed SystemView event {event_id}: {reason}")
             }
@@ -60,6 +70,7 @@ impl Error for DecodeError {}
 #[derive(Clone, Debug)]
 pub struct SystemViewDecoder {
     buffer: Vec<u8>,
+    awaiting_file_header: bool,
     awaiting_sync: bool,
     core_id: u32,
     next_sequence: u64,
@@ -75,6 +86,7 @@ impl SystemViewDecoder {
     pub fn with_max_packet_size(core_id: u32, max_packet_size: usize) -> Self {
         Self {
             buffer: Vec::new(),
+            awaiting_file_header: true,
             awaiting_sync: true,
             core_id,
             next_sequence: 0,
@@ -86,6 +98,7 @@ impl SystemViewDecoder {
     /// Discards buffered bytes and starts a new timestamp and sequence epoch.
     pub fn reset(&mut self) {
         self.buffer.clear();
+        self.awaiting_file_header = true;
         self.awaiting_sync = true;
         self.next_sequence = 0;
         self.timestamp_ticks = 0;
@@ -119,6 +132,17 @@ impl SystemViewDecoder {
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<TraceEvent>, DecodeError> {
         self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
+
+        if self.awaiting_file_header {
+            match detect_file_header(&self.buffer)? {
+                FileHeader::Pending => return Ok(events),
+                FileHeader::Absent => self.awaiting_file_header = false,
+                FileHeader::Present { consumed } => {
+                    self.buffer.drain(..consumed);
+                    self.awaiting_file_header = false;
+                }
+            }
+        }
 
         if self.awaiting_sync {
             if self.buffer.starts_with(&SYNC_PACKET) {
@@ -166,6 +190,43 @@ impl SystemViewDecoder {
 
         Ok(events)
     }
+}
+
+enum FileHeader {
+    Pending,
+    Absent,
+    Present { consumed: usize },
+}
+
+fn detect_file_header(input: &[u8]) -> Result<FileHeader, DecodeError> {
+    if FILE_HEADER_PREFIXES
+        .iter()
+        .any(|prefix| prefix.starts_with(input))
+    {
+        return Ok(FileHeader::Pending);
+    }
+    if !FILE_HEADER_PREFIXES
+        .iter()
+        .any(|prefix| input.starts_with(prefix))
+    {
+        return Ok(FileHeader::Absent);
+    }
+    for terminator in FILE_HEADER_TERMINATORS {
+        if let Some(offset) = input
+            .windows(terminator.len())
+            .position(|window| window == terminator)
+        {
+            return Ok(FileHeader::Present {
+                consumed: offset + terminator.len(),
+            });
+        }
+    }
+    if input.len() > MAX_FILE_HEADER_SIZE {
+        return Err(DecodeError::FileHeaderTooLarge {
+            maximum_size: MAX_FILE_HEADER_SIZE,
+        });
+    }
+    Ok(FileHeader::Pending)
 }
 
 impl Default for SystemViewDecoder {
@@ -572,6 +633,53 @@ mod tests {
             assert_eq!(events[0].kind, TraceEventKind::TraceStarted);
             assert_eq!(events[0].timestamp_ticks, 3);
         }
+    }
+
+    #[test]
+    fn skips_desktop_file_headers_across_every_chunk_boundary() {
+        for (header, include_sync) in [
+            (
+                ";\r\n; Version     SEGGER SystemView V3.52a\r\n; Title       Demo\r\n;\r\n",
+                true,
+            ),
+            (
+                ";\n; Version     SEGGER SystemViewer V2.12\n; Title       Demo\n;\n",
+                false,
+            ),
+        ] {
+            let mut stream = header.as_bytes().to_vec();
+            if include_sync {
+                stream.extend(SYNC_PACKET);
+            }
+            stream.extend(compact_packet(10, &[], 3));
+
+            for split in 0..=stream.len() {
+                let mut decoder = SystemViewDecoder::default();
+                let first = decoder.push(&stream[..split]).expect("prefix is valid");
+                let second = decoder.push(&stream[split..]).expect("suffix is valid");
+                let events: Vec<_> = first.into_iter().chain(second).collect();
+
+                assert_eq!(events.len(), 1, "split at {split}");
+                assert_eq!(events[0].kind, TraceEventKind::TraceStarted);
+                assert_eq!(events[0].timestamp_ticks, 3);
+                decoder.finish().expect("stream ends on a packet boundary");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_an_unbounded_desktop_file_header() {
+        let mut header = b";\n; Version     SEGGER SystemView".to_vec();
+        header.resize(MAX_FILE_HEADER_SIZE + 1, b'x');
+
+        assert_eq!(
+            SystemViewDecoder::default()
+                .push(&header)
+                .expect_err("an unbounded file header must be rejected"),
+            DecodeError::FileHeaderTooLarge {
+                maximum_size: MAX_FILE_HEADER_SIZE,
+            }
+        );
     }
 
     #[test]

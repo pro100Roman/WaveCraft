@@ -1373,10 +1373,10 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_systemview_demo_exercises_trace_instruments() {
+    fn checked_in_systemview_recording_exercises_trace_instruments() {
         let bytes = include_bytes!("../../../docs/examples/nrf52832-freertos.SVDat");
         let events = decode_systemview_stream(std::io::Cursor::new(bytes.as_slice()))
-            .expect("checked-in demo is valid raw SystemView data");
+            .expect("checked-in demo is a valid SystemView recording");
         let mut state = SystemTraceDisplayState::default();
 
         state.replace_trace_events(events);
