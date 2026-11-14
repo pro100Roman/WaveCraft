@@ -913,6 +913,7 @@ pub(crate) struct SystemTraceDisplayState {
     terminal_lines: VecDeque<RttTerminalLine>,
     probe_logs: VecDeque<ProbeLogEntry>,
     model: TraceModel,
+    target_frequencies_hz: Option<(u64, u64)>,
     event_capacity: usize,
     terminal_line_capacity: usize,
     probe_log_capacity: usize,
@@ -939,6 +940,7 @@ impl Default for SystemTraceDisplayState {
             terminal_lines: VecDeque::new(),
             probe_logs: VecDeque::new(),
             model: TraceModel::new(),
+            target_frequencies_hz: None,
             event_capacity: DEFAULT_EVENT_CAPACITY,
             terminal_line_capacity: DEFAULT_TERMINAL_LINE_CAPACITY,
             probe_log_capacity: DEFAULT_PROBE_LOG_CAPACITY,
@@ -967,6 +969,10 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn model(&self) -> &TraceModel {
         &self.model
+    }
+
+    pub(crate) fn target_frequencies_hz(&self) -> Option<(u64, u64)> {
+        self.target_frequencies_hz
     }
 
     pub(crate) fn terminal_lines(&self) -> &VecDeque<RttTerminalLine> {
@@ -1103,6 +1109,14 @@ impl SystemTraceDisplayState {
     }
 
     pub(crate) fn ingest(&mut self, event: TraceEvent) {
+        if let TraceEventKind::TargetInfo {
+            system_frequency_hz,
+            cpu_frequency_hz,
+            ..
+        } = &event.kind
+        {
+            self.target_frequencies_hz = Some((*system_frequency_hz, *cpu_frequency_hz));
+        }
         self.model.apply(&event);
         if self.events.len() == self.event_capacity
             && self
@@ -1149,6 +1163,7 @@ impl SystemTraceDisplayState {
     pub(crate) fn clear_trace_events(&mut self) {
         self.events.clear();
         self.model = TraceModel::new();
+        self.target_frequencies_hz = None;
         self.selected_sequence = None;
         self.event_table_focus_sequence = None;
         self.timeline_focus_sequence = None;
@@ -1432,6 +1447,31 @@ mod tests {
                 .and_then(|task| task.name.as_deref()),
             Some("worker")
         );
+    }
+
+    #[test]
+    fn retains_target_frequencies_after_the_metadata_event_leaves_the_display_buffer() {
+        let mut state = SystemTraceDisplayState::with_capacity(1);
+        state.ingest_all([
+            event(
+                0,
+                0,
+                TraceEventKind::TargetInfo {
+                    system_frequency_hz: 1_000_000,
+                    cpu_frequency_hz: 64_000_000,
+                    ram_base: 0x2000_0000,
+                    id_shift: 0,
+                },
+            ),
+            event(1, 1, TraceEventKind::TaskStarted { task_id: 7 }),
+        ]);
+
+        assert_eq!(state.events().len(), 1);
+        assert_eq!(state.target_frequencies_hz(), Some((1_000_000, 64_000_000)));
+
+        state.clear_trace_events();
+
+        assert_eq!(state.target_frequencies_hz(), None);
     }
 
     #[test]

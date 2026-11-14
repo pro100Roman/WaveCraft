@@ -13,7 +13,7 @@ use crate::system_trace::{
 };
 use crate::waveform::chrome::half_transparent_plate;
 use crate::{
-    collapsed_side_panel_frame, egui, fill_card_height, format_duration,
+    collapsed_side_panel_frame, egui, fill_card_height, format_duration, format_frequency,
     paint_capture_settings_save_button, toolbar_action_button, ui::frame_actions::FrameActions,
     RichText, SavedCaptureSettingsKind, WaveCraftApp, ACCENT, BACKGROUND,
     COLLAPSED_SIDE_PANEL_WIDTH, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, ORANGE, PANEL,
@@ -48,6 +48,8 @@ const TRACE_EVENT_ROW_FILLS: [egui::Color32; 2] = [
     egui::Color32::from_rgb(20, 27, 38),
 ];
 const TARGET_DROPDOWN_RESULT_LIMIT: usize = 200;
+const DEFAULT_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 1_000_000;
+const MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 10_000_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SystemTraceSettings {
@@ -59,6 +61,7 @@ pub(crate) struct SystemTraceSettings {
     pub(crate) systemview_enabled: bool,
     pub(crate) up_channel: usize,
     pub(crate) down_channel: usize,
+    pub(crate) timestamp_frequency_override_hz: Option<u64>,
     pub(crate) terminal_enabled: bool,
     pub(crate) terminal_up_channel: usize,
 }
@@ -74,6 +77,7 @@ impl Default for SystemTraceSettings {
             systemview_enabled: true,
             up_channel: 1,
             down_channel: 1,
+            timestamp_frequency_override_hz: None,
             terminal_enabled: true,
             terminal_up_channel: 0,
         }
@@ -112,6 +116,11 @@ impl SystemTraceSettings {
                 self.down_channel.to_string(),
             ),
             (
+                "system_trace.timestamp_frequency_override_hz".to_owned(),
+                self.timestamp_frequency_override_hz
+                    .map_or_else(|| "auto".to_owned(), |frequency| frequency.to_string()),
+            ),
+            (
                 "system_trace.terminal_enabled".to_owned(),
                 self.terminal_enabled.to_string(),
             ),
@@ -142,6 +151,20 @@ impl SystemTraceSettings {
         self.down_channel = saved_trace_value(values, "system_trace.systemview_down_channel")
             .unwrap_or(self.down_channel)
             .min(255);
+        if let Some(value) = values.get("system_trace.timestamp_frequency_override_hz") {
+            self.timestamp_frequency_override_hz =
+                if value.eq_ignore_ascii_case("auto") || value.trim().is_empty() {
+                    None
+                } else {
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|frequency| {
+                            (1..=MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ).contains(frequency)
+                        })
+                        .or(self.timestamp_frequency_override_hz)
+                };
+        }
         self.terminal_enabled = saved_trace_value(values, "system_trace.terminal_enabled")
             .unwrap_or(self.terminal_enabled);
         self.terminal_up_channel = saved_trace_value(values, "system_trace.terminal_up_channel")
@@ -467,39 +490,6 @@ impl WaveCraftApp {
                                 );
 
                                 ui.add_space(10.0);
-                                ui.checkbox(
-                                    &mut self.system_trace_settings.systemview_enabled,
-                                    "SystemView binary trace",
-                                )
-                                .on_hover_text(
-                                    "Enable decoding of SEGGER SystemView binary events from RTT",
-                                );
-                                ui.horizontal(|ui| {
-                                    setup_label(ui, "SystemView up");
-                                    ui.add_enabled(
-                                        self.system_trace_settings.systemview_enabled,
-                                        egui::DragValue::new(
-                                            &mut self.system_trace_settings.up_channel,
-                                        )
-                                        .range(0..=255),
-                                    )
-                                    .on_hover_text(
-                                        "RTT up-channel on which the target sends SystemView event data",
-                                    );
-                                    setup_label(ui, "Down");
-                                    ui.add_enabled(
-                                        self.system_trace_settings.systemview_enabled,
-                                        egui::DragValue::new(
-                                            &mut self.system_trace_settings.down_channel,
-                                        )
-                                        .range(0..=255),
-                                    )
-                                    .on_hover_text(
-                                        "RTT down-channel used to send SystemView start and stop commands to the target",
-                                    );
-                                });
-
-                                ui.add_space(10.0);
                                 ui.horizontal(|ui| {
                                     ui.checkbox(
                                         &mut self.system_trace_settings.terminal_enabled,
@@ -524,7 +514,127 @@ impl WaveCraftApp {
                                 });
                             });
                                 rtt_section.header_response.on_hover_text(
-                                    "Configure RTT discovery, SystemView channels, and the plain-text terminal channel",
+                                    "Configure RTT discovery and the plain-text terminal channel",
+                                );
+
+                                ui.add_space(8.0);
+                                let detected_frequencies =
+                                    trace_target_frequencies(&self.system_trace);
+                                let systemview_header = egui::CollapsingHeader::new(
+                                    RichText::new("SystemView").strong(),
+                                )
+                                .id_salt("system_trace_systemview_settings")
+                                .default_open(true);
+                                let systemview_section = systemview_header.show(ui, |ui| {
+                                    ui.checkbox(
+                                        &mut self.system_trace_settings.systemview_enabled,
+                                        "SystemView binary trace",
+                                    )
+                                    .on_hover_text(
+                                        "Enable decoding of SEGGER SystemView binary events from RTT",
+                                    );
+                                    ui.horizontal(|ui| {
+                                        setup_label(ui, "Up channel");
+                                        ui.add_enabled(
+                                            self.system_trace_settings.systemview_enabled,
+                                            egui::DragValue::new(
+                                                &mut self.system_trace_settings.up_channel,
+                                            )
+                                            .range(0..=255),
+                                        )
+                                        .on_hover_text(
+                                            "RTT up-channel on which the target sends SystemView event data",
+                                        );
+                                        setup_label(ui, "Down");
+                                        ui.add_enabled(
+                                            self.system_trace_settings.systemview_enabled,
+                                            egui::DragValue::new(
+                                                &mut self.system_trace_settings.down_channel,
+                                            )
+                                            .range(0..=255),
+                                        )
+                                        .on_hover_text(
+                                            "RTT down-channel used to send SystemView start and stop commands to the target",
+                                        );
+                                    });
+
+                                    ui.add_space(10.0);
+                                    setup_label(ui, "Detected timestamp clock");
+                                    ui.label(
+                                        RichText::new(format_detected_frequency(
+                                            detected_frequencies.map(|frequencies| frequencies.0),
+                                        ))
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                    );
+                                    setup_label(ui, "Detected CPU clock");
+                                    ui.label(
+                                        RichText::new(format_detected_frequency(
+                                            detected_frequencies.map(|frequencies| frequencies.1),
+                                        ))
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                    );
+
+                                    ui.add_space(10.0);
+                                    setup_label(ui, "Timestamp frequency override");
+                                    let mut manual_override = self
+                                        .system_trace_settings
+                                        .timestamp_frequency_override_hz
+                                        .is_some();
+                                    ui.add_enabled_ui(
+                                        self.system_trace_settings.systemview_enabled,
+                                        |ui| {
+                                            ui.horizontal(|ui| {
+                                                egui::ComboBox::from_id_salt(
+                                                    "system_trace_timestamp_frequency_mode",
+                                                )
+                                                .selected_text(if manual_override {
+                                                    "Manual fallback"
+                                                } else {
+                                                    "Auto"
+                                                })
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(
+                                                        &mut manual_override,
+                                                        false,
+                                                        "Auto",
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut manual_override,
+                                                        true,
+                                                        "Manual fallback",
+                                                    );
+                                                });
+                                                if manual_override {
+                                                    let frequency = self
+                                                        .system_trace_settings
+                                                        .timestamp_frequency_override_hz
+                                                        .get_or_insert(
+                                                            DEFAULT_TIMESTAMP_FREQUENCY_OVERRIDE_HZ,
+                                                        );
+                                                    ui.add(
+                                                        egui::DragValue::new(frequency)
+                                                            .range(
+                                                                1..=MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ,
+                                                            )
+                                                            .speed(1_000)
+                                                            .suffix(" Hz"),
+                                                    );
+                                                } else {
+                                                    self.system_trace_settings
+                                                        .timestamp_frequency_override_hz = None;
+                                                }
+                                            });
+                                        },
+                                    )
+                                    .response
+                                    .on_hover_text(
+                                        "Auto uses the timestamp frequency reported by SystemView. The manual value is used only when the trace omits it or reports zero",
+                                    );
+                                });
+                                systemview_section.header_response.on_hover_text(
+                                    "Configure SystemView channels and timestamp clock interpretation",
                                 );
                                 if paint_capture_settings_save_button(
                                     ui,
@@ -598,6 +708,8 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn paint_system_trace_central_panel(&mut self, context: &egui::Context) {
+        let timestamp_frequency_override_hz =
+            self.system_trace_settings.timestamp_frequency_override_hz;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -617,7 +729,11 @@ impl WaveCraftApp {
                     egui::vec2(pane_width, self.system_trace.timeline_view_height()),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        paint_timeline_instrument(ui, &mut self.system_trace);
+                        paint_timeline_instrument(
+                            ui,
+                            &mut self.system_trace,
+                            timestamp_frequency_override_hz,
+                        );
                     },
                 );
                 paint_trace_instrument_splitter(ui, &mut self.system_trace);
@@ -1015,7 +1131,11 @@ fn paint_trace_summary(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
     });
 }
 
-fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
+fn paint_timeline_instrument(
+    ui: &mut egui::Ui,
+    trace: &mut SystemTraceDisplayState,
+    timestamp_frequency_override_hz: Option<u64>,
+) {
     instrument_frame().show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
@@ -1132,7 +1252,10 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 &lanes,
                 start_ticks,
                 end_ticks,
-                selected_timestamp,
+                TimelineCanvasOptions {
+                    selected_timestamp,
+                    timestamp_frequency_override_hz,
+                },
             );
             (canvas.top(), canvas_width, clicked_sequence)
         });
@@ -1259,6 +1382,12 @@ struct TimelineIntervalPosition {
     rect: egui::Rect,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TimelineCanvasOptions {
+    selected_timestamp: Option<u64>,
+    timestamp_frequency_override_hz: Option<u64>,
+}
+
 fn timeline_lanes(model: &TraceModel) -> Vec<TimelineLane> {
     let mut lanes = Vec::new();
     for (core_id, core) in model.cores() {
@@ -1282,7 +1411,7 @@ fn paint_timeline_canvas(
     lanes: &[TimelineLane],
     start_ticks: u64,
     end_ticks: u64,
-    selected_timestamp: Option<u64>,
+    options: TimelineCanvasOptions,
 ) -> Option<u64> {
     let model = trace.model();
     let painter = ui.painter().with_clip_rect(canvas);
@@ -1543,7 +1672,7 @@ fn paint_timeline_canvas(
         }
     }
 
-    if let Some(timestamp) = selected_timestamp {
+    if let Some(timestamp) = options.selected_timestamp {
         let x = tick_x(timestamp, start_ticks, duration, plot_left, plot_width);
         plot_painter.line_segment(
             [egui::pos2(x, canvas.top()), egui::pos2(x, canvas.bottom())],
@@ -1579,6 +1708,7 @@ fn paint_timeline_canvas(
             end_ticks,
             trace,
             measurement,
+            options.timestamp_frequency_override_hz,
         );
     }
     clicked_sequence
@@ -1643,6 +1773,7 @@ fn paint_timeline_smart_timing_hint(
     trace_end_ticks: u64,
     trace: &SystemTraceDisplayState,
     measurement: TimelineSmartTiming,
+    timestamp_frequency_override_hz: Option<u64>,
 ) {
     let first = measurement.measurement.first;
     let second = measurement.measurement.second;
@@ -1691,11 +1822,12 @@ fn paint_timeline_smart_timing_hint(
     }
 
     let duration_ticks = first.timestamp_ticks.abs_diff(second.timestamp_ticks);
-    let duration = trace_system_frequency_hz(trace).map(|frequency_hz| {
-        format_duration(Duration::from_secs_f64(
-            duration_ticks as f64 / frequency_hz as f64,
-        ))
-    });
+    let duration =
+        trace_system_frequency_hz(trace, timestamp_frequency_override_hz).map(|frequency_hz| {
+            format_duration(Duration::from_secs_f64(
+                duration_ticks as f64 / frequency_hz as f64,
+            ))
+        });
     let context_line = format!(
         "{} → {}",
         timing_edge_label(trace.model(), first),
@@ -1780,17 +1912,26 @@ fn timing_edge_label(model: &TraceModel, edge: TimelineTimingEdge) -> String {
     )
 }
 
-fn trace_system_frequency_hz(trace: &SystemTraceDisplayState) -> Option<u64> {
-    trace.events().iter().rev().find_map(|event| {
-        let TraceEventKind::TargetInfo {
-            system_frequency_hz,
-            ..
-        } = &event.kind
-        else {
-            return None;
-        };
-        (*system_frequency_hz > 0).then_some(*system_frequency_hz)
-    })
+fn trace_target_frequencies(trace: &SystemTraceDisplayState) -> Option<(u64, u64)> {
+    trace.target_frequencies_hz()
+}
+
+fn trace_system_frequency_hz(
+    trace: &SystemTraceDisplayState,
+    timestamp_frequency_override_hz: Option<u64>,
+) -> Option<u64> {
+    trace_target_frequencies(trace)
+        .and_then(|(system_frequency_hz, _)| {
+            (system_frequency_hz > 0).then_some(system_frequency_hz)
+        })
+        .or(timestamp_frequency_override_hz.filter(|frequency| *frequency > 0))
+}
+
+fn format_detected_frequency(frequency_hz: Option<u64>) -> String {
+    frequency_hz.filter(|frequency| *frequency > 0).map_or_else(
+        || "Not reported by trace".to_owned(),
+        |frequency| format!("{} ({frequency} Hz)", format_frequency(frequency as f64)),
+    )
 }
 
 fn interval_event_sequence(
@@ -2988,15 +3129,29 @@ mod tests {
     }
 
     #[test]
-    fn setup_panel_groups_probe_and_rtt_above_save_control() {
+    fn setup_panel_groups_probe_rtt_and_systemview_above_save_control() {
         let context = egui::Context::default();
         let mut app = app();
+        app.system_trace = timing_trace();
 
         let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
         assert!(texts.iter().any(|(text, _)| text == "Probe"));
         assert!(texts.iter().any(|(text, _)| text == "Debug probe"));
         assert!(texts.iter().any(|(text, _)| text == "RTT"));
         assert!(texts.iter().any(|(text, _)| text == "RTT control block"));
+        assert!(texts.iter().any(|(text, _)| text == "SystemView"));
+        assert!(texts
+            .iter()
+            .any(|(text, _)| text == "Detected timestamp clock"));
+        assert!(texts
+            .iter()
+            .any(|(text, _)| text == "Timestamp frequency override"));
+        assert!(texts
+            .iter()
+            .any(|(text, _)| text == "1.00 MHz (1000000 Hz)"));
+        assert!(texts
+            .iter()
+            .any(|(text, _)| text == "64.00 MHz (64000000 Hz)"));
         let probe = texts
             .iter()
             .find(|(text, _)| text == "Probe")
@@ -3007,6 +3162,11 @@ mod tests {
             .find(|(text, _)| text == "RTT")
             .map(|(_, position)| *position)
             .expect("RTT section header is painted");
+        let systemview = texts
+            .iter()
+            .find(|(text, _)| text == "SystemView")
+            .map(|(_, position)| *position)
+            .expect("SystemView section header is painted");
         let save = texts
             .iter()
             .find(|(text, _)| text == "💾 Save TRACE settings")
@@ -3014,7 +3174,8 @@ mod tests {
             .expect("save settings control is painted");
 
         assert!(probe.y < rtt.y);
-        assert!(rtt.y < save.y);
+        assert!(rtt.y < systemview.y);
+        assert!(systemview.y < save.y);
         assert!(!texts.iter().any(|(text, _)| text == "Connect and attach"));
     }
 
@@ -3478,6 +3639,43 @@ mod tests {
     }
 
     #[test]
+    fn trace_timestamp_frequency_prefers_reported_clock_and_uses_manual_fallback() {
+        let trace = timing_trace();
+
+        assert_eq!(
+            trace_target_frequencies(&trace),
+            Some((1_000_000, 64_000_000))
+        );
+        assert_eq!(
+            trace_system_frequency_hz(&trace, Some(2_000_000)),
+            Some(1_000_000)
+        );
+
+        let mut missing_frequency = SystemTraceDisplayState::default();
+        missing_frequency.ingest(TraceEvent {
+            sequence: 0,
+            core_id: 0,
+            timestamp_ticks: 0,
+            kind: TraceEventKind::TargetInfo {
+                system_frequency_hz: 0,
+                cpu_frequency_hz: 48_000_000,
+                ram_base: 0x2000_0000,
+                id_shift: 0,
+            },
+        });
+        assert_eq!(
+            trace_system_frequency_hz(&missing_frequency, Some(32_768)),
+            Some(32_768)
+        );
+        assert_eq!(trace_system_frequency_hz(&missing_frequency, None), None);
+        assert_eq!(
+            format_detected_frequency(Some(64_000_000)),
+            "64.00 MHz (64000000 Hz)"
+        );
+        assert_eq!(format_detected_frequency(Some(0)), "Not reported by trace");
+    }
+
+    #[test]
     fn timeline_smart_timing_snaps_to_interval_edges_with_half_transparent_hover() {
         let context = egui::Context::default();
         let mut trace = timing_trace();
@@ -3499,7 +3697,15 @@ mod tests {
         };
         let _ = context.run(warm_up, |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                paint_timeline_canvas(ui, canvas, &mut trace, &lanes, 0, 220, None);
+                paint_timeline_canvas(
+                    ui,
+                    canvas,
+                    &mut trace,
+                    &lanes,
+                    0,
+                    220,
+                    TimelineCanvasOptions::default(),
+                );
             });
         });
         let input = egui::RawInput {
@@ -3513,7 +3719,15 @@ mod tests {
 
         let output = context.run(input, |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                paint_timeline_canvas(ui, canvas, &mut trace, &lanes, 0, 220, None);
+                paint_timeline_canvas(
+                    ui,
+                    canvas,
+                    &mut trace,
+                    &lanes,
+                    0,
+                    220,
+                    TimelineCanvasOptions::default(),
+                );
             });
         });
         let hover_fill = half_transparent_plate(PANEL);
@@ -3583,7 +3797,15 @@ mod tests {
             };
             context.run(input, |context| {
                 egui::CentralPanel::default().show(context, |ui| {
-                    paint_timeline_canvas(ui, canvas, trace, &lanes, 0, 220, None);
+                    paint_timeline_canvas(
+                        ui,
+                        canvas,
+                        trace,
+                        &lanes,
+                        0,
+                        220,
+                        TimelineCanvasOptions::default(),
+                    );
                 });
             })
         };
@@ -3838,6 +4060,7 @@ mod tests {
             systemview_enabled: true,
             up_channel: 1,
             down_channel: 1,
+            timestamp_frequency_override_hz: None,
             terminal_enabled: true,
             terminal_up_channel: 0,
         };
@@ -3893,6 +4116,7 @@ mod tests {
             systemview_enabled: true,
             up_channel: 2,
             down_channel: 3,
+            timestamp_frequency_override_hz: Some(2_000_000),
             terminal_enabled: true,
             terminal_up_channel: 0,
         };
@@ -3901,6 +4125,25 @@ mod tests {
         restored.apply_saved_values(&expected.saved_values());
 
         assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn timestamp_frequency_auto_clears_a_saved_manual_fallback() {
+        let mut restored = SystemTraceSettings {
+            timestamp_frequency_override_hz: Some(32_768),
+            ..SystemTraceSettings::default()
+        };
+
+        restored.apply_saved_values(&BTreeMap::from([(
+            "system_trace.timestamp_frequency_override_hz".to_owned(),
+            "auto".to_owned(),
+        )]));
+
+        assert_eq!(restored.timestamp_frequency_override_hz, None);
+        assert_eq!(
+            restored.saved_values()["system_trace.timestamp_frequency_override_hz"],
+            "auto"
+        );
     }
 
     #[test]
