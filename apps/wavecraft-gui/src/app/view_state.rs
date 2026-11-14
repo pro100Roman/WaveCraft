@@ -260,40 +260,7 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn available_waveform_tabs(&self) -> Vec<WaveformTab> {
-        let displayed_logic = self.captures.iter().any(|capture| capture.has_logic)
-            || self.logic_sessions.any(|capture| capture.has_logic)
-            || self
-                .combined_capture
-                .as_ref()
-                .is_some_and(|capture| capture.has_logic);
-        let displayed_scope = self.captures.iter().any(|capture| capture.has_scope)
-            || self.scope_sessions.any(|capture| capture.has_scope)
-            || self
-                .combined_capture
-                .as_ref()
-                .is_some_and(|capture| capture.has_scope);
-        let displayed_radio = self.captures.iter().any(|capture| capture.has_radio)
-            || self
-                .radio_capture
-                .as_ref()
-                .is_some_and(|capture| capture.has_radio);
-        let has_logic_analyzer = displayed_logic
-            || self
-                .devices
-                .iter()
-                .any(|entry| entry.device.profile.model.is_logic_analyzer());
-        let has_oscilloscope = displayed_scope
-            || self
-                .devices
-                .iter()
-                .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100);
-        let has_radio_receiver = displayed_radio || !self.radios.is_empty();
-        waveform_tabs(
-            has_logic_analyzer,
-            has_oscilloscope,
-            has_radio_receiver,
-            self.scope_function_settings.lissajous.enabled,
-        )
+        waveform_tabs(self.scope_function_settings.lissajous.enabled)
     }
 
     pub(crate) fn select_waveform_tab(&mut self, tab: WaveformTab) {

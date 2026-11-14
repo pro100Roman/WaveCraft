@@ -124,28 +124,12 @@ impl WaveformTab {
     }
 }
 
-pub(crate) fn waveform_tabs(
-    has_logic_analyzer: bool,
-    has_oscilloscope: bool,
-    has_radio_receiver: bool,
-    show_lissajous: bool,
-) -> Vec<WaveformTab> {
-    let mut tabs = Vec::with_capacity(5);
-    if has_logic_analyzer {
-        tabs.push(WaveformTab::LogicAnalyzer);
-    }
-    if has_oscilloscope {
-        tabs.push(WaveformTab::Oscilloscope);
-    }
-    if has_oscilloscope && show_lissajous {
+pub(crate) fn waveform_tabs(show_lissajous: bool) -> Vec<WaveformTab> {
+    let mut tabs = vec![WaveformTab::LogicAnalyzer, WaveformTab::Oscilloscope];
+    if show_lissajous {
         tabs.push(WaveformTab::Lissajous);
     }
-    if has_radio_receiver {
-        tabs.push(WaveformTab::RadioReceiver);
-    }
-    if has_logic_analyzer && has_oscilloscope {
-        tabs.push(WaveformTab::Combined);
-    }
+    tabs.extend([WaveformTab::RadioReceiver, WaveformTab::Combined]);
     tabs
 }
 
@@ -170,40 +154,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn waveform_tabs_require_their_connected_devices() {
-        assert!(waveform_tabs(false, false, false, true).is_empty());
+    fn waveform_tabs_do_not_require_connected_devices() {
         assert_eq!(
-            waveform_tabs(true, false, false, true),
-            vec![WaveformTab::LogicAnalyzer]
-        );
-        assert_eq!(
-            waveform_tabs(false, true, false, false),
-            vec![WaveformTab::Oscilloscope]
-        );
-        assert_eq!(
-            waveform_tabs(false, true, false, true),
-            vec![WaveformTab::Oscilloscope, WaveformTab::Lissajous]
-        );
-        assert_eq!(
-            waveform_tabs(true, true, false, false),
+            waveform_tabs(false),
             vec![
                 WaveformTab::LogicAnalyzer,
                 WaveformTab::Oscilloscope,
+                WaveformTab::RadioReceiver,
                 WaveformTab::Combined,
             ]
         );
         assert_eq!(
-            waveform_tabs(true, true, false, true),
+            waveform_tabs(true),
             vec![
                 WaveformTab::LogicAnalyzer,
                 WaveformTab::Oscilloscope,
                 WaveformTab::Lissajous,
+                WaveformTab::RadioReceiver,
                 WaveformTab::Combined,
             ]
-        );
-        assert_eq!(
-            waveform_tabs(false, false, true, false),
-            vec![WaveformTab::RadioReceiver]
         );
     }
 

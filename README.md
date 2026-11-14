@@ -322,12 +322,11 @@ DSCope while idle; existing waveforms retain the settings with which they were
 captured. Each input range uses a rotary-style encoder that supports vertical
 mouse dragging, the mouse wheel, and arrow keys. Double-clicking a scope encoder
 opens its channel color picker; the selected color is shared by the encoder,
-trace, offset reference, readout, and trigger indication. Logic Analyzer and
-Oscilloscope tabs are available for connected devices or matching data from an
-opened capture file. Capture Setup remains available for offline analysis even
-when no instrument is connected. The Combined tab appears when both signal
-types are available, and Refresh rebuilds the available tab set. Each waveform
-expands with the main window; Combined provides a draggable
+trace, offset reference, readout, and trigger indication. Logic Analyzer,
+Oscilloscope, RF Spectrum, and Combined tabs remain available when no instrument
+is connected, so their views and offline data can be inspected independently of
+hardware discovery. Capture controls still require the matching instrument.
+Each waveform expands with the main window; Combined provides a draggable
 horizontal divider for adjusting the DSLogic/DSCope height ratio. Logic
 waveform storage is bounded at two million activity-preserving buckets whose
 stride covers the configured finite or Loop duration, and rendering is further

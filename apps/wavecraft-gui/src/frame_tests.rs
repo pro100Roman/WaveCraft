@@ -80,8 +80,11 @@ fn an_app_without_instruments_paints_and_stays_idle() {
     let mut app = app();
     let context = context();
     run_frames(&mut app, &context, 3);
-    assert_eq!(app.active_waveform_tab, None);
-    assert_eq!(app.active_workspace_view, Some(WorkspaceView::SystemTrace));
+    assert_eq!(app.active_waveform_tab, Some(WaveformTab::Combined));
+    assert_eq!(
+        app.active_workspace_view,
+        Some(WorkspaceView::Waveform(WaveformTab::Combined))
+    );
     assert!(app.captures.is_empty());
     assert!(app.pending.is_none());
 }
@@ -206,8 +209,8 @@ fn plain_rtt_terminal_lines_reach_the_gui_through_the_worker_channel() {
 }
 
 #[test]
-fn every_waveform_tab_paints_with_every_instrument_connected() {
-    let mut app = app_with_every_instrument();
+fn every_waveform_tab_paints_without_connected_instruments() {
+    let mut app = app();
     let context = context();
     // The Lissajous tab only exists once the user enables it from the scope
     // view, and selecting a tab restores that view's saved settings, so enable
