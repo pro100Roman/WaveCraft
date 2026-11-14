@@ -1064,7 +1064,6 @@ fn paint_timeline_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplaySt
                 } else {
                     "Zoom: pinch or modifier-scroll; pan: drag"
                 })
-                .small()
                 .color(TEXT_MUTED),
             );
         });
