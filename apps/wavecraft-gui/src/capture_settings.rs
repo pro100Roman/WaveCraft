@@ -7,16 +7,18 @@ use std::path::{Path, PathBuf};
 const FORMAT_VERSION: u32 = 1;
 const SETTINGS_FILE_NAME: &str = "capture-settings.json";
 
-/// A portable, versioned representation of capture settings.
+/// A portable, versioned representation of application settings.
 ///
-/// The same document can back the application defaults today and named,
-/// user-selected profile files later. Keeping instrument values as stable
-/// string keys avoids coupling persisted files to private GUI types.
+/// Global settings describe application-wide behavior. Capture profiles can
+/// also back named, user-selected profile files later. Keeping instrument
+/// values as stable string keys avoids coupling them to private GUI types.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub(crate) struct CaptureSettingsDocument {
     pub(crate) format_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) name: Option<String>,
+    #[serde(default)]
+    pub(crate) global: GlobalSettings,
     #[serde(default)]
     pub(crate) profiles: CaptureSettingsProfiles,
 }
@@ -26,9 +28,28 @@ impl Default for CaptureSettingsDocument {
         Self {
             format_version: FORMAT_VERSION,
             name: None,
+            global: GlobalSettings::default(),
             profiles: CaptureSettingsProfiles::default(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub(crate) struct GlobalSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_active_view: Option<SavedWorkspaceView>,
+}
+
+/// Stable persisted names for views, independent of the GUI enum layout.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SavedWorkspaceView {
+    LogicAnalyzer,
+    Oscilloscope,
+    Lissajous,
+    RadioSpectrum,
+    Combined,
+    SystemTrace,
 }
 
 impl CaptureSettingsDocument {
@@ -251,6 +272,18 @@ mod tests {
     }
 
     #[test]
+    fn documents_without_global_settings_remain_compatible() {
+        let document = serde_json::from_str::<CaptureSettingsDocument>(
+            r#"{"format_version":1,"profiles":{}}"#,
+        )
+        .expect("the previous document shape should still load")
+        .validate()
+        .expect("the previous format version remains supported");
+
+        assert_eq!(document.global, GlobalSettings::default());
+    }
+
+    #[test]
     fn saving_again_replaces_each_profile_in_one_document() {
         let repository = test_repository("replace");
         let _ = fs::remove_file(repository.path());
@@ -263,6 +296,7 @@ mod tests {
             "scope.sample_rate_hz".to_owned(),
             "5000000".to_owned(),
         )])));
+        document.global.last_active_view = Some(SavedWorkspaceView::RadioSpectrum);
         repository.save(&document).expect("first save should work");
 
         document.profiles.logic_analyzer = Some(CaptureSettingsProfile::new(BTreeMap::from([(
@@ -273,6 +307,10 @@ mod tests {
 
         let loaded = repository.load().expect("saved settings should load");
         assert_eq!(loaded, document);
+        assert_eq!(
+            loaded.global.last_active_view,
+            Some(SavedWorkspaceView::RadioSpectrum)
+        );
         assert_eq!(
             loaded
                 .profiles

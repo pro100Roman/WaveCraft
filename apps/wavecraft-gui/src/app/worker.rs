@@ -11,7 +11,7 @@ use crate::{
     InstrumentKind, LoadedRecording, LogicDecodeWorker, ManualCalibrationEditor, Path, PathBuf,
     ProtocolAnalyzerInstance, ProtocolCaptureDecoder, ProtocolDecodeSnapshot, RadioDiscoveryReport,
     RadioSingleTrigger, ScopeMeasurementCache, TryRecvError, WaveformStore, WaveformTab,
-    WorkerSuccess, DSCOPE_VOLTS_PER_DIV_MV,
+    WorkerSuccess, WorkspaceView, DSCOPE_VOLTS_PER_DIV_MV,
 };
 
 use crate::WaveCraftApp;
@@ -622,6 +622,8 @@ impl WaveCraftApp {
             recording_completion_label(completion)
         );
         self.last_error = None;
+        self.active_workspace_view = self.active_waveform_tab.map(WorkspaceView::Waveform);
+        self.save_global_settings();
     }
 
     /// Offers to save the result of a finished DSCope auto calibration.

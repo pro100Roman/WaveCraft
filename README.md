@@ -326,8 +326,9 @@ trace, offset reference, readout, and trigger indication. Logic Analyzer,
 Oscilloscope, RF Spectrum, and Combined tabs remain available when no instrument
 is connected, so their views and offline data can be inspected independently of
 hardware discovery. Capture controls still require the matching instrument.
-Each waveform expands with the main window; Combined provides a draggable
-horizontal divider for adjusting the DSLogic/DSCope height ratio. Logic
+The active view is stored as a global application setting and restored at the
+next launch. Each waveform expands with the main window; Combined provides a
+draggable horizontal divider for adjusting the DSLogic/DSCope height ratio. Logic
 waveform storage is bounded at two million activity-preserving buckets whose
 stride covers the configured finite or Loop duration, and rendering is further
 decimated to the plot width; this display limit does not truncate data written

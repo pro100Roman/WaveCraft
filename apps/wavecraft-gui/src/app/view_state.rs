@@ -7,12 +7,59 @@ use crate::{
     saved_logic_settings_metadata, saved_radio_settings_metadata, saved_scope_settings_metadata,
     scope_settings_from_recording_metadata, waveform_tabs, AcquisitionMode, CaptureSettingsProfile,
     CaptureSettingsTab, CombinedSessionSettings, DeviceModel, LogicSessionSettings,
-    SavedCaptureSettingsKind, ScopeSessionSettings, WaveformTab, WorkspaceView,
+    SavedCaptureSettingsKind, SavedWorkspaceView, ScopeSessionSettings, WaveformTab, WorkspaceView,
 };
 
 use crate::WaveCraftApp;
 
+impl From<WorkspaceView> for SavedWorkspaceView {
+    fn from(view: WorkspaceView) -> Self {
+        match view {
+            WorkspaceView::Waveform(WaveformTab::LogicAnalyzer) => Self::LogicAnalyzer,
+            WorkspaceView::Waveform(WaveformTab::Oscilloscope) => Self::Oscilloscope,
+            WorkspaceView::Waveform(WaveformTab::Lissajous) => Self::Lissajous,
+            WorkspaceView::Waveform(WaveformTab::RadioReceiver) => Self::RadioSpectrum,
+            WorkspaceView::Waveform(WaveformTab::Combined) => Self::Combined,
+            WorkspaceView::SystemTrace => Self::SystemTrace,
+        }
+    }
+}
+
+impl From<SavedWorkspaceView> for WorkspaceView {
+    fn from(view: SavedWorkspaceView) -> Self {
+        match view {
+            SavedWorkspaceView::LogicAnalyzer => Self::Waveform(WaveformTab::LogicAnalyzer),
+            SavedWorkspaceView::Oscilloscope => Self::Waveform(WaveformTab::Oscilloscope),
+            SavedWorkspaceView::Lissajous => Self::Waveform(WaveformTab::Lissajous),
+            SavedWorkspaceView::RadioSpectrum => Self::Waveform(WaveformTab::RadioReceiver),
+            SavedWorkspaceView::Combined => Self::Waveform(WaveformTab::Combined),
+            SavedWorkspaceView::SystemTrace => Self::SystemTrace,
+        }
+    }
+}
+
 impl WaveCraftApp {
+    pub(crate) fn save_global_settings(&mut self) {
+        let Some(active_view) = self.active_workspace_view else {
+            return;
+        };
+        let saved_view = SavedWorkspaceView::from(active_view);
+        if self.saved_capture_settings.global.last_active_view == Some(saved_view) {
+            return;
+        }
+
+        let mut document = self.saved_capture_settings.clone();
+        document.global.last_active_view = Some(saved_view);
+        let result = self
+            .capture_settings_repository
+            .as_ref()
+            .map(|repository| repository.save(&document));
+        self.saved_capture_settings = document;
+        if let Some(Err(error)) = result {
+            self.last_error = Some(format!("Global settings could not be saved: {error}"));
+        }
+    }
+
     pub(crate) fn apply_saved_capture_settings(&mut self) {
         if let Some(profile) = self.saved_capture_settings.profiles.logic_analyzer.as_ref() {
             self.logic_settings = logic_settings_from_recording_metadata(&profile.values);
@@ -275,6 +322,7 @@ impl WaveCraftApp {
         if let Some(settings_tab) = tab.capture_settings_tab() {
             self.active_capture_settings_tab = settings_tab;
         }
+        self.save_global_settings();
     }
 
     pub(crate) fn select_system_trace_view(&mut self) {
@@ -283,6 +331,7 @@ impl WaveCraftApp {
         }
         self.active_workspace_view = Some(WorkspaceView::SystemTrace);
         self.snapshot_plot_rect = None;
+        self.save_global_settings();
     }
 
     pub(crate) fn system_trace_view_is_active(&self) -> bool {
@@ -364,5 +413,89 @@ impl WaveCraftApp {
                 self.active_workspace_view = Some(WorkspaceView::SystemTrace);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CaptureSettingsDocument, CaptureSettingsRepository};
+    use std::fs;
+
+    fn test_repository() -> CaptureSettingsRepository {
+        let directory = std::env::temp_dir().join(format!(
+            "wavecraft-global-view-settings-{}",
+            std::process::id()
+        ));
+        CaptureSettingsRepository::at(directory.join("capture-settings.json"))
+    }
+
+    fn remove_test_repository(repository: &CaptureSettingsRepository) {
+        let _ = fs::remove_file(repository.path());
+        if let Some(parent) = repository.path().parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn saved_workspace_views_round_trip_without_gui_layout_details() {
+        for view in [
+            WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
+            WorkspaceView::Waveform(WaveformTab::Oscilloscope),
+            WorkspaceView::Waveform(WaveformTab::Lissajous),
+            WorkspaceView::Waveform(WaveformTab::RadioReceiver),
+            WorkspaceView::Waveform(WaveformTab::Combined),
+            WorkspaceView::SystemTrace,
+        ] {
+            assert_eq!(WorkspaceView::from(SavedWorkspaceView::from(view)), view);
+        }
+    }
+
+    #[test]
+    fn selecting_a_view_persists_and_restores_the_global_setting() {
+        let repository = test_repository();
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+
+        app.select_waveform_tab(WaveformTab::Lissajous);
+
+        let saved = repository
+            .load()
+            .expect("the selected view should be saved");
+        assert_eq!(
+            saved.global.last_active_view,
+            Some(SavedWorkspaceView::Lissajous)
+        );
+        let mut restored = WaveCraftApp::with_settings(None, saved);
+        restored.reconcile_waveform_tab();
+        assert_eq!(
+            restored.active_workspace_view,
+            Some(WorkspaceView::Waveform(WaveformTab::Lissajous))
+        );
+        assert_eq!(restored.active_waveform_tab, Some(WaveformTab::Lissajous));
+        assert!(restored.scope_function_settings.lissajous.enabled);
+        assert!(restored
+            .available_waveform_tabs()
+            .contains(&WaveformTab::Lissajous));
+
+        app.select_system_trace_view();
+
+        let saved = repository
+            .load()
+            .expect("the system trace view should be saved");
+        assert_eq!(
+            saved.global.last_active_view,
+            Some(SavedWorkspaceView::SystemTrace)
+        );
+        let restored = WaveCraftApp::with_settings(None, saved);
+        assert_eq!(
+            restored.active_workspace_view,
+            Some(WorkspaceView::SystemTrace)
+        );
+        assert_eq!(restored.active_waveform_tab, None);
+        remove_test_repository(&repository);
     }
 }

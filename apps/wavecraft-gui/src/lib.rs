@@ -29,7 +29,7 @@ use acquisition::radio::*;
 use acquisition::radio_backend::*;
 use acquisition::scope::*;
 use capture_settings::{
-    CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository,
+    CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository, SavedWorkspaceView,
 };
 use debug_probes::*;
 use devices::{
@@ -410,7 +410,7 @@ impl WaveCraftApp {
         app.begin_refresh();
         if let Some(error) = settings_load_error {
             app.last_error = Some(format!(
-                "Saved capture settings could not be loaded; using defaults: {error}"
+                "Saved settings could not be loaded; using defaults: {error}"
             ));
         }
         app
@@ -422,6 +422,18 @@ impl WaveCraftApp {
         capture_settings_repository: Option<CaptureSettingsRepository>,
         saved_capture_settings: CaptureSettingsDocument,
     ) -> Self {
+        let restored_workspace_view = saved_capture_settings
+            .global
+            .last_active_view
+            .map(WorkspaceView::from);
+        let restored_waveform_tab = match restored_workspace_view {
+            Some(WorkspaceView::Waveform(tab)) => Some(tab),
+            Some(WorkspaceView::SystemTrace) | None => None,
+        };
+        let mut restored_scope_function_settings = ScopeFunctionSettings::default();
+        if restored_waveform_tab == Some(WaveformTab::Lissajous) {
+            restored_scope_function_settings.lissajous.enabled = true;
+        }
         let mut app = Self {
             capture_settings_repository,
             saved_capture_settings,
@@ -454,12 +466,12 @@ impl WaveCraftApp {
             scope_settings: ScopeCaptureSettings::default(),
             scope_auto_sample_rate: true,
             scope_smart_timing_enabled: false,
-            scope_function_settings: ScopeFunctionSettings::default(),
+            scope_function_settings: restored_scope_function_settings,
             scope_marker_settings: ScopeMarkerSettings::default(),
             scope_quick_time_measurement: ScopeQuickTimeMeasurement::default(),
             scope_marker_editor: None,
-            active_workspace_view: None,
-            active_waveform_tab: None,
+            active_workspace_view: restored_workspace_view,
+            active_waveform_tab: restored_waveform_tab,
             system_trace_settings: SystemTraceSettings::default(),
             system_trace_setup_panel_open: true,
             system_trace: system_trace::SystemTraceDisplayState::default(),
