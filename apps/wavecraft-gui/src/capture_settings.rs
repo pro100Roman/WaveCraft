@@ -38,6 +38,10 @@ impl Default for CaptureSettingsDocument {
 pub(crate) struct GlobalSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_active_view: Option<SavedWorkspaceView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) system_trace_event_view_order: Option<Vec<SavedTraceEventView>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) system_trace_instrument_order: Option<Vec<SavedTraceInstrument>>,
 }
 
 /// Stable persisted names for views, independent of the GUI enum layout.
@@ -50,6 +54,24 @@ pub(crate) enum SavedWorkspaceView {
     RadioSpectrum,
     Combined,
     SystemTrace,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SavedTraceEventView {
+    Events,
+    Logs,
+    RttTerminal,
+    ProbeLog,
+    CpuLoad,
+    ContextStatistics,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SavedTraceInstrument {
+    Timeline,
+    Analysis,
 }
 
 impl CaptureSettingsDocument {
@@ -297,6 +319,18 @@ mod tests {
             "5000000".to_owned(),
         )])));
         document.global.last_active_view = Some(SavedWorkspaceView::RadioSpectrum);
+        document.global.system_trace_event_view_order = Some(vec![
+            SavedTraceEventView::Logs,
+            SavedTraceEventView::Events,
+            SavedTraceEventView::RttTerminal,
+            SavedTraceEventView::ProbeLog,
+            SavedTraceEventView::CpuLoad,
+            SavedTraceEventView::ContextStatistics,
+        ]);
+        document.global.system_trace_instrument_order = Some(vec![
+            SavedTraceInstrument::Analysis,
+            SavedTraceInstrument::Timeline,
+        ]);
         repository.save(&document).expect("first save should work");
 
         document.profiles.logic_analyzer = Some(CaptureSettingsProfile::new(BTreeMap::from([(

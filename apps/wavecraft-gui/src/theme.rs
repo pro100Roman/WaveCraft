@@ -11,7 +11,32 @@ pub(crate) const SCOPE_COLORS: [Color32; 2] = [
     Color32::from_rgb(99, 179, 255),
 ];
 pub(crate) const MATH_COLOR: Color32 = Color32::from_rgb(213, 126, 255);
+pub(crate) const SETUP_PANEL_BODY_FONT_SIZE: f32 = 12.5;
+pub(crate) const SETUP_PANEL_SMALL_FONT_SIZE: f32 = 9.0;
+pub(crate) const SETUP_PANEL_MONOSPACE_FONT_SIZE: f32 = 12.0;
 const TOOLTIP_DELAY_SECONDS: f32 = 0.1;
+
+/// Keeps every instrument setup panel on the typography established by the RF
+/// settings, even when a nested panel customizes its local egui style.
+pub(crate) fn apply_setup_panel_typography(ui: &mut egui::Ui) {
+    let text_styles = &mut ui.style_mut().text_styles;
+    text_styles.insert(
+        egui::TextStyle::Small,
+        egui::FontId::proportional(SETUP_PANEL_SMALL_FONT_SIZE),
+    );
+    text_styles.insert(
+        egui::TextStyle::Body,
+        egui::FontId::proportional(SETUP_PANEL_BODY_FONT_SIZE),
+    );
+    text_styles.insert(
+        egui::TextStyle::Button,
+        egui::FontId::proportional(SETUP_PANEL_BODY_FONT_SIZE),
+    );
+    text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::monospace(SETUP_PANEL_MONOSPACE_FONT_SIZE),
+    );
+}
 
 pub(crate) fn toolbar_action_button(label: &str, color: Color32) -> egui::Button<'static> {
     egui::Button::new(label.to_owned())
@@ -68,5 +93,32 @@ mod tests {
         assert!(fonts.families[&egui::FontFamily::Proportional]
             .iter()
             .any(|font| font == "Hack"));
+    }
+
+    #[test]
+    fn setup_panel_typography_matches_the_rf_baseline() {
+        let context = egui::Context::default();
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                apply_setup_panel_typography(ui);
+                let styles = &ui.style().text_styles;
+                assert_eq!(
+                    styles[&egui::TextStyle::Body].size,
+                    SETUP_PANEL_BODY_FONT_SIZE
+                );
+                assert_eq!(
+                    styles[&egui::TextStyle::Button].size,
+                    SETUP_PANEL_BODY_FONT_SIZE
+                );
+                assert_eq!(
+                    styles[&egui::TextStyle::Small].size,
+                    SETUP_PANEL_SMALL_FONT_SIZE
+                );
+                assert_eq!(
+                    styles[&egui::TextStyle::Monospace].size,
+                    SETUP_PANEL_MONOSPACE_FONT_SIZE
+                );
+            });
+        });
     }
 }

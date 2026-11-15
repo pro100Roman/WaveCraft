@@ -29,7 +29,8 @@ use acquisition::radio::*;
 use acquisition::radio_backend::*;
 use acquisition::scope::*;
 use capture_settings::{
-    CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository, SavedWorkspaceView,
+    CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository,
+    SavedTraceEventView, SavedTraceInstrument, SavedWorkspaceView,
 };
 use debug_probes::*;
 use devices::{
@@ -87,8 +88,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use theme::{
-    configure_style, toolbar_action_button, ACCENT, BACKGROUND, GRID, MATH_COLOR, ORANGE, PANEL,
-    SCOPE_COLORS, TEXT_MUTED,
+    apply_setup_panel_typography, configure_style, toolbar_action_button, ACCENT, BACKGROUND, GRID,
+    MATH_COLOR, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
 };
 use ui::capture_settings_panel::*;
 use ui::decoded_panel::*;
@@ -659,6 +660,9 @@ impl WaveCraftApp {
         self.paint_session_tabs(context);
 
         self.paint_central_panel(context, &frame, actions.snapshot_clicked);
+        if self.system_trace.take_layout_changed() {
+            self.save_global_settings();
+        }
 
         self.paint_settings_window(
             context,

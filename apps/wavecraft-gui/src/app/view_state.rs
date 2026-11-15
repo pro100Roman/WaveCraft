@@ -7,10 +7,14 @@ use crate::{
     saved_logic_settings_metadata, saved_radio_settings_metadata, saved_scope_settings_metadata,
     scope_settings_from_recording_metadata, waveform_tabs, AcquisitionMode, CaptureSettingsProfile,
     CaptureSettingsTab, CombinedSessionSettings, DeviceModel, LogicSessionSettings,
-    SavedCaptureSettingsKind, SavedWorkspaceView, ScopeSessionSettings, WaveformTab, WorkspaceView,
+    SavedCaptureSettingsKind, SavedTraceEventView, SavedTraceInstrument, SavedWorkspaceView,
+    ScopeSessionSettings, WaveformTab, WorkspaceView,
 };
 
-use crate::WaveCraftApp;
+use crate::{
+    system_trace::{TraceEventView, TraceInstrument},
+    WaveCraftApp,
+};
 
 impl From<WorkspaceView> for SavedWorkspaceView {
     fn from(view: WorkspaceView) -> Self {
@@ -38,18 +42,91 @@ impl From<SavedWorkspaceView> for WorkspaceView {
     }
 }
 
+impl From<TraceEventView> for SavedTraceEventView {
+    fn from(view: TraceEventView) -> Self {
+        match view {
+            TraceEventView::Events => Self::Events,
+            TraceEventView::Logs => Self::Logs,
+            TraceEventView::Terminal => Self::RttTerminal,
+            TraceEventView::ProbeLog => Self::ProbeLog,
+            TraceEventView::CpuLoad => Self::CpuLoad,
+            TraceEventView::ContextStatistics => Self::ContextStatistics,
+        }
+    }
+}
+
+impl From<SavedTraceEventView> for TraceEventView {
+    fn from(view: SavedTraceEventView) -> Self {
+        match view {
+            SavedTraceEventView::Events => Self::Events,
+            SavedTraceEventView::Logs => Self::Logs,
+            SavedTraceEventView::RttTerminal => Self::Terminal,
+            SavedTraceEventView::ProbeLog => Self::ProbeLog,
+            SavedTraceEventView::CpuLoad => Self::CpuLoad,
+            SavedTraceEventView::ContextStatistics => Self::ContextStatistics,
+        }
+    }
+}
+
+impl From<TraceInstrument> for SavedTraceInstrument {
+    fn from(instrument: TraceInstrument) -> Self {
+        match instrument {
+            TraceInstrument::Timeline => Self::Timeline,
+            TraceInstrument::Analysis => Self::Analysis,
+        }
+    }
+}
+
+impl From<SavedTraceInstrument> for TraceInstrument {
+    fn from(instrument: SavedTraceInstrument) -> Self {
+        match instrument {
+            SavedTraceInstrument::Timeline => Self::Timeline,
+            SavedTraceInstrument::Analysis => Self::Analysis,
+        }
+    }
+}
+
 impl WaveCraftApp {
     pub(crate) fn save_global_settings(&mut self) {
         let Some(active_view) = self.active_workspace_view else {
             return;
         };
         let saved_view = SavedWorkspaceView::from(active_view);
-        if self.saved_capture_settings.global.last_active_view == Some(saved_view) {
+        let event_view_order = self
+            .system_trace
+            .event_view_order()
+            .iter()
+            .copied()
+            .map(SavedTraceEventView::from)
+            .collect::<Vec<_>>();
+        let instrument_order = self
+            .system_trace
+            .trace_instrument_order()
+            .iter()
+            .copied()
+            .map(SavedTraceInstrument::from)
+            .collect::<Vec<_>>();
+        if self.saved_capture_settings.global.last_active_view == Some(saved_view)
+            && self
+                .saved_capture_settings
+                .global
+                .system_trace_event_view_order
+                .as_deref()
+                == Some(event_view_order.as_slice())
+            && self
+                .saved_capture_settings
+                .global
+                .system_trace_instrument_order
+                .as_deref()
+                == Some(instrument_order.as_slice())
+        {
             return;
         }
 
         let mut document = self.saved_capture_settings.clone();
         document.global.last_active_view = Some(saved_view);
+        document.global.system_trace_event_view_order = Some(event_view_order);
+        document.global.system_trace_instrument_order = Some(instrument_order);
         let result = self
             .capture_settings_repository
             .as_ref()
@@ -61,6 +138,32 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn apply_saved_capture_settings(&mut self) {
+        if let Some(order) = self
+            .saved_capture_settings
+            .global
+            .system_trace_event_view_order
+            .as_ref()
+        {
+            let order = order
+                .iter()
+                .copied()
+                .map(TraceEventView::from)
+                .collect::<Vec<_>>();
+            self.system_trace.set_event_view_order(&order);
+        }
+        if let Some(order) = self
+            .saved_capture_settings
+            .global
+            .system_trace_instrument_order
+            .as_ref()
+        {
+            let order = order
+                .iter()
+                .copied()
+                .map(TraceInstrument::from)
+                .collect::<Vec<_>>();
+            self.system_trace.set_trace_instrument_order(&order);
+        }
         if let Some(profile) = self.saved_capture_settings.profiles.logic_analyzer.as_ref() {
             self.logic_settings = logic_settings_from_recording_metadata(&profile.values);
             self.logic_acquisition_mode = profile
@@ -423,9 +526,9 @@ mod tests {
     use crate::{CaptureSettingsDocument, CaptureSettingsRepository};
     use std::fs;
 
-    fn test_repository() -> CaptureSettingsRepository {
+    fn test_repository(test_name: &str) -> CaptureSettingsRepository {
         let directory = std::env::temp_dir().join(format!(
-            "wavecraft-global-view-settings-{}",
+            "wavecraft-global-view-settings-{test_name}-{}",
             std::process::id()
         ));
         CaptureSettingsRepository::at(directory.join("capture-settings.json"))
@@ -454,7 +557,7 @@ mod tests {
 
     #[test]
     fn selecting_a_view_persists_and_restores_the_global_setting() {
-        let repository = test_repository();
+        let repository = test_repository("active-view");
         remove_test_repository(&repository);
         let mut app = WaveCraftApp::with_settings(
             Some(repository.clone()),
@@ -497,6 +600,41 @@ mod tests {
             Some(WorkspaceView::SystemTrace)
         );
         assert_eq!(restored.active_waveform_tab, None);
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn system_trace_layout_persists_across_application_restart() {
+        let repository = test_repository("system-trace-layout");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.select_system_trace_view();
+        let event_order = [
+            TraceEventView::ProbeLog,
+            TraceEventView::CpuLoad,
+            TraceEventView::Events,
+            TraceEventView::Logs,
+            TraceEventView::ContextStatistics,
+            TraceEventView::Terminal,
+        ];
+        let instrument_order = [TraceInstrument::Analysis, TraceInstrument::Timeline];
+        assert!(app.system_trace.set_event_view_order(&event_order));
+        assert!(app
+            .system_trace
+            .set_trace_instrument_order(&instrument_order));
+
+        app.save_global_settings();
+
+        let saved = repository.load().expect("the trace layout should be saved");
+        let restored = WaveCraftApp::with_settings(None, saved);
+        assert_eq!(restored.system_trace.event_view_order(), &event_order);
+        assert_eq!(
+            restored.system_trace.trace_instrument_order(),
+            &instrument_order
+        );
         remove_test_repository(&repository);
     }
 }

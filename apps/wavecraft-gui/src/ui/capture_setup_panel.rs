@@ -1,10 +1,10 @@
 //! The fixed left panel: device selectors and per-instrument capture settings.
 
 use crate::{
-    egui, paint_capture_settings, paint_radio_capture_settings, paint_radio_device_selector,
-    selected_device_for_role, selected_radio, ui::frame_state::FrameState,
-    CaptureSettingsAvailability, CaptureSettingsTab, DeviceEntry, DeviceRole,
-    LogicCaptureSettingsEditor, RadioPanelState, RichText, SavedCaptureSettingsKind,
+    apply_setup_panel_typography, egui, paint_capture_settings, paint_radio_capture_settings,
+    paint_radio_device_selector, selected_device_for_role, selected_radio,
+    ui::frame_state::FrameState, CaptureSettingsAvailability, CaptureSettingsTab, DeviceEntry,
+    DeviceRole, LogicCaptureSettingsEditor, RadioPanelState, RichText, SavedCaptureSettingsKind,
     ScopeCaptureSettingsEditor, ScopeVisualizationSettingsEditor, WaveformTab, PANEL, TEXT_MUTED,
 };
 
@@ -49,6 +49,7 @@ impl WaveCraftApp {
                     .inner_margin(egui::Margin::same(14.0)),
             )
             .show(context, |ui| {
+                apply_setup_panel_typography(ui);
                 let available_capture_settings_tabs = self.available_capture_settings_tabs();
                 let content_width = ui.available_width();
                 egui::ScrollArea::vertical()
@@ -210,7 +211,7 @@ pub(crate) fn paint_device_selector(
         })
         .collect::<Vec<_>>();
     let before = selected_id.clone();
-    ui.label(RichText::new(label).small().color(TEXT_MUTED));
+    ui.label(RichText::new(label).color(TEXT_MUTED));
     ui.add_enabled_ui(enabled && !choices.is_empty(), |ui| {
         egui::ComboBox::from_id_salt(id_salt)
             .width(ui.available_width())
@@ -282,4 +283,95 @@ pub(crate) fn paint_capture_device_selectors(
         None => {}
     }
     (logic_changed, scope_changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::app::test_support::app;
+
+    fn painted_fonts(view: WaveformTab) -> Vec<(String, f32)> {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.select_waveform_tab(view);
+        let frame = app.frame_state();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let output = context.run(input, |context| {
+            let mut actions = FrameActions::default();
+            app.paint_capture_setup_panel(context, &frame, &mut actions);
+        });
+        let mut painted = Vec::new();
+        fn collect(shape: &egui::Shape, painted: &mut Vec<(String, f32)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| collect(shape, painted));
+                }
+                egui::Shape::Text(text) => {
+                    let font_size = text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map_or(0.0, |section| section.format.font_id.size);
+                    painted.push((text.galley.text().to_owned(), font_size));
+                }
+                _ => {}
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .for_each(|shape| collect(&shape.shape, &mut painted));
+        painted
+    }
+
+    fn font_size(painted: &[(String, f32)], label: &str) -> f32 {
+        painted
+            .iter()
+            .find(|(text, _)| text == label)
+            .map(|(_, size)| *size)
+            .unwrap_or_else(|| panic!("{label} is painted"))
+    }
+
+    #[test]
+    fn every_capture_setup_view_uses_the_rf_typography() {
+        for view in [
+            WaveformTab::LogicAnalyzer,
+            WaveformTab::Oscilloscope,
+            WaveformTab::RadioReceiver,
+            WaveformTab::Combined,
+        ] {
+            let painted = painted_fonts(view);
+            assert_eq!(
+                font_size(&painted, "CAPTURE SETUP"),
+                crate::theme::SETUP_PANEL_BODY_FONT_SIZE,
+                "{view:?}"
+            );
+        }
+
+        for view in [WaveformTab::LogicAnalyzer, WaveformTab::Oscilloscope] {
+            let painted = painted_fonts(view);
+            assert_eq!(
+                font_size(&painted, "Device"),
+                crate::theme::SETUP_PANEL_BODY_FONT_SIZE,
+                "{view:?}"
+            );
+        }
+
+        let combined = painted_fonts(WaveformTab::Combined);
+        for label in ["Logic analyzer", "Oscilloscope"] {
+            assert_eq!(
+                font_size(&combined, label),
+                crate::theme::SETUP_PANEL_BODY_FONT_SIZE,
+                "{label}"
+            );
+        }
+    }
 }

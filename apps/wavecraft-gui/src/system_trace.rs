@@ -1061,6 +1061,7 @@ pub(crate) struct SystemTraceDisplayState {
     dragged_event_view: Option<TraceEventView>,
     trace_instrument_order: [TraceInstrument; TraceInstrument::ALL.len()],
     dragged_trace_instrument: Option<TraceInstrument>,
+    layout_changed: bool,
     pub(crate) event_filter: String,
     pub(crate) event_category_filter: TraceEventCategoryFilter,
     pub(crate) time_display: TraceTimeDisplay,
@@ -1099,6 +1100,7 @@ impl Default for SystemTraceDisplayState {
             dragged_event_view: None,
             trace_instrument_order: TraceInstrument::ALL,
             dragged_trace_instrument: None,
+            layout_changed: false,
             event_filter: String::new(),
             event_category_filter: TraceEventCategoryFilter::default(),
             time_display: TraceTimeDisplay::Target,
@@ -1124,6 +1126,18 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn event_view_order(&self) -> &[TraceEventView; TraceEventView::ALL.len()] {
         &self.event_view_order
+    }
+
+    pub(crate) fn set_event_view_order(&mut self, order: &[TraceEventView]) -> bool {
+        if order.len() != TraceEventView::ALL.len()
+            || !TraceEventView::ALL
+                .iter()
+                .all(|view| order.iter().filter(|candidate| *candidate == view).count() == 1)
+        {
+            return false;
+        }
+        self.event_view_order.copy_from_slice(order);
+        true
     }
 
     pub(crate) fn begin_event_view_drag(&mut self, view: TraceEventView) {
@@ -1160,6 +1174,7 @@ impl SystemTraceDisplayState {
         } else {
             self.event_view_order[to..=from].rotate_right(1);
         }
+        self.layout_changed = true;
     }
 
     pub(crate) fn finish_event_view_drag(&mut self) {
@@ -1168,6 +1183,22 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn trace_instrument_order(&self) -> &[TraceInstrument; TraceInstrument::ALL.len()] {
         &self.trace_instrument_order
+    }
+
+    pub(crate) fn set_trace_instrument_order(&mut self, order: &[TraceInstrument]) -> bool {
+        if order.len() != TraceInstrument::ALL.len()
+            || !TraceInstrument::ALL.iter().all(|instrument| {
+                order
+                    .iter()
+                    .filter(|candidate| *candidate == instrument)
+                    .count()
+                    == 1
+            })
+        {
+            return false;
+        }
+        self.trace_instrument_order.copy_from_slice(order);
+        true
     }
 
     pub(crate) fn begin_trace_instrument_drag(&mut self, instrument: TraceInstrument) {
@@ -1184,11 +1215,19 @@ impl SystemTraceDisplayState {
         };
         if dragged != target {
             self.trace_instrument_order.swap(0, 1);
+            self.layout_changed = true;
         }
     }
 
     pub(crate) fn finish_trace_instrument_drag(&mut self) {
         self.dragged_trace_instrument = None;
+    }
+
+    pub(crate) fn take_layout_changed(&mut self) -> bool {
+        if self.dragged_event_view.is_some() || self.dragged_trace_instrument.is_some() {
+            return false;
+        }
+        std::mem::take(&mut self.layout_changed)
     }
 
     pub(crate) fn model(&self) -> &TraceModel {
@@ -1928,6 +1967,7 @@ mod tests {
         );
 
         state.drag_event_view_to(TraceEventView::ContextStatistics);
+        assert!(!state.take_layout_changed());
         state.finish_event_view_drag();
 
         assert_eq!(
@@ -1942,6 +1982,8 @@ mod tests {
             ]
         );
         assert_eq!(state.dragged_event_view(), None);
+        assert!(state.take_layout_changed());
+        assert!(!state.take_layout_changed());
     }
 
     #[test]
@@ -1950,6 +1992,7 @@ mod tests {
 
         state.begin_trace_instrument_drag(TraceInstrument::Timeline);
         state.drag_trace_instrument_to(TraceInstrument::Analysis);
+        assert!(!state.take_layout_changed());
         state.finish_trace_instrument_drag();
 
         assert_eq!(
@@ -1957,6 +2000,19 @@ mod tests {
             &[TraceInstrument::Analysis, TraceInstrument::Timeline]
         );
         assert_eq!(state.dragged_trace_instrument(), None);
+        assert!(state.take_layout_changed());
+    }
+
+    #[test]
+    fn restored_trace_layout_rejects_missing_and_duplicate_entries() {
+        let mut state = SystemTraceDisplayState::default();
+
+        assert!(!state.set_event_view_order(&[TraceEventView::Logs, TraceEventView::Events,]));
+        assert!(!state
+            .set_trace_instrument_order(&[TraceInstrument::Analysis, TraceInstrument::Analysis,]));
+
+        assert_eq!(state.event_view_order(), &TraceEventView::ALL);
+        assert_eq!(state.trace_instrument_order(), &TraceInstrument::ALL);
     }
 
     #[test]

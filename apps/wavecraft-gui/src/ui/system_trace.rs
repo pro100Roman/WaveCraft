@@ -15,10 +15,10 @@ use crate::system_trace::{
 };
 use crate::waveform::chrome::half_transparent_plate;
 use crate::{
-    collapsed_side_panel_frame, egui, fill_card_height, format_duration, format_frequency,
-    paint_capture_settings_save_button, toolbar_action_button, ui::frame_actions::FrameActions,
-    RichText, SavedCaptureSettingsKind, WaveCraftApp, ACCENT, BACKGROUND,
-    COLLAPSED_SIDE_PANEL_WIDTH, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, ORANGE, PANEL,
+    apply_setup_panel_typography, collapsed_side_panel_frame, egui, fill_card_height,
+    format_duration, format_frequency, paint_capture_settings_save_button, toolbar_action_button,
+    ui::frame_actions::FrameActions, RichText, SavedCaptureSettingsKind, WaveCraftApp, ACCENT,
+    BACKGROUND, COLLAPSED_SIDE_PANEL_WIDTH, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, ORANGE, PANEL,
     SCOPE_COLORS, TEXT_MUTED,
 };
 use wavecraft_debug_probe::{
@@ -61,6 +61,8 @@ const TRACE_EVENT_ROW_FILLS: [egui::Color32; 2] = [
 const TARGET_DROPDOWN_RESULT_LIMIT: usize = 200;
 const DEFAULT_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 1_000_000;
 const MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 10_000_000_000;
+const APPLICATION_ELF_HELP: &str = "Resolves _SEGGER_RTT, resource symbols, and .sv-data messages";
+const API_DESCRIPTION_HELP: &str = "Decodes typed OS and middleware API events 32–511";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SystemTraceSettings {
@@ -349,8 +351,13 @@ impl WaveCraftApp {
                     .inner_margin(egui::Margin::same(14.0)),
             )
             .show(context, |ui| {
+                apply_setup_panel_typography(ui);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("SYSTEM TRACE SETUP").strong().color(TEXT_MUTED));
+                    ui.label(
+                        RichText::new("SYSTEM TRACE SETUP")
+                            .strong()
+                            .color(TEXT_MUTED),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_sized(
@@ -560,8 +567,24 @@ impl WaveCraftApp {
                                         "Enable decoding of SEGGER SystemView binary events from RTT",
                                     );
                                     ui.add_space(10.0);
-                                    setup_label(ui, "Application ELF");
+                                    setup_label_with_hover(
+                                        ui,
+                                        "Application ELF",
+                                        APPLICATION_ELF_HELP,
+                                    );
                                     ui.horizontal(|ui| {
+                                        let elf_path_hover = if self
+                                            .system_trace_settings
+                                            .elf_path
+                                            .is_empty()
+                                        {
+                                            format!("No ELF selected\n\n{APPLICATION_ELF_HELP}")
+                                        } else {
+                                            format!(
+                                                "{}\n\n{APPLICATION_ELF_HELP}",
+                                                self.system_trace_settings.elf_path
+                                            )
+                                        };
                                         ui.label(
                                             RichText::new(asset_path_label(
                                                 &self.system_trace_settings.elf_path,
@@ -569,16 +592,12 @@ impl WaveCraftApp {
                                             .small()
                                             .color(TEXT_MUTED),
                                         )
-                                        .on_hover_text(if self
-                                            .system_trace_settings
-                                            .elf_path
-                                            .is_empty()
+                                        .on_hover_text(elf_path_hover);
+                                        if ui
+                                            .small_button("Choose…")
+                                            .on_hover_text(APPLICATION_ELF_HELP)
+                                            .clicked()
                                         {
-                                            "No ELF selected"
-                                        } else {
-                                            &self.system_trace_settings.elf_path
-                                        });
-                                        if ui.small_button("Choose…").clicked() {
                                             if let Some(path) = choose_systemview_elf() {
                                                 match read_systemview_elf(&path) {
                                                     Ok(elf) => {
@@ -627,17 +646,28 @@ impl WaveCraftApp {
                                             self.system_trace.set_elf(None);
                                         }
                                     });
-                                    ui.label(
-                                        RichText::new(
-                                            "Resolves _SEGGER_RTT, resource symbols, and .sv-data messages",
-                                        )
-                                        .small()
-                                        .color(TEXT_MUTED),
-                                    );
 
                                     ui.add_space(10.0);
-                                    setup_label(ui, "API description");
+                                    setup_label_with_hover(
+                                        ui,
+                                        "API description",
+                                        API_DESCRIPTION_HELP,
+                                    );
                                     ui.horizontal(|ui| {
+                                        let description_path_hover = if self
+                                            .system_trace_settings
+                                            .description_path
+                                            .is_empty()
+                                        {
+                                            format!(
+                                                "No description selected\n\n{API_DESCRIPTION_HELP}"
+                                            )
+                                        } else {
+                                            format!(
+                                                "{}\n\n{API_DESCRIPTION_HELP}",
+                                                self.system_trace_settings.description_path
+                                            )
+                                        };
                                         ui.label(
                                             RichText::new(asset_path_label(
                                                 &self.system_trace_settings.description_path,
@@ -645,16 +675,12 @@ impl WaveCraftApp {
                                             .small()
                                             .color(TEXT_MUTED),
                                         )
-                                        .on_hover_text(if self
-                                            .system_trace_settings
-                                            .description_path
-                                            .is_empty()
+                                        .on_hover_text(description_path_hover);
+                                        if ui
+                                            .small_button("Choose…")
+                                            .on_hover_text(API_DESCRIPTION_HELP)
+                                            .clicked()
                                         {
-                                            "No description selected"
-                                        } else {
-                                            &self.system_trace_settings.description_path
-                                        });
-                                        if ui.small_button("Choose…").clicked() {
                                             if let Some(path) = choose_systemview_description() {
                                                 match read_systemview_description(&path) {
                                                     Ok(description) => {
@@ -688,13 +714,6 @@ impl WaveCraftApp {
                                             self.system_trace.set_description(None);
                                         }
                                     });
-                                    ui.label(
-                                        RichText::new(
-                                            "Decodes typed OS and middleware API events 32–511",
-                                        )
-                                        .small()
-                                        .color(TEXT_MUTED),
-                                    );
 
                                     ui.add_space(10.0);
                                     ui.horizontal(|ui| {
@@ -950,7 +969,12 @@ impl WaveCraftApp {
 }
 
 fn setup_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).small().color(TEXT_MUTED));
+    ui.label(RichText::new(text).color(TEXT_MUTED));
+}
+
+fn setup_label_with_hover(ui: &mut egui::Ui, text: &str, hover: &str) {
+    ui.label(RichText::new(text).color(TEXT_MUTED))
+        .on_hover_text(hover);
 }
 
 fn asset_path_label(path: &str) -> &str {
@@ -4834,6 +4858,71 @@ mod tests {
         assert!(rtt.y < systemview.y);
         assert!(systemview.y < save.y);
         assert!(!texts.iter().any(|(text, _)| text == "Connect and attach"));
+        assert!(!texts.iter().any(|(text, _)| text == APPLICATION_ELF_HELP));
+        assert!(!texts.iter().any(|(text, _)| text == API_DESCRIPTION_HELP));
+    }
+
+    #[test]
+    fn setup_panel_typography_matches_the_rf_settings() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let output = context.run(input, |context| {
+            let mut actions = FrameActions::default();
+            app.paint_system_trace_setup_panel(context, &mut actions);
+        });
+        let mut painted_text = Vec::new();
+        fn collect(shape: &egui::Shape, painted_text: &mut Vec<(String, f32)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| collect(shape, painted_text));
+                }
+                egui::Shape::Text(text) => {
+                    let font_size = text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map_or(0.0, |section| section.format.font_id.size);
+                    painted_text.push((text.galley.text().to_owned(), font_size));
+                }
+                _ => {}
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .for_each(|shape| collect(&shape.shape, &mut painted_text));
+        let font_size = |label: &str| {
+            painted_text
+                .iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, size)| *size)
+                .unwrap_or_else(|| panic!("{label} is painted"))
+        };
+
+        for label in [
+            "SYSTEM TRACE SETUP",
+            "Probe",
+            "Debug probe",
+            "SystemView binary trace",
+        ] {
+            assert_eq!(
+                font_size(label),
+                crate::theme::SETUP_PANEL_BODY_FONT_SIZE,
+                "{label}"
+            );
+        }
+        assert_eq!(
+            font_size("Not selected"),
+            crate::theme::SETUP_PANEL_SMALL_FONT_SIZE
+        );
     }
 
     #[test]
