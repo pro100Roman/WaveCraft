@@ -15,6 +15,8 @@ pub(crate) const SETUP_PANEL_BODY_FONT_SIZE: f32 = 12.5;
 pub(crate) const SETUP_PANEL_SMALL_FONT_SIZE: f32 = 9.0;
 pub(crate) const SETUP_PANEL_MONOSPACE_FONT_SIZE: f32 = 12.0;
 const TOOLTIP_DELAY_SECONDS: f32 = 0.1;
+const SYMBOL_FONT_NAME: &str = "Noto Sans Symbols2";
+const SYMBOL_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/NotoSansSymbols2-Regular.ttf");
 
 /// Keeps every instrument setup panel on the typography established by the RF
 /// settings, even when a nested panel customizes its local egui style.
@@ -70,6 +72,17 @@ fn wavecraft_font_definitions() -> egui::FontDefinitions {
     if !proportional.contains(&hack) {
         proportional.push(hack);
     }
+    fonts.font_data.insert(
+        SYMBOL_FONT_NAME.to_owned(),
+        egui::FontData::from_static(SYMBOL_FONT_BYTES),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let family_fonts = fonts.families.entry(family).or_default();
+        let symbol_font = SYMBOL_FONT_NAME.to_owned();
+        if !family_fonts.contains(&symbol_font) {
+            family_fonts.push(symbol_font);
+        }
+    }
     fonts
 }
 
@@ -87,12 +100,35 @@ mod tests {
     }
 
     #[test]
-    fn proportional_text_has_the_symbol_font_fallback() {
+    fn symbol_font_is_the_last_fallback_for_both_default_families() {
         let fonts = wavecraft_font_definitions();
 
-        assert!(fonts.families[&egui::FontFamily::Proportional]
-            .iter()
-            .any(|font| font == "Hack"));
+        assert!(fonts.font_data.contains_key(SYMBOL_FONT_NAME));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            assert_eq!(
+                fonts.families[&family].last().map(String::as_str),
+                Some(SYMBOL_FONT_NAME)
+            );
+        }
+    }
+
+    #[test]
+    fn configured_fonts_contain_the_trace_drag_handle_glyph() {
+        let context = egui::Context::default();
+        configure_style(&context);
+        let mut supported = [false; 2];
+
+        let _ = context.run(egui::RawInput::default(), |context| {
+            supported = context.fonts(|fonts| {
+                [
+                    egui::FontId::proportional(14.0),
+                    egui::FontId::monospace(14.0),
+                ]
+                .map(|font_id| fonts.has_glyph(&font_id, '⠿'))
+            });
+        });
+
+        assert_eq!(supported, [true, true]);
     }
 
     #[test]

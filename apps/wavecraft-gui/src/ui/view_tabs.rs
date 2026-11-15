@@ -9,11 +9,95 @@ pub(crate) enum WorkspaceView {
 }
 
 impl WorkspaceView {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Waveform(WaveformTab::LogicAnalyzer),
+        Self::Waveform(WaveformTab::Oscilloscope),
+        Self::Waveform(WaveformTab::Lissajous),
+        Self::Waveform(WaveformTab::RadioReceiver),
+        Self::Waveform(WaveformTab::Combined),
+        Self::SystemTrace,
+    ];
+
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Waveform(tab) => tab.label(),
             Self::SystemTrace => "System Trace",
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceViewLayout {
+    order: [WorkspaceView; WorkspaceView::ALL.len()],
+    dragged_view: Option<WorkspaceView>,
+    layout_changed: bool,
+}
+
+impl Default for WorkspaceViewLayout {
+    fn default() -> Self {
+        Self {
+            order: WorkspaceView::ALL,
+            dragged_view: None,
+            layout_changed: false,
+        }
+    }
+}
+
+impl WorkspaceViewLayout {
+    pub(crate) fn order(&self) -> &[WorkspaceView; WorkspaceView::ALL.len()] {
+        &self.order
+    }
+
+    pub(crate) fn set_order(&mut self, order: &[WorkspaceView]) -> bool {
+        if order.len() != WorkspaceView::ALL.len()
+            || !WorkspaceView::ALL
+                .iter()
+                .all(|view| order.iter().filter(|candidate| *candidate == view).count() == 1)
+        {
+            return false;
+        }
+        self.order.copy_from_slice(order);
+        true
+    }
+
+    pub(crate) fn begin_drag(&mut self, view: WorkspaceView) {
+        self.dragged_view = Some(view);
+    }
+
+    pub(crate) fn dragged_view(&self) -> Option<WorkspaceView> {
+        self.dragged_view
+    }
+
+    pub(crate) fn drag_to(&mut self, target: WorkspaceView) {
+        let Some(dragged) = self.dragged_view else {
+            return;
+        };
+        let Some(from) = self.order.iter().position(|view| *view == dragged) else {
+            return;
+        };
+        let Some(to) = self.order.iter().position(|view| *view == target) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        if from < to {
+            self.order[from..=to].rotate_left(1);
+        } else {
+            self.order[to..=from].rotate_right(1);
+        }
+        self.layout_changed = true;
+    }
+
+    pub(crate) fn finish_drag(&mut self) {
+        self.dragged_view = None;
+    }
+
+    pub(crate) fn take_layout_changed(&mut self) -> bool {
+        if self.dragged_view.is_some() {
+            return false;
+        }
+        std::mem::take(&mut self.layout_changed)
     }
 }
 
@@ -186,6 +270,44 @@ mod tests {
                 WorkspaceView::SystemTrace,
             ]
         );
+    }
+
+    #[test]
+    fn workspace_view_layout_reorders_and_reports_completed_drags() {
+        let mut layout = WorkspaceViewLayout::default();
+        layout.begin_drag(WorkspaceView::SystemTrace);
+        layout.drag_to(WorkspaceView::Waveform(WaveformTab::Oscilloscope));
+
+        assert_eq!(
+            layout.order(),
+            &[
+                WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
+                WorkspaceView::SystemTrace,
+                WorkspaceView::Waveform(WaveformTab::Oscilloscope),
+                WorkspaceView::Waveform(WaveformTab::Lissajous),
+                WorkspaceView::Waveform(WaveformTab::RadioReceiver),
+                WorkspaceView::Waveform(WaveformTab::Combined),
+            ]
+        );
+        assert!(!layout.take_layout_changed());
+        layout.finish_drag();
+        assert!(layout.take_layout_changed());
+        assert!(!layout.take_layout_changed());
+    }
+
+    #[test]
+    fn workspace_view_layout_rejects_incomplete_or_duplicate_orders() {
+        let mut layout = WorkspaceViewLayout::default();
+        assert!(!layout.set_order(&WorkspaceView::ALL[..5]));
+        assert!(!layout.set_order(&[
+            WorkspaceView::SystemTrace,
+            WorkspaceView::SystemTrace,
+            WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
+            WorkspaceView::Waveform(WaveformTab::Oscilloscope),
+            WorkspaceView::Waveform(WaveformTab::Lissajous),
+            WorkspaceView::Waveform(WaveformTab::RadioReceiver),
+        ]));
+        assert_eq!(layout.order(), &WorkspaceView::ALL);
     }
 
     #[test]

@@ -572,27 +572,27 @@ impl WaveCraftApp {
                                         "Application ELF",
                                         APPLICATION_ELF_HELP,
                                     );
-                                    ui.horizontal(|ui| {
-                                        let elf_path_hover = if self
-                                            .system_trace_settings
-                                            .elf_path
-                                            .is_empty()
-                                        {
-                                            format!("No ELF selected\n\n{APPLICATION_ELF_HELP}")
-                                        } else {
-                                            format!(
-                                                "{}\n\n{APPLICATION_ELF_HELP}",
-                                                self.system_trace_settings.elf_path
-                                            )
-                                        };
-                                        ui.label(
-                                            RichText::new(asset_path_label(
-                                                &self.system_trace_settings.elf_path,
-                                            ))
-                                            .small()
-                                            .color(TEXT_MUTED),
+                                    let elf_path_hover = if self
+                                        .system_trace_settings
+                                        .elf_path
+                                        .is_empty()
+                                    {
+                                        format!("No ELF selected\n\n{APPLICATION_ELF_HELP}")
+                                    } else {
+                                        format!(
+                                            "{}\n\n{APPLICATION_ELF_HELP}",
+                                            self.system_trace_settings.elf_path
                                         )
-                                        .on_hover_text(elf_path_hover);
+                                    };
+                                    ui.label(
+                                        RichText::new(asset_path_label(
+                                            &self.system_trace_settings.elf_path,
+                                        ))
+                                        .strong()
+                                        .color(TEXT_MUTED),
+                                    )
+                                    .on_hover_text(elf_path_hover);
+                                    ui.horizontal(|ui| {
                                         if ui
                                             .small_button("Choose…")
                                             .on_hover_text(APPLICATION_ELF_HELP)
@@ -653,29 +653,29 @@ impl WaveCraftApp {
                                         "API description",
                                         API_DESCRIPTION_HELP,
                                     );
-                                    ui.horizontal(|ui| {
-                                        let description_path_hover = if self
-                                            .system_trace_settings
-                                            .description_path
-                                            .is_empty()
-                                        {
-                                            format!(
-                                                "No description selected\n\n{API_DESCRIPTION_HELP}"
-                                            )
-                                        } else {
-                                            format!(
-                                                "{}\n\n{API_DESCRIPTION_HELP}",
-                                                self.system_trace_settings.description_path
-                                            )
-                                        };
-                                        ui.label(
-                                            RichText::new(asset_path_label(
-                                                &self.system_trace_settings.description_path,
-                                            ))
-                                            .small()
-                                            .color(TEXT_MUTED),
+                                    let description_path_hover = if self
+                                        .system_trace_settings
+                                        .description_path
+                                        .is_empty()
+                                    {
+                                        format!(
+                                            "No description selected\n\n{API_DESCRIPTION_HELP}"
                                         )
-                                        .on_hover_text(description_path_hover);
+                                    } else {
+                                        format!(
+                                            "{}\n\n{API_DESCRIPTION_HELP}",
+                                            self.system_trace_settings.description_path
+                                        )
+                                    };
+                                    ui.label(
+                                        RichText::new(asset_path_label(
+                                            &self.system_trace_settings.description_path,
+                                        ))
+                                        .strong()
+                                        .color(TEXT_MUTED),
+                                    )
+                                    .on_hover_text(description_path_hover);
+                                    ui.horizontal(|ui| {
                                         if ui
                                             .small_button("Choose…")
                                             .on_hover_text(API_DESCRIPTION_HELP)
@@ -2444,8 +2444,11 @@ fn paint_event_instrument(
                 ui,
                 trace,
                 TraceInstrument::Analysis,
-                "ANALYSIS",
+                "TRACE ANALYSIS",
             );
+            if ui.available_width() >= 420.0 {
+                ui.label(RichText::new("TRACE ANALYSIS").strong().color(ACCENT));
+            }
             paint_event_view_tabs(ui, trace);
             let text_view = matches!(
                 trace.event_view,
@@ -4921,8 +4924,48 @@ mod tests {
         }
         assert_eq!(
             font_size("Not selected"),
-            crate::theme::SETUP_PANEL_SMALL_FONT_SIZE
+            crate::theme::SETUP_PANEL_BODY_FONT_SIZE
         );
+    }
+
+    #[test]
+    fn systemview_asset_buttons_are_below_the_larger_file_names() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace_settings.elf_path = "/tmp/application.elf".to_owned();
+        app.system_trace_settings.description_path = "/tmp/api-description.txt".to_owned();
+
+        let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
+        let position = |label: &str| {
+            texts
+                .iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, position)| *position)
+                .unwrap_or_else(|| panic!("{label} is painted"))
+        };
+        let application_label = position("Application ELF");
+        let application_file = position("application.elf");
+        let description_label = position("API description");
+        let description_file = position("api-description.txt");
+        let mut choose_buttons = texts
+            .iter()
+            .filter_map(|(text, position)| (text == "Choose…").then_some(*position))
+            .collect::<Vec<_>>();
+        let mut clear_buttons = texts
+            .iter()
+            .filter_map(|(text, position)| (text == "Clear").then_some(*position))
+            .collect::<Vec<_>>();
+        choose_buttons.sort_by(|left, right| left.y.total_cmp(&right.y));
+        clear_buttons.sort_by(|left, right| left.y.total_cmp(&right.y));
+
+        assert_eq!(choose_buttons.len(), 2);
+        assert_eq!(clear_buttons.len(), 2);
+        assert!(application_label.y < application_file.y);
+        assert!(application_file.y < choose_buttons[0].y);
+        assert!((choose_buttons[0].y - clear_buttons[0].y).abs() < 1.0);
+        assert!(description_label.y < description_file.y);
+        assert!(description_file.y < choose_buttons[1].y);
+        assert!((choose_buttons[1].y - clear_buttons[1].y).abs() < 1.0);
     }
 
     #[test]
@@ -6013,6 +6056,17 @@ mod tests {
         assert!(texts.iter().any(|text| text == "Smart timing"));
         assert!(texts.iter().any(|text| text == "+"));
         assert!(texts.iter().any(|text| text == "−"));
+    }
+
+    #[test]
+    fn trace_instruments_show_timeline_and_trace_analysis_titles() {
+        let context = egui::Context::default();
+        let mut app = app();
+
+        let texts = paint_central_texts(&context, &mut app);
+
+        assert!(texts.iter().any(|text| text == "TIMELINE"));
+        assert!(texts.iter().any(|text| text == "TRACE ANALYSIS"));
     }
 
     #[test]

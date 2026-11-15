@@ -333,6 +333,7 @@ struct WaveCraftApp {
     scope_marker_editor: Option<ScopeMarkerEditor>,
     active_workspace_view: Option<WorkspaceView>,
     active_waveform_tab: Option<WaveformTab>,
+    workspace_view_layout: WorkspaceViewLayout,
     system_trace_settings: SystemTraceSettings,
     system_trace_setup_panel_open: bool,
     system_trace: system_trace::SystemTraceDisplayState,
@@ -473,6 +474,7 @@ impl WaveCraftApp {
             scope_marker_editor: None,
             active_workspace_view: restored_workspace_view,
             active_waveform_tab: restored_waveform_tab,
+            workspace_view_layout: WorkspaceViewLayout::default(),
             system_trace_settings: SystemTraceSettings::default(),
             system_trace_setup_panel_open: true,
             system_trace: system_trace::SystemTraceDisplayState::default(),
@@ -631,6 +633,9 @@ impl WaveCraftApp {
         self.paint_toolbar(context, &frame, &mut actions);
 
         self.paint_waveform_tabs(context);
+        if self.workspace_view_layout.take_layout_changed() {
+            self.save_global_settings();
+        }
 
         if self.system_trace_view_is_active() {
             self.paint_system_trace_setup_panel(context, &mut actions);

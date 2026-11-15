@@ -92,6 +92,13 @@ impl WaveCraftApp {
             return;
         };
         let saved_view = SavedWorkspaceView::from(active_view);
+        let workspace_view_order = self
+            .workspace_view_layout
+            .order()
+            .iter()
+            .copied()
+            .map(SavedWorkspaceView::from)
+            .collect::<Vec<_>>();
         let event_view_order = self
             .system_trace
             .event_view_order()
@@ -110,6 +117,12 @@ impl WaveCraftApp {
             && self
                 .saved_capture_settings
                 .global
+                .workspace_view_order
+                .as_deref()
+                == Some(workspace_view_order.as_slice())
+            && self
+                .saved_capture_settings
+                .global
                 .system_trace_event_view_order
                 .as_deref()
                 == Some(event_view_order.as_slice())
@@ -125,6 +138,7 @@ impl WaveCraftApp {
 
         let mut document = self.saved_capture_settings.clone();
         document.global.last_active_view = Some(saved_view);
+        document.global.workspace_view_order = Some(workspace_view_order);
         document.global.system_trace_event_view_order = Some(event_view_order);
         document.global.system_trace_instrument_order = Some(instrument_order);
         let result = self
@@ -138,6 +152,19 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn apply_saved_capture_settings(&mut self) {
+        if let Some(order) = self
+            .saved_capture_settings
+            .global
+            .workspace_view_order
+            .as_ref()
+        {
+            let order = order
+                .iter()
+                .copied()
+                .map(WorkspaceView::from)
+                .collect::<Vec<_>>();
+            self.workspace_view_layout.set_order(&order);
+        }
         if let Some(order) = self
             .saved_capture_settings
             .global
@@ -636,5 +663,57 @@ mod tests {
             &instrument_order
         );
         remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn workspace_view_order_persists_across_application_restart() {
+        let repository = test_repository("workspace-view-order");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.select_waveform_tab(WaveformTab::LogicAnalyzer);
+        app.workspace_view_layout
+            .begin_drag(WorkspaceView::SystemTrace);
+        app.workspace_view_layout
+            .drag_to(WorkspaceView::Waveform(WaveformTab::Oscilloscope));
+        app.workspace_view_layout.finish_drag();
+
+        app.save_global_settings();
+
+        let saved = repository
+            .load()
+            .expect("the workspace view order should be saved");
+        let restored = WaveCraftApp::with_settings(None, saved);
+        assert_eq!(
+            restored.workspace_view_layout.order(),
+            &[
+                WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
+                WorkspaceView::SystemTrace,
+                WorkspaceView::Waveform(WaveformTab::Oscilloscope),
+                WorkspaceView::Waveform(WaveformTab::Lissajous),
+                WorkspaceView::Waveform(WaveformTab::RadioReceiver),
+                WorkspaceView::Waveform(WaveformTab::Combined),
+            ]
+        );
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn invalid_saved_workspace_view_order_falls_back_to_default() {
+        let mut settings = CaptureSettingsDocument::default();
+        settings.global.workspace_view_order = Some(vec![
+            SavedWorkspaceView::SystemTrace,
+            SavedWorkspaceView::SystemTrace,
+            SavedWorkspaceView::LogicAnalyzer,
+            SavedWorkspaceView::Oscilloscope,
+            SavedWorkspaceView::Lissajous,
+            SavedWorkspaceView::RadioSpectrum,
+        ]);
+
+        let app = WaveCraftApp::with_settings(None, settings);
+
+        assert_eq!(app.workspace_view_layout.order(), &WorkspaceView::ALL);
     }
 }

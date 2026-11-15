@@ -39,6 +39,8 @@ pub(crate) struct GlobalSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_active_view: Option<SavedWorkspaceView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_view_order: Option<Vec<SavedWorkspaceView>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_trace_event_view_order: Option<Vec<SavedTraceEventView>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_trace_instrument_order: Option<Vec<SavedTraceInstrument>>,
@@ -319,6 +321,14 @@ mod tests {
             "5000000".to_owned(),
         )])));
         document.global.last_active_view = Some(SavedWorkspaceView::RadioSpectrum);
+        document.global.workspace_view_order = Some(vec![
+            SavedWorkspaceView::SystemTrace,
+            SavedWorkspaceView::RadioSpectrum,
+            SavedWorkspaceView::LogicAnalyzer,
+            SavedWorkspaceView::Oscilloscope,
+            SavedWorkspaceView::Lissajous,
+            SavedWorkspaceView::Combined,
+        ]);
         document.global.system_trace_event_view_order = Some(vec![
             SavedTraceEventView::Logs,
             SavedTraceEventView::Events,
