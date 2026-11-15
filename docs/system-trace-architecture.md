@@ -588,7 +588,7 @@ Implement the remaining System Trace analysis work in the order below. Keep
 each numbered item in its own focused commit and mark it complete only after
 its tests, formatting, and workspace Clippy checks pass.
 
-1. [ ] Add a viewport-linked CPU-load graph and context-statistics table with
+1. [x] Add a viewport-linked CPU-load graph and context-statistics table with
    activations, total/last/min/max/average runtime, interrupted time, CPU load,
    blocked time where the trace provides enough lifecycle information, and
    reported stack usage.

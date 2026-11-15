@@ -37,6 +37,8 @@ pub(crate) enum TraceEventView {
     Logs,
     Terminal,
     ProbeLog,
+    CpuLoad,
+    ContextStatistics,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -929,6 +931,7 @@ pub(crate) struct SystemTraceDisplayState {
     timeline_timing_measurement: Option<TimelineTimingMeasurement>,
     timeline_timing_dragging: bool,
     timeline_zoom: f32,
+    timeline_visible_range: Option<(u64, u64)>,
     timeline_view_height: f32,
     event_view_height: f32,
 }
@@ -956,6 +959,7 @@ impl Default for SystemTraceDisplayState {
             timeline_timing_measurement: None,
             timeline_timing_dragging: false,
             timeline_zoom: MIN_TIMELINE_ZOOM,
+            timeline_visible_range: None,
             timeline_view_height: DEFAULT_TIMELINE_VIEW_HEIGHT,
             event_view_height: DEFAULT_EVENT_VIEW_HEIGHT,
         }
@@ -1040,6 +1044,14 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn scale_timeline_zoom(&mut self, factor: f32) {
         self.set_timeline_zoom(self.timeline_zoom * factor);
+    }
+
+    pub(crate) fn timeline_visible_range(&self) -> Option<(u64, u64)> {
+        self.timeline_visible_range
+    }
+
+    pub(crate) fn set_timeline_visible_range(&mut self, range: Option<(u64, u64)>) {
+        self.timeline_visible_range = range;
     }
 
     pub(crate) fn timeline_view_height(&self) -> f32 {
@@ -1169,6 +1181,7 @@ impl SystemTraceDisplayState {
         self.timeline_focus_sequence = None;
         self.clear_timeline_timing();
         self.timeline_zoom = MIN_TIMELINE_ZOOM;
+        self.timeline_visible_range = None;
     }
 
     pub(crate) fn time_bounds(&self) -> Option<(u64, u64)> {

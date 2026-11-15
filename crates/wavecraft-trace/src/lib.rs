@@ -115,13 +115,85 @@ pub enum TraceEventKind {
 }
 
 /// The execution context active during a target time interval.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ExecutionContext {
     Task(ContextId),
     Isr(ContextId),
     Timer(ContextId),
     Scheduler,
     Idle,
+}
+
+/// Latest target-reported stack information for one task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskStackInfo {
+    pub stack_base: u64,
+    pub stack_size: u64,
+    pub stack_usage: u64,
+}
+
+/// Aggregated execution statistics for one context in a trace model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextStatistics {
+    pub core_id: u32,
+    pub context: ExecutionContext,
+    pub activations: u64,
+    pub run_slices: u64,
+    pub total_run_ticks: u64,
+    pub last_run_ticks: Option<u64>,
+    pub minimum_run_ticks: Option<u64>,
+    pub maximum_run_ticks: Option<u64>,
+    pub interrupted_ticks: u64,
+    pub blocked_ticks: Option<u64>,
+    pub stack: Option<TaskStackInfo>,
+}
+
+impl ContextStatistics {
+    pub fn average_run_ticks(&self) -> Option<u64> {
+        (self.run_slices > 0).then(|| self.total_run_ticks / self.run_slices)
+    }
+}
+
+/// Per-context execution time accumulated inside one CPU-load time bin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CpuLoadBin {
+    pub start_ticks: u64,
+    pub end_ticks: u64,
+    pub context_ticks: BTreeMap<ExecutionContext, u64>,
+}
+
+impl CpuLoadBin {
+    pub fn duration_ticks(&self) -> u64 {
+        self.end_ticks.saturating_sub(self.start_ticks)
+    }
+
+    pub fn busy_ticks(&self) -> u64 {
+        self.context_ticks
+            .iter()
+            .filter(|(context, _)| **context != ExecutionContext::Idle)
+            .map(|(_, ticks)| *ticks)
+            .sum()
+    }
+}
+
+fn context_statistics_entry(
+    statistics: &mut BTreeMap<ExecutionContext, ContextStatistics>,
+    core_id: u32,
+    context: ExecutionContext,
+) -> &mut ContextStatistics {
+    statistics.entry(context).or_insert(ContextStatistics {
+        core_id,
+        context,
+        activations: 0,
+        run_slices: 0,
+        total_run_ticks: 0,
+        last_run_ticks: None,
+        minimum_run_ticks: None,
+        maximum_run_ticks: None,
+        interrupted_ticks: 0,
+        blocked_ticks: None,
+        stack: None,
+    })
 }
 
 /// A contiguous interval during which one context was executing.
@@ -153,6 +225,9 @@ pub struct TaskTraceState {
     pub state: TaskState,
     pub last_transition_ticks: u64,
     pub last_block_cause: Option<u64>,
+    pub stack: Option<TaskStackInfo>,
+    blocked_since_ticks: Option<u64>,
+    total_blocked_ticks: u64,
 }
 
 impl TaskTraceState {
@@ -164,8 +239,42 @@ impl TaskTraceState {
             state: TaskState::Created,
             last_transition_ticks: timestamp_ticks,
             last_block_cause: None,
+            stack: None,
+            blocked_since_ticks: None,
+            total_blocked_ticks: 0,
         }
     }
+
+    fn transition_to(&mut self, state: TaskState, timestamp_ticks: u64) {
+        if self.state == TaskState::Blocked && state != TaskState::Blocked {
+            self.close_blocked_interval(timestamp_ticks);
+        } else if self.state != TaskState::Blocked && state == TaskState::Blocked {
+            self.blocked_since_ticks = Some(timestamp_ticks);
+        }
+        self.state = state;
+        self.last_transition_ticks = timestamp_ticks;
+    }
+
+    fn close_blocked_interval(&mut self, timestamp_ticks: u64) {
+        if let Some(start_ticks) = self.blocked_since_ticks.take() {
+            self.total_blocked_ticks = self
+                .total_blocked_ticks
+                .saturating_add(timestamp_ticks.saturating_sub(start_ticks));
+        }
+    }
+
+    fn blocked_ticks_at(&self, end_ticks: u64) -> u64 {
+        self.total_blocked_ticks.saturating_add(
+            self.blocked_since_ticks
+                .map_or(0, |start_ticks| end_ticks.saturating_sub(start_ticks)),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InterruptedContext {
+    context: ExecutionContext,
+    start_ticks: u64,
 }
 
 /// Reconstructed state for one target core.
@@ -173,7 +282,9 @@ impl TaskTraceState {
 pub struct CoreTraceState {
     tasks: BTreeMap<ContextId, TaskTraceState>,
     intervals: Vec<ExecutionInterval>,
-    interrupted_contexts: Vec<ExecutionContext>,
+    interrupted_contexts: Vec<InterruptedContext>,
+    activation_counts: BTreeMap<ExecutionContext, u64>,
+    interrupted_ticks: BTreeMap<ExecutionContext, u64>,
     active_context: Option<ExecutionContext>,
     continuity_known: bool,
     dropped_events: u64,
@@ -200,6 +311,102 @@ impl CoreTraceState {
         self.dropped_events
     }
 
+    fn context_statistics(&self, core_id: u32, end_ticks: u64) -> Vec<ContextStatistics> {
+        let mut statistics = BTreeMap::<ExecutionContext, ContextStatistics>::new();
+
+        for interval in &self.intervals {
+            let interval_end = interval.end_ticks.unwrap_or(end_ticks).min(end_ticks);
+            let run_ticks = interval_end.saturating_sub(interval.start_ticks);
+            if run_ticks == 0 {
+                continue;
+            }
+            let context = context_statistics_entry(&mut statistics, core_id, interval.context);
+            context.run_slices = context.run_slices.saturating_add(1);
+            context.total_run_ticks = context.total_run_ticks.saturating_add(run_ticks);
+            context.last_run_ticks = Some(run_ticks);
+            context.minimum_run_ticks = Some(
+                context
+                    .minimum_run_ticks
+                    .map_or(run_ticks, |minimum| minimum.min(run_ticks)),
+            );
+            context.maximum_run_ticks = Some(
+                context
+                    .maximum_run_ticks
+                    .map_or(run_ticks, |maximum| maximum.max(run_ticks)),
+            );
+        }
+        for (context, activations) in &self.activation_counts {
+            context_statistics_entry(&mut statistics, core_id, *context).activations = *activations;
+        }
+        for (context, interrupted_ticks) in &self.interrupted_ticks {
+            context_statistics_entry(&mut statistics, core_id, *context).interrupted_ticks =
+                *interrupted_ticks;
+        }
+        for interrupted in &self.interrupted_contexts {
+            let context = context_statistics_entry(&mut statistics, core_id, interrupted.context);
+            context.interrupted_ticks = context
+                .interrupted_ticks
+                .saturating_add(end_ticks.saturating_sub(interrupted.start_ticks));
+        }
+        for task in self.tasks.values() {
+            let context =
+                context_statistics_entry(&mut statistics, core_id, ExecutionContext::Task(task.id));
+            context.blocked_ticks = Some(task.blocked_ticks_at(end_ticks));
+            context.stack = task.stack;
+        }
+        statistics.into_values().collect()
+    }
+
+    fn cpu_load_bins(
+        &self,
+        start_ticks: u64,
+        end_ticks: u64,
+        requested_bin_count: usize,
+    ) -> Vec<CpuLoadBin> {
+        let duration_ticks = end_ticks.saturating_sub(start_ticks);
+        if duration_ticks == 0 || requested_bin_count == 0 {
+            return Vec::new();
+        }
+        let bin_count = if duration_ticks < requested_bin_count as u64 {
+            duration_ticks as usize
+        } else {
+            requested_bin_count
+        };
+        let bin_edge = |index: usize| {
+            start_ticks.saturating_add(
+                (u128::from(duration_ticks) * index as u128 / bin_count as u128) as u64,
+            )
+        };
+        let mut bins = (0..bin_count)
+            .map(|index| CpuLoadBin {
+                start_ticks: bin_edge(index),
+                end_ticks: bin_edge(index + 1),
+                context_ticks: BTreeMap::new(),
+            })
+            .collect::<Vec<_>>();
+
+        for interval in &self.intervals {
+            let interval_end = interval.end_ticks.unwrap_or(end_ticks);
+            let overlap_start = interval.start_ticks.max(start_ticks);
+            let overlap_end = interval_end.min(end_ticks);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let first_bin = ((u128::from(overlap_start - start_ticks) * bin_count as u128)
+                / u128::from(duration_ticks)) as usize;
+            let last_bin = ((u128::from(overlap_end - 1 - start_ticks) * bin_count as u128)
+                / u128::from(duration_ticks)) as usize;
+            for bin in &mut bins[first_bin..=last_bin.min(bin_count - 1)] {
+                let ticks = overlap_end
+                    .min(bin.end_ticks)
+                    .saturating_sub(overlap_start.max(bin.start_ticks));
+                let total = bin.context_ticks.entry(interval.context).or_default();
+                *total = total.saturating_add(ticks);
+            }
+        }
+        bins
+    }
+
     fn task_mut(&mut self, task_id: ContextId, timestamp_ticks: u64) -> &mut TaskTraceState {
         self.tasks
             .entry(task_id)
@@ -208,8 +415,34 @@ impl CoreTraceState {
 
     fn set_task_state(&mut self, task_id: ContextId, state: TaskState, timestamp_ticks: u64) {
         let task = self.task_mut(task_id, timestamp_ticks);
-        task.state = state;
-        task.last_transition_ticks = timestamp_ticks;
+        task.transition_to(state, timestamp_ticks);
+    }
+
+    fn record_activation(&mut self, context: ExecutionContext) {
+        let activations = self.activation_counts.entry(context).or_default();
+        *activations = activations.saturating_add(1);
+    }
+
+    fn push_interrupted_context(&mut self, context: ExecutionContext, timestamp_ticks: u64) {
+        self.interrupted_contexts.push(InterruptedContext {
+            context,
+            start_ticks: timestamp_ticks,
+        });
+    }
+
+    fn pop_interrupted_context(&mut self, timestamp_ticks: u64) -> Option<ExecutionContext> {
+        let interrupted = self.interrupted_contexts.pop()?;
+        let ticks = timestamp_ticks.saturating_sub(interrupted.start_ticks);
+        let total = self
+            .interrupted_ticks
+            .entry(interrupted.context)
+            .or_default();
+        *total = total.saturating_add(ticks);
+        Some(interrupted.context)
+    }
+
+    fn close_interrupted_contexts(&mut self, timestamp_ticks: u64) {
+        while self.pop_interrupted_context(timestamp_ticks).is_some() {}
     }
 
     fn switch_context(
@@ -242,13 +475,14 @@ impl CoreTraceState {
 
     fn invalidate_continuity(&mut self, timestamp_ticks: u64, dropped_events: u64) {
         self.switch_context(None, timestamp_ticks, false);
-        self.interrupted_contexts.clear();
+        self.close_interrupted_contexts(timestamp_ticks);
         self.continuity_known = false;
         self.dropped_events = self.dropped_events.saturating_add(dropped_events);
         for task in self.tasks.values_mut() {
             if task.state == TaskState::Running {
-                task.state = TaskState::Created;
-                task.last_transition_ticks = timestamp_ticks;
+                task.transition_to(TaskState::Created, timestamp_ticks);
+            } else if task.state == TaskState::Blocked {
+                task.close_blocked_interval(timestamp_ticks);
             }
         }
     }
@@ -263,7 +497,10 @@ impl CoreTraceState {
             }
             TraceEventKind::TraceStopped => {
                 self.switch_context(None, timestamp, true);
-                self.interrupted_contexts.clear();
+                self.close_interrupted_contexts(timestamp);
+                for task in self.tasks.values_mut() {
+                    task.close_blocked_interval(timestamp);
+                }
             }
             TraceEventKind::Overflow { dropped_events } => {
                 self.invalidate_continuity(timestamp, *dropped_events);
@@ -286,8 +523,9 @@ impl CoreTraceState {
                         self.set_task_state(previous, TaskState::Created, timestamp);
                     }
                 }
-                self.interrupted_contexts.clear();
+                self.close_interrupted_contexts(timestamp);
                 self.set_task_state(*task_id, TaskState::Running, timestamp);
+                self.record_activation(ExecutionContext::Task(*task_id));
                 self.switch_context(Some(ExecutionContext::Task(*task_id)), timestamp, true);
                 self.continuity_known = true;
             }
@@ -301,7 +539,10 @@ impl CoreTraceState {
                         self.set_task_state(task_id, TaskState::Created, timestamp);
                     }
                 }
-                self.interrupted_contexts.clear();
+                self.close_interrupted_contexts(timestamp);
+                if self.active_context != Some(ExecutionContext::Scheduler) {
+                    self.record_activation(ExecutionContext::Scheduler);
+                }
                 self.switch_context(Some(ExecutionContext::Scheduler), timestamp, true);
             }
             TraceEventKind::TaskBecameReady { task_id } => {
@@ -309,8 +550,7 @@ impl CoreTraceState {
             }
             TraceEventKind::TaskStoppedReady { task_id, cause } => {
                 let task = self.task_mut(*task_id, timestamp);
-                task.state = TaskState::Blocked;
-                task.last_transition_ticks = timestamp;
+                task.transition_to(TaskState::Blocked, timestamp);
                 task.last_block_cause = Some(*cause);
             }
             TraceEventKind::TaskTerminated { task_id } => {
@@ -321,32 +561,52 @@ impl CoreTraceState {
             }
             TraceEventKind::IsrEntered { isr_id } => {
                 if let Some(context) = self.active_context {
-                    self.interrupted_contexts.push(context);
+                    self.push_interrupted_context(context, timestamp);
                 }
+                self.record_activation(ExecutionContext::Isr(*isr_id));
                 self.switch_context(Some(ExecutionContext::Isr(*isr_id)), timestamp, true);
             }
             TraceEventKind::IsrExited => {
-                let resumed = self.interrupted_contexts.pop();
+                let resumed = self.pop_interrupted_context(timestamp);
                 self.switch_context(resumed, timestamp, true);
             }
             TraceEventKind::IsrExitedToScheduler => {
-                self.interrupted_contexts.clear();
+                self.close_interrupted_contexts(timestamp);
+                if self.active_context != Some(ExecutionContext::Scheduler) {
+                    self.record_activation(ExecutionContext::Scheduler);
+                }
                 self.switch_context(Some(ExecutionContext::Scheduler), timestamp, true);
             }
             TraceEventKind::TimerEntered { timer_id } => {
                 if let Some(context) = self.active_context {
-                    self.interrupted_contexts.push(context);
+                    self.push_interrupted_context(context, timestamp);
                 }
+                self.record_activation(ExecutionContext::Timer(*timer_id));
                 self.switch_context(Some(ExecutionContext::Timer(*timer_id)), timestamp, true);
             }
             TraceEventKind::TimerExited => {
-                let resumed = self.interrupted_contexts.pop();
+                let resumed = self.pop_interrupted_context(timestamp);
                 self.switch_context(resumed, timestamp, true);
             }
             TraceEventKind::Idle => {
-                self.interrupted_contexts.clear();
+                self.close_interrupted_contexts(timestamp);
+                if self.active_context != Some(ExecutionContext::Idle) {
+                    self.record_activation(ExecutionContext::Idle);
+                }
                 self.switch_context(Some(ExecutionContext::Idle), timestamp, true);
                 self.continuity_known = true;
+            }
+            TraceEventKind::StackInfo {
+                task_id,
+                stack_base,
+                stack_size,
+                stack_usage,
+            } => {
+                self.task_mut(*task_id, timestamp).stack = Some(TaskStackInfo {
+                    stack_base: *stack_base,
+                    stack_size: *stack_size,
+                    stack_usage: *stack_usage,
+                });
             }
             TraceEventKind::NoOp
             | TraceEventKind::MarkerStarted { .. }
@@ -355,7 +615,6 @@ impl CoreTraceState {
             | TraceEventKind::ClockSyncCycles { .. }
             | TraceEventKind::ClockSyncMicros { .. }
             | TraceEventKind::TargetInfo { .. }
-            | TraceEventKind::StackInfo { .. }
             | TraceEventKind::ModuleDescription { .. }
             | TraceEventKind::ModuleCount { .. }
             | TraceEventKind::ResourceName { .. }
@@ -394,6 +653,25 @@ impl TraceModel {
         for event in events {
             self.apply(event);
         }
+    }
+
+    pub fn context_statistics(&self, end_ticks: u64) -> Vec<ContextStatistics> {
+        self.cores
+            .iter()
+            .flat_map(|(core_id, core)| core.context_statistics(*core_id, end_ticks))
+            .collect()
+    }
+
+    pub fn cpu_load_bins(
+        &self,
+        core_id: u32,
+        start_ticks: u64,
+        end_ticks: u64,
+        bin_count: usize,
+    ) -> Vec<CpuLoadBin> {
+        self.cores.get(&core_id).map_or_else(Vec::new, |core| {
+            core.cpu_load_bins(start_ticks, end_ticks, bin_count)
+        })
     }
 }
 
@@ -577,6 +855,103 @@ mod tests {
             model.core(1).and_then(CoreTraceState::active_context),
             Some(ExecutionContext::Idle)
         );
+    }
+
+    #[test]
+    fn aggregates_context_runtime_blocking_interruptions_and_stack_usage() {
+        let events = [
+            event(
+                0,
+                0,
+                TraceEventKind::TaskInfo {
+                    task_id: 7,
+                    priority: 2,
+                    name: "worker".to_owned(),
+                },
+            ),
+            event(
+                1,
+                0,
+                TraceEventKind::StackInfo {
+                    task_id: 7,
+                    stack_base: 0x2000_1000,
+                    stack_size: 1024,
+                    stack_usage: 640,
+                },
+            ),
+            event(2, 0, TraceEventKind::TaskStarted { task_id: 7 }),
+            event(3, 10, TraceEventKind::IsrEntered { isr_id: 15 }),
+            event(4, 15, TraceEventKind::IsrExited),
+            event(
+                5,
+                20,
+                TraceEventKind::TaskStoppedReady {
+                    task_id: 7,
+                    cause: 1,
+                },
+            ),
+            event(6, 20, TraceEventKind::TaskStopped),
+            event(7, 30, TraceEventKind::TaskBecameReady { task_id: 7 }),
+            event(8, 35, TraceEventKind::TaskStarted { task_id: 7 }),
+            event(9, 45, TraceEventKind::Idle),
+        ];
+        let mut model = TraceModel::new();
+        model.apply_all(&events);
+
+        let statistics = model.context_statistics(50);
+        let task = statistics
+            .iter()
+            .find(|statistics| statistics.context == ExecutionContext::Task(7))
+            .expect("task statistics exist");
+        assert_eq!(task.activations, 2);
+        assert_eq!(task.run_slices, 3);
+        assert_eq!(task.total_run_ticks, 25);
+        assert_eq!(task.last_run_ticks, Some(10));
+        assert_eq!(task.minimum_run_ticks, Some(5));
+        assert_eq!(task.average_run_ticks(), Some(8));
+        assert_eq!(task.maximum_run_ticks, Some(10));
+        assert_eq!(task.interrupted_ticks, 5);
+        assert_eq!(task.blocked_ticks, Some(10));
+        assert_eq!(
+            task.stack,
+            Some(TaskStackInfo {
+                stack_base: 0x2000_1000,
+                stack_size: 1024,
+                stack_usage: 640,
+            })
+        );
+        let isr = statistics
+            .iter()
+            .find(|statistics| statistics.context == ExecutionContext::Isr(15))
+            .expect("ISR statistics exist");
+        assert_eq!(isr.activations, 1);
+        assert_eq!(isr.total_run_ticks, 5);
+        assert_eq!(isr.blocked_ticks, None);
+    }
+
+    #[test]
+    fn cpu_load_bins_clip_context_intervals_to_the_requested_range() {
+        let events = [
+            event(0, 0, TraceEventKind::TaskStarted { task_id: 7 }),
+            event(1, 10, TraceEventKind::IsrEntered { isr_id: 15 }),
+            event(2, 15, TraceEventKind::IsrExited),
+            event(3, 20, TraceEventKind::TaskStopped),
+            event(4, 35, TraceEventKind::TaskStarted { task_id: 7 }),
+            event(5, 45, TraceEventKind::Idle),
+        ];
+        let mut model = TraceModel::new();
+        model.apply_all(&events);
+
+        let bins = model.cpu_load_bins(0, 0, 50, 5);
+
+        assert_eq!(bins.len(), 5);
+        assert_eq!(bins[0].context_ticks[&ExecutionContext::Task(7)], 10);
+        assert_eq!(bins[1].context_ticks[&ExecutionContext::Isr(15)], 5);
+        assert_eq!(bins[1].context_ticks[&ExecutionContext::Task(7)], 5);
+        assert_eq!(bins[4].context_ticks[&ExecutionContext::Task(7)], 5);
+        assert_eq!(bins[4].context_ticks[&ExecutionContext::Idle], 5);
+        assert_eq!(bins[4].duration_ticks(), 10);
+        assert_eq!(bins[4].busy_ticks(), 5);
     }
 
     #[test]

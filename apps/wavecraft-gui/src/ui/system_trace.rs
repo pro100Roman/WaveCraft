@@ -24,7 +24,9 @@ use wavecraft_debug_probe::{
     RttConfiguration, RttControlBlockLocation, RttTerminalColor, RttTerminalLine, TargetSelector,
     WireProtocol,
 };
-use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
+use wavecraft_trace::{
+    ContextStatistics, ExecutionContext, TraceEvent, TraceEventKind, TraceModel,
+};
 
 const TIMELINE_LABEL_WIDTH: f32 = 150.0;
 const TIMELINE_HEADER_HEIGHT: f32 = 24.0;
@@ -37,6 +39,11 @@ const TIMELINE_EDGE_SNAP_DISTANCE: f32 = 10.0;
 const TIMELINE_SHORT_EVENT_HOVER_DISTANCE: f32 = 8.0;
 const EVENT_TABLE_MINIMUM_WIDTH: f32 = 760.0;
 const EVENT_TABLE_ROW_HEIGHT: f32 = 22.0;
+const CPU_LOAD_GRAPH_MINIMUM_WIDTH: f32 = 720.0;
+const CPU_LOAD_GRAPH_HEADER_HEIGHT: f32 = 26.0;
+const CPU_LOAD_GRAPH_ROW_HEIGHT: f32 = 110.0;
+const CPU_LOAD_GRAPH_BIN_WIDTH: f32 = 7.0;
+const CONTEXT_STATISTICS_MINIMUM_WIDTH: f32 = 1_520.0;
 const TRACE_SPLITTER_HEIGHT: f32 = 10.0;
 const SELECTED_EVENT_FOOTER_HEIGHT: f32 = 36.0;
 const TERMINAL_TABLE_MINIMUM_WIDTH: f32 = 720.0;
@@ -741,7 +748,11 @@ impl WaveCraftApp {
                     egui::vec2(pane_width, self.system_trace.event_view_height()),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        paint_event_instrument(ui, &mut self.system_trace);
+                        paint_event_instrument(
+                            ui,
+                            &mut self.system_trace,
+                            timestamp_frequency_override_hz,
+                        );
                     },
                 );
             });
@@ -1259,6 +1270,13 @@ fn paint_timeline_instrument(
             );
             (canvas.top(), canvas_width, clicked_sequence)
         });
+        trace.set_timeline_visible_range(Some(timeline_visible_tick_range(
+            start_ticks,
+            end_ticks,
+            timeline.state.offset.x,
+            timeline.inner_rect.width(),
+            timeline.inner.1,
+        )));
         let timeline_pointer = ui.input(|input| {
             input.pointer.hover_pos().filter(|position| {
                 timeline.inner_rect.contains(*position)
@@ -1356,6 +1374,29 @@ fn timeline_focus_offset(
     let visible_plot_center =
         TIMELINE_LABEL_WIDTH + (viewport_width - TIMELINE_LABEL_WIDTH).max(1.0) * 0.5;
     (target_x - visible_plot_center).clamp(0.0, (canvas_width - viewport_width).max(0.0))
+}
+
+fn timeline_visible_tick_range(
+    start_ticks: u64,
+    end_ticks: u64,
+    horizontal_offset: f32,
+    viewport_width: f32,
+    canvas_width: f32,
+) -> (u64, u64) {
+    let duration_ticks = end_ticks.saturating_sub(start_ticks).max(1);
+    let plot_width = (canvas_width - TIMELINE_LABEL_WIDTH).max(1.0);
+    let visible_left =
+        (horizontal_offset + TIMELINE_LABEL_WIDTH).clamp(TIMELINE_LABEL_WIDTH, canvas_width);
+    let visible_right = (horizontal_offset + viewport_width).clamp(visible_left, canvas_width);
+    let start_fraction = ((visible_left - TIMELINE_LABEL_WIDTH) / plot_width).clamp(0.0, 1.0);
+    let end_fraction = ((visible_right - TIMELINE_LABEL_WIDTH) / plot_width).clamp(0.0, 1.0);
+    let visible_start = start_ticks
+        .saturating_add((duration_ticks as f64 * f64::from(start_fraction)).floor() as u64);
+    let visible_end = start_ticks
+        .saturating_add((duration_ticks as f64 * f64::from(end_fraction)).ceil() as u64)
+        .min(end_ticks)
+        .max(visible_start.saturating_add(1).min(end_ticks));
+    (visible_start.min(end_ticks), visible_end)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2094,7 +2135,11 @@ fn context_color(context: ExecutionContext) -> egui::Color32 {
     }
 }
 
-fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
+fn paint_event_instrument(
+    ui: &mut egui::Ui,
+    trace: &mut SystemTraceDisplayState,
+    timestamp_frequency_override_hz: Option<u64>,
+) {
     instrument_frame().show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
@@ -2110,16 +2155,37 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
                 TraceEventView::ProbeLog,
                 "PROBE LOG",
             );
-            ui.separator();
-            ui.add(
-                egui::TextEdit::singleline(&mut trace.event_filter)
-                    .hint_text("Filter")
-                    .desired_width(180.0),
+            ui.selectable_value(
+                &mut trace.event_view,
+                TraceEventView::CpuLoad,
+                "CPU LOAD",
             );
+            ui.selectable_value(
+                &mut trace.event_view,
+                TraceEventView::ContextStatistics,
+                "CONTEXTS",
+            );
+            let text_view = matches!(
+                trace.event_view,
+                TraceEventView::Events
+                    | TraceEventView::Logs
+                    | TraceEventView::Terminal
+                    | TraceEventView::ProbeLog
+            );
+            if text_view {
+                ui.separator();
+                ui.add(
+                    egui::TextEdit::singleline(&mut trace.event_filter)
+                        .hint_text("Filter")
+                        .desired_width(180.0),
+                );
+            }
             if trace.event_view == TraceEventView::Terminal {
                 ui.checkbox(&mut trace.terminal_wrap, "Wrap text");
             }
-            ui.checkbox(&mut trace.follow_latest, "Follow latest");
+            if text_view {
+                ui.checkbox(&mut trace.follow_latest, "Follow latest");
+            }
         });
         ui.add_space(5.0);
         let footer_height = if matches!(
@@ -2157,6 +2223,40 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
                     paint_probe_log_table(ui, trace, event_height);
                 }
             }
+            TraceEventView::CpuLoad => {
+                if trace.model().cores().is_empty() {
+                    paint_trace_empty_state(
+                        ui,
+                        "No CPU activity yet",
+                        "CPU load for the visible Timeline range will appear here.",
+                        event_height,
+                    );
+                } else {
+                    paint_cpu_load_graph(
+                        ui,
+                        trace,
+                        event_height,
+                        timestamp_frequency_override_hz,
+                    );
+                }
+            }
+            TraceEventView::ContextStatistics => {
+                if trace.model().cores().is_empty() {
+                    paint_trace_empty_state(
+                        ui,
+                        "No context statistics yet",
+                        "Task, ISR, timer, scheduler, and idle statistics will appear here.",
+                        event_height,
+                    );
+                } else {
+                    paint_context_statistics_table(
+                        ui,
+                        trace,
+                        event_height,
+                        timestamp_frequency_override_hz,
+                    );
+                }
+            }
             TraceEventView::Events | TraceEventView::Logs => {
                 if trace.events().is_empty() {
                     paint_trace_empty_state(
@@ -2172,6 +2272,394 @@ fn paint_event_instrument(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState
             }
         }
     });
+}
+
+fn paint_cpu_load_graph(
+    ui: &mut egui::Ui,
+    trace: &SystemTraceDisplayState,
+    view_height: f32,
+    timestamp_frequency_override_hz: Option<u64>,
+) {
+    let Some((range_start, range_end)) = trace
+        .timeline_visible_range()
+        .or_else(|| trace.time_bounds())
+    else {
+        return;
+    };
+    let frequency_hz = trace_system_frequency_hz(trace, timestamp_frequency_override_hz);
+    let graph_width = ui.available_width().max(CPU_LOAD_GRAPH_MINIMUM_WIDTH);
+    let plot_width = (graph_width - TIMELINE_LABEL_WIDTH).max(1.0);
+    let bin_count = (plot_width / CPU_LOAD_GRAPH_BIN_WIDTH)
+        .floor()
+        .clamp(16.0, 240.0) as usize;
+    let core_ids = trace.model().cores().keys().copied().collect::<Vec<_>>();
+
+    egui::Frame::none().fill(BACKGROUND).show(ui, |ui| {
+        ui.set_min_width(graph_width);
+        ui.set_min_height(view_height);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("VISIBLE TIMELINE").small().color(TEXT_MUTED));
+            ui.label(
+                RichText::new(format!(
+                    "{} → {} · {}",
+                    format_trace_ticks(range_start, frequency_hz),
+                    format_trace_ticks(range_end, frequency_hz),
+                    format_trace_ticks(range_end.saturating_sub(range_start), frequency_hz),
+                ))
+                .monospace(),
+            );
+        });
+        let available_graph_height =
+            (view_height - CPU_LOAD_GRAPH_HEADER_HEIGHT).max(CPU_LOAD_GRAPH_ROW_HEIGHT);
+        egui::ScrollArea::vertical()
+            .id_salt("system_trace_cpu_load")
+            .max_height(available_graph_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_min_width(graph_width);
+                for core_id in core_ids {
+                    let bins =
+                        trace
+                            .model()
+                            .cpu_load_bins(core_id, range_start, range_end, bin_count);
+                    paint_cpu_load_core_row(
+                        ui,
+                        trace.model(),
+                        core_id,
+                        &bins,
+                        graph_width,
+                        frequency_hz,
+                    );
+                }
+            });
+    });
+}
+
+fn paint_cpu_load_core_row(
+    ui: &mut egui::Ui,
+    model: &TraceModel,
+    core_id: u32,
+    bins: &[wavecraft_trace::CpuLoadBin],
+    width: f32,
+    frequency_hz: Option<u64>,
+) {
+    let (row_rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, CPU_LOAD_GRAPH_ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let plot_rect = egui::Rect::from_min_max(
+        egui::pos2(row_rect.left() + TIMELINE_LABEL_WIDTH, row_rect.top() + 6.0),
+        egui::pos2(row_rect.right(), row_rect.bottom() - 18.0),
+    );
+    let painter = ui.painter().with_clip_rect(row_rect);
+    painter.rect_filled(row_rect, 0.0, BACKGROUND);
+    let total_duration = bins
+        .iter()
+        .map(wavecraft_trace::CpuLoadBin::duration_ticks)
+        .sum::<u64>();
+    let total_busy = bins
+        .iter()
+        .map(wavecraft_trace::CpuLoadBin::busy_ticks)
+        .sum::<u64>();
+    let average_load = if total_duration > 0 {
+        total_busy as f64 * 100.0 / total_duration as f64
+    } else {
+        0.0
+    };
+    painter.text(
+        egui::pos2(row_rect.left() + 8.0, row_rect.top() + 10.0),
+        egui::Align2::LEFT_TOP,
+        format!("Core {core_id}"),
+        egui::FontId::proportional(13.0),
+        ui.visuals().text_color(),
+    );
+    painter.text(
+        egui::pos2(row_rect.left() + 8.0, row_rect.top() + 32.0),
+        egui::Align2::LEFT_TOP,
+        format!("{average_load:.1}% avg"),
+        egui::FontId::monospace(12.0),
+        ACCENT,
+    );
+    for percentage in [0_u32, 25, 50, 75, 100] {
+        let y = plot_rect.bottom() - plot_rect.height() * percentage as f32 / 100.0;
+        painter.line_segment(
+            [
+                egui::pos2(plot_rect.left(), y),
+                egui::pos2(plot_rect.right(), y),
+            ],
+            egui::Stroke::new(if percentage == 0 { 1.0_f32 } else { 0.5_f32 }, GRID),
+        );
+        if matches!(percentage, 0 | 50 | 100) {
+            painter.text(
+                egui::pos2(plot_rect.left() - 6.0, y),
+                egui::Align2::RIGHT_CENTER,
+                format!("{percentage}%"),
+                egui::FontId::monospace(9.0),
+                TEXT_MUTED,
+            );
+        }
+    }
+    if bins.is_empty() {
+        return;
+    }
+    let bin_width = plot_rect.width() / bins.len() as f32;
+    for (index, bin) in bins.iter().enumerate() {
+        let duration = bin.duration_ticks().max(1);
+        let left = plot_rect.left() + index as f32 * bin_width;
+        let right = plot_rect.left() + (index + 1) as f32 * bin_width;
+        let mut bottom = plot_rect.bottom();
+        for (context, ticks) in &bin.context_ticks {
+            if *context == ExecutionContext::Idle || *ticks == 0 {
+                continue;
+            }
+            let height = plot_rect.height() * *ticks as f32 / duration as f32;
+            let top = (bottom - height).max(plot_rect.top());
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(left, top),
+                    egui::pos2((right - 1.0).max(left), bottom),
+                ),
+                0.0,
+                context_color(*context),
+            );
+            bottom = top;
+        }
+        let response = ui.interact(
+            egui::Rect::from_min_max(
+                egui::pos2(left, plot_rect.top()),
+                egui::pos2(right, plot_rect.bottom()),
+            ),
+            ui.id().with(("cpu_load_bin", core_id, index)),
+            egui::Sense::hover(),
+        );
+        if response.hovered() {
+            let mut details = vec![format!(
+                "Core {core_id} · {}–{} · {:.1}% busy",
+                format_trace_ticks(bin.start_ticks, frequency_hz),
+                format_trace_ticks(bin.end_ticks, frequency_hz),
+                bin.busy_ticks() as f64 * 100.0 / duration as f64,
+            )];
+            details.extend(
+                bin.context_ticks
+                    .iter()
+                    .filter(|(_, ticks)| **ticks > 0)
+                    .map(|(context, ticks)| {
+                        format!(
+                            "{}: {:.1}%",
+                            analysis_context_name(model, core_id, *context),
+                            *ticks as f64 * 100.0 / duration as f64,
+                        )
+                    }),
+            );
+            response.on_hover_text(details.join("\n"));
+        }
+    }
+}
+
+fn paint_context_statistics_table(
+    ui: &mut egui::Ui,
+    trace: &SystemTraceDisplayState,
+    view_height: f32,
+    timestamp_frequency_override_hz: Option<u64>,
+) {
+    let Some((trace_start, trace_end)) = trace.time_bounds() else {
+        return;
+    };
+    let statistics = trace.model().context_statistics(trace_end);
+    let frequency_hz = trace_system_frequency_hz(trace, timestamp_frequency_override_hz);
+    let trace_duration = trace_end.saturating_sub(trace_start).max(1);
+    let table_row_count = statistics.len() + 1;
+
+    egui::Frame::none().fill(BACKGROUND).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.set_min_height(view_height);
+        let table_width = ui.available_width().max(CONTEXT_STATISTICS_MINIMUM_WIDTH);
+        egui::ScrollArea::both()
+            .id_salt("system_trace_context_statistics")
+            .max_height(view_height)
+            .auto_shrink([false, false])
+            .show_rows(
+                ui,
+                EVENT_TABLE_ROW_HEIGHT,
+                table_row_count,
+                |ui, row_range| {
+                    ui.set_min_width(table_width);
+                    for table_row in row_range {
+                        if table_row == 0 {
+                            paint_context_statistics_header(ui);
+                            continue;
+                        }
+                        let visible_row = table_row - 1;
+                        paint_context_statistics_row(
+                            ui,
+                            trace.model(),
+                            &statistics[visible_row],
+                            visible_row,
+                            trace_duration,
+                            frequency_hz,
+                        );
+                    }
+                },
+            );
+    });
+}
+
+fn paint_context_statistics_header(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        statistics_header_cell(ui, "CONTEXT", 165.0);
+        statistics_header_cell(ui, "TYPE", 75.0);
+        statistics_header_cell(ui, "CORE", 50.0);
+        statistics_header_cell(ui, "ACT", 55.0);
+        statistics_header_cell(ui, "CPU", 65.0);
+        statistics_header_cell(ui, "TOTAL RUN", 110.0);
+        statistics_header_cell(ui, "LAST", 95.0);
+        statistics_header_cell(ui, "MIN", 95.0);
+        statistics_header_cell(ui, "AVG", 95.0);
+        statistics_header_cell(ui, "MAX", 95.0);
+        statistics_header_cell(ui, "INTERRUPTED", 110.0);
+        statistics_header_cell(ui, "BLOCKED", 110.0);
+        statistics_header_cell(ui, "STACK", 170.0);
+    });
+}
+
+fn statistics_header_cell(ui: &mut egui::Ui, text: &str, width: f32) {
+    ui.add_sized(
+        [width, 20.0],
+        egui::Label::new(RichText::new(text).small().color(TEXT_MUTED)),
+    );
+}
+
+fn paint_context_statistics_row(
+    ui: &mut egui::Ui,
+    model: &TraceModel,
+    statistics: &ContextStatistics,
+    visible_row: usize,
+    trace_duration_ticks: u64,
+    frequency_hz: Option<u64>,
+) {
+    egui::Frame::none()
+        .fill(event_row_fill(visible_row, false))
+        .show(ui, |ui| {
+            ui.set_min_width(CONTEXT_STATISTICS_MINIMUM_WIDTH);
+            ui.horizontal(|ui| {
+                statistics_value_cell(
+                    ui,
+                    analysis_context_name(model, statistics.core_id, statistics.context),
+                    165.0,
+                );
+                statistics_value_cell(ui, context_type_label(statistics.context), 75.0);
+                statistics_value_cell(ui, statistics.core_id.to_string(), 50.0);
+                statistics_value_cell(ui, statistics.activations.to_string(), 55.0);
+                statistics_value_cell(
+                    ui,
+                    format!(
+                        "{:.1}%",
+                        statistics.total_run_ticks as f64 * 100.0 / trace_duration_ticks as f64
+                    ),
+                    65.0,
+                );
+                statistics_value_cell(
+                    ui,
+                    format_trace_ticks(statistics.total_run_ticks, frequency_hz),
+                    110.0,
+                );
+                statistics_optional_ticks_cell(ui, statistics.last_run_ticks, frequency_hz, 95.0);
+                statistics_optional_ticks_cell(
+                    ui,
+                    statistics.minimum_run_ticks,
+                    frequency_hz,
+                    95.0,
+                );
+                statistics_optional_ticks_cell(
+                    ui,
+                    statistics.average_run_ticks(),
+                    frequency_hz,
+                    95.0,
+                );
+                statistics_optional_ticks_cell(
+                    ui,
+                    statistics.maximum_run_ticks,
+                    frequency_hz,
+                    95.0,
+                );
+                statistics_value_cell(
+                    ui,
+                    format_trace_ticks(statistics.interrupted_ticks, frequency_hz),
+                    110.0,
+                );
+                statistics_optional_ticks_cell(ui, statistics.blocked_ticks, frequency_hz, 110.0);
+                let stack = statistics.stack.map_or_else(
+                    || "—".to_owned(),
+                    |stack| {
+                        let percentage = if stack.stack_size > 0 {
+                            (u128::from(stack.stack_usage) * 100 + u128::from(stack.stack_size) / 2)
+                                / u128::from(stack.stack_size)
+                        } else {
+                            0
+                        };
+                        format!(
+                            "{} / {} B ({percentage}%)",
+                            stack.stack_usage, stack.stack_size
+                        )
+                    },
+                );
+                statistics_value_cell(ui, stack, 170.0);
+            });
+        });
+}
+
+fn statistics_optional_ticks_cell(
+    ui: &mut egui::Ui,
+    ticks: Option<u64>,
+    frequency_hz: Option<u64>,
+    width: f32,
+) {
+    statistics_value_cell(
+        ui,
+        ticks.map_or_else(
+            || "—".to_owned(),
+            |ticks| format_trace_ticks(ticks, frequency_hz),
+        ),
+        width,
+    );
+}
+
+fn statistics_value_cell(ui: &mut egui::Ui, text: impl Into<String>, width: f32) {
+    ui.add_sized(
+        [width, 20.0],
+        egui::Label::new(RichText::new(text.into()).monospace()),
+    );
+}
+
+fn analysis_context_name(model: &TraceModel, core_id: u32, context: ExecutionContext) -> String {
+    match context {
+        ExecutionContext::Task(task_id) => model
+            .core(core_id)
+            .and_then(|core| core.tasks().get(&task_id))
+            .and_then(|task| task.name.as_deref())
+            .map_or_else(|| format!("Task {task_id}"), ToOwned::to_owned),
+        ExecutionContext::Isr(isr_id) => format!("ISR {isr_id}"),
+        ExecutionContext::Timer(timer_id) => format!("Timer {timer_id}"),
+        ExecutionContext::Scheduler => "Scheduler".to_owned(),
+        ExecutionContext::Idle => "Idle".to_owned(),
+    }
+}
+
+fn context_type_label(context: ExecutionContext) -> &'static str {
+    match context {
+        ExecutionContext::Task(_) => "Task",
+        ExecutionContext::Isr(_) => "ISR",
+        ExecutionContext::Timer(_) => "Timer",
+        ExecutionContext::Scheduler => "Scheduler",
+        ExecutionContext::Idle => "Idle",
+    }
+}
+
+fn format_trace_ticks(ticks: u64, frequency_hz: Option<u64>) -> String {
+    frequency_hz.map_or_else(
+        || format!("{ticks} ticks"),
+        |frequency_hz| format_duration(Duration::from_secs_f64(ticks as f64 / frequency_hz as f64)),
+    )
 }
 
 fn paint_probe_log_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, view_height: f32) {
@@ -2999,12 +3487,64 @@ mod tests {
         trace
     }
 
+    fn analysis_trace() -> SystemTraceDisplayState {
+        let mut trace = timing_trace();
+        for event in [
+            TraceEvent {
+                sequence: 6,
+                core_id: 0,
+                timestamp_ticks: 220,
+                kind: TraceEventKind::StackInfo {
+                    task_id: 7,
+                    stack_base: 0x2000_1000,
+                    stack_size: 1024,
+                    stack_usage: 640,
+                },
+            },
+            TraceEvent {
+                sequence: 7,
+                core_id: 0,
+                timestamp_ticks: 225,
+                kind: TraceEventKind::TaskStoppedReady {
+                    task_id: 8,
+                    cause: 1,
+                },
+            },
+            TraceEvent {
+                sequence: 8,
+                core_id: 0,
+                timestamp_ticks: 245,
+                kind: TraceEventKind::TaskBecameReady { task_id: 8 },
+            },
+            TraceEvent {
+                sequence: 9,
+                core_id: 0,
+                timestamp_ticks: 250,
+                kind: TraceEventKind::Idle,
+            },
+            TraceEvent {
+                sequence: 10,
+                core_id: 0,
+                timestamp_ticks: 300,
+                kind: TraceEventKind::NoOp,
+            },
+        ] {
+            trace.ingest(event);
+        }
+        trace
+    }
+
     fn paint_central_texts(context: &egui::Context, app: &mut WaveCraftApp) -> Vec<String> {
+        paint_central_texts_at_size(context, app, egui::vec2(1200.0, 800.0))
+    }
+
+    fn paint_central_texts_at_size(
+        context: &egui::Context,
+        app: &mut WaveCraftApp,
+        size: egui::Vec2,
+    ) -> Vec<String> {
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1200.0, 800.0),
-            )),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
             ..egui::RawInput::default()
         };
         let output = context.run(input, |context| {
@@ -3439,6 +3979,49 @@ mod tests {
     }
 
     #[test]
+    fn cpu_load_tab_tracks_the_visible_timeline_range() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace = analysis_trace();
+        app.system_trace.event_view = TraceEventView::CpuLoad;
+
+        let texts = paint_central_texts(&context, &mut app);
+
+        assert!(texts.iter().any(|text| text == "CPU LOAD"));
+        assert!(texts.iter().any(|text| text == "VISIBLE TIMELINE"));
+        assert!(texts.iter().any(|text| text == "Core 0"));
+        assert!(texts.iter().any(|text| text.ends_with("% avg")));
+        assert_eq!(app.system_trace.timeline_visible_range(), Some((0, 300)));
+    }
+
+    #[test]
+    fn context_statistics_tab_paints_runtime_blocking_and_stack_columns() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace = analysis_trace();
+        app.system_trace.event_view = TraceEventView::ContextStatistics;
+
+        let texts = paint_central_texts_at_size(&context, &mut app, egui::vec2(1800.0, 800.0));
+
+        for expected in [
+            "CONTEXTS",
+            "CONTEXT",
+            "TOTAL RUN",
+            "INTERRUPTED",
+            "BLOCKED",
+            "STACK",
+            "app_main",
+            "worker",
+            "640 / 1024 B (63%)",
+        ] {
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "missing context-statistics text {expected:?}: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rtt_terminal_output_uses_the_log_background() {
         let context = egui::Context::default();
         let mut trace = SystemTraceDisplayState::default();
@@ -3592,6 +4175,19 @@ mod tests {
         assert!(offset > 2_000.0);
         assert!(offset < 4_000.0);
         assert_eq!(timeline_focus_offset(900.0, 8.0, 0, 1_000, 0), 0.0);
+    }
+
+    #[test]
+    fn timeline_visible_range_follows_horizontal_scroll() {
+        assert_eq!(
+            timeline_visible_tick_range(0, 1_000, 0.0, 900.0, 900.0),
+            (0, 1_000)
+        );
+        let left = timeline_visible_tick_range(0, 1_000, 0.0, 900.0, 1_800.0);
+        let right = timeline_visible_tick_range(0, 1_000, 900.0, 900.0, 1_800.0);
+
+        assert_eq!(left, (0, 455));
+        assert_eq!(right, (545, 1_000));
     }
 
     #[test]
