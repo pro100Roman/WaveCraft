@@ -2210,7 +2210,7 @@ fn paint_probe_log_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, vie
                             continue;
                         }
                         let row = table_row - 1;
-                        let response = paint_probe_log_entry(ui, visible_entries[row]);
+                        let response = paint_probe_log_entry(ui, visible_entries[row], row);
                         if trace.follow_latest && row + 1 == entry_count {
                             response.scroll_to_me(Some(egui::Align::BOTTOM));
                         }
@@ -2234,27 +2234,36 @@ fn paint_probe_log_header(ui: &mut egui::Ui) {
     });
 }
 
-fn paint_probe_log_entry(ui: &mut egui::Ui, entry: &ProbeLogEntry) -> egui::Response {
-    ui.horizontal_top(|ui| {
-        ui.add_sized(
-            [70.0, 20.0],
-            egui::Label::new(
-                RichText::new(entry.sequence.to_string())
-                    .monospace()
-                    .color(TEXT_MUTED),
-            ),
-        );
-        ui.add_sized(
-            [80.0, 20.0],
-            egui::Label::new(
-                RichText::new(probe_log_level_label(entry.level))
-                    .monospace()
-                    .color(probe_log_level_color(entry.level)),
-            ),
-        );
-        ui.add(egui::Label::new(RichText::new(&entry.message).monospace()).extend());
-    })
-    .response
+fn paint_probe_log_entry(
+    ui: &mut egui::Ui,
+    entry: &ProbeLogEntry,
+    visible_row: usize,
+) -> egui::Response {
+    egui::Frame::none()
+        .fill(event_row_fill(visible_row, false))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.add_sized(
+                    [70.0, 20.0],
+                    egui::Label::new(
+                        RichText::new(entry.sequence.to_string())
+                            .monospace()
+                            .color(TEXT_MUTED),
+                    ),
+                );
+                ui.add_sized(
+                    [80.0, 20.0],
+                    egui::Label::new(
+                        RichText::new(probe_log_level_label(entry.level))
+                            .monospace()
+                            .color(probe_log_level_color(entry.level)),
+                    ),
+                );
+                ui.add(egui::Label::new(RichText::new(&entry.message).monospace()).extend());
+            });
+        })
+        .response
 }
 
 fn probe_log_level_label(level: ProbeLogLevel) -> &'static str {
@@ -2298,7 +2307,7 @@ fn paint_terminal_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, view
                     ui.set_min_width(ui.available_width());
                     paint_terminal_header(ui);
                     for (row, line) in visible_lines.iter().enumerate() {
-                        let response = paint_terminal_line(ui, line, true);
+                        let response = paint_terminal_line(ui, line, true, row);
                         if trace.follow_latest && row + 1 == line_count {
                             response.scroll_to_me(Some(egui::Align::BOTTOM));
                         }
@@ -2319,7 +2328,7 @@ fn paint_terminal_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, view
                             continue;
                         }
                         let row = table_row - 1;
-                        let response = paint_terminal_line(ui, visible_lines[row], false);
+                        let response = paint_terminal_line(ui, visible_lines[row], false, row);
                         if trace.follow_latest && row + 1 == line_count {
                             response.scroll_to_me(Some(egui::Align::BOTTOM));
                         }
@@ -2339,20 +2348,30 @@ fn paint_terminal_header(ui: &mut egui::Ui) {
     });
 }
 
-fn paint_terminal_line(ui: &mut egui::Ui, line: &RttTerminalLine, wrap: bool) -> egui::Response {
-    ui.horizontal_top(|ui| {
-        ui.add_sized(
-            [70.0, 20.0],
-            egui::Label::new(
-                RichText::new(line.sequence.to_string())
-                    .monospace()
-                    .color(TEXT_MUTED),
-            ),
-        );
-        let label = egui::Label::new(terminal_line_layout(ui, line));
-        ui.add(if wrap { label.wrap() } else { label.extend() });
-    })
-    .response
+fn paint_terminal_line(
+    ui: &mut egui::Ui,
+    line: &RttTerminalLine,
+    wrap: bool,
+    visible_row: usize,
+) -> egui::Response {
+    egui::Frame::none()
+        .fill(event_row_fill(visible_row, false))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.add_sized(
+                    [70.0, 20.0],
+                    egui::Label::new(
+                        RichText::new(line.sequence.to_string())
+                            .monospace()
+                            .color(TEXT_MUTED),
+                    ),
+                );
+                let label = egui::Label::new(terminal_line_layout(ui, line));
+                ui.add(if wrap { label.wrap() } else { label.extend() });
+            });
+        })
+        .response
 }
 
 fn terminal_line_layout(ui: &egui::Ui, line: &RttTerminalLine) -> egui::text::LayoutJob {
@@ -3945,6 +3964,64 @@ mod tests {
             assert_eq!(event_row_fill(1, false), TRACE_EVENT_ROW_FILLS[1]);
             assert_eq!(event_row_fill(2, false), TRACE_EVENT_ROW_FILLS[0]);
             assert_eq!(event_row_fill(0, true), TRACE_EVENT_SELECTION_FILL);
+        }
+    }
+
+    #[test]
+    fn terminal_and_probe_log_rows_alternate_between_two_background_colors() {
+        let mut trace = SystemTraceDisplayState::default();
+        for sequence in 0..4 {
+            trace.ingest_terminal_line(wavecraft_debug_probe::RttTerminalLine::plain(
+                sequence,
+                format!("terminal message {sequence}"),
+                true,
+            ));
+            trace.ingest_probe_log(crate::system_trace::ProbeLogMessage {
+                level: ProbeLogLevel::Info,
+                message: format!("probe message {sequence}"),
+            });
+        }
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 400.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let terminal_context = egui::Context::default();
+        let terminal_output = terminal_context.run(input(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_terminal_table(ui, &trace, 300.0);
+            });
+        });
+        trace.terminal_wrap = false;
+        let unwrapped_terminal_context = egui::Context::default();
+        let unwrapped_terminal_output = unwrapped_terminal_context.run(input(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_terminal_table(ui, &trace, 300.0);
+            });
+        });
+        let probe_context = egui::Context::default();
+        let probe_output = probe_context.run(input(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_probe_log_table(ui, &trace, 300.0);
+            });
+        });
+
+        for (view, output) in [
+            ("RTT TERMINAL (wrapped)", terminal_output),
+            ("RTT TERMINAL (unwrapped)", unwrapped_terminal_output),
+            ("PROBE LOG", probe_output),
+        ] {
+            for fill in TRACE_EVENT_ROW_FILLS {
+                assert!(
+                    output
+                        .shapes
+                        .iter()
+                        .any(|clipped| shape_contains_fill(&clipped.shape, fill)),
+                    "{view} should paint rows with {fill:?}"
+                );
+            }
         }
     }
 
