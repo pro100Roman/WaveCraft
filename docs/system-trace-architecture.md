@@ -582,6 +582,36 @@ contain a J-Link-specific dependency that prevents first-class ST-Link or BMP
 support. BMP continuous-trace support must additionally require non-halting
 memory access on the selected target.
 
+## Tracked analysis backlog
+
+Implement the remaining System Trace analysis work in the order below. Keep
+each numbered item in its own focused commit and mark it complete only after
+its tests, formatting, and workspace Clippy checks pass.
+
+1. [ ] Add a viewport-linked CPU-load graph and context-statistics table with
+   activations, total/last/min/max/average runtime, interrupted time, CPU load,
+   blocked time where the trace provides enough lifecycle information, and
+   reported stack usage.
+2. [ ] Add structured event-category filters, next/previous navigation,
+   next/previous-in-context navigation, go-to-sequence/timestamp, target versus
+   recording-relative time, and persistent time-reference markers.
+3. [ ] Add ELF and SystemView description-file support: `_SEGGER_RTT` lookup,
+   resource and symbol names, `.sv-data` Print-ELF messages, and typed decoding
+   of API event IDs 32 through 511.
+4. [ ] Add synchronized Data Plot instruments, per-context runtime statistics,
+   histograms and box plots, stack high-water analysis, Timeline markers and
+   annotations, and CSV export for events, contexts, logs, and terminal output.
+5. [ ] Add heap analysis and multicore recording with independent decoders,
+   clock synchronization, per-core focus, and shared-time visualization.
+6. [ ] Add live trigger modes, target event-mask control, post-mortem and
+   single-shot acquisition, and saved System Trace projects.
+7. [ ] Evaluate and, when justified by the RTT path and user demand, add UART
+   and IP recorder transports.
+
+Items 1 through 5 are the current product sequence. Items 6 and 7 remain
+lower-priority acquisition and workflow work; they must not delay the core
+offline and live analysis experience.
+
 [segger-systemview]: https://www.segger.com/products/development-tools/systemview/
 [sysview-source]: https://raw.githubusercontent.com/SEGGERMicro/SystemView/main/SYSVIEW/SEGGER_SYSVIEW.c
 [sysview-header]: https://raw.githubusercontent.com/SEGGERMicro/SystemView/main/SYSVIEW/SEGGER_SYSVIEW.h
