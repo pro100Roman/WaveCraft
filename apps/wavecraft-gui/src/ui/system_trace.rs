@@ -10,7 +10,8 @@ use crate::system_trace::{
 };
 use crate::system_trace::{
     ProbeLogEntry, ProbeLogLevel, SystemTraceDisplayState, TimelineTimingEdge,
-    TimelineTimingMeasurement, TraceEventCategory, TraceEventView, TraceTimeDisplay,
+    TimelineTimingMeasurement, TraceEventCategory, TraceEventView, TraceInstrument,
+    TraceTimeDisplay,
 };
 use crate::waveform::chrome::half_transparent_plate;
 use crate::{
@@ -888,29 +889,35 @@ impl WaveCraftApp {
                 self.system_trace
                     .fit_trace_instruments_to_height(available_pane_height);
                 let pane_width = ui.available_width();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(pane_width, self.system_trace.timeline_view_height()),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        paint_timeline_instrument(
-                            ui,
-                            &mut self.system_trace,
-                            timestamp_frequency_override_hz,
-                        );
-                    },
-                );
-                paint_trace_instrument_splitter(ui, &mut self.system_trace);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(pane_width, self.system_trace.event_view_height()),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        paint_event_instrument(
-                            ui,
-                            &mut self.system_trace,
-                            timestamp_frequency_override_hz,
-                        );
-                    },
-                );
+                let order = *self.system_trace.trace_instrument_order();
+                let mut pane_rects = Vec::with_capacity(order.len());
+                for (index, instrument) in order.into_iter().enumerate() {
+                    let pane_height = match instrument {
+                        TraceInstrument::Timeline => self.system_trace.timeline_view_height(),
+                        TraceInstrument::Analysis => self.system_trace.event_view_height(),
+                    };
+                    let pane = ui.allocate_ui_with_layout(
+                        egui::vec2(pane_width, pane_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| match instrument {
+                            TraceInstrument::Timeline => paint_timeline_instrument(
+                                ui,
+                                &mut self.system_trace,
+                                timestamp_frequency_override_hz,
+                            ),
+                            TraceInstrument::Analysis => paint_event_instrument(
+                                ui,
+                                &mut self.system_trace,
+                                timestamp_frequency_override_hz,
+                            ),
+                        },
+                    );
+                    pane_rects.push((instrument, pane.response.rect));
+                    if index == 0 {
+                        paint_trace_instrument_splitter(ui, &mut self.system_trace);
+                    }
+                }
+                update_trace_instrument_drag(&mut self.system_trace, &pane_rects, ui);
             });
     }
 
@@ -1271,6 +1278,55 @@ fn instrument_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(12.0))
 }
 
+fn paint_trace_instrument_drag_handle(
+    ui: &mut egui::Ui,
+    trace: &mut SystemTraceDisplayState,
+    instrument: TraceInstrument,
+    label: &str,
+) {
+    let dragging = trace.dragged_trace_instrument().is_some();
+    let response = ui
+        .add(
+            egui::Label::new(RichText::new("⠿").strong().color(ACCENT))
+                .sense(egui::Sense::click_and_drag()),
+        )
+        .on_hover_cursor(if dragging {
+            egui::CursorIcon::Grabbing
+        } else {
+            egui::CursorIcon::Grab
+        });
+    if ui.input(|input| input.pointer.primary_down())
+        && response.is_pointer_button_down_on()
+        && trace.dragged_trace_instrument().is_none()
+    {
+        trace.begin_trace_instrument_drag(instrument);
+    }
+    if !dragging {
+        response.on_hover_text(format!(
+            "Drag the {label} panel with the left mouse button to move it"
+        ));
+    }
+}
+
+fn update_trace_instrument_drag(
+    trace: &mut SystemTraceDisplayState,
+    pane_rects: &[(TraceInstrument, egui::Rect)],
+    ui: &egui::Ui,
+) {
+    let (primary_down, pointer_position) =
+        ui.input(|input| (input.pointer.primary_down(), input.pointer.interact_pos()));
+    if primary_down && trace.dragged_trace_instrument().is_some() {
+        if let Some((instrument, _)) = pane_rects
+            .iter()
+            .find(|(_, rect)| pointer_position.is_some_and(|position| rect.contains(position)))
+        {
+            trace.drag_trace_instrument_to(*instrument);
+        }
+    } else if !primary_down {
+        trace.finish_trace_instrument_drag();
+    }
+}
+
 fn paint_trace_instrument_splitter(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), TRACE_SPLITTER_HEIGHT),
@@ -1329,6 +1385,7 @@ fn paint_timeline_instrument(
         ui.set_min_width(ui.available_width());
         ui.set_max_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
+            paint_trace_instrument_drag_handle(ui, trace, TraceInstrument::Timeline, "TIMELINE");
             ui.label(RichText::new("TIMELINE").strong().color(ACCENT));
             ui.label(
                 RichText::new("Task, ISR, timer, scheduler, and idle execution").color(TEXT_MUTED),
@@ -2359,28 +2416,13 @@ fn paint_event_instrument(
         ui.set_min_width(ui.available_width());
         ui.set_max_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut trace.event_view, TraceEventView::Events, "EVENTS");
-            ui.selectable_value(&mut trace.event_view, TraceEventView::Logs, "LOGS");
-            ui.selectable_value(
-                &mut trace.event_view,
-                TraceEventView::Terminal,
-                "RTT TERMINAL",
+            paint_trace_instrument_drag_handle(
+                ui,
+                trace,
+                TraceInstrument::Analysis,
+                "ANALYSIS",
             );
-            ui.selectable_value(
-                &mut trace.event_view,
-                TraceEventView::ProbeLog,
-                "PROBE LOG",
-            );
-            ui.selectable_value(
-                &mut trace.event_view,
-                TraceEventView::CpuLoad,
-                "CPU LOAD",
-            );
-            ui.selectable_value(
-                &mut trace.event_view,
-                TraceEventView::ContextStatistics,
-                "CONTEXTS",
-            );
+            paint_event_view_tabs(ui, trace);
             let text_view = matches!(
                 trace.event_view,
                 TraceEventView::Events
@@ -2507,6 +2549,58 @@ fn paint_event_instrument(
             }
         }
     });
+}
+
+fn paint_event_view_tabs(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
+    let order = *trace.event_view_order();
+    let (primary_down, pointer_position) =
+        ui.input(|input| (input.pointer.primary_down(), input.pointer.interact_pos()));
+    for view in order {
+        let dragging = trace.dragged_event_view().is_some();
+        let response = ui
+            .add(
+                egui::Button::new(trace_event_view_label(view))
+                    .selected(trace.event_view == view)
+                    .sense(egui::Sense::click_and_drag()),
+            )
+            .on_hover_cursor(if dragging {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
+        if response.clicked() {
+            trace.event_view = view;
+        }
+        if primary_down
+            && response.is_pointer_button_down_on()
+            && trace.dragged_event_view().is_none()
+        {
+            trace.begin_event_view_drag(view);
+        }
+        if primary_down
+            && pointer_position.is_some_and(|position| response.rect.contains(position))
+            && trace.dragged_event_view().is_some()
+        {
+            trace.drag_event_view_to(view);
+        }
+        if !dragging {
+            response.on_hover_text("Drag with the left mouse button to reorder this view");
+        }
+    }
+    if !primary_down {
+        trace.finish_event_view_drag();
+    }
+}
+
+const fn trace_event_view_label(view: TraceEventView) -> &'static str {
+    match view {
+        TraceEventView::Events => "EVENTS",
+        TraceEventView::Logs => "LOGS",
+        TraceEventView::Terminal => "RTT TERMINAL",
+        TraceEventView::ProbeLog => "PROBE LOG",
+        TraceEventView::CpuLoad => "CPU LOAD",
+        TraceEventView::ContextStatistics => "CONTEXTS",
+    }
 }
 
 fn paint_event_navigation_controls(
@@ -4194,6 +4288,163 @@ mod tests {
             pressed,
             modifiers: egui::Modifiers::default(),
         }
+    }
+
+    fn paint_reorderable_event_tabs(
+        context: &egui::Context,
+        trace: &mut SystemTraceDisplayState,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Pos2)> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 120.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        };
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.horizontal(|ui| paint_event_view_tabs(ui, trace));
+            });
+        });
+        let mut texts = Vec::new();
+        fn collect(shape: &egui::Shape, texts: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| collect(shape, texts));
+                }
+                egui::Shape::Text(text) => texts.push((
+                    text.galley.text().to_owned(),
+                    text.visual_bounding_rect().center(),
+                )),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn paint_reorderable_trace_instruments(
+        context: &egui::Context,
+        app: &mut WaveCraftApp,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Pos2)> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        };
+        let output = context.run(input, |context| {
+            app.paint_system_trace_central_panel(context);
+        });
+        let mut texts = Vec::new();
+        fn collect(shape: &egui::Shape, texts: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| collect(shape, texts));
+                }
+                egui::Shape::Text(text) => texts.push((
+                    text.galley.text().to_owned(),
+                    text.visual_bounding_rect().center(),
+                )),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    #[test]
+    fn event_view_tabs_reorder_with_a_left_pointer_drag() {
+        let context = egui::Context::default();
+        let mut trace = SystemTraceDisplayState::default();
+        let texts = paint_reorderable_event_tabs(&context, &mut trace, Vec::new());
+        let position = |label: &str| {
+            texts
+                .iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, position)| *position)
+                .unwrap_or_else(|| panic!("{label} tab is painted"))
+        };
+        let probe_log = position("PROBE LOG");
+        let logs = position("LOGS");
+
+        let _ = paint_reorderable_event_tabs(
+            &context,
+            &mut trace,
+            vec![
+                egui::Event::PointerMoved(probe_log),
+                pointer_button(probe_log, true),
+            ],
+        );
+        let _ = paint_reorderable_event_tabs(
+            &context,
+            &mut trace,
+            vec![egui::Event::PointerMoved(logs)],
+        );
+        let _ =
+            paint_reorderable_event_tabs(&context, &mut trace, vec![pointer_button(logs, false)]);
+
+        assert_eq!(
+            trace.event_view_order(),
+            &[
+                TraceEventView::Events,
+                TraceEventView::ProbeLog,
+                TraceEventView::Logs,
+                TraceEventView::Terminal,
+                TraceEventView::CpuLoad,
+                TraceEventView::ContextStatistics,
+            ]
+        );
+        assert_eq!(trace.dragged_event_view(), None);
+    }
+
+    #[test]
+    fn trace_instruments_reorder_with_a_left_pointer_drag() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let texts = paint_reorderable_trace_instruments(&context, &mut app, Vec::new());
+        let mut handles = texts
+            .iter()
+            .filter_map(|(text, position)| (text == "⠿").then_some(*position))
+            .collect::<Vec<_>>();
+        handles.sort_by(|left, right| left.y.total_cmp(&right.y));
+        assert_eq!(handles.len(), 2, "both panel drag handles are painted");
+        let timeline = handles[0];
+        let analysis = handles[1];
+
+        let _ = paint_reorderable_trace_instruments(
+            &context,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(timeline),
+                pointer_button(timeline, true),
+            ],
+        );
+        let _ = paint_reorderable_trace_instruments(
+            &context,
+            &mut app,
+            vec![egui::Event::PointerMoved(analysis)],
+        );
+        let _ = paint_reorderable_trace_instruments(
+            &context,
+            &mut app,
+            vec![pointer_button(analysis, false)],
+        );
+
+        assert_eq!(
+            app.system_trace.trace_instrument_order(),
+            &[TraceInstrument::Analysis, TraceInstrument::Timeline]
+        );
+        assert_eq!(app.system_trace.dragged_trace_instrument(), None);
     }
 
     fn timing_trace() -> SystemTraceDisplayState {

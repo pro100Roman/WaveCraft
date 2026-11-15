@@ -44,6 +44,27 @@ pub(crate) enum TraceEventView {
     ContextStatistics,
 }
 
+impl TraceEventView {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Events,
+        Self::Logs,
+        Self::Terminal,
+        Self::ProbeLog,
+        Self::CpuLoad,
+        Self::ContextStatistics,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TraceInstrument {
+    Timeline,
+    Analysis,
+}
+
+impl TraceInstrument {
+    pub(crate) const ALL: [Self; 2] = [Self::Timeline, Self::Analysis];
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum TraceTimeDisplay {
     #[default]
@@ -1036,6 +1057,10 @@ pub(crate) struct SystemTraceDisplayState {
     event_table_focus_sequence: Option<u64>,
     timeline_focus_sequence: Option<u64>,
     pub(crate) event_view: TraceEventView,
+    event_view_order: [TraceEventView; TraceEventView::ALL.len()],
+    dragged_event_view: Option<TraceEventView>,
+    trace_instrument_order: [TraceInstrument; TraceInstrument::ALL.len()],
+    dragged_trace_instrument: Option<TraceInstrument>,
     pub(crate) event_filter: String,
     pub(crate) event_category_filter: TraceEventCategoryFilter,
     pub(crate) time_display: TraceTimeDisplay,
@@ -1070,6 +1095,10 @@ impl Default for SystemTraceDisplayState {
             event_table_focus_sequence: None,
             timeline_focus_sequence: None,
             event_view: TraceEventView::Events,
+            event_view_order: TraceEventView::ALL,
+            dragged_event_view: None,
+            trace_instrument_order: TraceInstrument::ALL,
+            dragged_trace_instrument: None,
             event_filter: String::new(),
             event_category_filter: TraceEventCategoryFilter::default(),
             time_display: TraceTimeDisplay::Target,
@@ -1091,6 +1120,75 @@ impl Default for SystemTraceDisplayState {
 impl SystemTraceDisplayState {
     pub(crate) fn events(&self) -> &VecDeque<TraceEvent> {
         &self.events
+    }
+
+    pub(crate) fn event_view_order(&self) -> &[TraceEventView; TraceEventView::ALL.len()] {
+        &self.event_view_order
+    }
+
+    pub(crate) fn begin_event_view_drag(&mut self, view: TraceEventView) {
+        self.dragged_event_view = Some(view);
+    }
+
+    pub(crate) fn dragged_event_view(&self) -> Option<TraceEventView> {
+        self.dragged_event_view
+    }
+
+    pub(crate) fn drag_event_view_to(&mut self, target: TraceEventView) {
+        let Some(dragged) = self.dragged_event_view else {
+            return;
+        };
+        let Some(from) = self
+            .event_view_order
+            .iter()
+            .position(|view| *view == dragged)
+        else {
+            return;
+        };
+        let Some(to) = self
+            .event_view_order
+            .iter()
+            .position(|view| *view == target)
+        else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        if from < to {
+            self.event_view_order[from..=to].rotate_left(1);
+        } else {
+            self.event_view_order[to..=from].rotate_right(1);
+        }
+    }
+
+    pub(crate) fn finish_event_view_drag(&mut self) {
+        self.dragged_event_view = None;
+    }
+
+    pub(crate) fn trace_instrument_order(&self) -> &[TraceInstrument; TraceInstrument::ALL.len()] {
+        &self.trace_instrument_order
+    }
+
+    pub(crate) fn begin_trace_instrument_drag(&mut self, instrument: TraceInstrument) {
+        self.dragged_trace_instrument = Some(instrument);
+    }
+
+    pub(crate) fn dragged_trace_instrument(&self) -> Option<TraceInstrument> {
+        self.dragged_trace_instrument
+    }
+
+    pub(crate) fn drag_trace_instrument_to(&mut self, target: TraceInstrument) {
+        let Some(dragged) = self.dragged_trace_instrument else {
+            return;
+        };
+        if dragged != target {
+            self.trace_instrument_order.swap(0, 1);
+        }
+    }
+
+    pub(crate) fn finish_trace_instrument_drag(&mut self) {
+        self.dragged_trace_instrument = None;
     }
 
     pub(crate) fn model(&self) -> &TraceModel {
@@ -1295,13 +1393,18 @@ impl SystemTraceDisplayState {
         if !delta.is_finite() {
             return;
         }
+        let timeline_delta = if self.trace_instrument_order[0] == TraceInstrument::Timeline {
+            delta
+        } else {
+            -delta
+        };
         let total_height = self.timeline_view_height + self.event_view_height;
         let effective_minimum = MIN_TRACE_INSTRUMENT_HEIGHT.min(total_height * 0.5);
         let minimum_timeline_height =
             effective_minimum.max(total_height - MAX_TRACE_INSTRUMENT_HEIGHT);
         let maximum_timeline_height =
             MAX_TRACE_INSTRUMENT_HEIGHT.min(total_height - effective_minimum);
-        self.timeline_view_height = (self.timeline_view_height + delta)
+        self.timeline_view_height = (self.timeline_view_height + timeline_delta)
             .clamp(minimum_timeline_height, maximum_timeline_height);
         self.event_view_height = total_height - self.timeline_view_height;
     }
@@ -1806,6 +1909,57 @@ mod tests {
     }
 
     #[test]
+    fn event_views_move_to_the_hovered_drag_position() {
+        let mut state = SystemTraceDisplayState::default();
+
+        state.begin_event_view_drag(TraceEventView::ProbeLog);
+        state.drag_event_view_to(TraceEventView::Logs);
+
+        assert_eq!(
+            state.event_view_order(),
+            &[
+                TraceEventView::Events,
+                TraceEventView::ProbeLog,
+                TraceEventView::Logs,
+                TraceEventView::Terminal,
+                TraceEventView::CpuLoad,
+                TraceEventView::ContextStatistics,
+            ]
+        );
+
+        state.drag_event_view_to(TraceEventView::ContextStatistics);
+        state.finish_event_view_drag();
+
+        assert_eq!(
+            state.event_view_order(),
+            &[
+                TraceEventView::Events,
+                TraceEventView::Logs,
+                TraceEventView::Terminal,
+                TraceEventView::CpuLoad,
+                TraceEventView::ContextStatistics,
+                TraceEventView::ProbeLog,
+            ]
+        );
+        assert_eq!(state.dragged_event_view(), None);
+    }
+
+    #[test]
+    fn trace_instruments_swap_at_the_drag_target() {
+        let mut state = SystemTraceDisplayState::default();
+
+        state.begin_trace_instrument_drag(TraceInstrument::Timeline);
+        state.drag_trace_instrument_to(TraceInstrument::Analysis);
+        state.finish_trace_instrument_drag();
+
+        assert_eq!(
+            state.trace_instrument_order(),
+            &[TraceInstrument::Analysis, TraceInstrument::Timeline]
+        );
+        assert_eq!(state.dragged_trace_instrument(), None);
+    }
+
+    #[test]
     fn time_references_are_sorted_deduplicated_and_cleared_with_trace_data() {
         let mut state = SystemTraceDisplayState::default();
         state.add_time_reference(20);
@@ -1860,6 +2014,23 @@ mod tests {
         state.move_trace_instrument_splitter(f32::NAN);
         assert_eq!(state.timeline_view_height(), 700.0);
         assert_eq!(state.event_view_height(), MIN_TRACE_INSTRUMENT_HEIGHT);
+    }
+
+    #[test]
+    fn trace_splitter_follows_the_visual_panel_order() {
+        let mut state = SystemTraceDisplayState {
+            timeline_view_height: 480.0,
+            event_view_height: 360.0,
+            ..SystemTraceDisplayState::default()
+        };
+        state.begin_trace_instrument_drag(TraceInstrument::Timeline);
+        state.drag_trace_instrument_to(TraceInstrument::Analysis);
+        state.finish_trace_instrument_drag();
+
+        state.move_trace_instrument_splitter(50.0);
+
+        assert_eq!(state.timeline_view_height(), 430.0);
+        assert_eq!(state.event_view_height(), 410.0);
     }
 
     #[test]
