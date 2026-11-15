@@ -1508,29 +1508,35 @@ fn paint_timeline_instrument(
                 timestamp,
             ));
         }
-        let timeline = timeline_scroll.show(ui, |ui| {
-            let canvas_width = timeline_canvas_width(ui.available_width(), trace.timeline_zoom());
-            let canvas_height = timeline_canvas_height(lanes.len());
-            let (canvas, _) = ui.allocate_exact_size(
-                egui::vec2(canvas_width, canvas_height),
-                egui::Sense::hover(),
-            );
-            let clicked_sequence = paint_timeline_canvas(
-                ui,
-                canvas,
-                trace,
-                &lanes,
-                start_ticks,
-                end_ticks,
-                TimelineCanvasOptions {
-                    selected_timestamp,
-                    timestamp_frequency_override_hz,
-                    time_display: trace.time_display,
-                    recording_start_ticks: start_ticks,
-                },
-            );
-            (canvas.top(), canvas_width, clicked_sequence)
-        });
+        let timeline = egui::Frame::none()
+            .fill(BACKGROUND)
+            .show(ui, |ui| {
+                timeline_scroll.show(ui, |ui| {
+                    let canvas_width =
+                        timeline_canvas_width(ui.available_width(), trace.timeline_zoom());
+                    let canvas_height = timeline_canvas_height(lanes.len());
+                    let (canvas, _) = ui.allocate_exact_size(
+                        egui::vec2(canvas_width, canvas_height),
+                        egui::Sense::hover(),
+                    );
+                    let clicked_sequence = paint_timeline_canvas(
+                        ui,
+                        canvas,
+                        trace,
+                        &lanes,
+                        start_ticks,
+                        end_ticks,
+                        TimelineCanvasOptions {
+                            selected_timestamp,
+                            timestamp_frequency_override_hz,
+                            time_display: trace.time_display,
+                            recording_start_ticks: start_ticks,
+                        },
+                    );
+                    (canvas.top(), canvas_width, clicked_sequence)
+                })
+            })
+            .inner;
         trace.set_timeline_visible_range(Some(timeline_visible_tick_range(
             start_ticks,
             end_ticks,
