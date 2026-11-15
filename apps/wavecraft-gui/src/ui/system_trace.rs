@@ -6061,12 +6061,26 @@ mod tests {
     #[test]
     fn trace_instruments_show_timeline_and_trace_analysis_titles() {
         let context = egui::Context::default();
+        crate::configure_style(&context);
         let mut app = app();
 
-        let texts = paint_central_texts(&context, &mut app);
+        let texts = paint_reorderable_trace_instruments(&context, &mut app, Vec::new());
+        let title_y = |label: &str| {
+            texts
+                .iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, position)| position.y)
+                .unwrap_or_else(|| panic!("{label} title is painted"))
+        };
+        let mut handle_y = texts
+            .iter()
+            .filter_map(|(text, position)| (text == "⠿").then_some(position.y))
+            .collect::<Vec<_>>();
+        handle_y.sort_by(f32::total_cmp);
 
-        assert!(texts.iter().any(|text| text == "TIMELINE"));
-        assert!(texts.iter().any(|text| text == "TRACE ANALYSIS"));
+        assert_eq!(handle_y.len(), 2);
+        assert!((handle_y[0] - title_y("TIMELINE")).abs() <= 0.5);
+        assert!((handle_y[1] - title_y("TRACE ANALYSIS")).abs() <= 0.5);
     }
 
     #[test]

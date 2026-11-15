@@ -74,7 +74,10 @@ fn wavecraft_font_definitions() -> egui::FontDefinitions {
     }
     fonts.font_data.insert(
         SYMBOL_FONT_NAME.to_owned(),
-        egui::FontData::from_static(SYMBOL_FONT_BYTES),
+        egui::FontData::from_static(SYMBOL_FONT_BYTES).tweak(egui::FontTweak {
+            y_offset_factor: 0.0625,
+            ..egui::FontTweak::default()
+        }),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         let family_fonts = fonts.families.entry(family).or_default();
