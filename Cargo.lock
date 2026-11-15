@@ -2096,6 +2096,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.36.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "hashbrown 0.15.5",
+ "indexmap",
+ "memchr",
+ "ruzstd",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2460,6 +2474,15 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ruzstd"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
+dependencies = [
+ "twox-hash",
+]
 
 [[package]]
 name = "same-file"
@@ -2831,6 +2854,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
+name = "twox-hash"
+version = "1.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
+dependencies = [
+ "cfg-if",
+ "static_assertions",
+]
+
+[[package]]
 name = "type-map"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3024,12 +3057,22 @@ dependencies = [
  "wavecraft-core",
  "wavecraft-recording",
  "wavecraft-sim",
+ "wavecraft-systemview",
+ "wavecraft-trace",
  "wavecraft-usb",
 ]
 
 [[package]]
 name = "wavecraft-core"
 version = "0.1.0"
+
+[[package]]
+name = "wavecraft-debug-probe"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "wavecraft-decode"
@@ -3056,12 +3099,15 @@ dependencies = [
  "serde",
  "serde_json",
  "wavecraft-core",
+ "wavecraft-debug-probe",
  "wavecraft-decode",
  "wavecraft-dsp",
  "wavecraft-hackrf",
  "wavecraft-radio",
  "wavecraft-recording",
  "wavecraft-sdr",
+ "wavecraft-systemview",
+ "wavecraft-trace",
  "wavecraft-usb",
  "windows-sys 0.61.2",
 ]
@@ -3106,6 +3152,31 @@ name = "wavecraft-sim"
 version = "0.1.0"
 dependencies = [
  "wavecraft-core",
+]
+
+[[package]]
+name = "wavecraft-systemview"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "wavecraft-trace",
+]
+
+[[package]]
+name = "wavecraft-trace"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "wavecraft-trace-recording"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "serde_json",
+ "wavecraft-trace",
 ]
 
 [[package]]

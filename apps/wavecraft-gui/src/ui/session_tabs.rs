@@ -138,6 +138,9 @@ impl WaveCraftApp {
     /// Paints the session tabs for the active logic or scope view and applies
     /// the select, add, close, and rename actions the user triggers.
     pub(crate) fn paint_session_tabs(&mut self, context: &egui::Context) {
+        if self.system_trace_view_is_active() {
+            return;
+        }
         let outcome = match self.session_tab_strip() {
             Some(strip) => self.paint_session_tab_strip(context, strip),
             None => SessionTabOutcome::default(),

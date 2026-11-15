@@ -39,7 +39,7 @@ impl WaveCraftApp {
     /// Derives the frame's enablement flags and pre-paint snapshots. It only
     /// reads application state.
     pub(crate) fn frame_state(&self) -> FrameState {
-        let control_target = self.active_waveform_tab.map(WaveformTab::capture_target);
+        let control_target = self.active_waveform_view().map(WaveformTab::capture_target);
         let capture_settings_enabled = control_target
             .map_or(true, |target| !self.capture_target_is_active(target))
             && self.pending.is_none();

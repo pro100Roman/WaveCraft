@@ -7,13 +7,232 @@ use crate::{
     saved_logic_settings_metadata, saved_radio_settings_metadata, saved_scope_settings_metadata,
     scope_settings_from_recording_metadata, waveform_tabs, AcquisitionMode, CaptureSettingsProfile,
     CaptureSettingsTab, CombinedSessionSettings, DeviceModel, LogicSessionSettings,
-    SavedCaptureSettingsKind, ScopeSessionSettings, WaveformTab,
+    SavedCaptureSettingsKind, SavedTraceEventView, SavedTraceInstrument, SavedWorkspaceView,
+    ScopeSessionSettings, WaveformTab, WorkspaceView,
+};
+use std::time::Instant;
+
+use crate::{
+    system_trace::{TraceEventView, TraceInstrument},
+    WaveCraftApp,
 };
 
-use crate::WaveCraftApp;
+impl From<WorkspaceView> for SavedWorkspaceView {
+    fn from(view: WorkspaceView) -> Self {
+        match view {
+            WorkspaceView::Waveform(WaveformTab::LogicAnalyzer) => Self::LogicAnalyzer,
+            WorkspaceView::Waveform(WaveformTab::Oscilloscope) => Self::Oscilloscope,
+            WorkspaceView::Waveform(WaveformTab::Lissajous) => Self::Lissajous,
+            WorkspaceView::Waveform(WaveformTab::RadioReceiver) => Self::RadioSpectrum,
+            WorkspaceView::Waveform(WaveformTab::Combined) => Self::Combined,
+            WorkspaceView::SystemTrace => Self::SystemTrace,
+        }
+    }
+}
+
+impl From<SavedWorkspaceView> for WorkspaceView {
+    fn from(view: SavedWorkspaceView) -> Self {
+        match view {
+            SavedWorkspaceView::LogicAnalyzer => Self::Waveform(WaveformTab::LogicAnalyzer),
+            SavedWorkspaceView::Oscilloscope => Self::Waveform(WaveformTab::Oscilloscope),
+            SavedWorkspaceView::Lissajous => Self::Waveform(WaveformTab::Lissajous),
+            SavedWorkspaceView::RadioSpectrum => Self::Waveform(WaveformTab::RadioReceiver),
+            SavedWorkspaceView::Combined => Self::Waveform(WaveformTab::Combined),
+            SavedWorkspaceView::SystemTrace => Self::SystemTrace,
+        }
+    }
+}
+
+impl From<TraceEventView> for SavedTraceEventView {
+    fn from(view: TraceEventView) -> Self {
+        match view {
+            TraceEventView::Events => Self::Events,
+            TraceEventView::Logs => Self::Logs,
+            TraceEventView::Terminal => Self::RttTerminal,
+            TraceEventView::ProbeLog => Self::ProbeLog,
+            TraceEventView::CpuLoad => Self::CpuLoad,
+            TraceEventView::ContextStatistics => Self::ContextStatistics,
+        }
+    }
+}
+
+impl From<SavedTraceEventView> for TraceEventView {
+    fn from(view: SavedTraceEventView) -> Self {
+        match view {
+            SavedTraceEventView::Events => Self::Events,
+            SavedTraceEventView::Logs => Self::Logs,
+            SavedTraceEventView::RttTerminal => Self::Terminal,
+            SavedTraceEventView::ProbeLog => Self::ProbeLog,
+            SavedTraceEventView::CpuLoad => Self::CpuLoad,
+            SavedTraceEventView::ContextStatistics => Self::ContextStatistics,
+        }
+    }
+}
+
+impl From<TraceInstrument> for SavedTraceInstrument {
+    fn from(instrument: TraceInstrument) -> Self {
+        match instrument {
+            TraceInstrument::Timeline => Self::Timeline,
+            TraceInstrument::Analysis => Self::Analysis,
+        }
+    }
+}
+
+impl From<SavedTraceInstrument> for TraceInstrument {
+    fn from(instrument: SavedTraceInstrument) -> Self {
+        match instrument {
+            SavedTraceInstrument::Timeline => Self::Timeline,
+            SavedTraceInstrument::Analysis => Self::Analysis,
+        }
+    }
+}
 
 impl WaveCraftApp {
+    pub(crate) fn track_window_size(&mut self, context: &crate::egui::Context) {
+        let now = Instant::now();
+        if let Some(size) = context.input(|input| {
+            input
+                .viewport()
+                .inner_rect
+                .map(|rect| rect.size())
+                .and_then(crate::saved_window_size_from_vec2)
+        }) {
+            self.observe_window_size(size, now);
+        }
+        self.save_window_size_if_due(now);
+    }
+
+    fn observe_window_size(&mut self, size: crate::SavedWindowSize, now: Instant) {
+        if self.observed_window_size == Some(size) {
+            return;
+        }
+        self.observed_window_size = Some(size);
+        self.window_size_save_due = Some(now + crate::WINDOW_SIZE_SAVE_DELAY);
+    }
+
+    fn save_window_size_if_due(&mut self, now: Instant) {
+        if self
+            .window_size_save_due
+            .is_some_and(|save_due| now >= save_due)
+        {
+            self.window_size_save_due = None;
+            self.save_global_settings();
+        }
+    }
+
+    pub(crate) fn save_pending_window_size(&mut self) {
+        if self.window_size_save_due.take().is_some() {
+            self.save_global_settings();
+        }
+    }
+
+    pub(crate) fn save_global_settings(&mut self) {
+        let Some(active_view) = self.active_workspace_view else {
+            return;
+        };
+        let saved_view = SavedWorkspaceView::from(active_view);
+        let window_inner_size = self.observed_window_size;
+        let workspace_view_order = self
+            .workspace_view_layout
+            .order()
+            .iter()
+            .copied()
+            .map(SavedWorkspaceView::from)
+            .collect::<Vec<_>>();
+        let event_view_order = self
+            .system_trace
+            .event_view_order()
+            .iter()
+            .copied()
+            .map(SavedTraceEventView::from)
+            .collect::<Vec<_>>();
+        let instrument_order = self
+            .system_trace
+            .trace_instrument_order()
+            .iter()
+            .copied()
+            .map(SavedTraceInstrument::from)
+            .collect::<Vec<_>>();
+        if self.saved_capture_settings.global.last_active_view == Some(saved_view)
+            && self.saved_capture_settings.global.window_inner_size == window_inner_size
+            && self
+                .saved_capture_settings
+                .global
+                .workspace_view_order
+                .as_deref()
+                == Some(workspace_view_order.as_slice())
+            && self
+                .saved_capture_settings
+                .global
+                .system_trace_event_view_order
+                .as_deref()
+                == Some(event_view_order.as_slice())
+            && self
+                .saved_capture_settings
+                .global
+                .system_trace_instrument_order
+                .as_deref()
+                == Some(instrument_order.as_slice())
+        {
+            return;
+        }
+
+        let mut document = self.saved_capture_settings.clone();
+        document.global.last_active_view = Some(saved_view);
+        document.global.window_inner_size = window_inner_size;
+        document.global.workspace_view_order = Some(workspace_view_order);
+        document.global.system_trace_event_view_order = Some(event_view_order);
+        document.global.system_trace_instrument_order = Some(instrument_order);
+        let result = self
+            .capture_settings_repository
+            .as_ref()
+            .map(|repository| repository.save(&document));
+        self.saved_capture_settings = document;
+        if let Some(Err(error)) = result {
+            self.last_error = Some(format!("Global settings could not be saved: {error}"));
+        }
+    }
+
     pub(crate) fn apply_saved_capture_settings(&mut self) {
+        if let Some(order) = self
+            .saved_capture_settings
+            .global
+            .workspace_view_order
+            .as_ref()
+        {
+            let order = order
+                .iter()
+                .copied()
+                .map(WorkspaceView::from)
+                .collect::<Vec<_>>();
+            self.workspace_view_layout.set_order(&order);
+        }
+        if let Some(order) = self
+            .saved_capture_settings
+            .global
+            .system_trace_event_view_order
+            .as_ref()
+        {
+            let order = order
+                .iter()
+                .copied()
+                .map(TraceEventView::from)
+                .collect::<Vec<_>>();
+            self.system_trace.set_event_view_order(&order);
+        }
+        if let Some(order) = self
+            .saved_capture_settings
+            .global
+            .system_trace_instrument_order
+            .as_ref()
+        {
+            let order = order
+                .iter()
+                .copied()
+                .map(TraceInstrument::from)
+                .collect::<Vec<_>>();
+            self.system_trace.set_trace_instrument_order(&order);
+        }
         if let Some(profile) = self.saved_capture_settings.profiles.logic_analyzer.as_ref() {
             self.logic_settings = logic_settings_from_recording_metadata(&profile.values);
             self.logic_acquisition_mode = profile
@@ -60,6 +279,11 @@ impl WaveCraftApp {
         {
             self.radio_settings = radio_settings_from_recording_metadata(&profile.values);
         }
+        if let Some(profile) = self.saved_capture_settings.profiles.system_trace.as_ref() {
+            self.system_trace_settings
+                .apply_saved_values(&profile.values);
+            self.reload_system_trace_assets();
+        }
     }
 
     pub(crate) fn save_capture_settings(&mut self, kind: SavedCaptureSettingsKind) {
@@ -86,6 +310,9 @@ impl WaveCraftApp {
             SavedCaptureSettingsKind::RadioFrequency => {
                 CaptureSettingsProfile::new(saved_radio_settings_metadata(&self.radio_settings))
             }
+            SavedCaptureSettingsKind::SystemTrace => {
+                CaptureSettingsProfile::new(self.system_trace_settings.saved_values())
+            }
         };
         match kind {
             SavedCaptureSettingsKind::LogicAnalyzer => {
@@ -97,6 +324,7 @@ impl WaveCraftApp {
             SavedCaptureSettingsKind::RadioFrequency => {
                 document.profiles.radio_frequency = Some(profile)
             }
+            SavedCaptureSettingsKind::SystemTrace => document.profiles.system_trace = Some(profile),
         }
 
         let Some(repository) = self.capture_settings_repository.as_ref() else {
@@ -252,40 +480,7 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn available_waveform_tabs(&self) -> Vec<WaveformTab> {
-        let displayed_logic = self.captures.iter().any(|capture| capture.has_logic)
-            || self.logic_sessions.any(|capture| capture.has_logic)
-            || self
-                .combined_capture
-                .as_ref()
-                .is_some_and(|capture| capture.has_logic);
-        let displayed_scope = self.captures.iter().any(|capture| capture.has_scope)
-            || self.scope_sessions.any(|capture| capture.has_scope)
-            || self
-                .combined_capture
-                .as_ref()
-                .is_some_and(|capture| capture.has_scope);
-        let displayed_radio = self.captures.iter().any(|capture| capture.has_radio)
-            || self
-                .radio_capture
-                .as_ref()
-                .is_some_and(|capture| capture.has_radio);
-        let has_logic_analyzer = displayed_logic
-            || self
-                .devices
-                .iter()
-                .any(|entry| entry.device.profile.model.is_logic_analyzer());
-        let has_oscilloscope = displayed_scope
-            || self
-                .devices
-                .iter()
-                .any(|entry| entry.device.profile.model == DeviceModel::DsCopeU3P100);
-        let has_radio_receiver = displayed_radio || !self.radios.is_empty();
-        waveform_tabs(
-            has_logic_analyzer,
-            has_oscilloscope,
-            has_radio_receiver,
-            self.scope_function_settings.lissajous.enabled,
-        )
+        waveform_tabs(self.scope_function_settings.lissajous.enabled)
     }
 
     pub(crate) fn select_waveform_tab(&mut self, tab: WaveformTab) {
@@ -296,8 +491,30 @@ impl WaveCraftApp {
             self.apply_waveform_view_settings(tab);
         }
         self.active_waveform_tab = Some(tab);
+        self.active_workspace_view = Some(WorkspaceView::Waveform(tab));
         if let Some(settings_tab) = tab.capture_settings_tab() {
             self.active_capture_settings_tab = settings_tab;
+        }
+        self.save_global_settings();
+    }
+
+    pub(crate) fn select_system_trace_view(&mut self) {
+        if let Some(active) = self.active_waveform_tab {
+            self.save_waveform_view_settings(active);
+        }
+        self.active_workspace_view = Some(WorkspaceView::SystemTrace);
+        self.snapshot_plot_rect = None;
+        self.save_global_settings();
+    }
+
+    pub(crate) fn system_trace_view_is_active(&self) -> bool {
+        self.active_workspace_view == Some(WorkspaceView::SystemTrace)
+    }
+
+    pub(crate) fn active_waveform_view(&self) -> Option<WaveformTab> {
+        match self.active_workspace_view {
+            Some(WorkspaceView::Waveform(tab)) => Some(tab),
+            Some(WorkspaceView::SystemTrace) | None => None,
         }
     }
 
@@ -347,6 +564,9 @@ impl WaveCraftApp {
             .active_waveform_tab
             .is_some_and(|active| available.contains(&active))
         {
+            if self.active_workspace_view.is_none() {
+                self.active_workspace_view = self.active_waveform_tab.map(WorkspaceView::Waveform);
+            }
             return;
         }
         let selected = if available.contains(&WaveformTab::Combined) {
@@ -355,9 +575,277 @@ impl WaveCraftApp {
             available.first().copied()
         };
         if let Some(tab) = selected {
-            self.select_waveform_tab(tab);
+            if self.system_trace_view_is_active() {
+                self.active_waveform_tab = Some(tab);
+            } else {
+                self.select_waveform_tab(tab);
+            }
         } else {
             self.active_waveform_tab = None;
+            if !self.system_trace_view_is_active() {
+                self.active_workspace_view = Some(WorkspaceView::SystemTrace);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{egui, CaptureSettingsDocument, CaptureSettingsRepository, SavedWindowSize};
+    use std::fs;
+
+    fn test_repository(test_name: &str) -> CaptureSettingsRepository {
+        let directory = std::env::temp_dir().join(format!(
+            "wavecraft-global-view-settings-{test_name}-{}",
+            std::process::id()
+        ));
+        CaptureSettingsRepository::at(directory.join("capture-settings.json"))
+    }
+
+    fn remove_test_repository(repository: &CaptureSettingsRepository) {
+        let _ = fs::remove_file(repository.path());
+        if let Some(parent) = repository.path().parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn saved_workspace_views_round_trip_without_gui_layout_details() {
+        for view in [
+            WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
+            WorkspaceView::Waveform(WaveformTab::Oscilloscope),
+            WorkspaceView::Waveform(WaveformTab::Lissajous),
+            WorkspaceView::Waveform(WaveformTab::RadioReceiver),
+            WorkspaceView::Waveform(WaveformTab::Combined),
+            WorkspaceView::SystemTrace,
+        ] {
+            assert_eq!(WorkspaceView::from(SavedWorkspaceView::from(view)), view);
+        }
+    }
+
+    #[test]
+    fn selecting_a_view_persists_and_restores_the_global_setting() {
+        let repository = test_repository("active-view");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+
+        app.select_waveform_tab(WaveformTab::Lissajous);
+
+        let saved = repository
+            .load()
+            .expect("the selected view should be saved");
+        assert_eq!(
+            saved.global.last_active_view,
+            Some(SavedWorkspaceView::Lissajous)
+        );
+        let mut restored = WaveCraftApp::with_settings(None, saved);
+        restored.reconcile_waveform_tab();
+        assert_eq!(
+            restored.active_workspace_view,
+            Some(WorkspaceView::Waveform(WaveformTab::Lissajous))
+        );
+        assert_eq!(restored.active_waveform_tab, Some(WaveformTab::Lissajous));
+        assert!(restored.scope_function_settings.lissajous.enabled);
+        assert!(restored
+            .available_waveform_tabs()
+            .contains(&WaveformTab::Lissajous));
+
+        app.select_system_trace_view();
+
+        let saved = repository
+            .load()
+            .expect("the system trace view should be saved");
+        assert_eq!(
+            saved.global.last_active_view,
+            Some(SavedWorkspaceView::SystemTrace)
+        );
+        let restored = WaveCraftApp::with_settings(None, saved);
+        assert_eq!(
+            restored.active_workspace_view,
+            Some(WorkspaceView::SystemTrace)
+        );
+        assert_eq!(restored.active_waveform_tab, None);
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn system_trace_layout_persists_across_application_restart() {
+        let repository = test_repository("system-trace-layout");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.select_system_trace_view();
+        let event_order = [
+            TraceEventView::ProbeLog,
+            TraceEventView::CpuLoad,
+            TraceEventView::Events,
+            TraceEventView::Logs,
+            TraceEventView::ContextStatistics,
+            TraceEventView::Terminal,
+        ];
+        let instrument_order = [TraceInstrument::Analysis, TraceInstrument::Timeline];
+        assert!(app.system_trace.set_event_view_order(&event_order));
+        assert!(app
+            .system_trace
+            .set_trace_instrument_order(&instrument_order));
+
+        app.save_global_settings();
+
+        let saved = repository.load().expect("the trace layout should be saved");
+        let restored = WaveCraftApp::with_settings(None, saved);
+        assert_eq!(restored.system_trace.event_view_order(), &event_order);
+        assert_eq!(
+            restored.system_trace.trace_instrument_order(),
+            &instrument_order
+        );
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn workspace_view_order_persists_across_application_restart() {
+        let repository = test_repository("workspace-view-order");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.select_waveform_tab(WaveformTab::LogicAnalyzer);
+        app.workspace_view_layout
+            .begin_drag(WorkspaceView::SystemTrace);
+        app.workspace_view_layout
+            .drag_to(WorkspaceView::Waveform(WaveformTab::Oscilloscope));
+        app.workspace_view_layout.finish_drag();
+
+        app.save_global_settings();
+
+        let saved = repository
+            .load()
+            .expect("the workspace view order should be saved");
+        let restored = WaveCraftApp::with_settings(None, saved);
+        assert_eq!(
+            restored.workspace_view_layout.order(),
+            &[
+                WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
+                WorkspaceView::SystemTrace,
+                WorkspaceView::Waveform(WaveformTab::Oscilloscope),
+                WorkspaceView::Waveform(WaveformTab::Lissajous),
+                WorkspaceView::Waveform(WaveformTab::RadioReceiver),
+                WorkspaceView::Waveform(WaveformTab::Combined),
+            ]
+        );
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn window_size_persists_after_resize_and_restores_at_startup() {
+        let repository = test_repository("window-size");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.select_waveform_tab(WaveformTab::LogicAnalyzer);
+        let now = Instant::now();
+        let resized = SavedWindowSize {
+            width: 1512,
+            height: 982,
+        };
+
+        app.observe_window_size(resized, now);
+        app.save_window_size_if_due(now + crate::WINDOW_SIZE_SAVE_DELAY);
+
+        let saved = repository.load().expect("the window size should be saved");
+        assert_eq!(saved.global.window_inner_size, Some(resized));
+        assert_eq!(crate::initial_window_inner_size(&saved), [1512.0, 982.0]);
+        let restored = WaveCraftApp::with_settings(None, saved);
+        assert_eq!(restored.observed_window_size, Some(resized));
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn invalid_saved_window_size_uses_the_default() {
+        let mut settings = CaptureSettingsDocument::default();
+        settings.global.window_inner_size = Some(SavedWindowSize {
+            width: 10,
+            height: 20,
+        });
+
+        assert_eq!(
+            crate::initial_window_inner_size(&settings),
+            crate::DEFAULT_WINDOW_INNER_SIZE
+        );
+        let app = WaveCraftApp::with_settings(None, settings);
+        assert_eq!(app.observed_window_size, None);
+    }
+
+    #[test]
+    fn pending_window_size_is_saved_when_the_application_exits() {
+        let repository = test_repository("window-size-on-exit");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.select_system_trace_view();
+        let resized = SavedWindowSize {
+            width: 1366,
+            height: 768,
+        };
+        app.observe_window_size(resized, Instant::now());
+
+        app.save_pending_window_size();
+
+        let saved = repository
+            .load()
+            .expect("the pending window size should be saved on exit");
+        assert_eq!(saved.global.window_inner_size, Some(resized));
+        assert_eq!(app.window_size_save_due, None);
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn window_size_is_read_from_the_native_viewport() {
+        let context = egui::Context::default();
+        let mut app = WaveCraftApp::with_settings(None, CaptureSettingsDocument::default());
+        let mut input = egui::RawInput::default();
+        let viewport = input.viewports.entry(input.viewport_id).or_default();
+        viewport.inner_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(40.0, 30.0),
+            egui::vec2(1600.0, 1000.0),
+        ));
+
+        let _ = context.run(input, |context| app.track_window_size(context));
+
+        assert_eq!(
+            app.observed_window_size,
+            Some(SavedWindowSize {
+                width: 1600,
+                height: 1000,
+            })
+        );
+        assert!(app.window_size_save_due.is_some());
+    }
+
+    #[test]
+    fn invalid_saved_workspace_view_order_falls_back_to_default() {
+        let mut settings = CaptureSettingsDocument::default();
+        settings.global.workspace_view_order = Some(vec![
+            SavedWorkspaceView::SystemTrace,
+            SavedWorkspaceView::SystemTrace,
+            SavedWorkspaceView::LogicAnalyzer,
+            SavedWorkspaceView::Oscilloscope,
+            SavedWorkspaceView::Lissajous,
+            SavedWorkspaceView::RadioSpectrum,
+        ]);
+
+        let app = WaveCraftApp::with_settings(None, settings);
+
+        assert_eq!(app.workspace_view_layout.order(), &WorkspaceView::ALL);
     }
 }

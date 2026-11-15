@@ -1,6 +1,7 @@
 mod acquisition;
 mod app;
 mod capture_settings;
+mod debug_probes;
 mod devices;
 mod format;
 #[cfg(test)]
@@ -15,6 +16,7 @@ mod recording;
 mod recording_metadata;
 mod sessions;
 mod snapshot;
+mod system_trace;
 #[cfg(test)]
 mod tests;
 mod theme;
@@ -28,7 +30,9 @@ use acquisition::radio_backend::*;
 use acquisition::scope::*;
 use capture_settings::{
     CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository,
+    SavedTraceEventView, SavedTraceInstrument, SavedWindowSize, SavedWorkspaceView,
 };
+use debug_probes::*;
 use devices::{
     capture_devices_for_target, default_resource_directory, first_device_id_for_role,
     first_radio_id, selected_device_for_role, selected_radio, usb_speed_warning, DeviceEntry,
@@ -79,13 +83,13 @@ use std::io::{BufReader, BufWriter, Read, Seek};
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use theme::{
-    configure_style, toolbar_action_button, ACCENT, BACKGROUND, GRID, MATH_COLOR, ORANGE, PANEL,
-    SCOPE_COLORS, TEXT_MUTED,
+    apply_setup_panel_typography, configure_style, toolbar_action_button, ACCENT, BACKGROUND, GRID,
+    MATH_COLOR, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
 };
 use ui::capture_settings_panel::*;
 use ui::decoded_panel::*;
@@ -94,6 +98,7 @@ use ui::frame_actions::FrameActions;
 use ui::protocol_analyzer_dialog::*;
 use ui::radio_settings::*;
 use ui::scope_settings::*;
+use ui::system_trace::*;
 use ui::view_tabs::*;
 use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
@@ -270,10 +275,55 @@ fn wavecraft_app_icon() -> Option<egui::IconData> {
     eframe::icon_data::from_png_bytes(include_bytes!("../assets/wavecraft-icon.png")).ok()
 }
 
+const DEFAULT_WINDOW_INNER_SIZE: [f32; 2] = [1280.0, 820.0];
+const MINIMUM_WINDOW_INNER_SIZE: [f32; 2] = [920.0, 620.0];
+const MAXIMUM_SAVED_WINDOW_DIMENSION: u32 = 16_384;
+const WINDOW_SIZE_SAVE_DELAY: Duration = Duration::from_millis(500);
+
+fn validated_window_inner_size(size: SavedWindowSize) -> Option<[f32; 2]> {
+    (size.width >= MINIMUM_WINDOW_INNER_SIZE[0] as u32
+        && size.height >= MINIMUM_WINDOW_INNER_SIZE[1] as u32
+        && size.width <= MAXIMUM_SAVED_WINDOW_DIMENSION
+        && size.height <= MAXIMUM_SAVED_WINDOW_DIMENSION)
+        .then_some([size.width as f32, size.height as f32])
+}
+
+fn saved_window_size_from_vec2(size: Vec2) -> Option<SavedWindowSize> {
+    if !size.x.is_finite() || !size.y.is_finite() {
+        return None;
+    }
+    let saved = SavedWindowSize {
+        width: size.x.round().max(0.0) as u32,
+        height: size.y.round().max(0.0) as u32,
+    };
+    validated_window_inner_size(saved).map(|_| saved)
+}
+
+fn initial_window_inner_size(settings: &CaptureSettingsDocument) -> [f32; 2] {
+    settings
+        .global
+        .window_inner_size
+        .and_then(validated_window_inner_size)
+        .unwrap_or(DEFAULT_WINDOW_INNER_SIZE)
+}
+
 pub fn run() -> eframe::Result<()> {
+    let (capture_settings_repository, saved_capture_settings, settings_load_error) =
+        match CaptureSettingsRepository::for_current_user() {
+            Ok(repository) => match repository.load() {
+                Ok(settings) => (Some(repository), settings, None),
+                Err(error) => (
+                    Some(repository),
+                    CaptureSettingsDocument::default(),
+                    Some(error),
+                ),
+            },
+            Err(error) => (None, CaptureSettingsDocument::default(), Some(error)),
+        };
+    let initial_window_size = initial_window_inner_size(&saved_capture_settings);
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1280.0, 820.0])
-        .with_min_inner_size([920.0, 620.0]);
+        .with_inner_size(initial_window_size)
+        .with_min_inner_size(MINIMUM_WINDOW_INNER_SIZE);
     // The icon is embedded at build time; if it ever fails to decode the window
     // simply opens with the platform's default icon.
     if let Some(icon) = wavecraft_app_icon() {
@@ -286,13 +336,26 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native(
         "WaveCraft",
         options,
-        Box::new(|creation_context| Ok(Box::new(WaveCraftApp::new(creation_context)))),
+        Box::new(move |creation_context| {
+            configure_style(&creation_context.egui_ctx);
+            let mut app =
+                WaveCraftApp::with_settings(capture_settings_repository, saved_capture_settings);
+            app.begin_refresh();
+            if let Some(error) = settings_load_error {
+                app.last_error = Some(format!(
+                    "Saved settings could not be loaded; using defaults: {error}"
+                ));
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
 struct WaveCraftApp {
     capture_settings_repository: Option<CaptureSettingsRepository>,
     saved_capture_settings: CaptureSettingsDocument,
+    observed_window_size: Option<SavedWindowSize>,
+    window_size_save_due: Option<Instant>,
     resource_directory: String,
     settings_open: bool,
     auto_calibration_confirmation_open: bool,
@@ -326,7 +389,20 @@ struct WaveCraftApp {
     scope_marker_settings: ScopeMarkerSettings,
     scope_quick_time_measurement: ScopeQuickTimeMeasurement,
     scope_marker_editor: Option<ScopeMarkerEditor>,
+    active_workspace_view: Option<WorkspaceView>,
     active_waveform_tab: Option<WaveformTab>,
+    workspace_view_layout: WorkspaceViewLayout,
+    system_trace_settings: SystemTraceSettings,
+    system_trace_setup_panel_open: bool,
+    system_trace: system_trace::SystemTraceDisplayState,
+    system_trace_events: Option<Receiver<wavecraft_trace::TraceEvent>>,
+    system_trace_terminal_lines: Option<Receiver<wavecraft_debug_probe::RttTerminalLine>>,
+    system_trace_connection: system_trace::SystemTraceConnectionState,
+    system_trace_worker_commands: Option<Sender<system_trace::SystemTraceWorkerCommand>>,
+    system_trace_worker_events: Option<Receiver<system_trace::SystemTraceWorkerEvent>>,
+    debug_probes: Vec<wavecraft_debug_probe::ProbeDescriptor>,
+    debug_probe_target_groups: Vec<wavecraft_debug_probe::ProbeTargetGroup>,
+    debug_probe_discovery_error: Option<String>,
     combined_logic_ratio: f32,
     logic_channel_colors: [Color32; LOGIC_CHANNEL_COUNT],
     logic_channel_marker_opacities: [u8; LOGIC_CHANNEL_COUNT],
@@ -376,39 +452,33 @@ fn default_scope_measurement_window_positions() -> [Vec2; 2] {
 }
 
 impl WaveCraftApp {
-    fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
-        configure_style(&creation_context.egui_ctx);
-        let (capture_settings_repository, saved_capture_settings, settings_load_error) =
-            match CaptureSettingsRepository::for_current_user() {
-                Ok(repository) => match repository.load() {
-                    Ok(settings) => (Some(repository), settings, None),
-                    Err(error) => (
-                        Some(repository),
-                        CaptureSettingsDocument::default(),
-                        Some(error),
-                    ),
-                },
-                Err(error) => (None, CaptureSettingsDocument::default(), Some(error)),
-            };
-        let mut app = Self::with_settings(capture_settings_repository, saved_capture_settings);
-        app.begin_refresh();
-        if let Some(error) = settings_load_error {
-            app.last_error = Some(format!(
-                "Saved capture settings could not be loaded; using defaults: {error}"
-            ));
-        }
-        app
-    }
-
     /// Builds the application state from saved settings. It neither discovers
     /// devices nor reads or writes the settings file, so tests can use it.
     fn with_settings(
         capture_settings_repository: Option<CaptureSettingsRepository>,
         saved_capture_settings: CaptureSettingsDocument,
     ) -> Self {
+        let restored_window_size = saved_capture_settings
+            .global
+            .window_inner_size
+            .filter(|size| validated_window_inner_size(*size).is_some());
+        let restored_workspace_view = saved_capture_settings
+            .global
+            .last_active_view
+            .map(WorkspaceView::from);
+        let restored_waveform_tab = match restored_workspace_view {
+            Some(WorkspaceView::Waveform(tab)) => Some(tab),
+            Some(WorkspaceView::SystemTrace) | None => None,
+        };
+        let mut restored_scope_function_settings = ScopeFunctionSettings::default();
+        if restored_waveform_tab == Some(WaveformTab::Lissajous) {
+            restored_scope_function_settings.lissajous.enabled = true;
+        }
         let mut app = Self {
             capture_settings_repository,
             saved_capture_settings,
+            observed_window_size: restored_window_size,
+            window_size_save_due: None,
             resource_directory: default_resource_directory(),
             settings_open: false,
             auto_calibration_confirmation_open: false,
@@ -438,11 +508,24 @@ impl WaveCraftApp {
             scope_settings: ScopeCaptureSettings::default(),
             scope_auto_sample_rate: true,
             scope_smart_timing_enabled: false,
-            scope_function_settings: ScopeFunctionSettings::default(),
+            scope_function_settings: restored_scope_function_settings,
             scope_marker_settings: ScopeMarkerSettings::default(),
             scope_quick_time_measurement: ScopeQuickTimeMeasurement::default(),
             scope_marker_editor: None,
-            active_waveform_tab: None,
+            active_workspace_view: restored_workspace_view,
+            active_waveform_tab: restored_waveform_tab,
+            workspace_view_layout: WorkspaceViewLayout::default(),
+            system_trace_settings: SystemTraceSettings::default(),
+            system_trace_setup_panel_open: true,
+            system_trace: system_trace::SystemTraceDisplayState::default(),
+            system_trace_events: None,
+            system_trace_terminal_lines: None,
+            system_trace_connection: system_trace::SystemTraceConnectionState::default(),
+            system_trace_worker_commands: None,
+            system_trace_worker_events: None,
+            debug_probes: Vec::new(),
+            debug_probe_target_groups: Vec::new(),
+            debug_probe_discovery_error: None,
             combined_logic_ratio: 0.55,
             logic_channel_colors: default_logic_channel_colors(),
             logic_channel_marker_opacities: default_logic_channel_marker_opacities(),
@@ -524,9 +607,49 @@ impl eframe::App for WaveCraftApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.run_frame(context);
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_pending_window_size();
+    }
 }
 
 impl WaveCraftApp {
+    fn poll_system_trace_events(&mut self) {
+        let mut disconnected = false;
+        if let Some(events) = &self.system_trace_events {
+            loop {
+                match events.try_recv() {
+                    Ok(event) => self.system_trace.ingest(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.system_trace_events = None;
+        }
+
+        let mut terminal_disconnected = false;
+        if let Some(lines) = &self.system_trace_terminal_lines {
+            loop {
+                match lines.try_recv() {
+                    Ok(line) => self.system_trace.ingest_terminal_line(line),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        terminal_disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if terminal_disconnected {
+            self.system_trace_terminal_lines = None;
+        }
+    }
+
     /// Runs one frame: polls workers, paints every panel, and applies what the
     /// user asked for. It does not use the `eframe::Frame`, so tests can call it
     /// with a bare `egui::Context`.
@@ -536,8 +659,11 @@ impl WaveCraftApp {
         context.request_repaint_after(CPU_LOAD_SAMPLE_INTERVAL);
         self.poll_calibration_progress();
         self.poll_worker();
+        self.poll_system_trace_events();
+        self.poll_system_trace_connection();
         self.reconcile_capture_settings_tab();
         self.reconcile_waveform_tab();
+        self.track_window_size(context);
         self.reconcile_device_selections();
         self.reconcile_radio_settings();
         self.poll_capture();
@@ -552,8 +678,15 @@ impl WaveCraftApp {
         self.paint_toolbar(context, &frame, &mut actions);
 
         self.paint_waveform_tabs(context);
+        if self.workspace_view_layout.take_layout_changed() {
+            self.save_global_settings();
+        }
 
-        self.paint_capture_setup_panel(context, &frame, &mut actions);
+        if self.system_trace_view_is_active() {
+            self.paint_system_trace_setup_panel(context, &mut actions);
+        } else {
+            self.paint_capture_setup_panel(context, &frame, &mut actions);
+        }
 
         if let Some(kind) = actions.save_capture_settings_kind {
             self.save_capture_settings(kind);
@@ -577,6 +710,9 @@ impl WaveCraftApp {
         self.paint_session_tabs(context);
 
         self.paint_central_panel(context, &frame, actions.snapshot_clicked);
+        if self.system_trace.take_layout_changed() {
+            self.save_global_settings();
+        }
 
         self.paint_settings_window(
             context,
@@ -616,6 +752,7 @@ impl WaveCraftApp {
         }
 
         self.apply_toolbar_actions(&mut actions, &frame);
+        self.apply_system_trace_action(actions.system_trace_action);
         match actions.calibration_action {
             Some(ScopeCalibrationAction::Auto) => {
                 self.auto_calibration_confirmation_open = true;
@@ -659,7 +796,10 @@ impl WaveCraftApp {
             }
         }
         self.apply_scope_frontend_changes(&actions, &frame);
-        if self.pending.is_some() || !self.captures.is_empty() {
+        if self.pending.is_some()
+            || !self.captures.is_empty()
+            || self.system_trace_connection.needs_fast_poll()
+        {
             context.request_repaint_after(Duration::from_millis(16));
         } else if let Some(scheduled) = self.scheduled_repetitive_capture {
             context.request_repaint_after(scheduled.due.saturating_duration_since(Instant::now()));

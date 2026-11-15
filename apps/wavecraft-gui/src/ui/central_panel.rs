@@ -130,6 +130,10 @@ impl WaveCraftApp {
         frame: &FrameState,
         snapshot_clicked: bool,
     ) {
+        if self.system_trace_view_is_active() {
+            self.paint_system_trace_central_panel(context);
+            return;
+        }
         let mut state = PanelState::take_from(self);
         egui::CentralPanel::default()
             .frame(
@@ -155,17 +159,13 @@ impl WaveCraftApp {
     }
 
     /// Paints the view of the active waveform tab, with the scope tools beside
-    /// it when that tab uses them, or a hint when no instrument is available.
+    /// it when that tab uses them.
     fn paint_waveform_views(
         &mut self,
         ui: &mut egui::Ui,
         frame: &FrameState,
         state: &mut PanelState,
     ) {
-        if self.available_waveform_tabs().is_empty() {
-            paint_connect_instrument_message(ui);
-            return;
-        }
         if !scope_tools_panel_is_visible(self.active_waveform_tab) {
             self.paint_active_waveform_view(ui, frame, state);
             return;
@@ -690,12 +690,6 @@ impl WaveCraftApp {
         }
         self.scope_settings.trigger = scope_trigger_settings;
     }
-}
-
-fn paint_connect_instrument_message(ui: &mut egui::Ui) {
-    ui.centered_and_justified(|ui| {
-        ui.label(RichText::new("Connect a supported instrument, then Refresh").color(TEXT_MUTED));
-    });
 }
 
 /// The expanded "DECODED DATA" panel; returns the sample range the user

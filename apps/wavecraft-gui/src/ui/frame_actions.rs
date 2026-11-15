@@ -1,6 +1,7 @@
 //! State that the panels painted by `update()` accumulate during one frame and
 //! that `update()` applies after painting.
 
+use crate::system_trace::SystemTraceAction;
 use crate::{
     choose_decoded_data_save_path, choose_recording_save_path, choose_recording_to_open,
     choose_saleae_export_path, ui::frame_state::FrameState, AcquisitionMode, CaptureTarget,
@@ -25,6 +26,7 @@ pub(crate) struct FrameActions {
     pub(crate) logic_device_selection_changed: bool,
     pub(crate) scope_device_selection_changed: bool,
     pub(crate) radio_device_selection_changed: bool,
+    pub(crate) system_trace_action: Option<SystemTraceAction>,
 }
 
 impl WaveCraftApp {

@@ -3,6 +3,105 @@
 use crate::CaptureTarget;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceView {
+    Waveform(WaveformTab),
+    SystemTrace,
+}
+
+impl WorkspaceView {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Waveform(WaveformTab::LogicAnalyzer),
+        Self::Waveform(WaveformTab::Oscilloscope),
+        Self::Waveform(WaveformTab::Lissajous),
+        Self::Waveform(WaveformTab::RadioReceiver),
+        Self::Waveform(WaveformTab::Combined),
+        Self::SystemTrace,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Waveform(tab) => tab.label(),
+            Self::SystemTrace => "System Trace",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceViewLayout {
+    order: [WorkspaceView; WorkspaceView::ALL.len()],
+    dragged_view: Option<WorkspaceView>,
+    layout_changed: bool,
+}
+
+impl Default for WorkspaceViewLayout {
+    fn default() -> Self {
+        Self {
+            order: WorkspaceView::ALL,
+            dragged_view: None,
+            layout_changed: false,
+        }
+    }
+}
+
+impl WorkspaceViewLayout {
+    pub(crate) fn order(&self) -> &[WorkspaceView; WorkspaceView::ALL.len()] {
+        &self.order
+    }
+
+    pub(crate) fn set_order(&mut self, order: &[WorkspaceView]) -> bool {
+        if order.len() != WorkspaceView::ALL.len()
+            || !WorkspaceView::ALL
+                .iter()
+                .all(|view| order.iter().filter(|candidate| *candidate == view).count() == 1)
+        {
+            return false;
+        }
+        self.order.copy_from_slice(order);
+        true
+    }
+
+    pub(crate) fn begin_drag(&mut self, view: WorkspaceView) {
+        self.dragged_view = Some(view);
+    }
+
+    pub(crate) fn dragged_view(&self) -> Option<WorkspaceView> {
+        self.dragged_view
+    }
+
+    pub(crate) fn drag_to(&mut self, target: WorkspaceView) {
+        let Some(dragged) = self.dragged_view else {
+            return;
+        };
+        let Some(from) = self.order.iter().position(|view| *view == dragged) else {
+            return;
+        };
+        let Some(to) = self.order.iter().position(|view| *view == target) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        if from < to {
+            self.order[from..=to].rotate_left(1);
+        } else {
+            self.order[to..=from].rotate_right(1);
+        }
+        self.layout_changed = true;
+    }
+
+    pub(crate) fn finish_drag(&mut self) {
+        self.dragged_view = None;
+    }
+
+    pub(crate) fn take_layout_changed(&mut self) -> bool {
+        if self.dragged_view.is_some() {
+            return false;
+        }
+        std::mem::take(&mut self.layout_changed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CaptureSettingsTab {
     DsLogic,
     DsCope,
@@ -13,6 +112,7 @@ pub(crate) enum SavedCaptureSettingsKind {
     LogicAnalyzer,
     Oscilloscope,
     RadioFrequency,
+    SystemTrace,
 }
 
 impl SavedCaptureSettingsKind {
@@ -21,6 +121,7 @@ impl SavedCaptureSettingsKind {
             Self::LogicAnalyzer => "LA",
             Self::Oscilloscope => "OSC",
             Self::RadioFrequency => "RF",
+            Self::SystemTrace => "TRACE",
         }
     }
 }
@@ -107,29 +208,22 @@ impl WaveformTab {
     }
 }
 
-pub(crate) fn waveform_tabs(
-    has_logic_analyzer: bool,
-    has_oscilloscope: bool,
-    has_radio_receiver: bool,
-    show_lissajous: bool,
-) -> Vec<WaveformTab> {
-    let mut tabs = Vec::with_capacity(5);
-    if has_logic_analyzer {
-        tabs.push(WaveformTab::LogicAnalyzer);
-    }
-    if has_oscilloscope {
-        tabs.push(WaveformTab::Oscilloscope);
-    }
-    if has_oscilloscope && show_lissajous {
+pub(crate) fn waveform_tabs(show_lissajous: bool) -> Vec<WaveformTab> {
+    let mut tabs = vec![WaveformTab::LogicAnalyzer, WaveformTab::Oscilloscope];
+    if show_lissajous {
         tabs.push(WaveformTab::Lissajous);
     }
-    if has_radio_receiver {
-        tabs.push(WaveformTab::RadioReceiver);
-    }
-    if has_logic_analyzer && has_oscilloscope {
-        tabs.push(WaveformTab::Combined);
-    }
+    tabs.extend([WaveformTab::RadioReceiver, WaveformTab::Combined]);
     tabs
+}
+
+pub(crate) fn workspace_views(waveform_tabs: &[WaveformTab]) -> Vec<WorkspaceView> {
+    waveform_tabs
+        .iter()
+        .copied()
+        .map(WorkspaceView::Waveform)
+        .chain(std::iter::once(WorkspaceView::SystemTrace))
+        .collect()
 }
 
 pub(crate) fn scope_tools_panel_is_visible(active_tab: Option<WaveformTab>) -> bool {
@@ -144,41 +238,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn waveform_tabs_require_their_connected_devices() {
-        assert!(waveform_tabs(false, false, false, true).is_empty());
+    fn waveform_tabs_do_not_require_connected_devices() {
         assert_eq!(
-            waveform_tabs(true, false, false, true),
-            vec![WaveformTab::LogicAnalyzer]
-        );
-        assert_eq!(
-            waveform_tabs(false, true, false, false),
-            vec![WaveformTab::Oscilloscope]
-        );
-        assert_eq!(
-            waveform_tabs(false, true, false, true),
-            vec![WaveformTab::Oscilloscope, WaveformTab::Lissajous]
-        );
-        assert_eq!(
-            waveform_tabs(true, true, false, false),
+            waveform_tabs(false),
             vec![
                 WaveformTab::LogicAnalyzer,
                 WaveformTab::Oscilloscope,
+                WaveformTab::RadioReceiver,
                 WaveformTab::Combined,
             ]
         );
         assert_eq!(
-            waveform_tabs(true, true, false, true),
+            waveform_tabs(true),
             vec![
                 WaveformTab::LogicAnalyzer,
                 WaveformTab::Oscilloscope,
                 WaveformTab::Lissajous,
+                WaveformTab::RadioReceiver,
                 WaveformTab::Combined,
             ]
         );
+    }
+
+    #[test]
+    fn system_trace_is_a_workspace_view_not_a_waveform() {
+        assert_eq!(workspace_views(&[]), vec![WorkspaceView::SystemTrace]);
         assert_eq!(
-            waveform_tabs(false, false, true, false),
-            vec![WaveformTab::RadioReceiver]
+            workspace_views(&[WaveformTab::LogicAnalyzer]),
+            vec![
+                WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
+                WorkspaceView::SystemTrace,
+            ]
         );
+    }
+
+    #[test]
+    fn workspace_view_layout_reorders_and_reports_completed_drags() {
+        let mut layout = WorkspaceViewLayout::default();
+        layout.begin_drag(WorkspaceView::SystemTrace);
+        layout.drag_to(WorkspaceView::Waveform(WaveformTab::Oscilloscope));
+
+        assert_eq!(
+            layout.order(),
+            &[
+                WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
+                WorkspaceView::SystemTrace,
+                WorkspaceView::Waveform(WaveformTab::Oscilloscope),
+                WorkspaceView::Waveform(WaveformTab::Lissajous),
+                WorkspaceView::Waveform(WaveformTab::RadioReceiver),
+                WorkspaceView::Waveform(WaveformTab::Combined),
+            ]
+        );
+        assert!(!layout.take_layout_changed());
+        layout.finish_drag();
+        assert!(layout.take_layout_changed());
+        assert!(!layout.take_layout_changed());
+    }
+
+    #[test]
+    fn workspace_view_layout_rejects_incomplete_or_duplicate_orders() {
+        let mut layout = WorkspaceViewLayout::default();
+        assert!(!layout.set_order(&WorkspaceView::ALL[..5]));
+        assert!(!layout.set_order(&[
+            WorkspaceView::SystemTrace,
+            WorkspaceView::SystemTrace,
+            WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
+            WorkspaceView::Waveform(WaveformTab::Oscilloscope),
+            WorkspaceView::Waveform(WaveformTab::Lissajous),
+            WorkspaceView::Waveform(WaveformTab::RadioReceiver),
+        ]));
+        assert_eq!(layout.order(), &WorkspaceView::ALL);
     }
 
     #[test]

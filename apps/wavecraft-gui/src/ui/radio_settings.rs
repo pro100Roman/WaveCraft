@@ -77,6 +77,7 @@ const RADIO_SECTION_INDENT: f32 = 10.0;
 const RADIO_CHANNEL_SYNC_WORD_WIDTH: f32 = 72.0;
 /// Most characters of a channel's sync word: eight bytes with a space between.
 const RADIO_CHANNEL_SYNC_WORD_CHARACTERS: usize = 24;
+const ANALYZER_CHANNELS_HELP: &str = "All modulation, framing, and whitening settings above are shared by every channel, except that a channel can have a sync word of its own.";
 
 pub(crate) const RADIO_GAIN_HANDLE_ASPECT_RATIO: f32 = 1.8;
 
@@ -276,17 +277,21 @@ pub(crate) fn paint_radio_capture_settings(
                 });
             if settings.analyzer.is_enabled() {
                 ui.separator();
-                egui::CollapsingHeader::new(RichText::new("Analyzer channels").strong())
-                    .id_salt("radio_analyzer_channels_section")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        paint_radio_analyzer_channels(
-                            ui,
-                            &mut settings.analyzer,
-                            settings.capture.sample_rate_hz,
-                            enabled,
-                        );
-                    });
+                let channels_section =
+                    egui::CollapsingHeader::new(RichText::new("Analyzer channels").strong())
+                        .id_salt("radio_analyzer_channels_section")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            paint_radio_analyzer_channels(
+                                ui,
+                                &mut settings.analyzer,
+                                settings.capture.sample_rate_hz,
+                                enabled,
+                            );
+                        });
+                channels_section
+                    .header_response
+                    .on_hover_selectable_text(ANALYZER_CHANNELS_HELP);
             }
             show_save_button
                 && paint_capture_settings_save_button(
@@ -1347,13 +1352,6 @@ pub(crate) fn paint_radio_analyzer_channels(
                 name_index, candidate,
             ));
     }
-    ui.label(
-        RichText::new(
-            "All modulation, framing, and whitening settings above are shared by every channel, except that a channel can have a sync word of its own.",
-        )
-        .small()
-        .color(TEXT_MUTED),
-    );
 }
 
 /// The receive parameters of one radio as a two-column grid: tuning, capture
@@ -2746,6 +2744,7 @@ mod tests {
             channels.font_of("Sync word"),
             analyzer.font_of("Channel filter taps")
         );
+        assert!(!channels.has(ANALYZER_CHANNELS_HELP));
     }
 
     #[test]

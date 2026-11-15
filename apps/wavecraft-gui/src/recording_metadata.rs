@@ -722,8 +722,8 @@ fn write_logic_trigger(metadata: &mut BTreeMap<String, String>, settings: &Logic
                 logic_trigger_condition_key(condition).to_owned(),
             );
         }
-        for stage in 0..DSLOGIC_TRIGGER_STAGE_COUNT {
-            if let Some(condition) = settings.smart_trigger_conditions[stage][channel] {
+        for (stage, conditions) in settings.smart_trigger_conditions.iter().enumerate() {
+            if let Some(condition) = conditions[channel] {
                 metadata.insert(
                     format!("logic.trigger.stage{stage}.ch{channel}.condition"),
                     logic_trigger_condition_key(condition).to_owned(),
