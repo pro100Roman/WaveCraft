@@ -9,7 +9,7 @@ use crate::system_trace::{
 };
 use crate::system_trace::{
     ProbeLogEntry, ProbeLogLevel, SystemTraceDisplayState, TimelineTimingEdge,
-    TimelineTimingMeasurement, TraceEventView,
+    TimelineTimingMeasurement, TraceEventCategory, TraceEventView, TraceTimeDisplay,
 };
 use crate::waveform::chrome::half_transparent_plate;
 use crate::{
@@ -50,6 +50,7 @@ const TERMINAL_TABLE_MINIMUM_WIDTH: f32 = 720.0;
 const TRACE_SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 92);
 const TRACE_SELECTION_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(32, 27, 12, 32);
 const TRACE_EVENT_SELECTION_FILL: egui::Color32 = egui::Color32::from_rgb(62, 52, 18);
+const TRACE_REFERENCE_COLOR: egui::Color32 = egui::Color32::from_rgb(187, 134, 252);
 const TRACE_EVENT_ROW_FILLS: [egui::Color32; 2] = [
     egui::Color32::from_rgb(15, 21, 30),
     egui::Color32::from_rgb(20, 27, 38),
@@ -1149,6 +1150,7 @@ fn paint_timeline_instrument(
 ) {
     instrument_frame().show(ui, |ui| {
         ui.set_min_width(ui.available_width());
+        ui.set_max_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("TIMELINE").strong().color(ACCENT));
             ui.label(
@@ -1266,6 +1268,8 @@ fn paint_timeline_instrument(
                 TimelineCanvasOptions {
                     selected_timestamp,
                     timestamp_frequency_override_hz,
+                    time_display: trace.time_display,
+                    recording_start_ticks: start_ticks,
                 },
             );
             (canvas.top(), canvas_width, clicked_sequence)
@@ -1427,6 +1431,20 @@ struct TimelineIntervalPosition {
 struct TimelineCanvasOptions {
     selected_timestamp: Option<u64>,
     timestamp_frequency_override_hz: Option<u64>,
+    time_display: TraceTimeDisplay,
+    recording_start_ticks: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TimelineTimeGrid {
+    canvas: egui::Rect,
+    plot_left: f32,
+    plot_right: f32,
+    start_ticks: u64,
+    duration: u64,
+    time_display: TraceTimeDisplay,
+    recording_start_ticks: u64,
+    frequency_hz: Option<u64>,
 }
 
 fn timeline_lanes(model: &TraceModel) -> Vec<TimelineLane> {
@@ -1474,11 +1492,16 @@ fn paint_timeline_canvas(
     );
     paint_timeline_time_grid(
         &plot_painter,
-        canvas,
-        plot_left,
-        plot_right,
-        start_ticks,
-        duration,
+        TimelineTimeGrid {
+            canvas,
+            plot_left,
+            plot_right,
+            start_ticks,
+            duration,
+            time_display: options.time_display,
+            recording_start_ticks: options.recording_start_ticks,
+            frequency_hz: trace_system_frequency_hz(trace, options.timestamp_frequency_override_hz),
+        },
     );
 
     let mut clicked_sequence = None;
@@ -1713,6 +1736,23 @@ fn paint_timeline_canvas(
         }
     }
 
+    for (index, timestamp) in trace.time_references().iter().copied().enumerate() {
+        if timestamp < start_ticks || timestamp > end_ticks {
+            continue;
+        }
+        let x = tick_x(timestamp, start_ticks, duration, plot_left, plot_width);
+        plot_painter.line_segment(
+            [egui::pos2(x, canvas.top()), egui::pos2(x, canvas.bottom())],
+            egui::Stroke::new(1.5_f32, TRACE_REFERENCE_COLOR),
+        );
+        plot_painter.text(
+            egui::pos2(x + 3.0, canvas.top() + 5.0),
+            egui::Align2::LEFT_TOP,
+            format!("R{}", index + 1),
+            egui::FontId::monospace(10.0),
+            TRACE_REFERENCE_COLOR,
+        );
+    }
     if let Some(timestamp) = options.selected_timestamp {
         let x = tick_x(timestamp, start_ticks, duration, plot_left, plot_width);
         plot_painter.line_segment(
@@ -2070,35 +2110,33 @@ fn paint_sticky_timeline_labels(
     }
 }
 
-fn paint_timeline_time_grid(
-    painter: &egui::Painter,
-    canvas: egui::Rect,
-    plot_left: f32,
-    plot_right: f32,
-    start_ticks: u64,
-    duration: u64,
-) {
-    let plot_width = (plot_right - plot_left).max(1.0);
+fn paint_timeline_time_grid(painter: &egui::Painter, grid: TimelineTimeGrid) {
+    let plot_width = (grid.plot_right - grid.plot_left).max(1.0);
     let divisions = ((plot_width / 120.0).floor() as usize).clamp(2, 512);
     for index in 0..=divisions {
         let fraction = index as f32 / divisions as f32;
-        let x = plot_left + plot_width * fraction;
-        let tick_offset = (u128::from(duration) * index as u128 / divisions as u128) as u64;
+        let x = grid.plot_left + plot_width * fraction;
+        let tick_offset = (u128::from(grid.duration) * index as u128 / divisions as u128) as u64;
         painter.line_segment(
             [
-                egui::pos2(x, canvas.top() + TIMELINE_HEADER_HEIGHT),
-                egui::pos2(x, canvas.bottom()),
+                egui::pos2(x, grid.canvas.top() + TIMELINE_HEADER_HEIGHT),
+                egui::pos2(x, grid.canvas.bottom()),
             ],
             egui::Stroke::new(0.5_f32, GRID),
         );
         painter.text(
-            egui::pos2(x, canvas.top() + 2.0),
+            egui::pos2(x, grid.canvas.top() + 2.0),
             if index == divisions {
                 egui::Align2::RIGHT_TOP
             } else {
                 egui::Align2::LEFT_TOP
             },
-            format!("{}", start_ticks.saturating_add(tick_offset)),
+            format_event_timestamp(
+                grid.start_ticks.saturating_add(tick_offset),
+                grid.recording_start_ticks,
+                grid.time_display,
+                grid.frequency_hz,
+            ),
             egui::FontId::monospace(11.0),
             TEXT_MUTED,
         );
@@ -2142,6 +2180,7 @@ fn paint_event_instrument(
 ) {
     instrument_frame().show(ui, |ui| {
         ui.set_min_width(ui.available_width());
+        ui.set_max_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut trace.event_view, TraceEventView::Events, "EVENTS");
             ui.selectable_value(&mut trace.event_view, TraceEventView::Logs, "LOGS");
@@ -2187,6 +2226,20 @@ fn paint_event_instrument(
                 ui.checkbox(&mut trace.follow_latest, "Follow latest");
             }
         });
+        if matches!(trace.event_view, TraceEventView::Events | TraceEventView::Logs) {
+            egui::ScrollArea::horizontal()
+                .id_salt("system_trace_event_navigation")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        paint_event_navigation_controls(
+                            ui,
+                            trace,
+                            timestamp_frequency_override_hz,
+                        );
+                    });
+                });
+        }
         ui.add_space(5.0);
         let footer_height = if matches!(
             trace.event_view,
@@ -2266,12 +2319,196 @@ fn paint_event_instrument(
                         event_height,
                     );
                 } else {
-                    paint_event_table(ui, trace, event_height);
+                    paint_event_table(
+                        ui,
+                        trace,
+                        event_height,
+                        timestamp_frequency_override_hz,
+                    );
                     paint_selected_event(ui, trace);
                 }
             }
         }
     });
+}
+
+fn paint_event_navigation_controls(
+    ui: &mut egui::Ui,
+    trace: &mut SystemTraceDisplayState,
+    timestamp_frequency_override_hz: Option<u64>,
+) {
+    if ui.small_button("Previous").clicked() {
+        navigate_visible_event(trace, false, false);
+    }
+    if ui.small_button("Next").clicked() {
+        navigate_visible_event(trace, true, false);
+    }
+    if ui
+        .small_button("Previous in context")
+        .on_hover_text("Select the previous visible event in the current execution context")
+        .clicked()
+    {
+        navigate_visible_event(trace, false, true);
+    }
+    if ui
+        .small_button("Next in context")
+        .on_hover_text("Select the next visible event in the current execution context")
+        .clicked()
+    {
+        navigate_visible_event(trace, true, true);
+    }
+    if trace.event_view == TraceEventView::Events {
+        ui.menu_button(
+            format!(
+                "Categories {}/{}",
+                trace.event_category_filter.enabled_count(),
+                TraceEventCategory::ALL.len()
+            ),
+            |ui| {
+                if ui.button("Show all").clicked() {
+                    trace.event_category_filter.show_all();
+                }
+                ui.separator();
+                for category in TraceEventCategory::ALL {
+                    ui.horizontal(|ui| {
+                        let mut enabled = trace.event_category_filter.is_enabled(category);
+                        if ui
+                            .checkbox(&mut enabled, trace_event_category_label(category))
+                            .changed()
+                        {
+                            trace.event_category_filter.set_enabled(category, enabled);
+                        }
+                        if ui.small_button("Only").clicked() {
+                            trace.event_category_filter.show_only(category);
+                        }
+                    });
+                }
+            },
+        );
+    }
+    ui.menu_button("Go to…", |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut trace.go_to_value)
+                .hint_text("Sequence or timestamp ticks")
+                .desired_width(180.0),
+        );
+        let parsed = parse_trace_integer(&trace.go_to_value);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(parsed.is_some(), egui::Button::new("Sequence"))
+                .clicked()
+            {
+                if let Some(sequence) = parsed {
+                    select_event_by_sequence(trace, sequence);
+                }
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(parsed.is_some(), egui::Button::new("Timestamp"))
+                .on_hover_text("Interpret the value as target timestamp ticks")
+                .clicked()
+            {
+                if let Some(mut timestamp_ticks) = parsed {
+                    if trace.time_display == TraceTimeDisplay::RecordingRelative {
+                        timestamp_ticks = timestamp_ticks.saturating_add(
+                            trace
+                                .time_bounds()
+                                .map_or(0, |(start_ticks, _)| start_ticks),
+                        );
+                    }
+                    select_event_by_timestamp(trace, timestamp_ticks);
+                }
+                ui.close_menu();
+            }
+        });
+        if !trace.go_to_value.trim().is_empty() && parsed.is_none() {
+            ui.label(
+                RichText::new("Enter an unsigned decimal or 0x hexadecimal value")
+                    .small()
+                    .color(egui::Color32::from_rgb(245, 96, 96)),
+            );
+        }
+    });
+    egui::ComboBox::from_id_salt("system_trace_time_display")
+        .selected_text(match trace.time_display {
+            TraceTimeDisplay::Target => "Target time",
+            TraceTimeDisplay::RecordingRelative => "Recording time",
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut trace.time_display,
+                TraceTimeDisplay::Target,
+                "Target time",
+            );
+            ui.selectable_value(
+                &mut trace.time_display,
+                TraceTimeDisplay::RecordingRelative,
+                "Recording time",
+            );
+        });
+
+    let selected_timestamp = trace.selected_event().map(|event| event.timestamp_ticks);
+    if ui
+        .add_enabled(
+            selected_timestamp.is_some(),
+            egui::Button::new("Add reference"),
+        )
+        .on_hover_text("Add the selected event timestamp as a persistent Timeline reference")
+        .clicked()
+    {
+        if let Some(timestamp_ticks) = selected_timestamp {
+            trace.add_time_reference(timestamp_ticks);
+        }
+    }
+    let frequency_hz = trace_system_frequency_hz(trace, timestamp_frequency_override_hz);
+    ui.menu_button(
+        format!("References ({})", trace.time_references().len()),
+        |ui| {
+            if trace.time_references().is_empty() {
+                ui.label(RichText::new("No references").color(TEXT_MUTED));
+            }
+            for (index, timestamp_ticks) in trace.time_references().to_vec().into_iter().enumerate()
+            {
+                let delta = selected_timestamp.map(|selected| selected.abs_diff(timestamp_ticks));
+                let label = delta.map_or_else(
+                    || format!("R{} · {} ticks", index + 1, timestamp_ticks),
+                    |delta| {
+                        format!(
+                            "R{} · {} ticks · Δ {}",
+                            index + 1,
+                            timestamp_ticks,
+                            format_trace_ticks(delta, frequency_hz)
+                        )
+                    },
+                );
+                if ui.button(label).clicked() {
+                    select_event_by_timestamp(trace, timestamp_ticks);
+                    ui.close_menu();
+                }
+            }
+            if !trace.time_references().is_empty() {
+                ui.separator();
+                if ui.button("Clear all references").clicked() {
+                    trace.clear_time_references();
+                    ui.close_menu();
+                }
+            }
+        },
+    );
+}
+
+fn parse_trace_integer(text: &str) -> Option<u64> {
+    let normalized = text.trim().replace('_', "");
+    if normalized.is_empty() {
+        return None;
+    }
+    normalized
+        .strip_prefix("0x")
+        .or_else(|| normalized.strip_prefix("0X"))
+        .map_or_else(
+            || normalized.parse().ok(),
+            |hexadecimal| u64::from_str_radix(hexadecimal, 16).ok(),
+        )
 }
 
 fn paint_cpu_load_graph(
@@ -2662,6 +2899,28 @@ fn format_trace_ticks(ticks: u64, frequency_hz: Option<u64>) -> String {
     )
 }
 
+fn format_event_timestamp(
+    timestamp_ticks: u64,
+    recording_start_ticks: u64,
+    time_display: TraceTimeDisplay,
+    frequency_hz: Option<u64>,
+) -> String {
+    let display_ticks = match time_display {
+        TraceTimeDisplay::Target => timestamp_ticks,
+        TraceTimeDisplay::RecordingRelative => {
+            timestamp_ticks.saturating_sub(recording_start_ticks)
+        }
+    };
+    let Some(frequency_hz) = frequency_hz.filter(|frequency| *frequency > 0) else {
+        return display_ticks.to_string();
+    };
+    let seconds = display_ticks / frequency_hz;
+    let subsecond_ticks = display_ticks % frequency_hz;
+    let nanoseconds =
+        (u128::from(subsecond_ticks) * 1_000_000_000 / u128::from(frequency_hz)) as u64;
+    format!("{seconds}.{nanoseconds:09} s")
+}
+
 fn paint_probe_log_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, view_height: f32) {
     let filter = trace.event_filter.trim().to_lowercase();
     let visible_entries = trace
@@ -2998,15 +3257,76 @@ fn dim_terminal_color(color: egui::Color32) -> egui::Color32 {
     )
 }
 
-fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, view_height: f32) {
+fn trace_event_category(kind: &TraceEventKind) -> TraceEventCategory {
+    match kind {
+        TraceEventKind::TaskCreated { .. }
+        | TraceEventKind::TaskInfo { .. }
+        | TraceEventKind::TaskStarted { .. }
+        | TraceEventKind::TaskStopped
+        | TraceEventKind::TaskBecameReady { .. }
+        | TraceEventKind::TaskStoppedReady { .. }
+        | TraceEventKind::TaskTerminated { .. }
+        | TraceEventKind::StackInfo { .. } => TraceEventCategory::Tasks,
+        TraceEventKind::IsrEntered { .. }
+        | TraceEventKind::IsrExited
+        | TraceEventKind::IsrExitedToScheduler => TraceEventCategory::Isrs,
+        TraceEventKind::TimerEntered { .. } | TraceEventKind::TimerExited => {
+            TraceEventCategory::Timers
+        }
+        TraceEventKind::FormattedPrint { .. } => TraceEventCategory::Logs,
+        TraceEventKind::MarkerStarted { .. } | TraceEventKind::MarkerStopped { .. } => {
+            TraceEventCategory::Markers
+        }
+        TraceEventKind::DataSample { .. } => TraceEventCategory::DataSamples,
+        TraceEventKind::ApiCallEnded { .. } | TraceEventKind::Unknown { event_id: 32.., .. } => {
+            TraceEventCategory::ApiCalls
+        }
+        TraceEventKind::NoOp
+        | TraceEventKind::TraceStarted
+        | TraceEventKind::TraceStopped
+        | TraceEventKind::Overflow { .. }
+        | TraceEventKind::Idle
+        | TraceEventKind::SystemDescription(_)
+        | TraceEventKind::ClockSyncCycles { .. }
+        | TraceEventKind::ClockSyncMicros { .. }
+        | TraceEventKind::TargetInfo { .. }
+        | TraceEventKind::ModuleDescription { .. }
+        | TraceEventKind::ModuleCount { .. }
+        | TraceEventKind::ResourceName { .. }
+        | TraceEventKind::Unknown { .. } => TraceEventCategory::System,
+    }
+}
+
+fn trace_event_category_label(category: TraceEventCategory) -> &'static str {
+    match category {
+        TraceEventCategory::Tasks => "Tasks",
+        TraceEventCategory::Isrs => "ISRs",
+        TraceEventCategory::Timers => "Timers",
+        TraceEventCategory::Logs => "Logs",
+        TraceEventCategory::Markers => "Markers",
+        TraceEventCategory::DataSamples => "Data samples",
+        TraceEventCategory::ApiCalls => "API calls",
+        TraceEventCategory::System => "System",
+    }
+}
+
+fn visible_event_indices(trace: &SystemTraceDisplayState) -> Vec<usize> {
     let filter = trace.event_filter.trim().to_lowercase();
-    let visible_indices = trace
+    trace
         .events()
         .iter()
         .enumerate()
         .filter(|(_, event)| {
-            let view_matches = trace.event_view == TraceEventView::Events
-                || matches!(event.kind, TraceEventKind::FormattedPrint { .. });
+            let view_matches = match trace.event_view {
+                TraceEventView::Events => trace
+                    .event_category_filter
+                    .is_enabled(trace_event_category(&event.kind)),
+                TraceEventView::Logs => matches!(event.kind, TraceEventKind::FormattedPrint { .. }),
+                TraceEventView::Terminal
+                | TraceEventView::ProbeLog
+                | TraceEventView::CpuLoad
+                | TraceEventView::ContextStatistics => false,
+            };
             view_matches
                 && (filter.is_empty()
                     || event_search_text(event)
@@ -3014,7 +3334,115 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
                         .contains(filter.as_str()))
         })
         .map(|(index, _)| index)
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn event_execution_context(model: &TraceModel, event: &TraceEvent) -> Option<ExecutionContext> {
+    model
+        .core(event.core_id)?
+        .intervals()
+        .iter()
+        .rev()
+        .find_map(|interval| {
+            let contains = interval.start_ticks <= event.timestamp_ticks
+                && interval
+                    .end_ticks
+                    .map_or(true, |end_ticks| event.timestamp_ticks < end_ticks);
+            contains.then_some(interval.context)
+        })
+}
+
+fn navigate_visible_event(
+    trace: &mut SystemTraceDisplayState,
+    forward: bool,
+    same_context: bool,
+) -> bool {
+    let visible_indices = visible_event_indices(trace);
+    if visible_indices.is_empty() {
+        return false;
+    }
+    let selected_position = trace.selected_sequence.and_then(|sequence| {
+        visible_indices
+            .iter()
+            .position(|index| trace.events()[*index].sequence == sequence)
+    });
+    let selected_context = same_context
+        .then(|| trace.selected_event())
+        .flatten()
+        .and_then(|event| {
+            event_execution_context(trace.model(), event).map(|context| (event.core_id, context))
+        });
+    if same_context && selected_context.is_none() {
+        return false;
+    }
+    let matches_context = |index: usize| {
+        if let Some((core_id, context)) = selected_context {
+            let event = &trace.events()[index];
+            event.core_id == core_id
+                && event_execution_context(trace.model(), event) == Some(context)
+        } else {
+            true
+        }
+    };
+    let next_index = if forward {
+        let start = selected_position.map_or(0, |position| position.saturating_add(1));
+        visible_indices
+            .iter()
+            .skip(start)
+            .copied()
+            .find(|index| matches_context(*index))
+    } else {
+        let end = selected_position.unwrap_or(visible_indices.len());
+        visible_indices[..end]
+            .iter()
+            .rev()
+            .copied()
+            .find(|index| matches_context(*index))
+    };
+    let Some(index) = next_index else {
+        return false;
+    };
+    let sequence = trace.events()[index].sequence;
+    trace.select_from_event_table(sequence);
+    true
+}
+
+fn select_event_by_sequence(trace: &mut SystemTraceDisplayState, sequence: u64) -> bool {
+    let Some(event) = trace
+        .events()
+        .iter()
+        .find(|event| event.sequence == sequence)
+    else {
+        return false;
+    };
+    trace.select_from_event_table(event.sequence);
+    true
+}
+
+fn select_event_by_timestamp(trace: &mut SystemTraceDisplayState, timestamp_ticks: u64) -> bool {
+    let event = trace
+        .events()
+        .iter()
+        .find(|event| event.timestamp_ticks >= timestamp_ticks)
+        .or_else(|| trace.events().back());
+    let Some(event) = event else {
+        return false;
+    };
+    trace.select_from_event_table(event.sequence);
+    true
+}
+
+fn paint_event_table(
+    ui: &mut egui::Ui,
+    trace: &mut SystemTraceDisplayState,
+    view_height: f32,
+    timestamp_frequency_override_hz: Option<u64>,
+) {
+    let visible_indices = visible_event_indices(trace);
+    let frequency_hz = trace_system_frequency_hz(trace, timestamp_frequency_override_hz);
+    let recording_start_ticks = trace
+        .time_bounds()
+        .map_or(0, |(start_ticks, _)| start_ticks);
     let mut selected_sequence = trace.selected_sequence;
     let event_table_focus = trace.take_event_table_focus();
     let follow_latest = trace.follow_latest && event_table_focus.is_none();
@@ -3062,15 +3490,22 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
                         ui.set_min_width(table_width);
                         ui.horizontal(|ui| {
                             ui.add_sized(
-                                [90.0, 20.0],
+                                [130.0, 20.0],
                                 egui::Label::new(
-                                    RichText::new(event.timestamp_ticks.to_string())
-                                        .monospace()
-                                        .color(if event_selected {
+                                    RichText::new(format_event_timestamp(
+                                        event.timestamp_ticks,
+                                        recording_start_ticks,
+                                        trace.time_display,
+                                        frequency_hz,
+                                    ))
+                                    .monospace()
+                                    .color(
+                                        if event_selected {
                                             TRACE_SELECTION_COLOR
                                         } else {
                                             ui.visuals().text_color()
-                                        }),
+                                        },
+                                    ),
                                 ),
                             );
                             ui.add_sized(
@@ -3123,6 +3558,11 @@ fn paint_event_table(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState, vie
         header_rect,
         event_scroll.inner_rect.right(),
         event_scroll.state.offset.x,
+        if frequency_hz.is_some() {
+            "TIME"
+        } else {
+            "TICKS"
+        },
     );
     if let Some(sequence) = clicked_sequence {
         trace.select_from_event_table(sequence);
@@ -3144,6 +3584,7 @@ fn paint_event_table_header(
     header_rect: egui::Rect,
     body_right: f32,
     horizontal_offset: f32,
+    time_header: &str,
 ) {
     let header_rect = egui::Rect::from_min_max(
         header_rect.min,
@@ -3171,8 +3612,8 @@ fn paint_event_table_header(
     header_ui.set_clip_rect(header_rect);
     header_ui.horizontal(|ui| {
         ui.add_sized(
-            [90.0, 20.0],
-            egui::Label::new(RichText::new("TICKS").small().color(TEXT_MUTED)),
+            [130.0, 20.0],
+            egui::Label::new(RichText::new(time_header).small().color(TEXT_MUTED)),
         );
         ui.add_sized(
             [45.0, 20.0],
@@ -4504,7 +4945,7 @@ mod tests {
 
         let output = context.run(input, |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                paint_event_table(ui, &mut trace, 300.0);
+                paint_event_table(ui, &mut trace, 300.0, None);
             });
         });
 
@@ -4513,6 +4954,199 @@ mod tests {
             .shapes
             .iter()
             .any(|clipped| shape_contains_fill(&clipped.shape, TRACE_EVENT_SELECTION_FILL)));
+    }
+
+    #[test]
+    fn structured_event_filters_classify_and_hide_categories() {
+        let mut trace = SystemTraceDisplayState::default();
+        for event in [
+            TraceEvent {
+                sequence: 0,
+                core_id: 0,
+                timestamp_ticks: 0,
+                kind: TraceEventKind::TaskStarted { task_id: 7 },
+            },
+            TraceEvent {
+                sequence: 1,
+                core_id: 0,
+                timestamp_ticks: 1,
+                kind: TraceEventKind::IsrEntered { isr_id: 15 },
+            },
+            TraceEvent {
+                sequence: 2,
+                core_id: 0,
+                timestamp_ticks: 2,
+                kind: TraceEventKind::FormattedPrint {
+                    format: "ready".to_owned(),
+                    options: 0,
+                    arguments: Vec::new(),
+                },
+            },
+            TraceEvent {
+                sequence: 3,
+                core_id: 0,
+                timestamp_ticks: 3,
+                kind: TraceEventKind::MarkerStarted { marker_id: 1 },
+            },
+            TraceEvent {
+                sequence: 4,
+                core_id: 0,
+                timestamp_ticks: 4,
+                kind: TraceEventKind::DataSample {
+                    sample_id: 2,
+                    value: 3.0,
+                },
+            },
+            TraceEvent {
+                sequence: 5,
+                core_id: 0,
+                timestamp_ticks: 5,
+                kind: TraceEventKind::Unknown {
+                    event_id: 47,
+                    payload: Vec::new(),
+                },
+            },
+            TraceEvent {
+                sequence: 6,
+                core_id: 0,
+                timestamp_ticks: 6,
+                kind: TraceEventKind::NoOp,
+            },
+        ] {
+            trace.ingest(event);
+        }
+        trace
+            .event_category_filter
+            .show_only(TraceEventCategory::Markers);
+
+        assert_eq!(visible_event_indices(&trace), vec![3]);
+        assert_eq!(
+            trace_event_category(&trace.events()[5].kind),
+            TraceEventCategory::ApiCalls
+        );
+
+        trace.event_view = TraceEventView::Logs;
+        assert_eq!(visible_event_indices(&trace), vec![2]);
+    }
+
+    #[test]
+    fn event_navigation_and_go_to_follow_visible_events_and_contexts() {
+        let mut trace = SystemTraceDisplayState::default();
+        for event in [
+            TraceEvent {
+                sequence: 0,
+                core_id: 0,
+                timestamp_ticks: 0,
+                kind: TraceEventKind::TaskStarted { task_id: 7 },
+            },
+            TraceEvent {
+                sequence: 1,
+                core_id: 0,
+                timestamp_ticks: 2,
+                kind: TraceEventKind::FormattedPrint {
+                    format: "task first".to_owned(),
+                    options: 0,
+                    arguments: Vec::new(),
+                },
+            },
+            TraceEvent {
+                sequence: 2,
+                core_id: 0,
+                timestamp_ticks: 4,
+                kind: TraceEventKind::IsrEntered { isr_id: 15 },
+            },
+            TraceEvent {
+                sequence: 3,
+                core_id: 0,
+                timestamp_ticks: 5,
+                kind: TraceEventKind::FormattedPrint {
+                    format: "isr".to_owned(),
+                    options: 0,
+                    arguments: Vec::new(),
+                },
+            },
+            TraceEvent {
+                sequence: 4,
+                core_id: 0,
+                timestamp_ticks: 6,
+                kind: TraceEventKind::IsrExited,
+            },
+            TraceEvent {
+                sequence: 5,
+                core_id: 0,
+                timestamp_ticks: 7,
+                kind: TraceEventKind::FormattedPrint {
+                    format: "task second".to_owned(),
+                    options: 0,
+                    arguments: Vec::new(),
+                },
+            },
+        ] {
+            trace.ingest(event);
+        }
+        trace.event_view = TraceEventView::Logs;
+        assert!(select_event_by_sequence(&mut trace, 1));
+
+        assert!(navigate_visible_event(&mut trace, true, true));
+        assert_eq!(trace.selected_sequence, Some(5));
+        assert!(navigate_visible_event(&mut trace, false, true));
+        assert_eq!(trace.selected_sequence, Some(1));
+        assert!(select_event_by_timestamp(&mut trace, 5));
+        assert_eq!(trace.selected_sequence, Some(3));
+        assert!(!select_event_by_sequence(&mut trace, 99));
+    }
+
+    #[test]
+    fn time_display_formats_target_and_recording_relative_timestamps() {
+        assert_eq!(
+            format_event_timestamp(
+                1_500_000,
+                1_000_000,
+                TraceTimeDisplay::Target,
+                Some(1_000_000),
+            ),
+            "1.500000000 s"
+        );
+        assert_eq!(
+            format_event_timestamp(
+                1_500_000,
+                1_000_000,
+                TraceTimeDisplay::RecordingRelative,
+                Some(1_000_000),
+            ),
+            "0.500000000 s"
+        );
+        assert_eq!(parse_trace_integer("0x1_000"), Some(4096));
+        assert_eq!(parse_trace_integer("bad"), None);
+    }
+
+    #[test]
+    fn event_analysis_controls_and_timeline_references_are_visible() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace = analysis_trace();
+        app.system_trace.selected_sequence = Some(4);
+        app.system_trace.add_time_reference(160);
+
+        let texts = paint_central_texts(&context, &mut app);
+
+        for expected in [
+            "Previous",
+            "Next",
+            "Previous in context",
+            "Next in context",
+            "Categories 8/8",
+            "Go to…",
+            "Target time",
+            "Add reference",
+            "References (1)",
+            "R1",
+        ] {
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "missing event-analysis control {expected:?}: {texts:?}"
+            );
+        }
     }
 
     #[test]
@@ -4543,7 +5177,7 @@ mod tests {
 
             let output = context.run(input, |context| {
                 egui::CentralPanel::default().show(context, |ui| {
-                    paint_event_table(ui, &mut trace, 300.0);
+                    paint_event_table(ui, &mut trace, 300.0, None);
                 });
             });
 
@@ -4678,9 +5312,12 @@ mod tests {
         });
 
         assert!(!bordered_rects.is_empty());
-        assert!(bordered_rects
-            .iter()
-            .all(|rect| rect.right() <= screen_rect.right() - 16.0));
+        assert!(
+            bordered_rects
+                .iter()
+                .all(|rect| rect.right() <= screen_rect.right() - 16.0),
+            "trace controls overflow the compact viewport: {bordered_rects:?}"
+        );
         let expected_width = screen_rect.width() - 32.0;
         assert!(
             bordered_rects

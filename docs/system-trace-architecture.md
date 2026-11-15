@@ -592,7 +592,7 @@ its tests, formatting, and workspace Clippy checks pass.
    activations, total/last/min/max/average runtime, interrupted time, CPU load,
    blocked time where the trace provides enough lifecycle information, and
    reported stack usage.
-2. [ ] Add structured event-category filters, next/previous navigation,
+2. [x] Add structured event-category filters, next/previous navigation,
    next/previous-in-context navigation, go-to-sequence/timestamp, target versus
    recording-relative time, and persistent time-reference markers.
 3. [ ] Add ELF and SystemView description-file support: `_SEGGER_RTT` lookup,

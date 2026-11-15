@@ -41,6 +41,87 @@ pub(crate) enum TraceEventView {
     ContextStatistics,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum TraceTimeDisplay {
+    #[default]
+    Target,
+    RecordingRelative,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TraceEventCategory {
+    Tasks,
+    Isrs,
+    Timers,
+    Logs,
+    Markers,
+    DataSamples,
+    ApiCalls,
+    System,
+}
+
+impl TraceEventCategory {
+    pub(crate) const ALL: [Self; 8] = [
+        Self::Tasks,
+        Self::Isrs,
+        Self::Timers,
+        Self::Logs,
+        Self::Markers,
+        Self::DataSamples,
+        Self::ApiCalls,
+        Self::System,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Tasks => 0,
+            Self::Isrs => 1,
+            Self::Timers => 2,
+            Self::Logs => 3,
+            Self::Markers => 4,
+            Self::DataSamples => 5,
+            Self::ApiCalls => 6,
+            Self::System => 7,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TraceEventCategoryFilter {
+    enabled: [bool; TraceEventCategory::ALL.len()],
+}
+
+impl Default for TraceEventCategoryFilter {
+    fn default() -> Self {
+        Self {
+            enabled: [true; TraceEventCategory::ALL.len()],
+        }
+    }
+}
+
+impl TraceEventCategoryFilter {
+    pub(crate) fn is_enabled(self, category: TraceEventCategory) -> bool {
+        self.enabled[category.index()]
+    }
+
+    pub(crate) fn set_enabled(&mut self, category: TraceEventCategory, enabled: bool) {
+        self.enabled[category.index()] = enabled;
+    }
+
+    pub(crate) fn show_all(&mut self) {
+        self.enabled.fill(true);
+    }
+
+    pub(crate) fn show_only(&mut self, category: TraceEventCategory) {
+        self.enabled.fill(false);
+        self.set_enabled(category, true);
+    }
+
+    pub(crate) fn enabled_count(self) -> usize {
+        self.enabled.into_iter().filter(|enabled| *enabled).count()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProbeLogLevel {
     Debug,
@@ -925,6 +1006,9 @@ pub(crate) struct SystemTraceDisplayState {
     timeline_focus_sequence: Option<u64>,
     pub(crate) event_view: TraceEventView,
     pub(crate) event_filter: String,
+    pub(crate) event_category_filter: TraceEventCategoryFilter,
+    pub(crate) time_display: TraceTimeDisplay,
+    pub(crate) go_to_value: String,
     pub(crate) follow_latest: bool,
     pub(crate) terminal_wrap: bool,
     pub(crate) timeline_smart_timing: bool,
@@ -932,6 +1016,7 @@ pub(crate) struct SystemTraceDisplayState {
     timeline_timing_dragging: bool,
     timeline_zoom: f32,
     timeline_visible_range: Option<(u64, u64)>,
+    time_references: Vec<u64>,
     timeline_view_height: f32,
     event_view_height: f32,
 }
@@ -953,6 +1038,9 @@ impl Default for SystemTraceDisplayState {
             timeline_focus_sequence: None,
             event_view: TraceEventView::Events,
             event_filter: String::new(),
+            event_category_filter: TraceEventCategoryFilter::default(),
+            time_display: TraceTimeDisplay::Target,
+            go_to_value: String::new(),
             follow_latest: true,
             terminal_wrap: true,
             timeline_smart_timing: true,
@@ -960,6 +1048,7 @@ impl Default for SystemTraceDisplayState {
             timeline_timing_dragging: false,
             timeline_zoom: MIN_TIMELINE_ZOOM,
             timeline_visible_range: None,
+            time_references: Vec::new(),
             timeline_view_height: DEFAULT_TIMELINE_VIEW_HEIGHT,
             event_view_height: DEFAULT_EVENT_VIEW_HEIGHT,
         }
@@ -1052,6 +1141,21 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn set_timeline_visible_range(&mut self, range: Option<(u64, u64)>) {
         self.timeline_visible_range = range;
+    }
+
+    pub(crate) fn time_references(&self) -> &[u64] {
+        &self.time_references
+    }
+
+    pub(crate) fn add_time_reference(&mut self, timestamp_ticks: u64) {
+        if !self.time_references.contains(&timestamp_ticks) {
+            self.time_references.push(timestamp_ticks);
+            self.time_references.sort_unstable();
+        }
+    }
+
+    pub(crate) fn clear_time_references(&mut self) {
+        self.time_references.clear();
     }
 
     pub(crate) fn timeline_view_height(&self) -> f32 {
@@ -1182,6 +1286,7 @@ impl SystemTraceDisplayState {
         self.clear_timeline_timing();
         self.timeline_zoom = MIN_TIMELINE_ZOOM;
         self.timeline_visible_range = None;
+        self.time_references.clear();
     }
 
     pub(crate) fn time_bounds(&self) -> Option<(u64, u64)> {
@@ -1533,6 +1638,36 @@ mod tests {
         assert_eq!(state.selected_sequence, None);
         assert_eq!(state.timeline_timing_measurement(), None);
         assert!(!state.timeline_timing_dragging());
+    }
+
+    #[test]
+    fn event_categories_can_show_one_category_and_restore_all() {
+        let mut filter = TraceEventCategoryFilter::default();
+        assert_eq!(filter.enabled_count(), TraceEventCategory::ALL.len());
+
+        filter.show_only(TraceEventCategory::Markers);
+
+        assert_eq!(filter.enabled_count(), 1);
+        assert!(filter.is_enabled(TraceEventCategory::Markers));
+        assert!(!filter.is_enabled(TraceEventCategory::Tasks));
+
+        filter.show_all();
+
+        assert_eq!(filter.enabled_count(), TraceEventCategory::ALL.len());
+    }
+
+    #[test]
+    fn time_references_are_sorted_deduplicated_and_cleared_with_trace_data() {
+        let mut state = SystemTraceDisplayState::default();
+        state.add_time_reference(20);
+        state.add_time_reference(10);
+        state.add_time_reference(20);
+
+        assert_eq!(state.time_references(), &[10, 20]);
+
+        state.clear_trace_events();
+
+        assert!(state.time_references().is_empty());
     }
 
     #[test]
