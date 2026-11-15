@@ -10,6 +10,7 @@ use crate::{
     SavedCaptureSettingsKind, SavedTraceEventView, SavedTraceInstrument, SavedWorkspaceView,
     ScopeSessionSettings, WaveformTab, WorkspaceView,
 };
+use std::time::Instant;
 
 use crate::{
     system_trace::{TraceEventView, TraceInstrument},
@@ -87,11 +88,50 @@ impl From<SavedTraceInstrument> for TraceInstrument {
 }
 
 impl WaveCraftApp {
+    pub(crate) fn track_window_size(&mut self, context: &crate::egui::Context) {
+        let now = Instant::now();
+        if let Some(size) = context.input(|input| {
+            input
+                .viewport()
+                .inner_rect
+                .map(|rect| rect.size())
+                .and_then(crate::saved_window_size_from_vec2)
+        }) {
+            self.observe_window_size(size, now);
+        }
+        self.save_window_size_if_due(now);
+    }
+
+    fn observe_window_size(&mut self, size: crate::SavedWindowSize, now: Instant) {
+        if self.observed_window_size == Some(size) {
+            return;
+        }
+        self.observed_window_size = Some(size);
+        self.window_size_save_due = Some(now + crate::WINDOW_SIZE_SAVE_DELAY);
+    }
+
+    fn save_window_size_if_due(&mut self, now: Instant) {
+        if self
+            .window_size_save_due
+            .is_some_and(|save_due| now >= save_due)
+        {
+            self.window_size_save_due = None;
+            self.save_global_settings();
+        }
+    }
+
+    pub(crate) fn save_pending_window_size(&mut self) {
+        if self.window_size_save_due.take().is_some() {
+            self.save_global_settings();
+        }
+    }
+
     pub(crate) fn save_global_settings(&mut self) {
         let Some(active_view) = self.active_workspace_view else {
             return;
         };
         let saved_view = SavedWorkspaceView::from(active_view);
+        let window_inner_size = self.observed_window_size;
         let workspace_view_order = self
             .workspace_view_layout
             .order()
@@ -114,6 +154,7 @@ impl WaveCraftApp {
             .map(SavedTraceInstrument::from)
             .collect::<Vec<_>>();
         if self.saved_capture_settings.global.last_active_view == Some(saved_view)
+            && self.saved_capture_settings.global.window_inner_size == window_inner_size
             && self
                 .saved_capture_settings
                 .global
@@ -138,6 +179,7 @@ impl WaveCraftApp {
 
         let mut document = self.saved_capture_settings.clone();
         document.global.last_active_view = Some(saved_view);
+        document.global.window_inner_size = window_inner_size;
         document.global.workspace_view_order = Some(workspace_view_order);
         document.global.system_trace_event_view_order = Some(event_view_order);
         document.global.system_trace_instrument_order = Some(instrument_order);
@@ -550,7 +592,7 @@ impl WaveCraftApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CaptureSettingsDocument, CaptureSettingsRepository};
+    use crate::{egui, CaptureSettingsDocument, CaptureSettingsRepository, SavedWindowSize};
     use std::fs;
 
     fn test_repository(test_name: &str) -> CaptureSettingsRepository {
@@ -698,6 +740,96 @@ mod tests {
             ]
         );
         remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn window_size_persists_after_resize_and_restores_at_startup() {
+        let repository = test_repository("window-size");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.select_waveform_tab(WaveformTab::LogicAnalyzer);
+        let now = Instant::now();
+        let resized = SavedWindowSize {
+            width: 1512,
+            height: 982,
+        };
+
+        app.observe_window_size(resized, now);
+        app.save_window_size_if_due(now + crate::WINDOW_SIZE_SAVE_DELAY);
+
+        let saved = repository.load().expect("the window size should be saved");
+        assert_eq!(saved.global.window_inner_size, Some(resized));
+        assert_eq!(crate::initial_window_inner_size(&saved), [1512.0, 982.0]);
+        let restored = WaveCraftApp::with_settings(None, saved);
+        assert_eq!(restored.observed_window_size, Some(resized));
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn invalid_saved_window_size_uses_the_default() {
+        let mut settings = CaptureSettingsDocument::default();
+        settings.global.window_inner_size = Some(SavedWindowSize {
+            width: 10,
+            height: 20,
+        });
+
+        assert_eq!(
+            crate::initial_window_inner_size(&settings),
+            crate::DEFAULT_WINDOW_INNER_SIZE
+        );
+        let app = WaveCraftApp::with_settings(None, settings);
+        assert_eq!(app.observed_window_size, None);
+    }
+
+    #[test]
+    fn pending_window_size_is_saved_when_the_application_exits() {
+        let repository = test_repository("window-size-on-exit");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.select_system_trace_view();
+        let resized = SavedWindowSize {
+            width: 1366,
+            height: 768,
+        };
+        app.observe_window_size(resized, Instant::now());
+
+        app.save_pending_window_size();
+
+        let saved = repository
+            .load()
+            .expect("the pending window size should be saved on exit");
+        assert_eq!(saved.global.window_inner_size, Some(resized));
+        assert_eq!(app.window_size_save_due, None);
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn window_size_is_read_from_the_native_viewport() {
+        let context = egui::Context::default();
+        let mut app = WaveCraftApp::with_settings(None, CaptureSettingsDocument::default());
+        let mut input = egui::RawInput::default();
+        let viewport = input.viewports.entry(input.viewport_id).or_default();
+        viewport.inner_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(40.0, 30.0),
+            egui::vec2(1600.0, 1000.0),
+        ));
+
+        let _ = context.run(input, |context| app.track_window_size(context));
+
+        assert_eq!(
+            app.observed_window_size,
+            Some(SavedWindowSize {
+                width: 1600,
+                height: 1000,
+            })
+        );
+        assert!(app.window_size_save_due.is_some());
     }
 
     #[test]

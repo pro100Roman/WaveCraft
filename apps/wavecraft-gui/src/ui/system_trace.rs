@@ -1,7 +1,6 @@
 //! Independent System Trace workspace and decoded-event instruments.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use crate::system_trace::{
     choose_systemview_description, choose_systemview_elf, choose_systemview_recording_path,
@@ -16,7 +15,7 @@ use crate::system_trace::{
 use crate::waveform::chrome::half_transparent_plate;
 use crate::{
     apply_setup_panel_typography, collapsed_side_panel_frame, egui, fill_card_height,
-    format_duration, format_frequency, paint_capture_settings_save_button, toolbar_action_button,
+    format_frequency, paint_capture_settings_save_button, toolbar_action_button,
     ui::frame_actions::FrameActions, RichText, SavedCaptureSettingsKind, WaveCraftApp, ACCENT,
     BACKGROUND, COLLAPSED_SIDE_PANEL_WIDTH, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, ORANGE, PANEL,
     SCOPE_COLORS, TEXT_MUTED,
@@ -2161,12 +2160,8 @@ fn paint_timeline_smart_timing_hint(
     }
 
     let duration_ticks = first.timestamp_ticks.abs_diff(second.timestamp_ticks);
-    let duration =
-        trace_system_frequency_hz(trace, timestamp_frequency_override_hz).map(|frequency_hz| {
-            format_duration(Duration::from_secs_f64(
-                duration_ticks as f64 / frequency_hz as f64,
-            ))
-        });
+    let duration = trace_system_frequency_hz(trace, timestamp_frequency_override_hz)
+        .map(|frequency_hz| format_trace_milliseconds(duration_ticks, frequency_hz));
     let context_line = format!(
         "{} → {}",
         timing_edge_label(trace.model(), first),
@@ -3193,8 +3188,15 @@ fn context_type_label(context: ExecutionContext) -> &'static str {
 fn format_trace_ticks(ticks: u64, frequency_hz: Option<u64>) -> String {
     frequency_hz.map_or_else(
         || format!("{ticks} ticks"),
-        |frequency_hz| format_duration(Duration::from_secs_f64(ticks as f64 / frequency_hz as f64)),
+        |frequency_hz| format_trace_milliseconds(ticks, frequency_hz),
     )
+}
+
+fn format_trace_milliseconds(ticks: u64, frequency_hz: u64) -> String {
+    let nanoseconds = u128::from(ticks) * 1_000_000_000_u128 / u128::from(frequency_hz.max(1));
+    let milliseconds = nanoseconds / 1_000_000;
+    let submillisecond_nanoseconds = nanoseconds % 1_000_000;
+    format!("{milliseconds}.{submillisecond_nanoseconds:06} ms")
 }
 
 fn format_event_timestamp(
@@ -3212,11 +3214,7 @@ fn format_event_timestamp(
     let Some(frequency_hz) = frequency_hz.filter(|frequency| *frequency > 0) else {
         return display_ticks.to_string();
     };
-    let seconds = display_ticks / frequency_hz;
-    let subsecond_ticks = display_ticks % frequency_hz;
-    let nanoseconds =
-        (u128::from(subsecond_ticks) * 1_000_000_000 / u128::from(frequency_hz)) as u64;
-    format!("{seconds}.{nanoseconds:09} s")
+    format_trace_milliseconds(display_ticks, frequency_hz)
 }
 
 fn paint_probe_log_table(ui: &mut egui::Ui, trace: &SystemTraceDisplayState, view_height: f32) {
@@ -5894,7 +5892,7 @@ mod tests {
                 TraceTimeDisplay::Target,
                 Some(1_000_000),
             ),
-            "1.500000000 s"
+            "1500.000000 ms"
         );
         assert_eq!(
             format_event_timestamp(
@@ -5903,8 +5901,11 @@ mod tests {
                 TraceTimeDisplay::RecordingRelative,
                 Some(1_000_000),
             ),
-            "0.500000000 s"
+            "500.000000 ms"
         );
+        assert_eq!(format_trace_ticks(1, Some(1_000_000)), "0.001000 ms");
+        assert_eq!(format_trace_ticks(1_500, Some(1_000)), "1500.000000 ms");
+        assert_eq!(format_trace_ticks(42, None), "42 ticks");
         assert_eq!(parse_trace_integer("0x1_000"), Some(4096));
         assert_eq!(parse_trace_integer("bad"), None);
     }

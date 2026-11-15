@@ -39,11 +39,19 @@ pub(crate) struct GlobalSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_active_view: Option<SavedWorkspaceView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) window_inner_size: Option<SavedWindowSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) workspace_view_order: Option<Vec<SavedWorkspaceView>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_trace_event_view_order: Option<Vec<SavedTraceEventView>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_trace_instrument_order: Option<Vec<SavedTraceInstrument>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub(crate) struct SavedWindowSize {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 /// Stable persisted names for views, independent of the GUI enum layout.
@@ -321,6 +329,10 @@ mod tests {
             "5000000".to_owned(),
         )])));
         document.global.last_active_view = Some(SavedWorkspaceView::RadioSpectrum);
+        document.global.window_inner_size = Some(SavedWindowSize {
+            width: 1440,
+            height: 900,
+        });
         document.global.workspace_view_order = Some(vec![
             SavedWorkspaceView::SystemTrace,
             SavedWorkspaceView::RadioSpectrum,

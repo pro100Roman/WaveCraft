@@ -30,7 +30,7 @@ use acquisition::radio_backend::*;
 use acquisition::scope::*;
 use capture_settings::{
     CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository,
-    SavedTraceEventView, SavedTraceInstrument, SavedWorkspaceView,
+    SavedTraceEventView, SavedTraceInstrument, SavedWindowSize, SavedWorkspaceView,
 };
 use debug_probes::*;
 use devices::{
@@ -275,10 +275,55 @@ fn wavecraft_app_icon() -> Option<egui::IconData> {
     eframe::icon_data::from_png_bytes(include_bytes!("../assets/wavecraft-icon.png")).ok()
 }
 
+const DEFAULT_WINDOW_INNER_SIZE: [f32; 2] = [1280.0, 820.0];
+const MINIMUM_WINDOW_INNER_SIZE: [f32; 2] = [920.0, 620.0];
+const MAXIMUM_SAVED_WINDOW_DIMENSION: u32 = 16_384;
+const WINDOW_SIZE_SAVE_DELAY: Duration = Duration::from_millis(500);
+
+fn validated_window_inner_size(size: SavedWindowSize) -> Option<[f32; 2]> {
+    (size.width >= MINIMUM_WINDOW_INNER_SIZE[0] as u32
+        && size.height >= MINIMUM_WINDOW_INNER_SIZE[1] as u32
+        && size.width <= MAXIMUM_SAVED_WINDOW_DIMENSION
+        && size.height <= MAXIMUM_SAVED_WINDOW_DIMENSION)
+        .then_some([size.width as f32, size.height as f32])
+}
+
+fn saved_window_size_from_vec2(size: Vec2) -> Option<SavedWindowSize> {
+    if !size.x.is_finite() || !size.y.is_finite() {
+        return None;
+    }
+    let saved = SavedWindowSize {
+        width: size.x.round().max(0.0) as u32,
+        height: size.y.round().max(0.0) as u32,
+    };
+    validated_window_inner_size(saved).map(|_| saved)
+}
+
+fn initial_window_inner_size(settings: &CaptureSettingsDocument) -> [f32; 2] {
+    settings
+        .global
+        .window_inner_size
+        .and_then(validated_window_inner_size)
+        .unwrap_or(DEFAULT_WINDOW_INNER_SIZE)
+}
+
 pub fn run() -> eframe::Result<()> {
+    let (capture_settings_repository, saved_capture_settings, settings_load_error) =
+        match CaptureSettingsRepository::for_current_user() {
+            Ok(repository) => match repository.load() {
+                Ok(settings) => (Some(repository), settings, None),
+                Err(error) => (
+                    Some(repository),
+                    CaptureSettingsDocument::default(),
+                    Some(error),
+                ),
+            },
+            Err(error) => (None, CaptureSettingsDocument::default(), Some(error)),
+        };
+    let initial_window_size = initial_window_inner_size(&saved_capture_settings);
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1280.0, 820.0])
-        .with_min_inner_size([920.0, 620.0]);
+        .with_inner_size(initial_window_size)
+        .with_min_inner_size(MINIMUM_WINDOW_INNER_SIZE);
     // The icon is embedded at build time; if it ever fails to decode the window
     // simply opens with the platform's default icon.
     if let Some(icon) = wavecraft_app_icon() {
@@ -291,13 +336,26 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native(
         "WaveCraft",
         options,
-        Box::new(|creation_context| Ok(Box::new(WaveCraftApp::new(creation_context)))),
+        Box::new(move |creation_context| {
+            configure_style(&creation_context.egui_ctx);
+            let mut app =
+                WaveCraftApp::with_settings(capture_settings_repository, saved_capture_settings);
+            app.begin_refresh();
+            if let Some(error) = settings_load_error {
+                app.last_error = Some(format!(
+                    "Saved settings could not be loaded; using defaults: {error}"
+                ));
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
 struct WaveCraftApp {
     capture_settings_repository: Option<CaptureSettingsRepository>,
     saved_capture_settings: CaptureSettingsDocument,
+    observed_window_size: Option<SavedWindowSize>,
+    window_size_save_due: Option<Instant>,
     resource_directory: String,
     settings_open: bool,
     auto_calibration_confirmation_open: bool,
@@ -394,36 +452,16 @@ fn default_scope_measurement_window_positions() -> [Vec2; 2] {
 }
 
 impl WaveCraftApp {
-    fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
-        configure_style(&creation_context.egui_ctx);
-        let (capture_settings_repository, saved_capture_settings, settings_load_error) =
-            match CaptureSettingsRepository::for_current_user() {
-                Ok(repository) => match repository.load() {
-                    Ok(settings) => (Some(repository), settings, None),
-                    Err(error) => (
-                        Some(repository),
-                        CaptureSettingsDocument::default(),
-                        Some(error),
-                    ),
-                },
-                Err(error) => (None, CaptureSettingsDocument::default(), Some(error)),
-            };
-        let mut app = Self::with_settings(capture_settings_repository, saved_capture_settings);
-        app.begin_refresh();
-        if let Some(error) = settings_load_error {
-            app.last_error = Some(format!(
-                "Saved settings could not be loaded; using defaults: {error}"
-            ));
-        }
-        app
-    }
-
     /// Builds the application state from saved settings. It neither discovers
     /// devices nor reads or writes the settings file, so tests can use it.
     fn with_settings(
         capture_settings_repository: Option<CaptureSettingsRepository>,
         saved_capture_settings: CaptureSettingsDocument,
     ) -> Self {
+        let restored_window_size = saved_capture_settings
+            .global
+            .window_inner_size
+            .filter(|size| validated_window_inner_size(*size).is_some());
         let restored_workspace_view = saved_capture_settings
             .global
             .last_active_view
@@ -439,6 +477,8 @@ impl WaveCraftApp {
         let mut app = Self {
             capture_settings_repository,
             saved_capture_settings,
+            observed_window_size: restored_window_size,
+            window_size_save_due: None,
             resource_directory: default_resource_directory(),
             settings_open: false,
             auto_calibration_confirmation_open: false,
@@ -567,6 +607,10 @@ impl eframe::App for WaveCraftApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.run_frame(context);
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_pending_window_size();
+    }
 }
 
 impl WaveCraftApp {
@@ -619,6 +663,7 @@ impl WaveCraftApp {
         self.poll_system_trace_connection();
         self.reconcile_capture_settings_tab();
         self.reconcile_waveform_tab();
+        self.track_window_size(context);
         self.reconcile_device_selections();
         self.reconcile_radio_settings();
         self.poll_capture();
