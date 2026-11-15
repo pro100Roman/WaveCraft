@@ -110,6 +110,7 @@ impl WaveCraftApp {
         if let Some(profile) = self.saved_capture_settings.profiles.system_trace.as_ref() {
             self.system_trace_settings
                 .apply_saved_values(&profile.values);
+            self.reload_system_trace_assets();
         }
     }
 

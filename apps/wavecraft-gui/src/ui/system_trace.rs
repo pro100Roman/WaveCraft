@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::system_trace::{
-    choose_systemview_recording_path, choose_systemview_trace_to_open, SystemTraceAction,
-    SystemTraceConnectionConfiguration, SystemTraceConnectionState,
+    choose_systemview_description, choose_systemview_elf, choose_systemview_recording_path,
+    choose_systemview_trace_to_open, read_systemview_description, read_systemview_elf,
+    SystemTraceAction, SystemTraceConnectionConfiguration, SystemTraceConnectionState,
 };
 use crate::system_trace::{
     ProbeLogEntry, ProbeLogLevel, SystemTraceDisplayState, TimelineTimingEdge,
@@ -24,6 +25,7 @@ use wavecraft_debug_probe::{
     RttConfiguration, RttControlBlockLocation, RttTerminalColor, RttTerminalLine, TargetSelector,
     WireProtocol,
 };
+use wavecraft_systemview::{ApiValue, DecodedApiParameter};
 use wavecraft_trace::{
     ContextStatistics, ExecutionContext, TraceEvent, TraceEventKind, TraceModel,
 };
@@ -66,6 +68,8 @@ pub(crate) struct SystemTraceSettings {
     pub(crate) speed_khz: u32,
     pub(crate) reset_after_attach: bool,
     pub(crate) control_block_address: String,
+    pub(crate) elf_path: String,
+    pub(crate) description_path: String,
     pub(crate) systemview_enabled: bool,
     pub(crate) up_channel: usize,
     pub(crate) down_channel: usize,
@@ -82,6 +86,8 @@ impl Default for SystemTraceSettings {
             speed_khz: 4_000,
             reset_after_attach: false,
             control_block_address: String::new(),
+            elf_path: String::new(),
+            description_path: String::new(),
             systemview_enabled: true,
             up_channel: 1,
             down_channel: 1,
@@ -110,6 +116,11 @@ impl SystemTraceSettings {
             (
                 "system_trace.rtt_control_block".to_owned(),
                 self.control_block_address.clone(),
+            ),
+            ("system_trace.elf_path".to_owned(), self.elf_path.clone()),
+            (
+                "system_trace.description_path".to_owned(),
+                self.description_path.clone(),
             ),
             (
                 "system_trace.systemview_enabled".to_owned(),
@@ -150,6 +161,12 @@ impl SystemTraceSettings {
             .unwrap_or(self.reset_after_attach);
         if let Some(address) = values.get("system_trace.rtt_control_block") {
             self.control_block_address.clone_from(address);
+        }
+        if let Some(path) = values.get("system_trace.elf_path") {
+            self.elf_path.clone_from(path);
+        }
+        if let Some(path) = values.get("system_trace.description_path") {
+            self.description_path.clone_from(path);
         }
         self.systemview_enabled = saved_trace_value(values, "system_trace.systemview_enabled")
             .unwrap_or(self.systemview_enabled);
@@ -541,6 +558,144 @@ impl WaveCraftApp {
                                     .on_hover_text(
                                         "Enable decoding of SEGGER SystemView binary events from RTT",
                                     );
+                                    ui.add_space(10.0);
+                                    setup_label(ui, "Application ELF");
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(asset_path_label(
+                                                &self.system_trace_settings.elf_path,
+                                            ))
+                                            .small()
+                                            .color(TEXT_MUTED),
+                                        )
+                                        .on_hover_text(if self
+                                            .system_trace_settings
+                                            .elf_path
+                                            .is_empty()
+                                        {
+                                            "No ELF selected"
+                                        } else {
+                                            &self.system_trace_settings.elf_path
+                                        });
+                                        if ui.small_button("Choose…").clicked() {
+                                            if let Some(path) = choose_systemview_elf() {
+                                                match read_systemview_elf(&path) {
+                                                    Ok(elf) => {
+                                                        let rtt_address = elf.rtt_control_block();
+                                                        clear_elf_derived_control_block(
+                                                            &mut self.system_trace_settings,
+                                                            &self.system_trace,
+                                                        );
+                                                        self.system_trace.set_elf(Some(elf));
+                                                        self.system_trace_settings.elf_path =
+                                                            path.display().to_string();
+                                                        if let Some(address) = rtt_address {
+                                                            self.system_trace_settings
+                                                                .control_block_address =
+                                                                format!("0x{address:x}");
+                                                        }
+                                                        self.status = rtt_address.map_or_else(
+                                                            || {
+                                                                "Loaded application ELF; _SEGGER_RTT was not present"
+                                                                    .to_owned()
+                                                            },
+                                                            |address| {
+                                                                format!(
+                                                                    "Loaded application ELF · _SEGGER_RTT at 0x{address:x}"
+                                                                )
+                                                            },
+                                                        );
+                                                        self.last_error = None;
+                                                    }
+                                                    Err(error) => self.last_error = Some(error),
+                                                }
+                                            }
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !self.system_trace_settings.elf_path.is_empty(),
+                                                egui::Button::new("Clear"),
+                                            )
+                                            .clicked()
+                                        {
+                                            clear_elf_derived_control_block(
+                                                &mut self.system_trace_settings,
+                                                &self.system_trace,
+                                            );
+                                            self.system_trace_settings.elf_path.clear();
+                                            self.system_trace.set_elf(None);
+                                        }
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "Resolves _SEGGER_RTT, resource symbols, and .sv-data messages",
+                                        )
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                    );
+
+                                    ui.add_space(10.0);
+                                    setup_label(ui, "API description");
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(asset_path_label(
+                                                &self.system_trace_settings.description_path,
+                                            ))
+                                            .small()
+                                            .color(TEXT_MUTED),
+                                        )
+                                        .on_hover_text(if self
+                                            .system_trace_settings
+                                            .description_path
+                                            .is_empty()
+                                        {
+                                            "No description selected"
+                                        } else {
+                                            &self.system_trace_settings.description_path
+                                        });
+                                        if ui.small_button("Choose…").clicked() {
+                                            if let Some(path) = choose_systemview_description() {
+                                                match read_systemview_description(&path) {
+                                                    Ok(description) => {
+                                                        let event_count =
+                                                            description.events().count();
+                                                        self.system_trace
+                                                            .set_description(Some(description));
+                                                        self.system_trace_settings
+                                                            .description_path =
+                                                            path.display().to_string();
+                                                        self.status = format!(
+                                                            "Loaded SystemView description · {event_count} API events"
+                                                        );
+                                                        self.last_error = None;
+                                                    }
+                                                    Err(error) => self.last_error = Some(error),
+                                                }
+                                            }
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !self
+                                                    .system_trace_settings
+                                                    .description_path
+                                                    .is_empty(),
+                                                egui::Button::new("Clear"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.system_trace_settings.description_path.clear();
+                                            self.system_trace.set_description(None);
+                                        }
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "Decodes typed OS and middleware API events 32–511",
+                                        )
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                    );
+
+                                    ui.add_space(10.0);
                                     ui.horizontal(|ui| {
                                         setup_label(ui, "Up channel");
                                         ui.add_enabled(
@@ -789,6 +944,28 @@ impl WaveCraftApp {
 
 fn setup_label(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).small().color(TEXT_MUTED));
+}
+
+fn asset_path_label(path: &str) -> &str {
+    if path.is_empty() {
+        return "Not selected";
+    }
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+}
+
+fn clear_elf_derived_control_block(
+    settings: &mut SystemTraceSettings,
+    trace: &SystemTraceDisplayState,
+) {
+    let Some(address) = trace.elf().and_then(|elf| elf.rtt_control_block()) else {
+        return;
+    };
+    if settings.control_block_address == format!("0x{address:x}") {
+        settings.control_block_address.clear();
+    }
 }
 
 fn paint_target_selector(
@@ -3273,14 +3450,16 @@ fn trace_event_category(kind: &TraceEventKind) -> TraceEventCategory {
         TraceEventKind::TimerEntered { .. } | TraceEventKind::TimerExited => {
             TraceEventCategory::Timers
         }
-        TraceEventKind::FormattedPrint { .. } => TraceEventCategory::Logs,
+        TraceEventKind::FormattedPrint { .. } | TraceEventKind::PrintElf { .. } => {
+            TraceEventCategory::Logs
+        }
         TraceEventKind::MarkerStarted { .. } | TraceEventKind::MarkerStopped { .. } => {
             TraceEventCategory::Markers
         }
         TraceEventKind::DataSample { .. } => TraceEventCategory::DataSamples,
-        TraceEventKind::ApiCallEnded { .. } | TraceEventKind::Unknown { event_id: 32.., .. } => {
-            TraceEventCategory::ApiCalls
-        }
+        TraceEventKind::ApiCall { .. }
+        | TraceEventKind::ApiCallEnded { .. }
+        | TraceEventKind::Unknown { event_id: 32.., .. } => TraceEventCategory::ApiCalls,
         TraceEventKind::NoOp
         | TraceEventKind::TraceStarted
         | TraceEventKind::TraceStopped
@@ -3321,7 +3500,10 @@ fn visible_event_indices(trace: &SystemTraceDisplayState) -> Vec<usize> {
                 TraceEventView::Events => trace
                     .event_category_filter
                     .is_enabled(trace_event_category(&event.kind)),
-                TraceEventView::Logs => matches!(event.kind, TraceEventKind::FormattedPrint { .. }),
+                TraceEventView::Logs => matches!(
+                    event.kind,
+                    TraceEventKind::FormattedPrint { .. } | TraceEventKind::PrintElf { .. }
+                ),
                 TraceEventView::Terminal
                 | TraceEventView::ProbeLog
                 | TraceEventView::CpuLoad
@@ -3329,7 +3511,7 @@ fn visible_event_indices(trace: &SystemTraceDisplayState) -> Vec<usize> {
             };
             view_matches
                 && (filter.is_empty()
-                    || event_search_text(event)
+                    || event_search_text(trace, event)
                         .to_lowercase()
                         .contains(filter.as_str()))
         })
@@ -3523,11 +3705,11 @@ fn paint_event_table(
                                     [170.0, 20.0],
                                     egui::SelectableLabel::new(
                                         event_selected,
-                                        event_name(&event.kind),
+                                        event_name(trace, event),
                                     ),
                                 )
                                 .clicked();
-                            ui.label(RichText::new(event_summary(&event.kind)).color(
+                            ui.label(RichText::new(event_summary(trace, event)).color(
                                 if event_selected {
                                     TRACE_SELECTION_COLOR
                                 } else {
@@ -3664,18 +3846,18 @@ fn paint_trace_empty_state(ui: &mut egui::Ui, title: &str, description: &str, mi
         });
 }
 
-fn event_search_text(event: &TraceEvent) -> String {
+fn event_search_text(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String {
     format!(
         "{} {} {} {}",
         event.timestamp_ticks,
         event.core_id,
-        event_name(&event.kind),
-        event_summary(&event.kind)
+        event_name(trace, event),
+        event_summary(trace, event)
     )
 }
 
-fn event_name(kind: &TraceEventKind) -> &'static str {
-    match kind {
+fn event_name(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String {
+    let name = match &event.kind {
         TraceEventKind::NoOp => "No-op",
         TraceEventKind::TraceStarted => "Trace started",
         TraceEventKind::TraceStopped => "Trace stopped",
@@ -3705,13 +3887,41 @@ fn event_name(kind: &TraceEventKind) -> &'static str {
         TraceEventKind::ResourceName { .. } => "Resource name",
         TraceEventKind::DataSample { .. } => "Data sample",
         TraceEventKind::FormattedPrint { .. } => "Log",
-        TraceEventKind::ApiCallEnded { .. } => "API call ended",
+        TraceEventKind::PrintElf { .. } => "Log",
+        TraceEventKind::ApiCall { event_id, .. } => {
+            return trace
+                .description_event_id(*event_id)
+                .and_then(|description_event_id| {
+                    trace
+                        .description()
+                        .and_then(|description| description.event(description_event_id))
+                })
+                .map_or_else(
+                    || format!("API event {event_id}"),
+                    |event| event.name.clone(),
+                );
+        }
+        TraceEventKind::ApiCallEnded { event_id, .. } => {
+            return u32::try_from(*event_id)
+                .ok()
+                .and_then(|event_id| trace.description_event_id(event_id))
+                .and_then(|description_event_id| {
+                    trace
+                        .description()
+                        .and_then(|description| description.event(description_event_id))
+                })
+                .map_or_else(
+                    || format!("API event {event_id} ended"),
+                    |event| format!("{} ended", event.name),
+                );
+        }
         TraceEventKind::Unknown { .. } => "Unknown event",
-    }
+    };
+    name.to_owned()
 }
 
-fn event_summary(kind: &TraceEventKind) -> String {
-    match kind {
+fn event_summary(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String {
+    match &event.kind {
         TraceEventKind::Overflow { dropped_events } => format!("{dropped_events} events dropped"),
         TraceEventKind::TaskCreated { task_id }
         | TraceEventKind::TaskStarted { task_id }
@@ -3765,10 +3975,70 @@ fn event_summary(kind: &TraceEventKind) -> String {
             options,
             arguments,
         } => format!("{format}  args={arguments:?}, options={options}"),
+        TraceEventKind::PrintElf {
+            format_address,
+            options,
+            payload,
+        } => trace.elf().map_or_else(
+            || {
+                format!(
+                    ".sv-data address 0x{format_address:x}, {} raw bytes, options={options}",
+                    payload.len()
+                )
+            },
+            |elf| {
+                elf.decode_print_elf(*format_address, payload).map_or_else(
+                    |error| format!("Print-ELF 0x{format_address:x}: {error}"),
+                    |message| format!("{}  options={options}", message.render()),
+                )
+            },
+        ),
+        TraceEventKind::ApiCall { event_id, payload } => trace
+            .description_event_id(*event_id)
+            .and_then(|description_event_id| {
+                trace.description().map(|description| {
+                    description
+                        .decode_api_call(description_event_id, payload)
+                        .map_or_else(
+                            |error| format!("event {event_id}: {error}"),
+                            |decoded| {
+                                decoded
+                                    .parameters
+                                    .iter()
+                                    .map(|parameter| {
+                                        format_api_parameter(trace, event.core_id, parameter)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            },
+                        )
+                })
+            })
+            .unwrap_or_else(|| format!("event {event_id}, {} raw bytes", payload.len())),
         TraceEventKind::ApiCallEnded {
             event_id,
             return_value,
-        } => format!("event {event_id}, return {return_value:?}"),
+        } => u32::try_from(*event_id)
+            .ok()
+            .and_then(|event_id| trace.description_event_id(event_id))
+            .and_then(|description_event_id| {
+                trace.description().map(|description| {
+                    description
+                        .decode_api_return(description_event_id, *return_value)
+                        .map_or_else(
+                            |error| format!("event {event_id}: {error}"),
+                            |parameter| {
+                                parameter.map_or_else(
+                                    || "return".to_owned(),
+                                    |parameter| {
+                                        format_api_parameter(trace, event.core_id, &parameter)
+                                    },
+                                )
+                            },
+                        )
+                })
+            })
+            .unwrap_or_else(|| format!("event {event_id}, return {return_value:?}")),
         TraceEventKind::Unknown { event_id, payload } => {
             format!("event {event_id}, {} raw bytes", payload.len())
         }
@@ -3780,6 +4050,62 @@ fn event_summary(kind: &TraceEventKind) -> String {
         | TraceEventKind::IsrExitedToScheduler
         | TraceEventKind::TimerExited
         | TraceEventKind::Idle => String::new(),
+    }
+}
+
+fn format_api_parameter(
+    trace: &SystemTraceDisplayState,
+    core_id: u32,
+    parameter: &DecodedApiParameter,
+) -> String {
+    let value = match &parameter.value {
+        ApiValue::Binary(value) => format!("0b{value:b}"),
+        ApiValue::Bytes(value) => value
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        ApiValue::Signed(value) => value.to_string(),
+        ApiValue::Time(value) | ApiValue::Unsigned(value) => value.to_string(),
+        ApiValue::Resource(resource_id) => {
+            let address = trace.resource_address(*resource_id);
+            trace.resource_name(*resource_id).map_or_else(
+                || address.map_or_else(|| resource_id.to_string(), |value| format!("0x{value:x}")),
+                |name| {
+                    address.map_or_else(|| name.to_owned(), |value| format!("{name} (0x{value:x})"))
+                },
+            )
+        }
+        ApiValue::Pointer(value) => trace
+            .elf()
+            .and_then(|elf| elf.symbol_name(*value))
+            .map_or_else(
+                || format!("0x{value:08x}"),
+                |name| format!("{name} (0x{value:x})"),
+            ),
+        ApiValue::String(value) => value.clone(),
+        ApiValue::Task(task_id) => trace
+            .model()
+            .core(core_id)
+            .and_then(|core| core.tasks().get(task_id))
+            .and_then(|task| task.name.as_deref())
+            .map_or_else(
+                || format!("task {task_id}"),
+                |name| format!("{name} ({task_id})"),
+            ),
+        ApiValue::Hex(value) => format!("0x{value:x}"),
+        ApiValue::Named {
+            type_name,
+            value,
+            name,
+        } => name
+            .as_ref()
+            .map_or_else(|| format!("{type_name}({value})"), |name| name.clone()),
+    };
+    if parameter.label.is_empty() {
+        value
+    } else {
+        format!("{}={value}", parameter.label)
     }
 }
 
@@ -3975,6 +4301,84 @@ mod tests {
         trace
     }
 
+    #[test]
+    fn api_descriptions_decode_typed_values_and_resolve_trace_names() {
+        let mut trace = timing_trace();
+        trace.set_description(Some(
+            wavecraft_systemview::SystemViewDescription::parse(
+                "32 QueueSend Queue=%I Task=%t Count=%u | Result=%u",
+            )
+            .expect("description parses"),
+        ));
+        trace.ingest(TraceEvent {
+            sequence: 6,
+            core_id: 0,
+            timestamp_ticks: 200,
+            kind: TraceEventKind::ResourceName {
+                resource_id: 0x20,
+                name: "ready_queue".to_owned(),
+            },
+        });
+        let call = TraceEvent {
+            sequence: 7,
+            core_id: 0,
+            timestamp_ticks: 210,
+            kind: TraceEventKind::ApiCall {
+                event_id: 32,
+                payload: vec![0x20, 7, 3],
+            },
+        };
+
+        assert_eq!(event_name(&trace, &call), "QueueSend");
+        assert_eq!(
+            event_summary(&trace, &call),
+            "Queue=ready_queue (0x20000020), Task=app_main (7), Count=3"
+        );
+
+        let returned = TraceEvent {
+            sequence: 8,
+            core_id: 0,
+            timestamp_ticks: 220,
+            kind: TraceEventKind::ApiCallEnded {
+                event_id: 32,
+                return_value: Some(1),
+            },
+        };
+        assert_eq!(event_name(&trace, &returned), "QueueSend ended");
+        assert_eq!(event_summary(&trace, &returned), "Result=1");
+    }
+
+    #[test]
+    fn module_description_offsets_map_local_api_ids() {
+        let mut trace = SystemTraceDisplayState::default();
+        trace.set_description(Some(
+            wavecraft_systemview::SystemViewDescription::parse("0 ModuleInit Flags=%x")
+                .expect("module description parses"),
+        ));
+        trace.ingest(TraceEvent {
+            sequence: 0,
+            core_id: 0,
+            timestamp_ticks: 0,
+            kind: TraceEventKind::ModuleDescription {
+                module_id: 1,
+                event_offset: 512,
+                name: "Middleware".to_owned(),
+            },
+        });
+        let call = TraceEvent {
+            sequence: 1,
+            core_id: 0,
+            timestamp_ticks: 1,
+            kind: TraceEventKind::ApiCall {
+                event_id: 512,
+                payload: vec![0x2a],
+            },
+        };
+
+        assert_eq!(event_name(&trace, &call), "ModuleInit");
+        assert_eq!(event_summary(&trace, &call), "Flags=0x2a");
+    }
+
     fn paint_central_texts(context: &egui::Context, app: &mut WaveCraftApp) -> Vec<String> {
         paint_central_texts_at_size(context, app, egui::vec2(1200.0, 800.0))
     }
@@ -4140,6 +4544,8 @@ mod tests {
         assert!(texts.iter().any(|(text, _)| text == "RTT"));
         assert!(texts.iter().any(|(text, _)| text == "RTT control block"));
         assert!(texts.iter().any(|(text, _)| text == "SystemView"));
+        assert!(texts.iter().any(|(text, _)| text == "Application ELF"));
+        assert!(texts.iter().any(|(text, _)| text == "API description"));
         assert!(texts
             .iter()
             .any(|(text, _)| text == "Detected timestamp clock"));
@@ -5367,6 +5773,8 @@ mod tests {
             speed_khz: 8_000,
             reset_after_attach: true,
             control_block_address: String::new(),
+            elf_path: String::new(),
+            description_path: String::new(),
             systemview_enabled: true,
             up_channel: 1,
             down_channel: 1,
@@ -5423,6 +5831,8 @@ mod tests {
             speed_khz: 2_000,
             reset_after_attach: true,
             control_block_address: "0x20001000".to_owned(),
+            elf_path: "/tmp/application.elf".to_owned(),
+            description_path: "/tmp/SYSVIEW_FreeRTOS.txt".to_owned(),
             systemview_enabled: true,
             up_channel: 2,
             down_channel: 3,

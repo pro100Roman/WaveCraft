@@ -104,6 +104,15 @@ pub enum TraceEventKind {
         options: u64,
         arguments: Vec<u64>,
     },
+    PrintElf {
+        format_address: u64,
+        options: u64,
+        payload: Vec<u8>,
+    },
+    ApiCall {
+        event_id: u32,
+        payload: Vec<u8>,
+    },
     ApiCallEnded {
         event_id: u64,
         return_value: Option<u64>,
@@ -620,6 +629,8 @@ impl CoreTraceState {
             | TraceEventKind::ResourceName { .. }
             | TraceEventKind::DataSample { .. }
             | TraceEventKind::FormattedPrint { .. }
+            | TraceEventKind::PrintElf { .. }
+            | TraceEventKind::ApiCall { .. }
             | TraceEventKind::ApiCallEnded { .. }
             | TraceEventKind::Unknown { .. } => {}
         }

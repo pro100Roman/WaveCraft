@@ -1,5 +1,12 @@
 //! Incremental decoder for the SEGGER SystemView target event stream.
 
+mod assets;
+
+pub use assets::{
+    ApiEventDescription, ApiValue, AssetError, DecodedApiEvent, DecodedApiParameter,
+    DecodedPrintElf, ElfSymbol, PrintElfValue, SystemViewDescription, SystemViewElf,
+};
+
 use std::error::Error;
 use std::fmt;
 
@@ -390,6 +397,29 @@ fn decode_length_prefixed_event(
     event_id: u32,
     payload: &[u8],
 ) -> Result<TraceEventKind, DecodeError> {
+    if (32..=2047).contains(&event_id) {
+        return Ok(TraceEventKind::ApiCall {
+            event_id,
+            payload: payload.to_vec(),
+        });
+    }
+    if event_id == 31 {
+        let mut reader = PayloadReader::new(event_id, payload);
+        let extended_event_id = reader.varint()?;
+        if extended_event_id == 7 {
+            let format_address = reader.varint()?;
+            let options = reader.varint()?;
+            return Ok(TraceEventKind::PrintElf {
+                format_address,
+                options,
+                payload: payload[reader.cursor..].to_vec(),
+            });
+        }
+        return Ok(TraceEventKind::Unknown {
+            event_id,
+            payload: payload.to_vec(),
+        });
+    }
     if !matches!(event_id, 24..=29) {
         return Ok(TraceEventKind::Unknown {
             event_id,
@@ -725,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_init_and_preserves_unknown_length_prefixed_events() {
+    fn decodes_init_and_preserves_typed_api_call_payloads() {
         let mut init_payload = Vec::new();
         init_payload.extend(encode_varint(1_000));
         init_payload.extend(encode_varint(168_000_000));
@@ -749,9 +779,30 @@ mod tests {
         );
         assert_eq!(
             events[1].kind,
-            TraceEventKind::Unknown {
+            TraceEventKind::ApiCall {
                 event_id: 47,
                 payload: vec![1, 2, 3],
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_extended_print_elf_payload() {
+        let mut payload = encode_varint(7);
+        payload.extend(encode_varint(0x8000));
+        payload.extend(encode_varint(2));
+        payload.extend(encode_varint(42));
+
+        let events = SystemViewDecoder::default()
+            .push(&length_packet(31, &payload, 5))
+            .expect("Print-ELF packet decodes");
+
+        assert_eq!(
+            events[0].kind,
+            TraceEventKind::PrintElf {
+                format_address: 0x8000,
+                options: 2,
+                payload: encode_varint(42),
             }
         );
     }

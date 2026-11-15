@@ -595,7 +595,7 @@ its tests, formatting, and workspace Clippy checks pass.
 2. [x] Add structured event-category filters, next/previous navigation,
    next/previous-in-context navigation, go-to-sequence/timestamp, target versus
    recording-relative time, and persistent time-reference markers.
-3. [ ] Add ELF and SystemView description-file support: `_SEGGER_RTT` lookup,
+3. [x] Add ELF and SystemView description-file support: `_SEGGER_RTT` lookup,
    resource and symbol names, `.sv-data` Print-ELF messages, and typed decoding
    of API event IDs 32 through 511.
 4. [ ] Add synchronized Data Plot instruments, per-context runtime statistics,

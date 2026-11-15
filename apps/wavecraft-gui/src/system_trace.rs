@@ -14,7 +14,10 @@ use wavecraft_debug_probe::{
     ProbeSelector, RttChannelDescriptor, RttChannelDirection, RttConfiguration, RttTerminalDecoder,
     RttTerminalLine,
 };
-use wavecraft_systemview::{SystemViewDecoder, SYSTEMVIEW_COMMAND_START, SYSTEMVIEW_COMMAND_STOP};
+use wavecraft_systemview::{
+    SystemViewDecoder, SystemViewDescription, SystemViewElf, SYSTEMVIEW_COMMAND_START,
+    SYSTEMVIEW_COMMAND_STOP,
+};
 use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
 
 const DEFAULT_EVENT_CAPACITY: usize = 100_000;
@@ -795,6 +798,32 @@ fn unexpected_reply(operation: &str) -> DebugProbeError {
 }
 
 impl crate::WaveCraftApp {
+    pub(crate) fn reload_system_trace_assets(&mut self) {
+        let elf_path = self.system_trace_settings.elf_path.trim().to_owned();
+        if !elf_path.is_empty() {
+            match read_systemview_elf(Path::new(&elf_path)) {
+                Ok(elf) => {
+                    if let Some(address) = elf.rtt_control_block() {
+                        self.system_trace_settings.control_block_address = format!("0x{address:x}");
+                    }
+                    self.system_trace.set_elf(Some(elf));
+                }
+                Err(error) => self.last_error = Some(error),
+            }
+        }
+        let description_path = self
+            .system_trace_settings
+            .description_path
+            .trim()
+            .to_owned();
+        if !description_path.is_empty() {
+            match read_systemview_description(Path::new(&description_path)) {
+                Ok(description) => self.system_trace.set_description(Some(description)),
+                Err(error) => self.last_error = Some(error),
+            }
+        }
+    }
+
     pub(crate) fn begin_open_system_trace(&mut self, path: PathBuf) {
         if self.pending.is_some() || !self.system_trace_connection.is_disconnected() {
             return;
@@ -996,6 +1025,8 @@ pub(crate) struct SystemTraceDisplayState {
     terminal_lines: VecDeque<RttTerminalLine>,
     probe_logs: VecDeque<ProbeLogEntry>,
     model: TraceModel,
+    elf: Option<SystemViewElf>,
+    description: Option<SystemViewDescription>,
     target_frequencies_hz: Option<(u64, u64)>,
     event_capacity: usize,
     terminal_line_capacity: usize,
@@ -1028,6 +1059,8 @@ impl Default for SystemTraceDisplayState {
             terminal_lines: VecDeque::new(),
             probe_logs: VecDeque::new(),
             model: TraceModel::new(),
+            elf: None,
+            description: None,
             target_frequencies_hz: None,
             event_capacity: DEFAULT_EVENT_CAPACITY,
             terminal_line_capacity: DEFAULT_TERMINAL_LINE_CAPACITY,
@@ -1062,6 +1095,77 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn model(&self) -> &TraceModel {
         &self.model
+    }
+
+    pub(crate) fn elf(&self) -> Option<&SystemViewElf> {
+        self.elf.as_ref()
+    }
+
+    pub(crate) fn set_elf(&mut self, elf: Option<SystemViewElf>) {
+        self.elf = elf;
+    }
+
+    pub(crate) fn description(&self) -> Option<&SystemViewDescription> {
+        self.description.as_ref()
+    }
+
+    pub(crate) fn set_description(&mut self, description: Option<SystemViewDescription>) {
+        self.description = description;
+    }
+
+    pub(crate) fn description_event_id(&self, event_id: u32) -> Option<u32> {
+        let description = self.description.as_ref()?;
+        if description.event(event_id).is_some() {
+            return Some(event_id);
+        }
+        self.events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                TraceEventKind::ModuleDescription { event_offset, .. } => {
+                    let event_offset = u32::try_from(*event_offset).ok()?;
+                    let local_event_id = event_id.checked_sub(event_offset)?;
+                    description
+                        .event(local_event_id)
+                        .is_some()
+                        .then_some(local_event_id)
+                }
+                _ => None,
+            })
+    }
+
+    pub(crate) fn resource_name(&self, resource_id: u64) -> Option<&str> {
+        if let Some(name) = self
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                TraceEventKind::ResourceName {
+                    resource_id: candidate,
+                    name,
+                } if *candidate == resource_id => Some(name.as_str()),
+                _ => None,
+            })
+        {
+            return Some(name);
+        }
+        let address = self.resource_address(resource_id)?;
+        self.elf.as_ref()?.symbol_name(address)
+    }
+
+    pub(crate) fn resource_address(&self, resource_id: u64) -> Option<u64> {
+        let (ram_base, id_shift) = self
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match event.kind {
+                TraceEventKind::TargetInfo {
+                    ram_base, id_shift, ..
+                } => Some((ram_base, id_shift)),
+                _ => None,
+            })?;
+        let shifted = resource_id.checked_shl(u32::try_from(id_shift).ok()?)?;
+        ram_base.checked_add(shifted)
     }
 
     pub(crate) fn target_frequencies_hz(&self) -> Option<(u64, u64)> {
@@ -1317,7 +1421,12 @@ impl SystemTraceDisplayState {
     pub(crate) fn log_count(&self) -> usize {
         self.events
             .iter()
-            .filter(|event| matches!(event.kind, TraceEventKind::FormattedPrint { .. }))
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    TraceEventKind::FormattedPrint { .. } | TraceEventKind::PrintElf { .. }
+                )
+            })
             .count()
     }
 
@@ -1335,6 +1444,46 @@ pub(crate) fn choose_systemview_trace_to_open() -> Option<PathBuf> {
         .set_title("Open raw SystemView trace")
         .add_filter("SystemView data", &["SVDat", "svdat"])
         .pick_file()
+}
+
+pub(crate) fn choose_systemview_elf() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Select application ELF")
+        .add_filter("ELF application", &["elf", "axf", "out"])
+        .pick_file()
+}
+
+pub(crate) fn choose_systemview_description() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Select SystemView description")
+        .add_filter("SystemView description", &["txt"])
+        .pick_file()
+}
+
+pub(crate) fn read_systemview_elf(path: &Path) -> Result<SystemViewElf, String> {
+    let data = std::fs::read(path)
+        .map_err(|error| format!("failed to read application ELF {}: {error}", path.display()))?;
+    SystemViewElf::parse(&data).map_err(|error| {
+        format!(
+            "failed to parse application ELF {}: {error}",
+            path.display()
+        )
+    })
+}
+
+pub(crate) fn read_systemview_description(path: &Path) -> Result<SystemViewDescription, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        format!(
+            "failed to read SystemView description {}: {error}",
+            path.display()
+        )
+    })?;
+    SystemViewDescription::parse(&text).map_err(|error| {
+        format!(
+            "failed to parse SystemView description {}: {error}",
+            path.display()
+        )
+    })
 }
 
 pub(crate) fn choose_systemview_recording_path() -> Option<PathBuf> {
