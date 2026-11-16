@@ -2187,15 +2187,18 @@ fn paint_timeline_canvas(
             if interval_rect.left() > plot_clip.right() {
                 break;
             }
+            let interval_events =
+                interval_event_sequences(trace, *lane, interval.start_ticks, interval.end_ticks);
+            let interval_selected = interval_events.contains(trace.selected_sequence);
             // At overview zoom, thousands of short context switches can map to
             // the same pixel. Painting and registering every covered interval
-            // only increases egui work without adding visible information.
-            if interval_rect.right() <= painted_through_x {
+            // only increases egui work without adding visible information. A
+            // selected interval must remain visible so event-table cross-
+            // references still work at overview scales.
+            if interval_rect.right() <= painted_through_x && !interval_selected {
                 continue;
             }
-            painted_through_x = interval_rect.right();
-            let interval_sequence = interval_event_sequence(trace, *lane, interval.start_ticks);
-            let interval_selected = interval_sequence == trace.selected_sequence;
+            painted_through_x = painted_through_x.max(interval_rect.right());
             if interval.end_ticks.is_some() {
                 let measurement = TimelineTimingMeasurement {
                     first: TimelineTimingEdge {
@@ -2259,7 +2262,14 @@ fn paint_timeline_canvas(
                 ));
             }
             if response.clicked() {
-                clicked_sequence = interval_sequence;
+                clicked_sequence = response.interact_pointer_pos().and_then(|pointer| {
+                    interval_events.nearest_to_x(
+                        pointer.x,
+                        x_start,
+                        x_end,
+                        interval_rect.center().x,
+                    )
+                });
             }
             if !interval.complete {
                 plot_painter.rect_stroke(
@@ -2678,24 +2688,81 @@ fn format_detected_frequency(frequency_hz: Option<u64>) -> String {
     )
 }
 
-fn interval_event_sequence(
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TimelineIntervalEvents {
+    start: Option<u64>,
+    end: Option<u64>,
+}
+
+impl TimelineIntervalEvents {
+    fn contains(self, sequence: Option<u64>) -> bool {
+        sequence.is_some() && (sequence == self.start || sequence == self.end)
+    }
+
+    fn nearest_to_x(
+        self,
+        pointer_x: f32,
+        start_x: f32,
+        end_x: f32,
+        visible_center_x: f32,
+    ) -> Option<u64> {
+        match (self.start, self.end) {
+            (Some(start), Some(end)) => {
+                let start_distance = (pointer_x - start_x).abs();
+                let end_distance = (pointer_x - end_x).abs();
+                if (start_distance - end_distance).abs() <= f32::EPSILON {
+                    Some(if pointer_x <= visible_center_x {
+                        start
+                    } else {
+                        end
+                    })
+                } else if start_distance < end_distance {
+                    Some(start)
+                } else {
+                    Some(end)
+                }
+            }
+            (Some(start), None) => Some(start),
+            (None, Some(end)) => Some(end),
+            (None, None) => None,
+        }
+    }
+}
+
+fn interval_event_sequences(
     trace: &SystemTraceDisplayState,
     lane: TimelineLane,
-    timestamp_ticks: u64,
-) -> Option<u64> {
+    start_ticks: u64,
+    end_ticks: Option<u64>,
+) -> TimelineIntervalEvents {
     let events = trace.events();
-    let first_index = lower_bound_event_timestamp(events, timestamp_ticks);
-    let events_at_timestamp = || {
+    let start_index = lower_bound_event_timestamp(events, start_ticks);
+    let start_events = || {
         events
             .iter()
-            .skip(first_index)
-            .take_while(|event| event.timestamp_ticks == timestamp_ticks)
+            .skip(start_index)
+            .take_while(|event| event.timestamp_ticks == start_ticks)
             .filter(|event| event.core_id == lane.core_id)
     };
-    events_at_timestamp()
+    let start = start_events()
         .find(|event| event_starts_context(&event.kind, lane.context))
-        .or_else(|| events_at_timestamp().next())
-        .map(|event| event.sequence)
+        .or_else(|| start_events().next())
+        .map(|event| event.sequence);
+    let end = end_ticks.and_then(|end_ticks| {
+        let end_index = lower_bound_event_timestamp(events, end_ticks);
+        let end_events = || {
+            events
+                .iter()
+                .skip(end_index)
+                .take_while(|event| event.timestamp_ticks == end_ticks)
+                .filter(|event| event.core_id == lane.core_id)
+        };
+        end_events()
+            .find(|event| event_ends_context(&event.kind, lane.context))
+            .or_else(|| end_events().last())
+            .map(|event| event.sequence)
+    });
+    TimelineIntervalEvents { start, end }
 }
 
 fn lower_bound_event_timestamp(events: &VecDeque<TraceEvent>, timestamp_ticks: u64) -> usize {
@@ -2735,6 +2802,59 @@ fn event_starts_context(kind: &TraceEventKind, context: ExecutionContext) -> boo
             | TraceEventKind::TaskTerminated { .. },
         ) => true,
         (ExecutionContext::Idle, TraceEventKind::Idle) => true,
+        _ => false,
+    }
+}
+
+fn event_ends_context(kind: &TraceEventKind, context: ExecutionContext) -> bool {
+    match (context, kind) {
+        (
+            _,
+            TraceEventKind::TraceStarted
+            | TraceEventKind::TraceStopped
+            | TraceEventKind::Overflow { .. },
+        ) => true,
+        (ExecutionContext::Task(expected), TraceEventKind::TaskStarted { task_id }) => {
+            expected != *task_id
+        }
+        (ExecutionContext::Task(expected), TraceEventKind::TaskTerminated { task_id }) => {
+            expected == *task_id
+        }
+        (
+            ExecutionContext::Task(_),
+            TraceEventKind::TaskStopped
+            | TraceEventKind::IsrEntered { .. }
+            | TraceEventKind::TimerEntered { .. }
+            | TraceEventKind::Idle,
+        ) => true,
+        (ExecutionContext::Isr(expected), TraceEventKind::IsrEntered { isr_id }) => {
+            expected != *isr_id
+        }
+        (
+            ExecutionContext::Isr(_),
+            TraceEventKind::IsrExited | TraceEventKind::IsrExitedToScheduler,
+        ) => true,
+        (ExecutionContext::Timer(expected), TraceEventKind::TimerEntered { timer_id }) => {
+            expected != *timer_id
+        }
+        (
+            ExecutionContext::Timer(_),
+            TraceEventKind::TimerExited | TraceEventKind::IsrEntered { .. },
+        ) => true,
+        (
+            ExecutionContext::Scheduler,
+            TraceEventKind::TaskStarted { .. }
+            | TraceEventKind::IsrEntered { .. }
+            | TraceEventKind::TimerEntered { .. }
+            | TraceEventKind::Idle,
+        ) => true,
+        (
+            ExecutionContext::Idle,
+            TraceEventKind::TaskStarted { .. }
+            | TraceEventKind::TaskStopped
+            | TraceEventKind::IsrEntered { .. }
+            | TraceEventKind::TimerEntered { .. },
+        ) => true,
         _ => false,
     }
 }
@@ -4537,15 +4657,24 @@ fn event_summary(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String 
         TraceEventKind::TaskCreated { task_id }
         | TraceEventKind::TaskStarted { task_id }
         | TraceEventKind::TaskBecameReady { task_id }
-        | TraceEventKind::TaskTerminated { task_id } => format!("task {task_id}"),
+        | TraceEventKind::TaskTerminated { task_id } => {
+            format_task_name(trace, event.core_id, *task_id)
+        }
         TraceEventKind::TaskInfo {
-            task_id,
             priority,
             name,
-        } => format!("task {task_id}, priority {priority}, {name}"),
+            ..
+        } => format!("{name}, priority {priority}"),
         TraceEventKind::TaskStoppedReady { task_id, cause } => {
-            format!("task {task_id}, cause {cause}")
+            format!(
+                "{}, cause {cause}",
+                format_task_name(trace, event.core_id, *task_id)
+            )
         }
+        TraceEventKind::TaskStopped => task_ending_at_event(trace, event)
+            .map_or_else(String::new, |task_id| {
+                format_task_name(trace, event.core_id, task_id)
+            }),
         TraceEventKind::IsrEntered { isr_id } => format!("ISR {isr_id}"),
         TraceEventKind::TimerEntered { timer_id } => format!("timer {timer_id}"),
         TraceEventKind::MarkerStarted { marker_id }
@@ -4567,7 +4696,8 @@ fn event_summary(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String 
             stack_size,
             stack_usage,
         } => format!(
-            "task {task_id}, base 0x{stack_base:x}, {stack_usage}/{stack_size} bytes"
+            "{}, base 0x{stack_base:x}, {stack_usage}/{stack_size} bytes",
+            format_task_name(trace, event.core_id, *task_id)
         ),
         TraceEventKind::ModuleDescription {
             module_id,
@@ -4656,12 +4786,47 @@ fn event_summary(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String 
         TraceEventKind::NoOp
         | TraceEventKind::TraceStarted
         | TraceEventKind::TraceStopped
-        | TraceEventKind::TaskStopped
         | TraceEventKind::IsrExited
         | TraceEventKind::IsrExitedToScheduler
         | TraceEventKind::TimerExited
         | TraceEventKind::Idle => String::new(),
     }
+}
+
+fn task_name(trace: &SystemTraceDisplayState, core_id: u32, task_id: u64) -> Option<&str> {
+    trace
+        .model()
+        .core(core_id)
+        .and_then(|core| core.tasks().get(&task_id))
+        .and_then(|task| task.name.as_deref())
+        .or_else(|| {
+            trace
+                .model()
+                .cores()
+                .values()
+                .find_map(|core| core.tasks().get(&task_id)?.name.as_deref())
+        })
+}
+
+fn format_task_name(trace: &SystemTraceDisplayState, core_id: u32, task_id: u64) -> String {
+    task_name(trace, core_id, task_id).map_or_else(|| format!("task {task_id}"), ToOwned::to_owned)
+}
+
+fn task_ending_at_event(trace: &SystemTraceDisplayState, event: &TraceEvent) -> Option<u64> {
+    trace
+        .model()
+        .core(event.core_id)?
+        .intervals()
+        .iter()
+        .rev()
+        .find_map(|interval| {
+            (interval.end_ticks == Some(event.timestamp_ticks))
+                .then_some(interval.context)
+                .and_then(|context| match context {
+                    ExecutionContext::Task(task_id) => Some(task_id),
+                    _ => None,
+                })
+        })
 }
 
 fn format_api_parameter(
@@ -4695,15 +4860,8 @@ fn format_api_parameter(
                 |name| format!("{name} (0x{value:x})"),
             ),
         ApiValue::String(value) => value.clone(),
-        ApiValue::Task(task_id) => trace
-            .model()
-            .core(core_id)
-            .and_then(|core| core.tasks().get(task_id))
-            .and_then(|task| task.name.as_deref())
-            .map_or_else(
-                || format!("task {task_id}"),
-                |name| format!("{name} ({task_id})"),
-            ),
+        ApiValue::Task(task_id) => task_name(trace, core_id, *task_id)
+            .map_or_else(|| format!("task {task_id}"), ToOwned::to_owned),
         ApiValue::Hex(value) => format!("0x{value:x}"),
         ApiValue::Named {
             type_name,
@@ -5100,7 +5258,7 @@ mod tests {
         assert_eq!(event_name(&trace, &call), "QueueSend");
         assert_eq!(
             event_summary(&trace, &call),
-            "Queue=ready_queue (0x20000020), Task=app_main (7), Count=3"
+            "Queue=ready_queue (0x20000020), Task=app_main, Count=3"
         );
 
         let returned = TraceEvent {
@@ -5114,6 +5272,24 @@ mod tests {
         };
         assert_eq!(event_name(&trace, &returned), "QueueSend ended");
         assert_eq!(event_summary(&trace, &returned), "Result=1");
+    }
+
+    #[test]
+    fn event_details_use_task_names_and_resolve_the_stopped_task() {
+        let trace = analysis_trace();
+        let summary = |sequence| {
+            let event = trace
+                .events()
+                .iter()
+                .find(|event| event.sequence == sequence)
+                .expect("event exists");
+            event_summary(&trace, event)
+        };
+
+        assert_eq!(summary(3), "app_main");
+        assert_eq!(summary(5), "worker");
+        assert_eq!(summary(6), "app_main, base 0x20001000, 640/1024 bytes");
+        assert_eq!(summary(7), "worker, cause 1");
     }
 
     #[test]
@@ -5989,26 +6165,125 @@ mod tests {
     }
 
     #[test]
-    fn timeline_intervals_resolve_their_originating_events() {
+    fn timeline_intervals_resolve_their_start_and_end_events() {
         let mut trace = SystemTraceDisplayState::default();
-        trace.ingest(TraceEvent {
-            sequence: 41,
-            core_id: 0,
-            timestamp_ticks: 120,
-            kind: TraceEventKind::TaskStarted { task_id: 7 },
-        });
+        for event in [
+            TraceEvent {
+                sequence: 41,
+                core_id: 0,
+                timestamp_ticks: 120,
+                kind: TraceEventKind::TaskStarted { task_id: 7 },
+            },
+            TraceEvent {
+                sequence: 42,
+                core_id: 0,
+                timestamp_ticks: 180,
+                kind: TraceEventKind::TaskStopped,
+            },
+        ] {
+            trace.ingest(event);
+        }
 
         assert_eq!(
-            interval_event_sequence(
+            interval_event_sequences(
                 &trace,
                 TimelineLane {
                     core_id: 0,
                     context: ExecutionContext::Task(7),
                 },
                 120,
+                Some(180),
             ),
-            Some(41)
+            TimelineIntervalEvents {
+                start: Some(41),
+                end: Some(42),
+            }
         );
+    }
+
+    #[test]
+    fn collapsed_interval_clicks_choose_the_nearest_boundary_event() {
+        let events = TimelineIntervalEvents {
+            start: Some(41),
+            end: Some(42),
+        };
+
+        assert_eq!(events.nearest_to_x(100.0, 100.0, 100.0, 101.0), Some(41));
+        assert_eq!(events.nearest_to_x(102.0, 100.0, 100.0, 101.0), Some(42));
+        assert!(events.contains(Some(41)));
+        assert!(events.contains(Some(42)));
+    }
+
+    #[test]
+    fn overview_timeline_keeps_the_event_table_selection_visible() {
+        let context = egui::Context::default();
+        let mut trace = SystemTraceDisplayState::default();
+        for event in [
+            TraceEvent {
+                sequence: 0,
+                core_id: 0,
+                timestamp_ticks: 0,
+                kind: TraceEventKind::TaskStarted { task_id: 7 },
+            },
+            TraceEvent {
+                sequence: 1,
+                core_id: 0,
+                timestamp_ticks: 1,
+                kind: TraceEventKind::TaskStarted { task_id: 8 },
+            },
+            TraceEvent {
+                sequence: 2,
+                core_id: 0,
+                timestamp_ticks: 2,
+                kind: TraceEventKind::TaskStarted { task_id: 7 },
+            },
+            TraceEvent {
+                sequence: 3,
+                core_id: 0,
+                timestamp_ticks: 3,
+                kind: TraceEventKind::TaskStarted { task_id: 8 },
+            },
+            TraceEvent {
+                sequence: 4,
+                core_id: 0,
+                timestamp_ticks: 1_000_000,
+                kind: TraceEventKind::NoOp,
+            },
+        ] {
+            trace.ingest(event);
+        }
+        trace.select_from_event_table(2);
+        let lanes = timeline_lanes(trace.model());
+        let canvas = egui::Rect::from_min_size(
+            egui::pos2(10.0, 10.0),
+            egui::vec2(700.0, timeline_canvas_height(lanes.len())),
+        );
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(760.0, 180.0),
+            )),
+            ..egui::RawInput::default()
+        };
+
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                paint_timeline_canvas(
+                    ui,
+                    canvas,
+                    &mut trace,
+                    &lanes,
+                    0,
+                    1_000_000,
+                    TimelineCanvasOptions::default(),
+                );
+            });
+        });
+
+        assert!(output
+            .shapes
+            .iter()
+            .any(|clipped| shape_contains_fill(&clipped.shape, TRACE_SELECTION_FILL)));
     }
 
     #[test]
