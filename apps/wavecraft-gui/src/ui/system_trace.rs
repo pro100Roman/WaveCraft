@@ -23,7 +23,7 @@ use crate::{
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugTargetDescriptor, ProbeDescriptor, ProbeProvider, ProbeSelector,
     RttConfiguration, RttControlBlockLocation, RttTerminalColor, RttTerminalLine, TargetSelector,
-    WireProtocol,
+    WireProtocol, JLINK_NETWORK_CONNECTION_ID_PREFIX,
 };
 use wavecraft_systemview::{ApiValue, DecodedApiParameter};
 use wavecraft_trace::{
@@ -62,10 +62,17 @@ const DEFAULT_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 1_000_000;
 const MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 10_000_000_000;
 const APPLICATION_ELF_HELP: &str = "Resolves _SEGGER_RTT, resource symbols, and .sv-data messages";
 const API_DESCRIPTION_HELP: &str = "Decodes typed OS and middleware API events 32–511";
+pub(crate) const NETWORK_BMP_PROBE_SELECTION: &str = "wavecraft:network-bmp";
+pub(crate) const NETWORK_JLINK_PROBE_SELECTION: &str = "wavecraft:network-jlink";
+const BLACK_MAGIC_PROBE_SELECTOR_PREFIX: &str = "1d50:6018";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SystemTraceSettings {
     pub(crate) probe_connection_id: Option<String>,
+    pub(crate) bmp_network_address: String,
+    pub(crate) bmp_network_port: u16,
+    pub(crate) jlink_network_address: String,
+    pub(crate) jlink_network_port: u16,
     pub(crate) target_name: String,
     pub(crate) speed_khz: u32,
     pub(crate) reset_after_attach: bool,
@@ -84,6 +91,10 @@ impl Default for SystemTraceSettings {
     fn default() -> Self {
         Self {
             probe_connection_id: None,
+            bmp_network_address: String::new(),
+            bmp_network_port: 2_000,
+            jlink_network_address: String::new(),
+            jlink_network_port: 19_020,
             target_name: String::new(),
             speed_khz: 4_000,
             reset_after_attach: false,
@@ -103,6 +114,22 @@ impl Default for SystemTraceSettings {
 impl SystemTraceSettings {
     pub(crate) fn saved_values(&self) -> BTreeMap<String, String> {
         BTreeMap::from([
+            (
+                "system_trace.bmp_network_address".to_owned(),
+                self.bmp_network_address.clone(),
+            ),
+            (
+                "system_trace.bmp_network_port".to_owned(),
+                self.bmp_network_port.to_string(),
+            ),
+            (
+                "system_trace.jlink_network_address".to_owned(),
+                self.jlink_network_address.clone(),
+            ),
+            (
+                "system_trace.jlink_network_port".to_owned(),
+                self.jlink_network_port.to_string(),
+            ),
             (
                 "system_trace.target_name".to_owned(),
                 self.target_name.clone(),
@@ -153,6 +180,18 @@ impl SystemTraceSettings {
     }
 
     pub(crate) fn apply_saved_values(&mut self, values: &BTreeMap<String, String>) {
+        if let Some(address) = values.get("system_trace.bmp_network_address") {
+            self.bmp_network_address.clone_from(address);
+        }
+        self.bmp_network_port = saved_trace_value(values, "system_trace.bmp_network_port")
+            .filter(|port| *port != 0)
+            .unwrap_or(self.bmp_network_port);
+        if let Some(address) = values.get("system_trace.jlink_network_address") {
+            self.jlink_network_address.clone_from(address);
+        }
+        self.jlink_network_port = saved_trace_value(values, "system_trace.jlink_network_port")
+            .filter(|port| *port != 0)
+            .unwrap_or(self.jlink_network_port);
         if let Some(target_name) = values.get("system_trace.target_name") {
             self.target_name.clone_from(target_name);
         }
@@ -203,11 +242,21 @@ impl SystemTraceSettings {
         if !self.systemview_enabled && !self.terminal_enabled {
             return Err("Enable SystemView trace or the plain RTT terminal".to_owned());
         }
-        let connection_id = self
+        let selected_probe = self
             .probe_connection_id
-            .clone()
+            .as_deref()
             .ok_or_else(|| "Select a debug probe before connecting".to_owned())?;
+        let connection_id = if selected_probe == NETWORK_BMP_PROBE_SELECTION {
+            network_bmp_connection_id(&self.bmp_network_address, self.bmp_network_port)?
+        } else if selected_probe == NETWORK_JLINK_PROBE_SELECTION {
+            network_jlink_connection_id(&self.jlink_network_address, self.jlink_network_port)?
+        } else {
+            selected_probe.to_owned()
+        };
         let target_name = self.target_name.trim();
+        if selected_probe == NETWORK_JLINK_PROBE_SELECTION && target_name.is_empty() {
+            return Err("Select a target MCU when using J-Link over the network".to_owned());
+        }
         let target = if target_name.is_empty() {
             TargetSelector::Auto
         } else {
@@ -233,6 +282,33 @@ impl SystemTraceSettings {
             terminal_up_channel: self.terminal_enabled.then_some(self.terminal_up_channel),
         })
     }
+}
+
+fn network_bmp_connection_id(address: &str, port: u16) -> Result<String, String> {
+    let endpoint = network_probe_endpoint(address, port, "BMP")?;
+    Ok(format!("{BLACK_MAGIC_PROBE_SELECTOR_PREFIX}:{endpoint}"))
+}
+
+fn network_jlink_connection_id(address: &str, port: u16) -> Result<String, String> {
+    let endpoint = network_probe_endpoint(address, port, "J-Link")?;
+    Ok(format!("{JLINK_NETWORK_CONNECTION_ID_PREFIX}{endpoint}"))
+}
+
+fn network_probe_endpoint(
+    address: &str,
+    port: u16,
+    probe_name: &str,
+) -> Result<std::net::SocketAddr, String> {
+    let address = address
+        .trim()
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| format!("Enter a valid IP address for the network {probe_name}"))?;
+    if port == 0 {
+        return Err(format!(
+            "{probe_name} network port must be between 1 and 65535"
+        ));
+    }
+    Ok(std::net::SocketAddr::new(address, port))
 }
 
 fn saved_trace_value<T: std::str::FromStr>(
@@ -399,18 +475,42 @@ impl WaveCraftApp {
                                             probe.connection_id.as_str() == connection_id
                                         })
                                     });
-                                let selected_probe_label = selected_probe
-                                    .map(probe_label)
-                                    .unwrap_or_else(|| "No debug probe found".to_owned());
-                                let selected_probe_hover = selected_probe.map_or_else(
-                                    || "Select the connected J-Link, ST-Link, or Black Magic Probe used for this trace session".to_owned(),
-                                    |probe| {
-                                        format!(
-                                            "{}\nConnection: {}\n\nSelect the debug probe used for this trace session",
-                                            probe_full_label(probe), probe.connection_id
-                                        )
-                                    },
-                                );
+                                let network_bmp_selected = self
+                                    .system_trace_settings
+                                    .probe_connection_id
+                                    .as_deref()
+                                    == Some(NETWORK_BMP_PROBE_SELECTION);
+                                let network_jlink_selected = self
+                                    .system_trace_settings
+                                    .probe_connection_id
+                                    .as_deref()
+                                    == Some(NETWORK_JLINK_PROBE_SELECTION);
+                                let selected_probe_label = if network_bmp_selected {
+                                    "BMP over network".to_owned()
+                                } else if network_jlink_selected {
+                                    "J-Link over network".to_owned()
+                                } else {
+                                    selected_probe
+                                        .map(probe_label)
+                                        .unwrap_or_else(|| "No debug probe found".to_owned())
+                                };
+                                let selected_probe_hover = if network_bmp_selected {
+                                    "Connect to a Black Magic Probe remote protocol endpoint over TCP".to_owned()
+                                } else if network_jlink_selected {
+                                    "Connect to a J-Link probe or SEGGER Remote Server over TCP/IP".to_owned()
+                                } else {
+                                    selected_probe.map_or_else(
+                                        || {
+                                            "Select a connected probe or configure a network Black Magic Probe for this trace session".to_owned()
+                                        },
+                                        |probe| {
+                                            format!(
+                                                "{}\nConnection: {}\n\nSelect the debug probe used for this trace session",
+                                                probe_full_label(probe), probe.connection_id
+                                            )
+                                        },
+                                    )
+                                };
                                 let mut probe_changed = false;
                                 egui::ComboBox::from_id_salt("system_trace_probe")
                                     .width(ui.available_width())
@@ -437,11 +537,80 @@ impl WaveCraftApp {
                                                 ))
                                                 .changed();
                                         }
+                                        ui.separator();
+                                        probe_changed |= ui
+                                            .selectable_value(
+                                                &mut self
+                                                    .system_trace_settings
+                                                    .probe_connection_id,
+                                                Some(NETWORK_BMP_PROBE_SELECTION.to_owned()),
+                                                "BMP over network",
+                                            )
+                                            .on_hover_text(
+                                                "Connect to a Black Magic Probe remote protocol endpoint over TCP",
+                                            )
+                                            .changed();
+                                        probe_changed |= ui
+                                            .selectable_value(
+                                                &mut self
+                                                    .system_trace_settings
+                                                    .probe_connection_id,
+                                                Some(NETWORK_JLINK_PROBE_SELECTION.to_owned()),
+                                                "J-Link over network",
+                                            )
+                                            .on_hover_text(
+                                                "Connect to a J-Link probe or SEGGER Remote Server over TCP/IP",
+                                            )
+                                            .changed();
                                     })
                                     .response
                                     .on_hover_text(selected_probe_hover);
                                 if probe_changed {
                                     self.system_trace_settings.target_name.clear();
+                                }
+                                if network_bmp_selected {
+                                    ui.add_space(8.0);
+                                    setup_label(ui, "BMP IP address");
+                                    ui.add_sized(
+                                        [ui.available_width(), 20.0],
+                                        egui::TextEdit::singleline(
+                                            &mut self.system_trace_settings.bmp_network_address,
+                                        )
+                                        .hint_text("192.168.1.100"),
+                                    )
+                                    .on_hover_text(
+                                        "IPv4 or IPv6 address of the Black Magic remote protocol endpoint",
+                                    );
+                                    setup_label(ui, "BMP port");
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut self.system_trace_settings.bmp_network_port,
+                                        )
+                                        .range(1..=u16::MAX),
+                                    )
+                                    .on_hover_text("TCP port of the Black Magic remote protocol endpoint");
+                                }
+                                if network_jlink_selected {
+                                    ui.add_space(8.0);
+                                    setup_label(ui, "J-Link IP address");
+                                    ui.add_sized(
+                                        [ui.available_width(), 20.0],
+                                        egui::TextEdit::singleline(
+                                            &mut self.system_trace_settings.jlink_network_address,
+                                        )
+                                        .hint_text("192.168.1.101"),
+                                    )
+                                    .on_hover_text(
+                                        "IPv4 or IPv6 address of the J-Link or SEGGER Remote Server",
+                                    );
+                                    setup_label(ui, "J-Link port");
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut self.system_trace_settings.jlink_network_port,
+                                        )
+                                        .range(1..=u16::MAX),
+                                    )
+                                    .on_hover_text("TCP/IP port used by the J-Link connection");
                                 }
                                 if let Some(error) = &self.debug_probe_discovery_error {
                                     ui.label(
@@ -453,17 +622,15 @@ impl WaveCraftApp {
 
                                 ui.add_space(10.0);
                                 setup_label(ui, "Target MCU");
-                                let selected_provider = self
-                                    .system_trace_settings
-                                    .probe_connection_id
-                                    .as_deref()
-                                    .and_then(|connection_id| {
-                                        self.debug_probes.iter().find(|probe| {
-                                            probe.connection_id.as_str() == connection_id
-                                        })
-                                    })
-                                    .map(|probe| &probe.provider);
+                                let selected_provider = if network_bmp_selected {
+                                    Some(ProbeProvider::BlackMagicProbe)
+                                } else if network_jlink_selected {
+                                    Some(ProbeProvider::JLink)
+                                } else {
+                                    selected_probe.map(|probe| probe.provider.clone())
+                                };
                                 let targets = selected_provider
+                                    .as_ref()
                                     .and_then(|provider| {
                                         self.debug_probe_target_groups
                                             .iter()
@@ -474,7 +641,7 @@ impl WaveCraftApp {
                                 paint_target_selector(
                                     ui,
                                     &mut self.system_trace_settings.target_name,
-                                    selected_provider,
+                                    selected_provider.as_ref(),
                                     targets,
                                 );
 
@@ -4870,6 +5037,54 @@ mod tests {
     }
 
     #[test]
+    fn network_bmp_selection_shows_ip_address_and_port_fields() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace_settings.probe_connection_id =
+            Some(NETWORK_BMP_PROBE_SELECTION.to_owned());
+        app.system_trace_settings.bmp_network_address = "192.168.1.42".to_owned();
+
+        let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
+
+        for expected in [
+            "BMP over network",
+            "BMP IP address",
+            "192.168.1.42",
+            "BMP port",
+            "2000",
+        ] {
+            assert!(
+                texts.iter().any(|(text, _)| text == expected),
+                "{expected} is painted"
+            );
+        }
+    }
+
+    #[test]
+    fn network_jlink_selection_shows_ip_address_and_port_fields() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace_settings.probe_connection_id =
+            Some(NETWORK_JLINK_PROBE_SELECTION.to_owned());
+        app.system_trace_settings.jlink_network_address = "192.168.1.43".to_owned();
+
+        let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
+
+        for expected in [
+            "J-Link over network",
+            "J-Link IP address",
+            "192.168.1.43",
+            "J-Link port",
+            "19020",
+        ] {
+            assert!(
+                texts.iter().any(|(text, _)| text == expected),
+                "{expected} is painted"
+            );
+        }
+    }
+
+    #[test]
     fn setup_panel_typography_matches_the_rf_settings() {
         let context = egui::Context::default();
         let mut app = app();
@@ -6184,6 +6399,10 @@ mod tests {
     fn connection_settings_apply_optional_reset_and_rtt_scan() {
         let settings = SystemTraceSettings {
             probe_connection_id: Some("1366:0105:1234".to_owned()),
+            bmp_network_address: String::new(),
+            bmp_network_port: 2_000,
+            jlink_network_address: String::new(),
+            jlink_network_port: 19_020,
             target_name: "STM32F407VGTx".to_owned(),
             speed_khz: 8_000,
             reset_after_attach: true,
@@ -6242,6 +6461,10 @@ mod tests {
     fn system_trace_settings_round_trip_through_saved_values() {
         let expected = SystemTraceSettings {
             probe_connection_id: None,
+            bmp_network_address: "192.168.1.42".to_owned(),
+            bmp_network_port: 3_141,
+            jlink_network_address: "192.168.1.43".to_owned(),
+            jlink_network_port: 19_021,
             target_name: "nRF52832_xxAA".to_owned(),
             speed_khz: 2_000,
             reset_after_attach: true,
@@ -6260,6 +6483,95 @@ mod tests {
         restored.apply_saved_values(&expected.saved_values());
 
         assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn network_bmp_settings_build_probe_rs_selector() {
+        let settings = SystemTraceSettings {
+            probe_connection_id: Some(NETWORK_BMP_PROBE_SELECTION.to_owned()),
+            bmp_network_address: " 192.168.1.42 ".to_owned(),
+            bmp_network_port: 2_000,
+            ..SystemTraceSettings::default()
+        };
+
+        let configuration = settings
+            .connection_configuration()
+            .expect("network BMP settings are valid");
+
+        assert_eq!(
+            configuration.probe,
+            ProbeSelector::connection_id("1d50:6018:192.168.1.42:2000")
+        );
+    }
+
+    #[test]
+    fn network_bmp_settings_support_ipv6_and_reject_invalid_addresses() {
+        assert_eq!(
+            network_bmp_connection_id("2001:db8::42", 2_000),
+            Ok("1d50:6018:[2001:db8::42]:2000".to_owned())
+        );
+        assert_eq!(
+            network_bmp_connection_id("black-magic.local", 2_000),
+            Err("Enter a valid IP address for the network BMP".to_owned())
+        );
+        assert_eq!(
+            network_bmp_connection_id("192.168.1.42", 0),
+            Err("BMP network port must be between 1 and 65535".to_owned())
+        );
+    }
+
+    #[test]
+    fn network_jlink_settings_build_transport_selector() {
+        let settings = SystemTraceSettings {
+            probe_connection_id: Some(NETWORK_JLINK_PROBE_SELECTION.to_owned()),
+            jlink_network_address: " 192.168.1.43 ".to_owned(),
+            jlink_network_port: 19_020,
+            target_name: "nRF52832_xxAA".to_owned(),
+            ..SystemTraceSettings::default()
+        };
+
+        let configuration = settings
+            .connection_configuration()
+            .expect("network J-Link settings are valid");
+
+        assert_eq!(
+            configuration.probe,
+            ProbeSelector::connection_id(format!(
+                "{JLINK_NETWORK_CONNECTION_ID_PREFIX}192.168.1.43:19020"
+            ))
+        );
+    }
+
+    #[test]
+    fn network_jlink_settings_support_ipv6_and_reject_invalid_addresses() {
+        assert_eq!(
+            network_jlink_connection_id("2001:db8::43", 19_020),
+            Ok(format!(
+                "{JLINK_NETWORK_CONNECTION_ID_PREFIX}[2001:db8::43]:19020"
+            ))
+        );
+        assert_eq!(
+            network_jlink_connection_id("jlink.local", 19_020),
+            Err("Enter a valid IP address for the network J-Link".to_owned())
+        );
+        assert_eq!(
+            network_jlink_connection_id("192.168.1.43", 0),
+            Err("J-Link network port must be between 1 and 65535".to_owned())
+        );
+    }
+
+    #[test]
+    fn network_jlink_requires_an_explicit_target() {
+        let settings = SystemTraceSettings {
+            probe_connection_id: Some(NETWORK_JLINK_PROBE_SELECTION.to_owned()),
+            jlink_network_address: "192.168.1.43".to_owned(),
+            ..SystemTraceSettings::default()
+        };
+
+        assert_eq!(
+            settings.connection_configuration(),
+            Err("Select a target MCU when using J-Link over the network".to_owned())
+        );
     }
 
     #[test]

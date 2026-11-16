@@ -33,16 +33,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn write_catalog() -> Result<(), Box<dyn Error>> {
     let probes = ProbeRsDriver.list_probes()?;
-    let discovered_providers = probes
-        .iter()
-        .map(|probe| probe.provider.clone())
-        .collect::<std::collections::BTreeSet<_>>();
     let catalog = DebugProbeCatalog {
         probes,
-        target_groups: ProbeRsDriver::supported_target_groups()
-            .into_iter()
-            .filter(|group| discovered_providers.contains(&group.provider))
-            .collect(),
+        // Network probes are configured manually and therefore are not part of USB discovery.
+        target_groups: ProbeRsDriver::supported_target_groups(),
     };
     serde_json::to_writer(io::stdout().lock(), &catalog)?;
     Ok(())

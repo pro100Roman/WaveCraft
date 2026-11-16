@@ -1,6 +1,7 @@
 //! `probe-rs` adapter for WaveCraft's provider-neutral debug-probe interface.
 
 pub mod helper;
+mod jlink_network;
 
 use probe_rs::probe::blackmagic::BlackMagicProbeFactory;
 use probe_rs::probe::cmsisdap::CmsisDapFactory;
@@ -15,9 +16,9 @@ use probe_rs::rtt::{Rtt, ScanRegion, try_attach_to_rtt};
 use probe_rs::{MemoryInterface, Permissions, Session, config};
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugProbeDriver, DebugProbeError, DebugProbeErrorKind, DebugProbeHandle,
-    DebugSession, DebugTargetDescriptor, ProbeDescriptor, ProbeProvider, ProbeSelector,
-    ProbeTargetGroup, RttChannelDescriptor, RttChannelDirection, RttConfiguration,
-    RttControlBlockLocation, TargetSelector, WireProtocol,
+    DebugSession, DebugTargetDescriptor, JLINK_NETWORK_CONNECTION_ID_PREFIX, ProbeDescriptor,
+    ProbeProvider, ProbeSelector, ProbeTargetGroup, RttChannelDescriptor, RttChannelDirection,
+    RttConfiguration, RttControlBlockLocation, TargetSelector, WireProtocol,
 };
 
 /// Minimum Rust release required by the pinned `probe-rs` adapter dependency.
@@ -110,6 +111,9 @@ impl DebugProbeDriver for ProbeRsDriver {
         &self,
         selector: &ProbeSelector,
     ) -> Result<Box<dyn DebugProbeHandle>, DebugProbeError> {
+        if let Some(endpoint) = network_jlink_endpoint(selector)? {
+            return jlink_network::open(endpoint, selector.connection_id.clone());
+        }
         let requested: DebugProbeSelector = selector.connection_id.parse().map_err(|error| {
             DebugProbeError::new(
                 DebugProbeErrorKind::InvalidConfiguration,
@@ -130,6 +134,23 @@ impl DebugProbeDriver for ProbeRsDriver {
         let probe = information.open().map_err(map_open_error)?;
         Ok(Box::new(ProbeRsHandle { descriptor, probe }))
     }
+}
+
+fn network_jlink_endpoint(
+    selector: &ProbeSelector,
+) -> Result<Option<std::net::SocketAddr>, DebugProbeError> {
+    let Some(endpoint) = selector
+        .connection_id
+        .strip_prefix(JLINK_NETWORK_CONNECTION_ID_PREFIX)
+    else {
+        return Ok(None);
+    };
+    endpoint.parse().map(Some).map_err(|error| {
+        DebugProbeError::new(
+            DebugProbeErrorKind::InvalidConfiguration,
+            format!("invalid network J-Link endpoint {endpoint:?}: {error}"),
+        )
+    })
 }
 
 struct ProbeRsHandle {
@@ -462,6 +483,56 @@ mod tests {
                 DebugProbeSelector::from(&information).to_string()
             );
         }
+    }
+
+    #[test]
+    fn lists_a_network_black_magic_probe_from_its_selector() {
+        let selector: DebugProbeSelector = "1d50:6018:192.0.2.42:2000"
+            .parse()
+            .expect("network BMP selector is valid");
+        let information = Lister::new()
+            .list(Some(&selector))
+            .into_iter()
+            .find(|probe| probe.is_probe_type::<BlackMagicProbeFactory>())
+            .expect("network BMP is listed from its selector");
+
+        assert_eq!(
+            probe_descriptor(&information),
+            ProbeDescriptor {
+                connection_id: "1d50:6018:192.0.2.42:2000".to_owned(),
+                provider: ProbeProvider::BlackMagicProbe,
+                vendor: Some("Black Magic Debug".to_owned()),
+                model: "192.0.2.42:2000".to_owned(),
+                serial_number: Some("192.0.2.42:2000".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn recognizes_network_jlink_connection_ids() {
+        let selector = ProbeSelector::connection_id(format!(
+            "{JLINK_NETWORK_CONNECTION_ID_PREFIX}[2001:db8::43]:19020"
+        ));
+
+        assert_eq!(
+            network_jlink_endpoint(&selector).expect("network selector is valid"),
+            Some(
+                "[2001:db8::43]:19020"
+                    .parse()
+                    .expect("socket address is valid")
+            )
+        );
+        assert!(
+            network_jlink_endpoint(&ProbeSelector::connection_id("1366:0105:1234"))
+                .expect("USB selector is valid")
+                .is_none()
+        );
+        assert!(
+            network_jlink_endpoint(&ProbeSelector::connection_id(format!(
+                "{JLINK_NETWORK_CONNECTION_ID_PREFIX}not-an-endpoint"
+            )))
+            .is_err()
+        );
     }
 
     #[test]

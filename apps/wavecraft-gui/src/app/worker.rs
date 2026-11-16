@@ -11,7 +11,8 @@ use crate::{
     InstrumentKind, LoadedRecording, LogicDecodeWorker, ManualCalibrationEditor, Path, PathBuf,
     ProtocolAnalyzerInstance, ProtocolCaptureDecoder, ProtocolDecodeSnapshot, RadioDiscoveryReport,
     RadioSingleTrigger, ScopeMeasurementCache, TryRecvError, WaveformStore, WaveformTab,
-    WorkerSuccess, WorkspaceView, DSCOPE_VOLTS_PER_DIV_MV,
+    WorkerSuccess, WorkspaceView, DSCOPE_VOLTS_PER_DIV_MV, NETWORK_BMP_PROBE_SELECTION,
+    NETWORK_JLINK_PROBE_SELECTION,
 };
 
 use crate::WaveCraftApp;
@@ -213,7 +214,11 @@ impl WaveCraftApp {
             .probe_connection_id
             .as_ref()
             .is_some_and(|selected| {
-                self.debug_probes
+                matches!(
+                    selected.as_str(),
+                    NETWORK_BMP_PROBE_SELECTION | NETWORK_JLINK_PROBE_SELECTION
+                ) || self
+                    .debug_probes
                     .iter()
                     .any(|probe| probe.connection_id == *selected)
             });
@@ -1048,6 +1053,25 @@ mod tests {
             Some("1366:0105:000261009815")
         );
         assert_eq!(app.status, "Detected 1 supported instrument(s)");
+    }
+
+    #[test]
+    fn device_refresh_keeps_network_probe_selection_without_a_local_probe() {
+        for selection in [NETWORK_BMP_PROBE_SELECTION, NETWORK_JLINK_PROBE_SELECTION] {
+            let mut app = app();
+            app.system_trace_settings.probe_connection_id = Some(selection.to_owned());
+
+            app.handle_devices_found(
+                Vec::new(),
+                RadioDiscoveryReport::default(),
+                DebugProbeDiscoveryReport::default(),
+            );
+
+            assert_eq!(
+                app.system_trace_settings.probe_connection_id.as_deref(),
+                Some(selection)
+            );
+        }
     }
 
     #[test]

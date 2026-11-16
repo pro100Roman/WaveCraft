@@ -21,6 +21,9 @@ pub enum ProbeProvider {
 /// Version of the newline-delimited helper protocol shared with probe adapters.
 pub const DEBUG_PROBE_HELPER_PROTOCOL_VERSION: u32 = 2;
 
+/// Connection-ID prefix reserved for a J-Link reached through SEGGER's TCP/IP transport.
+pub const JLINK_NETWORK_CONNECTION_ID_PREFIX: &str = "wavecraft:jlink-network:";
+
 /// Upper bound for one encoded helper request or response.
 pub const MAX_DEBUG_PROBE_HELPER_MESSAGE_BYTES: usize = 1024 * 1024;
 
