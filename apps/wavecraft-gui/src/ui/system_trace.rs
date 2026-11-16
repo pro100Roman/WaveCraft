@@ -4478,7 +4478,7 @@ fn event_name(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String {
         TraceEventKind::TaskCreated { .. } => "Task created",
         TraceEventKind::TaskInfo { .. } => "Task info",
         TraceEventKind::TaskStarted { .. } => "Task started",
-        TraceEventKind::TaskStopped => "Task stopped",
+        TraceEventKind::TaskStopped => "Scheduler entered",
         TraceEventKind::TaskBecameReady { .. } => "Task ready",
         TraceEventKind::TaskStoppedReady { .. } => "Task blocked",
         TraceEventKind::TaskTerminated { .. } => "Task terminated",
@@ -5157,17 +5157,18 @@ mod tests {
     }
 
     #[test]
-    fn event_details_use_task_names_and_resolve_the_stopped_task() {
+    fn event_details_name_scheduler_entry_and_resolve_the_stopped_task() {
         let trace = analysis_trace();
-        let summary = |sequence| {
-            let event = trace
+        let event = |sequence| {
+            trace
                 .events()
                 .iter()
                 .find(|event| event.sequence == sequence)
-                .expect("event exists");
-            event_summary(&trace, event)
+                .expect("event exists")
         };
+        let summary = |sequence| event_summary(&trace, event(sequence));
 
+        assert_eq!(event_name(&trace, event(5)), "Scheduler entered");
         assert_eq!(summary(3), "app_main");
         assert_eq!(summary(5), "worker");
         assert_eq!(summary(6), "app_main, base 0x20001000, 640/1024 bytes");
