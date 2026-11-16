@@ -38,7 +38,7 @@ const TIMELINE_SCALE_STEP: f64 = 1.5;
 const MIN_TIMELINE_SECONDS_PER_DIVISION: f64 = 0.000_001;
 const TIMELINE_SMART_TIMING_HINT_HEIGHT: f32 = 58.0;
 const TIMELINE_SMART_TIMING_HINT_HORIZONTAL_PADDING: f32 = 16.0;
-const TIMELINE_EDGE_SNAP_DISTANCE: f32 = 10.0;
+const TIMELINE_EDGE_SNAP_DISTANCE: f32 = 10.0 / 3.0;
 const TIMELINE_SHORT_EVENT_HOVER_DISTANCE: f32 = 8.0;
 const EVENT_TABLE_MINIMUM_WIDTH: f32 = 760.0;
 const EVENT_TABLE_ROW_HEIGHT: f32 = 22.0;
@@ -2187,9 +2187,8 @@ fn paint_timeline_canvas(
             if interval_rect.left() > plot_clip.right() {
                 break;
             }
-            let interval_events =
-                interval_event_sequences(trace, *lane, interval.start_ticks, interval.end_ticks);
-            let interval_selected = interval_events.contains(trace.selected_sequence);
+            let interval_sequence = interval_event_sequence(trace, *lane, interval.start_ticks);
+            let interval_selected = interval_sequence == trace.selected_sequence;
             // At overview zoom, thousands of short context switches can map to
             // the same pixel. Painting and registering every covered interval
             // only increases egui work without adding visible information. A
@@ -2262,14 +2261,7 @@ fn paint_timeline_canvas(
                 ));
             }
             if response.clicked() {
-                clicked_sequence = response.interact_pointer_pos().and_then(|pointer| {
-                    interval_events.nearest_to_x(
-                        pointer.x,
-                        x_start,
-                        x_end,
-                        interval_rect.center().x,
-                    )
-                });
+                clicked_sequence = interval_sequence;
             }
             if !interval.complete {
                 plot_painter.rect_stroke(
@@ -2688,81 +2680,24 @@ fn format_detected_frequency(frequency_hz: Option<u64>) -> String {
     )
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct TimelineIntervalEvents {
-    start: Option<u64>,
-    end: Option<u64>,
-}
-
-impl TimelineIntervalEvents {
-    fn contains(self, sequence: Option<u64>) -> bool {
-        sequence.is_some() && (sequence == self.start || sequence == self.end)
-    }
-
-    fn nearest_to_x(
-        self,
-        pointer_x: f32,
-        start_x: f32,
-        end_x: f32,
-        visible_center_x: f32,
-    ) -> Option<u64> {
-        match (self.start, self.end) {
-            (Some(start), Some(end)) => {
-                let start_distance = (pointer_x - start_x).abs();
-                let end_distance = (pointer_x - end_x).abs();
-                if (start_distance - end_distance).abs() <= f32::EPSILON {
-                    Some(if pointer_x <= visible_center_x {
-                        start
-                    } else {
-                        end
-                    })
-                } else if start_distance < end_distance {
-                    Some(start)
-                } else {
-                    Some(end)
-                }
-            }
-            (Some(start), None) => Some(start),
-            (None, Some(end)) => Some(end),
-            (None, None) => None,
-        }
-    }
-}
-
-fn interval_event_sequences(
+fn interval_event_sequence(
     trace: &SystemTraceDisplayState,
     lane: TimelineLane,
-    start_ticks: u64,
-    end_ticks: Option<u64>,
-) -> TimelineIntervalEvents {
+    timestamp_ticks: u64,
+) -> Option<u64> {
     let events = trace.events();
-    let start_index = lower_bound_event_timestamp(events, start_ticks);
-    let start_events = || {
+    let first_index = lower_bound_event_timestamp(events, timestamp_ticks);
+    let events_at_timestamp = || {
         events
             .iter()
-            .skip(start_index)
-            .take_while(|event| event.timestamp_ticks == start_ticks)
+            .skip(first_index)
+            .take_while(|event| event.timestamp_ticks == timestamp_ticks)
             .filter(|event| event.core_id == lane.core_id)
     };
-    let start = start_events()
+    events_at_timestamp()
         .find(|event| event_starts_context(&event.kind, lane.context))
-        .or_else(|| start_events().next())
-        .map(|event| event.sequence);
-    let end = end_ticks.and_then(|end_ticks| {
-        let end_index = lower_bound_event_timestamp(events, end_ticks);
-        let end_events = || {
-            events
-                .iter()
-                .skip(end_index)
-                .take_while(|event| event.timestamp_ticks == end_ticks)
-                .filter(|event| event.core_id == lane.core_id)
-        };
-        end_events()
-            .find(|event| event_ends_context(&event.kind, lane.context))
-            .or_else(|| end_events().last())
-            .map(|event| event.sequence)
-    });
-    TimelineIntervalEvents { start, end }
+        .or_else(|| events_at_timestamp().next())
+        .map(|event| event.sequence)
 }
 
 fn lower_bound_event_timestamp(events: &VecDeque<TraceEvent>, timestamp_ticks: u64) -> usize {
@@ -2802,59 +2737,6 @@ fn event_starts_context(kind: &TraceEventKind, context: ExecutionContext) -> boo
             | TraceEventKind::TaskTerminated { .. },
         ) => true,
         (ExecutionContext::Idle, TraceEventKind::Idle) => true,
-        _ => false,
-    }
-}
-
-fn event_ends_context(kind: &TraceEventKind, context: ExecutionContext) -> bool {
-    match (context, kind) {
-        (
-            _,
-            TraceEventKind::TraceStarted
-            | TraceEventKind::TraceStopped
-            | TraceEventKind::Overflow { .. },
-        ) => true,
-        (ExecutionContext::Task(expected), TraceEventKind::TaskStarted { task_id }) => {
-            expected != *task_id
-        }
-        (ExecutionContext::Task(expected), TraceEventKind::TaskTerminated { task_id }) => {
-            expected == *task_id
-        }
-        (
-            ExecutionContext::Task(_),
-            TraceEventKind::TaskStopped
-            | TraceEventKind::IsrEntered { .. }
-            | TraceEventKind::TimerEntered { .. }
-            | TraceEventKind::Idle,
-        ) => true,
-        (ExecutionContext::Isr(expected), TraceEventKind::IsrEntered { isr_id }) => {
-            expected != *isr_id
-        }
-        (
-            ExecutionContext::Isr(_),
-            TraceEventKind::IsrExited | TraceEventKind::IsrExitedToScheduler,
-        ) => true,
-        (ExecutionContext::Timer(expected), TraceEventKind::TimerEntered { timer_id }) => {
-            expected != *timer_id
-        }
-        (
-            ExecutionContext::Timer(_),
-            TraceEventKind::TimerExited | TraceEventKind::IsrEntered { .. },
-        ) => true,
-        (
-            ExecutionContext::Scheduler,
-            TraceEventKind::TaskStarted { .. }
-            | TraceEventKind::IsrEntered { .. }
-            | TraceEventKind::TimerEntered { .. }
-            | TraceEventKind::Idle,
-        ) => true,
-        (
-            ExecutionContext::Idle,
-            TraceEventKind::TaskStarted { .. }
-            | TraceEventKind::TaskStopped
-            | TraceEventKind::IsrEntered { .. }
-            | TraceEventKind::TimerEntered { .. },
-        ) => true,
         _ => false,
     }
 }
@@ -6165,53 +6047,51 @@ mod tests {
     }
 
     #[test]
-    fn timeline_intervals_resolve_their_start_and_end_events() {
+    fn timeline_intervals_resolve_the_event_that_started_them() {
         let mut trace = SystemTraceDisplayState::default();
-        for event in [
-            TraceEvent {
-                sequence: 41,
-                core_id: 0,
-                timestamp_ticks: 120,
-                kind: TraceEventKind::TaskStarted { task_id: 7 },
-            },
-            TraceEvent {
-                sequence: 42,
-                core_id: 0,
-                timestamp_ticks: 180,
-                kind: TraceEventKind::TaskStopped,
-            },
-        ] {
-            trace.ingest(event);
-        }
+        trace.ingest(TraceEvent {
+            sequence: 41,
+            core_id: 0,
+            timestamp_ticks: 120,
+            kind: TraceEventKind::TaskStarted { task_id: 7 },
+        });
 
         assert_eq!(
-            interval_event_sequences(
+            interval_event_sequence(
                 &trace,
                 TimelineLane {
                     core_id: 0,
                     context: ExecutionContext::Task(7),
                 },
                 120,
-                Some(180),
             ),
-            TimelineIntervalEvents {
-                start: Some(41),
-                end: Some(42),
-            }
+            Some(41)
         );
     }
 
     #[test]
-    fn collapsed_interval_clicks_choose_the_nearest_boundary_event() {
-        let events = TimelineIntervalEvents {
-            start: Some(41),
-            end: Some(42),
-        };
+    fn a_shared_edge_selects_only_the_interval_started_by_the_event() {
+        let trace = timing_trace();
+        let previous = interval_event_sequence(
+            &trace,
+            TimelineLane {
+                core_id: 0,
+                context: ExecutionContext::Task(7),
+            },
+            100,
+        );
+        let next = interval_event_sequence(
+            &trace,
+            TimelineLane {
+                core_id: 0,
+                context: ExecutionContext::Task(8),
+            },
+            160,
+        );
 
-        assert_eq!(events.nearest_to_x(100.0, 100.0, 100.0, 101.0), Some(41));
-        assert_eq!(events.nearest_to_x(102.0, 100.0, 100.0, 101.0), Some(42));
-        assert!(events.contains(Some(41)));
-        assert!(events.contains(Some(42)));
+        assert_eq!(previous, Some(3));
+        assert_eq!(next, Some(4));
+        assert_ne!(previous, next);
     }
 
     #[test]
@@ -6314,6 +6194,35 @@ mod tests {
                 &[interval],
                 egui::pos2(111.0, 48.0),
                 TIMELINE_SHORT_EVENT_HOVER_DISTANCE,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn smart_timing_edge_detection_uses_the_reduced_snap_distance() {
+        let edge = TimelineEdgePosition {
+            edge: TimelineTimingEdge {
+                core_id: 0,
+                context: ExecutionContext::Task(7),
+                timestamp_ticks: 100,
+            },
+            position: egui::pos2(100.0, 48.0),
+        };
+
+        assert_eq!(
+            nearest_timeline_edge(
+                &[edge],
+                egui::pos2(100.0 + TIMELINE_EDGE_SNAP_DISTANCE - 0.01, 48.0),
+                Some(TIMELINE_EDGE_SNAP_DISTANCE),
+            ),
+            Some(edge)
+        );
+        assert_eq!(
+            nearest_timeline_edge(
+                &[edge],
+                egui::pos2(100.0 + TIMELINE_EDGE_SNAP_DISTANCE + 0.01, 48.0),
+                Some(TIMELINE_EDGE_SNAP_DISTANCE),
             ),
             None
         );
