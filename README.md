@@ -141,6 +141,9 @@ simulators.
 Install Rust 1.79 or newer, then run:
 
 ```sh
+cargo run -p wavecraft-cli -- --help
+cargo run -p wavecraft-cli -- devices list --format json
+cargo run -p wavecraft-cli -- devices probe --id <connection-id> --format json
 cargo run -p wavecraft-cli -- 2
 cargo run -p wavecraft-cli -- list
 cargo run -p wavecraft-cli -- probe
@@ -156,10 +159,15 @@ cargo run -p wavecraft-cli -- capture run --device <usb-connection-id> \
 cargo run -p wavecraft-cli -- capture run --device <dscope-connection-id> \
   --resource-directory resources/fpga --sample-rate 1000000 \
   --samples 100000 --channels 0,1 --output scope.dsv --events ndjson
-cargo run -p wavecraft-cli -- inspect capture.dsv
+cargo run -p wavecraft-cli -- recording inspect capture.dsv
 cargo run -p wavecraft-cli -- simulate 1 --output simulated.dsv
 cargo run -p wavecraft-cli -- trace decode recording.SVDat
 ```
+
+The CLI uses typed subcommands and provides contextual `--help` for every
+command group. `devices`, `capture`, and `recording` are the stable public
+groups. The older top-level `list`, `probe`, `inspect`, `import`, and `export`
+forms remain available for compatibility with existing scripts.
 
 Here `<resource-directory>` contains the complete set of 25 `.bin` and `.fw`
 files shipped by the original DSView application. Unmodified copies are
@@ -212,15 +220,15 @@ device descriptors, frame sequences, shared-timeline timestamps, capture
 metadata, source errors, and a completion footer. Frames are written
 incrementally with CRC-32 checksums, so recording memory stays bounded and
 truncated or corrupted files are rejected. Existing files are never
-overwritten. Use `inspect <capture.dsv>` to validate a recording and print its
-per-device totals without connected hardware. The format is documented in
-`docs/recording-format.md`.
+overwritten. Use `recording inspect <capture.dsv>` to validate a recording and
+print its per-device totals without connected hardware. The format is
+documented in `docs/recording-format.md`.
 
 Saleae Logic 2 captures can be converted without connected hardware:
 
 ```sh
-cargo run -p wavecraft-cli -- import capture.sal capture.dsv
-cargo run -p wavecraft-cli -- export capture.dsv capture.sal
+cargo run -p wavecraft-cli -- recording import capture.sal capture.dsv
+cargo run -p wavecraft-cli -- recording export capture.dsv capture.sal
 ```
 
 The GUI's **Open** dialog accepts `.dsv` and `.sal`; **Export** writes the

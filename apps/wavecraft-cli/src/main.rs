@@ -1,8 +1,9 @@
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use wavecraft_automation::{
     AutomationEvent, AutomationEventKind, AutomationManager, CaptureConfiguration, DeviceBackend,
@@ -22,9 +23,191 @@ use wavecraft_usb::{
     LinkStatus,
 };
 
-const USAGE: &str = "usage: wavecraft-cli [devices list [--format json] | devices probe --id <connection-id> [--format json] | capture run --device <connection-id> --sample-rate <hz> --samples <count> --channels <0,1,...> --output <capture.dsv> [--resource-directory <resources/fpga>] [--timeout-ms <ms>] [--events ndjson] | trace decode <systemview.bin> | list | probe | load-fpga <resource-directory> | prepare <resource-directory> | capture-logic <resource-directory> [seconds] [--output <capture.dsv>] | capture-scope <resource-directory> [--output <capture.dsv>] | capture-usb <resource-directory> [--output <capture.dsv>] | inspect <capture.dsv> | import <capture.sal> <capture.dsv> | export <capture.dsv> <capture.sal> | simulate <seconds> [--output <capture.dsv>] | <seconds>]";
-
 type FileRecorder = RecordingWriter<BufWriter<File>>;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "wavecraft-cli",
+    version,
+    about = "Discover, capture from, and inspect WaveCraft instruments",
+    long_about = "Discover, configure, and capture from WaveCraft logic analyzers and oscilloscopes.\n\
+                  Machine-readable device output uses versioned JSON; capture events use NDJSON."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Discover and inspect explicitly selected instruments.
+    Devices {
+        #[command(subcommand)]
+        command: DevicesCommand,
+    },
+    /// Run a capture through the stable automation interface.
+    Capture {
+        #[command(subcommand)]
+        command: CaptureCommand,
+    },
+    /// Inspect or convert capture recordings.
+    Recording {
+        #[command(subcommand)]
+        command: RecordingCommand,
+    },
+    /// Run a deterministic simulated logic-and-scope capture.
+    Simulate(SimulateArguments),
+    /// List connected USB instruments (legacy human-readable command).
+    List,
+    /// Probe every connected USB instrument (legacy command).
+    Probe,
+    /// Load model-specific FPGA bitstreams into connected USB instruments.
+    LoadFpga(ResourceDirectoryArguments),
+    /// Prepare connected USB instruments for capture.
+    Prepare(ResourceDirectoryArguments),
+    /// Capture from the first supported DSLogic instrument.
+    CaptureLogic(CaptureLogicArguments),
+    /// Capture from the first supported DSCope U3P100.
+    CaptureScope(HardwareCaptureArguments),
+    /// Capture concurrently from the first supported DSLogic and DSCope.
+    CaptureUsb(HardwareCaptureArguments),
+    /// Inspect a WaveCraft recording (legacy alias for `recording inspect`).
+    Inspect(RecordingPathArguments),
+    /// Import a Saleae Logic 2 recording (legacy alias for `recording import`).
+    Import(RecordingConversionArguments),
+    /// Export a WaveCraft recording to Saleae Logic 2 (legacy alias).
+    Export(RecordingConversionArguments),
+    /// Existing SystemView stream utilities.
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum OutputFormat {
+    #[default]
+    Human,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum EventFormat {
+    #[default]
+    Human,
+    Ndjson,
+}
+
+#[derive(Debug, Subcommand)]
+enum DevicesCommand {
+    /// List supported connected devices.
+    List {
+        /// Select human-readable or schema-versioned JSON output.
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
+    },
+    /// Probe one exact device connection ID.
+    Probe {
+        /// Stable connection ID returned by `devices list`.
+        #[arg(long)]
+        id: String,
+        /// Select human-readable or schema-versioned JSON output.
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CaptureCommand {
+    /// Perform one finite capture and write a lossless `.dsv` recording.
+    Run(AutomationCaptureArguments),
+}
+
+#[derive(Debug, Args)]
+struct AutomationCaptureArguments {
+    /// Exact device connection ID returned by `devices list`.
+    #[arg(long)]
+    device: String,
+    /// Requested sample rate in hertz.
+    #[arg(long)]
+    sample_rate: u64,
+    /// Requested number of samples per enabled channel.
+    #[arg(long)]
+    samples: u64,
+    /// Comma-delimited zero-based channel indexes.
+    #[arg(long, value_delimiter = ',', required = true)]
+    channels: Vec<u8>,
+    /// New `.dsv` recording path; existing files are never overwritten.
+    #[arg(long)]
+    output: PathBuf,
+    /// Directory containing DSLogic/DSCope FPGA resources.
+    #[arg(long)]
+    resource_directory: Option<PathBuf>,
+    /// Capture timeout in milliseconds.
+    #[arg(long)]
+    timeout_ms: Option<u64>,
+    /// Select human-readable events or schema-versioned NDJSON.
+    #[arg(long, value_enum, default_value_t)]
+    events: EventFormat,
+}
+
+#[derive(Debug, Subcommand)]
+enum RecordingCommand {
+    /// Validate and summarize a WaveCraft `.dsv` recording.
+    Inspect(RecordingPathArguments),
+    /// Convert a Saleae Logic 2 `.sal` capture to WaveCraft `.dsv`.
+    Import(RecordingConversionArguments),
+    /// Convert a WaveCraft `.dsv` capture to Saleae Logic 2 `.sal`.
+    Export(RecordingConversionArguments),
+}
+
+#[derive(Debug, Subcommand)]
+enum TraceCommand {
+    Decode(RecordingPathArguments),
+}
+
+#[derive(Debug, Args)]
+struct SimulateArguments {
+    /// Capture duration in seconds.
+    #[arg(default_value_t = 2)]
+    seconds: u64,
+    /// Optional new `.dsv` recording path.
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ResourceDirectoryArguments {
+    resource_directory: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct CaptureLogicArguments {
+    resource_directory: PathBuf,
+    /// Capture duration in seconds.
+    #[arg(default_value_t = 1)]
+    seconds: u64,
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct HardwareCaptureArguments {
+    resource_directory: PathBuf,
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct RecordingPathArguments {
+    path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct RecordingConversionArguments {
+    input: PathBuf,
+    output: PathBuf,
+}
 
 #[derive(Default)]
 struct DeviceStats {
@@ -35,106 +218,65 @@ struct DeviceStats {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if arguments.first().map(String::as_str) == Some("capture")
-        && arguments.get(1).map(String::as_str) == Some("run")
-    {
-        return automation_capture_run(&arguments[2..]);
-    }
-    match arguments.as_slice() {
-        [group, command] if group == "devices" && command == "list" => {
-            return automation_list_devices(false);
-        }
-        [group, command, format, value]
-            if group == "devices"
-                && command == "list"
-                && format == "--format"
-                && value == "json" =>
-        {
-            return automation_list_devices(true);
-        }
-        [group, command, id_flag, id]
-            if group == "devices" && command == "probe" && id_flag == "--id" =>
-        {
-            return automation_probe_device(id, false);
-        }
-        [group, command, id_flag, id, format, value]
-            if group == "devices"
-                && command == "probe"
-                && id_flag == "--id"
-                && format == "--format"
-                && value == "json" =>
-        {
-            return automation_probe_device(id, true);
-        }
-        [group, command, path] if group == "trace" && command == "decode" => {
-            return decode_systemview_trace(Path::new(path));
-        }
-        [command] if command == "list" => return list_devices(),
-        [command] if command == "probe" => return probe_devices(),
-        [command, path] if command == "inspect" => return inspect_recording(Path::new(path)),
-        [command, input, output] if command == "import" => {
-            return import_saleae(Path::new(input), Path::new(output));
-        }
-        [command, input, output] if command == "export" => {
-            return export_saleae(Path::new(input), Path::new(output));
-        }
-        [command, resource_directory] if command == "load-fpga" => {
-            return load_fpgas(Path::new(resource_directory));
-        }
-        [command, resource_directory] if command == "prepare" => {
-            return prepare_devices(Path::new(resource_directory));
-        }
-        [command, resource_directory] if command == "capture-logic" => {
-            return capture_logic(Path::new(resource_directory), 1, None);
-        }
-        [command, resource_directory, seconds] if command == "capture-logic" => {
-            return capture_logic(Path::new(resource_directory), seconds.parse()?, None);
-        }
-        [command, resource_directory, flag, output]
-            if command == "capture-logic" && flag == "--output" =>
-        {
-            return capture_logic(Path::new(resource_directory), 1, Some(Path::new(output)));
-        }
-        [command, resource_directory, seconds, flag, output]
-            if command == "capture-logic" && flag == "--output" =>
-        {
-            return capture_logic(
-                Path::new(resource_directory),
-                seconds.parse()?,
-                Some(Path::new(output)),
-            );
-        }
-        [command, resource_directory] if command == "capture-scope" => {
-            return capture_scope(Path::new(resource_directory), None);
-        }
-        [command, resource_directory, flag, output]
-            if command == "capture-scope" && flag == "--output" =>
-        {
-            return capture_scope(Path::new(resource_directory), Some(Path::new(output)));
-        }
-        [command, resource_directory] if command == "capture-usb" => {
-            return capture_usb(Path::new(resource_directory), None);
-        }
-        [command, resource_directory, flag, output]
-            if command == "capture-usb" && flag == "--output" =>
-        {
-            return capture_usb(Path::new(resource_directory), Some(Path::new(output)));
-        }
-        [command, seconds, flag, output] if command == "simulate" && flag == "--output" => {
-            return run_simulation(seconds.parse()?, Some(Path::new(output)));
+    let arguments = std::env::args().collect::<Vec<_>>();
+    match arguments.get(1).map(String::as_str) {
+        None => return run_simulation(2, None),
+        Some(value) if value.parse::<u64>().is_ok() && arguments.len() == 2 => {
+            return run_simulation(value.parse()?, None);
         }
         _ => {}
     }
 
-    let run_seconds = match arguments.as_slice() {
-        [] => 2,
-        [seconds] => seconds.parse::<u64>()?,
-        [command, seconds] if command == "simulate" => seconds.parse::<u64>()?,
-        _ => return Err(USAGE.into()),
-    };
+    run_command(Cli::parse_from(arguments).command)
+}
 
-    run_simulation(run_seconds, None)
+fn run_command(command: Command) -> Result<(), Box<dyn Error>> {
+    match command {
+        Command::Devices { command } => match command {
+            DevicesCommand::List { format } => {
+                automation_list_devices(matches!(format, OutputFormat::Json))
+            }
+            DevicesCommand::Probe { id, format } => {
+                automation_probe_device(&id, matches!(format, OutputFormat::Json))
+            }
+        },
+        Command::Capture {
+            command: CaptureCommand::Run(arguments),
+        } => automation_capture_run(arguments),
+        Command::Recording { command } => match command {
+            RecordingCommand::Inspect(arguments) => inspect_recording(&arguments.path),
+            RecordingCommand::Import(arguments) => {
+                import_saleae(&arguments.input, &arguments.output)
+            }
+            RecordingCommand::Export(arguments) => {
+                export_saleae(&arguments.input, &arguments.output)
+            }
+        },
+        Command::Simulate(arguments) => {
+            run_simulation(arguments.seconds, arguments.output.as_deref())
+        }
+        Command::List => list_devices(),
+        Command::Probe => probe_devices(),
+        Command::LoadFpga(arguments) => load_fpgas(&arguments.resource_directory),
+        Command::Prepare(arguments) => prepare_devices(&arguments.resource_directory),
+        Command::CaptureLogic(arguments) => capture_logic(
+            &arguments.resource_directory,
+            arguments.seconds,
+            arguments.output.as_deref(),
+        ),
+        Command::CaptureScope(arguments) => {
+            capture_scope(&arguments.resource_directory, arguments.output.as_deref())
+        }
+        Command::CaptureUsb(arguments) => {
+            capture_usb(&arguments.resource_directory, arguments.output.as_deref())
+        }
+        Command::Inspect(arguments) => inspect_recording(&arguments.path),
+        Command::Import(arguments) => import_saleae(&arguments.input, &arguments.output),
+        Command::Export(arguments) => export_saleae(&arguments.input, &arguments.output),
+        Command::Trace {
+            command: TraceCommand::Decode(arguments),
+        } => decode_systemview_trace(&arguments.path),
+    }
 }
 
 fn decode_systemview_trace(path: &Path) -> Result<(), Box<dyn Error>> {
@@ -184,38 +326,26 @@ fn decode_systemview_trace(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct AutomationCaptureArguments {
-    device_id: String,
-    sample_rate_hz: u64,
-    sample_count: u64,
-    channels: Vec<u8>,
-    output: String,
-    resource_directory: Option<String>,
-    timeout_ms: Option<u64>,
-    ndjson_events: bool,
-}
-
-fn automation_capture_run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let arguments = parse_automation_capture_arguments(arguments)?;
-    let mut manager = automation_manager_for_device(&arguments.device_id);
+fn automation_capture_run(arguments: AutomationCaptureArguments) -> Result<(), Box<dyn Error>> {
+    let ndjson_events = matches!(arguments.events, EventFormat::Ndjson);
+    let mut manager = automation_manager_for_device(&arguments.device);
     if let Some(resource_directory) = &arguments.resource_directory {
         manager = manager.with_resource_directory(resource_directory);
     }
-    let device = match manager.open_device(DeviceSelector::connection_id(&arguments.device_id)) {
+    let device = match manager.open_device(DeviceSelector::connection_id(&arguments.device)) {
         Ok(device) => device,
-        Err(error) => return report_capture_error(error, arguments.ndjson_events),
+        Err(error) => return report_capture_error(error, ndjson_events),
     };
     let mut configuration = match device.descriptor().kind {
         AutomationInstrumentKind::LogicAnalyzer => CaptureConfiguration::finite_logic(
-            arguments.sample_rate_hz,
-            arguments.sample_count,
+            arguments.sample_rate,
+            arguments.samples,
             arguments.channels,
             &arguments.output,
         ),
         AutomationInstrumentKind::Oscilloscope => CaptureConfiguration::finite_scope(
-            arguments.sample_rate_hz,
-            arguments.sample_count,
+            arguments.sample_rate,
+            arguments.samples,
             arguments.channels,
             &arguments.output,
         ),
@@ -228,16 +358,16 @@ fn automation_capture_run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
     let capture = match device.start_capture(configuration) {
         Ok(capture) => capture,
-        Err(error) => return report_capture_error(error, arguments.ndjson_events),
+        Err(error) => return report_capture_error(error, ndjson_events),
     };
 
     loop {
         if let Some(event) = capture.next_event(Duration::from_millis(100))? {
-            print_capture_event(&event, arguments.ndjson_events)?;
+            print_capture_event(&event, ndjson_events)?;
         }
         if capture.status().is_terminal() {
             while let Some(event) = capture.next_event(Duration::ZERO)? {
-                print_capture_event(&event, arguments.ndjson_events)?;
+                print_capture_event(&event, ndjson_events)?;
             }
             break;
         }
@@ -245,7 +375,7 @@ fn automation_capture_run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     match capture.wait() {
         Ok(completed) => {
-            if arguments.ndjson_events {
+            if ndjson_events {
                 println!("{}", serde_json::to_string(&completed)?);
                 std::io::stdout().flush()?;
             } else {
@@ -259,82 +389,8 @@ fn automation_capture_run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             }
             Ok(())
         }
-        Err(error) => report_capture_error(error, arguments.ndjson_events),
+        Err(error) => report_capture_error(error, ndjson_events),
     }
-}
-
-fn parse_automation_capture_arguments(
-    arguments: &[String],
-) -> Result<AutomationCaptureArguments, Box<dyn Error>> {
-    let mut device_id = None;
-    let mut sample_rate_hz = None;
-    let mut sample_count = None;
-    let mut channels = None;
-    let mut output = None;
-    let mut resource_directory = None;
-    let mut timeout_ms = None;
-    let mut ndjson_events = false;
-    let mut index = 0;
-    while index < arguments.len() {
-        let flag = arguments[index].as_str();
-        let value = arguments
-            .get(index + 1)
-            .ok_or_else(|| format!("{flag} requires a value"))?;
-        match flag {
-            "--device" if device_id.is_none() => device_id = Some(value.clone()),
-            "--sample-rate" if sample_rate_hz.is_none() => {
-                sample_rate_hz = Some(
-                    value
-                        .parse::<u64>()
-                        .map_err(|error| format!("invalid --sample-rate value {value}: {error}"))?,
-                )
-            }
-            "--samples" if sample_count.is_none() => {
-                sample_count = Some(
-                    value
-                        .parse::<u64>()
-                        .map_err(|error| format!("invalid --samples value {value}: {error}"))?,
-                )
-            }
-            "--channels" if channels.is_none() => {
-                let parsed = value
-                    .split(',')
-                    .map(|channel| {
-                        channel.parse::<u8>().map_err(|error| {
-                            format!("invalid channel {channel} in --channels: {error}")
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                channels = Some(parsed);
-            }
-            "--output" if output.is_none() => output = Some(value.clone()),
-            "--resource-directory" if resource_directory.is_none() => {
-                resource_directory = Some(value.clone())
-            }
-            "--timeout-ms" if timeout_ms.is_none() => {
-                timeout_ms = Some(
-                    value
-                        .parse::<u64>()
-                        .map_err(|error| format!("invalid --timeout-ms value {value}: {error}"))?,
-                )
-            }
-            "--events" if !ndjson_events && value == "ndjson" => ndjson_events = true,
-            "--events" => return Err("--events currently supports only ndjson".into()),
-            _ => return Err(format!("unknown or duplicate capture option {flag}").into()),
-        }
-        index += 2;
-    }
-
-    Ok(AutomationCaptureArguments {
-        device_id: device_id.ok_or("capture run requires --device")?,
-        sample_rate_hz: sample_rate_hz.ok_or("capture run requires --sample-rate")?,
-        sample_count: sample_count.ok_or("capture run requires --samples")?,
-        channels: channels.ok_or("capture run requires --channels")?,
-        output: output.ok_or("capture run requires --output")?,
-        resource_directory,
-        timeout_ms,
-        ndjson_events,
-    })
 }
 
 fn print_capture_event(event: &AutomationEvent, ndjson: bool) -> Result<(), Box<dyn Error>> {
@@ -1226,13 +1282,12 @@ fn run_simulation(run_seconds: u64, output: Option<&Path>) -> Result<(), Box<dyn
 mod automation_cli_tests {
     use super::*;
 
-    fn arguments(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_owned()).collect()
-    }
-
     #[test]
     fn parses_direct_capture_arguments_in_any_order() {
-        let parsed = parse_automation_capture_arguments(&arguments(&[
+        let parsed = Cli::try_parse_from([
+            "wavecraft-cli",
+            "capture",
+            "run",
             "--samples",
             "10000",
             "--device",
@@ -1249,29 +1304,81 @@ mod automation_cli_tests {
             "ndjson",
             "--timeout-ms",
             "5000",
-        ]))
+        ])
         .expect("valid capture arguments should parse");
+        let Command::Capture {
+            command: CaptureCommand::Run(parsed),
+        } = parsed.command
+        else {
+            panic!("capture run should produce capture arguments");
+        };
 
-        assert_eq!(parsed.device_id, "sim:logic-0");
-        assert_eq!(parsed.sample_rate_hz, 100_000);
-        assert_eq!(parsed.sample_count, 10_000);
+        assert_eq!(parsed.device, "sim:logic-0");
+        assert_eq!(parsed.sample_rate, 100_000);
+        assert_eq!(parsed.samples, 10_000);
         assert_eq!(parsed.channels, [0, 2, 7]);
-        assert_eq!(parsed.output, "capture.dsv");
-        assert_eq!(parsed.resource_directory.as_deref(), Some("resources/fpga"));
+        assert_eq!(parsed.output, PathBuf::from("capture.dsv"));
+        assert_eq!(
+            parsed.resource_directory.as_deref(),
+            Some(Path::new("resources/fpga"))
+        );
         assert_eq!(parsed.timeout_ms, Some(5_000));
-        assert!(parsed.ndjson_events);
+        assert!(matches!(parsed.events, EventFormat::Ndjson));
     }
 
     #[test]
     fn rejects_duplicate_capture_options() {
-        let error = parse_automation_capture_arguments(&arguments(&[
+        let error = Cli::try_parse_from([
+            "wavecraft-cli",
+            "capture",
+            "run",
             "--device",
             "sim:logic-0",
             "--device",
             "sim:logic-1",
-        ]))
+        ])
         .expect_err("duplicate device selection should fail");
 
-        assert!(error.to_string().contains("duplicate"));
+        assert!(error.to_string().contains("cannot be used multiple times"));
+    }
+
+    #[test]
+    fn parses_grouped_recording_commands_and_legacy_aliases() {
+        let grouped = Cli::try_parse_from(["wavecraft-cli", "recording", "inspect", "capture.dsv"])
+            .expect("grouped recording command should parse");
+        assert!(matches!(
+            grouped.command,
+            Command::Recording {
+                command: RecordingCommand::Inspect(_)
+            }
+        ));
+
+        let legacy = Cli::try_parse_from(["wavecraft-cli", "inspect", "capture.dsv"])
+            .expect("legacy recording alias should parse");
+        assert!(matches!(legacy.command, Command::Inspect(_)));
+    }
+
+    #[test]
+    fn devices_options_accept_conventional_ordering() {
+        let parsed = Cli::try_parse_from([
+            "wavecraft-cli",
+            "devices",
+            "probe",
+            "--format",
+            "json",
+            "--id",
+            "sim:logic-0",
+        ])
+        .expect("device options should parse in any order");
+
+        assert!(matches!(
+            parsed.command,
+            Command::Devices {
+                command: DevicesCommand::Probe {
+                    format: OutputFormat::Json,
+                    ..
+                }
+            }
+        ));
     }
 }
