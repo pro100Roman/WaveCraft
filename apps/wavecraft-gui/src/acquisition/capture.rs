@@ -438,6 +438,10 @@ pub(crate) enum WorkerSuccess {
         path: PathBuf,
         trace: Box<crate::system_trace::LoadedSystemTrace>,
     },
+    SystemTraceSaved {
+        source: PathBuf,
+        path: PathBuf,
+    },
     SaleaeExported(PathBuf),
 }
 

@@ -3,9 +3,10 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::system_trace::{
-    choose_systemview_description, choose_systemview_elf, choose_systemview_recording_path,
-    choose_systemview_trace_to_open, read_systemview_description, read_systemview_elf,
-    SystemTraceAction, SystemTraceConnectionConfiguration, SystemTraceConnectionState,
+    choose_systemview_description, choose_systemview_elf, choose_systemview_history_save_path,
+    choose_systemview_recording_path, choose_systemview_trace_to_open, read_systemview_description,
+    read_systemview_elf, SystemTraceAction, SystemTraceConnectionConfiguration,
+    SystemTraceConnectionState,
 };
 use crate::system_trace::{
     ProbeLogEntry, ProbeLogLevel, SystemTraceDisplayState, TimelineTimingEdge,
@@ -33,8 +34,8 @@ use wavecraft_trace::{
 const TIMELINE_LABEL_WIDTH: f32 = 150.0;
 const TIMELINE_HEADER_HEIGHT: f32 = 24.0;
 const TIMELINE_ROW_HEIGHT: f32 = 25.0;
-const TIMELINE_MINIMUM_WIDTH: f32 = 720.0;
-const TIMELINE_ZOOM_STEP: f32 = 1.5;
+const TIMELINE_SCALE_STEP: f64 = 1.5;
+const MIN_TIMELINE_SECONDS_PER_DIVISION: f64 = 0.000_001;
 const TIMELINE_SMART_TIMING_HINT_HEIGHT: f32 = 58.0;
 const TIMELINE_SMART_TIMING_HINT_HORIZONTAL_PADDING: f32 = 16.0;
 const TIMELINE_EDGE_SNAP_DISTANCE: f32 = 10.0;
@@ -381,6 +382,24 @@ impl WaveCraftApp {
                         .clicked()
                     {
                         actions.system_trace_action = Some(SystemTraceAction::Open);
+                    }
+                    let can_save_history = !self.is_busy()
+                        && self.system_trace.history_is_temporary()
+                        && matches!(
+                            self.system_trace_connection,
+                            SystemTraceConnectionState::Disconnected
+                                | SystemTraceConnectionState::Error(_)
+                                | SystemTraceConnectionState::Attached { .. }
+                        );
+                    if ui
+                        .add_enabled(
+                            can_save_history,
+                            toolbar_action_button("💾 Save", TEXT_MUTED),
+                        )
+                        .on_hover_text("Save the complete temporary trace history as .SVDat")
+                        .clicked()
+                    {
+                        actions.system_trace_action = Some(SystemTraceAction::Save);
                     }
                     ui.separator();
                     paint_connection_control(
@@ -1124,6 +1143,11 @@ impl WaveCraftApp {
                     self.request_system_trace_recording(path);
                 }
             }
+            Some(SystemTraceAction::Save) => {
+                if let Some(path) = choose_systemview_history_save_path() {
+                    self.begin_save_system_trace_history(path);
+                }
+            }
             Some(SystemTraceAction::Connect) => {
                 match self.system_trace_settings.connection_configuration() {
                     Ok(configuration) => self.begin_system_trace_connection(configuration),
@@ -1599,38 +1623,97 @@ fn paint_timeline_instrument(
                 RichText::new("Task, ISR, timer, scheduler, and idle execution").color(TEXT_MUTED),
             );
         });
+
+        let time_bounds = trace.time_bounds();
+        let has_trace_data = time_bounds.is_some();
+        let (trace_start_ticks, trace_end_ticks) = time_bounds.unwrap_or((0, 1));
+        let frequency_hz = trace_system_frequency_hz(trace, timestamp_frequency_override_hz);
+        let time_divisions =
+            timeline_grid_division_count((ui.available_width() - TIMELINE_LABEL_WIDTH).max(1.0));
+        let time_scale = TimelineTimeScale::new(
+            trace_start_ticks,
+            trace_end_ticks,
+            frequency_hz,
+            time_divisions,
+        );
+
+        let timeline_focus = trace.take_timeline_focus();
+        let timeline_focus_timestamp = timeline_focus.and_then(|sequence| {
+            trace
+                .events()
+                .iter()
+                .find(|event| event.sequence == sequence)
+                .map(|event| event.timestamp_ticks)
+        });
+        if let Some(timestamp) = timeline_focus_timestamp {
+            let ticks_per_division =
+                time_scale.ticks_per_division(trace.timeline_ticks_per_division());
+            trace.set_timeline_view_start_ticks(Some(time_scale.anchored_start(
+                timestamp,
+                0.5,
+                ticks_per_division,
+            )));
+        }
+
         ui.horizontal_wrapped(|ui| {
-            if ui.small_button("−").on_hover_text("Zoom out").clicked() {
-                trace.scale_timeline_zoom(1.0 / TIMELINE_ZOOM_STEP);
-            }
-            let mut zoom = trace.timeline_zoom();
-            if ui
-                .add_sized(
-                    [110.0, 18.0],
-                    egui::Slider::new(&mut zoom, 1.0..=64.0)
+            ui.add_enabled_ui(has_trace_data, |ui| {
+                if ui.small_button("−").on_hover_text("Zoom out").clicked() {
+                    set_timeline_time_scale(
+                        trace,
+                        time_scale,
+                        time_scale.ticks_per_division(trace.timeline_ticks_per_division())
+                            * TIMELINE_SCALE_STEP,
+                        0.5,
+                    );
+                }
+                let mut ticks_per_division =
+                    time_scale.ticks_per_division(trace.timeline_ticks_per_division());
+                if ui
+                    .add_sized(
+                        [110.0, 18.0],
+                        egui::Slider::new(
+                            &mut ticks_per_division,
+                            time_scale.minimum_ticks_per_division
+                                ..=time_scale.fit_ticks_per_division,
+                        )
                         .logarithmic(true)
                         .show_value(false),
-                )
-                .on_hover_text("Drag to set timeline zoom")
-                .changed()
-            {
-                trace.set_timeline_zoom(zoom);
-            }
-            ui.label(
-                RichText::new(format!("{:.1}×", trace.timeline_zoom()))
+                    )
+                    .on_hover_text("Visible time per division")
+                    .changed()
+                {
+                    set_timeline_time_scale(trace, time_scale, ticks_per_division, 0.5);
+                }
+                ui.label(
+                    RichText::new(if has_trace_data {
+                        format_timeline_time_per_division(
+                            time_scale.ticks_per_division(trace.timeline_ticks_per_division()),
+                            frequency_hz,
+                        )
+                    } else {
+                        "—/div".to_owned()
+                    })
                     .monospace()
                     .color(TEXT_MUTED),
-            );
-            if ui.small_button("+").on_hover_text("Zoom in").clicked() {
-                trace.scale_timeline_zoom(TIMELINE_ZOOM_STEP);
-            }
-            if ui
-                .small_button("Fit")
-                .on_hover_text("Fit the entire trace")
-                .clicked()
-            {
-                trace.set_timeline_zoom(1.0);
-            }
+                );
+                if ui.small_button("+").on_hover_text("Zoom in").clicked() {
+                    set_timeline_time_scale(
+                        trace,
+                        time_scale,
+                        time_scale.ticks_per_division(trace.timeline_ticks_per_division())
+                            / TIMELINE_SCALE_STEP,
+                        0.5,
+                    );
+                }
+                if ui
+                    .small_button("Fit")
+                    .on_hover_text("Fit the entire trace")
+                    .clicked()
+                {
+                    trace.set_timeline_ticks_per_division(None);
+                    trace.set_timeline_view_start_ticks(None);
+                }
+            });
             let timing_toggle = ui
                 .checkbox(&mut trace.timeline_smart_timing, "Smart timing")
                 .on_hover_text("Measure between exact event edges");
@@ -1639,9 +1722,9 @@ fn paint_timeline_instrument(
             }
             ui.label(
                 RichText::new(if trace.timeline_smart_timing {
-                    "Zoom: pinch or modifier-scroll; pan: drag; timing: drag edge-to-edge"
+                    "Zoom: pinch or Alt-scroll; pan: drag or wheel; timing: drag edge-to-edge"
                 } else {
-                    "Zoom: pinch or modifier-scroll; pan: drag"
+                    "Zoom: pinch or Alt-scroll; pan: drag or wheel"
                 })
                 .color(TEXT_MUTED),
             );
@@ -1649,8 +1732,7 @@ fn paint_timeline_instrument(
         ui.add_space(6.0);
         let timeline_height = ui.available_height().max(TIMELINE_HEADER_HEIGHT);
 
-        let lanes = timeline_lanes(trace.model());
-        let Some((start_ticks, end_ticks)) = trace.time_bounds() else {
+        if !has_trace_data {
             paint_trace_empty_state(
                 ui,
                 "No execution data",
@@ -1658,7 +1740,9 @@ fn paint_timeline_instrument(
                 timeline_height,
             );
             return;
-        };
+        }
+
+        let lanes = timeline_lanes(trace.model());
         if lanes.is_empty() {
             paint_trace_empty_state(
                 ui,
@@ -1669,40 +1753,26 @@ fn paint_timeline_instrument(
             return;
         }
 
-        let timeline_focus = trace.take_timeline_focus();
-        let timeline_focus_timestamp = timeline_focus.and_then(|sequence| {
-            trace
-                .events()
-                .iter()
-                .find(|event| event.sequence == sequence)
-                .map(|event| event.timestamp_ticks)
-        });
-        let selected_timestamp = trace.selected_event().map(|event| event.timestamp_ticks);
-        let viewport_width = ui.available_width();
-        let mut timeline_scroll = egui::ScrollArea::both()
+        let ticks_per_division = time_scale.ticks_per_division(trace.timeline_ticks_per_division());
+        let (start_ticks, end_ticks) =
+            time_scale.visible_range(trace.timeline_view_start_ticks(), ticks_per_division);
+        let selected_timestamp = trace
+            .selected_event()
+            .map(|event| event.timestamp_ticks)
+            .filter(|timestamp| *timestamp >= start_ticks && *timestamp <= end_ticks);
+        let timeline_scroll = egui::ScrollArea::vertical()
             .id_salt("system_trace_timeline")
             .max_height(timeline_height)
-            .drag_to_scroll(true)
             .auto_shrink([false, false]);
-        if let Some(timestamp) = timeline_focus_timestamp {
-            timeline_scroll = timeline_scroll.horizontal_scroll_offset(timeline_focus_offset(
-                viewport_width,
-                trace.timeline_zoom(),
-                start_ticks,
-                end_ticks,
-                timestamp,
-            ));
-        }
         let timeline = egui::Frame::none()
             .fill(BACKGROUND)
             .show(ui, |ui| {
                 timeline_scroll.show(ui, |ui| {
-                    let canvas_width =
-                        timeline_canvas_width(ui.available_width(), trace.timeline_zoom());
+                    let canvas_width = ui.available_width();
                     let canvas_height = timeline_canvas_height(lanes.len());
-                    let (canvas, _) = ui.allocate_exact_size(
+                    let (canvas, canvas_response) = ui.allocate_exact_size(
                         egui::vec2(canvas_width, canvas_height),
-                        egui::Sense::hover(),
+                        egui::Sense::click_and_drag(),
                     );
                     let clicked_sequence = paint_timeline_canvas(
                         ui,
@@ -1715,26 +1785,39 @@ fn paint_timeline_instrument(
                             selected_timestamp,
                             timestamp_frequency_override_hz,
                             time_display: trace.time_display,
-                            recording_start_ticks: start_ticks,
+                            recording_start_ticks: trace_start_ticks,
+                            time_divisions,
                         },
                     );
-                    (canvas.top(), canvas_width, clicked_sequence)
+                    let wheel_delta = take_timeline_horizontal_scroll(ui, canvas);
+                    (canvas.top(), clicked_sequence, canvas_response, wheel_delta)
                 })
             })
             .inner;
-        trace.set_timeline_visible_range(Some(timeline_visible_tick_range(
-            start_ticks,
-            end_ticks,
-            timeline.state.offset.x,
-            timeline.inner_rect.width(),
-            timeline.inner.1,
-        )));
+        trace.set_timeline_visible_range(Some((start_ticks, end_ticks)));
         let timeline_pointer = ui.input(|input| {
             input.pointer.hover_pos().filter(|position| {
                 timeline.inner_rect.contains(*position)
                     && position.x >= timeline.inner_rect.left() + TIMELINE_LABEL_WIDTH
             })
         });
+        let drag_delta_x = if timeline.inner.2.dragged() && !trace.timeline_timing_dragging() {
+            ui.input(|input| input.pointer.delta().x)
+        } else {
+            0.0
+        };
+        let pan_delta_x = drag_delta_x + timeline.inner.3;
+        if pan_delta_x.abs() > f32::EPSILON {
+            let plot_width = (timeline.inner_rect.width() - TIMELINE_LABEL_WIDTH).max(1.0);
+            let visible_ticks = end_ticks.saturating_sub(start_ticks).max(1) as f64;
+            let tick_delta = -f64::from(pan_delta_x) / f64::from(plot_width) * visible_ticks;
+            trace.set_timeline_view_start_ticks(Some(time_scale.pan_start(
+                start_ticks,
+                tick_delta,
+                ticks_per_division,
+            )));
+            ui.ctx().request_repaint();
+        }
         if let Some(pointer) = timeline_pointer {
             let zoom_delta = ui.input(|input| {
                 let native_zoom = input.zoom_delta();
@@ -1747,18 +1830,17 @@ fn paint_timeline_instrument(
                 }
             });
             if (zoom_delta - 1.0).abs() > f32::EPSILON {
-                let previous_zoom = trace.timeline_zoom();
-                trace.scale_timeline_zoom(zoom_delta);
-                let mut scroll_state = timeline.state;
-                scroll_state.offset.x = timeline_zoom_offset_at_pointer(
-                    scroll_state.offset.x,
-                    timeline.inner_rect.width(),
-                    pointer.x - timeline.inner_rect.left(),
-                    timeline.inner.1,
-                    previous_zoom,
-                    trace.timeline_zoom(),
+                let plot_width = (timeline.inner_rect.width() - TIMELINE_LABEL_WIDTH).max(1.0);
+                let pointer_fraction =
+                    ((pointer.x - timeline.inner_rect.left() - TIMELINE_LABEL_WIDTH) / plot_width)
+                        .clamp(0.0, 1.0);
+                set_timeline_time_scale(
+                    trace,
+                    time_scale,
+                    ticks_per_division / f64::from(zoom_delta),
+                    f64::from(pointer_fraction),
                 );
-                scroll_state.store(ui.ctx(), timeline.id);
+                ui.ctx().request_repaint();
             }
         }
         paint_sticky_timeline_labels(
@@ -1768,14 +1850,10 @@ fn paint_timeline_instrument(
             trace.model(),
             &lanes,
         );
-        if let Some(sequence) = timeline.inner.2 {
+        if let Some(sequence) = timeline.inner.1 {
             trace.select_from_timeline(sequence);
         }
     });
-}
-
-fn timeline_canvas_width(available_width: f32, zoom: f32) -> f32 {
-    available_width.max(TIMELINE_MINIMUM_WIDTH) * zoom
 }
 
 fn timeline_canvas_height(lane_count: usize) -> f32 {
@@ -1783,24 +1861,26 @@ fn timeline_canvas_height(lane_count: usize) -> f32 {
         .max(TIMELINE_SMART_TIMING_HINT_HEIGHT + 8.0)
 }
 
-fn timeline_zoom_offset_at_pointer(
-    current_offset: f32,
-    viewport_width: f32,
-    pointer_x_in_viewport: f32,
-    current_canvas_width: f32,
-    current_zoom: f32,
-    new_zoom: f32,
-) -> f32 {
-    let base_canvas_width = current_canvas_width / current_zoom.max(f32::EPSILON);
-    let current_plot_width = (current_canvas_width - TIMELINE_LABEL_WIDTH).max(1.0);
-    let content_x = current_offset + pointer_x_in_viewport;
-    let timeline_fraction =
-        ((content_x - TIMELINE_LABEL_WIDTH) / current_plot_width).clamp(0.0, 1.0);
-    let new_canvas_width = base_canvas_width * new_zoom;
-    let new_plot_width = (new_canvas_width - TIMELINE_LABEL_WIDTH).max(1.0);
-    let anchored_content_x = TIMELINE_LABEL_WIDTH + timeline_fraction * new_plot_width;
-    (anchored_content_x - pointer_x_in_viewport)
-        .clamp(0.0, (new_canvas_width - viewport_width).max(0.0))
+fn take_timeline_horizontal_scroll(ui: &egui::Ui, canvas: egui::Rect) -> f32 {
+    ui.input_mut(|input| {
+        let pointer_is_over_plot = input.pointer.hover_pos().is_some_and(|pointer| {
+            canvas.contains(pointer) && pointer.x >= canvas.left() + TIMELINE_LABEL_WIDTH
+        });
+        let native_zoom_active = (input.zoom_delta() - 1.0).abs() > f32::EPSILON;
+        if !pointer_is_over_plot || input.modifiers.alt || native_zoom_active {
+            return 0.0;
+        }
+        let delta = if input.raw_scroll_delta.x.abs() > f32::EPSILON {
+            input.raw_scroll_delta.x
+        } else {
+            input.raw_scroll_delta.y
+        };
+        if delta.abs() > f32::EPSILON {
+            input.raw_scroll_delta = egui::Vec2::ZERO;
+            input.smooth_scroll_delta = egui::Vec2::ZERO;
+        }
+        delta
+    })
 }
 
 fn timeline_plot_clip(canvas: egui::Rect, viewport: egui::Rect) -> egui::Rect {
@@ -1811,44 +1891,144 @@ fn timeline_plot_clip(canvas: egui::Rect, viewport: egui::Rect) -> egui::Rect {
     ))
 }
 
-fn timeline_focus_offset(
-    viewport_width: f32,
-    zoom: f32,
-    start_ticks: u64,
-    end_ticks: u64,
-    timestamp: u64,
-) -> f32 {
-    let canvas_width = timeline_canvas_width(viewport_width, zoom);
-    let plot_width = (canvas_width - TIMELINE_LABEL_WIDTH).max(1.0);
-    let duration = end_ticks.saturating_sub(start_ticks).max(1);
-    let target_x = TIMELINE_LABEL_WIDTH
-        + timestamp.saturating_sub(start_ticks).min(duration) as f32 / duration as f32 * plot_width;
-    let visible_plot_center =
-        TIMELINE_LABEL_WIDTH + (viewport_width - TIMELINE_LABEL_WIDTH).max(1.0) * 0.5;
-    (target_x - visible_plot_center).clamp(0.0, (canvas_width - viewport_width).max(0.0))
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TimelineTimeScale {
+    trace_start_ticks: u64,
+    trace_end_ticks: u64,
+    minimum_ticks_per_division: f64,
+    fit_ticks_per_division: f64,
+    division_count: f64,
 }
 
-fn timeline_visible_tick_range(
-    start_ticks: u64,
-    end_ticks: u64,
-    horizontal_offset: f32,
-    viewport_width: f32,
-    canvas_width: f32,
-) -> (u64, u64) {
-    let duration_ticks = end_ticks.saturating_sub(start_ticks).max(1);
-    let plot_width = (canvas_width - TIMELINE_LABEL_WIDTH).max(1.0);
-    let visible_left =
-        (horizontal_offset + TIMELINE_LABEL_WIDTH).clamp(TIMELINE_LABEL_WIDTH, canvas_width);
-    let visible_right = (horizontal_offset + viewport_width).clamp(visible_left, canvas_width);
-    let start_fraction = ((visible_left - TIMELINE_LABEL_WIDTH) / plot_width).clamp(0.0, 1.0);
-    let end_fraction = ((visible_right - TIMELINE_LABEL_WIDTH) / plot_width).clamp(0.0, 1.0);
-    let visible_start = start_ticks
-        .saturating_add((duration_ticks as f64 * f64::from(start_fraction)).floor() as u64);
-    let visible_end = start_ticks
-        .saturating_add((duration_ticks as f64 * f64::from(end_fraction)).ceil() as u64)
-        .min(end_ticks)
-        .max(visible_start.saturating_add(1).min(end_ticks));
-    (visible_start.min(end_ticks), visible_end)
+impl TimelineTimeScale {
+    fn new(
+        trace_start_ticks: u64,
+        trace_end_ticks: u64,
+        frequency_hz: Option<u64>,
+        division_count: usize,
+    ) -> Self {
+        let duration_ticks = trace_end_ticks.saturating_sub(trace_start_ticks).max(1) as f64;
+        let division_count = division_count.max(1) as f64;
+        let fit_ticks_per_division = duration_ticks / division_count;
+        let one_microsecond_ticks = frequency_hz
+            .filter(|frequency| *frequency > 0)
+            .map_or(1.0, |frequency| {
+                frequency as f64 * MIN_TIMELINE_SECONDS_PER_DIVISION
+            })
+            .max(1.0);
+        Self {
+            trace_start_ticks,
+            trace_end_ticks,
+            minimum_ticks_per_division: one_microsecond_ticks.min(fit_ticks_per_division),
+            fit_ticks_per_division,
+            division_count,
+        }
+    }
+
+    fn ticks_per_division(self, requested: Option<f64>) -> f64 {
+        requested
+            .filter(|ticks| ticks.is_finite())
+            .unwrap_or(self.fit_ticks_per_division)
+            .clamp(self.minimum_ticks_per_division, self.fit_ticks_per_division)
+    }
+
+    fn visible_span_ticks(self, ticks_per_division: f64) -> u64 {
+        (self.ticks_per_division(Some(ticks_per_division)) * self.division_count)
+            .ceil()
+            .clamp(1.0, self.duration_ticks() as f64) as u64
+    }
+
+    fn visible_range(
+        self,
+        requested_start_ticks: Option<u64>,
+        ticks_per_division: f64,
+    ) -> (u64, u64) {
+        let span_ticks = self.visible_span_ticks(ticks_per_division);
+        let maximum_start = self.trace_end_ticks.saturating_sub(span_ticks);
+        let start_ticks = requested_start_ticks
+            .unwrap_or(self.trace_start_ticks)
+            .clamp(self.trace_start_ticks, maximum_start);
+        let end_ticks = start_ticks
+            .saturating_add(span_ticks)
+            .min(self.trace_end_ticks);
+        (start_ticks, end_ticks.max(start_ticks.saturating_add(1)))
+    }
+
+    fn anchored_start(
+        self,
+        anchor_timestamp: u64,
+        anchor_fraction: f64,
+        ticks_per_division: f64,
+    ) -> u64 {
+        let span_ticks = self.visible_span_ticks(ticks_per_division);
+        let ticks_before_anchor = (span_ticks as f64 * anchor_fraction.clamp(0.0, 1.0)).round();
+        let requested_start = anchor_timestamp.saturating_sub(ticks_before_anchor as u64);
+        let maximum_start = self.trace_end_ticks.saturating_sub(span_ticks);
+        requested_start.clamp(self.trace_start_ticks, maximum_start)
+    }
+
+    fn pan_start(self, current_start_ticks: u64, tick_delta: f64, ticks_per_division: f64) -> u64 {
+        let span_ticks = self.visible_span_ticks(ticks_per_division);
+        let maximum_start = self.trace_end_ticks.saturating_sub(span_ticks);
+        (current_start_ticks as f64 + tick_delta)
+            .round()
+            .clamp(self.trace_start_ticks as f64, maximum_start as f64) as u64
+    }
+
+    fn duration_ticks(self) -> u64 {
+        self.trace_end_ticks
+            .saturating_sub(self.trace_start_ticks)
+            .max(1)
+    }
+}
+
+fn set_timeline_time_scale(
+    trace: &mut SystemTraceDisplayState,
+    time_scale: TimelineTimeScale,
+    requested_ticks_per_division: f64,
+    anchor_fraction: f64,
+) {
+    let previous_ticks_per_division =
+        time_scale.ticks_per_division(trace.timeline_ticks_per_division());
+    let (start_ticks, end_ticks) = time_scale.visible_range(
+        trace.timeline_view_start_ticks(),
+        previous_ticks_per_division,
+    );
+    let anchor_timestamp = start_ticks.saturating_add(
+        (end_ticks.saturating_sub(start_ticks) as f64 * anchor_fraction.clamp(0.0, 1.0)).round()
+            as u64,
+    );
+    let ticks_per_division = time_scale.ticks_per_division(Some(requested_ticks_per_division));
+    trace.set_timeline_ticks_per_division(Some(ticks_per_division));
+    trace.set_timeline_view_start_ticks(Some(time_scale.anchored_start(
+        anchor_timestamp,
+        anchor_fraction,
+        ticks_per_division,
+    )));
+}
+
+fn format_timeline_time_per_division(ticks_per_division: f64, frequency_hz: Option<u64>) -> String {
+    let Some(frequency_hz) = frequency_hz.filter(|frequency| *frequency > 0) else {
+        return format!("{} ticks/div", ticks_per_division.round() as u64);
+    };
+    let seconds = ticks_per_division / frequency_hz as f64;
+    let (value, unit) = if seconds >= 1.0 {
+        (seconds, "s")
+    } else if seconds >= 0.001 {
+        (seconds * 1_000.0, "ms")
+    } else if seconds >= 0.000_001 {
+        (seconds * 1_000_000.0, "µs")
+    } else {
+        (seconds * 1_000_000_000.0, "ns")
+    };
+    let value = if value >= 100.0 {
+        format!("{value:.0}")
+    } else if value >= 10.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value:.2}")
+    };
+    format!("{value} {unit}/div")
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1881,6 +2061,7 @@ struct TimelineCanvasOptions {
     timestamp_frequency_override_hz: Option<u64>,
     time_display: TraceTimeDisplay,
     recording_start_ticks: u64,
+    time_divisions: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1893,6 +2074,7 @@ struct TimelineTimeGrid {
     time_display: TraceTimeDisplay,
     recording_start_ticks: u64,
     frequency_hz: Option<u64>,
+    divisions: usize,
 }
 
 fn timeline_lanes(model: &TraceModel) -> Vec<TimelineLane> {
@@ -1950,6 +2132,7 @@ fn paint_timeline_canvas(
             time_display: options.time_display,
             recording_start_ticks: options.recording_start_ticks,
             frequency_hz: trace_system_frequency_hz(trace, options.timestamp_frequency_override_hz),
+            divisions: options.time_divisions,
         },
     );
 
@@ -1980,6 +2163,12 @@ fn paint_timeline_canvas(
                 .end_ticks
                 .unwrap_or(end_ticks)
                 .max(interval.start_ticks);
+            if interval_end < start_ticks {
+                continue;
+            }
+            if interval.start_ticks > end_ticks {
+                break;
+            }
             let x_start = tick_x(
                 interval.start_ticks,
                 start_ticks,
@@ -2604,7 +2793,7 @@ fn paint_sticky_timeline_labels(
 
 fn paint_timeline_time_grid(painter: &egui::Painter, grid: TimelineTimeGrid) {
     let plot_width = (grid.plot_right - grid.plot_left).max(1.0);
-    let divisions = ((plot_width / 120.0).floor() as usize).clamp(2, 512);
+    let divisions = grid.divisions.max(1);
     for index in 0..=divisions {
         let fraction = index as f32 / divisions as f32;
         let x = grid.plot_left + plot_width * fraction;
@@ -2633,6 +2822,10 @@ fn paint_timeline_time_grid(painter: &egui::Painter, grid: TimelineTimeGrid) {
             TEXT_MUTED,
         );
     }
+}
+
+fn timeline_grid_division_count(plot_width: f32) -> usize {
+    ((plot_width / 120.0).floor() as usize).clamp(2, 512)
 }
 
 fn tick_x(timestamp: u64, start: u64, duration: u64, left: f32, width: f32) -> f32 {
@@ -2696,8 +2889,15 @@ fn paint_event_instrument(
                 ui.add(
                     egui::TextEdit::singleline(&mut trace.event_filter)
                         .hint_text("Filter")
-                        .desired_width(180.0),
+                        .desired_width(160.0),
                 );
+                if ui
+                    .add_enabled(!trace.event_filter.is_empty(), egui::Button::new("×").small())
+                    .on_hover_text("Clear filter")
+                    .clicked()
+                {
+                    trace.event_filter.clear();
+                }
             }
             if trace.event_view == TraceEventView::Terminal {
                 ui.checkbox(&mut trace.terminal_wrap, "Wrap text");
@@ -5410,12 +5610,14 @@ mod tests {
         let refresh = position("↻ Refresh");
         let record = position("● Record…");
         let open = position("📂 Open");
+        let save = position("💾 Save");
         let connect = position("Connect and attach");
 
         assert!(title.x < refresh.x);
         assert!(refresh.x < record.x);
         assert!(record.x < open.x);
-        assert!(open.x < connect.x);
+        assert!(open.x < save.x);
+        assert!(save.x < connect.x);
     }
 
     #[test]
@@ -5460,6 +5662,20 @@ mod tests {
         assert!(texts.iter().any(|(text, _)| text == "● Record…"));
         assert!(texts.iter().any(|(text, _)| text == "Disconnect"));
         assert!(texts.iter().any(|(text, _)| text == "▶ Start"));
+    }
+
+    #[test]
+    fn system_trace_toolbar_exposes_temporary_history_save() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace.set_history_path(
+            std::env::temp_dir().join("wavecraft-toolbar-test.SVDat"),
+            true,
+        );
+
+        let (_, texts) = paint_toolbar(&context, &mut app, Vec::new());
+
+        assert!(texts.iter().any(|(text, _)| text == "💾 Save"));
     }
 
     #[test]
@@ -5702,60 +5918,74 @@ mod tests {
     }
 
     #[test]
-    fn timeline_zoom_expands_the_scrollable_time_canvas() {
-        assert_eq!(timeline_canvas_width(600.0, 1.0), 720.0);
-        assert_eq!(timeline_canvas_width(900.0, 1.0), 900.0);
-        assert_eq!(timeline_canvas_width(900.0, 4.0), 3_600.0);
+    fn timeline_uses_a_fixed_height_canvas() {
         assert_eq!(timeline_canvas_height(1), 66.0);
         assert_eq!(timeline_canvas_height(3), 99.0);
     }
 
     #[test]
-    fn timeline_zoom_keeps_the_timestamp_under_the_pointer() {
-        let current_offset = 420.0;
-        let viewport_width = 900.0;
-        let pointer_x = 560.0;
-        let current_canvas_width = 1_800.0;
-        let current_zoom = 2.0;
-        let new_zoom = 4.0;
-        let old_fraction = (current_offset + pointer_x - TIMELINE_LABEL_WIDTH)
-            / (current_canvas_width - TIMELINE_LABEL_WIDTH);
+    fn timeline_time_scale_reaches_one_microsecond_per_division() {
+        let scale = TimelineTimeScale::new(0, 1_000_000, Some(1_000_000), 10);
 
-        let new_offset = timeline_zoom_offset_at_pointer(
-            current_offset,
-            viewport_width,
-            pointer_x,
-            current_canvas_width,
-            current_zoom,
-            new_zoom,
-        );
-        let new_canvas_width = current_canvas_width / current_zoom * new_zoom;
-        let new_fraction = (new_offset + pointer_x - TIMELINE_LABEL_WIDTH)
-            / (new_canvas_width - TIMELINE_LABEL_WIDTH);
-
-        assert!((new_fraction - old_fraction).abs() < 0.000_001);
-    }
-
-    #[test]
-    fn timeline_focus_centers_selected_timestamp_within_scroll_bounds() {
-        assert_eq!(timeline_focus_offset(900.0, 1.0, 0, 1_000, 500), 0.0);
-        let offset = timeline_focus_offset(900.0, 8.0, 0, 1_000, 500);
-        assert!(offset > 2_000.0);
-        assert!(offset < 4_000.0);
-        assert_eq!(timeline_focus_offset(900.0, 8.0, 0, 1_000, 0), 0.0);
-    }
-
-    #[test]
-    fn timeline_visible_range_follows_horizontal_scroll() {
+        assert_eq!(scale.minimum_ticks_per_division, 1.0);
+        assert_eq!(scale.fit_ticks_per_division, 100_000.0);
+        assert_eq!(scale.visible_range(Some(500_000), 1.0), (500_000, 500_010));
         assert_eq!(
-            timeline_visible_tick_range(0, 1_000, 0.0, 900.0, 900.0),
-            (0, 1_000)
+            format_timeline_time_per_division(1.0, Some(1_000_000)),
+            "1.00 µs/div"
         );
-        let left = timeline_visible_tick_range(0, 1_000, 0.0, 900.0, 1_800.0);
-        let right = timeline_visible_tick_range(0, 1_000, 900.0, 900.0, 1_800.0);
+    }
 
-        assert_eq!(left, (0, 455));
-        assert_eq!(right, (545, 1_000));
+    #[test]
+    fn timeline_time_scale_keeps_the_anchor_stationary() {
+        let scale = TimelineTimeScale::new(0, 1_000_000, Some(1_000_000), 10);
+
+        assert_eq!(scale.anchored_start(500_000, 0.5, 10.0), 499_950);
+        assert_eq!(scale.anchored_start(0, 0.5, 10.0), 0);
+        assert_eq!(scale.anchored_start(1_000_000, 0.5, 10.0), 999_900);
+    }
+
+    #[test]
+    fn timeline_time_scale_pans_within_trace_bounds() {
+        let scale = TimelineTimeScale::new(100, 1_100, None, 10);
+
+        assert_eq!(scale.pan_start(400, 25.0, 10.0), 425);
+        assert_eq!(scale.pan_start(100, -500.0, 10.0), 100);
+        assert_eq!(scale.pan_start(1_000, 500.0, 10.0), 1_000);
+    }
+
+    #[test]
+    fn timeline_consumes_the_mouse_wheel_as_horizontal_scroll() {
+        let context = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(800.0, 200.0));
+        let pointer = egui::pos2(
+            canvas.left() + TIMELINE_LABEL_WIDTH + 20.0,
+            canvas.center().y,
+        );
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1_000.0, 400.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -40.0),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..egui::RawInput::default()
+        };
+        let mut scroll_delta = 0.0;
+
+        let _ = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                scroll_delta = take_timeline_horizontal_scroll(ui, canvas);
+            });
+        });
+
+        assert_eq!(scroll_delta, -40.0);
     }
 
     #[test]
@@ -6157,6 +6387,17 @@ mod tests {
     }
 
     #[test]
+    fn text_trace_views_show_a_filter_clear_button() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace.event_filter = "worker".to_owned();
+
+        let texts = paint_central_texts(&context, &mut app);
+
+        assert!(texts.iter().any(|text| text == "×"));
+    }
+
+    #[test]
     fn event_navigation_and_go_to_follow_visible_events_and_contexts() {
         let mut trace = SystemTraceDisplayState::default();
         for event in [
@@ -6386,17 +6627,30 @@ mod tests {
     }
 
     #[test]
-    fn timeline_exposes_zoom_controls_without_trace_data() {
+    fn timeline_exposes_time_scale_controls_with_trace_data() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace = analysis_trace();
+
+        let texts = paint_central_texts(&context, &mut app);
+
+        assert!(texts.iter().any(|text| text.ends_with("/div")));
+        assert!(texts.iter().any(|text| text == "Fit"));
+        assert!(texts.iter().any(|text| text == "Smart timing"));
+        assert!(texts.iter().any(|text| text == "+"));
+        assert!(texts.iter().any(|text| text == "−"));
+    }
+
+    #[test]
+    fn timeline_keeps_disabled_time_scale_controls_without_trace_data() {
         let context = egui::Context::default();
         let mut app = app();
 
         let texts = paint_central_texts(&context, &mut app);
 
-        assert!(texts.iter().any(|text| text == "1.0×"));
-        assert!(texts.iter().any(|text| text == "Fit"));
-        assert!(texts.iter().any(|text| text == "Smart timing"));
-        assert!(texts.iter().any(|text| text == "+"));
-        assert!(texts.iter().any(|text| text == "−"));
+        for expected in ["—/div", "Fit", "Smart timing", "+", "−"] {
+            assert!(texts.iter().any(|text| text == expected));
+        }
     }
 
     #[test]

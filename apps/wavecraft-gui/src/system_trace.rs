@@ -24,8 +24,6 @@ use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
 const DEFAULT_EVENT_CAPACITY: usize = 20_000;
 const DEFAULT_TERMINAL_LINE_CAPACITY: usize = 20_000;
 const DEFAULT_PROBE_LOG_CAPACITY: usize = 10_000;
-const MIN_TIMELINE_ZOOM: f32 = 1.0;
-const MAX_TIMELINE_ZOOM: f32 = 64.0;
 const DEFAULT_TIMELINE_VIEW_HEIGHT: f32 = 260.0;
 const DEFAULT_EVENT_VIEW_HEIGHT: f32 = 230.0;
 const MIN_TRACE_INSTRUMENT_HEIGHT: f32 = 140.0;
@@ -264,6 +262,7 @@ pub(crate) enum SystemTraceWorkerCommand {
 pub(crate) enum SystemTraceAction {
     Open,
     Record,
+    Save,
     Connect,
     Start,
     Stop,
@@ -1145,6 +1144,24 @@ impl crate::WaveCraftApp {
         });
     }
 
+    pub(crate) fn begin_save_system_trace_history(&mut self, path: PathBuf) {
+        if self.pending.is_some() || !self.system_trace.history_is_temporary() {
+            return;
+        }
+        let Some(source) = self.system_trace.history_path().map(Path::to_owned) else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.pending = Some(receiver);
+        self.status = format!("Saving SystemView trace to {}…", path.display());
+        self.last_error = None;
+        thread::spawn(move || {
+            let result = save_systemview_history(&source, &path)
+                .map(|()| WorkerSuccess::SystemTraceSaved { source, path });
+            let _ = sender.send(result);
+        });
+    }
+
     pub(crate) fn begin_system_trace_connection(
         &mut self,
         configuration: SystemTraceConnectionConfiguration,
@@ -1421,7 +1438,8 @@ pub(crate) struct SystemTraceDisplayState {
     pub(crate) timeline_smart_timing: bool,
     timeline_timing_measurement: Option<TimelineTimingMeasurement>,
     timeline_timing_dragging: bool,
-    timeline_zoom: f32,
+    timeline_ticks_per_division: Option<f64>,
+    timeline_view_start_ticks: Option<u64>,
     timeline_visible_range: Option<(u64, u64)>,
     time_references: Vec<u64>,
     timeline_view_height: f32,
@@ -1465,7 +1483,8 @@ impl Default for SystemTraceDisplayState {
             timeline_smart_timing: true,
             timeline_timing_measurement: None,
             timeline_timing_dragging: false,
-            timeline_zoom: MIN_TIMELINE_ZOOM,
+            timeline_ticks_per_division: None,
+            timeline_view_start_ticks: None,
             timeline_visible_range: None,
             time_references: Vec::new(),
             timeline_view_height: DEFAULT_TIMELINE_VIEW_HEIGHT,
@@ -1684,8 +1703,20 @@ impl SystemTraceDisplayState {
         self.next_probe_log_sequence = self.next_probe_log_sequence.saturating_add(1);
     }
 
-    pub(crate) fn timeline_zoom(&self) -> f32 {
-        self.timeline_zoom
+    pub(crate) fn timeline_ticks_per_division(&self) -> Option<f64> {
+        self.timeline_ticks_per_division
+    }
+
+    pub(crate) fn set_timeline_ticks_per_division(&mut self, ticks: Option<f64>) {
+        self.timeline_ticks_per_division = ticks.filter(|ticks| ticks.is_finite() && *ticks > 0.0);
+    }
+
+    pub(crate) fn timeline_view_start_ticks(&self) -> Option<u64> {
+        self.timeline_view_start_ticks
+    }
+
+    pub(crate) fn set_timeline_view_start_ticks(&mut self, timestamp: Option<u64>) {
+        self.timeline_view_start_ticks = timestamp;
     }
 
     pub(crate) fn timeline_timing_measurement(&self) -> Option<TimelineTimingMeasurement> {
@@ -1717,18 +1748,6 @@ impl SystemTraceDisplayState {
     pub(crate) fn clear_timeline_timing(&mut self) {
         self.timeline_timing_measurement = None;
         self.timeline_timing_dragging = false;
-    }
-
-    pub(crate) fn set_timeline_zoom(&mut self, zoom: f32) {
-        self.timeline_zoom = if zoom.is_finite() {
-            zoom.clamp(MIN_TIMELINE_ZOOM, MAX_TIMELINE_ZOOM)
-        } else {
-            MIN_TIMELINE_ZOOM
-        };
-    }
-
-    pub(crate) fn scale_timeline_zoom(&mut self, factor: f32) {
-        self.set_timeline_zoom(self.timeline_zoom * factor);
     }
 
     pub(crate) fn timeline_visible_range(&self) -> Option<(u64, u64)> {
@@ -1927,7 +1946,8 @@ impl SystemTraceDisplayState {
         self.event_table_focus_sequence = None;
         self.timeline_focus_sequence = None;
         self.clear_timeline_timing();
-        self.timeline_zoom = MIN_TIMELINE_ZOOM;
+        self.timeline_ticks_per_division = None;
+        self.timeline_view_start_ticks = None;
         self.timeline_visible_range = None;
         self.time_references.clear();
     }
@@ -1947,6 +1967,10 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn history_path(&self) -> Option<&Path> {
         self.history_path.as_deref()
+    }
+
+    pub(crate) fn history_is_temporary(&self) -> bool {
+        self.history_is_temporary && self.history_path.is_some()
     }
 
     fn discard_temporary_history(&mut self) {
@@ -2060,6 +2084,15 @@ pub(crate) fn choose_systemview_recording_path() -> Option<PathBuf> {
         .map(normalize_systemview_recording_path)
 }
 
+pub(crate) fn choose_systemview_history_save_path() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Save SystemView trace")
+        .add_filter("SystemView data", &["SVDat"])
+        .set_file_name("system-trace.SVDat")
+        .save_file()
+        .map(normalize_systemview_recording_path)
+}
+
 fn normalize_systemview_recording_path(mut path: PathBuf) -> PathBuf {
     let has_systemview_extension = path
         .extension()
@@ -2069,6 +2102,16 @@ fn normalize_systemview_recording_path(mut path: PathBuf) -> PathBuf {
         path.set_extension("SVDat");
     }
     path
+}
+
+fn save_systemview_history(source: &Path, path: &Path) -> Result<(), String> {
+    std::fs::copy(source, path).map(|_| ()).map_err(|error| {
+        format!(
+            "failed to save SystemView trace from {} to {}: {error}",
+            source.display(),
+            path.display()
+        )
+    })
 }
 
 fn read_systemview_trace_file(path: &Path) -> Result<Vec<TraceEvent>, String> {
@@ -2258,6 +2301,24 @@ mod tests {
         state.set_history_path(path.clone(), true);
         state.cleanup_temporary_history();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn temporary_history_can_be_promoted_to_a_saved_trace() {
+        let directory = crate::app::test_support::scratch_directory("systemview-history-save");
+        let source = directory.join("temporary.SVDat");
+        let saved = directory.join("saved.SVDat");
+        std::fs::write(&source, [10, 1]).expect("temporary history is written");
+
+        save_systemview_history(&source, &saved).expect("temporary history is copied");
+        let mut state = SystemTraceDisplayState::default();
+        state.set_history_path(source.clone(), true);
+        state.set_history_path(saved.clone(), false);
+
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&saved).expect("saved trace exists"), [10, 1]);
+        assert_eq!(state.history_path(), Some(saved.as_path()));
+        assert!(!state.history_is_temporary());
     }
 
     #[test]
@@ -2528,20 +2589,21 @@ mod tests {
     }
 
     #[test]
-    fn timeline_zoom_is_bounded_and_resets_with_trace_data() {
+    fn timeline_time_view_resets_with_trace_data() {
         let mut state = SystemTraceDisplayState::default();
 
-        state.set_timeline_zoom(8.0);
-        assert_eq!(state.timeline_zoom(), 8.0);
-        state.scale_timeline_zoom(100.0);
-        assert_eq!(state.timeline_zoom(), MAX_TIMELINE_ZOOM);
-        state.set_timeline_zoom(f32::NAN);
-        assert_eq!(state.timeline_zoom(), MIN_TIMELINE_ZOOM);
-        state.set_timeline_zoom(4.0);
+        state.set_timeline_ticks_per_division(Some(64.0));
+        state.set_timeline_view_start_ticks(Some(1_024));
+        assert_eq!(state.timeline_ticks_per_division(), Some(64.0));
+        assert_eq!(state.timeline_view_start_ticks(), Some(1_024));
+        state.set_timeline_ticks_per_division(Some(f64::NAN));
+        assert_eq!(state.timeline_ticks_per_division(), None);
+        state.set_timeline_ticks_per_division(Some(64.0));
 
         state.clear_trace_events();
 
-        assert_eq!(state.timeline_zoom(), MIN_TIMELINE_ZOOM);
+        assert_eq!(state.timeline_ticks_per_division(), None);
+        assert_eq!(state.timeline_view_start_ticks(), None);
     }
 
     #[test]

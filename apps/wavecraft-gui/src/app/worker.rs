@@ -167,6 +167,13 @@ impl WaveCraftApp {
                 );
                 self.last_error = None;
             }
+            Ok(WorkerSuccess::SystemTraceSaved { source, path }) => {
+                if self.system_trace.history_path() == Some(source.as_path()) {
+                    self.system_trace.set_history_path(path.clone(), false);
+                }
+                self.status = format!("Saved SystemView trace to {}", path.display());
+                self.last_error = None;
+            }
             Ok(WorkerSuccess::SaleaeExported(path)) => {
                 self.status = format!("Exported Saleae capture to {}", path.display());
                 self.last_error = None;
