@@ -25,6 +25,8 @@ system and RTOS traces.
 
 ### System Trace
 
+![WaveCraft System Trace view with task, interrupt, timer, scheduler, and idle execution](docs/images/wavecraft-system-trace.png)
+
 The independent **System Trace** workspace captures or opens SEGGER SystemView
 event streams and reconstructs task, interrupt, timer, scheduler, and idle
 execution. It combines an interactive timeline with event and log tables, CPU
