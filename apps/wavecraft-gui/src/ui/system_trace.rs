@@ -1,6 +1,6 @@
 //! Independent System Trace workspace and decoded-event instruments.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::system_trace::{
     choose_systemview_description, choose_systemview_elf, choose_systemview_recording_path,
@@ -351,13 +351,14 @@ impl WaveCraftApp {
                         .on_hover_text("Scan for debug probes, DSLogic, DSCope, and radio devices")
                         .clicked();
                     ui.separator();
-                    let can_record = matches!(
-                        self.system_trace_connection,
-                        SystemTraceConnectionState::Attached {
-                            systemview_enabled: true,
-                            ..
-                        }
-                    );
+                    let can_record = !self.is_busy()
+                        && matches!(
+                            self.system_trace_connection,
+                            SystemTraceConnectionState::Attached {
+                                systemview_enabled: true,
+                                ..
+                            }
+                        );
                     if ui
                         .add_enabled(
                             can_record,
@@ -389,7 +390,12 @@ impl WaveCraftApp {
                         actions,
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        paint_trace_run_control(ui, &self.system_trace_connection, actions);
+                        paint_trace_run_control(
+                            ui,
+                            &self.system_trace_connection,
+                            self.is_busy(),
+                            actions,
+                        );
                         if ui
                             .add_enabled(
                                 !self.system_trace.events().is_empty()
@@ -1337,6 +1343,7 @@ fn paint_connection_control(
 fn paint_trace_run_control(
     ui: &mut egui::Ui,
     state: &SystemTraceConnectionState,
+    busy: bool,
     actions: &mut FrameActions,
 ) {
     match state {
@@ -1344,7 +1351,10 @@ fn paint_trace_run_control(
             systemview_enabled: true,
             ..
         } => {
-            if ui.button("▶ Start").clicked() {
+            if ui
+                .add_enabled(!busy, egui::Button::new("▶ Start"))
+                .clicked()
+            {
                 actions.system_trace_action = Some(SystemTraceAction::Start);
             }
         }
@@ -1556,12 +1566,20 @@ fn paint_trace_summary(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
         let dropped_events = trace.dropped_event_count();
         if dropped_events > 0 {
             ui.label(
-                RichText::new(format!("⚠ {dropped_events} dropped"))
+                RichText::new(format!("⚠ {dropped_events} target-dropped"))
                     .strong()
                     .color(egui::Color32::from_rgb(245, 96, 96)),
             );
         } else {
             ui.label(RichText::new("No reported loss").color(TEXT_MUTED));
+        }
+        let display_skipped_events = trace.display_skipped_event_count();
+        if display_skipped_events > 0 {
+            ui.label(
+                RichText::new(format!("{display_skipped_events} skipped in live view"))
+                    .color(ORANGE),
+            )
+            .on_hover_text("The complete SystemView stream remains available in trace history");
         }
     });
 }
@@ -1833,7 +1851,7 @@ fn timeline_visible_tick_range(
     (visible_start.min(end_ticks), visible_end)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TimelineLane {
     core_id: u32,
     context: ExecutionContext,
@@ -1911,6 +1929,7 @@ fn paint_timeline_canvas(
     let plot_right = canvas.right();
     let plot_width = (plot_right - plot_left).max(1.0);
     let duration = end_ticks.saturating_sub(start_ticks).max(1);
+    let lane_interval_indices = timeline_lane_interval_indices(model);
 
     painter.rect_filled(canvas, 3.0, BACKGROUND);
     plot_painter.line_segment(
@@ -1951,12 +1970,12 @@ fn paint_timeline_canvas(
         let Some(core) = model.core(lane.core_id) else {
             continue;
         };
-        for (interval_index, interval) in core
-            .intervals()
-            .iter()
-            .enumerate()
-            .filter(|(_, interval)| interval.context == lane.context)
-        {
+        let Some(interval_indices) = lane_interval_indices.get(lane) else {
+            continue;
+        };
+        let mut painted_through_x = f32::NEG_INFINITY;
+        for interval_index in interval_indices.iter().copied() {
+            let interval = &core.intervals()[interval_index];
             let interval_end = interval
                 .end_ticks
                 .unwrap_or(end_ticks)
@@ -1973,6 +1992,19 @@ fn paint_timeline_canvas(
                 egui::pos2(x_start, row_top + 4.0),
                 egui::pos2((x_end.max(x_start + 2.0)).min(plot_right), row_bottom - 4.0),
             );
+            if interval_rect.right() < plot_clip.left() {
+                continue;
+            }
+            if interval_rect.left() > plot_clip.right() {
+                break;
+            }
+            // At overview zoom, thousands of short context switches can map to
+            // the same pixel. Painting and registering every covered interval
+            // only increases egui work without adding visible information.
+            if interval_rect.right() <= painted_through_x {
+                continue;
+            }
+            painted_through_x = interval_rect.right();
             let interval_sequence = interval_event_sequence(trace, *lane, interval.start_ticks);
             let interval_selected = interval_sequence == trace.selected_sequence;
             if interval.end_ticks.is_some() {
@@ -2225,6 +2257,22 @@ fn paint_timeline_canvas(
     clicked_sequence
 }
 
+fn timeline_lane_interval_indices(model: &TraceModel) -> BTreeMap<TimelineLane, Vec<usize>> {
+    let mut lane_intervals = BTreeMap::<TimelineLane, Vec<usize>>::new();
+    for (core_id, core) in model.cores() {
+        for (interval_index, interval) in core.intervals().iter().enumerate() {
+            lane_intervals
+                .entry(TimelineLane {
+                    core_id: *core_id,
+                    context: interval.context,
+                })
+                .or_default()
+                .push(interval_index);
+        }
+    }
+    lane_intervals
+}
+
 fn nearest_timeline_edge(
     edges: &[TimelineEdgePosition],
     pointer: egui::Pos2,
@@ -2446,15 +2494,33 @@ fn interval_event_sequence(
     lane: TimelineLane,
     timestamp_ticks: u64,
 ) -> Option<u64> {
+    let events = trace.events();
+    let first_index = lower_bound_event_timestamp(events, timestamp_ticks);
     let events_at_timestamp = || {
-        trace.events().iter().filter(|event| {
-            event.core_id == lane.core_id && event.timestamp_ticks == timestamp_ticks
-        })
+        events
+            .iter()
+            .skip(first_index)
+            .take_while(|event| event.timestamp_ticks == timestamp_ticks)
+            .filter(|event| event.core_id == lane.core_id)
     };
     events_at_timestamp()
         .find(|event| event_starts_context(&event.kind, lane.context))
         .or_else(|| events_at_timestamp().next())
         .map(|event| event.sequence)
+}
+
+fn lower_bound_event_timestamp(events: &VecDeque<TraceEvent>, timestamp_ticks: u64) -> usize {
+    let mut left = 0;
+    let mut right = events.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        if events[middle].timestamp_ticks < timestamp_ticks {
+            left = middle + 1;
+        } else {
+            right = middle;
+        }
+    }
+    left
 }
 
 fn event_starts_context(kind: &TraceEventKind, context: ExecutionContext) -> bool {
@@ -3811,6 +3877,62 @@ fn visible_event_indices(trace: &SystemTraceDisplayState) -> Vec<usize> {
         .collect()
 }
 
+enum VisibleEventRows {
+    All(usize),
+    Filtered(Vec<usize>),
+}
+
+impl VisibleEventRows {
+    fn for_trace(trace: &SystemTraceDisplayState) -> Self {
+        if trace.event_view == TraceEventView::Events
+            && trace.event_filter.trim().is_empty()
+            && trace.event_category_filter.enabled_count() == TraceEventCategory::ALL.len()
+        {
+            Self::All(trace.events().len())
+        } else {
+            Self::Filtered(visible_event_indices(trace))
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::All(len) => *len,
+            Self::Filtered(indices) => indices.len(),
+        }
+    }
+
+    fn event_index(&self, row: usize) -> usize {
+        match self {
+            Self::All(_) => row,
+            Self::Filtered(indices) => indices[row],
+        }
+    }
+
+    fn sequence_position(&self, events: &VecDeque<TraceEvent>, sequence: u64) -> Option<usize> {
+        match self {
+            Self::All(_) => lower_bound_event_sequence(events, sequence)
+                .filter(|index| events[*index].sequence == sequence),
+            Self::Filtered(indices) => indices
+                .iter()
+                .position(|index| events[*index].sequence == sequence),
+        }
+    }
+}
+
+fn lower_bound_event_sequence(events: &VecDeque<TraceEvent>, sequence: u64) -> Option<usize> {
+    let mut left = 0;
+    let mut right = events.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        if events[middle].sequence < sequence {
+            left = middle + 1;
+        } else {
+            right = middle;
+        }
+    }
+    (left < events.len()).then_some(left)
+}
+
 fn event_execution_context(model: &TraceModel, event: &TraceEvent) -> Option<ExecutionContext> {
     model
         .core(event.core_id)?
@@ -3912,7 +4034,7 @@ fn paint_event_table(
     view_height: f32,
     timestamp_frequency_override_hz: Option<u64>,
 ) {
-    let visible_indices = visible_event_indices(trace);
+    let visible_rows = VisibleEventRows::for_trace(trace);
     let frequency_hz = trace_system_frequency_hz(trace, timestamp_frequency_override_hz);
     let recording_start_ticks = trace
         .time_bounds()
@@ -3920,13 +4042,10 @@ fn paint_event_table(
     let mut selected_sequence = trace.selected_sequence;
     let event_table_focus = trace.take_event_table_focus();
     let follow_latest = trace.follow_latest && event_table_focus.is_none();
-    let event_count = visible_indices.len();
+    let event_count = visible_rows.len();
     let table_width = ui.available_width().max(EVENT_TABLE_MINIMUM_WIDTH);
-    let focus_row = event_table_focus.and_then(|sequence| {
-        visible_indices
-            .iter()
-            .position(|index| trace.events()[*index].sequence == sequence)
-    });
+    let focus_row = event_table_focus
+        .and_then(|sequence| visible_rows.sequence_position(trace.events(), sequence));
 
     let header_width = ui.available_width();
     let (header_rect, _) = ui.allocate_exact_size(
@@ -3951,7 +4070,7 @@ fn paint_event_table(
         event_scroll.show_rows(ui, EVENT_TABLE_ROW_HEIGHT, event_count, |ui, row_range| {
             ui.set_min_width(table_width);
             for visible_row in row_range {
-                let event = &trace.events()[visible_indices[visible_row]];
+                let event = &trace.events()[visible_rows.event_index(visible_row)];
                 let event_selected = selected_sequence == Some(event.sequence);
                 let row = egui::Frame::none()
                     .fill(event_row_fill(visible_row, event_selected))

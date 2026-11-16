@@ -1,10 +1,11 @@
 //! Bounded GUI state for decoded system trace events.
 
 use std::collections::VecDeque;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use wavecraft_systemview::{
 };
 use wavecraft_trace::{ExecutionContext, TraceEvent, TraceEventKind, TraceModel};
 
-const DEFAULT_EVENT_CAPACITY: usize = 100_000;
+const DEFAULT_EVENT_CAPACITY: usize = 20_000;
 const DEFAULT_TERMINAL_LINE_CAPACITY: usize = 20_000;
 const DEFAULT_PROBE_LOG_CAPACITY: usize = 10_000;
 const MIN_TIMELINE_ZOOM: f32 = 1.0;
@@ -30,8 +31,14 @@ const DEFAULT_EVENT_VIEW_HEIGHT: f32 = 230.0;
 const MIN_TRACE_INSTRUMENT_HEIGHT: f32 = 140.0;
 const MAX_TRACE_INSTRUMENT_HEIGHT: f32 = 900.0;
 const RTT_READ_SIZE: usize = 16 * 1024;
+const MAX_SYSTEMVIEW_RTT_READS_PER_POLL: usize = 4;
+const MAX_SYSTEMVIEW_STOP_DRAIN_READS: usize = 16;
+const TRACE_EVENT_QUEUE_CAPACITY: usize = 64 * 1024;
+const TERMINAL_LINE_QUEUE_CAPACITY: usize = 2 * 1024;
 const IDLE_RTT_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const RTT_CHANNEL_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SYSTEMVIEW_FILE_READ_SIZE: usize = 64 * 1024;
+static NEXT_TEMPORARY_TRACE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum TraceEventView {
@@ -272,6 +279,8 @@ pub(crate) enum SystemTraceWorkerEvent {
     },
     Tracing {
         recording_path: Option<PathBuf>,
+        history_path: PathBuf,
+        history_is_temporary: bool,
     },
     Stopped,
     RecordingSaved(PathBuf),
@@ -279,10 +288,21 @@ pub(crate) enum SystemTraceWorkerEvent {
     Error(String),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LiveTraceUpdate {
+    Event(TraceEvent),
+    DisplayGap {
+        sequence: u64,
+        core_id: u32,
+        timestamp_ticks: u64,
+        skipped_events: u64,
+    },
+}
+
 pub(crate) struct SystemTraceWorkerChannels {
     pub(crate) commands: Sender<SystemTraceWorkerCommand>,
     pub(crate) events: Receiver<SystemTraceWorkerEvent>,
-    pub(crate) trace_events: Receiver<TraceEvent>,
+    pub(crate) trace_events: Receiver<LiveTraceUpdate>,
     pub(crate) terminal_lines: Receiver<RttTerminalLine>,
 }
 
@@ -291,8 +311,9 @@ pub(crate) fn spawn_system_trace_connection(
 ) -> SystemTraceWorkerChannels {
     let (command_sender, command_receiver) = mpsc::channel();
     let (event_sender, event_receiver) = mpsc::channel();
-    let (trace_event_sender, trace_event_receiver) = mpsc::channel();
-    let (terminal_line_sender, terminal_line_receiver) = mpsc::channel();
+    let (trace_event_sender, trace_event_receiver) = mpsc::sync_channel(TRACE_EVENT_QUEUE_CAPACITY);
+    let (terminal_line_sender, terminal_line_receiver) =
+        mpsc::sync_channel(TERMINAL_LINE_QUEUE_CAPACITY);
     thread::spawn(move || match DebugProbeHelperProcess::spawn() {
         Ok(helper) => {
             send_probe_log(
@@ -341,8 +362,8 @@ fn run_connection_worker(
     configuration: SystemTraceConnectionConfiguration,
     commands: Receiver<SystemTraceWorkerCommand>,
     events: Sender<SystemTraceWorkerEvent>,
-    trace_events: Sender<TraceEvent>,
-    terminal_lines: Sender<RttTerminalLine>,
+    trace_events: SyncSender<LiveTraceUpdate>,
+    terminal_lines: SyncSender<RttTerminalLine>,
 ) {
     let connection = establish_connection(&mut transport, &configuration, &events);
     let channels = match connection {
@@ -360,6 +381,15 @@ fn run_connection_worker(
             "SystemView binary trace is disabled; session is RTT-terminal only",
         );
     }
+    let systemview_read_size = channels
+        .iter()
+        .find(|channel| {
+            channel.direction == RttChannelDirection::Up
+                && channel.number == configuration.up_channel
+        })
+        .map_or(RTT_READ_SIZE, |channel| {
+            channel.buffer_size.clamp(1, RTT_READ_SIZE)
+        });
     if events
         .send(SystemTraceWorkerEvent::Attached {
             channels: channels.clone(),
@@ -372,8 +402,10 @@ fn run_connection_worker(
     }
 
     let mut decoder = SystemViewDecoder::new(configuration.attach.core_index as u32);
+    let mut trace_events = TraceEventPublisher::new(trace_events);
     let mut terminal_decoder = RttTerminalDecoder::new();
-    let mut raw_recording: Option<(PathBuf, BufWriter<File>)> = None;
+    let mut terminal_lines = TerminalLinePublisher::new(terminal_lines);
+    let mut raw_recording: Option<ActiveSystemViewRecording> = None;
     let mut tracing = false;
     loop {
         let polling = tracing || configuration.terminal_up_channel.is_some();
@@ -403,15 +435,12 @@ fn run_connection_worker(
                     ),
                 );
                 decoder.reset();
-                raw_recording = match recording_path.as_ref() {
-                    Some(path) => match create_systemview_recording(path) {
-                        Ok(recording) => Some((path.clone(), recording)),
-                        Err(error) => {
-                            let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
-                            continue;
-                        }
-                    },
-                    None => None,
+                raw_recording = match create_systemview_recording(recording_path.as_deref()) {
+                    Ok(recording) => Some(recording),
+                    Err(error) => {
+                        let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+                        continue;
+                    }
                 };
                 match write_systemview_command(
                     &mut transport,
@@ -421,7 +450,17 @@ fn run_connection_worker(
                     Ok(()) => {
                         tracing = true;
                         send_probe_log(&events, ProbeLogLevel::Success, "SystemView trace started");
-                        let _ = events.send(SystemTraceWorkerEvent::Tracing { recording_path });
+                        let Some(recording) = raw_recording.as_ref() else {
+                            let _ = events.send(SystemTraceWorkerEvent::Error(
+                                "SystemView history recording was not created".to_owned(),
+                            ));
+                            return;
+                        };
+                        let _ = events.send(SystemTraceWorkerEvent::Tracing {
+                            recording_path,
+                            history_path: recording.path.clone(),
+                            history_is_temporary: recording.temporary,
+                        });
                     }
                     Err(error) => {
                         let _ = close_connection(transport);
@@ -439,6 +478,20 @@ fn run_connection_worker(
                 ) {
                     Ok(()) => {
                         tracing = false;
+                        if let Err(error) = drain_stopped_systemview(
+                            &mut transport,
+                            configuration.up_channel,
+                            systemview_read_size,
+                            &mut decoder,
+                            &mut trace_events,
+                            raw_recording
+                                .as_mut()
+                                .map(|recording| &mut recording.writer),
+                        ) {
+                            let _ = close_connection(transport);
+                            let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+                            return;
+                        }
                         if let Err(error) =
                             finish_systemview_recording(raw_recording.take(), &events)
                         {
@@ -458,11 +511,30 @@ fn run_connection_worker(
             }
             Some(SystemTraceWorkerCommand::Disconnect) => {
                 send_probe_log(&events, ProbeLogLevel::Info, "closing debug-probe session");
-                if tracing {
-                    let _ = write_systemview_command(
+                let drain_failed = tracing
+                    && write_systemview_command(
                         &mut transport,
                         configuration.down_channel,
                         SYSTEMVIEW_COMMAND_STOP,
+                    )
+                    .and_then(|()| {
+                        drain_stopped_systemview(
+                            &mut transport,
+                            configuration.up_channel,
+                            systemview_read_size,
+                            &mut decoder,
+                            &mut trace_events,
+                            raw_recording
+                                .as_mut()
+                                .map(|recording| &mut recording.writer),
+                        )
+                    })
+                    .is_err();
+                if drain_failed {
+                    send_probe_log(
+                        &events,
+                        ProbeLogLevel::Warning,
+                        "SystemView stream could not be fully drained before disconnect",
                     );
                 }
                 if let Err(error) = finish_systemview_recording(raw_recording.take(), &events) {
@@ -471,7 +543,7 @@ fn run_connection_worker(
                     return;
                 }
                 if let Some(line) = terminal_decoder.finish() {
-                    let _ = terminal_lines.send(line);
+                    let _ = terminal_lines.publish(line);
                 }
                 match close_connection(transport) {
                     Ok(()) => {
@@ -494,18 +566,28 @@ fn run_connection_worker(
 
         let mut bytes_read = 0;
         if tracing {
-            match read_and_decode_rtt(
-                &mut transport,
-                configuration.up_channel,
-                &mut decoder,
-                &trace_events,
-                raw_recording.as_mut().map(|(_, recording)| recording),
-            ) {
-                Ok(count) => bytes_read += count,
-                Err(error) => {
-                    let _ = close_connection(transport);
-                    let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
-                    return;
+            for _ in 0..MAX_SYSTEMVIEW_RTT_READS_PER_POLL {
+                match read_and_decode_rtt(
+                    &mut transport,
+                    configuration.up_channel,
+                    systemview_read_size,
+                    &mut decoder,
+                    &mut trace_events,
+                    raw_recording
+                        .as_mut()
+                        .map(|recording| &mut recording.writer),
+                ) {
+                    Ok(count) => {
+                        bytes_read += count;
+                        if count < systemview_read_size {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = close_connection(transport);
+                        let _ = events.send(SystemTraceWorkerEvent::Error(error.to_string()));
+                        return;
+                    }
                 }
             }
         }
@@ -514,7 +596,7 @@ fn run_connection_worker(
                 &mut transport,
                 channel_number,
                 &mut terminal_decoder,
-                &terminal_lines,
+                &mut terminal_lines,
             ) {
                 Ok(count) => bytes_read += count,
                 Err(error) => {
@@ -551,13 +633,14 @@ fn write_systemview_command(
 fn read_and_decode_rtt(
     transport: &mut impl ProbeCommandTransport,
     channel_number: usize,
+    maximum_length: usize,
     decoder: &mut SystemViewDecoder,
-    trace_events: &Sender<TraceEvent>,
+    trace_events: &mut TraceEventPublisher,
     raw_recording: Option<&mut BufWriter<File>>,
 ) -> Result<usize, DebugProbeError> {
     let data = match transport.send(DebugProbeCommand::ReadRttUp {
         channel_number,
-        maximum_length: RTT_READ_SIZE,
+        maximum_length,
     })? {
         DebugProbeReply::RttData(data) => data,
         _ => return Err(unexpected_reply("read SystemView RTT data")),
@@ -578,50 +661,171 @@ fn read_and_decode_rtt(
         )
     })?;
     for event in decoded {
-        trace_events.send(event).map_err(|_| {
-            DebugProbeError::new(
-                DebugProbeErrorKind::Disconnected,
-                "System Trace event receiver is no longer available",
-            )
-        })?;
+        trace_events.publish(event)?;
     }
     Ok(byte_count)
 }
 
-fn create_systemview_recording(path: &Path) -> Result<BufWriter<File>, DebugProbeError> {
-    File::create(path).map(BufWriter::new).map_err(|error| {
-        DebugProbeError::new(
-            DebugProbeErrorKind::Transport,
-            format!(
-                "failed to create raw SystemView recording {}: {error}",
-                path.display()
-            ),
-        )
-    })
+fn drain_stopped_systemview(
+    transport: &mut impl ProbeCommandTransport,
+    channel_number: usize,
+    maximum_length: usize,
+    decoder: &mut SystemViewDecoder,
+    trace_events: &mut TraceEventPublisher,
+    mut raw_recording: Option<&mut BufWriter<File>>,
+) -> Result<(), DebugProbeError> {
+    thread::sleep(IDLE_RTT_POLL_INTERVAL);
+    for _ in 0..MAX_SYSTEMVIEW_STOP_DRAIN_READS {
+        let count = read_and_decode_rtt(
+            transport,
+            channel_number,
+            maximum_length,
+            decoder,
+            trace_events,
+            raw_recording.as_deref_mut(),
+        )?;
+        if count == 0 {
+            return decoder.finish().map_err(|error| {
+                DebugProbeError::new(
+                    DebugProbeErrorKind::Transport,
+                    format!("SystemView stream ended with an incomplete packet: {error}"),
+                )
+            });
+        }
+    }
+    Err(DebugProbeError::new(
+        DebugProbeErrorKind::Transport,
+        "SystemView RTT channel did not become empty after stop",
+    ))
+}
+
+struct TraceEventPublisher {
+    sender: SyncSender<LiveTraceUpdate>,
+    dropped_events: u64,
+}
+
+impl TraceEventPublisher {
+    fn new(sender: SyncSender<LiveTraceUpdate>) -> Self {
+        Self {
+            sender,
+            dropped_events: 0,
+        }
+    }
+
+    fn publish(&mut self, event: TraceEvent) -> Result<(), DebugProbeError> {
+        let update = if self.dropped_events == 0 {
+            LiveTraceUpdate::Event(event)
+        } else {
+            let skipped_events = self.dropped_events.saturating_add(1);
+            LiveTraceUpdate::DisplayGap {
+                sequence: event.sequence,
+                core_id: event.core_id,
+                timestamp_ticks: event.timestamp_ticks,
+                skipped_events,
+            }
+        };
+        match self.sender.try_send(update) {
+            Ok(()) => {
+                self.dropped_events = 0;
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => {
+                self.dropped_events = self.dropped_events.saturating_add(1);
+                Ok(())
+            }
+            Err(TrySendError::Disconnected(_)) => Err(DebugProbeError::new(
+                DebugProbeErrorKind::Disconnected,
+                "System Trace event receiver is no longer available",
+            )),
+        }
+    }
+}
+
+struct ActiveSystemViewRecording {
+    path: PathBuf,
+    temporary: bool,
+    writer: BufWriter<File>,
+}
+
+fn create_systemview_recording(
+    requested_path: Option<&Path>,
+) -> Result<ActiveSystemViewRecording, DebugProbeError> {
+    if let Some(path) = requested_path {
+        let file = File::create(path).map_err(|error| recording_create_error(path, error))?;
+        return Ok(ActiveSystemViewRecording {
+            path: path.to_owned(),
+            temporary: false,
+            writer: BufWriter::new(file),
+        });
+    }
+
+    for _ in 0..100 {
+        let id = NEXT_TEMPORARY_TRACE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "wavecraft-systemview-{}-{id}.SVDat",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                return Ok(ActiveSystemViewRecording {
+                    path,
+                    temporary: true,
+                    writer: BufWriter::new(file),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(recording_create_error(&path, error)),
+        }
+    }
+    Err(DebugProbeError::new(
+        DebugProbeErrorKind::Transport,
+        "failed to allocate a unique temporary SystemView history file",
+    ))
+}
+
+fn recording_create_error(path: &Path, error: std::io::Error) -> DebugProbeError {
+    DebugProbeError::new(
+        DebugProbeErrorKind::Transport,
+        format!(
+            "failed to create raw SystemView recording {}: {error}",
+            path.display()
+        ),
+    )
 }
 
 fn finish_systemview_recording(
-    recording: Option<(PathBuf, BufWriter<File>)>,
+    recording: Option<ActiveSystemViewRecording>,
     events: &Sender<SystemTraceWorkerEvent>,
 ) -> Result<(), DebugProbeError> {
-    let Some((path, mut recording)) = recording else {
+    let Some(mut recording) = recording else {
         return Ok(());
     };
-    recording.flush().map_err(|error| {
+    recording.writer.flush().map_err(|error| {
         DebugProbeError::new(
             DebugProbeErrorKind::Transport,
             format!(
                 "failed to finish raw SystemView recording {}: {error}",
-                path.display()
+                recording.path.display()
             ),
         )
     })?;
-    send_probe_log(
-        events,
-        ProbeLogLevel::Success,
-        format!("SystemView recording saved to {}", path.display()),
-    );
-    let _ = events.send(SystemTraceWorkerEvent::RecordingSaved(path));
+    if recording.temporary {
+        send_probe_log(
+            events,
+            ProbeLogLevel::Debug,
+            format!(
+                "complete SystemView history retained in {}",
+                recording.path.display()
+            ),
+        );
+    } else {
+        send_probe_log(
+            events,
+            ProbeLogLevel::Success,
+            format!("SystemView recording saved to {}", recording.path.display()),
+        );
+        let _ = events.send(SystemTraceWorkerEvent::RecordingSaved(recording.path));
+    }
     Ok(())
 }
 
@@ -629,7 +833,7 @@ fn read_rtt_terminal(
     transport: &mut impl ProbeCommandTransport,
     channel_number: usize,
     decoder: &mut RttTerminalDecoder,
-    terminal_lines: &Sender<RttTerminalLine>,
+    terminal_lines: &mut TerminalLinePublisher,
 ) -> Result<usize, DebugProbeError> {
     let data = match transport.send(DebugProbeCommand::ReadRttUp {
         channel_number,
@@ -640,14 +844,50 @@ fn read_rtt_terminal(
     };
     let byte_count = data.len();
     for line in decoder.push(&data) {
-        terminal_lines.send(line).map_err(|_| {
-            DebugProbeError::new(
-                DebugProbeErrorKind::Disconnected,
-                "RTT terminal receiver is no longer available",
-            )
-        })?;
+        terminal_lines.publish(line)?;
     }
     Ok(byte_count)
+}
+
+struct TerminalLinePublisher {
+    sender: SyncSender<RttTerminalLine>,
+    dropped_lines: u64,
+}
+
+impl TerminalLinePublisher {
+    fn new(sender: SyncSender<RttTerminalLine>) -> Self {
+        Self {
+            sender,
+            dropped_lines: 0,
+        }
+    }
+
+    fn publish(&mut self, line: RttTerminalLine) -> Result<(), DebugProbeError> {
+        let line = if self.dropped_lines == 0 {
+            line
+        } else {
+            let dropped_lines = self.dropped_lines.saturating_add(1);
+            RttTerminalLine::plain(
+                line.sequence,
+                format!("[WaveCraft: dropped {dropped_lines} RTT terminal lines]"),
+                true,
+            )
+        };
+        match self.sender.try_send(line) {
+            Ok(()) => {
+                self.dropped_lines = 0;
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => {
+                self.dropped_lines = self.dropped_lines.saturating_add(1);
+                Ok(())
+            }
+            Err(TrySendError::Disconnected(_)) => Err(DebugProbeError::new(
+                DebugProbeErrorKind::Disconnected,
+                "RTT terminal receiver is no longer available",
+            )),
+        }
+    }
 }
 
 fn establish_connection(
@@ -655,6 +895,7 @@ fn establish_connection(
     configuration: &SystemTraceConnectionConfiguration,
     events: &Sender<SystemTraceWorkerEvent>,
 ) -> Result<Vec<RttChannelDescriptor>, DebugProbeError> {
+    validate_rtt_channel_selection(configuration)?;
     send_probe_log(
         events,
         ProbeLogLevel::Info,
@@ -704,35 +945,60 @@ fn establish_connection(
             configuration.rtt.control_block, configuration.rtt.timeout
         ),
     );
-    match transport.send(DebugProbeCommand::AttachRtt {
-        configuration: configuration.rtt.clone(),
-    })? {
-        DebugProbeReply::RttAttached(channels) => {
-            validate_rtt_channels(&channels, configuration)?;
-            send_probe_log(
-                events,
-                ProbeLogLevel::Success,
-                format!("RTT attached with {} channel(s)", channels.len()),
-            );
-            for channel in &channels {
+    let discovery_started = std::time::Instant::now();
+    let mut waiting_for_channels_logged = false;
+    loop {
+        let mut rtt_configuration = configuration.rtt.clone();
+        rtt_configuration.timeout = configuration
+            .rtt
+            .timeout
+            .saturating_sub(discovery_started.elapsed());
+        let channels = match transport.send(DebugProbeCommand::AttachRtt {
+            configuration: rtt_configuration,
+        })? {
+            DebugProbeReply::RttAttached(channels) => channels,
+            _ => return Err(unexpected_reply("attach RTT")),
+        };
+        match validate_rtt_channels(&channels, configuration) {
+            Ok(()) => {
                 send_probe_log(
                     events,
-                    ProbeLogLevel::Debug,
-                    format!(
-                        "RTT {:?} channel {}{}",
-                        channel.direction,
-                        channel.number,
-                        channel
-                            .name
-                            .as_deref()
-                            .map(|name| format!(" ({name})"))
-                            .unwrap_or_default()
-                    ),
+                    ProbeLogLevel::Success,
+                    format!("RTT attached with {} channel(s)", channels.len()),
                 );
+                for channel in &channels {
+                    send_probe_log(
+                        events,
+                        ProbeLogLevel::Debug,
+                        format!(
+                            "RTT {:?} channel {}{}",
+                            channel.direction,
+                            channel.number,
+                            channel
+                                .name
+                                .as_deref()
+                                .map(|name| format!(" ({name})"))
+                                .unwrap_or_default()
+                        ),
+                    );
+                }
+                return Ok(channels);
             }
-            Ok(channels)
+            Err(error) if discovery_started.elapsed() >= configuration.rtt.timeout => {
+                return Err(error);
+            }
+            Err(_) => {
+                if !waiting_for_channels_logged {
+                    send_probe_log(
+                        events,
+                        ProbeLogLevel::Debug,
+                        "RTT control block found; waiting for configured channels",
+                    );
+                    waiting_for_channels_logged = true;
+                }
+                thread::sleep(RTT_CHANNEL_DISCOVERY_RETRY_INTERVAL);
+            }
         }
-        _ => Err(unexpected_reply("attach RTT")),
     }
 }
 
@@ -751,6 +1017,7 @@ fn validate_rtt_channels(
     channels: &[RttChannelDescriptor],
     configuration: &SystemTraceConnectionConfiguration,
 ) -> Result<(), DebugProbeError> {
+    validate_rtt_channel_selection(configuration)?;
     if configuration.systemview_enabled {
         let has_up = channels.iter().any(|channel| {
             channel.direction == RttChannelDirection::Up
@@ -771,12 +1038,6 @@ fn validate_rtt_channels(
         }
     }
     if let Some(terminal_channel) = configuration.terminal_up_channel {
-        if configuration.systemview_enabled && terminal_channel == configuration.up_channel {
-            return Err(DebugProbeError::new(
-                DebugProbeErrorKind::InvalidConfiguration,
-                "plain RTT terminal and SystemView must use different up-channels",
-            ));
-        }
         let has_terminal = channels.iter().any(|channel| {
             channel.direction == RttChannelDirection::Up && channel.number == terminal_channel
         });
@@ -786,6 +1047,20 @@ fn validate_rtt_channels(
                 format!("target does not expose RTT terminal up-channel {terminal_channel}"),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_rtt_channel_selection(
+    configuration: &SystemTraceConnectionConfiguration,
+) -> Result<(), DebugProbeError> {
+    if configuration.systemview_enabled
+        && configuration.terminal_up_channel == Some(configuration.up_channel)
+    {
+        return Err(DebugProbeError::new(
+            DebugProbeErrorKind::InvalidConfiguration,
+            "plain RTT terminal and SystemView must use different up-channels",
+        ));
     }
     Ok(())
 }
@@ -846,7 +1121,13 @@ impl crate::WaveCraftApp {
     }
 
     pub(crate) fn begin_open_system_trace(&mut self, path: PathBuf) {
-        if self.pending.is_some() || !self.system_trace_connection.is_disconnected() {
+        let trace_is_idle = matches!(
+            self.system_trace_connection,
+            SystemTraceConnectionState::Disconnected
+                | SystemTraceConnectionState::Error(_)
+                | SystemTraceConnectionState::Attached { .. }
+        );
+        if self.pending.is_some() || !trace_is_idle {
             return;
         }
         let (sender, receiver) = mpsc::channel();
@@ -855,7 +1136,11 @@ impl crate::WaveCraftApp {
         self.last_error = None;
         thread::spawn(move || {
             let result = read_systemview_trace_file(&path)
-                .map(|events| WorkerSuccess::SystemTraceLoaded { path, events });
+                .map(LoadedSystemTrace::from_events)
+                .map(|trace| WorkerSuccess::SystemTraceLoaded {
+                    path,
+                    trace: Box::new(trace),
+                });
             let _ = sender.send(result);
         });
     }
@@ -884,6 +1169,9 @@ impl crate::WaveCraftApp {
     }
 
     fn request_system_trace_start_with_recording(&mut self, recording_path: Option<PathBuf>) {
+        if self.pending.is_some() {
+            return;
+        }
         let SystemTraceConnectionState::Attached {
             channels,
             systemview_enabled: true,
@@ -895,7 +1183,7 @@ impl crate::WaveCraftApp {
         if self.send_system_trace_worker_command(SystemTraceWorkerCommand::Start {
             recording_path: recording_path.clone(),
         }) {
-            self.system_trace.clear_trace_events();
+            self.system_trace.begin_live_trace();
             self.system_trace_connection = SystemTraceConnectionState::Starting {
                 channels,
                 recording_path,
@@ -955,6 +1243,7 @@ impl crate::WaveCraftApp {
 
     pub(crate) fn poll_system_trace_connection(&mut self) {
         let mut finished = false;
+        let mut completed_history = None;
         if let Some(events) = &self.system_trace_worker_events {
             loop {
                 match events.try_recv() {
@@ -970,7 +1259,13 @@ impl crate::WaveCraftApp {
                             systemview_enabled,
                         };
                     }
-                    Ok(SystemTraceWorkerEvent::Tracing { recording_path }) => {
+                    Ok(SystemTraceWorkerEvent::Tracing {
+                        recording_path,
+                        history_path,
+                        history_is_temporary,
+                    }) => {
+                        self.system_trace
+                            .set_history_path(history_path, history_is_temporary);
                         let channels = self
                             .system_trace_connection
                             .channels()
@@ -991,6 +1286,7 @@ impl crate::WaveCraftApp {
                             channels,
                             systemview_enabled: true,
                         };
+                        completed_history = self.system_trace.history_path().map(Path::to_owned);
                     }
                     Ok(SystemTraceWorkerEvent::RecordingSaved(path)) => {
                         self.status = format!("SystemView recording saved to {}", path.display());
@@ -1035,11 +1331,60 @@ impl crate::WaveCraftApp {
             self.system_trace_worker_commands = None;
             self.system_trace_worker_events = None;
         }
+        if let Some(path) = completed_history {
+            self.begin_open_system_trace(path);
+        }
     }
 }
 
 /// Display state is intentionally independent of a debug-probe backend. A
 /// future capture worker can feed this type events from any supported probe.
+pub(crate) struct LoadedSystemTrace {
+    events: VecDeque<TraceEvent>,
+    model: TraceModel,
+    target_frequencies_hz: Option<(u64, u64)>,
+    log_count: usize,
+    target_dropped_event_count: u64,
+}
+
+impl LoadedSystemTrace {
+    fn from_events(events: Vec<TraceEvent>) -> Self {
+        let mut model = TraceModel::new();
+        let mut target_frequencies_hz = None;
+        let mut log_count = 0_usize;
+        let mut target_dropped_event_count = 0_u64;
+        for event in &events {
+            model.apply(event);
+            match &event.kind {
+                TraceEventKind::TargetInfo {
+                    system_frequency_hz,
+                    cpu_frequency_hz,
+                    ..
+                } => {
+                    target_frequencies_hz = Some((*system_frequency_hz, *cpu_frequency_hz));
+                }
+                TraceEventKind::Overflow { dropped_events } => {
+                    target_dropped_event_count =
+                        target_dropped_event_count.saturating_add(*dropped_events);
+                }
+                kind if is_log_event(kind) => log_count = log_count.saturating_add(1),
+                _ => {}
+            }
+        }
+        Self {
+            events: events.into(),
+            model,
+            target_frequencies_hz,
+            log_count,
+            target_dropped_event_count,
+        }
+    }
+
+    pub(crate) fn event_count(&self) -> usize {
+        self.events.len()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SystemTraceDisplayState {
     events: VecDeque<TraceEvent>,
@@ -1049,6 +1394,11 @@ pub(crate) struct SystemTraceDisplayState {
     elf: Option<SystemViewElf>,
     description: Option<SystemViewDescription>,
     target_frequencies_hz: Option<(u64, u64)>,
+    log_count: usize,
+    display_skipped_event_count: u64,
+    target_dropped_event_count: u64,
+    history_path: Option<PathBuf>,
+    history_is_temporary: bool,
     event_capacity: usize,
     terminal_line_capacity: usize,
     probe_log_capacity: usize,
@@ -1088,6 +1438,11 @@ impl Default for SystemTraceDisplayState {
             elf: None,
             description: None,
             target_frequencies_hz: None,
+            log_count: 0,
+            display_skipped_event_count: 0,
+            target_dropped_event_count: 0,
+            history_path: None,
+            history_is_temporary: false,
             event_capacity: DEFAULT_EVENT_CAPACITY,
             terminal_line_capacity: DEFAULT_TERMINAL_LINE_CAPACITY,
             probe_log_capacity: DEFAULT_PROBE_LOG_CAPACITY,
@@ -1480,17 +1835,47 @@ impl SystemTraceDisplayState {
             self.target_frequencies_hz = Some((*system_frequency_hz, *cpu_frequency_hz));
         }
         self.model.apply(&event);
-        if self.events.len() == self.event_capacity
-            && self
-                .events
-                .pop_front()
-                .is_some_and(|discarded| Some(discarded.sequence) == self.selected_sequence)
-        {
-            self.selected_sequence = None;
-            self.event_table_focus_sequence = None;
-            self.timeline_focus_sequence = None;
+        if let TraceEventKind::Overflow { dropped_events } = &event.kind {
+            self.target_dropped_event_count = self
+                .target_dropped_event_count
+                .saturating_add(*dropped_events);
+        }
+        if is_log_event(&event.kind) {
+            self.log_count = self.log_count.saturating_add(1);
+        }
+        if self.events.len() == self.event_capacity {
+            if let Some(discarded) = self.events.pop_front() {
+                if is_log_event(&discarded.kind) {
+                    self.log_count = self.log_count.saturating_sub(1);
+                }
+                if Some(discarded.sequence) == self.selected_sequence {
+                    self.selected_sequence = None;
+                    self.event_table_focus_sequence = None;
+                    self.timeline_focus_sequence = None;
+                }
+            }
         }
         self.events.push_back(event);
+    }
+
+    pub(crate) fn ingest_display_gap(
+        &mut self,
+        sequence: u64,
+        core_id: u32,
+        timestamp_ticks: u64,
+        skipped_events: u64,
+    ) {
+        self.display_skipped_event_count = self
+            .display_skipped_event_count
+            .saturating_add(skipped_events);
+        self.model.apply(&TraceEvent {
+            sequence,
+            core_id,
+            timestamp_ticks,
+            kind: TraceEventKind::Overflow {
+                dropped_events: skipped_events,
+            },
+        });
     }
 
     pub(crate) fn ingest_terminal_line(&mut self, line: RttTerminalLine) {
@@ -1500,13 +1885,21 @@ impl SystemTraceDisplayState {
         self.terminal_lines.push_back(line);
     }
 
-    pub(crate) fn replace_trace_events(&mut self, events: impl IntoIterator<Item = TraceEvent>) {
+    #[cfg(test)]
+    pub(crate) fn replace_trace_events(&mut self, events: Vec<TraceEvent>) {
+        self.replace_loaded_trace(LoadedSystemTrace::from_events(events));
+    }
+
+    pub(crate) fn replace_loaded_trace(&mut self, trace: LoadedSystemTrace) {
         self.clear_trace_events();
+        self.event_capacity = trace.events.len().max(DEFAULT_EVENT_CAPACITY);
         self.event_filter.clear();
         self.event_view = TraceEventView::Events;
-        for event in events {
-            self.ingest(event);
-        }
+        self.events = trace.events;
+        self.model = trace.model;
+        self.target_frequencies_hz = trace.target_frequencies_hz;
+        self.log_count = trace.log_count;
+        self.target_dropped_event_count = trace.target_dropped_event_count;
     }
 
     #[cfg(test)]
@@ -1525,7 +1918,11 @@ impl SystemTraceDisplayState {
     pub(crate) fn clear_trace_events(&mut self) {
         self.events.clear();
         self.model = TraceModel::new();
+        self.event_capacity = DEFAULT_EVENT_CAPACITY;
         self.target_frequencies_hz = None;
+        self.log_count = 0;
+        self.display_skipped_event_count = 0;
+        self.target_dropped_event_count = 0;
         self.selected_sequence = None;
         self.event_table_focus_sequence = None;
         self.timeline_focus_sequence = None;
@@ -1535,22 +1932,49 @@ impl SystemTraceDisplayState {
         self.time_references.clear();
     }
 
+    pub(crate) fn begin_live_trace(&mut self) {
+        self.discard_temporary_history();
+        self.history_path = None;
+        self.history_is_temporary = false;
+        self.clear_trace_events();
+    }
+
+    pub(crate) fn set_history_path(&mut self, path: PathBuf, temporary: bool) {
+        self.discard_temporary_history();
+        self.history_path = Some(path);
+        self.history_is_temporary = temporary;
+    }
+
+    pub(crate) fn history_path(&self) -> Option<&Path> {
+        self.history_path.as_deref()
+    }
+
+    fn discard_temporary_history(&mut self) {
+        if self.history_is_temporary {
+            if let Some(path) = &self.history_path {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    pub(crate) fn cleanup_temporary_history(&mut self) {
+        self.discard_temporary_history();
+        self.history_path = None;
+        self.history_is_temporary = false;
+    }
+
     pub(crate) fn time_bounds(&self) -> Option<(u64, u64)> {
-        let mut timestamps = self.events.iter().map(|event| event.timestamp_ticks);
-        let first = timestamps.next()?;
-        Some(
-            timestamps.fold((first, first), |(minimum, maximum), timestamp| {
-                (minimum.min(timestamp), maximum.max(timestamp))
-            }),
-        )
+        let first = self.events.front()?.timestamp_ticks;
+        let last = self.events.back()?.timestamp_ticks;
+        Some((first.min(last), first.max(last)))
     }
 
     pub(crate) fn dropped_event_count(&self) -> u64 {
-        self.model()
-            .cores()
-            .values()
-            .map(|core| core.dropped_events())
-            .sum()
+        self.target_dropped_event_count
+    }
+
+    pub(crate) fn display_skipped_event_count(&self) -> u64 {
+        self.display_skipped_event_count
     }
 
     pub(crate) fn selected_event(&self) -> Option<&TraceEvent> {
@@ -1561,15 +1985,7 @@ impl SystemTraceDisplayState {
     }
 
     pub(crate) fn log_count(&self) -> usize {
-        self.events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event.kind,
-                    TraceEventKind::FormattedPrint { .. } | TraceEventKind::PrintElf { .. }
-                )
-            })
-            .count()
+        self.log_count
     }
 
     #[cfg(test)]
@@ -1579,6 +1995,13 @@ impl SystemTraceDisplayState {
             ..Self::default()
         }
     }
+}
+
+fn is_log_event(kind: &TraceEventKind) -> bool {
+    matches!(
+        kind,
+        TraceEventKind::FormattedPrint { .. } | TraceEventKind::PrintElf { .. }
+    )
 }
 
 pub(crate) fn choose_systemview_trace_to_open() -> Option<PathBuf> {
@@ -1760,6 +2183,81 @@ mod tests {
             timestamp_ticks,
             kind,
         }
+    }
+
+    #[test]
+    fn full_live_event_queue_reports_a_display_gap_without_blocking() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut publisher = TraceEventPublisher::new(sender);
+
+        publisher
+            .publish(event(0, 1, TraceEventKind::Idle))
+            .expect("first event fits");
+        publisher
+            .publish(event(1, 2, TraceEventKind::Idle))
+            .expect("a full display queue does not block the probe worker");
+        assert_eq!(
+            receiver.recv().expect("first event is queued"),
+            LiveTraceUpdate::Event(event(0, 1, TraceEventKind::Idle))
+        );
+
+        publisher
+            .publish(event(2, 3, TraceEventKind::Idle))
+            .expect("overflow marker fits after the UI drains the queue");
+
+        assert_eq!(
+            receiver.recv().expect("overflow marker is queued"),
+            LiveTraceUpdate::DisplayGap {
+                sequence: 2,
+                core_id: 0,
+                timestamp_ticks: 3,
+                skipped_events: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn target_loss_and_live_display_skips_are_reported_separately() {
+        let mut state = SystemTraceDisplayState::default();
+        state.ingest(event(0, 1, TraceEventKind::Overflow { dropped_events: 3 }));
+
+        state.ingest_display_gap(10, 0, 20, 7);
+
+        assert_eq!(state.dropped_event_count(), 3);
+        assert_eq!(state.display_skipped_event_count(), 7);
+        assert_eq!(
+            state.model().core(0).map(|core| core.dropped_events()),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn temporary_recording_retains_complete_history_until_cleanup() {
+        let mut recording =
+            create_systemview_recording(None).expect("temporary history is created");
+        assert!(recording.temporary);
+        let path = recording.path.clone();
+        recording
+            .writer
+            .write_all(&[10, 1])
+            .expect("trace packet is written");
+        let (event_sender, event_receiver) = mpsc::channel();
+
+        finish_systemview_recording(Some(recording), &event_sender)
+            .expect("temporary history is flushed");
+
+        assert!(path.is_file());
+        assert_eq!(
+            read_systemview_trace_file(&path).expect("temporary history can be reopened"),
+            vec![event(0, 1, TraceEventKind::TraceStarted)]
+        );
+        assert!(!event_receiver
+            .try_iter()
+            .any(|event| matches!(event, SystemTraceWorkerEvent::RecordingSaved(_))));
+        let mut state = SystemTraceDisplayState::default();
+        state.set_history_path(path.clone(), true);
+        state.cleanup_temporary_history();
+        assert!(!path.exists());
     }
 
     #[test]
@@ -2162,16 +2660,17 @@ mod tests {
             shutdown,
         };
         let mut decoder = RttTerminalDecoder::new();
-        let (line_sender, line_receiver) = mpsc::channel();
+        let (line_sender, line_receiver) = mpsc::sync_channel(16);
+        let mut line_publisher = TerminalLinePublisher::new(line_sender);
 
         assert_eq!(
-            read_rtt_terminal(&mut transport, 0, &mut decoder, &line_sender)
+            read_rtt_terminal(&mut transport, 0, &mut decoder, &mut line_publisher)
                 .expect("first terminal read succeeds"),
             5
         );
         assert!(line_receiver.try_recv().is_err());
         assert_eq!(
-            read_rtt_terminal(&mut transport, 0, &mut decoder, &line_sender)
+            read_rtt_terminal(&mut transport, 0, &mut decoder, &mut line_publisher)
                 .expect("second terminal read succeeds"),
             7
         );
@@ -2223,6 +2722,81 @@ mod tests {
     }
 
     #[test]
+    fn connection_waits_for_systemview_channels_after_partial_rtt_initialization() {
+        let terminal_channel = RttChannelDescriptor {
+            number: 0,
+            direction: RttChannelDirection::Up,
+            name: Some("Terminal".to_owned()),
+            buffer_size: 512,
+        };
+        let up_channel = RttChannelDescriptor {
+            number: 1,
+            direction: RttChannelDirection::Up,
+            name: Some("SysView".to_owned()),
+            buffer_size: 1024,
+        };
+        let down_channel = RttChannelDescriptor {
+            number: 1,
+            direction: RttChannelDirection::Down,
+            name: Some("SysView".to_owned()),
+            buffer_size: 8,
+        };
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(Mutex::new(false));
+        let transport = FakeTransport {
+            replies: VecDeque::from([
+                Ok(DebugProbeReply::ProbeOpened(probe_descriptor())),
+                Ok(DebugProbeReply::TargetAttached),
+                Ok(DebugProbeReply::RttAttached(vec![terminal_channel.clone()])),
+                Ok(DebugProbeReply::RttAttached(vec![
+                    terminal_channel,
+                    up_channel,
+                    down_channel,
+                ])),
+                Ok(DebugProbeReply::SessionClosed),
+            ]),
+            commands: Arc::clone(&commands),
+            shutdown: Arc::clone(&shutdown),
+        };
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (trace_event_sender, _trace_event_receiver) = mpsc::sync_channel(16);
+        let (terminal_line_sender, _terminal_line_receiver) = mpsc::sync_channel(16);
+        command_sender
+            .send(SystemTraceWorkerCommand::Disconnect)
+            .expect("disconnect is queued");
+        let mut configuration = connection_configuration();
+        configuration.rtt.timeout = Duration::from_millis(100);
+
+        run_connection_worker(
+            transport,
+            configuration,
+            command_receiver,
+            event_sender,
+            trace_event_sender,
+            terminal_line_sender,
+        );
+
+        assert_eq!(
+            commands
+                .lock()
+                .expect("commands are available")
+                .iter()
+                .filter(|command| matches!(command, DebugProbeCommand::AttachRtt { .. }))
+                .count(),
+            2
+        );
+        assert!(event_receiver.try_iter().any(|event| matches!(
+            event,
+            SystemTraceWorkerEvent::ProbeLog(ProbeLogMessage {
+                level: ProbeLogLevel::Debug,
+                message,
+            }) if message == "RTT control block found; waiting for configured channels"
+        )));
+        assert!(*shutdown.lock().expect("shutdown flag is available"));
+    }
+
+    #[test]
     fn connection_worker_optionally_resets_before_rtt_attach() {
         let up_channel = RttChannelDescriptor {
             number: 1,
@@ -2254,8 +2828,8 @@ mod tests {
         };
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
-        let (trace_event_sender, _trace_event_receiver) = mpsc::channel();
-        let (terminal_line_sender, _terminal_line_receiver) = mpsc::channel();
+        let (trace_event_sender, _trace_event_receiver) = mpsc::sync_channel(16);
+        let (terminal_line_sender, _terminal_line_receiver) = mpsc::sync_channel(16);
         command_sender
             .send(SystemTraceWorkerCommand::Disconnect)
             .expect("disconnect is queued");
@@ -2316,8 +2890,8 @@ mod tests {
         };
         let (_command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
-        let (trace_event_sender, _trace_event_receiver) = mpsc::channel();
-        let (terminal_line_sender, _terminal_line_receiver) = mpsc::channel();
+        let (trace_event_sender, _trace_event_receiver) = mpsc::sync_channel(16);
+        let (terminal_line_sender, _terminal_line_receiver) = mpsc::sync_channel(16);
 
         run_connection_worker(
             transport,
@@ -2374,6 +2948,7 @@ mod tests {
                 Ok(DebugProbeReply::RttBytesWritten(1)),
                 Ok(DebugProbeReply::RttData(vec![10, 3, 4, 7, 2])),
                 Ok(DebugProbeReply::RttBytesWritten(1)),
+                Ok(DebugProbeReply::RttData(Vec::new())),
                 Ok(DebugProbeReply::SessionClosed),
             ]),
             commands: Arc::clone(&commands),
@@ -2381,8 +2956,8 @@ mod tests {
         };
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
-        let (trace_event_sender, trace_event_receiver) = mpsc::channel();
-        let (terminal_line_sender, _terminal_line_receiver) = mpsc::channel();
+        let (trace_event_sender, trace_event_receiver) = mpsc::sync_channel(16);
+        let (terminal_line_sender, _terminal_line_receiver) = mpsc::sync_channel(16);
         for command in [
             SystemTraceWorkerCommand::Start {
                 recording_path: Some(recording_path.clone()),
@@ -2419,13 +2994,21 @@ mod tests {
                 },
                 SystemTraceWorkerEvent::Tracing {
                     recording_path: Some(recording_path.clone()),
+                    history_path: recording_path.clone(),
+                    history_is_temporary: false,
                 },
                 SystemTraceWorkerEvent::RecordingSaved(recording_path.clone()),
                 SystemTraceWorkerEvent::Stopped,
                 SystemTraceWorkerEvent::Disconnected,
             ]
         );
-        let decoded = trace_event_receiver.try_iter().collect::<Vec<_>>();
+        let decoded = trace_event_receiver
+            .try_iter()
+            .filter_map(|update| match update {
+                LiveTraceUpdate::Event(event) => Some(event),
+                LiveTraceUpdate::DisplayGap { .. } => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].kind, TraceEventKind::TraceStarted);
         assert_eq!(decoded[1].kind, TraceEventKind::TaskStarted { task_id: 7 });

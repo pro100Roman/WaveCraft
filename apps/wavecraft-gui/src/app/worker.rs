@@ -157,9 +157,9 @@ impl WaveCraftApp {
             Ok(WorkerSuccess::RecordingLoaded { path, recording }) => {
                 self.handle_recording_loaded(path, recording)
             }
-            Ok(WorkerSuccess::SystemTraceLoaded { path, events }) => {
-                let event_count = events.len();
-                self.system_trace.replace_trace_events(events);
+            Ok(WorkerSuccess::SystemTraceLoaded { path, trace }) => {
+                let event_count = trace.event_count();
+                self.system_trace.replace_loaded_trace(*trace);
                 self.select_system_trace_view();
                 self.status = format!(
                     "Opened SystemView trace {} · {event_count} events",

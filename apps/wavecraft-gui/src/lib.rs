@@ -185,6 +185,11 @@ const MAX_RADIO_ANALYZER_CHANNELS: usize = 100;
 const RAW_AUTOMATIC_PREAMBLE_BITS: usize = 24;
 const MAX_CAPTURE_EVENTS_PER_POLL: usize = 8;
 const MAX_RADIO_DSP_OUTPUTS_PER_POLL: usize = 8;
+// A live SystemView producer can keep the channel permanently non-empty. Bound
+// the work done on the UI thread so one frame always reaches painting and input
+// handling instead of draining trace data forever.
+const MAX_SYSTEM_TRACE_EVENTS_PER_POLL: usize = 4_096;
+const MAX_SYSTEM_TRACE_TERMINAL_LINES_PER_POLL: usize = 128;
 // Bound logic display storage by activity-preserving buckets. The bucket stride
 // expands to cover the configured finite or Loop duration without limiting the
 // decoder, recorder, or zoom-out domain to this in-memory bucket count.
@@ -395,7 +400,7 @@ struct WaveCraftApp {
     system_trace_settings: SystemTraceSettings,
     system_trace_setup_panel_open: bool,
     system_trace: system_trace::SystemTraceDisplayState,
-    system_trace_events: Option<Receiver<wavecraft_trace::TraceEvent>>,
+    system_trace_events: Option<Receiver<system_trace::LiveTraceUpdate>>,
     system_trace_terminal_lines: Option<Receiver<wavecraft_debug_probe::RttTerminalLine>>,
     system_trace_connection: system_trace::SystemTraceConnectionState,
     system_trace_worker_commands: Option<Sender<system_trace::SystemTraceWorkerCommand>>,
@@ -610,6 +615,7 @@ impl eframe::App for WaveCraftApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_pending_window_size();
+        self.system_trace.cleanup_temporary_history();
     }
 }
 
@@ -617,9 +623,22 @@ impl WaveCraftApp {
     fn poll_system_trace_events(&mut self) {
         let mut disconnected = false;
         if let Some(events) = &self.system_trace_events {
-            loop {
+            for _ in 0..MAX_SYSTEM_TRACE_EVENTS_PER_POLL {
                 match events.try_recv() {
-                    Ok(event) => self.system_trace.ingest(event),
+                    Ok(system_trace::LiveTraceUpdate::Event(event)) => {
+                        self.system_trace.ingest(event);
+                    }
+                    Ok(system_trace::LiveTraceUpdate::DisplayGap {
+                        sequence,
+                        core_id,
+                        timestamp_ticks,
+                        skipped_events,
+                    }) => self.system_trace.ingest_display_gap(
+                        sequence,
+                        core_id,
+                        timestamp_ticks,
+                        skipped_events,
+                    ),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         disconnected = true;
@@ -634,7 +653,7 @@ impl WaveCraftApp {
 
         let mut terminal_disconnected = false;
         if let Some(lines) = &self.system_trace_terminal_lines {
-            loop {
+            for _ in 0..MAX_SYSTEM_TRACE_TERMINAL_LINES_PER_POLL {
                 match lines.try_recv() {
                     Ok(line) => self.system_trace.ingest_terminal_line(line),
                     Err(TryRecvError::Empty) => break,

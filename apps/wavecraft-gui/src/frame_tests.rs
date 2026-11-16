@@ -163,12 +163,12 @@ fn decoded_trace_events_reach_the_gui_through_the_worker_channel() {
     let (sender, receiver) = mpsc::channel();
     app.system_trace_events = Some(receiver);
     sender
-        .send(TraceEvent {
+        .send(system_trace::LiveTraceUpdate::Event(TraceEvent {
             sequence: 9,
             core_id: 1,
             timestamp_ticks: 42,
             kind: TraceEventKind::Idle,
-        })
+        }))
         .expect("test receiver remains connected");
 
     run_frames(&mut app, &context(), 1);
@@ -186,6 +186,37 @@ fn decoded_trace_events_reach_the_gui_through_the_worker_channel() {
             .core(1)
             .and_then(|core| core.active_context()),
         Some(wavecraft_trace::ExecutionContext::Idle)
+    );
+}
+
+#[test]
+fn live_system_trace_polling_yields_to_the_next_gui_frame() {
+    let mut app = app();
+    let (sender, receiver) = mpsc::channel();
+    app.system_trace_events = Some(receiver);
+    for sequence in 0..=MAX_SYSTEM_TRACE_EVENTS_PER_POLL as u64 {
+        sender
+            .send(system_trace::LiveTraceUpdate::Event(TraceEvent {
+                sequence,
+                core_id: 0,
+                timestamp_ticks: sequence,
+                kind: TraceEventKind::Idle,
+            }))
+            .expect("test receiver remains connected");
+    }
+
+    app.poll_system_trace_events();
+
+    assert_eq!(
+        app.system_trace.events().len(),
+        MAX_SYSTEM_TRACE_EVENTS_PER_POLL
+    );
+
+    app.poll_system_trace_events();
+
+    assert_eq!(
+        app.system_trace.events().len(),
+        MAX_SYSTEM_TRACE_EVENTS_PER_POLL + 1
     );
 }
 

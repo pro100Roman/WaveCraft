@@ -313,6 +313,7 @@ impl DebugSession for JLinkNetworkSession {
         &mut self,
         configuration: &RttConfiguration,
     ) -> Result<Vec<RttChannelDescriptor>, DebugProbeError> {
+        self.connection.stop_rtt();
         self.connection
             .configure_rtt_location(&configuration.control_block)?;
         // SAFETY: RTT is started on an open DLL with an attached target; null selects auto/configured search.
