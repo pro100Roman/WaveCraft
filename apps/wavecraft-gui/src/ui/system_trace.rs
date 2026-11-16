@@ -9,7 +9,7 @@ use crate::system_trace::{
     SystemTraceConnectionState,
 };
 use crate::system_trace::{
-    ProbeLogEntry, ProbeLogLevel, SystemTraceDisplayState, TimelineTimingEdge,
+    EventFilterCacheKey, ProbeLogEntry, ProbeLogLevel, SystemTraceDisplayState, TimelineTimingEdge,
     TimelineTimingMeasurement, TraceEventCategory, TraceEventView, TraceInstrument,
     TraceTimeDisplay,
 };
@@ -4049,50 +4049,79 @@ fn trace_event_category_label(category: TraceEventCategory) -> &'static str {
     }
 }
 
-fn visible_event_indices(trace: &SystemTraceDisplayState) -> Vec<usize> {
-    let filter = trace.event_filter.trim().to_lowercase();
-    trace
+fn visible_event_sequences(trace: &mut SystemTraceDisplayState) -> std::sync::Arc<Vec<u64>> {
+    let key = EventFilterCacheKey {
+        query: trace.event_filter.trim().to_lowercase(),
+        view: trace.event_view,
+        categories: trace.event_category_filter,
+        search_generation: trace.event_search_generation(),
+    };
+    let mut cache = std::mem::take(&mut trace.event_filter_cache);
+    let newest_sequence = trace.events().back().map(|event| event.sequence);
+    let rebuild = cache.key.as_ref() != Some(&key)
+        || cache
+            .last_scanned_sequence
+            .zip(newest_sequence)
+            .is_some_and(|(last_scanned, newest)| newest < last_scanned);
+    if rebuild {
+        cache.key = Some(key.clone());
+        cache.matching_sequences = Default::default();
+        cache.last_scanned_sequence = None;
+    } else if let Some(first_sequence) = trace.events().front().map(|event| event.sequence) {
+        std::sync::Arc::make_mut(&mut cache.matching_sequences)
+            .retain(|sequence| *sequence >= first_sequence);
+    } else {
+        cache.matching_sequences = Default::default();
+        cache.last_scanned_sequence = None;
+    }
+
+    let last_scanned_sequence = cache.last_scanned_sequence;
+    let matching_sequences = std::sync::Arc::make_mut(&mut cache.matching_sequences);
+    for event in trace
         .events()
         .iter()
-        .enumerate()
-        .filter(|(_, event)| {
-            let view_matches = match trace.event_view {
-                TraceEventView::Events => trace
-                    .event_category_filter
-                    .is_enabled(trace_event_category(&event.kind)),
-                TraceEventView::Logs => matches!(
-                    event.kind,
-                    TraceEventKind::FormattedPrint { .. } | TraceEventKind::PrintElf { .. }
-                ),
-                TraceEventView::Terminal
-                | TraceEventView::ProbeLog
-                | TraceEventView::CpuLoad
-                | TraceEventView::ContextStatistics => false,
-            };
-            view_matches
-                && (filter.is_empty()
-                    || event_search_text(trace, event)
-                        .to_lowercase()
-                        .contains(filter.as_str()))
-        })
-        .map(|(index, _)| index)
-        .collect()
+        .filter(|event| last_scanned_sequence.map_or(true, |sequence| event.sequence > sequence))
+    {
+        let view_matches = match key.view {
+            TraceEventView::Events => key.categories.is_enabled(trace_event_category(&event.kind)),
+            TraceEventView::Logs => matches!(
+                event.kind,
+                TraceEventKind::FormattedPrint { .. } | TraceEventKind::PrintElf { .. }
+            ),
+            TraceEventView::Terminal
+            | TraceEventView::ProbeLog
+            | TraceEventView::CpuLoad
+            | TraceEventView::ContextStatistics => false,
+        };
+        if view_matches
+            && (key.query.is_empty()
+                || event_search_text(trace, event)
+                    .to_lowercase()
+                    .contains(key.query.as_str()))
+        {
+            matching_sequences.push(event.sequence);
+        }
+    }
+    cache.last_scanned_sequence = newest_sequence;
+    let visible = cache.matching_sequences.clone();
+    trace.event_filter_cache = cache;
+    visible
 }
 
 enum VisibleEventRows {
     All(usize),
-    Filtered(Vec<usize>),
+    Filtered(std::sync::Arc<Vec<u64>>),
 }
 
 impl VisibleEventRows {
-    fn for_trace(trace: &SystemTraceDisplayState) -> Self {
+    fn for_trace(trace: &mut SystemTraceDisplayState) -> Self {
         if trace.event_view == TraceEventView::Events
             && trace.event_filter.trim().is_empty()
             && trace.event_category_filter.enabled_count() == TraceEventCategory::ALL.len()
         {
             Self::All(trace.events().len())
         } else {
-            Self::Filtered(visible_event_indices(trace))
+            Self::Filtered(visible_event_sequences(trace))
         }
     }
 
@@ -4103,10 +4132,11 @@ impl VisibleEventRows {
         }
     }
 
-    fn event_index(&self, row: usize) -> usize {
+    fn event_index(&self, events: &VecDeque<TraceEvent>, row: usize) -> Option<usize> {
         match self {
-            Self::All(_) => row,
-            Self::Filtered(indices) => indices[row],
+            Self::All(_) => Some(row),
+            Self::Filtered(sequences) => lower_bound_event_sequence(events, sequences[row])
+                .filter(|index| events[*index].sequence == sequences[row]),
         }
     }
 
@@ -4114,9 +4144,7 @@ impl VisibleEventRows {
         match self {
             Self::All(_) => lower_bound_event_sequence(events, sequence)
                 .filter(|index| events[*index].sequence == sequence),
-            Self::Filtered(indices) => indices
-                .iter()
-                .position(|index| events[*index].sequence == sequence),
+            Self::Filtered(sequences) => sequences.binary_search(&sequence).ok(),
         }
     }
 }
@@ -4155,15 +4183,13 @@ fn navigate_visible_event(
     forward: bool,
     same_context: bool,
 ) -> bool {
-    let visible_indices = visible_event_indices(trace);
-    if visible_indices.is_empty() {
+    let visible_sequences = visible_event_sequences(trace);
+    if visible_sequences.is_empty() {
         return false;
     }
-    let selected_position = trace.selected_sequence.and_then(|sequence| {
-        visible_indices
-            .iter()
-            .position(|index| trace.events()[*index].sequence == sequence)
-    });
+    let selected_position = trace
+        .selected_sequence
+        .and_then(|sequence| visible_sequences.binary_search(&sequence).ok());
     let selected_context = same_context
         .then(|| trace.selected_event())
         .flatten()
@@ -4173,8 +4199,13 @@ fn navigate_visible_event(
     if same_context && selected_context.is_none() {
         return false;
     }
-    let matches_context = |index: usize| {
+    let matches_context = |sequence: u64| {
         if let Some((core_id, context)) = selected_context {
+            let Some(index) = lower_bound_event_sequence(trace.events(), sequence)
+                .filter(|index| trace.events()[*index].sequence == sequence)
+            else {
+                return false;
+            };
             let event = &trace.events()[index];
             event.core_id == core_id
                 && event_execution_context(trace.model(), event) == Some(context)
@@ -4184,23 +4215,22 @@ fn navigate_visible_event(
     };
     let next_index = if forward {
         let start = selected_position.map_or(0, |position| position.saturating_add(1));
-        visible_indices
+        visible_sequences
             .iter()
             .skip(start)
             .copied()
-            .find(|index| matches_context(*index))
+            .find(|sequence| matches_context(*sequence))
     } else {
-        let end = selected_position.unwrap_or(visible_indices.len());
-        visible_indices[..end]
+        let end = selected_position.unwrap_or(visible_sequences.len());
+        visible_sequences[..end]
             .iter()
             .rev()
             .copied()
-            .find(|index| matches_context(*index))
+            .find(|sequence| matches_context(*sequence))
     };
-    let Some(index) = next_index else {
+    let Some(sequence) = next_index else {
         return false;
     };
-    let sequence = trace.events()[index].sequence;
     trace.select_from_event_table(sequence);
     true
 }
@@ -4272,7 +4302,11 @@ fn paint_event_table(
         event_scroll.show_rows(ui, EVENT_TABLE_ROW_HEIGHT, event_count, |ui, row_range| {
             ui.set_min_width(table_width);
             for visible_row in row_range {
-                let event = &trace.events()[visible_rows.event_index(visible_row)];
+                let Some(event_index) = visible_rows.event_index(trace.events(), visible_row)
+                else {
+                    continue;
+                };
+                let event = &trace.events()[event_index];
                 let event_selected = selected_sequence == Some(event.sequence);
                 let row = egui::Frame::none()
                     .fill(event_row_fill(visible_row, event_selected))
@@ -4695,19 +4729,18 @@ fn format_task_name(trace: &SystemTraceDisplayState, core_id: u32, task_id: u64)
 }
 
 fn task_ending_at_event(trace: &SystemTraceDisplayState, event: &TraceEvent) -> Option<u64> {
-    trace
-        .model()
-        .core(event.core_id)?
-        .intervals()
+    let intervals = trace.model().core(event.core_id)?.intervals();
+    let first_candidate = intervals.partition_point(|interval| {
+        interval
+            .end_ticks
+            .is_some_and(|end_ticks| end_ticks < event.timestamp_ticks)
+    });
+    intervals[first_candidate..]
         .iter()
-        .rev()
-        .find_map(|interval| {
-            (interval.end_ticks == Some(event.timestamp_ticks))
-                .then_some(interval.context)
-                .and_then(|context| match context {
-                    ExecutionContext::Task(task_id) => Some(task_id),
-                    _ => None,
-                })
+        .take_while(|interval| interval.end_ticks == Some(event.timestamp_ticks))
+        .find_map(|interval| match interval.context {
+            ExecutionContext::Task(task_id) => Some(task_id),
+            _ => None,
         })
 }
 
@@ -6561,14 +6594,40 @@ mod tests {
             .event_category_filter
             .show_only(TraceEventCategory::Markers);
 
-        assert_eq!(visible_event_indices(&trace), vec![3]);
+        assert_eq!(visible_event_sequences(&mut trace).as_ref(), &[3]);
         assert_eq!(
             trace_event_category(&trace.events()[5].kind),
             TraceEventCategory::ApiCalls
         );
 
         trace.event_view = TraceEventView::Logs;
-        assert_eq!(visible_event_indices(&trace), vec![2]);
+        assert_eq!(visible_event_sequences(&mut trace).as_ref(), &[2]);
+    }
+
+    #[test]
+    fn event_text_filter_reuses_matches_and_only_scans_new_events() {
+        let mut trace = timing_trace();
+        trace.event_filter = "worker".to_owned();
+
+        let first = visible_event_sequences(&mut trace);
+        assert_eq!(first.as_ref(), &[2, 4, 5]);
+        let cached_matches = std::sync::Arc::as_ptr(&first);
+        drop(first);
+
+        let unchanged = visible_event_sequences(&mut trace);
+        assert_eq!(std::sync::Arc::as_ptr(&unchanged), cached_matches);
+        drop(unchanged);
+
+        trace.ingest(TraceEvent {
+            sequence: 6,
+            core_id: 0,
+            timestamp_ticks: 240,
+            kind: TraceEventKind::TaskStarted { task_id: 8 },
+        });
+        assert_eq!(visible_event_sequences(&mut trace).as_ref(), &[2, 4, 5, 6]);
+
+        trace.event_filter = "app_main".to_owned();
+        assert_eq!(visible_event_sequences(&mut trace).as_ref(), &[1, 3]);
     }
 
     #[test]

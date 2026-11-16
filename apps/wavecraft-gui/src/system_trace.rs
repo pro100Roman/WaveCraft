@@ -6,6 +6,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -149,6 +150,21 @@ impl TraceEventCategoryFilter {
     pub(crate) fn enabled_count(self) -> usize {
         self.enabled.into_iter().filter(|enabled| *enabled).count()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EventFilterCacheKey {
+    pub(crate) query: String,
+    pub(crate) view: TraceEventView,
+    pub(crate) categories: TraceEventCategoryFilter,
+    pub(crate) search_generation: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct EventFilterCache {
+    pub(crate) key: Option<EventFilterCacheKey>,
+    pub(crate) matching_sequences: Arc<Vec<u64>>,
+    pub(crate) last_scanned_sequence: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1431,6 +1447,8 @@ pub(crate) struct SystemTraceDisplayState {
     layout_changed: bool,
     pub(crate) event_filter: String,
     pub(crate) event_category_filter: TraceEventCategoryFilter,
+    pub(crate) event_filter_cache: EventFilterCache,
+    event_search_generation: u64,
     pub(crate) time_display: TraceTimeDisplay,
     pub(crate) go_to_value: String,
     pub(crate) follow_latest: bool,
@@ -1476,6 +1494,8 @@ impl Default for SystemTraceDisplayState {
             layout_changed: false,
             event_filter: String::new(),
             event_category_filter: TraceEventCategoryFilter::default(),
+            event_filter_cache: EventFilterCache::default(),
+            event_search_generation: 0,
             time_display: TraceTimeDisplay::Target,
             go_to_value: String::new(),
             follow_latest: true,
@@ -1614,6 +1634,7 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn set_elf(&mut self, elf: Option<SystemViewElf>) {
         self.elf = elf;
+        self.invalidate_event_search_metadata();
     }
 
     pub(crate) fn description(&self) -> Option<&SystemViewDescription> {
@@ -1622,6 +1643,15 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn set_description(&mut self, description: Option<SystemViewDescription>) {
         self.description = description;
+        self.invalidate_event_search_metadata();
+    }
+
+    pub(crate) fn event_search_generation(&self) -> u64 {
+        self.event_search_generation
+    }
+
+    fn invalidate_event_search_metadata(&mut self) {
+        self.event_search_generation = self.event_search_generation.wrapping_add(1);
     }
 
     pub(crate) fn description_event_id(&self, event_id: u32) -> Option<u32> {
@@ -1845,6 +1875,15 @@ impl SystemTraceDisplayState {
     }
 
     pub(crate) fn ingest(&mut self, event: TraceEvent) {
+        if matches!(
+            &event.kind,
+            TraceEventKind::TaskInfo { .. }
+                | TraceEventKind::TargetInfo { .. }
+                | TraceEventKind::ModuleDescription { .. }
+                | TraceEventKind::ResourceName { .. }
+        ) {
+            self.invalidate_event_search_metadata();
+        }
         if let TraceEventKind::TargetInfo {
             system_frequency_hz,
             cpu_frequency_hz,
@@ -1938,6 +1977,8 @@ impl SystemTraceDisplayState {
         self.events.clear();
         self.model = TraceModel::new();
         self.event_capacity = DEFAULT_EVENT_CAPACITY;
+        self.event_filter_cache = EventFilterCache::default();
+        self.invalidate_event_search_metadata();
         self.target_frequencies_hz = None;
         self.log_count = 0;
         self.display_skipped_event_count = 0;
