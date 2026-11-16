@@ -2,7 +2,8 @@
 
 A Rust reimplementation of [DSView](https://github.com/DreamSourceLab/DSView)
 designed to capture concurrently from logic analyzers (DSLogic), oscilloscopes
-(DSCope), and SDR radio receivers (HackRF One).
+(DSCope), and SDR radio receivers (HackRF One), and to analyze SystemView-based
+system and RTOS traces.
 
 ## Application views
 
@@ -21,6 +22,13 @@ designed to capture concurrently from logic analyzers (DSLogic), oscilloscopes
 ### Combined view
 
 ![WaveCraft Combined view with synchronized logic and oscilloscope waveforms](docs/images/wavecraft-combined.png)
+
+### System Trace
+
+The independent **System Trace** workspace captures or opens SEGGER SystemView
+event streams and reconstructs task, interrupt, timer, scheduler, and idle
+execution. It combines an interactive timeline with event and log tables, CPU
+load, context statistics, a plain RTT terminal, and probe diagnostics.
 
 ## Release packages
 
@@ -49,6 +57,8 @@ In project discussions and feature requests, these abbreviations are used:
 - **SDR** — Software-Defined Radio
 - **IQ** — In-phase and Quadrature radio samples
 - **FSK/GFSK** — Frequency-Shift Keying / Gaussian Frequency-Shift Keying
+- **RTOS** — Real-Time Operating System
+- **RTT** — SEGGER Real Time Transfer
 
 ## Current milestone
 
@@ -78,6 +88,9 @@ The repository contains a working vertical slice of the new capture engine:
 - independent GUI capture sessions, so idle instruments and capture-file
   operations remain available while another instrument is running;
 - a native desktop capture workbench with synchronized, interactive waveform views;
+- an independent System and RTOS Trace workspace with live RTT acquisition,
+  offline SystemView decoding, execution timelines, CPU-load analysis, context
+  statistics, logs, and a plain RTT terminal;
 - logic timing tools and oscilloscope measurements, markers, math, FFT, and XY views;
 - time-aligned I²C and SPI byte decoding in dedicated logic-analyzer rows;
 - versioned, lossless full-capture recording from the GUI and CLI;
@@ -143,6 +156,7 @@ cargo run -p wavecraft-cli -- capture run --device <dscope-connection-id> \
   --samples 100000 --channels 0,1 --output scope.dsv --events ndjson
 cargo run -p wavecraft-cli -- inspect capture.dsv
 cargo run -p wavecraft-cli -- simulate 1 --output simulated.dsv
+cargo run -p wavecraft-cli -- trace decode recording.SVDat
 ```
 
 Here `<resource-directory>` contains the complete set of 25 `.bin` and `.fw`
@@ -216,6 +230,12 @@ and WaveCraft-only settings are not representable and are omitted. WaveCraft sup
 the current `<SALEAE>` binary version 3 layout and reports other internal
 revisions as unsupported because Saleae does not promise `.sal` format
 stability.
+
+`trace decode <systemview-file>` incrementally decodes a raw SEGGER SystemView
+event stream without connected hardware. It reports the event and timestamp
+range plus reconstructed per-core task, execution-interval, dropped-event, and
+continuity totals. The command accepts the same raw `.SVDat` stream that the GUI
+can record and reopen.
 
 ## Run the desktop application
 
@@ -361,6 +381,34 @@ resizable **Decoded Data** pane shares the logic-waveform workspace, groups I²C
 bytes into read/write transactions, lists SPI transfers, and renders decoded
 UART bytes as human-readable text when ASCII is selected. Clicking a decoded
 operation focuses its range in the waveform.
+
+The **System Trace** tab is separate from sampled logic, scope, and radio
+captures. It is compatible with firmware instrumented for the SEGGER SystemView
+target protocol; it does not infer RTOS activity from uninstrumented firmware.
+WaveCraft discovers debug probes through the isolated `probe-rs` helper,
+attaches over SWD without flashing the target, locates the RTT control block by
+automatic RAM scan, exact address, or the `_SEGGER_RTT` symbol in an optional
+application ELF, and reads binary SystemView events from configurable RTT
+channels. Reset after attach is opt-in. An optional SystemView description file
+adds typed names and parameters for OS and middleware API events, while the ELF
+also resolves resources, symbols, and Print-ELF messages.
+
+Live trace controls connect, start, stop, disconnect, and optionally save the
+raw stream as `.SVDat`. Existing raw `.SVDat` streams can be opened without a
+probe. The timeline reconstructs task, ISR, timer, scheduler, and idle
+intervals, exposes pan, zoom, selection, duration measurement, and persistent
+time references, and marks lost-data boundaries instead of presenting them as
+continuous execution. The analysis pane provides categorized events, formatted
+logs, target-relative or recording-relative time, CPU-load graphs, per-context
+runtime and stack statistics, ANSI-colored plain RTT terminal output, and the
+debug-probe session log. Timeline and analysis panes, as well as the analysis
+tabs, can be reordered by dragging.
+
+SystemView capture requires target firmware with SystemView and RTT enabled and
+a debug probe/target combination supported by `probe-rs`. The packaged macOS
+application includes the helper. In a development build, WaveCraft starts it
+from `crates/wavecraft-probe-rs` automatically; that helper currently requires
+Rust 1.95 even though the main workspace remains compatible with Rust 1.79.
 
 The **Radio Receiver** tab provides a live RF spectrum and waterfall with
 frequency/power hover readouts and adjustable pane heights. HackRF controls
