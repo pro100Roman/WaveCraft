@@ -153,6 +153,10 @@ pub(crate) fn open(
     connection_id: String,
 ) -> Result<Box<dyn DebugProbeHandle>, DebugProbeError> {
     let api = JLinkApi::load()?;
+    // WaveCraft is an interactive application. Explicitly enable SEGGER's GUI
+    // before opening the probe so required dialogs, including J-Link EDU terms
+    // of use, can be presented to the user by the official J-Link software.
+    exec_command(&api, "SuppressGUI = 0")?;
     let host = CString::new(endpoint.ip().to_string()).map_err(|error| {
         DebugProbeError::new(
             DebugProbeErrorKind::InvalidConfiguration,
@@ -395,27 +399,7 @@ struct JLinkConnection {
 
 impl JLinkConnection {
     fn exec_command(&self, command: &str) -> Result<(), DebugProbeError> {
-        let command = CString::new(command).map_err(|error| {
-            DebugProbeError::new(
-                DebugProbeErrorKind::InvalidConfiguration,
-                format!("invalid J-Link command: {error}"),
-            )
-        })?;
-        let mut output = [0 as c_char; 256];
-        // SAFETY: Both buffers are live and NUL-terminated/output-sized as required by the SDK.
-        let result = unsafe {
-            (self.api.exec_command)(command.as_ptr(), output.as_mut_ptr(), output.len() as c_int)
-        };
-        if result < 0 {
-            let detail = c_char_buffer(&output);
-            Err(transport_error(if detail.is_empty() {
-                "J-Link command failed".to_owned()
-            } else {
-                format!("J-Link command failed: {detail}")
-            }))
-        } else {
-            Ok(())
-        }
+        exec_command(&self.api, command)
     }
 
     fn configure_rtt_location(
@@ -507,6 +491,29 @@ impl JLinkConnection {
             let _ = unsafe { (self.api.rtt_control)(RTT_CONTROL_STOP, std::ptr::null_mut()) };
             self.rtt_started = false;
         }
+    }
+}
+
+fn exec_command(api: &JLinkApi, command: &str) -> Result<(), DebugProbeError> {
+    let command = CString::new(command).map_err(|error| {
+        DebugProbeError::new(
+            DebugProbeErrorKind::InvalidConfiguration,
+            format!("invalid J-Link command: {error}"),
+        )
+    })?;
+    let mut output = [0 as c_char; 256];
+    // SAFETY: Both buffers are live and NUL-terminated/output-sized as required by the SDK.
+    let result =
+        unsafe { (api.exec_command)(command.as_ptr(), output.as_mut_ptr(), output.len() as c_int) };
+    if result < 0 {
+        let detail = c_char_buffer(&output);
+        Err(transport_error(if detail.is_empty() {
+            "J-Link command failed".to_owned()
+        } else {
+            format!("J-Link command failed: {detail}")
+        }))
+    } else {
+        Ok(())
     }
 }
 

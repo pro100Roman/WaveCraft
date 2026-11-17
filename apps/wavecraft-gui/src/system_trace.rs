@@ -396,15 +396,7 @@ fn run_connection_worker(
             "SystemView binary trace is disabled; session is RTT-terminal only",
         );
     }
-    let systemview_read_size = channels
-        .iter()
-        .find(|channel| {
-            channel.direction == RttChannelDirection::Up
-                && channel.number == configuration.up_channel
-        })
-        .map_or(RTT_READ_SIZE, |channel| {
-            channel.buffer_size.clamp(1, RTT_READ_SIZE)
-        });
+    let systemview_read_size = systemview_rtt_read_size(&channels, configuration.up_channel);
     if events
         .send(SystemTraceWorkerEvent::Attached {
             channels: channels.clone(),
@@ -625,6 +617,23 @@ fn run_connection_worker(
             thread::sleep(IDLE_RTT_POLL_INTERVAL);
         }
     }
+}
+
+fn systemview_rtt_read_size(channels: &[RttChannelDescriptor], channel_number: usize) -> usize {
+    channels
+        .iter()
+        .find(|channel| {
+            channel.direction == RttChannelDirection::Up && channel.number == channel_number
+        })
+        .map_or(RTT_READ_SIZE, |channel| {
+            // An RTT ring always keeps one byte unused to distinguish a full
+            // buffer from an empty one. Request its usable capacity so a full
+            // read can trigger another immediate drain pass.
+            channel
+                .buffer_size
+                .saturating_sub(1)
+                .clamp(1, RTT_READ_SIZE)
+        })
 }
 
 fn write_systemview_command(
@@ -2306,6 +2315,30 @@ mod tests {
             timestamp_ticks,
             kind,
         }
+    }
+
+    #[test]
+    fn systemview_read_size_uses_the_rtt_ring_usable_capacity() {
+        let channels = [RttChannelDescriptor {
+            number: 1,
+            direction: RttChannelDirection::Up,
+            name: Some("SystemView".to_owned()),
+            buffer_size: 8 * 1024,
+        }];
+
+        assert_eq!(systemview_rtt_read_size(&channels, 1), 8 * 1024 - 1);
+    }
+
+    #[test]
+    fn systemview_read_size_stays_within_the_helper_transfer_limit() {
+        let channels = [RttChannelDescriptor {
+            number: 1,
+            direction: RttChannelDirection::Up,
+            name: Some("SystemView".to_owned()),
+            buffer_size: RTT_READ_SIZE * 2,
+        }];
+
+        assert_eq!(systemview_rtt_read_size(&channels, 1), RTT_READ_SIZE);
     }
 
     #[test]
