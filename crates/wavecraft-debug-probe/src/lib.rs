@@ -19,7 +19,7 @@ pub enum ProbeProvider {
 }
 
 /// Version of the newline-delimited helper protocol shared with probe adapters.
-pub const DEBUG_PROBE_HELPER_PROTOCOL_VERSION: u32 = 2;
+pub const DEBUG_PROBE_HELPER_PROTOCOL_VERSION: u32 = 3;
 
 /// Connection-ID prefix reserved for a J-Link reached through SEGGER's TCP/IP transport.
 pub const JLINK_NETWORK_CONNECTION_ID_PREFIX: &str = "wavecraft:jlink-network:";
@@ -583,7 +583,10 @@ pub enum DebugProbeCommand {
     },
     ReadRttUp {
         channel_number: usize,
+        /// Maximum bytes requested from the target in one RTT transaction.
         maximum_length: usize,
+        /// Maximum consecutive target reads combined into this helper reply.
+        maximum_reads: usize,
     },
     WriteRttDown {
         channel_number: usize,
@@ -1043,7 +1046,7 @@ mod tests {
 
         assert_eq!(
             encoded,
-            r#"{"protocol_version":2,"request_id":7,"command":{"command":"list_probes"}}"#
+            r#"{"protocol_version":3,"request_id":7,"command":{"command":"list_probes"}}"#
         );
         assert_eq!(
             serde_json::from_str::<DebugProbeRequest>(&encoded).expect("request deserializes"),

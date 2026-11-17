@@ -16,6 +16,7 @@ use probe_rs::rtt::{Rtt, ScanRegion, try_attach_to_rtt};
 use probe_rs::{MemoryInterface, Permissions, Session, config};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -221,6 +222,8 @@ fn start_network_bmp_proxy(
     remote
         .set_nodelay(true)
         .map_err(|error| transport_error("failed to configure the network BMP socket", error))?;
+    configure_abortive_close(&remote)
+        .map_err(|error| transport_error("failed to configure BMP disconnect handling", error))?;
     thread::Builder::new()
         .name("wavecraft-network-bmp-proxy".to_owned())
         .spawn(move || {
@@ -231,6 +234,66 @@ fn start_network_bmp_proxy(
         })
         .map_err(|error| transport_error("failed to start the network BMP proxy", error))?;
     Ok(local_endpoint)
+}
+
+// The ESP32JTAG BMP server handles one GDB remote client at a time. An
+// ordinary FIN can remain queued in lwIP while a stalled GDB command is being
+// processed, leaving the next WaveCraft connection accepted but unanswered.
+// Abortive close makes helper termination, timeout, and disconnect release the
+// server-side session immediately.
+#[cfg(unix)]
+fn configure_abortive_close(stream: &TcpStream) -> io::Result<()> {
+    use std::mem::size_of;
+    use std::os::fd::AsRawFd;
+
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let result = unsafe {
+        // SAFETY: the file descriptor belongs to `stream`, `linger` remains
+        // valid for the call, and its exact size is supplied to setsockopt.
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&linger as *const libc::linger).cast(),
+            size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn configure_abortive_close(stream: &TcpStream) -> io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{LINGER, SO_LINGER, SOL_SOCKET, setsockopt};
+
+    let linger = LINGER {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let result = unsafe {
+        // SAFETY: the socket belongs to `stream`, `linger` remains valid for
+        // the call, and its exact size is supplied to setsockopt.
+        setsockopt(
+            stream.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_LINGER,
+            (&linger as *const LINGER).cast(),
+            size_of::<LINGER>() as i32,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 fn relay_network_bmp(
@@ -245,9 +308,10 @@ fn relay_network_bmp(
     let mut remote_reader = remote.try_clone()?;
     let mut local_writer = local.try_clone()?;
     let local_stop = local.try_clone()?;
-    let remote_stop = remote.try_clone()?;
     let pending_response = Arc::new(Mutex::new(None));
     let response_pending = Arc::clone(&pending_response);
+    let closing = Arc::new(AtomicBool::new(false));
+    let response_closing = Arc::clone(&closing);
     let reverse = thread::Builder::new()
         .name("wavecraft-network-bmp-proxy-reply".to_owned())
         .spawn(move || {
@@ -255,20 +319,17 @@ fn relay_network_bmp(
                 &mut remote_reader,
                 &mut local_writer,
                 &response_pending,
+                &response_closing,
                 response_timeout,
             );
             let _ = local_stop.shutdown(Shutdown::Both);
-            let _ = remote_stop.shutdown(Shutdown::Both);
             result
         })?;
 
-    let forward = relay_network_bmp_requests(
-        &mut local_reader,
-        &mut remote_writer,
-        &pending_response,
-    );
+    let forward =
+        relay_network_bmp_requests(&mut local_reader, &mut remote_writer, &pending_response);
+    closing.store(true, Ordering::Release);
     let _ = local.shutdown(Shutdown::Both);
-    let _ = remote.shutdown(Shutdown::Both);
     let reverse = reverse
         .join()
         .map_err(|_| io::Error::other("network BMP response relay panicked"))?;
@@ -299,6 +360,7 @@ fn relay_network_bmp_responses(
     remote: &mut TcpStream,
     local: &mut TcpStream,
     pending_response: &Mutex<Option<Instant>>,
+    closing: &AtomicBool,
     response_timeout: Duration,
 ) -> io::Result<()> {
     let poll_interval = response_timeout
@@ -323,6 +385,9 @@ fn relay_network_bmp_responses(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
+                if closing.load(Ordering::Acquire) {
+                    return Ok(());
+                }
                 let timed_out = pending_response
                     .lock()
                     .map_err(|_| io::Error::other("network BMP response state is unavailable"))?

@@ -136,18 +136,32 @@ impl<D: DebugProbeDriver> HelperServer<D> {
             DebugProbeCommand::ReadRttUp {
                 channel_number,
                 maximum_length,
+                maximum_reads,
             } => {
                 validate_transfer_length(maximum_length)?;
-                let session = self.session_mut()?;
-                let mut data = vec![0; maximum_length];
-                let count = session.read_rtt_up(channel_number, &mut data)?;
-                if count > data.len() {
-                    return Err(DebugProbeError::new(
-                        DebugProbeErrorKind::Transport,
-                        "debug-probe backend returned an invalid RTT byte count",
-                    ));
+                if maximum_reads == 0 {
+                    return Err(protocol_error("RTT read count must be greater than zero"));
                 }
-                data.truncate(count);
+                let total_capacity = maximum_length
+                    .checked_mul(maximum_reads)
+                    .ok_or_else(|| protocol_error("RTT read batch length overflowed"))?;
+                validate_transfer_length(total_capacity)?;
+                let session = self.session_mut()?;
+                let mut data = Vec::with_capacity(total_capacity);
+                let mut read_buffer = vec![0; maximum_length];
+                for _ in 0..maximum_reads {
+                    let count = session.read_rtt_up(channel_number, &mut read_buffer)?;
+                    if count > read_buffer.len() {
+                        return Err(DebugProbeError::new(
+                            DebugProbeErrorKind::Transport,
+                            "debug-probe backend returned an invalid RTT byte count",
+                        ));
+                    }
+                    data.extend_from_slice(&read_buffer[..count]);
+                    if count < maximum_length {
+                        break;
+                    }
+                }
                 Ok(DebugProbeReply::RttData(data))
             }
             DebugProbeCommand::WriteRttDown {
@@ -459,6 +473,7 @@ mod tests {
             DebugProbeCommand::ReadRttUp {
                 channel_number: 1,
                 maximum_length: 16,
+                maximum_reads: 1,
             },
             DebugProbeCommand::WriteRttDown {
                 channel_number: 1,
@@ -477,9 +492,7 @@ mod tests {
         );
         assert_eq!(
             responses[3].outcome,
-            wavecraft_debug_probe::DebugProbeResponseOutcome::Success(
-                DebugProbeReply::TargetReset
-            )
+            wavecraft_debug_probe::DebugProbeResponseOutcome::Success(DebugProbeReply::TargetReset)
         );
         assert_eq!(
             responses[5].outcome,
@@ -505,6 +518,68 @@ mod tests {
                 DebugProbeReply::ShuttingDown
             )
         );
+    }
+
+    #[test]
+    fn batches_consecutive_rtt_reads_before_replying() {
+        let responses = run_requests([
+            DebugProbeCommand::OpenProbe {
+                selector: ProbeSelector::connection_id("1366:0105:1234"),
+            },
+            DebugProbeCommand::Attach {
+                configuration: AttachConfiguration::default(),
+            },
+            DebugProbeCommand::AttachRtt {
+                configuration: RttConfiguration::default(),
+            },
+            DebugProbeCommand::ReadRttUp {
+                channel_number: 1,
+                maximum_length: 2,
+                maximum_reads: 3,
+            },
+        ]);
+
+        assert_eq!(
+            responses[3].outcome,
+            wavecraft_debug_probe::DebugProbeResponseOutcome::Success(DebugProbeReply::RttData(
+                vec![1, 2, 1, 2, 1, 2]
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_or_oversized_rtt_read_batch() {
+        let responses = run_requests([
+            DebugProbeCommand::OpenProbe {
+                selector: ProbeSelector::connection_id("1366:0105:1234"),
+            },
+            DebugProbeCommand::Attach {
+                configuration: AttachConfiguration::default(),
+            },
+            DebugProbeCommand::AttachRtt {
+                configuration: RttConfiguration::default(),
+            },
+            DebugProbeCommand::ReadRttUp {
+                channel_number: 1,
+                maximum_length: 2,
+                maximum_reads: 0,
+            },
+            DebugProbeCommand::ReadRttUp {
+                channel_number: 1,
+                maximum_length: MAX_DEBUG_PROBE_TRANSFER_BYTES,
+                maximum_reads: 2,
+            },
+        ]);
+
+        for response in &responses[3..] {
+            assert!(matches!(
+                response.outcome,
+                wavecraft_debug_probe::DebugProbeResponseOutcome::Error(DebugProbeError {
+                    kind: DebugProbeErrorKind::InvalidConfiguration,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

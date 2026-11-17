@@ -33,12 +33,15 @@ const RTT_READ_SIZE: usize = 16 * 1024;
 // probe-rs uses a 1024-byte Black Magic remote buffer. Memory reads are hex
 // encoded, leaving 504 payload bytes per remote command. Four payloads balance
 // target read-pointer latency against the control-block overhead of every RTT
-// read; larger batches kept an 8-KiB target buffer occupied for too long, while
-// single-payload reads could not sustain the incoming trace data rate.
+// read. The helper batches consecutive RTT drains so it can advance the target
+// read pointer without waiting for the GUI to decode each response.
 const BLACK_MAGIC_REMOTE_READ_PAYLOAD_SIZE: usize = 504;
 const NETWORK_BMP_RTT_READ_SIZE: usize = 4 * BLACK_MAGIC_REMOTE_READ_PAYLOAD_SIZE;
 const NETWORK_BMP_SELECTOR_PREFIX: &str = "1d50:6018:";
 const MAX_SYSTEMVIEW_RTT_READS_PER_POLL: usize = 4;
+// 32 * 2016 bytes stays below the 64-KiB helper response limit while keeping a
+// saturated network BMP busy draining RTT for as long as possible.
+const NETWORK_BMP_RTT_READ_BATCH: usize = 32;
 const MAX_SYSTEMVIEW_STOP_DRAIN_BUFFER_PASSES: usize = 4;
 const TRACE_EVENT_QUEUE_CAPACITY: usize = 64 * 1024;
 const TERMINAL_LINE_QUEUE_CAPACITY: usize = 2 * 1024;
@@ -406,17 +409,15 @@ fn run_connection_worker(
     }
     let systemview_read_size =
         systemview_rtt_read_size(&channels, configuration.up_channel, &configuration.probe);
-    let systemview_stop_drain_read_limit = systemview_stop_drain_read_limit(
-        &channels,
-        configuration.up_channel,
-        systemview_read_size,
-    );
+    let systemview_read_batch = systemview_rtt_read_batch(&configuration.probe);
+    let systemview_stop_drain_read_limit =
+        systemview_stop_drain_read_limit(&channels, configuration.up_channel, systemview_read_size);
     if configuration.systemview_enabled && is_network_bmp(&configuration.probe) {
         send_probe_log(
             &events,
             ProbeLogLevel::Info,
             format!(
-                "network BMP RTT optimization active: {systemview_read_size}-byte reads"
+                "network BMP RTT optimization active: {systemview_read_batch} × {systemview_read_size}-byte reads per helper round trip"
             ),
         );
     }
@@ -598,11 +599,13 @@ fn run_connection_worker(
 
         let mut bytes_read = 0;
         if tracing {
-            for _ in 0..MAX_SYSTEMVIEW_RTT_READS_PER_POLL {
+            let reads_per_poll = MAX_SYSTEMVIEW_RTT_READS_PER_POLL.div_ceil(systemview_read_batch);
+            for _ in 0..reads_per_poll {
                 match read_and_decode_rtt(
                     &mut transport,
                     configuration.up_channel,
                     systemview_read_size,
+                    systemview_read_batch,
                     &mut decoder,
                     &mut trace_events,
                     raw_recording
@@ -611,7 +614,7 @@ fn run_connection_worker(
                 ) {
                     Ok(count) => {
                         bytes_read += count;
-                        if count < systemview_read_size {
+                        if count < systemview_read_size.saturating_mul(systemview_read_batch) {
                             break;
                         }
                     }
@@ -677,6 +680,14 @@ fn is_network_bmp(probe: &ProbeSelector) -> bool {
         .is_some_and(|endpoint| endpoint.parse::<std::net::SocketAddr>().is_ok())
 }
 
+fn systemview_rtt_read_batch(probe: &ProbeSelector) -> usize {
+    if is_network_bmp(probe) {
+        NETWORK_BMP_RTT_READ_BATCH
+    } else {
+        1
+    }
+}
+
 fn systemview_stop_drain_read_limit(
     channels: &[RttChannelDescriptor],
     channel_number: usize,
@@ -718,6 +729,7 @@ fn read_and_decode_rtt(
     transport: &mut impl ProbeCommandTransport,
     channel_number: usize,
     maximum_length: usize,
+    maximum_reads: usize,
     decoder: &mut SystemViewDecoder,
     trace_events: &mut TraceEventPublisher,
     raw_recording: Option<&mut BufWriter<File>>,
@@ -725,6 +737,7 @@ fn read_and_decode_rtt(
     let data = match transport.send(DebugProbeCommand::ReadRttUp {
         channel_number,
         maximum_length,
+        maximum_reads,
     })? {
         DebugProbeReply::RttData(data) => data,
         _ => return Err(unexpected_reply("read SystemView RTT data")),
@@ -765,6 +778,7 @@ fn drain_stopped_systemview(
             transport,
             channel_number,
             maximum_length,
+            1,
             decoder,
             trace_events,
             raw_recording.as_deref_mut(),
@@ -923,6 +937,7 @@ fn read_rtt_terminal(
     let data = match transport.send(DebugProbeCommand::ReadRttUp {
         channel_number,
         maximum_length: RTT_READ_SIZE,
+        maximum_reads: 1,
     })? {
         DebugProbeReply::RttData(data) => data,
         _ => return Err(unexpected_reply("read plain RTT terminal data")),
@@ -2422,6 +2437,14 @@ mod tests {
             systemview_rtt_read_size(&channels, 1, &probe),
             NETWORK_BMP_RTT_READ_SIZE
         );
+        assert_eq!(
+            systemview_rtt_read_batch(&probe),
+            NETWORK_BMP_RTT_READ_BATCH
+        );
+        assert_eq!(
+            systemview_rtt_read_batch(&connection_configuration().probe),
+            1
+        );
     }
 
     #[test]
@@ -2433,10 +2456,8 @@ mod tests {
             buffer_size: 8 * 1024,
         }];
 
-        let read_limit =
-            systemview_stop_drain_read_limit(&channels, 1, NETWORK_BMP_RTT_READ_SIZE);
-        let reads_for_one_full_buffer =
-            (8_usize * 1024 - 1).div_ceil(NETWORK_BMP_RTT_READ_SIZE);
+        let read_limit = systemview_stop_drain_read_limit(&channels, 1, NETWORK_BMP_RTT_READ_SIZE);
+        let reads_for_one_full_buffer = (8_usize * 1024 - 1).div_ceil(NETWORK_BMP_RTT_READ_SIZE);
 
         assert!(read_limit > reads_for_one_full_buffer);
     }

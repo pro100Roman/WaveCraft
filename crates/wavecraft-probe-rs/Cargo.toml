@@ -21,4 +21,4 @@ wavecraft-debug-probe = { path = "../wavecraft-debug-probe" }
 libc = "0.2.191"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_Threading"] }
