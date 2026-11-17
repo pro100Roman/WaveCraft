@@ -722,8 +722,14 @@ fn missing_channel(direction: RttChannelDirection, channel_number: usize) -> Deb
     )
 }
 
-fn target_error(context: &str, error: impl std::fmt::Display) -> DebugProbeError {
-    DebugProbeError::new(DebugProbeErrorKind::Target, format!("{context}: {error}"))
+fn target_error(
+    context: &str,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> DebugProbeError {
+    DebugProbeError::new(
+        DebugProbeErrorKind::Target,
+        format!("{context}: {}", describe_error_chain(&error)),
+    )
 }
 
 fn transport_error(context: &str, error: impl std::fmt::Display) -> DebugProbeError {

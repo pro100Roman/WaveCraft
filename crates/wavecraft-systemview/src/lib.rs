@@ -430,6 +430,13 @@ fn decode_length_prefixed_event(
         let mut reader = PayloadReader::new(event_id, payload);
         let extended_event_id = reader.varint()?;
         match extended_event_id {
+            0 => {
+                let kind = TraceEventKind::MarkerReached {
+                    marker_id: reader.varint()?,
+                };
+                reader.finish()?;
+                return Ok(kind);
+            }
             1 => {
                 let kind = TraceEventKind::MarkerName {
                     marker_id: reader.varint()?,
@@ -437,6 +444,60 @@ fn decode_length_prefixed_event(
                 };
                 reader.finish()?;
                 return Ok(kind);
+            }
+            2 => {
+                let kind = TraceEventKind::HeapDefined {
+                    heap_id: reader.varint()?,
+                    base: reader.varint()?,
+                    size: reader.varint()?,
+                    metadata_size: reader.varint()?,
+                };
+                reader.finish()?;
+                return Ok(kind);
+            }
+            3 | 4 => {
+                let heap_id = reader.varint()?;
+                let address = reader.varint()?;
+                let size = reader.varint()?;
+                let tag = (extended_event_id == 4)
+                    .then(|| reader.varint())
+                    .transpose()?;
+                reader.finish()?;
+                return Ok(TraceEventKind::HeapAllocated {
+                    heap_id,
+                    address,
+                    size,
+                    tag,
+                });
+            }
+            5 => {
+                let kind = TraceEventKind::HeapFreed {
+                    heap_id: reader.varint()?,
+                    address: reader.varint()?,
+                };
+                reader.finish()?;
+                return Ok(kind);
+            }
+            6 => {
+                let sample_id = reader.varint()?;
+                let name = reader.string()?;
+                let data_type = reader.optional_varint()?;
+                let offset = reader.optional_i32()?;
+                let range_min = reader.optional_i32()?;
+                let range_max = reader.optional_i32()?;
+                let scaling_factor = reader.optional_f32()?;
+                let unit = reader.optional_string()?;
+                reader.finish()?;
+                return Ok(TraceEventKind::DataRegistered {
+                    sample_id,
+                    name,
+                    data_type,
+                    offset,
+                    range_min,
+                    range_max,
+                    scaling_factor,
+                    unit,
+                });
             }
             7 => {
                 let format_address = reader.varint()?;
@@ -552,6 +613,32 @@ impl<'a> PayloadReader<'a> {
         }
     }
 
+    fn optional_varint(&mut self) -> Result<Option<u64>, DecodeError> {
+        if self.is_finished() {
+            Ok(None)
+        } else {
+            self.varint().map(Some)
+        }
+    }
+
+    fn optional_i32(&mut self) -> Result<Option<i32>, DecodeError> {
+        self.optional_varint()
+            .map(|value| value.map(|value| value as u32 as i32))
+    }
+
+    fn optional_f32(&mut self) -> Result<Option<f32>, DecodeError> {
+        self.optional_varint()
+            .map(|value| value.map(|value| f32::from_bits(value as u32)))
+    }
+
+    fn optional_string(&mut self) -> Result<Option<String>, DecodeError> {
+        if self.is_finished() {
+            Ok(None)
+        } else {
+            self.string().map(Some)
+        }
+    }
+
     fn is_finished(&self) -> bool {
         self.cursor == self.payload.len()
     }
@@ -652,6 +739,12 @@ mod tests {
         packet.extend_from_slice(payload);
         packet.extend(encode_varint(delta));
         packet
+    }
+
+    fn encode_string(value: &str) -> Vec<u8> {
+        let mut encoded = vec![value.len() as u8];
+        encoded.extend_from_slice(value.as_bytes());
+        encoded
     }
 
     #[test]
@@ -886,6 +979,126 @@ mod tests {
                 name: "DPS310 interrupt".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn decodes_every_extended_primitive() {
+        let mut packets = Vec::new();
+
+        let mut marker = encode_varint(0);
+        marker.extend(encode_varint(11));
+        packets.extend(length_packet(31, &marker, 1));
+
+        let mut heap_definition = encode_varint(2);
+        for value in [3, 0x1000, 0x800, 16] {
+            heap_definition.extend(encode_varint(value));
+        }
+        packets.extend(length_packet(31, &heap_definition, 1));
+
+        let mut heap_allocation = encode_varint(3);
+        for value in [3, 0x1010, 32] {
+            heap_allocation.extend(encode_varint(value));
+        }
+        packets.extend(length_packet(31, &heap_allocation, 1));
+
+        let mut tagged_heap_allocation = encode_varint(4);
+        for value in [3, 0x1030, 64, 9] {
+            tagged_heap_allocation.extend(encode_varint(value));
+        }
+        packets.extend(length_packet(31, &tagged_heap_allocation, 1));
+
+        let mut heap_free = encode_varint(5);
+        for value in [3, 0x1010] {
+            heap_free.extend(encode_varint(value));
+        }
+        packets.extend(length_packet(31, &heap_free, 1));
+
+        let mut data_registration = encode_varint(6);
+        data_registration.extend(encode_varint(7));
+        data_registration.extend(encode_string("temperature"));
+        data_registration.extend(encode_varint(1));
+        data_registration.extend(encode_varint((-40_i32) as u32));
+        data_registration.extend(encode_varint((-20_i32) as u32));
+        data_registration.extend(encode_varint(120));
+        data_registration.extend(encode_varint(0.25_f32.to_bits()));
+        data_registration.extend(encode_string("C"));
+        packets.extend(length_packet(31, &data_registration, 1));
+
+        let events = SystemViewDecoder::default()
+            .push(&packets)
+            .expect("all extended packets decode");
+
+        assert_eq!(
+            events
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            [
+                TraceEventKind::MarkerReached { marker_id: 11 },
+                TraceEventKind::HeapDefined {
+                    heap_id: 3,
+                    base: 0x1000,
+                    size: 0x800,
+                    metadata_size: 16,
+                },
+                TraceEventKind::HeapAllocated {
+                    heap_id: 3,
+                    address: 0x1010,
+                    size: 32,
+                    tag: None,
+                },
+                TraceEventKind::HeapAllocated {
+                    heap_id: 3,
+                    address: 0x1030,
+                    size: 64,
+                    tag: Some(9),
+                },
+                TraceEventKind::HeapFreed {
+                    heap_id: 3,
+                    address: 0x1010,
+                },
+                TraceEventKind::DataRegistered {
+                    sample_id: 7,
+                    name: "temperature".to_owned(),
+                    data_type: Some(1),
+                    offset: Some(-40),
+                    range_min: Some(-20),
+                    range_max: Some(120),
+                    scaling_factor: Some(0.25),
+                    unit: Some("C".to_owned()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_minimal_data_registration_across_every_chunk_boundary() {
+        let mut payload = encode_varint(6);
+        payload.extend(encode_varint(4));
+        payload.extend(encode_string("rpm"));
+        let packet = length_packet(31, &payload, 7);
+
+        for split in 0..=packet.len() {
+            let mut decoder = SystemViewDecoder::default();
+            let prefix = decoder.push(&packet[..split]).expect("prefix is valid");
+            let suffix = decoder.push(&packet[split..]).expect("suffix is valid");
+            let events = prefix.into_iter().chain(suffix).collect::<Vec<_>>();
+
+            assert_eq!(events.len(), 1, "split at {split}");
+            assert_eq!(
+                events[0].kind,
+                TraceEventKind::DataRegistered {
+                    sample_id: 4,
+                    name: "rpm".to_owned(),
+                    data_type: None,
+                    offset: None,
+                    range_min: None,
+                    range_max: None,
+                    scaling_factor: None,
+                    unit: None,
+                }
+            );
+        }
     }
 
     #[test]

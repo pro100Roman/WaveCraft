@@ -73,6 +73,7 @@ const TIMELINE_LANE_COLORS: [egui::Color32; 12] = [
     egui::Color32::from_rgb(255, 184, 92),
 ];
 const TARGET_DROPDOWN_RESULT_LIMIT: usize = 200;
+const CONNECTION_STATUS_FONT_SIZE: f32 = 9.0;
 const DEFAULT_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 1_000_000;
 const MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 10_000_000_000;
 const APPLICATION_ELF_HELP: &str = "Resolves _SEGGER_RTT, resource symbols, and .sv-data messages";
@@ -1160,7 +1161,7 @@ impl WaveCraftApp {
                                         "terminal only"
                                     }
                                 ))
-                                .small()
+                                .size(CONNECTION_STATUS_FONT_SIZE)
                                 .color(ACCENT),
                             );
                         }
@@ -1169,6 +1170,7 @@ impl WaveCraftApp {
                         {
                             ui.label(
                                 RichText::new(error)
+                                    .size(CONNECTION_STATUS_FONT_SIZE)
                                     .color(egui::Color32::from_rgb(245, 96, 96)),
                             );
                         }
@@ -1500,7 +1502,7 @@ fn paint_trace_run_control(
             ..
         } => {
             if ui
-                .add_enabled(!busy, egui::Button::new("▶ Start"))
+                .add_enabled(!busy, toolbar_action_button("▶ Start", ACCENT))
                 .clicked()
             {
                 actions.system_trace_action = Some(SystemTraceAction::Start);
@@ -1513,10 +1515,13 @@ fn paint_trace_run_control(
             ui.label(RichText::new("RTT terminal connected").color(ACCENT));
         }
         SystemTraceConnectionState::Starting { .. } => {
-            ui.add_enabled(false, egui::Button::new("Starting…"));
+            ui.add_enabled(false, toolbar_action_button("Starting…", ACCENT));
         }
         SystemTraceConnectionState::Tracing { recording_path, .. } => {
-            if ui.button("■ Stop").clicked() {
+            if ui
+                .add(toolbar_action_button("■ Stop", egui::Color32::LIGHT_RED))
+                .clicked()
+            {
                 actions.system_trace_action = Some(SystemTraceAction::Stop);
             }
             if recording_path.is_some() {
@@ -1526,13 +1531,16 @@ fn paint_trace_run_control(
             }
         }
         SystemTraceConnectionState::Stopping { .. } => {
-            ui.add_enabled(false, egui::Button::new("Stopping…"));
+            ui.add_enabled(
+                false,
+                toolbar_action_button("Stopping…", egui::Color32::LIGHT_RED),
+            );
         }
         SystemTraceConnectionState::Disconnected
         | SystemTraceConnectionState::Connecting
         | SystemTraceConnectionState::Disconnecting
         | SystemTraceConnectionState::Error(_) => {
-            ui.add_enabled(false, egui::Button::new("▶ Start"));
+            ui.add_enabled(false, toolbar_action_button("▶ Start", ACCENT));
         }
     }
 }
@@ -2226,6 +2234,12 @@ struct TimelineTimeGrid {
 fn timeline_lanes(model: &TraceModel) -> Vec<TimelineLane> {
     let mut lanes = Vec::new();
     for (core_id, core) in model.cores() {
+        for task_id in core.tasks().keys() {
+            lanes.push(TimelineLane {
+                core_id: *core_id,
+                context: ExecutionContext::Task(*task_id),
+            });
+        }
         for interval in core.intervals() {
             let lane = TimelineLane {
                 core_id: *core_id,
@@ -4325,8 +4339,11 @@ fn trace_event_category(kind: &TraceEventKind) -> TraceEventCategory {
         }
         TraceEventKind::MarkerStarted { .. }
         | TraceEventKind::MarkerStopped { .. }
+        | TraceEventKind::MarkerReached { .. }
         | TraceEventKind::MarkerName { .. } => TraceEventCategory::Markers,
-        TraceEventKind::DataSample { .. } => TraceEventCategory::DataSamples,
+        TraceEventKind::DataSample { .. } | TraceEventKind::DataRegistered { .. } => {
+            TraceEventCategory::DataSamples
+        }
         TraceEventKind::ApiCall { .. }
         | TraceEventKind::ApiCallEnded { .. }
         | TraceEventKind::Unknown { event_id: 32.., .. } => TraceEventCategory::ApiCalls,
@@ -4342,6 +4359,9 @@ fn trace_event_category(kind: &TraceEventKind) -> TraceEventCategory {
         | TraceEventKind::ModuleDescription { .. }
         | TraceEventKind::ModuleCount { .. }
         | TraceEventKind::ResourceName { .. }
+        | TraceEventKind::HeapDefined { .. }
+        | TraceEventKind::HeapAllocated { .. }
+        | TraceEventKind::HeapFreed { .. }
         | TraceEventKind::Unknown { .. } => TraceEventCategory::System,
     }
 }
@@ -4834,6 +4854,7 @@ fn event_name(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String {
         TraceEventKind::Idle => "Idle",
         TraceEventKind::MarkerStarted { .. } => "Marker started",
         TraceEventKind::MarkerStopped { .. } => "Marker stopped",
+        TraceEventKind::MarkerReached { .. } => "Marker reached",
         TraceEventKind::MarkerName { .. } => "Marker name",
         TraceEventKind::SystemDescription(_) => "System description",
         TraceEventKind::ClockSyncCycles { .. } => "Clock sync cycles",
@@ -4844,6 +4865,10 @@ fn event_name(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String {
         TraceEventKind::ModuleCount { .. } => "Module count",
         TraceEventKind::ResourceName { .. } => "Resource name",
         TraceEventKind::DataSample { .. } => "Data sample",
+        TraceEventKind::DataRegistered { .. } => "Data registered",
+        TraceEventKind::HeapDefined { .. } => "Heap defined",
+        TraceEventKind::HeapAllocated { .. } => "Heap allocated",
+        TraceEventKind::HeapFreed { .. } => "Heap freed",
         TraceEventKind::FormattedPrint { .. } => "Log",
         TraceEventKind::PrintElf { .. } => "Log",
         TraceEventKind::ApiCall { event_id, .. } => {
@@ -4905,7 +4930,8 @@ fn event_summary(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String 
         TraceEventKind::IsrEntered { isr_id } => format!("ISR {isr_id}"),
         TraceEventKind::TimerEntered { timer_id } => format!("timer {timer_id}"),
         TraceEventKind::MarkerStarted { marker_id }
-        | TraceEventKind::MarkerStopped { marker_id } => trace
+        | TraceEventKind::MarkerStopped { marker_id }
+        | TraceEventKind::MarkerReached { marker_id } => trace
             .marker_name(*marker_id)
             .map_or_else(|| format!("marker {marker_id}"), |name| format!("{name} (marker {marker_id})")),
         TraceEventKind::MarkerName { marker_id, name } => {
@@ -4942,6 +4968,37 @@ fn event_summary(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String 
         }
         TraceEventKind::DataSample { sample_id, value } => {
             format!("sample {sample_id}: {value}")
+        }
+        TraceEventKind::DataRegistered {
+            sample_id,
+            name,
+            data_type,
+            offset,
+            range_min,
+            range_max,
+            scaling_factor,
+            unit,
+        } => format!(
+            "sample {sample_id}: {name}, type={data_type:?}, offset={offset:?}, range={range_min:?}..{range_max:?}, scale={scaling_factor:?}, unit={unit:?}"
+        ),
+        TraceEventKind::HeapDefined {
+            heap_id,
+            base,
+            size,
+            metadata_size,
+        } => format!(
+            "heap {heap_id}, base {base}, size {size}, metadata {metadata_size} bytes"
+        ),
+        TraceEventKind::HeapAllocated {
+            heap_id,
+            address,
+            size,
+            tag,
+        } => format!(
+            "heap {heap_id}, address {address}, size {size}, tag {tag:?}"
+        ),
+        TraceEventKind::HeapFreed { heap_id, address } => {
+            format!("heap {heap_id}, address {address}")
         }
         TraceEventKind::FormattedPrint {
             format,
@@ -5586,6 +5643,34 @@ mod tests {
     }
 
     #[test]
+    fn declared_task_has_a_timeline_lane_before_it_runs() {
+        let mut trace = SystemTraceDisplayState::default();
+        trace.ingest(TraceEvent {
+            sequence: 10,
+            core_id: 0,
+            timestamp_ticks: 69_699,
+            kind: TraceEventKind::TaskInfo {
+                task_id: 0x6430,
+                priority: 2,
+                name: "BLE".to_owned(),
+            },
+        });
+
+        let lane = TimelineLane {
+            core_id: 0,
+            context: ExecutionContext::Task(0x6430),
+        };
+        assert_eq!(timeline_lanes(trace.model()), [lane]);
+        assert_eq!(context_label(trace.model(), lane), "C0  BLE");
+        assert!(trace
+            .model()
+            .core(0)
+            .expect("core exists")
+            .intervals()
+            .is_empty());
+    }
+
+    #[test]
     fn module_description_offsets_map_local_api_ids() {
         let mut trace = SystemTraceDisplayState::default();
         trace.set_description(Some(
@@ -5956,6 +6041,65 @@ mod tests {
         assert_eq!(
             font_size("Not selected"),
             crate::theme::SETUP_PANEL_BODY_FONT_SIZE
+        );
+    }
+
+    #[test]
+    fn connection_status_messages_use_the_configured_font_size() {
+        fn status_font_size(state: SystemTraceConnectionState, expected: &str) -> f32 {
+            let context = egui::Context::default();
+            let mut app = app();
+            app.system_trace_connection = state;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..egui::RawInput::default()
+            };
+            let output = context.run(input, |context| {
+                let mut actions = FrameActions::default();
+                app.paint_system_trace_setup_panel(context, &mut actions);
+            });
+
+            fn find_size(shape: &egui::Shape, expected: &str) -> Option<f32> {
+                match shape {
+                    egui::Shape::Vec(shapes) => {
+                        shapes.iter().find_map(|shape| find_size(shape, expected))
+                    }
+                    egui::Shape::Text(text) if text.galley.text() == expected => text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map(|section| section.format.font_id.size),
+                    _ => None,
+                }
+            }
+
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| find_size(&shape.shape, expected))
+                .unwrap_or_else(|| panic!("{expected:?} is painted"))
+        }
+
+        assert_eq!(
+            status_font_size(
+                SystemTraceConnectionState::Attached {
+                    channels: Vec::new(),
+                    systemview_enabled: true,
+                },
+                "Attached with 0 RTT channel(s); SystemView ready",
+            ),
+            CONNECTION_STATUS_FONT_SIZE
+        );
+        assert_eq!(
+            status_font_size(
+                SystemTraceConnectionState::Error("Probe connection failed".to_owned()),
+                "Probe connection failed",
+            ),
+            CONNECTION_STATUS_FONT_SIZE
         );
     }
 

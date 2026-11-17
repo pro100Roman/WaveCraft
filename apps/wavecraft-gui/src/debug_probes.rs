@@ -4,6 +4,9 @@ use std::env;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use wavecraft_debug_probe::{
     DebugProbeCatalog, DebugProbeCommand, DebugProbeError, DebugProbeProtocolClient,
@@ -68,12 +71,15 @@ pub(crate) fn discover_debug_probes() -> DebugProbeDiscoveryReport {
 
 pub(crate) struct DebugProbeHelperProcess {
     child: Option<Child>,
-    client: DebugProbeProtocolClient<BufReader<ChildStdout>, ChildStdin>,
+    client: Option<DebugProbeProtocolClient<BufReader<ChildStdout>, ChildStdin>>,
 }
 
 impl DebugProbeHelperProcess {
     pub(crate) fn spawn() -> Result<Self, String> {
-        let mut command = helper_command(HelperInvocation::Serve)?;
+        Self::spawn_command(helper_command(HelperInvocation::Serve)?)
+    }
+
+    fn spawn_command(mut command: Command) -> Result<Self, String> {
         let mut child = command
             .env(
                 HELPER_PARENT_PROCESS_ID_ENVIRONMENT_VARIABLE,
@@ -93,7 +99,7 @@ impl DebugProbeHelperProcess {
         };
         Ok(Self {
             child: Some(child),
-            client: DebugProbeProtocolClient::new(BufReader::new(stdout), stdin),
+            client: Some(DebugProbeProtocolClient::new(BufReader::new(stdout), stdin)),
         })
     }
 
@@ -101,7 +107,46 @@ impl DebugProbeHelperProcess {
         &mut self,
         command: DebugProbeCommand,
     ) -> Result<DebugProbeReply, DebugProbeError> {
-        self.client.send(command)
+        self.client_mut()?.send(command)
+    }
+
+    pub(crate) fn send_with_timeout(
+        &mut self,
+        command: DebugProbeCommand,
+        timeout: Duration,
+    ) -> Result<DebugProbeReply, DebugProbeError> {
+        let Some(mut client) = self.client.take() else {
+            return Err(helper_unavailable());
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let result = client.send(command);
+            let _ = sender.send((client, result));
+        });
+
+        match receiver.recv_timeout(timeout) {
+            Ok((client, result)) => {
+                self.client = Some(client);
+                result
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.terminate_child();
+                Err(DebugProbeError::new(
+                    wavecraft_debug_probe::DebugProbeErrorKind::Transport,
+                    format!(
+                        "debug-probe helper did not respond within {:.1} s",
+                        timeout.as_secs_f32()
+                    ),
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.terminate_child();
+                Err(DebugProbeError::new(
+                    wavecraft_debug_probe::DebugProbeErrorKind::Transport,
+                    "debug-probe helper response worker stopped unexpectedly",
+                ))
+            }
+        }
     }
 
     pub(crate) fn send_streaming(
@@ -109,11 +154,14 @@ impl DebugProbeHelperProcess {
         command: DebugProbeCommand,
         publish: impl FnMut(DebugProbeReply) -> Result<(), DebugProbeError>,
     ) -> Result<(), DebugProbeError> {
-        self.client.send_streaming(command, publish)
+        self.client_mut()?.send_streaming(command, publish)
     }
 
     pub(crate) fn shutdown(mut self) -> Result<(), DebugProbeError> {
-        let result = self.client.send(DebugProbeCommand::Shutdown).map(|_| ());
+        let result = self
+            .client_mut()
+            .and_then(|client| client.send(DebugProbeCommand::Shutdown))
+            .map(|_| ());
         if let Some(mut child) = self.child.take() {
             if result.is_err() {
                 let _ = child.kill();
@@ -122,6 +170,28 @@ impl DebugProbeHelperProcess {
         }
         result
     }
+
+    fn client_mut(
+        &mut self,
+    ) -> Result<&mut DebugProbeProtocolClient<BufReader<ChildStdout>, ChildStdin>, DebugProbeError>
+    {
+        self.client.as_mut().ok_or_else(helper_unavailable)
+    }
+
+    fn terminate_child(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.child = None;
+    }
+}
+
+fn helper_unavailable() -> DebugProbeError {
+    DebugProbeError::new(
+        wavecraft_debug_probe::DebugProbeErrorKind::Transport,
+        "debug-probe helper is unavailable",
+    )
 }
 
 impl Drop for DebugProbeHelperProcess {
@@ -237,6 +307,26 @@ mod tests {
         );
         assert_eq!(catalog.target_groups.len(), 1);
         assert_eq!(catalog.target_groups[0].targets[0].name, "nRF52832_xxAA");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_command_terminates_an_unresponsive_helper() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 60"]);
+        let mut helper =
+            DebugProbeHelperProcess::spawn_command(command).expect("test helper starts");
+
+        let error = helper
+            .send_with_timeout(DebugProbeCommand::ListProbes, Duration::from_millis(25))
+            .expect_err("unresponsive helper times out");
+
+        assert_eq!(
+            error.kind,
+            wavecraft_debug_probe::DebugProbeErrorKind::Transport
+        );
+        assert!(error.message.contains("did not respond within"));
+        assert!(helper.child.is_none());
     }
 
     #[test]

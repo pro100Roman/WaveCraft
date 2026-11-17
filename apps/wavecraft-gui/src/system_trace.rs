@@ -13,8 +13,8 @@ use std::time::Duration;
 use crate::{debug_probes::DebugProbeHelperProcess, WorkerSuccess};
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugProbeCommand, DebugProbeError, DebugProbeErrorKind, DebugProbeReply,
-    ProbeSelector, RttChannelDescriptor, RttChannelDirection, RttConfiguration, RttTerminalDecoder,
-    RttTerminalLine,
+    ProbeProvider, ProbeSelector, RttChannelDescriptor, RttChannelDirection, RttConfiguration,
+    RttTerminalDecoder, RttTerminalLine, TargetSelector,
 };
 use wavecraft_systemview::{
     SystemViewDecoder, SystemViewDescription, SystemViewElf, SYSTEMVIEW_COMMAND_START,
@@ -47,6 +47,10 @@ const TRACE_EVENT_QUEUE_CAPACITY: usize = 64 * 1024;
 const TERMINAL_LINE_QUEUE_CAPACITY: usize = 2 * 1024;
 const IDLE_RTT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RTT_CHANNEL_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const PROBE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const TARGET_ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+const TARGET_RESET_TIMEOUT: Duration = Duration::from_secs(10);
+const RTT_ATTACH_TIMEOUT_MARGIN: Duration = Duration::from_secs(2);
 const SYSTEMVIEW_FILE_READ_SIZE: usize = 64 * 1024;
 static NEXT_TEMPORARY_TRACE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -370,6 +374,13 @@ pub(crate) fn spawn_system_trace_connection(
 
 trait ProbeCommandTransport: Sized {
     fn send(&mut self, command: DebugProbeCommand) -> Result<DebugProbeReply, DebugProbeError>;
+    fn send_with_timeout(
+        &mut self,
+        command: DebugProbeCommand,
+        _timeout: Duration,
+    ) -> Result<DebugProbeReply, DebugProbeError> {
+        self.send(command)
+    }
     fn send_streaming(
         &mut self,
         command: DebugProbeCommand,
@@ -391,6 +402,14 @@ impl ProbeCommandTransport for DebugProbeHelperProcess {
         publish: &mut dyn FnMut(DebugProbeReply) -> Result<(), DebugProbeError>,
     ) -> Result<(), DebugProbeError> {
         Self::send_streaming(self, command, publish)
+    }
+
+    fn send_with_timeout(
+        &mut self,
+        command: DebugProbeCommand,
+        timeout: Duration,
+    ) -> Result<DebugProbeReply, DebugProbeError> {
+        Self::send_with_timeout(self, command, timeout)
     }
 
     fn shutdown(self) -> Result<(), DebugProbeError> {
@@ -1022,14 +1041,24 @@ fn establish_connection(
         ProbeLogLevel::Info,
         format!("opening debug probe {}", configuration.probe.connection_id),
     );
-    expect_reply(
-        transport.send(DebugProbeCommand::OpenProbe {
+    let opened_probe = match transport.send_with_timeout(
+        DebugProbeCommand::OpenProbe {
             selector: configuration.probe.clone(),
-        })?,
-        |reply| matches!(reply, DebugProbeReply::ProbeOpened(_)),
-        "open probe",
-    )?;
+        },
+        PROBE_OPEN_TIMEOUT,
+    )? {
+        DebugProbeReply::ProbeOpened(probe) => probe,
+        _ => return Err(unexpected_reply("open probe")),
+    };
     send_probe_log(events, ProbeLogLevel::Success, "debug probe opened");
+    if opened_probe.provider == ProbeProvider::JLink
+        && matches!(configuration.attach.target, TargetSelector::Auto)
+    {
+        return Err(DebugProbeError::new(
+            DebugProbeErrorKind::InvalidConfiguration,
+            "select the target MCU explicitly when using J-Link; automatic target detection is not reliable for this probe",
+        ));
+    }
     send_probe_log(
         events,
         ProbeLogLevel::Info,
@@ -1042,9 +1071,12 @@ fn establish_connection(
         ),
     );
     expect_reply(
-        transport.send(DebugProbeCommand::Attach {
-            configuration: configuration.attach.clone(),
-        })?,
+        transport.send_with_timeout(
+            DebugProbeCommand::Attach {
+                configuration: configuration.attach.clone(),
+            },
+            TARGET_ATTACH_TIMEOUT,
+        )?,
         |reply| reply == &DebugProbeReply::TargetAttached,
         "attach target",
     )?;
@@ -1052,7 +1084,7 @@ fn establish_connection(
     if configuration.reset_after_attach {
         send_probe_log(events, ProbeLogLevel::Info, "resetting target after attach");
         expect_reply(
-            transport.send(DebugProbeCommand::ResetTarget)?,
+            transport.send_with_timeout(DebugProbeCommand::ResetTarget, TARGET_RESET_TIMEOUT)?,
             |reply| reply == &DebugProbeReply::TargetReset,
             "reset target",
         )?;
@@ -1074,9 +1106,15 @@ fn establish_connection(
             .rtt
             .timeout
             .saturating_sub(discovery_started.elapsed());
-        let channels = match transport.send(DebugProbeCommand::AttachRtt {
-            configuration: rtt_configuration,
-        })? {
+        let helper_timeout = rtt_configuration
+            .timeout
+            .saturating_add(RTT_ATTACH_TIMEOUT_MARGIN);
+        let channels = match transport.send_with_timeout(
+            DebugProbeCommand::AttachRtt {
+                configuration: rtt_configuration,
+            },
+            helper_timeout,
+        )? {
             DebugProbeReply::RttAttached(channels) => channels,
             _ => return Err(unexpected_reply("attach RTT")),
         };
@@ -3319,6 +3357,44 @@ mod tests {
                 "target was not found".to_owned()
             )]
         );
+        assert!(*shutdown.lock().expect("shutdown flag is available"));
+    }
+
+    #[test]
+    fn jlink_requires_an_explicit_target_before_attach() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(Mutex::new(false));
+        let transport = FakeTransport {
+            replies: VecDeque::from([Ok(DebugProbeReply::ProbeOpened(probe_descriptor()))]),
+            commands: Arc::clone(&commands),
+            shutdown: Arc::clone(&shutdown),
+        };
+        let (_command_sender, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (trace_event_sender, _trace_event_receiver) = mpsc::sync_channel(16);
+        let (terminal_line_sender, _terminal_line_receiver) = mpsc::sync_channel(16);
+        let mut configuration = connection_configuration();
+        configuration.attach.target = TargetSelector::Auto;
+
+        run_connection_worker(
+            transport,
+            configuration,
+            command_receiver,
+            event_sender,
+            trace_event_sender,
+            terminal_line_sender,
+        );
+
+        assert_eq!(
+            lifecycle_events(event_receiver.try_iter()),
+            [SystemTraceWorkerEvent::Error(
+                "select the target MCU explicitly when using J-Link; automatic target detection is not reliable for this probe".to_owned()
+            )]
+        );
+        assert!(matches!(
+            commands.lock().expect("commands are available").as_slice(),
+            [DebugProbeCommand::OpenProbe { .. }]
+        ));
         assert!(*shutdown.lock().expect("shutdown flag is available"));
     }
 

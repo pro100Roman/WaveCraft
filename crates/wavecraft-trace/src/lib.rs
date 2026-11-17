@@ -64,6 +64,9 @@ pub enum TraceEventKind {
     MarkerStopped {
         marker_id: u64,
     },
+    MarkerReached {
+        marker_id: u64,
+    },
     MarkerName {
         marker_id: u64,
         name: String,
@@ -102,6 +105,32 @@ pub enum TraceEventKind {
     DataSample {
         sample_id: u64,
         value: f32,
+    },
+    DataRegistered {
+        sample_id: u64,
+        name: String,
+        data_type: Option<u64>,
+        offset: Option<i32>,
+        range_min: Option<i32>,
+        range_max: Option<i32>,
+        scaling_factor: Option<f32>,
+        unit: Option<String>,
+    },
+    HeapDefined {
+        heap_id: ContextId,
+        base: ContextId,
+        size: u64,
+        metadata_size: u64,
+    },
+    HeapAllocated {
+        heap_id: ContextId,
+        address: ContextId,
+        size: u64,
+        tag: Option<u64>,
+    },
+    HeapFreed {
+        heap_id: ContextId,
+        address: ContextId,
     },
     FormattedPrint {
         format: String,
@@ -683,6 +712,7 @@ impl CoreTraceState {
                 }
             }
             TraceEventKind::NoOp
+            | TraceEventKind::MarkerReached { .. }
             | TraceEventKind::MarkerName { .. }
             | TraceEventKind::SystemDescription(_)
             | TraceEventKind::ClockSyncCycles { .. }
@@ -692,6 +722,10 @@ impl CoreTraceState {
             | TraceEventKind::ModuleCount { .. }
             | TraceEventKind::ResourceName { .. }
             | TraceEventKind::DataSample { .. }
+            | TraceEventKind::DataRegistered { .. }
+            | TraceEventKind::HeapDefined { .. }
+            | TraceEventKind::HeapAllocated { .. }
+            | TraceEventKind::HeapFreed { .. }
             | TraceEventKind::FormattedPrint { .. }
             | TraceEventKind::PrintElf { .. }
             | TraceEventKind::ApiCall { .. }
