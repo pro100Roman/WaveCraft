@@ -370,6 +370,49 @@ impl CoreTraceState {
         self.dropped_events
     }
 
+    fn retain_from(&mut self, start_ticks: u64) {
+        let retained_interval = self.intervals.partition_point(|interval| {
+            interval
+                .end_ticks
+                .is_some_and(|end_ticks| end_ticks <= start_ticks)
+        });
+        if retained_interval > 0 {
+            self.intervals.drain(..retained_interval);
+        }
+        if let Some(interval) = self
+            .intervals
+            .first_mut()
+            .filter(|interval| interval.start_ticks < start_ticks)
+        {
+            interval.start_ticks = start_ticks;
+        }
+
+        if self.marker_intervals.is_empty() {
+            return;
+        }
+        let old_intervals = std::mem::take(&mut self.marker_intervals);
+        let mut retained_indices = vec![None; old_intervals.len()];
+        for (old_index, mut interval) in old_intervals.into_iter().enumerate() {
+            if interval
+                .end_ticks
+                .is_some_and(|end_ticks| end_ticks <= start_ticks)
+            {
+                continue;
+            }
+            interval.start_ticks = interval.start_ticks.max(start_ticks);
+            retained_indices[old_index] = Some(self.marker_intervals.len());
+            self.marker_intervals.push(interval);
+        }
+        for interval_indices in self.active_markers.values_mut() {
+            *interval_indices = interval_indices
+                .iter()
+                .filter_map(|index| retained_indices.get(*index).copied().flatten())
+                .collect();
+        }
+        self.active_markers
+            .retain(|_, interval_indices| !interval_indices.is_empty());
+    }
+
     fn context_statistics(&self, core_id: u32, end_ticks: u64) -> Vec<ContextStatistics> {
         let mut statistics = BTreeMap::<ExecutionContext, ContextStatistics>::new();
 
@@ -764,6 +807,17 @@ impl TraceModel {
         }
     }
 
+    /// Discards completed timeline intervals before `start_ticks` while
+    /// preserving the current task, context, marker, and aggregate state.
+    ///
+    /// Live consumers use this to keep rendering work proportional to their
+    /// retained display window without interrupting ongoing reconstruction.
+    pub fn retain_from(&mut self, start_ticks: u64) {
+        for core in self.cores.values_mut() {
+            core.retain_from(start_ticks);
+        }
+    }
+
     pub fn context_statistics(&self, end_ticks: u64) -> Vec<ContextStatistics> {
         self.cores
             .iter()
@@ -878,6 +932,43 @@ mod tests {
         assert_eq!(core.intervals()[0].context, ExecutionContext::Task(7));
         assert_eq!(core.intervals()[0].start_ticks, 2);
         assert_eq!(core.intervals()[0].end_ticks, Some(7));
+    }
+
+    #[test]
+    fn retaining_a_live_window_prunes_old_intervals_and_keeps_active_markers_writable() {
+        let mut model = TraceModel::new();
+        model.apply_all(&[
+            event(0, 1, TraceEventKind::TaskStarted { task_id: 7 }),
+            event(1, 2, TraceEventKind::MarkerStarted { marker_id: 11 }),
+            event(2, 3, TraceEventKind::MarkerStopped { marker_id: 11 }),
+            event(3, 4, TraceEventKind::MarkerStarted { marker_id: 12 }),
+            event(4, 5, TraceEventKind::TaskStopped),
+            event(5, 8, TraceEventKind::Idle),
+        ]);
+
+        model.retain_from(4);
+
+        let core = model.core(0).expect("core remains present");
+        assert_eq!(core.intervals().len(), 3);
+        assert_eq!(core.intervals()[0].start_ticks, 4);
+        assert_eq!(core.marker_intervals().len(), 1);
+        assert_eq!(core.marker_intervals()[0].marker_id, 12);
+        assert_eq!(core.marker_intervals()[0].start_ticks, 4);
+
+        model.apply(&event(
+            6,
+            9,
+            TraceEventKind::MarkerStopped { marker_id: 12 },
+        ));
+
+        assert_eq!(
+            model
+                .core(0)
+                .expect("core remains present")
+                .marker_intervals()[0]
+                .end_ticks,
+            Some(9)
+        );
     }
 
     #[test]

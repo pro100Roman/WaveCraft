@@ -42,6 +42,10 @@ const BLACK_MAGIC_REMOTE_READ_PAYLOAD_SIZE: usize = 504;
 const NETWORK_BMP_RTT_READ_SIZE: usize = 4 * BLACK_MAGIC_REMOTE_READ_PAYLOAD_SIZE;
 const NETWORK_BMP_SELECTOR_PREFIX: &str = "1d50:6018:";
 const MAX_SYSTEMVIEW_RTT_READS_PER_POLL: usize = 4;
+// USB and other ordinary helper-backed probes can stream the same four drain
+// attempts through one helper request. This removes process round trips between
+// full RTT-buffer reads while preserving the command-polling and 64-KiB bounds.
+const HELPER_RTT_READ_BATCH: usize = MAX_SYSTEMVIEW_RTT_READS_PER_POLL;
 // 32 * 2016 bytes stays below the 64-KiB helper request limit while keeping a
 // saturated network BMP busy. Each completed read is streamed back immediately.
 const NETWORK_BMP_RTT_READ_BATCH: usize = 32;
@@ -721,7 +725,7 @@ fn systemview_rtt_read_batch(probe: &ProbeSelector) -> usize {
     if is_network_bmp(probe) {
         NETWORK_BMP_RTT_READ_BATCH
     } else {
-        1
+        HELPER_RTT_READ_BATCH
     }
 }
 
@@ -1588,6 +1592,7 @@ pub(crate) struct SystemTraceDisplayState {
     elf: Option<SystemViewElf>,
     description: Option<SystemViewDescription>,
     target_frequencies_hz: Option<(u64, u64)>,
+    latest_timestamp_ticks: Option<u64>,
     log_count: usize,
     display_skipped_event_count: u64,
     target_dropped_event_count: u64,
@@ -1638,6 +1643,7 @@ impl Default for SystemTraceDisplayState {
             elf: None,
             description: None,
             target_frequencies_hz: None,
+            latest_timestamp_ticks: None,
             log_count: 0,
             display_skipped_event_count: 0,
             target_dropped_event_count: 0,
@@ -2080,7 +2086,15 @@ impl SystemTraceDisplayState {
         self.timeline_focus_sequence.take()
     }
 
+    #[cfg(test)]
     pub(crate) fn ingest(&mut self, event: TraceEvent) {
+        let evicted = self.ingest_event(event);
+        if evicted {
+            self.prune_model_to_display_window();
+        }
+    }
+
+    fn ingest_event(&mut self, event: TraceEvent) -> bool {
         if let Some(event_id) = api_event_id(&event.kind) {
             self.api_event_lanes.insert((event.core_id, event_id));
         }
@@ -2114,8 +2128,11 @@ impl SystemTraceDisplayState {
         if is_log_event(&event.kind) {
             self.log_count = self.log_count.saturating_add(1);
         }
+        self.latest_timestamp_ticks = Some(event.timestamp_ticks);
+        let mut evicted = false;
         if self.events.len() == self.event_capacity {
             if let Some(discarded) = self.events.pop_front() {
+                evicted = true;
                 if is_log_event(&discarded.kind) {
                     self.log_count = self.log_count.saturating_sub(1);
                 }
@@ -2127,9 +2144,21 @@ impl SystemTraceDisplayState {
             }
         }
         self.events.push_back(event);
+        evicted
     }
 
+    #[cfg(test)]
     pub(crate) fn ingest_display_gap(
+        &mut self,
+        sequence: u64,
+        core_id: u32,
+        timestamp_ticks: u64,
+        skipped_events: u64,
+    ) {
+        self.ingest_display_gap_update(sequence, core_id, timestamp_ticks, skipped_events);
+    }
+
+    fn ingest_display_gap_update(
         &mut self,
         sequence: u64,
         core_id: u32,
@@ -2139,6 +2168,7 @@ impl SystemTraceDisplayState {
         self.display_skipped_event_count = self
             .display_skipped_event_count
             .saturating_add(skipped_events);
+        self.latest_timestamp_ticks = Some(timestamp_ticks);
         self.model.apply(&TraceEvent {
             sequence,
             core_id,
@@ -2147,6 +2177,38 @@ impl SystemTraceDisplayState {
                 dropped_events: skipped_events,
             },
         });
+    }
+
+    pub(crate) fn ingest_live_updates(
+        &mut self,
+        updates: impl IntoIterator<Item = LiveTraceUpdate>,
+    ) {
+        let mut evicted = false;
+        for update in updates {
+            match update {
+                LiveTraceUpdate::Event(event) => evicted |= self.ingest_event(event),
+                LiveTraceUpdate::DisplayGap {
+                    sequence,
+                    core_id,
+                    timestamp_ticks,
+                    skipped_events,
+                } => self.ingest_display_gap_update(
+                    sequence,
+                    core_id,
+                    timestamp_ticks,
+                    skipped_events,
+                ),
+            }
+        }
+        if evicted {
+            self.prune_model_to_display_window();
+        }
+    }
+
+    fn prune_model_to_display_window(&mut self) {
+        if let Some(first) = self.events.front() {
+            self.model.retain_from(first.timestamp_ticks);
+        }
     }
 
     pub(crate) fn ingest_terminal_line(&mut self, line: RttTerminalLine) {
@@ -2166,6 +2228,7 @@ impl SystemTraceDisplayState {
         self.event_capacity = trace.events.len().max(DEFAULT_EVENT_CAPACITY);
         self.event_filter.clear();
         self.event_view = TraceEventView::Events;
+        self.latest_timestamp_ticks = trace.events.back().map(|event| event.timestamp_ticks);
         self.events = trace.events;
         self.model = trace.model;
         self.marker_names = trace.marker_names;
@@ -2197,6 +2260,7 @@ impl SystemTraceDisplayState {
         self.event_filter_cache = EventFilterCache::default();
         self.invalidate_event_search_metadata();
         self.target_frequencies_hz = None;
+        self.latest_timestamp_ticks = None;
         self.log_count = 0;
         self.display_skipped_event_count = 0;
         self.target_dropped_event_count = 0;
@@ -2247,7 +2311,7 @@ impl SystemTraceDisplayState {
 
     pub(crate) fn time_bounds(&self) -> Option<(u64, u64)> {
         let first = self.events.front()?.timestamp_ticks;
-        let last = self.events.back()?.timestamp_ticks;
+        let last = self.latest_timestamp_ticks?;
         Some((first.min(last), first.max(last)))
     }
 
@@ -2578,18 +2642,31 @@ mod tests {
             systemview_rtt_read_batch(&probe),
             NETWORK_BMP_RTT_READ_BATCH
         );
+    }
+
+    #[test]
+    fn helper_backed_rtt_reads_stream_four_drains_per_request() {
         assert_eq!(
             systemview_rtt_read_batch(&connection_configuration().probe),
-            1
+            HELPER_RTT_READ_BATCH
         );
 
+        let channels = [RttChannelDescriptor {
+            number: 1,
+            direction: RttChannelDirection::Up,
+            name: Some("SystemView".to_owned()),
+            buffer_size: 8 * 1024,
+        }];
         let network_jlink =
             ProbeSelector::connection_id("wavecraft:jlink-network:192.0.2.43:19020");
         assert_eq!(
             systemview_rtt_read_size(&channels, 1, &network_jlink),
             8 * 1024 - 1
         );
-        assert_eq!(systemview_rtt_read_batch(&network_jlink), 1);
+        assert_eq!(
+            systemview_rtt_read_batch(&network_jlink),
+            HELPER_RTT_READ_BATCH
+        );
     }
 
     #[test]
@@ -2666,10 +2743,37 @@ mod tests {
 
         assert_eq!(state.dropped_event_count(), 3);
         assert_eq!(state.display_skipped_event_count(), 7);
+        assert_eq!(state.time_bounds(), Some((1, 20)));
         assert_eq!(
             state.model().core(0).map(|core| core.dropped_events()),
             Some(10)
         );
+    }
+
+    #[test]
+    fn batched_live_ingest_prunes_timeline_intervals_to_the_display_window() {
+        let mut state = SystemTraceDisplayState::with_capacity(3);
+        state.ingest_live_updates((0..8).map(|sequence| {
+            LiveTraceUpdate::Event(event(
+                sequence,
+                sequence + 1,
+                if sequence % 2 == 0 {
+                    TraceEventKind::TaskStarted { task_id: 1 }
+                } else {
+                    TraceEventKind::Idle
+                },
+            ))
+        }));
+
+        assert_eq!(state.events().len(), 3);
+        assert_eq!(state.time_bounds(), Some((6, 8)));
+        let intervals = state
+            .model()
+            .core(0)
+            .expect("live core remains present")
+            .intervals();
+        assert!(intervals.len() <= 3);
+        assert!(intervals.iter().all(|interval| interval.start_ticks >= 6));
     }
 
     #[test]

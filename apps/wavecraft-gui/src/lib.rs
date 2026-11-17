@@ -624,23 +624,11 @@ impl eframe::App for WaveCraftApp {
 impl WaveCraftApp {
     fn poll_system_trace_events(&mut self) {
         let mut disconnected = false;
+        let mut updates = Vec::new();
         if let Some(events) = &self.system_trace_events {
             for _ in 0..MAX_SYSTEM_TRACE_EVENTS_PER_POLL {
                 match events.try_recv() {
-                    Ok(system_trace::LiveTraceUpdate::Event(event)) => {
-                        self.system_trace.ingest(event);
-                    }
-                    Ok(system_trace::LiveTraceUpdate::DisplayGap {
-                        sequence,
-                        core_id,
-                        timestamp_ticks,
-                        skipped_events,
-                    }) => self.system_trace.ingest_display_gap(
-                        sequence,
-                        core_id,
-                        timestamp_ticks,
-                        skipped_events,
-                    ),
+                    Ok(update) => updates.push(update),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         disconnected = true;
@@ -649,6 +637,7 @@ impl WaveCraftApp {
                 }
             }
         }
+        self.system_trace.ingest_live_updates(updates);
         if disconnected {
             self.system_trace_events = None;
         }

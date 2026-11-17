@@ -419,6 +419,9 @@ a debug probe/target combination supported by `probe-rs`. The packaged macOS
 application includes the helper. In a development build, WaveCraft starts it
 from `crates/wavecraft-probe-rs` automatically; that helper currently requires
 Rust 1.95 even though the main workspace remains compatible with Rust 1.79.
+See [CMSIS-DAP System Trace transport notes](docs/cmsis-dap-system-trace.md)
+for the USB reliability fix, live backpressure design, validation procedure,
+and the network CMSIS-DAP follow-up plan.
 
 The **Radio Receiver** tab provides a live RF spectrum and waterfall with
 frequency/power hover readouts and adjustable pane heights. HackRF controls

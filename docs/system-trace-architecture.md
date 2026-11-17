@@ -417,6 +417,11 @@ container before the trace model is stable.
 
 ## Risks and constraints
 
+Implementation and validation details for the serialized ESP32JTAG USB path,
+bounded live display, current CMSIS-DAP TCP proxy, and planned network
+investigation are maintained in the
+[CMSIS-DAP System Trace transport notes](cmsis-dap-system-trace.md).
+
 ### ST-Link V2 bandwidth
 
 Typical trace loads should fit, but peak interrupt and API traffic may overflow
