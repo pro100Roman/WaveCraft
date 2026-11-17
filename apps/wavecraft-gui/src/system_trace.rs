@@ -33,14 +33,14 @@ const RTT_READ_SIZE: usize = 16 * 1024;
 // probe-rs uses a 1024-byte Black Magic remote buffer. Memory reads are hex
 // encoded, leaving 504 payload bytes per remote command. Four payloads balance
 // target read-pointer latency against the control-block overhead of every RTT
-// read. The helper batches consecutive RTT drains so it can advance the target
-// read pointer without waiting for the GUI to decode each response.
+// read. The helper streams consecutive RTT drains so it can advance the target
+// read pointer continuously while the GUI decodes each completed chunk.
 const BLACK_MAGIC_REMOTE_READ_PAYLOAD_SIZE: usize = 504;
 const NETWORK_BMP_RTT_READ_SIZE: usize = 4 * BLACK_MAGIC_REMOTE_READ_PAYLOAD_SIZE;
 const NETWORK_BMP_SELECTOR_PREFIX: &str = "1d50:6018:";
 const MAX_SYSTEMVIEW_RTT_READS_PER_POLL: usize = 4;
-// 32 * 2016 bytes stays below the 64-KiB helper response limit while keeping a
-// saturated network BMP busy draining RTT for as long as possible.
+// 32 * 2016 bytes stays below the 64-KiB helper request limit while keeping a
+// saturated network BMP busy. Each completed read is streamed back immediately.
 const NETWORK_BMP_RTT_READ_BATCH: usize = 32;
 const MAX_SYSTEMVIEW_STOP_DRAIN_BUFFER_PASSES: usize = 4;
 const TRACE_EVENT_QUEUE_CAPACITY: usize = 64 * 1024;
@@ -370,12 +370,27 @@ pub(crate) fn spawn_system_trace_connection(
 
 trait ProbeCommandTransport: Sized {
     fn send(&mut self, command: DebugProbeCommand) -> Result<DebugProbeReply, DebugProbeError>;
+    fn send_streaming(
+        &mut self,
+        command: DebugProbeCommand,
+        publish: &mut dyn FnMut(DebugProbeReply) -> Result<(), DebugProbeError>,
+    ) -> Result<(), DebugProbeError> {
+        publish(self.send(command)?)
+    }
     fn shutdown(self) -> Result<(), DebugProbeError>;
 }
 
 impl ProbeCommandTransport for DebugProbeHelperProcess {
     fn send(&mut self, command: DebugProbeCommand) -> Result<DebugProbeReply, DebugProbeError> {
         Self::send(self, command)
+    }
+
+    fn send_streaming(
+        &mut self,
+        command: DebugProbeCommand,
+        publish: &mut dyn FnMut(DebugProbeReply) -> Result<(), DebugProbeError>,
+    ) -> Result<(), DebugProbeError> {
+        Self::send_streaming(self, command, publish)
     }
 
     fn shutdown(self) -> Result<(), DebugProbeError> {
@@ -417,7 +432,7 @@ fn run_connection_worker(
             &events,
             ProbeLogLevel::Info,
             format!(
-                "network BMP RTT optimization active: {systemview_read_batch} × {systemview_read_size}-byte reads per helper round trip"
+                "network BMP RTT optimization active: up to {systemview_read_batch} × {systemview_read_size}-byte reads per streamed helper request"
             ),
         );
     }
@@ -732,34 +747,40 @@ fn read_and_decode_rtt(
     maximum_reads: usize,
     decoder: &mut SystemViewDecoder,
     trace_events: &mut TraceEventPublisher,
-    raw_recording: Option<&mut BufWriter<File>>,
+    mut raw_recording: Option<&mut BufWriter<File>>,
 ) -> Result<usize, DebugProbeError> {
-    let data = match transport.send(DebugProbeCommand::ReadRttUp {
-        channel_number,
-        maximum_length,
-        maximum_reads,
-    })? {
-        DebugProbeReply::RttData(data) => data,
-        _ => return Err(unexpected_reply("read SystemView RTT data")),
-    };
-    let byte_count = data.len();
-    if let Some(recording) = raw_recording {
-        recording.write_all(&data).map_err(|error| {
-            DebugProbeError::new(
-                DebugProbeErrorKind::Transport,
-                format!("failed to write raw SystemView recording: {error}"),
-            )
-        })?;
-    }
-    let decoded = decoder.push(&data).map_err(|error| {
-        DebugProbeError::new(
-            DebugProbeErrorKind::Transport,
-            format!("failed to decode SystemView stream: {error}"),
-        )
-    })?;
-    for event in decoded {
-        trace_events.publish(event)?;
-    }
+    let mut byte_count = 0_usize;
+    transport.send_streaming(
+        DebugProbeCommand::ReadRttUp {
+            channel_number,
+            maximum_length,
+            maximum_reads,
+        },
+        &mut |reply| {
+            let DebugProbeReply::RttData { data, .. } = reply else {
+                return Err(unexpected_reply("read SystemView RTT data"));
+            };
+            byte_count = byte_count.saturating_add(data.len());
+            if let Some(recording) = raw_recording.as_deref_mut() {
+                recording.write_all(&data).map_err(|error| {
+                    DebugProbeError::new(
+                        DebugProbeErrorKind::Transport,
+                        format!("failed to write raw SystemView recording: {error}"),
+                    )
+                })?;
+            }
+            let decoded = decoder.push(&data).map_err(|error| {
+                DebugProbeError::new(
+                    DebugProbeErrorKind::Transport,
+                    format!("failed to decode SystemView stream: {error}"),
+                )
+            })?;
+            for event in decoded {
+                trace_events.publish(event)?;
+            }
+            Ok(())
+        },
+    )?;
     Ok(byte_count)
 }
 
@@ -939,7 +960,7 @@ fn read_rtt_terminal(
         maximum_length: RTT_READ_SIZE,
         maximum_reads: 1,
     })? {
-        DebugProbeReply::RttData(data) => data,
+        DebugProbeReply::RttData { data, .. } => data,
         _ => return Err(unexpected_reply("read plain RTT terminal data")),
     };
     let byte_count = data.len();
@@ -2330,6 +2351,12 @@ mod tests {
         shutdown: Arc<Mutex<bool>>,
     }
 
+    struct ObservingStreamingTransport {
+        chunks: VecDeque<Vec<u8>>,
+        receiver: Receiver<LiveTraceUpdate>,
+        chunks_observed: usize,
+    }
+
     impl ProbeCommandTransport for FakeTransport {
         fn send(&mut self, command: DebugProbeCommand) -> Result<DebugProbeReply, DebugProbeError> {
             self.commands
@@ -2343,6 +2370,36 @@ mod tests {
 
         fn shutdown(self) -> Result<(), DebugProbeError> {
             *self.shutdown.lock().expect("shutdown flag is available") = true;
+            Ok(())
+        }
+    }
+
+    impl ProbeCommandTransport for ObservingStreamingTransport {
+        fn send(
+            &mut self,
+            _command: DebugProbeCommand,
+        ) -> Result<DebugProbeReply, DebugProbeError> {
+            panic!("streaming test must use send_streaming")
+        }
+
+        fn send_streaming(
+            &mut self,
+            _command: DebugProbeCommand,
+            publish: &mut dyn FnMut(DebugProbeReply) -> Result<(), DebugProbeError>,
+        ) -> Result<(), DebugProbeError> {
+            while let Some(data) = self.chunks.pop_front() {
+                let more = !self.chunks.is_empty();
+                publish(DebugProbeReply::RttData { data, more })?;
+                assert!(matches!(
+                    self.receiver.try_recv(),
+                    Ok(LiveTraceUpdate::Event(_))
+                ));
+                self.chunks_observed += 1;
+            }
+            Ok(())
+        }
+
+        fn shutdown(self) -> Result<(), DebugProbeError> {
             Ok(())
         }
     }
@@ -2445,6 +2502,33 @@ mod tests {
             systemview_rtt_read_batch(&connection_configuration().probe),
             1
         );
+
+        let network_jlink =
+            ProbeSelector::connection_id("wavecraft:jlink-network:192.0.2.43:19020");
+        assert_eq!(
+            systemview_rtt_read_size(&channels, 1, &network_jlink),
+            8 * 1024 - 1
+        );
+        assert_eq!(systemview_rtt_read_batch(&network_jlink), 1);
+    }
+
+    #[test]
+    fn streamed_rtt_chunks_reach_the_timeline_before_the_batch_completes() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut transport = ObservingStreamingTransport {
+            chunks: VecDeque::from([vec![10, 1], vec![17, 1]]),
+            receiver,
+            chunks_observed: 0,
+        };
+        let mut decoder = SystemViewDecoder::default();
+        let mut publisher = TraceEventPublisher::new(sender);
+
+        let bytes =
+            read_and_decode_rtt(&mut transport, 1, 2, 2, &mut decoder, &mut publisher, None)
+                .expect("streamed RTT data decodes");
+
+        assert_eq!(bytes, 4);
+        assert_eq!(transport.chunks_observed, 2);
     }
 
     #[test]
@@ -2966,8 +3050,14 @@ mod tests {
         let shutdown = Arc::new(Mutex::new(false));
         let mut transport = FakeTransport {
             replies: VecDeque::from([
-                Ok(DebugProbeReply::RttData(b"boot ".to_vec())),
-                Ok(DebugProbeReply::RttData(b"ready\r\n".to_vec())),
+                Ok(DebugProbeReply::RttData {
+                    data: b"boot ".to_vec(),
+                    more: false,
+                }),
+                Ok(DebugProbeReply::RttData {
+                    data: b"ready\r\n".to_vec(),
+                    more: false,
+                }),
             ]),
             commands: Arc::clone(&commands),
             shutdown,
@@ -3259,9 +3349,15 @@ mod tests {
                     down_channel.clone(),
                 ])),
                 Ok(DebugProbeReply::RttBytesWritten(1)),
-                Ok(DebugProbeReply::RttData(vec![10, 3, 4, 7, 2])),
+                Ok(DebugProbeReply::RttData {
+                    data: vec![10, 3, 4, 7, 2],
+                    more: false,
+                }),
                 Ok(DebugProbeReply::RttBytesWritten(1)),
-                Ok(DebugProbeReply::RttData(Vec::new())),
+                Ok(DebugProbeReply::RttData {
+                    data: Vec::new(),
+                    more: false,
+                }),
                 Ok(DebugProbeReply::SessionClosed),
             ]),
             commands: Arc::clone(&commands),

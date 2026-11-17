@@ -3,9 +3,10 @@
 use std::io::{self, BufRead, Write};
 
 use wavecraft_debug_probe::{
-    DEBUG_PROBE_HELPER_PROTOCOL_VERSION, DebugProbeCommand, DebugProbeDriver, DebugProbeError,
-    DebugProbeErrorKind, DebugProbeHandle, DebugProbeReply, DebugProbeRequest, DebugProbeResponse,
-    DebugSession, MAX_DEBUG_PROBE_HELPER_MESSAGE_BYTES, MAX_DEBUG_PROBE_TRANSFER_BYTES,
+    DebugProbeCommand, DebugProbeDriver, DebugProbeError, DebugProbeErrorKind, DebugProbeHandle,
+    DebugProbeReply, DebugProbeRequest, DebugProbeResponse, DebugSession,
+    DEBUG_PROBE_HELPER_PROTOCOL_VERSION, MAX_DEBUG_PROBE_HELPER_MESSAGE_BYTES,
+    MAX_DEBUG_PROBE_TRANSFER_BYTES,
 };
 
 /// Runs one stateful helper session until shutdown or end-of-input.
@@ -47,29 +48,44 @@ pub fn serve(
             }
         };
         let request_id = request.request_id;
-        let (response, shutdown) =
-            if request.protocol_version != DEBUG_PROBE_HELPER_PROTOCOL_VERSION {
-                (
-                    DebugProbeResponse::error(
-                        request_id,
-                        DebugProbeError::new(
-                            DebugProbeErrorKind::Unsupported,
-                            format!(
-                                "unsupported debug-probe helper protocol version {}; expected {}",
-                                request.protocol_version, DEBUG_PROBE_HELPER_PROTOCOL_VERSION
-                            ),
+        if request.protocol_version != DEBUG_PROBE_HELPER_PROTOCOL_VERSION {
+            write_response(
+                &mut writer,
+                &DebugProbeResponse::error(
+                    request_id,
+                    DebugProbeError::new(
+                        DebugProbeErrorKind::Unsupported,
+                        format!(
+                            "unsupported debug-probe helper protocol version {}; expected {}",
+                            request.protocol_version, DEBUG_PROBE_HELPER_PROTOCOL_VERSION
                         ),
                     ),
-                    false,
-                )
-            } else {
-                let shutdown = request.command == DebugProbeCommand::Shutdown;
-                let response = match server.execute(request.command) {
-                    Ok(reply) => DebugProbeResponse::success(request_id, reply),
-                    Err(error) => DebugProbeResponse::error(request_id, error),
-                };
-                (response, shutdown)
-            };
+                ),
+            )?;
+            continue;
+        }
+        if let DebugProbeCommand::ReadRttUp {
+            channel_number,
+            maximum_length,
+            maximum_reads,
+        } = &request.command
+        {
+            if let Err(error) = server.stream_rtt_up(
+                *channel_number,
+                *maximum_length,
+                *maximum_reads,
+                request_id,
+                &mut writer,
+            )? {
+                write_response(&mut writer, &DebugProbeResponse::error(request_id, error))?;
+            }
+            continue;
+        }
+        let shutdown = request.command == DebugProbeCommand::Shutdown;
+        let response = match server.execute(request.command) {
+            Ok(reply) => DebugProbeResponse::success(request_id, reply),
+            Err(error) => DebugProbeResponse::error(request_id, error),
+        };
         write_response(&mut writer, &response)?;
         if shutdown {
             return Ok(());
@@ -89,6 +105,51 @@ enum HelperState {
 }
 
 impl<D: DebugProbeDriver> HelperServer<D> {
+    fn stream_rtt_up(
+        &mut self,
+        channel_number: usize,
+        maximum_length: usize,
+        maximum_reads: usize,
+        request_id: u64,
+        writer: &mut impl Write,
+    ) -> io::Result<Result<(), DebugProbeError>> {
+        if let Err(error) = validate_rtt_read_batch(maximum_length, maximum_reads) {
+            return Ok(Err(error));
+        }
+        let session = match self.session_mut() {
+            Ok(session) => session,
+            Err(error) => return Ok(Err(error)),
+        };
+        let mut data = vec![0; maximum_length];
+        for read_index in 0..maximum_reads {
+            let count = match session.read_rtt_up(channel_number, &mut data) {
+                Ok(count) => count,
+                Err(error) => return Ok(Err(error)),
+            };
+            if count > data.len() {
+                return Ok(Err(DebugProbeError::new(
+                    DebugProbeErrorKind::Transport,
+                    "debug-probe backend returned an invalid RTT byte count",
+                )));
+            }
+            let more = count == maximum_length && read_index + 1 < maximum_reads;
+            write_response(
+                writer,
+                &DebugProbeResponse::success(
+                    request_id,
+                    DebugProbeReply::RttData {
+                        data: data[..count].to_vec(),
+                        more,
+                    },
+                ),
+            )?;
+            if !more {
+                break;
+            }
+        }
+        Ok(Ok(()))
+    }
+
     fn execute(&mut self, command: DebugProbeCommand) -> Result<DebugProbeReply, DebugProbeError> {
         match command {
             DebugProbeCommand::ListProbes => self.driver.list_probes().map(DebugProbeReply::Probes),
@@ -133,37 +194,9 @@ impl<D: DebugProbeDriver> HelperServer<D> {
                 .session_mut()?
                 .attach_rtt(&configuration)
                 .map(DebugProbeReply::RttAttached),
-            DebugProbeCommand::ReadRttUp {
-                channel_number,
-                maximum_length,
-                maximum_reads,
-            } => {
-                validate_transfer_length(maximum_length)?;
-                if maximum_reads == 0 {
-                    return Err(protocol_error("RTT read count must be greater than zero"));
-                }
-                let total_capacity = maximum_length
-                    .checked_mul(maximum_reads)
-                    .ok_or_else(|| protocol_error("RTT read batch length overflowed"))?;
-                validate_transfer_length(total_capacity)?;
-                let session = self.session_mut()?;
-                let mut data = Vec::with_capacity(total_capacity);
-                let mut read_buffer = vec![0; maximum_length];
-                for _ in 0..maximum_reads {
-                    let count = session.read_rtt_up(channel_number, &mut read_buffer)?;
-                    if count > read_buffer.len() {
-                        return Err(DebugProbeError::new(
-                            DebugProbeErrorKind::Transport,
-                            "debug-probe backend returned an invalid RTT byte count",
-                        ));
-                    }
-                    data.extend_from_slice(&read_buffer[..count]);
-                    if count < maximum_length {
-                        break;
-                    }
-                }
-                Ok(DebugProbeReply::RttData(data))
-            }
+            DebugProbeCommand::ReadRttUp { .. } => Err(protocol_error(
+                "RTT reads must be streamed by the helper server",
+            )),
             DebugProbeCommand::WriteRttDown {
                 channel_number,
                 data,
@@ -205,6 +238,20 @@ fn validate_transfer_length(length: usize) -> Result<(), DebugProbeError> {
             ),
         ))
     }
+}
+
+fn validate_rtt_read_batch(
+    maximum_length: usize,
+    maximum_reads: usize,
+) -> Result<(), DebugProbeError> {
+    validate_transfer_length(maximum_length)?;
+    if maximum_reads == 0 {
+        return Err(protocol_error("RTT read count must be greater than zero"));
+    }
+    let total_capacity = maximum_length
+        .checked_mul(maximum_reads)
+        .ok_or_else(|| protocol_error("RTT read batch length overflowed"))?;
+    validate_transfer_length(total_capacity)
 }
 
 enum ReadMessage {
@@ -502,9 +549,10 @@ mod tests {
         );
         assert_eq!(
             responses[7].outcome,
-            wavecraft_debug_probe::DebugProbeResponseOutcome::Success(DebugProbeReply::RttData(
-                vec![1, 2, 3]
-            ))
+            wavecraft_debug_probe::DebugProbeResponseOutcome::Success(DebugProbeReply::RttData {
+                data: vec![1, 2, 3],
+                more: false,
+            })
         );
         assert_eq!(
             responses[8].outcome,
@@ -521,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn batches_consecutive_rtt_reads_before_replying() {
+    fn streams_consecutive_rtt_reads_as_individual_replies() {
         let responses = run_requests([
             DebugProbeCommand::OpenProbe {
                 selector: ProbeSelector::connection_id("1366:0105:1234"),
@@ -539,12 +587,19 @@ mod tests {
             },
         ]);
 
-        assert_eq!(
-            responses[3].outcome,
-            wavecraft_debug_probe::DebugProbeResponseOutcome::Success(DebugProbeReply::RttData(
-                vec![1, 2, 1, 2, 1, 2]
-            ))
-        );
+        assert_eq!(responses.len(), 6);
+        for (index, more) in [true, true, false].into_iter().enumerate() {
+            assert_eq!(responses[index + 3].request_id, 4);
+            assert_eq!(
+                responses[index + 3].outcome,
+                wavecraft_debug_probe::DebugProbeResponseOutcome::Success(
+                    DebugProbeReply::RttData {
+                        data: vec![1, 2],
+                        more,
+                    }
+                )
+            );
+        }
     }
 
     #[test]

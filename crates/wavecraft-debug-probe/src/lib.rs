@@ -19,7 +19,7 @@ pub enum ProbeProvider {
 }
 
 /// Version of the newline-delimited helper protocol shared with probe adapters.
-pub const DEBUG_PROBE_HELPER_PROTOCOL_VERSION: u32 = 3;
+pub const DEBUG_PROBE_HELPER_PROTOCOL_VERSION: u32 = 4;
 
 /// Connection-ID prefix reserved for a J-Link reached through SEGGER's TCP/IP transport.
 pub const JLINK_NETWORK_CONNECTION_ID_PREFIX: &str = "wavecraft:jlink-network:";
@@ -585,7 +585,7 @@ pub enum DebugProbeCommand {
         channel_number: usize,
         /// Maximum bytes requested from the target in one RTT transaction.
         maximum_length: usize,
-        /// Maximum consecutive target reads combined into this helper reply.
+        /// Maximum consecutive target reads served by this streamed helper request.
         maximum_reads: usize,
     },
     WriteRttDown {
@@ -596,7 +596,10 @@ pub enum DebugProbeCommand {
     Shutdown,
 }
 
-/// One response emitted for exactly one helper request.
+/// A response emitted for a helper request.
+///
+/// Most requests emit exactly one response. Streaming RTT reads can emit multiple
+/// responses with the same request ID, ending with `RttData { more: false, .. }`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DebugProbeResponse {
     pub protocol_version: u32,
@@ -640,7 +643,11 @@ pub enum DebugProbeReply {
     MemoryData(Vec<u8>),
     MemoryWritten,
     RttAttached(Vec<RttChannelDescriptor>),
-    RttData(Vec<u8>),
+    RttData {
+        data: Vec<u8>,
+        /// Whether another response for the same request follows.
+        more: bool,
+    },
     RttBytesWritten(usize),
     SessionClosed,
     ShuttingDown,
@@ -666,6 +673,41 @@ impl<R: BufRead, W: Write> DebugProbeProtocolClient<R, W> {
     }
 
     pub fn send(&mut self, command: DebugProbeCommand) -> Result<DebugProbeReply, DebugProbeError> {
+        let is_rtt_read = matches!(command, DebugProbeCommand::ReadRttUp { .. });
+        let mut result = None;
+        let mut rtt_data = Vec::new();
+        self.send_streaming(command, |reply| {
+            match reply {
+                DebugProbeReply::RttData { data, .. } if is_rtt_read => {
+                    rtt_data.extend(data);
+                }
+                reply => result = Some(reply),
+            }
+            Ok(())
+        })?;
+        if is_rtt_read {
+            Ok(DebugProbeReply::RttData {
+                data: rtt_data,
+                more: false,
+            })
+        } else {
+            result.ok_or_else(|| {
+                DebugProbeError::new(
+                    DebugProbeErrorKind::Transport,
+                    "debug-probe helper returned no response",
+                )
+            })
+        }
+    }
+
+    /// Sends one command and publishes every streamed helper reply as soon as
+    /// it arrives. RTT reads can yield multiple replies with the same request
+    /// ID; all other commands yield exactly one.
+    pub fn send_streaming(
+        &mut self,
+        command: DebugProbeCommand,
+        mut publish: impl FnMut(DebugProbeReply) -> Result<(), DebugProbeError>,
+    ) -> Result<(), DebugProbeError> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         let encoded = serde_json::to_vec(&DebugProbeRequest::new(request_id, command))
@@ -682,30 +724,44 @@ impl<R: BufRead, W: Write> DebugProbeProtocolClient<R, W> {
             .and_then(|()| self.writer.flush())
             .map_err(|error| protocol_transport_error("failed to send helper request", error))?;
 
-        let encoded_response = read_bounded_protocol_message(&mut self.reader)?;
-        let response = serde_json::from_slice::<DebugProbeResponse>(&encoded_response)
-            .map_err(|error| protocol_transport_error("invalid helper response", error))?;
-        if response.protocol_version != DEBUG_PROBE_HELPER_PROTOCOL_VERSION {
-            return Err(DebugProbeError::new(
-                DebugProbeErrorKind::Unsupported,
-                format!(
-                    "helper uses protocol version {}; expected {}",
-                    response.protocol_version, DEBUG_PROBE_HELPER_PROTOCOL_VERSION
-                ),
-            ));
-        }
-        if response.request_id != request_id {
-            return Err(DebugProbeError::new(
-                DebugProbeErrorKind::Transport,
-                format!(
-                    "helper response ID {} does not match request ID {request_id}",
-                    response.request_id
-                ),
-            ));
-        }
-        match response.outcome {
-            DebugProbeResponseOutcome::Success(reply) => Ok(reply),
-            DebugProbeResponseOutcome::Error(error) => Err(error),
+        let mut publish_error = None;
+        loop {
+            let encoded_response = read_bounded_protocol_message(&mut self.reader)?;
+            let response = serde_json::from_slice::<DebugProbeResponse>(&encoded_response)
+                .map_err(|error| protocol_transport_error("invalid helper response", error))?;
+            if response.protocol_version != DEBUG_PROBE_HELPER_PROTOCOL_VERSION {
+                return Err(DebugProbeError::new(
+                    DebugProbeErrorKind::Unsupported,
+                    format!(
+                        "helper uses protocol version {}; expected {}",
+                        response.protocol_version, DEBUG_PROBE_HELPER_PROTOCOL_VERSION
+                    ),
+                ));
+            }
+            if response.request_id != request_id {
+                return Err(DebugProbeError::new(
+                    DebugProbeErrorKind::Transport,
+                    format!(
+                        "helper response ID {} does not match request ID {request_id}",
+                        response.request_id
+                    ),
+                ));
+            }
+            let reply = match response.outcome {
+                DebugProbeResponseOutcome::Success(reply) => reply,
+                DebugProbeResponseOutcome::Error(error) => return Err(error),
+            };
+            let more = matches!(&reply, DebugProbeReply::RttData { more: true, .. });
+            if publish_error.is_none() {
+                if let Err(error) = publish(reply) {
+                    // Keep draining this request so the next command cannot
+                    // consume a remaining chunk with the previous request ID.
+                    publish_error = Some(error);
+                }
+            }
+            if !more {
+                return publish_error.map_or(Ok(()), Err);
+            }
         }
     }
 
@@ -1046,7 +1102,7 @@ mod tests {
 
         assert_eq!(
             encoded,
-            r#"{"protocol_version":3,"request_id":7,"command":{"command":"list_probes"}}"#
+            r#"{"protocol_version":4,"request_id":7,"command":{"command":"list_probes"}}"#
         );
         assert_eq!(
             serde_json::from_str::<DebugProbeRequest>(&encoded).expect("request deserializes"),
@@ -1056,7 +1112,13 @@ mod tests {
 
     #[test]
     fn helper_responses_round_trip_successes_and_errors() {
-        let success = DebugProbeResponse::success(4, DebugProbeReply::RttData(vec![0, 127, 255]));
+        let success = DebugProbeResponse::success(
+            4,
+            DebugProbeReply::RttData {
+                data: vec![0, 127, 255],
+                more: false,
+            },
+        );
         let failure = DebugProbeResponse::error(
             5,
             DebugProbeError::new(DebugProbeErrorKind::Busy, "probe is already open"),
@@ -1070,6 +1132,52 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn protocol_client_publishes_rtt_chunks_before_the_stream_completes() {
+        let responses = [
+            DebugProbeResponse::success(
+                1,
+                DebugProbeReply::RttData {
+                    data: vec![1, 2],
+                    more: true,
+                },
+            ),
+            DebugProbeResponse::success(
+                1,
+                DebugProbeReply::RttData {
+                    data: vec![3],
+                    more: false,
+                },
+            ),
+        ];
+        let mut input = Vec::new();
+        for response in responses {
+            serde_json::to_writer(&mut input, &response).expect("response serializes");
+            input.push(b'\n');
+        }
+        let mut client = DebugProbeProtocolClient::new(Cursor::new(input), Vec::new());
+        let mut chunks = Vec::new();
+
+        client
+            .send_streaming(
+                DebugProbeCommand::ReadRttUp {
+                    channel_number: 1,
+                    maximum_length: 2,
+                    maximum_reads: 2,
+                },
+                |reply| {
+                    let DebugProbeReply::RttData { data, .. } = reply else {
+                        panic!("RTT stream returned another reply type");
+                    };
+                    chunks.push(data);
+                    Ok(())
+                },
+            )
+            .expect("RTT stream succeeds");
+
+        assert_eq!(chunks, [vec![1, 2], vec![3]]);
     }
 
     #[test]

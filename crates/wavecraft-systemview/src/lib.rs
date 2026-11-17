@@ -82,6 +82,7 @@ pub struct SystemViewDecoder {
     core_id: u32,
     next_sequence: u64,
     timestamp_ticks: u64,
+    last_target_drop_count: Option<u64>,
     max_packet_size: usize,
 }
 
@@ -98,6 +99,7 @@ impl SystemViewDecoder {
             core_id,
             next_sequence: 0,
             timestamp_ticks: 0,
+            last_target_drop_count: None,
             max_packet_size: max_packet_size.max(1),
         }
     }
@@ -109,6 +111,7 @@ impl SystemViewDecoder {
         self.awaiting_sync = true;
         self.next_sequence = 0;
         self.timestamp_ticks = 0;
+        self.last_target_drop_count = None;
     }
 
     pub fn pending_bytes(&self) -> usize {
@@ -177,11 +180,31 @@ impl SystemViewDecoder {
 
             self.buffer.drain(..packet.consumed);
             self.timestamp_ticks = self.timestamp_ticks.saturating_add(packet.timestamp_delta);
+            let kind = match packet.kind {
+                TraceEventKind::Overflow { dropped_events } => {
+                    // SEGGER sends DropCount as a cumulative counter and does
+                    // not clear it after an overflow packet is delivered.
+                    // TraceEvent consumers expect the number newly lost at
+                    // this point in the stream, so convert the counter here.
+                    let newly_dropped =
+                        self.last_target_drop_count
+                            .map_or(dropped_events, |previous| {
+                                dropped_events
+                                    .checked_sub(previous)
+                                    .unwrap_or(dropped_events)
+                            });
+                    self.last_target_drop_count = Some(dropped_events);
+                    TraceEventKind::Overflow {
+                        dropped_events: newly_dropped,
+                    }
+                }
+                kind => kind,
+            };
             events.push(TraceEvent {
                 sequence: self.next_sequence,
                 core_id: self.core_id,
                 timestamp_ticks: self.timestamp_ticks,
-                kind: packet.kind,
+                kind,
             });
             self.next_sequence = self.next_sequence.saturating_add(1);
         }
@@ -762,6 +785,33 @@ mod tests {
                 .map(|event| event.timestamp_ticks)
                 .collect::<Vec<_>>(),
             [5, 135, 137]
+        );
+    }
+
+    #[test]
+    fn converts_cumulative_target_drop_counts_to_event_deltas() {
+        let mut stream = compact_packet(1, &encode_varint(12), 5);
+        stream.extend(compact_packet(1, &encode_varint(19), 3));
+        stream.extend(compact_packet(1, &encode_varint(4), 2));
+        let mut decoder = SystemViewDecoder::default();
+
+        let events = decoder.push(&stream).expect("overflow packets decode");
+
+        assert_eq!(
+            events.iter().map(|event| &event.kind).collect::<Vec<_>>(),
+            [
+                &TraceEventKind::Overflow { dropped_events: 12 },
+                &TraceEventKind::Overflow { dropped_events: 7 },
+                &TraceEventKind::Overflow { dropped_events: 4 },
+            ]
+        );
+        decoder.reset();
+        assert_eq!(
+            decoder
+                .push(&compact_packet(1, &encode_varint(9), 1))
+                .expect("overflow after reset decodes")[0]
+                .kind,
+            TraceEventKind::Overflow { dropped_events: 9 }
         );
     }
 

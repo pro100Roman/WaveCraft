@@ -104,6 +104,14 @@ impl DebugProbeHelperProcess {
         self.client.send(command)
     }
 
+    pub(crate) fn send_streaming(
+        &mut self,
+        command: DebugProbeCommand,
+        publish: impl FnMut(DebugProbeReply) -> Result<(), DebugProbeError>,
+    ) -> Result<(), DebugProbeError> {
+        self.client.send_streaming(command, publish)
+    }
+
     pub(crate) fn shutdown(mut self) -> Result<(), DebugProbeError> {
         let result = self.client.send(DebugProbeCommand::Shutdown).map(|_| ());
         if let Some(mut child) = self.child.take() {
