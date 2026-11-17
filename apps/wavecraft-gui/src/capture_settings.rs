@@ -46,12 +46,20 @@ pub(crate) struct GlobalSettings {
     pub(crate) system_trace_event_view_order: Option<Vec<SavedTraceEventView>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_trace_instrument_order: Option<Vec<SavedTraceInstrument>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) system_trace_instrument_heights: Option<SavedTraceInstrumentHeights>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub(crate) struct SavedWindowSize {
     pub(crate) width: u32,
     pub(crate) height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub(crate) struct SavedTraceInstrumentHeights {
+    pub(crate) timeline: u32,
+    pub(crate) analysis: u32,
 }
 
 /// Stable persisted names for views, independent of the GUI enum layout.

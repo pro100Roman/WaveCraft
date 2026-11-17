@@ -7,8 +7,9 @@ use crate::{
     saved_logic_settings_metadata, saved_radio_settings_metadata, saved_scope_settings_metadata,
     scope_settings_from_recording_metadata, waveform_tabs, AcquisitionMode, CaptureSettingsProfile,
     CaptureSettingsTab, CombinedSessionSettings, DeviceModel, LogicSessionSettings,
-    SavedCaptureSettingsKind, SavedTraceEventView, SavedTraceInstrument, SavedWorkspaceView,
-    ScopeSessionSettings, WaveformTab, WorkspaceView,
+    SavedCaptureSettingsKind, SavedTraceEventView, SavedTraceInstrument,
+    SavedTraceInstrumentHeights, SavedWorkspaceView, ScopeSessionSettings, WaveformTab,
+    WorkspaceView,
 };
 use std::time::Instant;
 
@@ -153,6 +154,10 @@ impl WaveCraftApp {
             .copied()
             .map(SavedTraceInstrument::from)
             .collect::<Vec<_>>();
+        let instrument_heights = SavedTraceInstrumentHeights {
+            timeline: self.system_trace.timeline_view_height().round() as u32,
+            analysis: self.system_trace.event_view_height().round() as u32,
+        };
         if self.saved_capture_settings.global.last_active_view == Some(saved_view)
             && self.saved_capture_settings.global.window_inner_size == window_inner_size
             && self
@@ -173,6 +178,11 @@ impl WaveCraftApp {
                 .system_trace_instrument_order
                 .as_deref()
                 == Some(instrument_order.as_slice())
+            && self
+                .saved_capture_settings
+                .global
+                .system_trace_instrument_heights
+                == Some(instrument_heights)
         {
             return;
         }
@@ -183,6 +193,7 @@ impl WaveCraftApp {
         document.global.workspace_view_order = Some(workspace_view_order);
         document.global.system_trace_event_view_order = Some(event_view_order);
         document.global.system_trace_instrument_order = Some(instrument_order);
+        document.global.system_trace_instrument_heights = Some(instrument_heights);
         let result = self
             .capture_settings_repository
             .as_ref()
@@ -232,6 +243,14 @@ impl WaveCraftApp {
                 .map(TraceInstrument::from)
                 .collect::<Vec<_>>();
             self.system_trace.set_trace_instrument_order(&order);
+        }
+        if let Some(heights) = self
+            .saved_capture_settings
+            .global
+            .system_trace_instrument_heights
+        {
+            self.system_trace
+                .set_trace_instrument_heights(heights.timeline as f32, heights.analysis as f32);
         }
         if let Some(profile) = self.saved_capture_settings.profiles.logic_analyzer.as_ref() {
             self.logic_settings = logic_settings_from_recording_metadata(&profile.values);
@@ -694,6 +713,7 @@ mod tests {
         assert!(app
             .system_trace
             .set_trace_instrument_order(&instrument_order));
+        assert!(app.system_trace.set_trace_instrument_heights(420.0, 280.0));
 
         app.save_global_settings();
 
@@ -704,6 +724,8 @@ mod tests {
             restored.system_trace.trace_instrument_order(),
             &instrument_order
         );
+        assert_eq!(restored.system_trace.timeline_view_height(), 420.0);
+        assert_eq!(restored.system_trace.event_view_height(), 280.0);
         remove_test_repository(&repository);
     }
 

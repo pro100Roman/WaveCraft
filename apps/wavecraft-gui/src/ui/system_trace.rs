@@ -58,6 +58,20 @@ const TRACE_EVENT_ROW_FILLS: [egui::Color32; 2] = [
     egui::Color32::from_rgb(15, 21, 30),
     egui::Color32::from_rgb(20, 27, 38),
 ];
+const TIMELINE_LANE_COLORS: [egui::Color32; 12] = [
+    egui::Color32::from_rgb(255, 204, 74),
+    egui::Color32::from_rgb(99, 179, 255),
+    egui::Color32::from_rgb(213, 126, 255),
+    egui::Color32::from_rgb(255, 145, 77),
+    egui::Color32::from_rgb(70, 210, 185),
+    egui::Color32::from_rgb(255, 105, 180),
+    egui::Color32::from_rgb(166, 227, 86),
+    egui::Color32::from_rgb(84, 216, 255),
+    egui::Color32::from_rgb(255, 107, 107),
+    egui::Color32::from_rgb(160, 150, 255),
+    egui::Color32::from_rgb(94, 214, 121),
+    egui::Color32::from_rgb(255, 184, 92),
+];
 const TARGET_DROPDOWN_RESULT_LIMIT: usize = 200;
 const DEFAULT_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 1_000_000;
 const MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 10_000_000_000;
@@ -1573,6 +1587,9 @@ fn paint_trace_instrument_splitter(ui: &mut egui::Ui, trace: &mut SystemTraceDis
     if response.dragged() {
         trace.move_trace_instrument_splitter(ui.input(|input| input.pointer.delta().y));
     }
+    if response.drag_stopped() {
+        trace.finish_trace_instrument_resize();
+    }
 }
 
 fn paint_trace_summary(ui: &mut egui::Ui, trace: &SystemTraceDisplayState) {
@@ -2279,7 +2296,7 @@ fn paint_timeline_canvas(
                     });
                 }
             }
-            plot_painter.rect_filled(interval_rect, 2.0, context_color(lane.context));
+            plot_painter.rect_filled(interval_rect, 2.0, timeline_lane_color(lane_index));
             if interval_selected {
                 plot_painter.rect_filled(interval_rect, 2.0, TRACE_SELECTION_FILL);
             }
@@ -2375,7 +2392,7 @@ fn paint_timeline_canvas(
                 continue;
             }
             painted_through_x = painted_through_x.max(interval_rect.right());
-            let color = marker_color(interval.marker_id);
+            let color = timeline_lane_color(lane_index);
             plot_painter.rect_filled(interval_rect, 2.0, color);
             if interval_selected {
                 plot_painter.rect_filled(interval_rect, 2.0, TRACE_SELECTION_FILL);
@@ -2687,7 +2704,7 @@ fn paint_timeline_smart_timing_hint(
         ),
         egui::pos2(plot_right.min(clip.right()), canvas.bottom()),
     );
-    let color = context_color(first.context);
+    let color = execution_lane_color(trace.model(), first.core_id, first.context);
     let hover_color = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 128);
     painter.rect_filled(
         egui::Rect::from_min_max(
@@ -2924,7 +2941,7 @@ fn paint_sticky_timeline_labels(
             egui::Align2::LEFT_CENTER,
             context_label(model, *lane),
             egui::FontId::monospace(11.0),
-            TEXT_MUTED,
+            timeline_lane_color(lane_index),
         );
     }
     for (marker_lane_index, lane) in marker_lanes.iter().enumerate() {
@@ -2943,7 +2960,7 @@ fn paint_sticky_timeline_labels(
             egui::Align2::LEFT_CENTER,
             marker_lane_label(trace, *lane),
             egui::FontId::monospace(11.0),
-            marker_color(lane.marker_id),
+            timeline_lane_color(lane_index),
         );
     }
 }
@@ -3022,8 +3039,19 @@ fn marker_lane_label(trace: &SystemTraceDisplayState, lane: MarkerTimelineLane) 
     format!("C{}  {marker}", lane.core_id)
 }
 
-fn marker_color(marker_id: u64) -> egui::Color32 {
-    SCOPE_COLORS[(marker_id as usize) % SCOPE_COLORS.len()]
+fn timeline_lane_color(lane_index: usize) -> egui::Color32 {
+    TIMELINE_LANE_COLORS[lane_index % TIMELINE_LANE_COLORS.len()]
+}
+
+fn execution_lane_color(
+    model: &TraceModel,
+    core_id: u32,
+    context: ExecutionContext,
+) -> egui::Color32 {
+    timeline_lanes(model)
+        .iter()
+        .position(|lane| lane.core_id == core_id && lane.context == context)
+        .map_or_else(|| context_color(context), timeline_lane_color)
 }
 
 fn paint_event_instrument(
@@ -6259,6 +6287,30 @@ mod tests {
             format_timeline_time_per_division(1.0, Some(1_000_000)),
             "1.00 µs/div"
         );
+    }
+
+    #[test]
+    fn timeline_lane_palette_is_stable_distinct_and_visible_on_the_background() {
+        assert_eq!(
+            timeline_lane_color(0),
+            egui::Color32::from_rgb(255, 204, 74)
+        );
+        assert_eq!(
+            timeline_lane_color(1),
+            egui::Color32::from_rgb(99, 179, 255)
+        );
+        for lane_index in 0..TIMELINE_LANE_COLORS.len() * 2 {
+            assert_ne!(
+                timeline_lane_color(lane_index),
+                timeline_lane_color(lane_index + 1)
+            );
+        }
+        for color in TIMELINE_LANE_COLORS {
+            let brightness = u16::from(color.r()) + u16::from(color.g()) + u16::from(color.b());
+            let background_brightness =
+                u16::from(BACKGROUND.r()) + u16::from(BACKGROUND.g()) + u16::from(BACKGROUND.b());
+            assert!(brightness > background_brightness + 300);
+        }
     }
 
     #[test]

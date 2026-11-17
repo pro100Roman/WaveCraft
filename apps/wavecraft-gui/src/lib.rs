@@ -30,7 +30,8 @@ use acquisition::radio_backend::*;
 use acquisition::scope::*;
 use capture_settings::{
     CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository,
-    SavedTraceEventView, SavedTraceInstrument, SavedWindowSize, SavedWorkspaceView,
+    SavedTraceEventView, SavedTraceInstrument, SavedTraceInstrumentHeights, SavedWindowSize,
+    SavedWorkspaceView,
 };
 use debug_probes::*;
 use devices::{
@@ -615,6 +616,7 @@ impl eframe::App for WaveCraftApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_pending_window_size();
+        self.save_global_settings();
         self.system_trace.cleanup_temporary_history();
     }
 }
