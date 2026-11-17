@@ -73,7 +73,7 @@ const TIMELINE_LANE_COLORS: [egui::Color32; 12] = [
     egui::Color32::from_rgb(255, 184, 92),
 ];
 const TARGET_DROPDOWN_RESULT_LIMIT: usize = 200;
-const CONNECTION_STATUS_FONT_SIZE: f32 = 9.0;
+const CONNECTION_STATUS_FONT_SIZE: f32 = 10.0;
 const DEFAULT_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 1_000_000;
 const MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 10_000_000_000;
 const APPLICATION_ELF_HELP: &str = "Resolves _SEGGER_RTT, resource symbols, and .sv-data messages";
