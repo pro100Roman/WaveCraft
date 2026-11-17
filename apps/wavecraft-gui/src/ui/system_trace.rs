@@ -3,10 +3,10 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::system_trace::{
-    choose_systemview_description, choose_systemview_elf, choose_systemview_history_save_path,
-    choose_systemview_recording_path, choose_systemview_trace_to_open, read_systemview_description,
-    read_systemview_elf, SystemTraceAction, SystemTraceConnectionConfiguration,
-    SystemTraceConnectionState,
+    api_event_id, choose_systemview_description, choose_systemview_elf,
+    choose_systemview_history_save_path, choose_systemview_recording_path,
+    choose_systemview_trace_to_open, read_systemview_description, read_systemview_elf,
+    SystemTraceAction, SystemTraceConnectionConfiguration, SystemTraceConnectionState,
 };
 use crate::system_trace::{
     EventFilterCacheKey, ProbeLogEntry, ProbeLogLevel, SystemTraceDisplayState, TimelineTimingEdge,
@@ -32,6 +32,8 @@ use wavecraft_trace::{
 };
 
 const TIMELINE_LABEL_WIDTH: f32 = 150.0;
+const TIMELINE_MINIMUM_PLOT_WIDTH: f32 = 120.0;
+const TIMELINE_LABEL_SPLITTER_WIDTH: f32 = 8.0;
 const TIMELINE_HEADER_HEIGHT: f32 = 24.0;
 const TIMELINE_ROW_HEIGHT: f32 = 25.0;
 const TIMELINE_SCALE_STEP: f64 = 1.5;
@@ -1793,7 +1795,7 @@ fn paint_timeline_instrument(
             paint_trace_instrument_drag_handle(ui, trace, TraceInstrument::Timeline, "TIMELINE");
             ui.label(RichText::new("TIMELINE").strong().color(ACCENT));
             ui.label(
-                RichText::new("Task, ISR, timer, marker, scheduler, and idle intervals")
+                RichText::new("Task, ISR, timer, marker, scheduler, idle, and API events")
                     .color(TEXT_MUTED),
             );
         });
@@ -1802,8 +1804,11 @@ fn paint_timeline_instrument(
         let has_trace_data = time_bounds.is_some();
         let (trace_start_ticks, trace_end_ticks) = time_bounds.unwrap_or((0, 1));
         let frequency_hz = trace_system_frequency_hz(trace, timestamp_frequency_override_hz);
+        let timeline_label_width = trace
+            .timeline_label_width()
+            .min((ui.available_width() - TIMELINE_MINIMUM_PLOT_WIDTH).max(80.0));
         let time_divisions =
-            timeline_grid_division_count((ui.available_width() - TIMELINE_LABEL_WIDTH).max(1.0));
+            timeline_grid_division_count((ui.available_width() - timeline_label_width).max(1.0));
         let time_scale = TimelineTimeScale::new(
             trace_start_ticks,
             trace_end_ticks,
@@ -1918,11 +1923,12 @@ fn paint_timeline_instrument(
 
         let lanes = timeline_lanes(trace.model());
         let marker_lanes = timeline_marker_lanes(trace.model());
-        if lanes.is_empty() && marker_lanes.is_empty() {
+        let api_lanes = timeline_api_lanes(trace);
+        if lanes.is_empty() && marker_lanes.is_empty() && api_lanes.is_empty() {
             paint_trace_empty_state(
                 ui,
-                "No execution intervals yet",
-                "Trace metadata and non-execution events are available in the event stream below.",
+                "No timeline events yet",
+                "Trace metadata is available in the event stream below.",
                 timeline_height,
             );
             return;
@@ -1944,7 +1950,8 @@ fn paint_timeline_instrument(
             .show(ui, |ui| {
                 timeline_scroll.show(ui, |ui| {
                     let canvas_width = ui.available_width();
-                    let canvas_height = timeline_canvas_height(lanes.len() + marker_lanes.len());
+                    let canvas_height =
+                        timeline_canvas_height(lanes.len() + marker_lanes.len() + api_lanes.len());
                     let (canvas, canvas_response) = ui.allocate_exact_size(
                         egui::vec2(canvas_width, canvas_height),
                         egui::Sense::click_and_drag(),
@@ -1956,6 +1963,7 @@ fn paint_timeline_instrument(
                         TimelineLanes {
                             contexts: &lanes,
                             markers: &marker_lanes,
+                            api_events: &api_lanes,
                         },
                         start_ticks,
                         end_ticks,
@@ -1965,9 +1973,11 @@ fn paint_timeline_instrument(
                             time_display: trace.time_display,
                             recording_start_ticks: trace_start_ticks,
                             time_divisions,
+                            label_width: timeline_label_width,
                         },
                     );
-                    let wheel_delta = take_timeline_horizontal_scroll(ui, canvas);
+                    let wheel_delta =
+                        take_timeline_horizontal_scroll(ui, canvas, timeline_label_width);
                     (canvas.top(), clicked_sequence, canvas_response, wheel_delta)
                 })
             })
@@ -1976,17 +1986,20 @@ fn paint_timeline_instrument(
         let timeline_pointer = ui.input(|input| {
             input.pointer.hover_pos().filter(|position| {
                 timeline.inner_rect.contains(*position)
-                    && position.x >= timeline.inner_rect.left() + TIMELINE_LABEL_WIDTH
+                    && position.x >= timeline.inner_rect.left() + timeline_label_width
             })
         });
-        let drag_delta_x = if timeline.inner.2.dragged() && !trace.timeline_timing_dragging() {
+        let drag_delta_x = if timeline.inner.2.dragged()
+            && timeline_pointer.is_some()
+            && !trace.timeline_timing_dragging()
+        {
             ui.input(|input| input.pointer.delta().x)
         } else {
             0.0
         };
         let pan_delta_x = drag_delta_x + timeline.inner.3;
         if pan_delta_x.abs() > f32::EPSILON {
-            let plot_width = (timeline.inner_rect.width() - TIMELINE_LABEL_WIDTH).max(1.0);
+            let plot_width = (timeline.inner_rect.width() - timeline_label_width).max(1.0);
             let visible_ticks = end_ticks.saturating_sub(start_ticks).max(1) as f64;
             let tick_delta = -f64::from(pan_delta_x) / f64::from(plot_width) * visible_ticks;
             trace.set_timeline_view_start_ticks(Some(time_scale.pan_start(
@@ -2008,9 +2021,9 @@ fn paint_timeline_instrument(
                 }
             });
             if (zoom_delta - 1.0).abs() > f32::EPSILON {
-                let plot_width = (timeline.inner_rect.width() - TIMELINE_LABEL_WIDTH).max(1.0);
+                let plot_width = (timeline.inner_rect.width() - timeline_label_width).max(1.0);
                 let pointer_fraction =
-                    ((pointer.x - timeline.inner_rect.left() - TIMELINE_LABEL_WIDTH) / plot_width)
+                    ((pointer.x - timeline.inner_rect.left() - timeline_label_width) / plot_width)
                         .clamp(0.0, 1.0);
                 set_timeline_time_scale(
                     trace,
@@ -2026,10 +2039,15 @@ fn paint_timeline_instrument(
             timeline.inner_rect,
             timeline.inner.0,
             trace.model(),
-            &lanes,
-            &marker_lanes,
+            TimelineLanes {
+                contexts: &lanes,
+                markers: &marker_lanes,
+                api_events: &api_lanes,
+            },
             trace,
+            timeline_label_width,
         );
+        paint_timeline_label_splitter(ui, timeline.inner_rect, trace);
         if let Some(sequence) = timeline.inner.1 {
             trace.select_from_timeline(sequence);
         }
@@ -2041,10 +2059,10 @@ fn timeline_canvas_height(lane_count: usize) -> f32 {
         .max(TIMELINE_SMART_TIMING_HINT_HEIGHT + 8.0)
 }
 
-fn take_timeline_horizontal_scroll(ui: &egui::Ui, canvas: egui::Rect) -> f32 {
+fn take_timeline_horizontal_scroll(ui: &egui::Ui, canvas: egui::Rect, label_width: f32) -> f32 {
     ui.input_mut(|input| {
         let pointer_is_over_plot = input.pointer.hover_pos().is_some_and(|pointer| {
-            canvas.contains(pointer) && pointer.x >= canvas.left() + TIMELINE_LABEL_WIDTH
+            canvas.contains(pointer) && pointer.x >= canvas.left() + label_width
         });
         let native_zoom_active = (input.zoom_delta() - 1.0).abs() > f32::EPSILON;
         if !pointer_is_over_plot || input.modifiers.alt || native_zoom_active {
@@ -2063,8 +2081,8 @@ fn take_timeline_horizontal_scroll(ui: &egui::Ui, canvas: egui::Rect) -> f32 {
     })
 }
 
-fn timeline_plot_clip(canvas: egui::Rect, viewport: egui::Rect) -> egui::Rect {
-    let fixed_plot_left = (viewport.left() + TIMELINE_LABEL_WIDTH).min(viewport.right());
+fn timeline_plot_clip(canvas: egui::Rect, viewport: egui::Rect, label_width: f32) -> egui::Rect {
+    let fixed_plot_left = (viewport.left() + label_width).min(viewport.right());
     canvas.intersect(egui::Rect::from_min_max(
         egui::pos2(fixed_plot_left, canvas.top()),
         egui::pos2(viewport.right(), canvas.bottom()),
@@ -2223,10 +2241,17 @@ struct MarkerTimelineLane {
     marker_id: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ApiTimelineLane {
+    core_id: u32,
+    event_id: u32,
+}
+
 #[derive(Clone, Copy)]
 struct TimelineLanes<'a> {
     contexts: &'a [TimelineLane],
     markers: &'a [MarkerTimelineLane],
+    api_events: &'a [ApiTimelineLane],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2247,13 +2272,27 @@ struct TimelineIntervalPosition {
     rect: egui::Rect,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct TimelineCanvasOptions {
     selected_timestamp: Option<u64>,
     timestamp_frequency_override_hz: Option<u64>,
     time_display: TraceTimeDisplay,
     recording_start_ticks: u64,
     time_divisions: usize,
+    label_width: f32,
+}
+
+impl Default for TimelineCanvasOptions {
+    fn default() -> Self {
+        Self {
+            selected_timestamp: None,
+            timestamp_frequency_override_hz: None,
+            time_display: TraceTimeDisplay::default(),
+            recording_start_ticks: 0,
+            time_divisions: 0,
+            label_width: TIMELINE_LABEL_WIDTH,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2313,6 +2352,37 @@ fn timeline_marker_lanes(model: &TraceModel) -> Vec<MarkerTimelineLane> {
     lanes
 }
 
+fn timeline_api_lanes(trace: &SystemTraceDisplayState) -> Vec<ApiTimelineLane> {
+    trace
+        .api_event_lanes()
+        .map(|(core_id, event_id)| ApiTimelineLane { core_id, event_id })
+        .collect()
+}
+
+fn visible_api_event_indices(
+    events: &VecDeque<TraceEvent>,
+    start_ticks: u64,
+    end_ticks: u64,
+) -> BTreeMap<ApiTimelineLane, Vec<usize>> {
+    let mut visible = BTreeMap::<ApiTimelineLane, Vec<usize>>::new();
+    let first_index = lower_bound_event_timestamp(events, start_ticks);
+    for (event_index, event) in events.iter().enumerate().skip(first_index) {
+        if event.timestamp_ticks > end_ticks {
+            break;
+        }
+        if let Some(event_id) = api_event_id(&event.kind) {
+            visible
+                .entry(ApiTimelineLane {
+                    core_id: event.core_id,
+                    event_id,
+                })
+                .or_default()
+                .push(event_index);
+        }
+    }
+    visible
+}
+
 fn paint_timeline_canvas(
     ui: &egui::Ui,
     canvas: egui::Rect,
@@ -2324,16 +2394,18 @@ fn paint_timeline_canvas(
 ) -> Option<u64> {
     let lanes = timeline_lanes.contexts;
     let marker_lanes = timeline_lanes.markers;
+    let api_lanes = timeline_lanes.api_events;
     let model = trace.model();
     let painter = ui.painter().with_clip_rect(canvas);
     let viewport = ui.clip_rect();
-    let plot_clip = timeline_plot_clip(canvas, viewport);
+    let plot_clip = timeline_plot_clip(canvas, viewport, options.label_width);
     let plot_painter = painter.with_clip_rect(plot_clip);
-    let plot_left = canvas.left() + TIMELINE_LABEL_WIDTH;
+    let plot_left = canvas.left() + options.label_width;
     let plot_right = canvas.right();
     let plot_width = (plot_right - plot_left).max(1.0);
     let duration = end_ticks.saturating_sub(start_ticks).max(1);
     let lane_interval_indices = timeline_lane_interval_indices(model);
+    let visible_api_events = visible_api_event_indices(trace.events(), start_ticks, end_ticks);
 
     painter.rect_filled(canvas, 3.0, BACKGROUND);
     plot_painter.line_segment(
@@ -2604,6 +2676,91 @@ fn paint_timeline_canvas(
             }
         }
     }
+    for (api_lane_index, lane) in api_lanes.iter().enumerate() {
+        let lane_index = lanes.len() + marker_lanes.len() + api_lane_index;
+        let row_top =
+            canvas.top() + TIMELINE_HEADER_HEIGHT + lane_index as f32 * TIMELINE_ROW_HEIGHT;
+        let row_bottom = row_top + TIMELINE_ROW_HEIGHT;
+        let row_center = (row_top + row_bottom) * 0.5;
+        plot_painter.line_segment(
+            [
+                egui::pos2(canvas.left(), row_bottom),
+                egui::pos2(canvas.right(), row_bottom),
+            ],
+            egui::Stroke::new(1.0_f32, GRID),
+        );
+        let Some(event_indices) = visible_api_events.get(lane) else {
+            continue;
+        };
+        let color = timeline_lane_color(lane_index);
+        let mut last_painted_x = f32::NEG_INFINITY;
+        for event_index in event_indices.iter().copied() {
+            let event = &trace.events()[event_index];
+            let x = tick_x(
+                event.timestamp_ticks,
+                start_ticks,
+                duration,
+                plot_left,
+                plot_width,
+            );
+            let selected = trace.selected_sequence == Some(event.sequence);
+            // Dense API streams can put thousands of calls on one screen
+            // pixel. One glyph per pixel preserves the visible information
+            // while keeping egui interaction work bounded by canvas width.
+            if x <= last_painted_x + 2.0 && !selected {
+                continue;
+            }
+            last_painted_x = last_painted_x.max(x);
+            let stroke = if selected {
+                egui::Stroke::new(3.0_f32, TRACE_SELECTION_COLOR)
+            } else {
+                egui::Stroke::new(2.0_f32, color)
+            };
+            plot_painter.line_segment(
+                [
+                    egui::pos2(x, row_top + 4.0),
+                    egui::pos2(x, row_bottom - 4.0),
+                ],
+                stroke,
+            );
+            plot_painter.circle_filled(
+                egui::pos2(x, row_center),
+                if selected { 4.0 } else { 3.0 },
+                if selected {
+                    TRACE_SELECTION_COLOR
+                } else {
+                    color
+                },
+            );
+            let hit_rect = egui::Rect::from_center_size(
+                egui::pos2(x, row_center),
+                egui::vec2(8.0, TIMELINE_ROW_HEIGHT - 2.0),
+            )
+            .intersect(plot_clip);
+            let response = ui
+                .interact(
+                    hit_rect,
+                    ui.id().with(("api_event", event.sequence)),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(format!(
+                    "{} · {} ticks · {}",
+                    event_name(trace, event),
+                    event.timestamp_ticks,
+                    event_summary(trace, event)
+                ));
+            if response.clicked() {
+                clicked_sequence = Some(event.sequence);
+            }
+            if response.hovered() && !selected {
+                plot_painter.circle_stroke(
+                    egui::pos2(x, row_center),
+                    5.0,
+                    egui::Stroke::new(1.5_f32, half_transparent_plate(egui::Color32::WHITE)),
+                );
+            }
+        }
+    }
     if trace.timeline_smart_timing {
         for (index, edge) in edge_positions.iter().enumerate() {
             let hit_rect = egui::Rect::from_center_size(
@@ -2761,7 +2918,7 @@ fn paint_timeline_canvas(
             end_ticks,
             trace,
             measurement,
-            options.timestamp_frequency_override_hz,
+            options,
         );
     }
     clicked_sequence
@@ -2842,11 +2999,11 @@ fn paint_timeline_smart_timing_hint(
     trace_end_ticks: u64,
     trace: &SystemTraceDisplayState,
     measurement: TimelineSmartTiming,
-    timestamp_frequency_override_hz: Option<u64>,
+    options: TimelineCanvasOptions,
 ) {
     let first = measurement.measurement.first;
     let second = measurement.measurement.second;
-    let plot_left = canvas.left() + TIMELINE_LABEL_WIDTH;
+    let plot_left = canvas.left() + options.label_width;
     let plot_right = canvas.right();
     let plot_width = (plot_right - plot_left).max(1.0);
     let trace_duration_ticks = trace_end_ticks.saturating_sub(trace_start_ticks).max(1);
@@ -2891,7 +3048,7 @@ fn paint_timeline_smart_timing_hint(
     }
 
     let duration_ticks = first.timestamp_ticks.abs_diff(second.timestamp_ticks);
-    let duration = trace_system_frequency_hz(trace, timestamp_frequency_override_hz)
+    let duration = trace_system_frequency_hz(trace, options.timestamp_frequency_override_hz)
         .map(|frequency_hz| format_trace_milliseconds(duration_ticks, frequency_hz));
     let context_line = format!(
         "{} → {}",
@@ -3061,15 +3218,18 @@ fn event_starts_context(kind: &TraceEventKind, context: ExecutionContext) -> boo
 }
 
 fn paint_sticky_timeline_labels(
-    ui: &egui::Ui,
+    ui: &mut egui::Ui,
     viewport: egui::Rect,
     canvas_top: f32,
     model: &TraceModel,
-    lanes: &[TimelineLane],
-    marker_lanes: &[MarkerTimelineLane],
+    timeline_lanes: TimelineLanes<'_>,
     trace: &SystemTraceDisplayState,
+    label_width: f32,
 ) {
-    let label_right = (viewport.left() + TIMELINE_LABEL_WIDTH).min(viewport.right());
+    let lanes = timeline_lanes.contexts;
+    let marker_lanes = timeline_lanes.markers;
+    let api_lanes = timeline_lanes.api_events;
+    let label_right = (viewport.left() + label_width).min(viewport.right());
     let label_area =
         egui::Rect::from_min_max(viewport.min, egui::pos2(label_right, viewport.bottom()));
     let painter = ui.painter().with_clip_rect(label_area);
@@ -3104,12 +3264,13 @@ fn paint_sticky_timeline_labels(
             ],
             egui::Stroke::new(1.0_f32, GRID),
         );
-        lane_painter.text(
-            egui::pos2(viewport.left() + 6.0, row_top + TIMELINE_ROW_HEIGHT * 0.5),
-            egui::Align2::LEFT_CENTER,
+        paint_selectable_timeline_label(
+            ui,
+            label_area,
+            row_top,
             context_label(model, *lane),
-            egui::FontId::monospace(11.0),
             timeline_lane_color(lane_index),
+            ("context_lane_label", lane_index),
         );
     }
     for (marker_lane_index, lane) in marker_lanes.iter().enumerate() {
@@ -3123,13 +3284,99 @@ fn paint_sticky_timeline_labels(
             ],
             egui::Stroke::new(1.0_f32, GRID),
         );
-        lane_painter.text(
-            egui::pos2(viewport.left() + 6.0, row_top + TIMELINE_ROW_HEIGHT * 0.5),
-            egui::Align2::LEFT_CENTER,
+        paint_selectable_timeline_label(
+            ui,
+            label_area,
+            row_top,
             marker_lane_label(trace, *lane),
-            egui::FontId::monospace(11.0),
             timeline_lane_color(lane_index),
+            ("marker_lane_label", lane_index),
         );
+    }
+    for (api_lane_index, lane) in api_lanes.iter().enumerate() {
+        let lane_index = lanes.len() + marker_lanes.len() + api_lane_index;
+        let row_top = canvas_top + TIMELINE_HEADER_HEIGHT + lane_index as f32 * TIMELINE_ROW_HEIGHT;
+        let row_bottom = row_top + TIMELINE_ROW_HEIGHT;
+        lane_painter.line_segment(
+            [
+                egui::pos2(viewport.left(), row_bottom),
+                egui::pos2(label_right, row_bottom),
+            ],
+            egui::Stroke::new(1.0_f32, GRID),
+        );
+        paint_selectable_timeline_label(
+            ui,
+            label_area,
+            row_top,
+            api_lane_label(trace, *lane),
+            timeline_lane_color(lane_index),
+            ("api_lane_label", lane_index),
+        );
+    }
+}
+
+fn paint_selectable_timeline_label(
+    ui: &mut egui::Ui,
+    label_area: egui::Rect,
+    row_top: f32,
+    text: String,
+    color: egui::Color32,
+    id_salt: impl std::hash::Hash,
+) {
+    let row_rect = egui::Rect::from_min_max(
+        egui::pos2(label_area.left() + 6.0, row_top),
+        egui::pos2(label_area.right() - 4.0, row_top + TIMELINE_ROW_HEIGHT),
+    );
+    if !row_rect.intersects(label_area) {
+        return;
+    }
+    let mut label_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(id_salt)
+            .max_rect(row_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    label_ui.set_clip_rect(row_rect.intersect(label_area));
+    label_ui.add(
+        egui::Label::new(RichText::new(text).monospace().size(11.0).color(color))
+            .selectable(true)
+            .truncate(),
+    );
+}
+
+fn paint_timeline_label_splitter(
+    ui: &mut egui::Ui,
+    viewport: egui::Rect,
+    trace: &mut SystemTraceDisplayState,
+) {
+    let maximum_width = (viewport.width() - TIMELINE_MINIMUM_PLOT_WIDTH).clamp(80.0, 600.0);
+    let label_width = trace.timeline_label_width().min(maximum_width);
+    let x = viewport.left() + label_width;
+    let splitter_rect = egui::Rect::from_center_size(
+        egui::pos2(x, viewport.center().y),
+        egui::vec2(TIMELINE_LABEL_SPLITTER_WIDTH, viewport.height()),
+    );
+    let response = ui
+        .interact(
+            splitter_rect,
+            ui.id().with("timeline_lane_column_splitter"),
+            egui::Sense::drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    ui.painter().line_segment(
+        [
+            egui::pos2(x, viewport.top()),
+            egui::pos2(x, viewport.bottom()),
+        ],
+        egui::Stroke::new(if response.hovered() { 2.0_f32 } else { 1.0_f32 }, GRID),
+    );
+    if response.dragged() {
+        let delta = ui.input(|input| input.pointer.delta().x);
+        trace.set_timeline_label_width((label_width + delta).clamp(80.0, maximum_width));
+        ui.ctx().request_repaint();
+    }
+    if response.drag_stopped() {
+        trace.finish_trace_instrument_resize();
     }
 }
 
@@ -3205,6 +3452,28 @@ fn marker_lane_label(trace: &SystemTraceDisplayState, lane: MarkerTimelineLane) 
         .marker_name(lane.marker_id)
         .map_or_else(|| format!("Marker {}", lane.marker_id), ToOwned::to_owned);
     format!("C{}  {marker}", lane.core_id)
+}
+
+fn api_lane_label(trace: &SystemTraceDisplayState, lane: ApiTimelineLane) -> String {
+    format!(
+        "C{}  {}",
+        lane.core_id,
+        api_event_display_name(trace, lane.event_id)
+    )
+}
+
+fn api_event_display_name(trace: &SystemTraceDisplayState, event_id: u32) -> String {
+    trace
+        .description_event_id(event_id)
+        .and_then(|description_event_id| {
+            trace
+                .description()
+                .and_then(|description| description.event(description_event_id))
+        })
+        .map_or_else(
+            || format!("API event {event_id}"),
+            |event| event.name.clone(),
+        )
 }
 
 fn timeline_lane_color(lane_index: usize) -> egui::Color32 {
@@ -4910,31 +5179,13 @@ fn event_name(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String {
         TraceEventKind::FormattedPrint { .. } => "Log",
         TraceEventKind::PrintElf { .. } => "Log",
         TraceEventKind::ApiCall { event_id, .. } => {
-            return trace
-                .description_event_id(*event_id)
-                .and_then(|description_event_id| {
-                    trace
-                        .description()
-                        .and_then(|description| description.event(description_event_id))
-                })
-                .map_or_else(
-                    || format!("API event {event_id}"),
-                    |event| event.name.clone(),
-                );
+            return api_event_display_name(trace, *event_id);
         }
         TraceEventKind::ApiCallEnded { event_id, .. } => {
             return u32::try_from(*event_id)
                 .ok()
-                .and_then(|event_id| trace.description_event_id(event_id))
-                .and_then(|description_event_id| {
-                    trace
-                        .description()
-                        .and_then(|description| description.event(description_event_id))
-                })
-                .map_or_else(
-                    || format!("API event {event_id} ended"),
-                    |event| format!("{} ended", event.name),
-                );
+                .map(|event_id| format!("{} ended", api_event_display_name(trace, event_id)))
+                .unwrap_or_else(|| format!("API event {event_id} ended"));
         }
         TraceEventKind::Unknown { .. } => "Unknown event",
     };
@@ -5598,6 +5849,66 @@ mod tests {
         };
         assert_eq!(event_name(&trace, &returned), "QueueSend ended");
         assert_eq!(event_summary(&trace, &returned), "Result=1");
+    }
+
+    #[test]
+    fn api_calls_create_distinct_timeline_lanes_and_visible_points() {
+        let mut trace = SystemTraceDisplayState::default();
+        for event in [
+            TraceEvent {
+                sequence: 1,
+                core_id: 0,
+                timestamp_ticks: 100,
+                kind: TraceEventKind::ApiCall {
+                    event_id: 42,
+                    payload: vec![1, 2, 3],
+                },
+            },
+            TraceEvent {
+                sequence: 2,
+                core_id: 0,
+                timestamp_ticks: 110,
+                kind: TraceEventKind::ApiCall {
+                    event_id: 41,
+                    payload: vec![4, 5, 6],
+                },
+            },
+            TraceEvent {
+                sequence: 3,
+                core_id: 1,
+                timestamp_ticks: 120,
+                kind: TraceEventKind::ApiCallEnded {
+                    event_id: 42,
+                    return_value: None,
+                },
+            },
+        ] {
+            trace.ingest(event);
+        }
+
+        let lanes = timeline_api_lanes(&trace);
+        assert_eq!(
+            lanes,
+            vec![
+                ApiTimelineLane {
+                    core_id: 0,
+                    event_id: 41,
+                },
+                ApiTimelineLane {
+                    core_id: 0,
+                    event_id: 42,
+                },
+                ApiTimelineLane {
+                    core_id: 1,
+                    event_id: 42,
+                },
+            ]
+        );
+        assert_eq!(api_lane_label(&trace, lanes[0]), "C0  API event 41");
+
+        let visible = visible_api_event_indices(trace.events(), 105, 115);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[&lanes[0]], vec![1]);
     }
 
     #[test]
@@ -6783,7 +7094,7 @@ mod tests {
 
         let _ = context.run(input, |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                scroll_delta = take_timeline_horizontal_scroll(ui, canvas);
+                scroll_delta = take_timeline_horizontal_scroll(ui, canvas, TIMELINE_LABEL_WIDTH);
             });
         });
 
@@ -6899,6 +7210,7 @@ mod tests {
                     TimelineLanes {
                         contexts: &lanes,
                         markers: &[],
+                        api_events: &[],
                     },
                     0,
                     1_000_000,
@@ -7048,6 +7360,7 @@ mod tests {
                     TimelineLanes {
                         contexts: &lanes,
                         markers: &[],
+                        api_events: &[],
                     },
                     0,
                     220,
@@ -7073,6 +7386,7 @@ mod tests {
                     TimelineLanes {
                         contexts: &lanes,
                         markers: &[],
+                        api_events: &[],
                     },
                     0,
                     220,
@@ -7154,6 +7468,7 @@ mod tests {
                         TimelineLanes {
                             contexts: &lanes,
                             markers: &[],
+                            api_events: &[],
                         },
                         0,
                         220,
@@ -7213,7 +7528,7 @@ mod tests {
         let scrolled_canvas =
             egui::Rect::from_min_size(egui::pos2(-200.0, 20.0), egui::vec2(1_200.0, 200.0));
 
-        let clip = timeline_plot_clip(scrolled_canvas, viewport);
+        let clip = timeline_plot_clip(scrolled_canvas, viewport, TIMELINE_LABEL_WIDTH);
 
         assert_eq!(clip.left(), viewport.left() + TIMELINE_LABEL_WIDTH);
         assert_eq!(clip.right(), viewport.right());

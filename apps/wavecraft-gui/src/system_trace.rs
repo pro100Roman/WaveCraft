@@ -1,6 +1,6 @@
 //! Bounded GUI state for decoded system trace events.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,9 @@ const DEFAULT_TERMINAL_LINE_CAPACITY: usize = 20_000;
 const DEFAULT_PROBE_LOG_CAPACITY: usize = 10_000;
 const DEFAULT_TIMELINE_VIEW_HEIGHT: f32 = 260.0;
 const DEFAULT_EVENT_VIEW_HEIGHT: f32 = 230.0;
+const DEFAULT_TIMELINE_LABEL_WIDTH: f32 = 150.0;
+const MIN_TIMELINE_LABEL_WIDTH: f32 = 80.0;
+const MAX_TIMELINE_LABEL_WIDTH: f32 = 600.0;
 const MIN_TRACE_INSTRUMENT_HEIGHT: f32 = 140.0;
 const MAX_TRACE_INSTRUMENT_HEIGHT: f32 = 900.0;
 const RTT_READ_SIZE: usize = 16 * 1024;
@@ -1520,6 +1523,7 @@ pub(crate) struct LoadedSystemTrace {
     events: VecDeque<TraceEvent>,
     model: TraceModel,
     marker_names: BTreeMap<u64, String>,
+    api_event_lanes: BTreeSet<(u32, u32)>,
     target_frequencies_hz: Option<(u64, u64)>,
     log_count: usize,
     target_dropped_event_count: u64,
@@ -1529,11 +1533,15 @@ impl LoadedSystemTrace {
     fn from_events(events: Vec<TraceEvent>) -> Self {
         let mut model = TraceModel::new();
         let mut marker_names = BTreeMap::new();
+        let mut api_event_lanes = BTreeSet::new();
         let mut target_frequencies_hz = None;
         let mut log_count = 0_usize;
         let mut target_dropped_event_count = 0_u64;
         for event in &events {
             model.apply(event);
+            if let Some(event_id) = api_event_id(&event.kind) {
+                api_event_lanes.insert((event.core_id, event_id));
+            }
             match &event.kind {
                 TraceEventKind::MarkerName { marker_id, name } => {
                     marker_names.insert(*marker_id, name.clone());
@@ -1557,6 +1565,7 @@ impl LoadedSystemTrace {
             events: events.into(),
             model,
             marker_names,
+            api_event_lanes,
             target_frequencies_hz,
             log_count,
             target_dropped_event_count,
@@ -1575,6 +1584,7 @@ pub(crate) struct SystemTraceDisplayState {
     probe_logs: VecDeque<ProbeLogEntry>,
     model: TraceModel,
     marker_names: BTreeMap<u64, String>,
+    api_event_lanes: BTreeSet<(u32, u32)>,
     elf: Option<SystemViewElf>,
     description: Option<SystemViewDescription>,
     target_frequencies_hz: Option<(u64, u64)>,
@@ -1613,6 +1623,7 @@ pub(crate) struct SystemTraceDisplayState {
     time_references: Vec<u64>,
     timeline_view_height: f32,
     event_view_height: f32,
+    timeline_label_width: f32,
 }
 
 impl Default for SystemTraceDisplayState {
@@ -1623,6 +1634,7 @@ impl Default for SystemTraceDisplayState {
             probe_logs: VecDeque::new(),
             model: TraceModel::new(),
             marker_names: BTreeMap::new(),
+            api_event_lanes: BTreeSet::new(),
             elf: None,
             description: None,
             target_frequencies_hz: None,
@@ -1661,6 +1673,7 @@ impl Default for SystemTraceDisplayState {
             time_references: Vec::new(),
             timeline_view_height: DEFAULT_TIMELINE_VIEW_HEIGHT,
             event_view_height: DEFAULT_EVENT_VIEW_HEIGHT,
+            timeline_label_width: DEFAULT_TIMELINE_LABEL_WIDTH,
         }
     }
 }
@@ -1668,6 +1681,10 @@ impl Default for SystemTraceDisplayState {
 impl SystemTraceDisplayState {
     pub(crate) fn events(&self) -> &VecDeque<TraceEvent> {
         &self.events
+    }
+
+    pub(crate) fn api_event_lanes(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.api_event_lanes.iter().copied()
     }
 
     pub(crate) fn event_view_order(&self) -> &[TraceEventView; TraceEventView::ALL.len()] {
@@ -1967,6 +1984,18 @@ impl SystemTraceDisplayState {
         self.event_view_height
     }
 
+    pub(crate) fn timeline_label_width(&self) -> f32 {
+        self.timeline_label_width
+    }
+
+    pub(crate) fn set_timeline_label_width(&mut self, width: f32) -> bool {
+        if !width.is_finite() || width <= 0.0 {
+            return false;
+        }
+        self.timeline_label_width = width.clamp(MIN_TIMELINE_LABEL_WIDTH, MAX_TIMELINE_LABEL_WIDTH);
+        true
+    }
+
     pub(crate) fn set_trace_instrument_heights(
         &mut self,
         timeline_height: f32,
@@ -2052,6 +2081,9 @@ impl SystemTraceDisplayState {
     }
 
     pub(crate) fn ingest(&mut self, event: TraceEvent) {
+        if let Some(event_id) = api_event_id(&event.kind) {
+            self.api_event_lanes.insert((event.core_id, event_id));
+        }
         if matches!(
             &event.kind,
             TraceEventKind::TaskInfo { .. }
@@ -2137,6 +2169,7 @@ impl SystemTraceDisplayState {
         self.events = trace.events;
         self.model = trace.model;
         self.marker_names = trace.marker_names;
+        self.api_event_lanes = trace.api_event_lanes;
         self.target_frequencies_hz = trace.target_frequencies_hz;
         self.log_count = trace.log_count;
         self.target_dropped_event_count = trace.target_dropped_event_count;
@@ -2159,6 +2192,7 @@ impl SystemTraceDisplayState {
         self.events.clear();
         self.model = TraceModel::new();
         self.marker_names.clear();
+        self.api_event_lanes.clear();
         self.event_capacity = DEFAULT_EVENT_CAPACITY;
         self.event_filter_cache = EventFilterCache::default();
         self.invalidate_event_search_metadata();
@@ -2250,6 +2284,14 @@ fn is_log_event(kind: &TraceEventKind) -> bool {
         kind,
         TraceEventKind::FormattedPrint { .. } | TraceEventKind::PrintElf { .. }
     )
+}
+
+pub(crate) fn api_event_id(kind: &TraceEventKind) -> Option<u32> {
+    match kind {
+        TraceEventKind::ApiCall { event_id, .. } => Some(*event_id),
+        TraceEventKind::ApiCallEnded { event_id, .. } => u32::try_from(*event_id).ok(),
+        _ => None,
+    }
 }
 
 pub(crate) fn choose_systemview_trace_to_open() -> Option<PathBuf> {
@@ -2665,8 +2707,10 @@ mod tests {
         let source = directory.join("temporary.SVDat");
         let saved = directory.join("saved.SVDat");
         std::fs::write(&source, [10, 1]).expect("temporary history is written");
+        std::fs::write(&saved, b"old trace").expect("existing destination is written");
 
-        save_systemview_history(&source, &saved).expect("temporary history is copied");
+        save_systemview_history(&source, &saved)
+            .expect("temporary history replaces the confirmed destination");
         let mut state = SystemTraceDisplayState::default();
         state.set_history_path(source.clone(), true);
         state.set_history_path(saved.clone(), false);
@@ -2796,6 +2840,29 @@ mod tests {
         state.clear_trace_events();
 
         assert_eq!(state.target_frequencies_hz(), None);
+    }
+
+    #[test]
+    fn retains_api_lanes_after_their_events_leave_the_display_buffer() {
+        let mut state = SystemTraceDisplayState::with_capacity(1);
+        state.ingest_all([
+            event(
+                0,
+                10,
+                TraceEventKind::ApiCall {
+                    event_id: 41,
+                    payload: vec![1, 2, 3],
+                },
+            ),
+            event(1, 20, TraceEventKind::Idle),
+        ]);
+
+        assert_eq!(state.events().len(), 1);
+        assert_eq!(state.api_event_lanes().collect::<Vec<_>>(), [(0, 41)]);
+
+        state.clear_trace_events();
+
+        assert!(state.api_event_lanes().next().is_none());
     }
 
     #[test]
@@ -3003,6 +3070,18 @@ mod tests {
         assert!(state.set_trace_instrument_heights(10_000.0, 10_000.0));
         assert_eq!(state.timeline_view_height(), MAX_TRACE_INSTRUMENT_HEIGHT);
         assert_eq!(state.event_view_height(), MAX_TRACE_INSTRUMENT_HEIGHT);
+    }
+
+    #[test]
+    fn timeline_label_width_validates_and_clamps_values() {
+        let mut state = SystemTraceDisplayState::default();
+
+        assert!(state.set_timeline_label_width(240.0));
+        assert_eq!(state.timeline_label_width(), 240.0);
+        assert!(!state.set_timeline_label_width(f32::NAN));
+        assert!(!state.set_timeline_label_width(0.0));
+        assert!(state.set_timeline_label_width(10_000.0));
+        assert_eq!(state.timeline_label_width(), MAX_TIMELINE_LABEL_WIDTH);
     }
 
     #[test]

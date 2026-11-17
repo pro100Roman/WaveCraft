@@ -158,6 +158,7 @@ impl WaveCraftApp {
             timeline: self.system_trace.timeline_view_height().round() as u32,
             analysis: self.system_trace.event_view_height().round() as u32,
         };
+        let timeline_label_width = self.system_trace.timeline_label_width().round() as u32;
         if self.saved_capture_settings.global.last_active_view == Some(saved_view)
             && self.saved_capture_settings.global.window_inner_size == window_inner_size
             && self
@@ -183,6 +184,11 @@ impl WaveCraftApp {
                 .global
                 .system_trace_instrument_heights
                 == Some(instrument_heights)
+            && self
+                .saved_capture_settings
+                .global
+                .system_trace_timeline_label_width
+                == Some(timeline_label_width)
         {
             return;
         }
@@ -194,6 +200,7 @@ impl WaveCraftApp {
         document.global.system_trace_event_view_order = Some(event_view_order);
         document.global.system_trace_instrument_order = Some(instrument_order);
         document.global.system_trace_instrument_heights = Some(instrument_heights);
+        document.global.system_trace_timeline_label_width = Some(timeline_label_width);
         let result = self
             .capture_settings_repository
             .as_ref()
@@ -251,6 +258,13 @@ impl WaveCraftApp {
         {
             self.system_trace
                 .set_trace_instrument_heights(heights.timeline as f32, heights.analysis as f32);
+        }
+        if let Some(width) = self
+            .saved_capture_settings
+            .global
+            .system_trace_timeline_label_width
+        {
+            self.system_trace.set_timeline_label_width(width as f32);
         }
         if let Some(profile) = self.saved_capture_settings.profiles.logic_analyzer.as_ref() {
             self.logic_settings = logic_settings_from_recording_metadata(&profile.values);
@@ -714,6 +728,7 @@ mod tests {
             .system_trace
             .set_trace_instrument_order(&instrument_order));
         assert!(app.system_trace.set_trace_instrument_heights(420.0, 280.0));
+        assert!(app.system_trace.set_timeline_label_width(240.0));
 
         app.save_global_settings();
 
@@ -726,6 +741,7 @@ mod tests {
         );
         assert_eq!(restored.system_trace.timeline_view_height(), 420.0);
         assert_eq!(restored.system_trace.event_view_height(), 280.0);
+        assert_eq!(restored.system_trace.timeline_label_width(), 240.0);
         remove_test_repository(&repository);
     }
 

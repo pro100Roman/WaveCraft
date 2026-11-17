@@ -48,6 +48,8 @@ pub(crate) struct GlobalSettings {
     pub(crate) system_trace_instrument_order: Option<Vec<SavedTraceInstrument>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_trace_instrument_heights: Option<SavedTraceInstrumentHeights>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) system_trace_timeline_label_width: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
