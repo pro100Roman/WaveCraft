@@ -1,6 +1,6 @@
 //! Bounded GUI state for decoded system trace events.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1375,6 +1375,7 @@ impl crate::WaveCraftApp {
 pub(crate) struct LoadedSystemTrace {
     events: VecDeque<TraceEvent>,
     model: TraceModel,
+    marker_names: BTreeMap<u64, String>,
     target_frequencies_hz: Option<(u64, u64)>,
     log_count: usize,
     target_dropped_event_count: u64,
@@ -1383,12 +1384,16 @@ pub(crate) struct LoadedSystemTrace {
 impl LoadedSystemTrace {
     fn from_events(events: Vec<TraceEvent>) -> Self {
         let mut model = TraceModel::new();
+        let mut marker_names = BTreeMap::new();
         let mut target_frequencies_hz = None;
         let mut log_count = 0_usize;
         let mut target_dropped_event_count = 0_u64;
         for event in &events {
             model.apply(event);
             match &event.kind {
+                TraceEventKind::MarkerName { marker_id, name } => {
+                    marker_names.insert(*marker_id, name.clone());
+                }
                 TraceEventKind::TargetInfo {
                     system_frequency_hz,
                     cpu_frequency_hz,
@@ -1407,6 +1412,7 @@ impl LoadedSystemTrace {
         Self {
             events: events.into(),
             model,
+            marker_names,
             target_frequencies_hz,
             log_count,
             target_dropped_event_count,
@@ -1424,6 +1430,7 @@ pub(crate) struct SystemTraceDisplayState {
     terminal_lines: VecDeque<RttTerminalLine>,
     probe_logs: VecDeque<ProbeLogEntry>,
     model: TraceModel,
+    marker_names: BTreeMap<u64, String>,
     elf: Option<SystemViewElf>,
     description: Option<SystemViewDescription>,
     target_frequencies_hz: Option<(u64, u64)>,
@@ -1471,6 +1478,7 @@ impl Default for SystemTraceDisplayState {
             terminal_lines: VecDeque::new(),
             probe_logs: VecDeque::new(),
             model: TraceModel::new(),
+            marker_names: BTreeMap::new(),
             elf: None,
             description: None,
             target_frequencies_hz: None,
@@ -1694,6 +1702,10 @@ impl SystemTraceDisplayState {
         self.elf.as_ref()?.symbol_name(address)
     }
 
+    pub(crate) fn marker_name(&self, marker_id: u64) -> Option<&str> {
+        self.marker_names.get(&marker_id).map(String::as_str)
+    }
+
     pub(crate) fn resource_address(&self, resource_id: u64) -> Option<u64> {
         let (ram_base, id_shift) = self
             .events
@@ -1881,6 +1893,7 @@ impl SystemTraceDisplayState {
                 | TraceEventKind::TargetInfo { .. }
                 | TraceEventKind::ModuleDescription { .. }
                 | TraceEventKind::ResourceName { .. }
+                | TraceEventKind::MarkerName { .. }
         ) {
             self.invalidate_event_search_metadata();
         }
@@ -1891,6 +1904,9 @@ impl SystemTraceDisplayState {
         } = &event.kind
         {
             self.target_frequencies_hz = Some((*system_frequency_hz, *cpu_frequency_hz));
+        }
+        if let TraceEventKind::MarkerName { marker_id, name } = &event.kind {
+            self.marker_names.insert(*marker_id, name.clone());
         }
         self.model.apply(&event);
         if let TraceEventKind::Overflow { dropped_events } = &event.kind {
@@ -1955,6 +1971,7 @@ impl SystemTraceDisplayState {
         self.event_view = TraceEventView::Events;
         self.events = trace.events;
         self.model = trace.model;
+        self.marker_names = trace.marker_names;
         self.target_frequencies_hz = trace.target_frequencies_hz;
         self.log_count = trace.log_count;
         self.target_dropped_event_count = trace.target_dropped_event_count;
@@ -1976,6 +1993,7 @@ impl SystemTraceDisplayState {
     pub(crate) fn clear_trace_events(&mut self) {
         self.events.clear();
         self.model = TraceModel::new();
+        self.marker_names.clear();
         self.event_capacity = DEFAULT_EVENT_CAPACITY;
         self.event_filter_cache = EventFilterCache::default();
         self.invalidate_event_search_metadata();

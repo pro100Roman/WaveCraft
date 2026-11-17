@@ -1620,7 +1620,8 @@ fn paint_timeline_instrument(
             paint_trace_instrument_drag_handle(ui, trace, TraceInstrument::Timeline, "TIMELINE");
             ui.label(RichText::new("TIMELINE").strong().color(ACCENT));
             ui.label(
-                RichText::new("Task, ISR, timer, scheduler, and idle execution").color(TEXT_MUTED),
+                RichText::new("Task, ISR, timer, marker, scheduler, and idle intervals")
+                    .color(TEXT_MUTED),
             );
         });
 
@@ -1743,7 +1744,8 @@ fn paint_timeline_instrument(
         }
 
         let lanes = timeline_lanes(trace.model());
-        if lanes.is_empty() {
+        let marker_lanes = timeline_marker_lanes(trace.model());
+        if lanes.is_empty() && marker_lanes.is_empty() {
             paint_trace_empty_state(
                 ui,
                 "No execution intervals yet",
@@ -1769,7 +1771,7 @@ fn paint_timeline_instrument(
             .show(ui, |ui| {
                 timeline_scroll.show(ui, |ui| {
                     let canvas_width = ui.available_width();
-                    let canvas_height = timeline_canvas_height(lanes.len());
+                    let canvas_height = timeline_canvas_height(lanes.len() + marker_lanes.len());
                     let (canvas, canvas_response) = ui.allocate_exact_size(
                         egui::vec2(canvas_width, canvas_height),
                         egui::Sense::click_and_drag(),
@@ -1778,7 +1780,10 @@ fn paint_timeline_instrument(
                         ui,
                         canvas,
                         trace,
-                        &lanes,
+                        TimelineLanes {
+                            contexts: &lanes,
+                            markers: &marker_lanes,
+                        },
                         start_ticks,
                         end_ticks,
                         TimelineCanvasOptions {
@@ -1849,6 +1854,8 @@ fn paint_timeline_instrument(
             timeline.inner.0,
             trace.model(),
             &lanes,
+            &marker_lanes,
+            trace,
         );
         if let Some(sequence) = timeline.inner.1 {
             trace.select_from_timeline(sequence);
@@ -2037,6 +2044,18 @@ struct TimelineLane {
     context: ExecutionContext,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct MarkerTimelineLane {
+    core_id: u32,
+    marker_id: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TimelineLanes<'a> {
+    contexts: &'a [TimelineLane],
+    markers: &'a [MarkerTimelineLane],
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct TimelineSmartTiming {
     measurement: TimelineTimingMeasurement,
@@ -2093,15 +2112,33 @@ fn timeline_lanes(model: &TraceModel) -> Vec<TimelineLane> {
     lanes
 }
 
+fn timeline_marker_lanes(model: &TraceModel) -> Vec<MarkerTimelineLane> {
+    let mut lanes = Vec::new();
+    for (core_id, core) in model.cores() {
+        for interval in core.marker_intervals() {
+            let lane = MarkerTimelineLane {
+                core_id: *core_id,
+                marker_id: interval.marker_id,
+            };
+            if !lanes.contains(&lane) {
+                lanes.push(lane);
+            }
+        }
+    }
+    lanes
+}
+
 fn paint_timeline_canvas(
     ui: &egui::Ui,
     canvas: egui::Rect,
     trace: &mut SystemTraceDisplayState,
-    lanes: &[TimelineLane],
+    timeline_lanes: TimelineLanes<'_>,
     start_ticks: u64,
     end_ticks: u64,
     options: TimelineCanvasOptions,
 ) -> Option<u64> {
+    let lanes = timeline_lanes.contexts;
+    let marker_lanes = timeline_lanes.markers;
     let model = trace.model();
     let painter = ui.painter().with_clip_rect(canvas);
     let viewport = ui.clip_rect();
@@ -2262,6 +2299,103 @@ fn paint_timeline_canvas(
             }
             if response.clicked() {
                 clicked_sequence = interval_sequence;
+            }
+            if !interval.complete {
+                plot_painter.rect_stroke(
+                    interval_rect,
+                    2.0,
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(245, 96, 96)),
+                );
+            }
+            if interval_selected {
+                plot_painter.rect_stroke(
+                    interval_rect,
+                    2.0,
+                    egui::Stroke::new(3.0_f32, TRACE_SELECTION_COLOR),
+                );
+            } else if response.hovered() {
+                plot_painter.rect_stroke(
+                    interval_rect,
+                    2.0,
+                    egui::Stroke::new(1.5_f32, half_transparent_plate(egui::Color32::WHITE)),
+                );
+            }
+        }
+    }
+    for (marker_lane_index, lane) in marker_lanes.iter().enumerate() {
+        let lane_index = lanes.len() + marker_lane_index;
+        let row_top =
+            canvas.top() + TIMELINE_HEADER_HEIGHT + lane_index as f32 * TIMELINE_ROW_HEIGHT;
+        let row_bottom = row_top + TIMELINE_ROW_HEIGHT;
+        plot_painter.line_segment(
+            [
+                egui::pos2(canvas.left(), row_bottom),
+                egui::pos2(canvas.right(), row_bottom),
+            ],
+            egui::Stroke::new(1.0_f32, GRID),
+        );
+        let Some(core) = model.core(lane.core_id) else {
+            continue;
+        };
+        let mut painted_through_x = f32::NEG_INFINITY;
+        for (interval_index, interval) in core.marker_intervals().iter().enumerate() {
+            if interval.marker_id != lane.marker_id {
+                continue;
+            }
+            let interval_end = interval
+                .end_ticks
+                .unwrap_or(end_ticks)
+                .max(interval.start_ticks);
+            if interval_end < start_ticks {
+                continue;
+            }
+            if interval.start_ticks > end_ticks {
+                break;
+            }
+            let x_start = tick_x(
+                interval.start_ticks,
+                start_ticks,
+                duration,
+                plot_left,
+                plot_width,
+            );
+            let x_end = tick_x(interval_end, start_ticks, duration, plot_left, plot_width);
+            let interval_rect = egui::Rect::from_min_max(
+                egui::pos2(x_start, row_top + 4.0),
+                egui::pos2((x_end.max(x_start + 2.0)).min(plot_right), row_bottom - 4.0),
+            );
+            if interval_rect.right() < plot_clip.left() {
+                continue;
+            }
+            if interval_rect.left() > plot_clip.right() {
+                break;
+            }
+            let interval_selected = trace.selected_sequence == Some(interval.start_sequence);
+            if interval_rect.right() <= painted_through_x && !interval_selected {
+                continue;
+            }
+            painted_through_x = painted_through_x.max(interval_rect.right());
+            let color = marker_color(interval.marker_id);
+            plot_painter.rect_filled(interval_rect, 2.0, color);
+            if interval_selected {
+                plot_painter.rect_filled(interval_rect, 2.0, TRACE_SELECTION_FILL);
+            }
+            let visible_interval_rect = interval_rect.intersect(plot_clip);
+            let response = ui
+                .interact(
+                    visible_interval_rect,
+                    ui.id()
+                        .with(("marker_interval", lane_index, interval_index)),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(format!(
+                    "{} · {}–{} ticks",
+                    marker_lane_label(trace, *lane),
+                    interval.start_ticks,
+                    interval_end
+                ));
+            if response.clicked() {
+                clicked_sequence = Some(interval.start_sequence);
             }
             if !interval.complete {
                 plot_painter.rect_stroke(
@@ -2747,6 +2881,8 @@ fn paint_sticky_timeline_labels(
     canvas_top: f32,
     model: &TraceModel,
     lanes: &[TimelineLane],
+    marker_lanes: &[MarkerTimelineLane],
+    trace: &SystemTraceDisplayState,
 ) {
     let label_right = (viewport.left() + TIMELINE_LABEL_WIDTH).min(viewport.right());
     let label_area =
@@ -2763,7 +2899,7 @@ fn paint_sticky_timeline_labels(
     painter.text(
         egui::pos2(viewport.left() + 6.0, viewport.top() + 2.0),
         egui::Align2::LEFT_TOP,
-        "CONTEXT",
+        "LANE",
         egui::FontId::monospace(11.0),
         TEXT_MUTED,
     );
@@ -2789,6 +2925,25 @@ fn paint_sticky_timeline_labels(
             context_label(model, *lane),
             egui::FontId::monospace(11.0),
             TEXT_MUTED,
+        );
+    }
+    for (marker_lane_index, lane) in marker_lanes.iter().enumerate() {
+        let lane_index = lanes.len() + marker_lane_index;
+        let row_top = canvas_top + TIMELINE_HEADER_HEIGHT + lane_index as f32 * TIMELINE_ROW_HEIGHT;
+        let row_bottom = row_top + TIMELINE_ROW_HEIGHT;
+        lane_painter.line_segment(
+            [
+                egui::pos2(viewport.left(), row_bottom),
+                egui::pos2(label_right, row_bottom),
+            ],
+            egui::Stroke::new(1.0_f32, GRID),
+        );
+        lane_painter.text(
+            egui::pos2(viewport.left() + 6.0, row_top + TIMELINE_ROW_HEIGHT * 0.5),
+            egui::Align2::LEFT_CENTER,
+            marker_lane_label(trace, *lane),
+            egui::FontId::monospace(11.0),
+            marker_color(lane.marker_id),
         );
     }
 }
@@ -2858,6 +3013,17 @@ fn context_color(context: ExecutionContext) -> egui::Color32 {
         ExecutionContext::Scheduler => egui::Color32::from_rgb(105, 138, 180),
         ExecutionContext::Idle => egui::Color32::from_rgb(72, 160, 116),
     }
+}
+
+fn marker_lane_label(trace: &SystemTraceDisplayState, lane: MarkerTimelineLane) -> String {
+    let marker = trace
+        .marker_name(lane.marker_id)
+        .map_or_else(|| format!("Marker {}", lane.marker_id), ToOwned::to_owned);
+    format!("C{}  {marker}", lane.core_id)
+}
+
+fn marker_color(marker_id: u64) -> egui::Color32 {
+    SCOPE_COLORS[(marker_id as usize) % SCOPE_COLORS.len()]
 }
 
 fn paint_event_instrument(
@@ -4013,9 +4179,9 @@ fn trace_event_category(kind: &TraceEventKind) -> TraceEventCategory {
         TraceEventKind::FormattedPrint { .. } | TraceEventKind::PrintElf { .. } => {
             TraceEventCategory::Logs
         }
-        TraceEventKind::MarkerStarted { .. } | TraceEventKind::MarkerStopped { .. } => {
-            TraceEventCategory::Markers
-        }
+        TraceEventKind::MarkerStarted { .. }
+        | TraceEventKind::MarkerStopped { .. }
+        | TraceEventKind::MarkerName { .. } => TraceEventCategory::Markers,
         TraceEventKind::DataSample { .. } => TraceEventCategory::DataSamples,
         TraceEventKind::ApiCall { .. }
         | TraceEventKind::ApiCallEnded { .. }
@@ -4524,6 +4690,7 @@ fn event_name(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String {
         TraceEventKind::Idle => "Idle",
         TraceEventKind::MarkerStarted { .. } => "Marker started",
         TraceEventKind::MarkerStopped { .. } => "Marker stopped",
+        TraceEventKind::MarkerName { .. } => "Marker name",
         TraceEventKind::SystemDescription(_) => "System description",
         TraceEventKind::ClockSyncCycles { .. } => "Clock sync cycles",
         TraceEventKind::ClockSyncMicros { .. } => "Clock sync time",
@@ -4594,7 +4761,12 @@ fn event_summary(trace: &SystemTraceDisplayState, event: &TraceEvent) -> String 
         TraceEventKind::IsrEntered { isr_id } => format!("ISR {isr_id}"),
         TraceEventKind::TimerEntered { timer_id } => format!("timer {timer_id}"),
         TraceEventKind::MarkerStarted { marker_id }
-        | TraceEventKind::MarkerStopped { marker_id } => format!("marker {marker_id}"),
+        | TraceEventKind::MarkerStopped { marker_id } => trace
+            .marker_name(*marker_id)
+            .map_or_else(|| format!("marker {marker_id}"), |name| format!("{name} (marker {marker_id})")),
+        TraceEventKind::MarkerName { marker_id, name } => {
+            format!("marker {marker_id}, {name}")
+        }
         TraceEventKind::SystemDescription(description) => description.clone(),
         TraceEventKind::ClockSyncCycles { cycles } => format!("{cycles} cycles"),
         TraceEventKind::ClockSyncMicros { micros } => format!("{micros} µs"),
@@ -5206,6 +5378,67 @@ mod tests {
         assert_eq!(summary(5), "worker");
         assert_eq!(summary(6), "app_main, base 0x20001000, 640/1024 bytes");
         assert_eq!(summary(7), "worker, cause 1");
+    }
+
+    #[test]
+    fn marker_names_resolve_in_events_and_use_a_separate_timeline_lane() {
+        let mut trace = SystemTraceDisplayState::default();
+        trace.ingest(TraceEvent {
+            sequence: 0,
+            core_id: 0,
+            timestamp_ticks: 1,
+            kind: TraceEventKind::MarkerName {
+                marker_id: 1,
+                name: "DPS310 interrupt".to_owned(),
+            },
+        });
+        trace.ingest(TraceEvent {
+            sequence: 1,
+            core_id: 0,
+            timestamp_ticks: 2,
+            kind: TraceEventKind::IsrEntered { isr_id: 22 },
+        });
+        trace.ingest(TraceEvent {
+            sequence: 2,
+            core_id: 0,
+            timestamp_ticks: 3,
+            kind: TraceEventKind::MarkerStarted { marker_id: 1 },
+        });
+        trace.ingest(TraceEvent {
+            sequence: 3,
+            core_id: 0,
+            timestamp_ticks: 4,
+            kind: TraceEventKind::MarkerStopped { marker_id: 1 },
+        });
+        trace.ingest(TraceEvent {
+            sequence: 4,
+            core_id: 0,
+            timestamp_ticks: 5,
+            kind: TraceEventKind::IsrExited,
+        });
+
+        assert_eq!(
+            event_summary(&trace, &trace.events()[2]),
+            "DPS310 interrupt (marker 1)"
+        );
+        assert_eq!(
+            timeline_marker_lanes(trace.model()),
+            vec![MarkerTimelineLane {
+                core_id: 0,
+                marker_id: 1,
+            }]
+        );
+        assert_eq!(
+            marker_lane_label(
+                &trace,
+                MarkerTimelineLane {
+                    core_id: 0,
+                    marker_id: 1,
+                }
+            ),
+            "C0  DPS310 interrupt"
+        );
+        assert_eq!(timeline_lanes(trace.model()).len(), 1);
     }
 
     #[test]
@@ -6186,7 +6419,10 @@ mod tests {
                     ui,
                     canvas,
                     &mut trace,
-                    &lanes,
+                    TimelineLanes {
+                        contexts: &lanes,
+                        markers: &[],
+                    },
                     0,
                     1_000_000,
                     TimelineCanvasOptions::default(),
@@ -6332,7 +6568,10 @@ mod tests {
                     ui,
                     canvas,
                     &mut trace,
-                    &lanes,
+                    TimelineLanes {
+                        contexts: &lanes,
+                        markers: &[],
+                    },
                     0,
                     220,
                     TimelineCanvasOptions::default(),
@@ -6354,7 +6593,10 @@ mod tests {
                     ui,
                     canvas,
                     &mut trace,
-                    &lanes,
+                    TimelineLanes {
+                        contexts: &lanes,
+                        markers: &[],
+                    },
                     0,
                     220,
                     TimelineCanvasOptions::default(),
@@ -6432,7 +6674,10 @@ mod tests {
                         ui,
                         canvas,
                         trace,
-                        &lanes,
+                        TimelineLanes {
+                            contexts: &lanes,
+                            markers: &[],
+                        },
                         0,
                         220,
                         TimelineCanvasOptions::default(),

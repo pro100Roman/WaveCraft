@@ -64,6 +64,10 @@ pub enum TraceEventKind {
     MarkerStopped {
         marker_id: u64,
     },
+    MarkerName {
+        marker_id: u64,
+        name: String,
+    },
     SystemDescription(String),
     ClockSyncCycles {
         cycles: u64,
@@ -215,6 +219,17 @@ pub struct ExecutionInterval {
     pub complete: bool,
 }
 
+/// A target performance-marker interval reconstructed from matching start and stop events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkerInterval {
+    pub marker_id: u64,
+    pub start_sequence: u64,
+    pub start_ticks: u64,
+    pub end_ticks: Option<u64>,
+    /// False when the interval ended because tracing stopped or data was lost.
+    pub complete: bool,
+}
+
 /// Last reconstructed lifecycle state for a task.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskState {
@@ -291,6 +306,8 @@ struct InterruptedContext {
 pub struct CoreTraceState {
     tasks: BTreeMap<ContextId, TaskTraceState>,
     intervals: Vec<ExecutionInterval>,
+    marker_intervals: Vec<MarkerInterval>,
+    active_markers: BTreeMap<u64, Vec<usize>>,
     interrupted_contexts: Vec<InterruptedContext>,
     activation_counts: BTreeMap<ExecutionContext, u64>,
     interrupted_ticks: BTreeMap<ExecutionContext, u64>,
@@ -306,6 +323,10 @@ impl CoreTraceState {
 
     pub fn intervals(&self) -> &[ExecutionInterval] {
         &self.intervals
+    }
+
+    pub fn marker_intervals(&self) -> &[MarkerInterval] {
+        &self.marker_intervals
     }
 
     pub fn active_context(&self) -> Option<ExecutionContext> {
@@ -484,6 +505,7 @@ impl CoreTraceState {
 
     fn invalidate_continuity(&mut self, timestamp_ticks: u64, dropped_events: u64) {
         self.switch_context(None, timestamp_ticks, false);
+        self.close_active_markers(timestamp_ticks, false);
         self.close_interrupted_contexts(timestamp_ticks);
         self.continuity_known = false;
         self.dropped_events = self.dropped_events.saturating_add(dropped_events);
@@ -496,16 +518,30 @@ impl CoreTraceState {
         }
     }
 
+    fn close_active_markers(&mut self, timestamp_ticks: u64, complete: bool) {
+        for interval_indices in self.active_markers.values() {
+            for interval_index in interval_indices {
+                if let Some(interval) = self.marker_intervals.get_mut(*interval_index) {
+                    interval.end_ticks = Some(timestamp_ticks.max(interval.start_ticks));
+                    interval.complete = complete;
+                }
+            }
+        }
+        self.active_markers.clear();
+    }
+
     fn apply(&mut self, event: &TraceEvent) {
         let timestamp = event.timestamp_ticks;
         match &event.kind {
             TraceEventKind::TraceStarted => {
+                self.close_active_markers(timestamp, false);
                 self.continuity_known = true;
                 self.interrupted_contexts.clear();
                 self.switch_context(None, timestamp, true);
             }
             TraceEventKind::TraceStopped => {
                 self.switch_context(None, timestamp, true);
+                self.close_active_markers(timestamp, false);
                 self.close_interrupted_contexts(timestamp);
                 for task in self.tasks.values_mut() {
                     task.close_blocked_interval(timestamp);
@@ -617,9 +653,37 @@ impl CoreTraceState {
                     stack_usage: *stack_usage,
                 });
             }
+            TraceEventKind::MarkerStarted { marker_id } => {
+                let interval_index = self.marker_intervals.len();
+                self.marker_intervals.push(MarkerInterval {
+                    marker_id: *marker_id,
+                    start_sequence: event.sequence,
+                    start_ticks: timestamp,
+                    end_ticks: None,
+                    complete: true,
+                });
+                self.active_markers
+                    .entry(*marker_id)
+                    .or_default()
+                    .push(interval_index);
+            }
+            TraceEventKind::MarkerStopped { marker_id } => {
+                let interval_index = self.active_markers.get_mut(marker_id).and_then(Vec::pop);
+                if self
+                    .active_markers
+                    .get(marker_id)
+                    .is_some_and(Vec::is_empty)
+                {
+                    self.active_markers.remove(marker_id);
+                }
+                if let Some(interval) = interval_index
+                    .and_then(|interval_index| self.marker_intervals.get_mut(interval_index))
+                {
+                    interval.end_ticks = Some(timestamp.max(interval.start_ticks));
+                }
+            }
             TraceEventKind::NoOp
-            | TraceEventKind::MarkerStarted { .. }
-            | TraceEventKind::MarkerStopped { .. }
+            | TraceEventKind::MarkerName { .. }
             | TraceEventKind::SystemDescription(_)
             | TraceEventKind::ClockSyncCycles { .. }
             | TraceEventKind::ClockSyncMicros { .. }
@@ -752,6 +816,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reconstructs_marker_intervals_without_changing_execution_context() {
+        let events = [
+            event(0, 1, TraceEventKind::TraceStarted),
+            event(1, 2, TraceEventKind::TaskStarted { task_id: 7 }),
+            event(2, 3, TraceEventKind::MarkerStarted { marker_id: 1 }),
+            event(3, 5, TraceEventKind::MarkerStopped { marker_id: 1 }),
+            event(4, 7, TraceEventKind::TaskStopped),
+        ];
+        let mut model = TraceModel::new();
+        model.apply_all(&events);
+        let core = model.core(0).expect("core exists");
+
+        assert_eq!(
+            core.marker_intervals(),
+            &[MarkerInterval {
+                marker_id: 1,
+                start_sequence: 2,
+                start_ticks: 3,
+                end_ticks: Some(5),
+                complete: true,
+            }]
+        );
+        assert_eq!(core.intervals()[0].context, ExecutionContext::Task(7));
+        assert_eq!(core.intervals()[0].start_ticks, 2);
+        assert_eq!(core.intervals()[0].end_ticks, Some(7));
     }
 
     #[test]

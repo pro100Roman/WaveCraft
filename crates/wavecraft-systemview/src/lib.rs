@@ -406,14 +406,25 @@ fn decode_length_prefixed_event(
     if event_id == 31 {
         let mut reader = PayloadReader::new(event_id, payload);
         let extended_event_id = reader.varint()?;
-        if extended_event_id == 7 {
-            let format_address = reader.varint()?;
-            let options = reader.varint()?;
-            return Ok(TraceEventKind::PrintElf {
-                format_address,
-                options,
-                payload: payload[reader.cursor..].to_vec(),
-            });
+        match extended_event_id {
+            1 => {
+                let kind = TraceEventKind::MarkerName {
+                    marker_id: reader.varint()?,
+                    name: reader.string()?,
+                };
+                reader.finish()?;
+                return Ok(kind);
+            }
+            7 => {
+                let format_address = reader.varint()?;
+                let options = reader.varint()?;
+                return Ok(TraceEventKind::PrintElf {
+                    format_address,
+                    options,
+                    payload: payload[reader.cursor..].to_vec(),
+                });
+            }
+            _ => {}
         }
         return Ok(TraceEventKind::Unknown {
             event_id,
@@ -803,6 +814,26 @@ mod tests {
                 format_address: 0x8000,
                 options: 2,
                 payload: encode_varint(42),
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_extended_marker_name() {
+        let mut payload = encode_varint(1);
+        payload.extend(encode_varint(42));
+        payload.extend(encode_varint(16));
+        payload.extend_from_slice(b"DPS310 interrupt");
+
+        let events = SystemViewDecoder::default()
+            .push(&length_packet(31, &payload, 5))
+            .expect("marker name packet decodes");
+
+        assert_eq!(
+            events[0].kind,
+            TraceEventKind::MarkerName {
+                marker_id: 42,
+                name: "DPS310 interrupt".to_owned(),
             }
         );
     }
