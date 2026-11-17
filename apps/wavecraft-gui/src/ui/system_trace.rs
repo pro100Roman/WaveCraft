@@ -2126,6 +2126,11 @@ fn timeline_lanes(model: &TraceModel) -> Vec<TimelineLane> {
             }
         }
     }
+    // Runtime scheduling determines which context produces an interval first,
+    // so discovery order is not stable between otherwise identical sessions.
+    // Keep lane positions, and therefore palette indices, tied to their stable
+    // core/context identifiers instead.
+    lanes.sort_unstable();
     lanes
 }
 
@@ -2142,6 +2147,7 @@ fn timeline_marker_lanes(model: &TraceModel) -> Vec<MarkerTimelineLane> {
             }
         }
     }
+    lanes.sort_unstable();
     lanes
 }
 
@@ -6311,6 +6317,82 @@ mod tests {
                 u16::from(BACKGROUND.r()) + u16::from(BACKGROUND.g()) + u16::from(BACKGROUND.b());
             assert!(brightness > background_brightness + 300);
         }
+    }
+
+    #[test]
+    fn timeline_lane_colors_do_not_depend_on_runtime_discovery_order() {
+        fn trace_with_order(
+            task_ids: [u64; 2],
+            marker_ids: [u64; 2],
+        ) -> SystemTraceDisplayState {
+            let mut trace = SystemTraceDisplayState::default();
+            let mut sequence = 0_u64;
+            let mut timestamp_ticks = 0_u64;
+            for task_id in task_ids {
+                trace.ingest(TraceEvent {
+                    sequence,
+                    core_id: 0,
+                    timestamp_ticks,
+                    kind: TraceEventKind::TaskStarted { task_id },
+                });
+                sequence += 1;
+                timestamp_ticks += 1;
+            }
+            trace.ingest(TraceEvent {
+                sequence,
+                core_id: 0,
+                timestamp_ticks,
+                kind: TraceEventKind::IsrEntered { isr_id: 22 },
+            });
+            sequence += 1;
+            timestamp_ticks += 1;
+            trace.ingest(TraceEvent {
+                sequence,
+                core_id: 0,
+                timestamp_ticks,
+                kind: TraceEventKind::IsrExited,
+            });
+            sequence += 1;
+            timestamp_ticks += 1;
+            for marker_id in marker_ids {
+                for kind in [
+                    TraceEventKind::MarkerStarted { marker_id },
+                    TraceEventKind::MarkerStopped { marker_id },
+                ] {
+                    trace.ingest(TraceEvent {
+                        sequence,
+                        core_id: 0,
+                        timestamp_ticks,
+                        kind,
+                    });
+                    sequence += 1;
+                    timestamp_ticks += 1;
+                }
+            }
+            trace
+        }
+
+        let first = trace_with_order([9, 3], [8, 2]);
+        let second = trace_with_order([3, 9], [2, 8]);
+        let first_lanes = timeline_lanes(first.model());
+        let second_lanes = timeline_lanes(second.model());
+        let first_markers = timeline_marker_lanes(first.model());
+        let second_markers = timeline_marker_lanes(second.model());
+
+        assert_eq!(first_lanes, second_lanes);
+        assert_eq!(first_markers, second_markers);
+        assert_eq!(
+            first_lanes
+                .iter()
+                .enumerate()
+                .map(|(index, lane)| (*lane, timeline_lane_color(index)))
+                .collect::<Vec<_>>(),
+            second_lanes
+                .iter()
+                .enumerate()
+                .map(|(index, lane)| (*lane, timeline_lane_color(index)))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
