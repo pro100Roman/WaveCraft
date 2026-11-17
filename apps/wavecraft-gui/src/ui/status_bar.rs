@@ -52,20 +52,21 @@ impl WaveCraftApp {
                             TEXT_MUTED
                         };
                         ui.label(RichText::new("●").color(color));
+                        // `Label::truncate` already shows the complete text in
+                        // one tooltip when it is elided. Adding another hover
+                        // tooltip here would render the same hint twice.
                         ui.add(
                             egui::Label::new(&self.status)
                                 .selectable(true)
                                 .truncate(),
-                        )
-                        .on_hover_selectable_text(&self.status);
+                        );
                         if let Some(error) = &self.last_error {
                             ui.separator();
                             ui.add(
                                 egui::Label::new(RichText::new(error).color(Color32::LIGHT_RED))
                                     .selectable(true)
                                     .truncate(),
-                            )
-                            .on_hover_selectable_text(error);
+                            );
                         }
                     });
                 });
