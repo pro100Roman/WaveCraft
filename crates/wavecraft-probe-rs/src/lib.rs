@@ -49,6 +49,7 @@ impl ProbeRsDriver {
             ProbeProvider::JLink,
             ProbeProvider::StLink,
             ProbeProvider::BlackMagicProbe,
+            ProbeProvider::CmsisDap,
         ]
         .into_iter()
         .map(|provider| ProbeTargetGroup {
@@ -105,8 +106,8 @@ fn provider_supports_core(provider: &ProbeProvider, core_type: config::CoreType)
                 | config::CoreType::Armv8a
                 | config::CoreType::Armv8m
         ),
-        ProbeProvider::JLink | ProbeProvider::BlackMagicProbe => true,
-        ProbeProvider::CmsisDap | ProbeProvider::Other(_) => false,
+        ProbeProvider::JLink | ProbeProvider::BlackMagicProbe | ProbeProvider::CmsisDap => true,
+        ProbeProvider::Other(_) => false,
     }
 }
 
@@ -910,6 +911,7 @@ mod tests {
                 &ProbeProvider::BlackMagicProbe,
                 arm_core
             ));
+            assert!(provider_supports_core(&ProbeProvider::CmsisDap, arm_core));
         }
         for non_arm_core in [
             config::CoreType::Riscv,
@@ -925,6 +927,10 @@ mod tests {
                 &ProbeProvider::BlackMagicProbe,
                 non_arm_core
             ));
+            assert!(provider_supports_core(
+                &ProbeProvider::CmsisDap,
+                non_arm_core
+            ));
         }
     }
 
@@ -932,11 +938,18 @@ mod tests {
     fn exposes_sorted_provider_specific_target_groups() {
         let groups = ProbeRsDriver::supported_target_groups();
 
-        assert_eq!(groups.len(), 3);
+        assert_eq!(groups.len(), 4);
         assert_eq!(groups[0].provider, ProbeProvider::JLink);
         assert_eq!(groups[1].provider, ProbeProvider::StLink);
         assert_eq!(groups[2].provider, ProbeProvider::BlackMagicProbe);
+        assert_eq!(groups[3].provider, ProbeProvider::CmsisDap);
         assert!(groups.iter().all(|group| !group.targets.is_empty()));
+        assert!(
+            groups[3]
+                .targets
+                .iter()
+                .any(|target| target.name == "nRF52832_xxAA")
+        );
         for group in groups {
             assert!(group.targets.windows(2).all(|targets| {
                 targets[0].name.to_ascii_lowercase() <= targets[1].name.to_ascii_lowercase()
