@@ -1063,7 +1063,14 @@ mod tests {
     }
 
     #[test]
-    fn device_refresh_keeps_network_probe_selection_without_a_local_probe() {
+    fn device_refresh_keeps_network_probe_selection_with_a_local_probe_connected() {
+        let local_jlink = wavecraft_debug_probe::ProbeDescriptor {
+            connection_id: "1366:0105:000261009815".to_owned(),
+            provider: wavecraft_debug_probe::ProbeProvider::JLink,
+            vendor: Some("SEGGER".to_owned()),
+            model: "J-Link EDU".to_owned(),
+            serial_number: Some("000261009815".to_owned()),
+        };
         for selection in [NETWORK_BMP_PROBE_SELECTION, NETWORK_JLINK_PROBE_SELECTION] {
             let mut app = app();
             app.system_trace_settings.probe_connection_id = Some(selection.to_owned());
@@ -1071,7 +1078,10 @@ mod tests {
             app.handle_devices_found(
                 Vec::new(),
                 RadioDiscoveryReport::default(),
-                DebugProbeDiscoveryReport::default(),
+                DebugProbeDiscoveryReport {
+                    probes: vec![local_jlink.clone()],
+                    ..DebugProbeDiscoveryReport::default()
+                },
             );
 
             assert_eq!(

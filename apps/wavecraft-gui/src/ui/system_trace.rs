@@ -130,6 +130,10 @@ impl SystemTraceSettings {
     pub(crate) fn saved_values(&self) -> BTreeMap<String, String> {
         BTreeMap::from([
             (
+                "system_trace.probe_connection_id".to_owned(),
+                self.probe_connection_id.clone().unwrap_or_default(),
+            ),
+            (
                 "system_trace.bmp_network_address".to_owned(),
                 self.bmp_network_address.clone(),
             ),
@@ -195,6 +199,10 @@ impl SystemTraceSettings {
     }
 
     pub(crate) fn apply_saved_values(&mut self, values: &BTreeMap<String, String>) {
+        let saved_probe_connection_id = values.get("system_trace.probe_connection_id");
+        if let Some(connection_id) = saved_probe_connection_id {
+            self.probe_connection_id = (!connection_id.is_empty()).then(|| connection_id.clone());
+        }
         if let Some(address) = values.get("system_trace.bmp_network_address") {
             self.bmp_network_address.clone_from(address);
         }
@@ -203,6 +211,16 @@ impl SystemTraceSettings {
             .unwrap_or(self.bmp_network_port);
         if let Some(address) = values.get("system_trace.jlink_network_address") {
             self.jlink_network_address.clone_from(address);
+        }
+        if saved_probe_connection_id.is_none() && self.probe_connection_id.is_none() {
+            self.probe_connection_id = match (
+                self.bmp_network_address.trim().is_empty(),
+                self.jlink_network_address.trim().is_empty(),
+            ) {
+                (false, true) => Some(NETWORK_BMP_PROBE_SELECTION.to_owned()),
+                (true, false) => Some(NETWORK_JLINK_PROBE_SELECTION.to_owned()),
+                _ => None,
+            };
         }
         self.jlink_network_port = saved_trace_value(values, "system_trace.jlink_network_port")
             .filter(|port| *port != 0)
@@ -7456,7 +7474,7 @@ mod tests {
     #[test]
     fn system_trace_settings_round_trip_through_saved_values() {
         let expected = SystemTraceSettings {
-            probe_connection_id: None,
+            probe_connection_id: Some(NETWORK_BMP_PROBE_SELECTION.to_owned()),
             bmp_network_address: "192.168.1.42".to_owned(),
             bmp_network_port: 3_141,
             jlink_network_address: "192.168.1.43".to_owned(),
@@ -7479,6 +7497,21 @@ mod tests {
         restored.apply_saved_values(&expected.saved_values());
 
         assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn legacy_network_bmp_settings_restore_the_probe_selection() {
+        let mut restored = SystemTraceSettings::default();
+
+        restored.apply_saved_values(&BTreeMap::from([(
+            "system_trace.bmp_network_address".to_owned(),
+            "192.168.4.1".to_owned(),
+        )]));
+
+        assert_eq!(
+            restored.probe_connection_id.as_deref(),
+            Some(NETWORK_BMP_PROBE_SELECTION)
+        );
     }
 
     #[test]
