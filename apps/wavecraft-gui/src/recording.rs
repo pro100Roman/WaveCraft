@@ -40,22 +40,6 @@ fn normalize_recording_path(mut path: PathBuf) -> PathBuf {
     path
 }
 
-/// Returns `path` if it is free, otherwise the first free `stem-N.dsv`
-/// sibling. `None` only if every numbered name is taken.
-fn available_recording_path(path: PathBuf) -> Option<PathBuf> {
-    if !path.exists() {
-        return Some(path);
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let stem = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("capture");
-    (2_u32..=u32::MAX)
-        .map(|index| parent.join(format!("{stem}-{index}.dsv")))
-        .find(|candidate| !candidate.exists())
-}
-
 pub(crate) fn choose_recording_save_path(current_path: &str) -> Option<PathBuf> {
     let default_name = Path::new(current_path.trim())
         .file_name()
@@ -68,7 +52,6 @@ pub(crate) fn choose_recording_save_path(current_path: &str) -> Option<PathBuf> 
         .set_file_name(default_name)
         .save_file()
         .map(normalize_recording_path)
-        .and_then(available_recording_path)
 }
 
 fn normalize_decoded_data_path(mut path: PathBuf) -> PathBuf {
@@ -80,22 +63,6 @@ fn normalize_decoded_data_path(mut path: PathBuf) -> PathBuf {
         path.set_extension("jsonl");
     }
     path
-}
-
-/// Returns `path` if it is free, otherwise the first free `stem-N.jsonl`
-/// sibling. `None` only if every numbered name is taken.
-fn available_decoded_data_path(path: PathBuf) -> Option<PathBuf> {
-    if !path.exists() {
-        return Some(path);
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let stem = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("decoded-data");
-    (2_u32..=u32::MAX)
-        .map(|index| parent.join(format!("{stem}-{index}.jsonl")))
-        .find(|candidate| !candidate.exists())
 }
 
 pub(crate) fn choose_decoded_data_save_path(current_path: &str) -> Option<PathBuf> {
@@ -110,7 +77,6 @@ pub(crate) fn choose_decoded_data_save_path(current_path: &str) -> Option<PathBu
         .set_file_name(default_name)
         .save_file()
         .map(normalize_decoded_data_path)
-        .and_then(available_decoded_data_path)
 }
 
 pub(crate) struct DecodedDataRecorder<W: Write> {
@@ -311,11 +277,12 @@ pub(crate) fn create_decoded_data_recorder(
 ) -> Result<FileDecodedDataRecorder, String> {
     let file = OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .open(path)
         .map_err(|error| {
             format!(
-                "failed to create decoded data recording {} without overwriting an existing file: {error}",
+                "failed to create or replace decoded data recording {}: {error}",
                 path.display()
             )
         })?;
@@ -632,11 +599,12 @@ pub(crate) fn start_gui_recording(
 ) -> Result<FileRecorder, String> {
     let file = OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .open(path)
         .map_err(|error| {
             format!(
-                "failed to create recording {} without overwriting an existing file: {error}",
+                "failed to create or replace recording {}: {error}",
                 path.display()
             )
         })?;
@@ -1898,48 +1866,6 @@ mod tests {
     }
 
     #[test]
-    fn available_paths_skip_names_that_already_exist() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "wavecraft-available-paths-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-
-        let capture = directory.join("capture.dsv");
-        assert_eq!(
-            available_recording_path(capture.clone()),
-            Some(capture.clone())
-        );
-        std::fs::write(&capture, b"x").unwrap();
-        assert_eq!(
-            available_recording_path(capture.clone()),
-            Some(directory.join("capture-2.dsv"))
-        );
-        std::fs::write(directory.join("capture-2.dsv"), b"x").unwrap();
-        assert_eq!(
-            available_recording_path(capture),
-            Some(directory.join("capture-3.dsv"))
-        );
-
-        let decoded = directory.join("decoded.jsonl");
-        assert_eq!(
-            available_decoded_data_path(decoded.clone()),
-            Some(decoded.clone())
-        );
-        std::fs::write(&decoded, b"x").unwrap();
-        assert_eq!(
-            available_decoded_data_path(decoded),
-            Some(directory.join("decoded-2.jsonl"))
-        );
-
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
     fn saleae_export_replaces_the_selected_file() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2234,21 +2160,31 @@ mod tests {
     }
 
     #[test]
-    fn a_new_recording_never_replaces_an_existing_file() {
+    fn a_new_recording_replaces_the_confirmed_existing_file() {
         let directory = crate::app::test_support::scratch_directory("gui-recording-exists");
         let path = directory.join("capture.dsv");
         std::fs::write(&path, b"keep me").unwrap();
 
-        let error = RecordingCase::new()
-            .start(&path)
-            .err()
-            .expect("an existing file must not be replaced");
+        let mut recorder = RecordingCase::new().start(&path).unwrap();
+        recorder.finish(CompletionStatus::Complete).unwrap();
 
-        assert!(
-            error.contains("without overwriting an existing file"),
-            "{error}"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+        let bytes = std::fs::read(&path).unwrap();
+        assert_ne!(bytes, b"keep me");
+        RecordingReader::new(BufReader::new(bytes.as_slice())).unwrap();
+    }
+
+    #[test]
+    fn decoded_data_recording_replaces_the_confirmed_existing_file() {
+        let directory = crate::app::test_support::scratch_directory("decoded-recording-exists");
+        let path = directory.join("decoded.jsonl");
+        std::fs::write(&path, b"keep me").unwrap();
+
+        let mut recorder = create_decoded_data_recorder(&path, &RadioSettings::default()).unwrap();
+        recorder.finish(CompletionStatus::Complete).unwrap();
+
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.contains("keep me"));
+        assert!(text.contains("\"type\":\"footer\""));
     }
 
     #[test]
