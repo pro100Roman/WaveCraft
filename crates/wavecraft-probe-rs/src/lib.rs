@@ -13,17 +13,17 @@ use probe_rs::probe::{
     Probe as ProbeRsProbe, ProbeCreationError, ProbeTransport, WireProtocol as ProbeRsWireProtocol,
 };
 use probe_rs::rtt::{Rtt, RttTarget, ScanRegion, try_attach_to_rtt};
-use probe_rs::{MemoryInterface, Permissions, Session, config};
+use probe_rs::{Architecture, MemoryInterface, Permissions, Session, VectorCatchCondition, config};
 use std::error::Error as StdError;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use wavecraft_debug_probe::{
-    AttachConfiguration, DebugProbeDriver, DebugProbeError, DebugProbeErrorKind, DebugProbeHandle,
-    DebugSession, DebugTargetDescriptor, CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX,
+    AttachConfiguration, CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX, DebugProbeDriver, DebugProbeError,
+    DebugProbeErrorKind, DebugProbeHandle, DebugSession, DebugTargetDescriptor,
     JLINK_NETWORK_CONNECTION_ID_PREFIX, ProbeDescriptor, ProbeProvider, ProbeSelector,
     ProbeTargetGroup, RttChannelDescriptor, RttChannelDirection, RttConfiguration,
     RttControlBlockLocation, TargetSelector, WireProtocol,
@@ -35,6 +35,12 @@ const NETWORK_BMP_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(2_500);
 const NETWORK_BMP_RETRY_DELAY: Duration = Duration::from_millis(100);
 const NETWORK_BMP_OPEN_ATTEMPTS: usize = 2;
 const NETWORK_BMP_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const NETWORK_CMSIS_DAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const CMSIS_DAP_TCP_HEADER_LENGTH: usize = 8;
+const CMSIS_DAP_TCP_REQUEST_TYPE: u8 = 1;
+const CMSIS_DAP_TCP_RESPONSE_TYPE: u8 = 2;
+const CMSIS_DAP_INFO_COMMAND: u8 = 0;
+const CMSIS_DAP_PACKET_COUNT_INFO_ID: u8 = 0xfe;
 
 /// Minimum Rust release required by the pinned `probe-rs` adapter dependency.
 pub const MINIMUM_RUST_VERSION: &str = "1.95";
@@ -132,10 +138,13 @@ impl DebugProbeDriver for ProbeRsDriver {
         }
         let network_bmp_endpoint = network_bmp_endpoint(selector);
         let network_cmsis_dap_endpoint = network_cmsis_dap_endpoint(selector)?;
-        let requested_connection_id = network_cmsis_dap_endpoint.map_or_else(
-            || selector.connection_id.clone(),
-            |endpoint| format!("{PROBE_RS_CMSIS_DAP_TCP_SELECTOR_PREFIX}{endpoint}"),
-        );
+        let requested_connection_id = match network_cmsis_dap_endpoint {
+            Some(endpoint) => {
+                let proxy_endpoint = start_network_cmsis_dap_proxy(endpoint)?;
+                format!("{PROBE_RS_CMSIS_DAP_TCP_SELECTOR_PREFIX}{proxy_endpoint}")
+            }
+            None => selector.connection_id.clone(),
+        };
         let requested: DebugProbeSelector = requested_connection_id.parse().map_err(|error| {
             DebugProbeError::new(
                 DebugProbeErrorKind::InvalidConfiguration,
@@ -208,6 +217,138 @@ fn open_network_bmp(endpoint: SocketAddr) -> Result<ProbeRsProbe, DebugProbeErro
     }))
 }
 
+fn start_network_cmsis_dap_proxy(endpoint: SocketAddr) -> Result<SocketAddr, DebugProbeError> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| transport_error("failed to create the network CMSIS-DAP proxy", error))?;
+    let local_endpoint = listener
+        .local_addr()
+        .map_err(|error| transport_error("failed to inspect the network CMSIS-DAP proxy", error))?;
+    let remote = TcpStream::connect_timeout(&endpoint, NETWORK_CMSIS_DAP_CONNECT_TIMEOUT)
+        .map_err(|error| transport_error("failed to connect to network CMSIS-DAP", error))?;
+    remote.set_nodelay(true).map_err(|error| {
+        transport_error("failed to configure the network CMSIS-DAP socket", error)
+    })?;
+    configure_abortive_close(&remote).map_err(|error| {
+        transport_error("failed to configure CMSIS-DAP disconnect handling", error)
+    })?;
+    thread::Builder::new()
+        .name("wavecraft-network-cmsis-dap-proxy".to_owned())
+        .spawn(move || {
+            let Ok((local, _)) = listener.accept() else {
+                return;
+            };
+            let _ = relay_network_cmsis_dap(local, remote);
+        })
+        .map_err(|error| transport_error("failed to start the network CMSIS-DAP proxy", error))?;
+    Ok(local_endpoint)
+}
+
+fn relay_network_cmsis_dap(local: TcpStream, remote: TcpStream) -> io::Result<()> {
+    local.set_nodelay(true)?;
+
+    let mut local_reader = local.try_clone()?;
+    let mut remote_writer = remote.try_clone()?;
+    let mut remote_reader = remote.try_clone()?;
+    let mut local_writer = local.try_clone()?;
+    let local_stop = local.try_clone()?;
+    let pending_packet_count_replies = Arc::new(AtomicUsize::new(0));
+    let response_pending_packet_counts = Arc::clone(&pending_packet_count_replies);
+    let reverse = thread::Builder::new()
+        .name("wavecraft-network-cmsis-dap-proxy-reply".to_owned())
+        .spawn(move || {
+            let result = relay_network_cmsis_dap_responses(
+                &mut remote_reader,
+                &mut local_writer,
+                &response_pending_packet_counts,
+            );
+            let _ = local_stop.shutdown(Shutdown::Both);
+            result
+        })?;
+
+    let forward = relay_network_cmsis_dap_requests(
+        &mut local_reader,
+        &mut remote_writer,
+        &pending_packet_count_replies,
+    );
+    let _ = local.shutdown(Shutdown::Both);
+    let _ = remote.shutdown(Shutdown::Both);
+    let reverse = reverse
+        .join()
+        .map_err(|_| io::Error::other("network CMSIS-DAP response relay panicked"))?;
+    forward.and(reverse)
+}
+
+fn relay_network_cmsis_dap_requests(
+    local: &mut TcpStream,
+    remote: &mut TcpStream,
+    pending_packet_count_replies: &AtomicUsize,
+) -> io::Result<()> {
+    while let Some(frame) = read_cmsis_dap_tcp_frame(local, CMSIS_DAP_TCP_REQUEST_TYPE)? {
+        if frame.get(CMSIS_DAP_TCP_HEADER_LENGTH..)
+            == Some(&[CMSIS_DAP_INFO_COMMAND, CMSIS_DAP_PACKET_COUNT_INFO_ID])
+        {
+            pending_packet_count_replies.fetch_add(1, Ordering::Release);
+        }
+        remote.write_all(&frame)?;
+    }
+    Ok(())
+}
+
+fn relay_network_cmsis_dap_responses(
+    remote: &mut TcpStream,
+    local: &mut TcpStream,
+    pending_packet_count_replies: &AtomicUsize,
+) -> io::Result<()> {
+    while let Some(mut frame) = read_cmsis_dap_tcp_frame(remote, CMSIS_DAP_TCP_RESPONSE_TYPE)? {
+        limit_cmsis_dap_packet_count(&mut frame, pending_packet_count_replies);
+        local.write_all(&frame)?;
+    }
+    Ok(())
+}
+
+fn read_cmsis_dap_tcp_frame(
+    stream: &mut TcpStream,
+    expected_type: u8,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut header = [0_u8; CMSIS_DAP_TCP_HEADER_LENGTH];
+    match stream.read(&mut header[..1])? {
+        0 => return Ok(None),
+        1 => {}
+        _ => {
+            return Err(io::Error::other(
+                "CMSIS-DAP TCP one-byte read returned an invalid length",
+            ));
+        }
+    }
+    stream.read_exact(&mut header[1..])?;
+    if header[..4] != *b"DAP\0" || header[6] != expected_type {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid CMSIS-DAP TCP frame header",
+        ));
+    }
+    let payload_length = usize::from(u16::from_le_bytes([header[4], header[5]]));
+    let mut frame = Vec::with_capacity(CMSIS_DAP_TCP_HEADER_LENGTH + payload_length);
+    frame.extend_from_slice(&header);
+    frame.resize(CMSIS_DAP_TCP_HEADER_LENGTH + payload_length, 0);
+    stream.read_exact(&mut frame[CMSIS_DAP_TCP_HEADER_LENGTH..])?;
+    Ok(Some(frame))
+}
+
+fn limit_cmsis_dap_packet_count(frame: &mut [u8], pending_replies: &AtomicUsize) {
+    let payload_start = CMSIS_DAP_TCP_HEADER_LENGTH.min(frame.len());
+    let payload = &mut frame[payload_start..];
+    if pending_replies.load(Ordering::Acquire) == 0
+        || !matches!(payload, [CMSIS_DAP_INFO_COMMAND, 1, _, ..])
+    {
+        return;
+    }
+    payload[2] = 1;
+    let _ = pending_replies.try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+        pending.checked_sub(1)
+    });
+}
+
 fn open_network_bmp_once(endpoint: SocketAddr) -> Result<ProbeRsProbe, DebugProbeError> {
     let proxy_endpoint = start_network_bmp_proxy(
         endpoint,
@@ -265,11 +406,11 @@ fn start_network_bmp_proxy(
     Ok(local_endpoint)
 }
 
-// The ESP32JTAG BMP server handles one GDB remote client at a time. An
-// ordinary FIN can remain queued in lwIP while a stalled GDB command is being
-// processed, leaving the next WaveCraft connection accepted but unanswered.
-// Abortive close makes helper termination, timeout, and disconnect release the
-// server-side session immediately.
+// ESP32JTAG's debug servers handle one remote client at a time. An ordinary
+// FIN can remain queued in lwIP while a stalled command is being processed,
+// leaving the next WaveCraft connection accepted but unanswered. Abortive
+// close makes helper termination, timeout, and disconnect release the
+// server-side session immediately for both BMP and CMSIS-DAP.
 #[cfg(unix)]
 fn configure_abortive_close(stream: &TcpStream) -> io::Result<()> {
     use std::mem::size_of;
@@ -476,6 +617,14 @@ impl DebugProbeHandle for ProbeRsHandle {
         if let Some(speed_khz) = configuration.speed_khz {
             probe.set_speed(speed_khz).map_err(map_probe_error)?;
         }
+        if self.descriptor.provider == ProbeProvider::CmsisDap {
+            probe.target_reset_deassert().map_err(|error| {
+                transport_error(
+                    "failed to release the CMSIS-DAP target reset line before attach",
+                    describe_error_chain(&error),
+                )
+            })?;
+        }
         let target = match &configuration.target {
             TargetSelector::Auto => config::TargetSelector::Auto,
             TargetSelector::Name(name) => config::TargetSelector::Unspecified(name.clone()),
@@ -508,8 +657,20 @@ impl DebugSession for ProbeRsSession {
             .session
             .core(self.core_index)
             .map_err(|error| target_error("target core is unavailable", error))?;
+        if core.architecture() == Architecture::Arm {
+            core.disable_vector_catch(VectorCatchCondition::CoreReset)
+                .map_err(|error| target_error("failed to clear reset vector catch", error))?;
+        }
         core.reset()
-            .map_err(|error| target_error("failed to reset target", error))
+            .map_err(|error| target_error("failed to reset target", error))?;
+        if core
+            .core_halted()
+            .map_err(|error| target_error("failed to inspect target after reset", error))?
+        {
+            core.run()
+                .map_err(|error| target_error("failed to resume target after reset", error))?;
+        }
+        Ok(())
     }
 
     fn read_memory(&mut self, address: u64, destination: &mut [u8]) -> Result<(), DebugProbeError> {
@@ -680,7 +841,10 @@ fn map_open_error(error: ProbeRsDebugProbeError) -> DebugProbeError {
     };
     DebugProbeError::new(
         kind,
-        format!("failed to open debug probe: {}", describe_error_chain(&error)),
+        format!(
+            "failed to open debug probe: {}",
+            describe_error_chain(&error)
+        ),
     )
 }
 
@@ -909,6 +1073,84 @@ mod tests {
             )))
             .is_err()
         );
+    }
+
+    fn cmsis_dap_tcp_frame(packet_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = b"DAP\0".to_vec();
+        frame.extend_from_slice(
+            &u16::try_from(payload.len())
+                .expect("test payload fits in a CMSIS-DAP frame")
+                .to_le_bytes(),
+        );
+        frame.extend_from_slice(&[packet_type, 0]);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn network_cmsis_dap_proxy_limits_the_reported_packet_pipeline() {
+        let remote_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("test remote endpoint binds");
+        let remote_endpoint = remote_listener
+            .local_addr()
+            .expect("test remote endpoint has an address");
+        let remote = thread::spawn(move || {
+            let (mut stream, _) = remote_listener.accept().expect("proxy connects to remote");
+            let expected = cmsis_dap_tcp_frame(
+                CMSIS_DAP_TCP_REQUEST_TYPE,
+                &[CMSIS_DAP_INFO_COMMAND, CMSIS_DAP_PACKET_COUNT_INFO_ID],
+            );
+            let mut request = vec![0; expected.len()];
+            stream
+                .read_exact(&mut request)
+                .expect("packet-count request reaches remote");
+            assert_eq!(request, expected);
+            stream
+                .write_all(&cmsis_dap_tcp_frame(
+                    CMSIS_DAP_TCP_RESPONSE_TYPE,
+                    &[CMSIS_DAP_INFO_COMMAND, 1, 4],
+                ))
+                .expect("remote writes packet-count reply");
+        });
+
+        let proxy_endpoint =
+            start_network_cmsis_dap_proxy(remote_endpoint).expect("network CMSIS-DAP proxy starts");
+        let mut client = TcpStream::connect(proxy_endpoint).expect("client connects to proxy");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("test read timeout is configured");
+        client
+            .write_all(&cmsis_dap_tcp_frame(
+                CMSIS_DAP_TCP_REQUEST_TYPE,
+                &[CMSIS_DAP_INFO_COMMAND, CMSIS_DAP_PACKET_COUNT_INFO_ID],
+            ))
+            .expect("client writes packet-count request");
+        let expected =
+            cmsis_dap_tcp_frame(CMSIS_DAP_TCP_RESPONSE_TYPE, &[CMSIS_DAP_INFO_COMMAND, 1, 1]);
+        let mut reply = vec![0; expected.len()];
+        client
+            .read_exact(&mut reply)
+            .expect("limited packet-count reply reaches client");
+
+        assert_eq!(reply, expected);
+        remote.join().expect("test remote exits cleanly");
+    }
+
+    #[test]
+    fn cmsis_dap_proxy_leaves_other_info_replies_unchanged() {
+        let pending = AtomicUsize::new(1);
+        let mut packet_size = cmsis_dap_tcp_frame(
+            CMSIS_DAP_TCP_RESPONSE_TYPE,
+            &[CMSIS_DAP_INFO_COMMAND, 2, 0, 4],
+        );
+
+        limit_cmsis_dap_packet_count(&mut packet_size, &pending);
+
+        assert_eq!(
+            &packet_size[CMSIS_DAP_TCP_HEADER_LENGTH..],
+            &[CMSIS_DAP_INFO_COMMAND, 2, 0, 4]
+        );
+        assert_eq!(pending.load(Ordering::Acquire), 1);
     }
 
     #[test]

@@ -797,16 +797,19 @@ impl WaveCraftApp {
 
                                 ui.add_space(10.0);
                                 setup_label(ui, "SWD speed (kHz)");
-                                ui.add(
-                                    egui::DragValue::new(
-                                        &mut self.system_trace_settings.speed_khz,
-                                    )
-                                    .range(100..=50_000)
-                                    .speed(100),
+                                let mut speed_khz =
+                                    u64::from(self.system_trace_settings.speed_khz);
+                                paint_typed_bounded_value(
+                                    ui,
+                                    "system_trace_swd_speed_khz",
+                                    &mut speed_khz,
+                                    100..=50_000,
                                 )
                                 .on_hover_text(
                                     "Set the SWD clock in kHz. Reduce it if target communication is unreliable",
                                 );
+                                self.system_trace_settings.speed_khz = u32::try_from(speed_khz)
+                                    .unwrap_or(self.system_trace_settings.speed_khz);
 
                                 ui.add_space(10.0);
                                 ui.checkbox(
@@ -1112,14 +1115,13 @@ impl WaveCraftApp {
                                                         .get_or_insert(
                                                             DEFAULT_TIMESTAMP_FREQUENCY_OVERRIDE_HZ,
                                                         );
-                                                    ui.add(
-                                                        egui::DragValue::new(frequency)
-                                                            .range(
-                                                                1..=MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ,
-                                                            )
-                                                            .speed(1_000)
-                                                            .suffix(" Hz"),
+                                                    paint_typed_bounded_value(
+                                                        ui,
+                                                        "system_trace_timestamp_frequency_hz",
+                                                        frequency,
+                                                        1..=MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ,
                                                     );
+                                                    ui.label("Hz");
                                                 } else {
                                                     self.system_trace_settings
                                                         .timestamp_frequency_override_hz = None;
@@ -1292,6 +1294,42 @@ impl WaveCraftApp {
 
 fn setup_label(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).color(TEXT_MUTED));
+}
+
+fn paint_typed_bounded_value(
+    ui: &mut egui::Ui,
+    id_source: &'static str,
+    value: &mut u64,
+    range: std::ops::RangeInclusive<u64>,
+) -> egui::Response {
+    let id = ui.make_persistent_id(id_source);
+    let has_focus = ui.memory(|memory| memory.has_focus(id));
+    let mut input = ui
+        .data(|data| data.get_temp::<String>(id))
+        .unwrap_or_else(|| value.to_string());
+    if !has_focus {
+        input = value.to_string();
+    }
+
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut input)
+            .id(id)
+            .desired_width(100.0)
+            .char_limit(20),
+    );
+    if response.changed() {
+        input.retain(|character| character.is_ascii_digit());
+        if let Ok(parsed) = input.parse::<u64>() {
+            if range.contains(&parsed) {
+                *value = parsed;
+            }
+        }
+    }
+    if response.lost_focus() {
+        input = value.to_string();
+    }
+    ui.data_mut(|data| data.insert_temp(id, input));
+    response
 }
 
 fn setup_label_with_hover(ui: &mut egui::Ui, text: &str, hover: &str) {
@@ -5907,6 +5945,36 @@ mod tests {
         assert!(!texts.iter().any(|(text, _)| text == "Connect and attach"));
         assert!(!texts.iter().any(|(text, _)| text == APPLICATION_ELF_HELP));
         assert!(!texts.iter().any(|(text, _)| text == API_DESCRIPTION_HELP));
+    }
+
+    #[test]
+    fn pointer_drag_does_not_change_swd_speed() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace_settings.speed_khz = 4_000;
+
+        let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
+        let speed = texts
+            .iter()
+            .find(|(text, _)| text == "4000")
+            .map(|(_, position)| *position)
+            .expect("typed SWD speed is painted");
+        let end = speed + egui::vec2(100.0, 0.0);
+        let _ = paint_setup_panel(
+            &context,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(speed),
+                pointer_button(speed, true),
+            ],
+        );
+        let _ = paint_setup_panel(
+            &context,
+            &mut app,
+            vec![egui::Event::PointerMoved(end), pointer_button(end, false)],
+        );
+
+        assert_eq!(app.system_trace_settings.speed_khz, 4_000);
     }
 
     #[test]
