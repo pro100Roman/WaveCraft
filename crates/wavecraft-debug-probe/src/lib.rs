@@ -24,6 +24,9 @@ pub const DEBUG_PROBE_HELPER_PROTOCOL_VERSION: u32 = 4;
 /// Connection-ID prefix reserved for a J-Link reached through SEGGER's TCP/IP transport.
 pub const JLINK_NETWORK_CONNECTION_ID_PREFIX: &str = "wavecraft:jlink-network:";
 
+/// Connection-ID prefix reserved for CMSIS-DAP probes reached over TCP/IP.
+pub const CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX: &str = "wavecraft:cmsis-dap-network:";
+
 /// Upper bound for one encoded helper request or response.
 pub const MAX_DEBUG_PROBE_HELPER_MESSAGE_BYTES: usize = 1024 * 1024;
 

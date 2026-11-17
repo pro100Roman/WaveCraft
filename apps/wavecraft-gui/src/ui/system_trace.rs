@@ -24,7 +24,7 @@ use crate::{
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugTargetDescriptor, ProbeDescriptor, ProbeProvider, ProbeSelector,
     RttConfiguration, RttControlBlockLocation, RttTerminalColor, RttTerminalLine, TargetSelector,
-    WireProtocol, JLINK_NETWORK_CONNECTION_ID_PREFIX,
+    WireProtocol, CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX, JLINK_NETWORK_CONNECTION_ID_PREFIX,
 };
 use wavecraft_systemview::{ApiValue, DecodedApiParameter};
 use wavecraft_trace::{
@@ -78,6 +78,7 @@ const MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 10_000_000_000;
 const APPLICATION_ELF_HELP: &str = "Resolves _SEGGER_RTT, resource symbols, and .sv-data messages";
 const API_DESCRIPTION_HELP: &str = "Decodes typed OS and middleware API events 32–511";
 pub(crate) const NETWORK_BMP_PROBE_SELECTION: &str = "wavecraft:network-bmp";
+pub(crate) const NETWORK_CMSIS_DAP_PROBE_SELECTION: &str = "wavecraft:network-cmsis-dap";
 pub(crate) const NETWORK_JLINK_PROBE_SELECTION: &str = "wavecraft:network-jlink";
 const BLACK_MAGIC_PROBE_SELECTOR_PREFIX: &str = "1d50:6018";
 
@@ -86,6 +87,8 @@ pub(crate) struct SystemTraceSettings {
     pub(crate) probe_connection_id: Option<String>,
     pub(crate) bmp_network_address: String,
     pub(crate) bmp_network_port: u16,
+    pub(crate) cmsis_dap_network_address: String,
+    pub(crate) cmsis_dap_network_port: u16,
     pub(crate) jlink_network_address: String,
     pub(crate) jlink_network_port: u16,
     pub(crate) target_name: String,
@@ -108,6 +111,8 @@ impl Default for SystemTraceSettings {
             probe_connection_id: None,
             bmp_network_address: String::new(),
             bmp_network_port: 2_000,
+            cmsis_dap_network_address: String::new(),
+            cmsis_dap_network_port: 4_441,
             jlink_network_address: String::new(),
             jlink_network_port: 19_020,
             target_name: String::new(),
@@ -140,6 +145,14 @@ impl SystemTraceSettings {
             (
                 "system_trace.bmp_network_port".to_owned(),
                 self.bmp_network_port.to_string(),
+            ),
+            (
+                "system_trace.cmsis_dap_network_address".to_owned(),
+                self.cmsis_dap_network_address.clone(),
+            ),
+            (
+                "system_trace.cmsis_dap_network_port".to_owned(),
+                self.cmsis_dap_network_port.to_string(),
             ),
             (
                 "system_trace.jlink_network_address".to_owned(),
@@ -209,16 +222,25 @@ impl SystemTraceSettings {
         self.bmp_network_port = saved_trace_value(values, "system_trace.bmp_network_port")
             .filter(|port| *port != 0)
             .unwrap_or(self.bmp_network_port);
+        if let Some(address) = values.get("system_trace.cmsis_dap_network_address") {
+            self.cmsis_dap_network_address.clone_from(address);
+        }
+        self.cmsis_dap_network_port =
+            saved_trace_value(values, "system_trace.cmsis_dap_network_port")
+                .filter(|port| *port != 0)
+                .unwrap_or(self.cmsis_dap_network_port);
         if let Some(address) = values.get("system_trace.jlink_network_address") {
             self.jlink_network_address.clone_from(address);
         }
         if saved_probe_connection_id.is_none() && self.probe_connection_id.is_none() {
             self.probe_connection_id = match (
                 self.bmp_network_address.trim().is_empty(),
+                self.cmsis_dap_network_address.trim().is_empty(),
                 self.jlink_network_address.trim().is_empty(),
             ) {
-                (false, true) => Some(NETWORK_BMP_PROBE_SELECTION.to_owned()),
-                (true, false) => Some(NETWORK_JLINK_PROBE_SELECTION.to_owned()),
+                (false, true, true) => Some(NETWORK_BMP_PROBE_SELECTION.to_owned()),
+                (true, false, true) => Some(NETWORK_CMSIS_DAP_PROBE_SELECTION.to_owned()),
+                (true, true, false) => Some(NETWORK_JLINK_PROBE_SELECTION.to_owned()),
                 _ => None,
             };
         }
@@ -281,14 +303,24 @@ impl SystemTraceSettings {
             .ok_or_else(|| "Select a debug probe before connecting".to_owned())?;
         let connection_id = if selected_probe == NETWORK_BMP_PROBE_SELECTION {
             network_bmp_connection_id(&self.bmp_network_address, self.bmp_network_port)?
+        } else if selected_probe == NETWORK_CMSIS_DAP_PROBE_SELECTION {
+            network_cmsis_dap_connection_id(
+                &self.cmsis_dap_network_address,
+                self.cmsis_dap_network_port,
+            )?
         } else if selected_probe == NETWORK_JLINK_PROBE_SELECTION {
             network_jlink_connection_id(&self.jlink_network_address, self.jlink_network_port)?
         } else {
             selected_probe.to_owned()
         };
         let target_name = self.target_name.trim();
-        if selected_probe == NETWORK_JLINK_PROBE_SELECTION && target_name.is_empty() {
-            return Err("Select a target MCU when using J-Link over the network".to_owned());
+        if target_name.is_empty() {
+            if selected_probe == NETWORK_CMSIS_DAP_PROBE_SELECTION {
+                return Err("Select a target MCU when using CMSIS-DAP over the network".to_owned());
+            }
+            if selected_probe == NETWORK_JLINK_PROBE_SELECTION {
+                return Err("Select a target MCU when using J-Link over the network".to_owned());
+            }
         }
         let target = if target_name.is_empty() {
             TargetSelector::Auto
@@ -320,6 +352,13 @@ impl SystemTraceSettings {
 fn network_bmp_connection_id(address: &str, port: u16) -> Result<String, String> {
     let endpoint = network_probe_endpoint(address, port, "BMP")?;
     Ok(format!("{BLACK_MAGIC_PROBE_SELECTOR_PREFIX}:{endpoint}"))
+}
+
+fn network_cmsis_dap_connection_id(address: &str, port: u16) -> Result<String, String> {
+    let endpoint = network_probe_endpoint(address, port, "CMSIS-DAP")?;
+    Ok(format!(
+        "{CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX}{endpoint}"
+    ))
 }
 
 fn network_jlink_connection_id(address: &str, port: u16) -> Result<String, String> {
@@ -537,6 +576,11 @@ impl WaveCraftApp {
                                     .probe_connection_id
                                     .as_deref()
                                     == Some(NETWORK_BMP_PROBE_SELECTION);
+                                let network_cmsis_dap_selected = self
+                                    .system_trace_settings
+                                    .probe_connection_id
+                                    .as_deref()
+                                    == Some(NETWORK_CMSIS_DAP_PROBE_SELECTION);
                                 let network_jlink_selected = self
                                     .system_trace_settings
                                     .probe_connection_id
@@ -544,6 +588,8 @@ impl WaveCraftApp {
                                     == Some(NETWORK_JLINK_PROBE_SELECTION);
                                 let selected_probe_label = if network_bmp_selected {
                                     "BMP over network".to_owned()
+                                } else if network_cmsis_dap_selected {
+                                    "CMSIS-DAP over network".to_owned()
                                 } else if network_jlink_selected {
                                     "J-Link over network".to_owned()
                                 } else {
@@ -553,12 +599,14 @@ impl WaveCraftApp {
                                 };
                                 let selected_probe_hover = if network_bmp_selected {
                                     "Connect to a Black Magic Probe remote protocol endpoint over TCP".to_owned()
+                                } else if network_cmsis_dap_selected {
+                                    "Connect to an OpenOCD-compatible CMSIS-DAP TCP endpoint".to_owned()
                                 } else if network_jlink_selected {
                                     "Connect to a J-Link probe or SEGGER Remote Server over TCP/IP".to_owned()
                                 } else {
                                     selected_probe.map_or_else(
                                         || {
-                                            "Select a connected probe or configure a network Black Magic Probe for this trace session".to_owned()
+                                            "Select a connected probe or configure a network probe for this trace session".to_owned()
                                         },
                                         |probe| {
                                             format!(
@@ -612,6 +660,20 @@ impl WaveCraftApp {
                                                 &mut self
                                                     .system_trace_settings
                                                     .probe_connection_id,
+                                                Some(
+                                                    NETWORK_CMSIS_DAP_PROBE_SELECTION.to_owned(),
+                                                ),
+                                                "CMSIS-DAP over network",
+                                            )
+                                            .on_hover_text(
+                                                "Connect to an OpenOCD-compatible CMSIS-DAP TCP endpoint",
+                                            )
+                                            .changed();
+                                        probe_changed |= ui
+                                            .selectable_value(
+                                                &mut self
+                                                    .system_trace_settings
+                                                    .probe_connection_id,
                                                 Some(NETWORK_JLINK_PROBE_SELECTION.to_owned()),
                                                 "J-Link over network",
                                             )
@@ -647,6 +709,34 @@ impl WaveCraftApp {
                                     )
                                     .on_hover_text("TCP port of the Black Magic remote protocol endpoint");
                                 }
+                                if network_cmsis_dap_selected {
+                                    ui.add_space(8.0);
+                                    setup_label(ui, "CMSIS-DAP IP address");
+                                    ui.add_sized(
+                                        [ui.available_width(), 20.0],
+                                        egui::TextEdit::singleline(
+                                            &mut self
+                                                .system_trace_settings
+                                                .cmsis_dap_network_address,
+                                        )
+                                        .hint_text("192.168.1.100"),
+                                    )
+                                    .on_hover_text(
+                                        "IPv4 or IPv6 address of the CMSIS-DAP TCP endpoint",
+                                    );
+                                    setup_label(ui, "CMSIS-DAP port");
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut self
+                                                .system_trace_settings
+                                                .cmsis_dap_network_port,
+                                        )
+                                        .range(1..=u16::MAX),
+                                    )
+                                    .on_hover_text(
+                                        "OpenOCD-compatible CMSIS-DAP TCP port; ESP32JTAG uses 4441",
+                                    );
+                                }
                                 if network_jlink_selected {
                                     ui.add_space(8.0);
                                     setup_label(ui, "J-Link IP address");
@@ -681,6 +771,8 @@ impl WaveCraftApp {
                                 setup_label(ui, "Target MCU");
                                 let selected_provider = if network_bmp_selected {
                                     Some(ProbeProvider::BlackMagicProbe)
+                                } else if network_cmsis_dap_selected {
+                                    Some(ProbeProvider::CmsisDap)
                                 } else if network_jlink_selected {
                                     Some(ProbeProvider::JLink)
                                 } else {
@@ -5757,6 +5849,30 @@ mod tests {
     }
 
     #[test]
+    fn network_cmsis_dap_selection_shows_ip_address_and_port_fields() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.system_trace_settings.probe_connection_id =
+            Some(NETWORK_CMSIS_DAP_PROBE_SELECTION.to_owned());
+        app.system_trace_settings.cmsis_dap_network_address = "192.168.1.44".to_owned();
+
+        let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
+
+        for expected in [
+            "CMSIS-DAP over network",
+            "CMSIS-DAP IP address",
+            "192.168.1.44",
+            "CMSIS-DAP port",
+            "4441",
+        ] {
+            assert!(
+                texts.iter().any(|(text, _)| text == expected),
+                "{expected} is painted"
+            );
+        }
+    }
+
+    #[test]
     fn network_jlink_selection_shows_ip_address_and_port_fields() {
         let context = egui::Context::default();
         let mut app = app();
@@ -6339,10 +6455,7 @@ mod tests {
 
     #[test]
     fn timeline_lane_colors_do_not_depend_on_runtime_discovery_order() {
-        fn trace_with_order(
-            task_ids: [u64; 2],
-            marker_ids: [u64; 2],
-        ) -> SystemTraceDisplayState {
+        fn trace_with_order(task_ids: [u64; 2], marker_ids: [u64; 2]) -> SystemTraceDisplayState {
             let mut trace = SystemTraceDisplayState::default();
             let mut sequence = 0_u64;
             let mut timestamp_ticks = 0_u64;
@@ -7415,6 +7528,8 @@ mod tests {
             probe_connection_id: Some("1366:0105:1234".to_owned()),
             bmp_network_address: String::new(),
             bmp_network_port: 2_000,
+            cmsis_dap_network_address: String::new(),
+            cmsis_dap_network_port: 4_441,
             jlink_network_address: String::new(),
             jlink_network_port: 19_020,
             target_name: "STM32F407VGTx".to_owned(),
@@ -7477,6 +7592,8 @@ mod tests {
             probe_connection_id: Some(NETWORK_BMP_PROBE_SELECTION.to_owned()),
             bmp_network_address: "192.168.1.42".to_owned(),
             bmp_network_port: 3_141,
+            cmsis_dap_network_address: "192.168.1.44".to_owned(),
+            cmsis_dap_network_port: 4_442,
             jlink_network_address: "192.168.1.43".to_owned(),
             jlink_network_port: 19_021,
             target_name: "nRF52832_xxAA".to_owned(),
@@ -7546,6 +7663,60 @@ mod tests {
         assert_eq!(
             network_bmp_connection_id("192.168.1.42", 0),
             Err("BMP network port must be between 1 and 65535".to_owned())
+        );
+    }
+
+    #[test]
+    fn network_cmsis_dap_settings_build_probe_rs_selector() {
+        let settings = SystemTraceSettings {
+            probe_connection_id: Some(NETWORK_CMSIS_DAP_PROBE_SELECTION.to_owned()),
+            cmsis_dap_network_address: " 192.168.1.44 ".to_owned(),
+            cmsis_dap_network_port: 4_987,
+            target_name: "nRF52832_xxAA".to_owned(),
+            ..SystemTraceSettings::default()
+        };
+
+        let configuration = settings
+            .connection_configuration()
+            .expect("network CMSIS-DAP settings are valid");
+
+        assert_eq!(
+            configuration.probe,
+            ProbeSelector::connection_id(format!(
+                "{CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX}192.168.1.44:4987"
+            ))
+        );
+    }
+
+    #[test]
+    fn network_cmsis_dap_settings_support_ipv6_and_reject_invalid_addresses() {
+        assert_eq!(
+            network_cmsis_dap_connection_id("2001:db8::44", 4_441),
+            Ok(format!(
+                "{CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX}[2001:db8::44]:4441"
+            ))
+        );
+        assert_eq!(
+            network_cmsis_dap_connection_id("esp32jtag.local", 4_441),
+            Err("Enter a valid IP address for the network CMSIS-DAP".to_owned())
+        );
+        assert_eq!(
+            network_cmsis_dap_connection_id("192.168.1.44", 0),
+            Err("CMSIS-DAP network port must be between 1 and 65535".to_owned())
+        );
+    }
+
+    #[test]
+    fn network_cmsis_dap_requires_an_explicit_target() {
+        let settings = SystemTraceSettings {
+            probe_connection_id: Some(NETWORK_CMSIS_DAP_PROBE_SELECTION.to_owned()),
+            cmsis_dap_network_address: "192.168.1.44".to_owned(),
+            ..SystemTraceSettings::default()
+        };
+
+        assert_eq!(
+            settings.connection_configuration(),
+            Err("Select a target MCU when using CMSIS-DAP over the network".to_owned())
         );
     }
 

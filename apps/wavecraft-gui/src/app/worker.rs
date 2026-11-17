@@ -12,7 +12,7 @@ use crate::{
     ProtocolAnalyzerInstance, ProtocolCaptureDecoder, ProtocolDecodeSnapshot, RadioDiscoveryReport,
     RadioSingleTrigger, ScopeMeasurementCache, TryRecvError, WaveformStore, WaveformTab,
     WorkerSuccess, WorkspaceView, DSCOPE_VOLTS_PER_DIV_MV, NETWORK_BMP_PROBE_SELECTION,
-    NETWORK_JLINK_PROBE_SELECTION,
+    NETWORK_CMSIS_DAP_PROBE_SELECTION, NETWORK_JLINK_PROBE_SELECTION,
 };
 
 use crate::WaveCraftApp;
@@ -223,7 +223,9 @@ impl WaveCraftApp {
             .is_some_and(|selected| {
                 matches!(
                     selected.as_str(),
-                    NETWORK_BMP_PROBE_SELECTION | NETWORK_JLINK_PROBE_SELECTION
+                    NETWORK_BMP_PROBE_SELECTION
+                        | NETWORK_CMSIS_DAP_PROBE_SELECTION
+                        | NETWORK_JLINK_PROBE_SELECTION
                 ) || self
                     .debug_probes
                     .iter()
@@ -1071,7 +1073,11 @@ mod tests {
             model: "J-Link EDU".to_owned(),
             serial_number: Some("000261009815".to_owned()),
         };
-        for selection in [NETWORK_BMP_PROBE_SELECTION, NETWORK_JLINK_PROBE_SELECTION] {
+        for selection in [
+            NETWORK_BMP_PROBE_SELECTION,
+            NETWORK_CMSIS_DAP_PROBE_SELECTION,
+            NETWORK_JLINK_PROBE_SELECTION,
+        ] {
             let mut app = app();
             app.system_trace_settings.probe_connection_id = Some(selection.to_owned());
 

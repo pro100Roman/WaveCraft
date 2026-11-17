@@ -14,6 +14,7 @@ use probe_rs::probe::{
 };
 use probe_rs::rtt::{Rtt, RttTarget, ScanRegion, try_attach_to_rtt};
 use probe_rs::{MemoryInterface, Permissions, Session, config};
+use std::error::Error as StdError;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,12 +23,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugProbeDriver, DebugProbeError, DebugProbeErrorKind, DebugProbeHandle,
-    DebugSession, DebugTargetDescriptor, JLINK_NETWORK_CONNECTION_ID_PREFIX, ProbeDescriptor,
-    ProbeProvider, ProbeSelector, ProbeTargetGroup, RttChannelDescriptor, RttChannelDirection,
-    RttConfiguration, RttControlBlockLocation, TargetSelector, WireProtocol,
+    DebugSession, DebugTargetDescriptor, CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX,
+    JLINK_NETWORK_CONNECTION_ID_PREFIX, ProbeDescriptor, ProbeProvider, ProbeSelector,
+    ProbeTargetGroup, RttChannelDescriptor, RttChannelDirection, RttConfiguration,
+    RttControlBlockLocation, TargetSelector, WireProtocol,
 };
 
 const BLACK_MAGIC_NETWORK_SELECTOR_PREFIX: &str = "1d50:6018:";
+const PROBE_RS_CMSIS_DAP_TCP_SELECTOR_PREFIX: &str = "0000:0001:";
 const NETWORK_BMP_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(2_500);
 const NETWORK_BMP_RETRY_DELAY: Duration = Duration::from_millis(100);
 const NETWORK_BMP_OPEN_ATTEMPTS: usize = 2;
@@ -128,23 +131,31 @@ impl DebugProbeDriver for ProbeRsDriver {
             return jlink_network::open(endpoint, selector.connection_id.clone());
         }
         let network_bmp_endpoint = network_bmp_endpoint(selector);
-        let requested: DebugProbeSelector = selector.connection_id.parse().map_err(|error| {
+        let network_cmsis_dap_endpoint = network_cmsis_dap_endpoint(selector)?;
+        let requested_connection_id = network_cmsis_dap_endpoint.map_or_else(
+            || selector.connection_id.clone(),
+            |endpoint| format!("{PROBE_RS_CMSIS_DAP_TCP_SELECTOR_PREFIX}{endpoint}"),
+        );
+        let requested: DebugProbeSelector = requested_connection_id.parse().map_err(|error| {
             DebugProbeError::new(
                 DebugProbeErrorKind::InvalidConfiguration,
-                format!("invalid probe selector {}: {error}", selector.connection_id),
+                format!("invalid probe selector {requested_connection_id}: {error}"),
             )
         })?;
         let information = Lister::new()
             .list(Some(&requested))
             .into_iter()
-            .find(|information| connection_id(information) == selector.connection_id)
+            .find(|information| connection_id(information) == requested_connection_id)
             .ok_or_else(|| {
                 DebugProbeError::new(
                     DebugProbeErrorKind::NotFound,
                     format!("debug probe {} was not found", selector.connection_id),
                 )
             })?;
-        let descriptor = probe_descriptor(&information);
+        let mut descriptor = probe_descriptor(&information);
+        if network_cmsis_dap_endpoint.is_some() {
+            descriptor.connection_id.clone_from(&selector.connection_id);
+        }
         let probe = if let Some(endpoint) = network_bmp_endpoint {
             open_network_bmp(endpoint)?
         } else {
@@ -159,6 +170,23 @@ fn network_bmp_endpoint(selector: &ProbeSelector) -> Option<SocketAddr> {
         .connection_id
         .strip_prefix(BLACK_MAGIC_NETWORK_SELECTOR_PREFIX)?;
     endpoint.parse().ok()
+}
+
+fn network_cmsis_dap_endpoint(
+    selector: &ProbeSelector,
+) -> Result<Option<SocketAddr>, DebugProbeError> {
+    let Some(endpoint) = selector
+        .connection_id
+        .strip_prefix(CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX)
+    else {
+        return Ok(None);
+    };
+    endpoint.parse().map(Some).map_err(|error| {
+        DebugProbeError::new(
+            DebugProbeErrorKind::InvalidConfiguration,
+            format!("invalid network CMSIS-DAP endpoint {endpoint:?}: {error}"),
+        )
+    })
 }
 
 fn open_network_bmp(endpoint: SocketAddr) -> Result<ProbeRsProbe, DebugProbeError> {
@@ -650,7 +678,21 @@ fn map_open_error(error: ProbeRsDebugProbeError) -> DebugProbeError {
         ProbeRsDebugProbeError::TargetNotFound => DebugProbeErrorKind::Target,
         _ => DebugProbeErrorKind::Transport,
     };
-    DebugProbeError::new(kind, format!("failed to open debug probe: {error}"))
+    DebugProbeError::new(
+        kind,
+        format!("failed to open debug probe: {}", describe_error_chain(&error)),
+    )
+}
+
+fn describe_error_chain(error: &(dyn StdError + 'static)) -> String {
+    let mut description = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        description.push_str(": ");
+        description.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    description
 }
 
 fn map_probe_error(error: ProbeRsDebugProbeError) -> DebugProbeError {
@@ -696,6 +738,34 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::time::Duration;
+
+    #[derive(Debug)]
+    struct TestProbeError(io::Error);
+
+    impl std::fmt::Display for TestProbeError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("probe wrapper")
+        }
+    }
+
+    impl std::error::Error for TestProbeError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn error_descriptions_include_every_source() {
+        let error = TestProbeError(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "TCP peer closed the connection",
+        ));
+
+        assert_eq!(
+            describe_error_chain(&error),
+            "probe wrapper: TCP peer closed the connection"
+        );
+    }
 
     #[test]
     fn classifies_requested_probe_families_without_exposing_probe_rs_types() {
@@ -782,6 +852,56 @@ mod tests {
                 model: "192.0.2.42:2000".to_owned(),
                 serial_number: Some("192.0.2.42:2000".to_owned()),
             }
+        );
+    }
+
+    #[test]
+    fn lists_a_network_cmsis_dap_probe_from_its_selector() {
+        let selector: DebugProbeSelector = "0000:0001:192.0.2.44:4441"
+            .parse()
+            .expect("network CMSIS-DAP selector is valid");
+        let information = Lister::new()
+            .list(Some(&selector))
+            .into_iter()
+            .find(|probe| probe.is_probe_type::<CmsisDapFactory>())
+            .expect("network CMSIS-DAP is listed from its selector");
+
+        assert_eq!(
+            probe_descriptor(&information),
+            ProbeDescriptor {
+                connection_id: "0000:0001:192.0.2.44:4441".to_owned(),
+                provider: ProbeProvider::CmsisDap,
+                vendor: Some("Arm CMSIS-DAP".to_owned()),
+                model: "CMSIS-DAP TCP".to_owned(),
+                serial_number: Some("192.0.2.44:4441".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn recognizes_network_cmsis_dap_connection_ids() {
+        let selector = ProbeSelector::connection_id(format!(
+            "{CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX}[2001:db8::44]:4987"
+        ));
+
+        assert_eq!(
+            network_cmsis_dap_endpoint(&selector).expect("network selector is valid"),
+            Some(
+                "[2001:db8::44]:4987"
+                    .parse()
+                    .expect("socket address is valid")
+            )
+        );
+        assert!(
+            network_cmsis_dap_endpoint(&ProbeSelector::connection_id("0d28:0204:C123"))
+                .expect("USB selector is valid")
+                .is_none()
+        );
+        assert!(
+            network_cmsis_dap_endpoint(&ProbeSelector::connection_id(format!(
+                "{CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX}not-an-endpoint"
+            )))
+            .is_err()
         );
     }
 
