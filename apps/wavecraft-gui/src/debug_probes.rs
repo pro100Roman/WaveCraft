@@ -15,6 +15,7 @@ const HELPER_ENVIRONMENT_VARIABLE: &str = "WAVECRAFT_PROBE_HELPER";
 const HELPER_EXECUTABLE: &str = "wavecraft-probe-helper.exe";
 #[cfg(not(windows))]
 const HELPER_EXECUTABLE: &str = "wavecraft-probe-helper";
+const HELPER_PARENT_PROCESS_ID_ENVIRONMENT_VARIABLE: &str = "WAVECRAFT_GUI_PROCESS_ID";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DebugProbeDiscoveryReport {
@@ -74,6 +75,10 @@ impl DebugProbeHelperProcess {
     pub(crate) fn spawn() -> Result<Self, String> {
         let mut command = helper_command(HelperInvocation::Serve)?;
         let mut child = command
+            .env(
+                HELPER_PARENT_PROCESS_ID_ENVIRONMENT_VARIABLE,
+                std::process::id().to_string(),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

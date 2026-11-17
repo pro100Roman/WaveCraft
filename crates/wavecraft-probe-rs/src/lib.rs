@@ -14,12 +14,17 @@ use probe_rs::probe::{
 };
 use probe_rs::rtt::{Rtt, ScanRegion, try_attach_to_rtt};
 use probe_rs::{MemoryInterface, Permissions, Session, config};
+use std::io;
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::thread;
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugProbeDriver, DebugProbeError, DebugProbeErrorKind, DebugProbeHandle,
     DebugSession, DebugTargetDescriptor, JLINK_NETWORK_CONNECTION_ID_PREFIX, ProbeDescriptor,
     ProbeProvider, ProbeSelector, ProbeTargetGroup, RttChannelDescriptor, RttChannelDirection,
     RttConfiguration, RttControlBlockLocation, TargetSelector, WireProtocol,
 };
+
+const BLACK_MAGIC_NETWORK_SELECTOR_PREFIX: &str = "1d50:6018:";
 
 /// Minimum Rust release required by the pinned `probe-rs` adapter dependency.
 pub const MINIMUM_RUST_VERSION: &str = "1.95";
@@ -114,6 +119,7 @@ impl DebugProbeDriver for ProbeRsDriver {
         if let Some(endpoint) = network_jlink_endpoint(selector)? {
             return jlink_network::open(endpoint, selector.connection_id.clone());
         }
+        let network_bmp_endpoint = network_bmp_endpoint(selector);
         let requested: DebugProbeSelector = selector.connection_id.parse().map_err(|error| {
             DebugProbeError::new(
                 DebugProbeErrorKind::InvalidConfiguration,
@@ -131,9 +137,85 @@ impl DebugProbeDriver for ProbeRsDriver {
                 )
             })?;
         let descriptor = probe_descriptor(&information);
-        let probe = information.open().map_err(map_open_error)?;
+        let probe = if let Some(endpoint) = network_bmp_endpoint {
+            let proxy_endpoint = start_network_bmp_proxy(endpoint)?;
+            let proxy_selector: DebugProbeSelector =
+                format!("{BLACK_MAGIC_NETWORK_SELECTOR_PREFIX}{proxy_endpoint}")
+                    .parse()
+                    .map_err(|error| {
+                        DebugProbeError::new(
+                            DebugProbeErrorKind::Transport,
+                            format!("failed to create the network BMP proxy selector: {error}"),
+                        )
+                    })?;
+            let proxy_information = Lister::new()
+                .list(Some(&proxy_selector))
+                .into_iter()
+                .find(|information| connection_id(information) == proxy_selector.to_string())
+                .ok_or_else(|| {
+                    DebugProbeError::new(
+                        DebugProbeErrorKind::NotFound,
+                        "network BMP proxy was not found",
+                    )
+                })?;
+            proxy_information.open().map_err(map_open_error)?
+        } else {
+            information.open().map_err(map_open_error)?
+        };
         Ok(Box::new(ProbeRsHandle { descriptor, probe }))
     }
+}
+
+fn network_bmp_endpoint(selector: &ProbeSelector) -> Option<SocketAddr> {
+    let endpoint = selector
+        .connection_id
+        .strip_prefix(BLACK_MAGIC_NETWORK_SELECTOR_PREFIX)?;
+    endpoint.parse().ok()
+}
+
+fn start_network_bmp_proxy(endpoint: SocketAddr) -> Result<SocketAddr, DebugProbeError> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| transport_error("failed to create the network BMP proxy", error))?;
+    let local_endpoint = listener
+        .local_addr()
+        .map_err(|error| transport_error("failed to inspect the network BMP proxy", error))?;
+    thread::Builder::new()
+        .name("wavecraft-network-bmp-proxy".to_owned())
+        .spawn(move || {
+            let Ok((local, _)) = listener.accept() else {
+                return;
+            };
+            let _ = relay_network_bmp(local, endpoint);
+        })
+        .map_err(|error| transport_error("failed to start the network BMP proxy", error))?;
+    Ok(local_endpoint)
+}
+
+fn relay_network_bmp(local: TcpStream, endpoint: SocketAddr) -> io::Result<()> {
+    local.set_nodelay(true)?;
+    let remote = TcpStream::connect(endpoint)?;
+    remote.set_nodelay(true)?;
+
+    let mut local_reader = local.try_clone()?;
+    let mut remote_writer = remote.try_clone()?;
+    let mut remote_reader = remote.try_clone()?;
+    let mut local_writer = local.try_clone()?;
+    let local_stop = local.try_clone()?;
+    let remote_stop = remote.try_clone()?;
+    let reverse = thread::Builder::new()
+        .name("wavecraft-network-bmp-proxy-reply".to_owned())
+        .spawn(move || {
+            let result = io::copy(&mut remote_reader, &mut local_writer);
+            let _ = local_stop.shutdown(Shutdown::Both);
+            let _ = remote_stop.shutdown(Shutdown::Both);
+            result
+        })?;
+
+    let forward = io::copy(&mut local_reader, &mut remote_writer);
+    let _ = local.shutdown(Shutdown::Both);
+    let _ = remote.shutdown(Shutdown::Both);
+    let _ = reverse.join();
+    forward.map(|_| ())
 }
 
 fn network_jlink_endpoint(
@@ -420,6 +502,8 @@ fn transport_error(context: &str, error: impl std::fmt::Display) -> DebugProbeEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::time::Duration;
 
     #[test]
     fn classifies_requested_probe_families_without_exposing_probe_rs_types() {
@@ -506,6 +590,53 @@ mod tests {
                 serial_number: Some("192.0.2.42:2000".to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn recognizes_network_black_magic_connection_ids() {
+        assert_eq!(
+            network_bmp_endpoint(&ProbeSelector::connection_id("1d50:6018:192.0.2.42:2000")),
+            Some("192.0.2.42:2000".parse().expect("socket address is valid"))
+        );
+        assert_eq!(
+            network_bmp_endpoint(&ProbeSelector::connection_id("1d50:6018:B123")),
+            None
+        );
+        assert_eq!(
+            network_bmp_endpoint(&ProbeSelector::connection_id("1366:0105:J123")),
+            None
+        );
+    }
+
+    #[test]
+    fn network_bmp_proxy_relays_data_in_both_directions() {
+        let remote_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("test remote endpoint binds");
+        let remote_endpoint = remote_listener
+            .local_addr()
+            .expect("test remote endpoint has an address");
+        let remote = thread::spawn(move || {
+            let (mut stream, _) = remote_listener.accept().expect("proxy connects to remote");
+            let mut request = [0; 4];
+            stream
+                .read_exact(&mut request)
+                .expect("request reaches remote");
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").expect("remote writes reply");
+        });
+
+        let proxy_endpoint =
+            start_network_bmp_proxy(remote_endpoint).expect("network BMP proxy starts");
+        let mut client = TcpStream::connect(proxy_endpoint).expect("client connects to proxy");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("test read timeout is configured");
+        client.write_all(b"ping").expect("client writes request");
+        let mut reply = [0; 4];
+        client.read_exact(&mut reply).expect("reply reaches client");
+
+        assert_eq!(&reply, b"pong");
+        remote.join().expect("test remote exits cleanly");
     }
 
     #[test]
