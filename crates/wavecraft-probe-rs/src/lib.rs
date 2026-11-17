@@ -10,9 +10,9 @@ use probe_rs::probe::list::Lister;
 use probe_rs::probe::stlink::StLinkFactory;
 use probe_rs::probe::{
     DebugProbeError as ProbeRsDebugProbeError, DebugProbeInfo, DebugProbeSelector,
-    Probe as ProbeRsProbe, ProbeCreationError, WireProtocol as ProbeRsWireProtocol,
+    Probe as ProbeRsProbe, ProbeCreationError, ProbeTransport, WireProtocol as ProbeRsWireProtocol,
 };
-use probe_rs::rtt::{Rtt, ScanRegion, try_attach_to_rtt};
+use probe_rs::rtt::{Rtt, RttTarget, ScanRegion, try_attach_to_rtt};
 use probe_rs::{MemoryInterface, Permissions, Session, config};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -511,7 +511,8 @@ impl DebugSession for ProbeRsSession {
             .session
             .core(self.core_index)
             .map_err(|error| target_error("target core is unavailable", error))?;
-        let mut rtt = try_attach_to_rtt(&mut core, configuration.timeout, &region)
+        let rtt_target = RttTarget::from(&core);
+        let mut rtt = try_attach_to_rtt(&mut core, &rtt_target, configuration.timeout, &region)
             .map_err(|error| target_error("failed to attach to RTT", error))?;
         let mut channels = Vec::with_capacity(rtt.up_channels().len() + rtt.down_channels().len());
         channels.extend(
@@ -598,13 +599,14 @@ fn probe_descriptor(information: &DebugProbeInfo) -> ProbeDescriptor {
         ProbeProvider::CmsisDap => Some("Arm CMSIS-DAP"),
         ProbeProvider::Other(_) => None,
     };
+    let ProbeTransport::Usb(transport) = &information.transport;
 
     ProbeDescriptor {
         connection_id: connection_id(information),
         provider,
         vendor: vendor.map(str::to_owned),
         model: information.identifier.clone(),
-        serial_number: information.serial_number.clone(),
+        serial_number: transport.serial_number.clone(),
     }
 }
 
@@ -751,7 +753,8 @@ mod tests {
         for (information, expected_provider) in cases {
             let descriptor = probe_descriptor(&information);
             assert_eq!(descriptor.provider, expected_provider);
-            assert_eq!(descriptor.serial_number, information.serial_number);
+            let ProbeTransport::Usb(transport) = &information.transport;
+            assert_eq!(descriptor.serial_number, transport.serial_number);
             assert_eq!(
                 descriptor.connection_id,
                 DebugProbeSelector::from(&information).to_string()
