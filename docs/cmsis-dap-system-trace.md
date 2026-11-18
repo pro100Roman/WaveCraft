@@ -58,8 +58,31 @@ Firmware commit
 [`6950e01`](https://github.com/pro100Roman/esp32jtag_firmware/commit/6950e01)
 replaces those per-edge driver calls with the ESP32-S3 inline low-level GPIO
 accessors. Direction changes still use the ESP-IDF driver because they occur
-only at SWD turnarounds. The change builds cleanly with ESP-IDF 5.5.6; it must
-be flashed before measuring the new physical clock and RTT throughput.
+only at SWD turnarounds.
+
+After flashing `6950e01`, repeated 8 KiB RAM reads sustained about 239 KiB/s
+at requested clocks of 1, 4, and 6 MHz, up from about 100 KiB/s before the
+change. An eight-second SystemView run received 1,176,155 bytes (143.6 KiB/s),
+decoded 202,492 events, and reported 6,831 target-dropped events. The final
+`DHCSR=0x01010001` showed that the core remained running rather than halted or
+locked up. This is a 2.4x raw-memory improvement and a 3.75x trace-throughput
+improvement, but it is still below the event rate captured by J-Link.
+
+The remaining hot path switched SWDIO direction and the external
+`SWDIO_RDnWR` buffer through full ESP-IDF driver calls once per SWD transfer.
+Firmware commit
+[`50960f5`](https://github.com/pro100Roman/esp32jtag_firmware/commit/50960f5)
+uses low-level output-enable and output-disable register access for those
+turnarounds as well. It builds cleanly with ESP-IDF 5.5.6 and is the next
+hardware-test revision; the throughput numbers above do not include it.
+
+Firmware commit
+[`cbdbc22`](https://github.com/pro100Roman/esp32jtag_firmware/commit/cbdbc22)
+also shows the short firmware commit on the LCD. The display keeps XVC and GDB
+on one row and places `DAP:4441` on the next row aligned with XVC. Follow-up
+commit
+[`56d60b7`](https://github.com/pro100Roman/esp32jtag_firmware/commit/56d60b7)
+anchors the firmware hash at the bottom-right corner of the display.
 
 ## CMSIS-DAP host behavior
 
