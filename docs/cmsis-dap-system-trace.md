@@ -73,8 +73,15 @@ The remaining hot path switched SWDIO direction and the external
 Firmware commit
 [`50960f5`](https://github.com/pro100Roman/esp32jtag_firmware/commit/50960f5)
 uses low-level output-enable and output-disable register access for those
-turnarounds as well. It builds cleanly with ESP-IDF 5.5.6 and is the next
-hardware-test revision; the throughput numbers above do not include it.
+turnarounds as well. Its initial implementation omitted the corresponding
+ESP32-S3 input-enable operation, leaving SWDIO unable to receive target replies
+and causing attach to fail with `No target responded to the debug port`.
+Firmware commit
+[`f4e6b82`](https://github.com/pro100Roman/esp32jtag_firmware/commit/f4e6b82)
+restores the complete input/output direction semantics with low-level GPIO
+accessors. It builds cleanly with ESP-IDF 5.5.6 and is the next hardware-test
+revision; the throughput numbers above do not include either direction-change
+revision.
 
 Firmware commit
 [`cbdbc22`](https://github.com/pro100Roman/esp32jtag_firmware/commit/cbdbc22)
