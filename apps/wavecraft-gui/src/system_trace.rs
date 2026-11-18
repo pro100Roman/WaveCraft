@@ -14,7 +14,8 @@ use crate::{debug_probes::DebugProbeHelperProcess, WorkerSuccess};
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugProbeCommand, DebugProbeError, DebugProbeErrorKind, DebugProbeReply,
     ProbeProvider, ProbeSelector, RttChannelDescriptor, RttChannelDirection, RttConfiguration,
-    RttTerminalDecoder, RttTerminalLine, TargetSelector,
+    RttTerminalDecoder, RttTerminalLine, TargetSelector, CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX,
+    MAX_DEBUG_PROBE_TRANSFER_BYTES,
 };
 use wavecraft_systemview::{
     SystemViewDecoder, SystemViewDescription, SystemViewElf, SYSTEMVIEW_COMMAND_START,
@@ -33,6 +34,7 @@ const MAX_TIMELINE_LABEL_WIDTH: f32 = 600.0;
 const MIN_TRACE_INSTRUMENT_HEIGHT: f32 = 140.0;
 const MAX_TRACE_INSTRUMENT_HEIGHT: f32 = 900.0;
 const RTT_READ_SIZE: usize = 16 * 1024;
+const NETWORK_CMSIS_DAP_RTT_READ_SIZE: usize = MAX_DEBUG_PROBE_TRANSFER_BYTES;
 // probe-rs uses a 1024-byte Black Magic remote buffer. Memory reads are hex
 // encoded, leaving 504 payload bytes per remote command. Four payloads balance
 // target read-pointer latency against the control-block overhead of every RTT
@@ -450,7 +452,8 @@ fn run_connection_worker(
     }
     let systemview_read_size =
         systemview_rtt_read_size(&channels, configuration.up_channel, &configuration.probe);
-    let systemview_read_batch = systemview_rtt_read_batch(&configuration.probe);
+    let systemview_read_batch =
+        systemview_rtt_read_batch(&configuration.probe, systemview_read_size);
     let systemview_stop_drain_read_limit =
         systemview_stop_drain_read_limit(&channels, configuration.up_channel, systemview_read_size);
     if configuration.systemview_enabled && is_network_bmp(&configuration.probe) {
@@ -695,6 +698,8 @@ fn systemview_rtt_read_size(
 ) -> usize {
     let maximum_read_size = if is_network_bmp(probe) {
         NETWORK_BMP_RTT_READ_SIZE
+    } else if is_network_cmsis_dap(probe) {
+        NETWORK_CMSIS_DAP_RTT_READ_SIZE
     } else {
         RTT_READ_SIZE
     };
@@ -721,11 +726,20 @@ fn is_network_bmp(probe: &ProbeSelector) -> bool {
         .is_some_and(|endpoint| endpoint.parse::<std::net::SocketAddr>().is_ok())
 }
 
-fn systemview_rtt_read_batch(probe: &ProbeSelector) -> usize {
+fn is_network_cmsis_dap(probe: &ProbeSelector) -> bool {
+    probe
+        .connection_id
+        .strip_prefix(CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX)
+        .is_some_and(|endpoint| endpoint.parse::<std::net::SocketAddr>().is_ok())
+}
+
+fn systemview_rtt_read_batch(probe: &ProbeSelector, maximum_length: usize) -> usize {
     if is_network_bmp(probe) {
         NETWORK_BMP_RTT_READ_BATCH
     } else {
         HELPER_RTT_READ_BATCH
+            .min(MAX_DEBUG_PROBE_TRANSFER_BYTES / maximum_length.max(1))
+            .max(1)
     }
 }
 
@@ -2639,7 +2653,7 @@ mod tests {
             NETWORK_BMP_RTT_READ_SIZE
         );
         assert_eq!(
-            systemview_rtt_read_batch(&probe),
+            systemview_rtt_read_batch(&probe, NETWORK_BMP_RTT_READ_SIZE),
             NETWORK_BMP_RTT_READ_BATCH
         );
     }
@@ -2647,7 +2661,7 @@ mod tests {
     #[test]
     fn helper_backed_rtt_reads_stream_four_drains_per_request() {
         assert_eq!(
-            systemview_rtt_read_batch(&connection_configuration().probe),
+            systemview_rtt_read_batch(&connection_configuration().probe, RTT_READ_SIZE),
             HELPER_RTT_READ_BATCH
         );
 
@@ -2664,9 +2678,26 @@ mod tests {
             8 * 1024 - 1
         );
         assert_eq!(
-            systemview_rtt_read_batch(&network_jlink),
+            systemview_rtt_read_batch(&network_jlink, 8 * 1024 - 1),
             HELPER_RTT_READ_BATCH
         );
+    }
+
+    #[test]
+    fn network_cmsis_dap_uses_the_ring_capacity_within_the_helper_limit() {
+        let channels = [RttChannelDescriptor {
+            number: 1,
+            direction: RttChannelDirection::Up,
+            name: Some("SystemView".to_owned()),
+            buffer_size: 32 * 1024,
+        }];
+        let probe = ProbeSelector::connection_id(format!(
+            "{CMSIS_DAP_NETWORK_CONNECTION_ID_PREFIX}192.0.2.44:4441"
+        ));
+        let read_size = systemview_rtt_read_size(&channels, 1, &probe);
+
+        assert_eq!(read_size, 32 * 1024 - 1);
+        assert_eq!(systemview_rtt_read_batch(&probe, read_size), 2);
     }
 
     #[test]

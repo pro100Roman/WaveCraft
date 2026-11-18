@@ -576,8 +576,11 @@ impl DebugProbeHandle for ProbeRsHandle {
             TargetSelector::Auto => config::TargetSelector::Auto,
             TargetSelector::Name(name) => config::TargetSelector::Unspecified(name.clone()),
         };
-        let mut session = probe
-            .attach(target, Permissions::default())
+        let mut session = if self.descriptor.provider == ProbeProvider::CmsisDap {
+            probe.attach_without_breakpoint_cleanup(target, Permissions::default())
+        } else {
+            probe.attach(target, Permissions::default())
+        }
             .map_err(|error| target_error("failed to attach to target", error))?;
         session
             .core(configuration.core_index)
@@ -690,8 +693,7 @@ impl DebugSession for ProbeRsSession {
             .session
             .core(self.core_index)
             .map_err(|error| target_error("target core is unavailable", error))?;
-        channel
-            .read(&mut core, destination)
+        channel.read(&mut core, destination)
             .map_err(|error| transport_error("failed to read RTT up channel", error))
     }
 
