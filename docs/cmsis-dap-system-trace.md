@@ -39,10 +39,27 @@ ESP32-S3 configuration this is 240 MHz. CherryDAP can now calculate a delay for
 the requested SWD frequency instead of always selecting its fast path.
 
 The firmware was rebuilt successfully with ESP-IDF 5.5.6. The generated image
-is `build/esp32jtag_firmware.bin`; the complete flash image is the generated
-`build/esp32jtag_*_full.bin` file. Keep the fix because requested clock control
-is required for useful diagnostics, but do not treat it as resolving the
-target freeze.
+is `build_board_esp32jtag/esp32jtag_firmware.bin`; the complete flash image is
+the generated `build_board_esp32jtag/esp32jtag_*_full.bin` file. Keep the fix
+because requested clock control is required for useful diagnostics, but do not
+treat it as resolving the target freeze.
+
+## Confirmed firmware GPIO bottleneck
+
+A headless WaveCraft helper benchmark read 8 KiB RAM blocks through the same
+USB CMSIS-DAP path used by RTT. It sustained 100.1 KiB/s at a requested 1 MHz,
+99.8 KiB/s at 4 MHz, and 99.8 KiB/s at 6 MHz. Identical throughput at all three
+settings shows that the requested clock is no longer the limiting delay. The
+ESP32-S3 CherryDAP port called the full ESP-IDF `gpio_set_level()` and
+`gpio_get_level()` APIs for every SWCLK and SWDIO edge, imposing an effective
+roughly 1 MHz ceiling on the bit-banged transport.
+
+Firmware commit
+[`6950e01`](https://github.com/pro100Roman/esp32jtag_firmware/commit/6950e01)
+replaces those per-edge driver calls with the ESP32-S3 inline low-level GPIO
+accessors. Direction changes still use the ESP-IDF driver because they occur
+only at SWD turnarounds. The change builds cleanly with ESP-IDF 5.5.6; it must
+be flashed before measuring the new physical clock and RTT throughput.
 
 ## CMSIS-DAP host behavior
 
@@ -108,6 +125,12 @@ next hardware-test configuration: it combines fine-grained target recovery
 windows with the throughput-oriented block pipeline. WaveCraft's TCP proxy now
 also preserves ESP32JTAG's reported packet count instead of forcing it to one.
 
+An eight-second headless run of this revision received 313,624 bytes
+(38.3 KiB/s). The decoder recovered 54,026 events and reported 35,720 target
+drops. This confirms that restoring the block pipeline improved the earlier
+10.6 KiB/s serialized result, but the pre-`6950e01` GPIO implementation still
+could not carry the target's event rate.
+
 The rule is selected only for the exact USB product `ESP32JTAG CMSIS-DAP` and
 for WaveCraft's CMSIS-DAP TCP selector, whose transport has no USB product
 descriptor. J-Link uses a different backend and is unaffected. Other USB
@@ -158,6 +181,16 @@ pinned probe-rs revision:
    access as pass criteria; throughput alone is not sufficient. If the target
    still freezes, capture its halted/running state and fault registers before
    reset, then instrument CherryDAP's ordinary `DAP_Transfer` path.
+
+The connected nRF52832 used during the November 18 hardware check exposed a
+separate application failure after reset. `DHCSR=0x01030003` and `DFSR=0x2`
+showed a debugger-visible breakpoint rather than an SWD transport stall. Core
+registers placed the PC at `app_error_fault_handler`; its saved SDK assert data
+identified `sensor.c:339`, where `APP_ERROR_CHECK(dps310_reset(...))` stops the
+debug build. Subsequent captures contain no SystemView data until the target
+and DPS310 startup failure are recovered. Do not attribute that deterministic
+target `BKPT` to CMSIS-DAP polling, and do not use such a run to validate trace
+throughput.
 
 Software verification for probe-rs `01b5b6d4` includes 69 focused CMSIS-DAP
 tests, all 22 WaveCraft probe-adapter tests, the complete WaveCraft workspace
