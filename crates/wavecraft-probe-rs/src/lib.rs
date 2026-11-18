@@ -17,7 +17,7 @@ use probe_rs::{Architecture, MemoryInterface, Permissions, Session, VectorCatchC
 use std::error::Error as StdError;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,8 +39,6 @@ const NETWORK_CMSIS_DAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const CMSIS_DAP_TCP_HEADER_LENGTH: usize = 8;
 const CMSIS_DAP_TCP_REQUEST_TYPE: u8 = 1;
 const CMSIS_DAP_TCP_RESPONSE_TYPE: u8 = 2;
-const CMSIS_DAP_INFO_COMMAND: u8 = 0;
-const CMSIS_DAP_PACKET_COUNT_INFO_ID: u8 = 0xfe;
 
 /// Minimum Rust release required by the pinned `probe-rs` adapter dependency.
 pub const MINIMUM_RUST_VERSION: &str = "1.95";
@@ -251,25 +249,15 @@ fn relay_network_cmsis_dap(local: TcpStream, remote: TcpStream) -> io::Result<()
     let mut remote_reader = remote.try_clone()?;
     let mut local_writer = local.try_clone()?;
     let local_stop = local.try_clone()?;
-    let pending_packet_count_replies = Arc::new(AtomicUsize::new(0));
-    let response_pending_packet_counts = Arc::clone(&pending_packet_count_replies);
     let reverse = thread::Builder::new()
         .name("wavecraft-network-cmsis-dap-proxy-reply".to_owned())
         .spawn(move || {
-            let result = relay_network_cmsis_dap_responses(
-                &mut remote_reader,
-                &mut local_writer,
-                &response_pending_packet_counts,
-            );
+            let result = relay_network_cmsis_dap_responses(&mut remote_reader, &mut local_writer);
             let _ = local_stop.shutdown(Shutdown::Both);
             result
         })?;
 
-    let forward = relay_network_cmsis_dap_requests(
-        &mut local_reader,
-        &mut remote_writer,
-        &pending_packet_count_replies,
-    );
+    let forward = relay_network_cmsis_dap_requests(&mut local_reader, &mut remote_writer);
     let _ = local.shutdown(Shutdown::Both);
     let _ = remote.shutdown(Shutdown::Both);
     let reverse = reverse
@@ -281,14 +269,8 @@ fn relay_network_cmsis_dap(local: TcpStream, remote: TcpStream) -> io::Result<()
 fn relay_network_cmsis_dap_requests(
     local: &mut TcpStream,
     remote: &mut TcpStream,
-    pending_packet_count_replies: &AtomicUsize,
 ) -> io::Result<()> {
     while let Some(frame) = read_cmsis_dap_tcp_frame(local, CMSIS_DAP_TCP_REQUEST_TYPE)? {
-        if frame.get(CMSIS_DAP_TCP_HEADER_LENGTH..)
-            == Some(&[CMSIS_DAP_INFO_COMMAND, CMSIS_DAP_PACKET_COUNT_INFO_ID])
-        {
-            pending_packet_count_replies.fetch_add(1, Ordering::Release);
-        }
         remote.write_all(&frame)?;
     }
     Ok(())
@@ -297,10 +279,8 @@ fn relay_network_cmsis_dap_requests(
 fn relay_network_cmsis_dap_responses(
     remote: &mut TcpStream,
     local: &mut TcpStream,
-    pending_packet_count_replies: &AtomicUsize,
 ) -> io::Result<()> {
-    while let Some(mut frame) = read_cmsis_dap_tcp_frame(remote, CMSIS_DAP_TCP_RESPONSE_TYPE)? {
-        limit_cmsis_dap_packet_count(&mut frame, pending_packet_count_replies);
+    while let Some(frame) = read_cmsis_dap_tcp_frame(remote, CMSIS_DAP_TCP_RESPONSE_TYPE)? {
         local.write_all(&frame)?;
     }
     Ok(())
@@ -333,20 +313,6 @@ fn read_cmsis_dap_tcp_frame(
     frame.resize(CMSIS_DAP_TCP_HEADER_LENGTH + payload_length, 0);
     stream.read_exact(&mut frame[CMSIS_DAP_TCP_HEADER_LENGTH..])?;
     Ok(Some(frame))
-}
-
-fn limit_cmsis_dap_packet_count(frame: &mut [u8], pending_replies: &AtomicUsize) {
-    let payload_start = CMSIS_DAP_TCP_HEADER_LENGTH.min(frame.len());
-    let payload = &mut frame[payload_start..];
-    if pending_replies.load(Ordering::Acquire) == 0
-        || !matches!(payload, [CMSIS_DAP_INFO_COMMAND, 1, _, ..])
-    {
-        return;
-    }
-    payload[2] = 1;
-    let _ = pending_replies.try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-        pending.checked_sub(1)
-    });
 }
 
 fn open_network_bmp_once(endpoint: SocketAddr) -> Result<ProbeRsProbe, DebugProbeError> {
@@ -1088,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn network_cmsis_dap_proxy_limits_the_reported_packet_pipeline() {
+    fn network_cmsis_dap_proxy_preserves_the_reported_packet_pipeline() {
         let remote_listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("test remote endpoint binds");
         let remote_endpoint = remote_listener
@@ -1098,7 +1064,7 @@ mod tests {
             let (mut stream, _) = remote_listener.accept().expect("proxy connects to remote");
             let expected = cmsis_dap_tcp_frame(
                 CMSIS_DAP_TCP_REQUEST_TYPE,
-                &[CMSIS_DAP_INFO_COMMAND, CMSIS_DAP_PACKET_COUNT_INFO_ID],
+                &[0x00, 0xfe],
             );
             let mut request = vec![0; expected.len()];
             stream
@@ -1108,7 +1074,7 @@ mod tests {
             stream
                 .write_all(&cmsis_dap_tcp_frame(
                     CMSIS_DAP_TCP_RESPONSE_TYPE,
-                    &[CMSIS_DAP_INFO_COMMAND, 1, 4],
+                    &[0x00, 1, 8],
                 ))
                 .expect("remote writes packet-count reply");
         });
@@ -1122,35 +1088,17 @@ mod tests {
         client
             .write_all(&cmsis_dap_tcp_frame(
                 CMSIS_DAP_TCP_REQUEST_TYPE,
-                &[CMSIS_DAP_INFO_COMMAND, CMSIS_DAP_PACKET_COUNT_INFO_ID],
+                &[0x00, 0xfe],
             ))
             .expect("client writes packet-count request");
-        let expected =
-            cmsis_dap_tcp_frame(CMSIS_DAP_TCP_RESPONSE_TYPE, &[CMSIS_DAP_INFO_COMMAND, 1, 1]);
+        let expected = cmsis_dap_tcp_frame(CMSIS_DAP_TCP_RESPONSE_TYPE, &[0x00, 1, 8]);
         let mut reply = vec![0; expected.len()];
         client
             .read_exact(&mut reply)
-            .expect("limited packet-count reply reaches client");
+            .expect("packet-count reply reaches client");
 
         assert_eq!(reply, expected);
         remote.join().expect("test remote exits cleanly");
-    }
-
-    #[test]
-    fn cmsis_dap_proxy_leaves_other_info_replies_unchanged() {
-        let pending = AtomicUsize::new(1);
-        let mut packet_size = cmsis_dap_tcp_frame(
-            CMSIS_DAP_TCP_RESPONSE_TYPE,
-            &[CMSIS_DAP_INFO_COMMAND, 2, 0, 4],
-        );
-
-        limit_cmsis_dap_packet_count(&mut packet_size, &pending);
-
-        assert_eq!(
-            &packet_size[CMSIS_DAP_TCP_HEADER_LENGTH..],
-            &[CMSIS_DAP_INFO_COMMAND, 2, 0, 4]
-        );
-        assert_eq!(pending.load(Ordering::Acquire), 1);
     }
 
     #[test]

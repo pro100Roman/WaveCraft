@@ -80,7 +80,7 @@ that whole read does not provide useful backpressure inside the burst.
 
 Probe-rs commit
 [`e3ec8255`](https://github.com/pro100Roman/probe-rs/commit/e3ec82551c192be71b3be6c1387c7e147ba243d4)
-extends the ESP32JTAG compatibility rule in two ways:
+tested two ESP32JTAG compatibility changes together:
 
 - `DAP_TransferBlock` remains disabled, so repeated accesses travel as bounded
   ordinary `DAP_Transfer` packets.
@@ -88,11 +88,25 @@ extends the ESP32JTAG compatibility rule in two ways:
   transfer. This creates fine-grained target-bus recovery windows inside a
   large RTT read instead of delaying only after the read has completed.
 
-Eight cycles match probe-rs's normal raw-SWD recovery setting and add less
-latency than millisecond sleeps between logical reads. This is the current
-target-liveness fix, but the exact causal link still needs a sustained hardware
-run: code inspection establishes the zero-idle behavior; only the target test
-can prove that bus starvation was the remaining freeze mechanism.
+Hardware validation disproved that combination as a complete fix. The target
+still became unresponsive, and roughly 82,000 target events were dropped in
+about six seconds. Because SystemView channel 1 is an 8 KiB
+`SEGGER_RTT_MODE_NO_BLOCK_SKIP` buffer, overflow cannot block the target, but it
+does show that the serialized non-block path is far below the event rate.
+
+The checked target configuration generates about 245,000 events and 1.4 MiB of
+trace in roughly eight seconds when captured successfully with J-Link. A
+10.6 KiB/s serialized CMSIS-DAP path cannot preserve that stream. Further
+serialization or sleeps therefore make both the target-drop count and apparent
+stall worse rather than addressing the transport bottleneck.
+
+Probe-rs commit
+[`01b5b6d4`](https://github.com/pro100Roman/probe-rs/commit/01b5b6d4f38e14d5984b17228cf36eb86e4dbc54)
+keeps the eight per-transfer idle cycles but restores normal
+`DAP_TransferBlock` requests and the probe-reported packet pipeline. This is the
+next hardware-test configuration: it combines fine-grained target recovery
+windows with the throughput-oriented block pipeline. WaveCraft's TCP proxy now
+also preserves ESP32JTAG's reported packet count instead of forcing it to one.
 
 The rule is selected only for the exact USB product `ESP32JTAG CMSIS-DAP` and
 for WaveCraft's CMSIS-DAP TCP selector, whose transport has no USB product
@@ -132,8 +146,8 @@ pinned probe-rs revision:
 
 1. Disconnect other debugger software and power-cycle or reset the target.
 2. Start with a requested 1 MHz SWD clock. Confirm the WaveCraft helper uses
-   probe-rs `e3ec8255` or a descendant so both the block-transfer isolation and
-   eight idle cycles are active.
+   probe-rs `01b5b6d4` or a descendant so both the block pipeline and eight idle
+   cycles are active.
 3. Run SystemView capture well beyond the previous failure interval. Record
    firmware revision, target MCU, requested and measured SWD clocks, RTT
    up-buffer size, capture duration, received bytes, target-drop count, and
@@ -145,8 +159,8 @@ pinned probe-rs revision:
    still freezes, capture its halted/running state and fault registers before
    reset, then instrument CherryDAP's ordinary `DAP_Transfer` path.
 
-Software verification for probe-rs `e3ec8255` includes 71 focused CMSIS-DAP
-tests, all 23 WaveCraft probe-adapter tests, the complete WaveCraft workspace
+Software verification for probe-rs `01b5b6d4` includes 69 focused CMSIS-DAP
+tests, all 22 WaveCraft probe-adapter tests, the complete WaveCraft workspace
 suite, Clippy with warnings denied, formatting, and diff checks. Sustained USB
 and TCP captures remain the decisive hardware tests.
 
@@ -161,21 +175,18 @@ The proxy currently:
 
 - validates the `DAP\0` frame header, request or response type, and payload
   length;
-- recognizes the `DAP_Info` packet-count query and reports one in-flight
-  packet;
-- preserves all other request and response payloads;
+- preserves the `DAP_Info` packet count and all other request and response
+  payloads;
 - enables `TCP_NODELAY`; and
 - uses an abortive close so a stalled ESP32JTAG/lwIP session does not retain
   the single remote client slot after timeout or helper termination.
 
 The SWD clock fix applies to the command engine shared by USB and network
-CMSIS-DAP, but it does not validate the Wi-Fi/TCP transport. Network packet
-serialization remains in place until that path is tested independently.
-CMSIS-DAP TCP has no USB product descriptor, so the probe-rs fork explicitly
-routes WaveCraft's TCP selector through the same ESP32JTAG compatibility rule:
-block transfers are disabled and eight idle cycles are applied. This closes a
-gap in `ec01f319`, where the workaround was active for USB but silently absent
-for TCP.
+CMSIS-DAP, but it does not validate the Wi-Fi/TCP transport. CMSIS-DAP TCP has
+no USB product descriptor, so the probe-rs fork explicitly routes WaveCraft's
+TCP selector through the same ESP32JTAG compatibility rule. Block transfers,
+the reported packet pipeline, and eight idle cycles are now consistent between
+USB and TCP.
 
 ## Network follow-up plan
 
@@ -190,7 +201,7 @@ CMSIS-DAP in this order:
 3. Exercise start, sustained capture, stop, disconnect, helper termination,
    network loss, and immediate reconnect. Confirm that both the local proxy and
    ESP32JTAG server release their sockets.
-4. If a stall remains with `e3ec8255`, determine whether it originates in the
+4. If a stall remains with `01b5b6d4`, determine whether it originates in the
    firmware server task, Wi-Fi/lwIP transport, shared command engine, WaveCraft
    proxy, or probe-rs timeout handling before changing batching or retry policy.
 5. Tune logical RTT read size and helper batching separately from CMSIS-DAP

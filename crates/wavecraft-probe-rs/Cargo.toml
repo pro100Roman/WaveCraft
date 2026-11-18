@@ -13,7 +13,7 @@ expect_used = "warn"
 
 [dependencies]
 libloading = "0.8.9"
-probe-rs = { git = "https://github.com/pro100Roman/probe-rs.git", rev = "e3ec82551c192be71b3be6c1387c7e147ba243d4", default-features = false, features = ["builtin-targets"] }
+probe-rs = { git = "https://github.com/pro100Roman/probe-rs.git", rev = "01b5b6d4f38e14d5984b17228cf36eb86e4dbc54", default-features = false, features = ["builtin-targets"] }
 serde_json = "1.0.154"
 wavecraft-debug-probe = { path = "../wavecraft-debug-probe" }
 
