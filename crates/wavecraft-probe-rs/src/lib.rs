@@ -36,8 +36,10 @@ const NETWORK_BMP_RETRY_DELAY: Duration = Duration::from_millis(100);
 const NETWORK_BMP_OPEN_ATTEMPTS: usize = 2;
 const NETWORK_BMP_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const NETWORK_CMSIS_DAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const CMSIS_DAP_TCP_HEADER_LENGTH: usize = 8;
+const CMSIS_DAP_TCP_RELAY_BUFFER_SIZE: usize = 32 * 1024;
+#[cfg(test)]
 const CMSIS_DAP_TCP_REQUEST_TYPE: u8 = 1;
+#[cfg(test)]
 const CMSIS_DAP_TCP_RESPONSE_TYPE: u8 = 2;
 
 /// Minimum Rust release required by the pinned `probe-rs` adapter dependency.
@@ -270,49 +272,28 @@ fn relay_network_cmsis_dap_requests(
     local: &mut TcpStream,
     remote: &mut TcpStream,
 ) -> io::Result<()> {
-    while let Some(frame) = read_cmsis_dap_tcp_frame(local, CMSIS_DAP_TCP_REQUEST_TYPE)? {
-        remote.write_all(&frame)?;
-    }
-    Ok(())
+    relay_network_cmsis_dap_stream(local, remote)
 }
 
 fn relay_network_cmsis_dap_responses(
     remote: &mut TcpStream,
     local: &mut TcpStream,
 ) -> io::Result<()> {
-    while let Some(frame) = read_cmsis_dap_tcp_frame(remote, CMSIS_DAP_TCP_RESPONSE_TYPE)? {
-        local.write_all(&frame)?;
-    }
-    Ok(())
+    relay_network_cmsis_dap_stream(remote, local)
 }
 
-fn read_cmsis_dap_tcp_frame(
-    stream: &mut TcpStream,
-    expected_type: u8,
-) -> io::Result<Option<Vec<u8>>> {
-    let mut header = [0_u8; CMSIS_DAP_TCP_HEADER_LENGTH];
-    match stream.read(&mut header[..1])? {
-        0 => return Ok(None),
-        1 => {}
-        _ => {
-            return Err(io::Error::other(
-                "CMSIS-DAP TCP one-byte read returned an invalid length",
-            ));
+fn relay_network_cmsis_dap_stream(
+    source: &mut TcpStream,
+    destination: &mut TcpStream,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; CMSIS_DAP_TCP_RELAY_BUFFER_SIZE];
+    loop {
+        let length = source.read(&mut buffer)?;
+        if length == 0 {
+            return Ok(());
         }
+        destination.write_all(&buffer[..length])?;
     }
-    stream.read_exact(&mut header[1..])?;
-    if header[..4] != *b"DAP\0" || header[6] != expected_type {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid CMSIS-DAP TCP frame header",
-        ));
-    }
-    let payload_length = usize::from(u16::from_le_bytes([header[4], header[5]]));
-    let mut frame = Vec::with_capacity(CMSIS_DAP_TCP_HEADER_LENGTH + payload_length);
-    frame.extend_from_slice(&header);
-    frame.resize(CMSIS_DAP_TCP_HEADER_LENGTH + payload_length, 0);
-    stream.read_exact(&mut frame[CMSIS_DAP_TCP_HEADER_LENGTH..])?;
-    Ok(Some(frame))
 }
 
 fn open_network_bmp_once(endpoint: SocketAddr) -> Result<ProbeRsProbe, DebugProbeError> {
