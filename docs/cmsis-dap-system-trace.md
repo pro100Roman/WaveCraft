@@ -81,7 +81,16 @@ Firmware commit
 restores the complete input/output direction semantics with low-level GPIO
 accessors. It builds cleanly with ESP-IDF 5.5.6 and is the next hardware-test
 revision; the throughput numbers above do not include either direction-change
-revision.
+revision. A subsequent hardware run with `f4e6b82` attached successfully and
+reported no target-dropped events or target freeze.
+
+These GPIO optimizations are confined to the CherryDAP CMSIS-DAP port. The
+Black Magic Probe GDB server retains its separate ESP32 GPIO implementation,
+while logic-analyzer and XVC routing remains controlled by the FPGA
+`set_cfga()` configuration applied at startup. Changing a port between LA,
+SWD/JTAG, and XVC still requires the existing save-and-restart flow. GDB and
+CMSIS-DAP share the physical target debug pins when SWD/JTAG routing is active,
+so only one debugger connection should drive the target at a time.
 
 Firmware commit
 [`cbdbc22`](https://github.com/pro100Roman/esp32jtag_firmware/commit/cbdbc22)
