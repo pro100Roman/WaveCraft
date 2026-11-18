@@ -602,7 +602,7 @@ checksum = "4a6394b9e965e73d0a289ee54f589087e2c676aedf60885baf52c76b771e4958"
 [[package]]
 name = "probe-rs"
 version = "0.32.0"
-source = "git+https://github.com/pro100Roman/probe-rs.git?rev=ec01f319fab9e597bb417fa5df7a33d307b7b458#ec01f319fab9e597bb417fa5df7a33d307b7b458"
+source = "git+https://github.com/pro100Roman/probe-rs.git?rev=e3ec82551c192be71b3be6c1387c7e147ba243d4#e3ec82551c192be71b3be6c1387c7e147ba243d4"
 dependencies = [
  "anyhow",
  "bincode",
@@ -630,7 +630,7 @@ dependencies = [
 [[package]]
 name = "probe-rs-target"
 version = "0.32.0"
-source = "git+https://github.com/pro100Roman/probe-rs.git?rev=ec01f319fab9e597bb417fa5df7a33d307b7b458#ec01f319fab9e597bb417fa5df7a33d307b7b458"
+source = "git+https://github.com/pro100Roman/probe-rs.git?rev=e3ec82551c192be71b3be6c1387c7e147ba243d4#e3ec82551c192be71b3be6c1387c7e147ba243d4"
 dependencies = [
  "base64",
  "bincode",
