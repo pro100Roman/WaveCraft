@@ -11,6 +11,7 @@ use crate::{
     SavedTraceInstrumentHeights, SavedWorkspaceView, ScopeSessionSettings, WaveformTab,
     WorkspaceView,
 };
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use crate::{
@@ -26,6 +27,7 @@ impl From<WorkspaceView> for SavedWorkspaceView {
             WorkspaceView::Waveform(WaveformTab::Lissajous) => Self::Lissajous,
             WorkspaceView::Waveform(WaveformTab::RadioReceiver) => Self::RadioSpectrum,
             WorkspaceView::Waveform(WaveformTab::Combined) => Self::Combined,
+            WorkspaceView::Vna => Self::Vna,
             WorkspaceView::SystemTrace => Self::SystemTrace,
         }
     }
@@ -39,6 +41,7 @@ impl From<SavedWorkspaceView> for WorkspaceView {
             SavedWorkspaceView::Lissajous => Self::Waveform(WaveformTab::Lissajous),
             SavedWorkspaceView::RadioSpectrum => Self::Waveform(WaveformTab::RadioReceiver),
             SavedWorkspaceView::Combined => Self::Waveform(WaveformTab::Combined),
+            SavedWorkspaceView::Vna => Self::Vna,
             SavedWorkspaceView::SystemTrace => Self::SystemTrace,
         }
     }
@@ -312,6 +315,43 @@ impl WaveCraftApp {
         {
             self.radio_settings = radio_settings_from_recording_metadata(&profile.values);
         }
+        if let Some(profile) = self
+            .saved_capture_settings
+            .profiles
+            .vector_network_analyzer
+            .as_ref()
+        {
+            let mut settings = self.vna_settings;
+            settings.start_mhz = recording_metadata_value(&profile.values, "vna.start_mhz")
+                .unwrap_or(settings.start_mhz);
+            settings.stop_mhz = recording_metadata_value(&profile.values, "vna.stop_mhz")
+                .unwrap_or(settings.stop_mhz);
+            settings.points =
+                recording_metadata_value(&profile.values, "vna.points").unwrap_or(settings.points);
+            settings.averaging = recording_metadata_value(&profile.values, "vna.averaging")
+                .unwrap_or(settings.averaging);
+            if settings.sweep_config().is_ok() {
+                self.vna_settings = settings;
+                self.vna_start_frequency_input = settings.start_mhz.to_string();
+                self.vna_stop_frequency_input = settings.stop_mhz.to_string();
+            }
+            if let Some(serialized) = profile.values.get("vna.one_port_calibration") {
+                match serde_json::from_str::<crate::OnePortCalibration>(serialized) {
+                    Ok(calibration) => match calibration.validate() {
+                        Ok(()) => self.vna_calibration = Some(calibration),
+                        Err(error) => {
+                            self.last_error =
+                                Some(format!("Saved VNA calibration was ignored: {error}"));
+                        }
+                    },
+                    Err(error) => {
+                        self.last_error = Some(format!(
+                            "Saved VNA calibration could not be parsed and was ignored: {error}"
+                        ));
+                    }
+                }
+            }
+        }
         if let Some(profile) = self.saved_capture_settings.profiles.system_trace.as_ref() {
             self.system_trace_settings
                 .apply_saved_values(&profile.values);
@@ -343,6 +383,36 @@ impl WaveCraftApp {
             SavedCaptureSettingsKind::RadioFrequency => {
                 CaptureSettingsProfile::new(saved_radio_settings_metadata(&self.radio_settings))
             }
+            SavedCaptureSettingsKind::VectorNetworkAnalyzer => {
+                let mut values = BTreeMap::new();
+                values.insert(
+                    "vna.start_mhz".to_owned(),
+                    self.vna_settings.start_mhz.to_string(),
+                );
+                values.insert(
+                    "vna.stop_mhz".to_owned(),
+                    self.vna_settings.stop_mhz.to_string(),
+                );
+                values.insert(
+                    "vna.points".to_owned(),
+                    self.vna_settings.points.to_string(),
+                );
+                values.insert(
+                    "vna.averaging".to_owned(),
+                    self.vna_settings.averaging.to_string(),
+                );
+                if let Some(calibration) = &self.vna_calibration {
+                    let serialized = match serde_json::to_string(calibration) {
+                        Ok(serialized) => serialized,
+                        Err(error) => {
+                            self.set_error(format!("failed to serialize VNA calibration: {error}"));
+                            return;
+                        }
+                    };
+                    values.insert("vna.one_port_calibration".to_owned(), serialized);
+                }
+                CaptureSettingsProfile::new(values)
+            }
             SavedCaptureSettingsKind::SystemTrace => {
                 CaptureSettingsProfile::new(self.system_trace_settings.saved_values())
             }
@@ -356,6 +426,9 @@ impl WaveCraftApp {
             }
             SavedCaptureSettingsKind::RadioFrequency => {
                 document.profiles.radio_frequency = Some(profile)
+            }
+            SavedCaptureSettingsKind::VectorNetworkAnalyzer => {
+                document.profiles.vector_network_analyzer = Some(profile)
             }
             SavedCaptureSettingsKind::SystemTrace => document.profiles.system_trace = Some(profile),
         }
@@ -540,6 +613,23 @@ impl WaveCraftApp {
         self.save_global_settings();
     }
 
+    pub(crate) fn select_vna_view(&mut self) {
+        let entering_vna = !self.vna_view_is_active();
+        if let Some(active) = self.active_waveform_tab {
+            self.save_waveform_view_settings(active);
+        }
+        self.active_workspace_view = Some(WorkspaceView::Vna);
+        if entering_vna {
+            self.vna_calibration_notice_open = true;
+        }
+        self.snapshot_plot_rect = None;
+        self.save_global_settings();
+    }
+
+    pub(crate) fn vna_view_is_active(&self) -> bool {
+        self.active_workspace_view == Some(WorkspaceView::Vna)
+    }
+
     pub(crate) fn system_trace_view_is_active(&self) -> bool {
         self.active_workspace_view == Some(WorkspaceView::SystemTrace)
     }
@@ -547,7 +637,7 @@ impl WaveCraftApp {
     pub(crate) fn active_waveform_view(&self) -> Option<WaveformTab> {
         match self.active_workspace_view {
             Some(WorkspaceView::Waveform(tab)) => Some(tab),
-            Some(WorkspaceView::SystemTrace) | None => None,
+            Some(WorkspaceView::Vna | WorkspaceView::SystemTrace) | None => None,
         }
     }
 
@@ -608,14 +698,14 @@ impl WaveCraftApp {
             available.first().copied()
         };
         if let Some(tab) = selected {
-            if self.system_trace_view_is_active() {
+            if self.system_trace_view_is_active() || self.vna_view_is_active() {
                 self.active_waveform_tab = Some(tab);
             } else {
                 self.select_waveform_tab(tab);
             }
         } else {
             self.active_waveform_tab = None;
-            if !self.system_trace_view_is_active() {
+            if !self.system_trace_view_is_active() && !self.vna_view_is_active() {
                 self.active_workspace_view = Some(WorkspaceView::SystemTrace);
             }
         }
@@ -651,6 +741,7 @@ mod tests {
             WorkspaceView::Waveform(WaveformTab::Lissajous),
             WorkspaceView::Waveform(WaveformTab::RadioReceiver),
             WorkspaceView::Waveform(WaveformTab::Combined),
+            WorkspaceView::Vna,
             WorkspaceView::SystemTrace,
         ] {
             assert_eq!(WorkspaceView::from(SavedWorkspaceView::from(view)), view);
@@ -702,7 +793,33 @@ mod tests {
             Some(WorkspaceView::SystemTrace)
         );
         assert_eq!(restored.active_waveform_tab, None);
+
+        app.select_vna_view();
+        let saved = repository.load().expect("the VNA view should be saved");
+        assert_eq!(saved.global.last_active_view, Some(SavedWorkspaceView::Vna));
+        let mut restored = WaveCraftApp::with_settings(None, saved);
+        restored.reconcile_waveform_tab();
+        assert_eq!(restored.active_workspace_view, Some(WorkspaceView::Vna));
+        assert_eq!(restored.active_waveform_tab, Some(WaveformTab::Combined));
+        assert!(restored.vna_calibration_notice_open);
         remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn entering_vna_opens_the_calibration_notice_once_per_entry() {
+        let mut app = WaveCraftApp::with_settings(None, CaptureSettingsDocument::default());
+        app.select_waveform_tab(WaveformTab::LogicAnalyzer);
+
+        app.select_vna_view();
+        assert!(app.vna_calibration_notice_open);
+
+        app.vna_calibration_notice_open = false;
+        app.select_vna_view();
+        assert!(!app.vna_calibration_notice_open);
+
+        app.select_waveform_tab(WaveformTab::Oscilloscope);
+        app.select_vna_view();
+        assert!(app.vna_calibration_notice_open);
     }
 
     #[test]
@@ -775,6 +892,7 @@ mod tests {
                 WorkspaceView::Waveform(WaveformTab::Lissajous),
                 WorkspaceView::Waveform(WaveformTab::RadioReceiver),
                 WorkspaceView::Waveform(WaveformTab::Combined),
+                WorkspaceView::Vna,
             ]
         );
         remove_test_repository(&repository);
@@ -844,6 +962,51 @@ mod tests {
             .expect("the pending window size should be saved on exit");
         assert_eq!(saved.global.window_inner_size, Some(resized));
         assert_eq!(app.window_size_save_due, None);
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn vna_settings_and_calibration_persist_across_restart() {
+        let repository = test_repository("vna-calibration");
+        remove_test_repository(&repository);
+        let calibration = r#"{
+            "frequencies_hz":[10000000,20000000],
+            "directivity":[{"real":0.0,"imaginary":0.0},{"real":0.0,"imaginary":0.0}],
+            "source_match":[{"real":0.0,"imaginary":0.0},{"real":0.0,"imaginary":0.0}],
+            "reflection_tracking":[{"real":1.0,"imaginary":0.0},{"real":1.0,"imaginary":0.0}]
+        }"#;
+        let mut values = BTreeMap::new();
+        values.insert("vna.start_mhz".to_owned(), "10".to_owned());
+        values.insert("vna.stop_mhz".to_owned(), "20".to_owned());
+        values.insert("vna.points".to_owned(), "2".to_owned());
+        values.insert("vna.averaging".to_owned(), "4".to_owned());
+        values.insert(
+            "vna.one_port_calibration".to_owned(),
+            calibration.to_owned(),
+        );
+        let mut saved = CaptureSettingsDocument::default();
+        saved.profiles.vector_network_analyzer = Some(CaptureSettingsProfile::new(values));
+        let mut app = WaveCraftApp::with_settings(Some(repository.clone()), saved);
+
+        app.save_capture_settings(SavedCaptureSettingsKind::VectorNetworkAnalyzer);
+
+        let restored = WaveCraftApp::with_settings(
+            None,
+            repository.load().expect("the VNA profile should be saved"),
+        );
+        assert_eq!(restored.vna_settings.start_mhz, 10.0);
+        assert_eq!(restored.vna_settings.stop_mhz, 20.0);
+        assert_eq!(restored.vna_settings.points, 2);
+        assert_eq!(restored.vna_settings.averaging, 4);
+        let restored_calibration = restored
+            .vna_calibration
+            .expect("the calibration should be restored");
+        assert!(restored_calibration.matches_config(
+            restored
+                .vna_settings
+                .sweep_config()
+                .expect("the restored sweep should be valid")
+        ));
         remove_test_repository(&repository);
     }
 

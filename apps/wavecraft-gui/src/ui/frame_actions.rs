@@ -4,8 +4,8 @@
 use crate::system_trace::SystemTraceAction;
 use crate::{
     choose_decoded_data_save_path, choose_recording_save_path, choose_recording_to_open,
-    choose_saleae_export_path, ui::frame_state::FrameState, AcquisitionMode, CaptureTarget,
-    SavedCaptureSettingsKind, ScopeCalibrationAction, WaveCraftApp,
+    choose_saleae_export_path, ui::frame_state::FrameState, AcquisitionMode, CalibrationStandard,
+    CaptureTarget, SavedCaptureSettingsKind, ScopeCalibrationAction, WaveCraftApp,
 };
 
 /// What the user asked for this frame. Panels set fields while they paint; the
@@ -27,6 +27,11 @@ pub(crate) struct FrameActions {
     pub(crate) scope_device_selection_changed: bool,
     pub(crate) radio_device_selection_changed: bool,
     pub(crate) system_trace_action: Option<SystemTraceAction>,
+    pub(crate) vna_connection_clicked: bool,
+    pub(crate) vna_sweep_clicked: bool,
+    pub(crate) vna_run_stop_clicked: bool,
+    pub(crate) vna_calibration_standard: Option<CalibrationStandard>,
+    pub(crate) vna_clear_calibration: bool,
 }
 
 impl WaveCraftApp {

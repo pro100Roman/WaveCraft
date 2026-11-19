@@ -23,6 +23,10 @@ impl WaveCraftApp {
         frame: &FrameState,
         actions: &mut FrameActions,
     ) {
+        if self.vna_view_is_active() {
+            self.paint_vna_toolbar(context, actions);
+            return;
+        }
         if self.system_trace_view_is_active() {
             self.paint_system_trace_toolbar(context, actions);
             return;

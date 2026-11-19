@@ -21,6 +21,7 @@ mod system_trace;
 mod tests;
 mod theme;
 mod ui;
+mod vna;
 pub mod waveform;
 
 use acquisition::capture::*;
@@ -101,6 +102,7 @@ use ui::radio_settings::*;
 use ui::scope_settings::*;
 use ui::system_trace::*;
 use ui::view_tabs::*;
+use vna::*;
 use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
     DeviceDescriptor, DeviceId, InstrumentKind, ScopeBatch,
@@ -141,6 +143,7 @@ use wavecraft_usb::{
     DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_ALIGNMENT,
     DSLOGIC_SAMPLE_RATES_HZ, DSLOGIC_TRIGGER_STAGE_COUNT, REQUIRED_RESOURCE_FILES,
 };
+use wavecraft_vna::{LiteVnaDevice, OnePortCalibration, VnaPoint, VnaSweep};
 use waveform::chrome::*;
 use waveform::combined::*;
 use waveform::logic::*;
@@ -384,6 +387,26 @@ struct WaveCraftApp {
     radios: Vec<DiscoveredRadio>,
     selected_radio_id: Option<String>,
     radio_discovery_failures: Vec<RadioProviderFailure>,
+    vna_devices: Vec<LiteVnaDevice>,
+    selected_vna_port: Option<String>,
+    vna_discovery_error: Option<String>,
+    vna_settings: VnaSettings,
+    vna_start_frequency_input: String,
+    vna_stop_frequency_input: String,
+    vna_session: Option<VnaSharedSession>,
+    vna_connection_pending: Option<VnaConnectionReceiver>,
+    vna_connection_closing: bool,
+    vna_sweep: Option<VnaSweep>,
+    vna_pending: Option<VnaWorkerReceiver>,
+    vna_run_active: bool,
+    vna_run_stop_requested: bool,
+    vna_run_events: Option<VnaWorkerReceiver>,
+    vna_run_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    vna_pending_purpose: Option<VnaSweepPurpose>,
+    vna_calibration_captures: VnaCalibrationCaptures,
+    vna_calibration: Option<OnePortCalibration>,
+    vna_sweep_calibrated: bool,
+    vna_calibration_notice_open: bool,
     radio_settings: RadioSettings,
     radio_view: RefCell<RadioViewState>,
     active_capture_settings_tab: CaptureSettingsTab,
@@ -474,7 +497,7 @@ impl WaveCraftApp {
             .map(WorkspaceView::from);
         let restored_waveform_tab = match restored_workspace_view {
             Some(WorkspaceView::Waveform(tab)) => Some(tab),
-            Some(WorkspaceView::SystemTrace) | None => None,
+            Some(WorkspaceView::Vna | WorkspaceView::SystemTrace) | None => None,
         };
         let mut restored_scope_function_settings = ScopeFunctionSettings::default();
         if restored_waveform_tab == Some(WaveformTab::Lissajous) {
@@ -507,6 +530,26 @@ impl WaveCraftApp {
             radios: Vec::new(),
             selected_radio_id: None,
             radio_discovery_failures: Vec::new(),
+            vna_devices: Vec::new(),
+            selected_vna_port: None,
+            vna_discovery_error: None,
+            vna_settings: VnaSettings::default(),
+            vna_start_frequency_input: "1".to_owned(),
+            vna_stop_frequency_input: "100".to_owned(),
+            vna_session: None,
+            vna_connection_pending: None,
+            vna_connection_closing: false,
+            vna_sweep: None,
+            vna_pending: None,
+            vna_run_active: false,
+            vna_run_stop_requested: false,
+            vna_run_events: None,
+            vna_run_cancel: None,
+            vna_pending_purpose: None,
+            vna_calibration_captures: VnaCalibrationCaptures::default(),
+            vna_calibration: None,
+            vna_sweep_calibrated: false,
+            vna_calibration_notice_open: restored_workspace_view == Some(WorkspaceView::Vna),
             radio_settings: RadioSettings::default(),
             radio_view: RefCell::new(RadioViewState::default()),
             active_capture_settings_tab: CaptureSettingsTab::DsLogic,
@@ -586,6 +629,9 @@ impl WaveCraftApp {
     }
 
     fn set_error(&mut self, error: String) {
+        if let Some(cancel) = &self.vna_run_cancel {
+            cancel.store(true, Ordering::Release);
+        }
         if let Some(target) = self.requested_capture_target.take() {
             self.capture_requests.remove(&target);
             self.queued_capture_rearms
@@ -604,6 +650,9 @@ impl WaveCraftApp {
 
     fn is_busy(&self) -> bool {
         self.pending.is_some()
+            || self.vna_connection_pending.is_some()
+            || self.vna_pending.is_some()
+            || self.vna_run_active
             || !self.captures.is_empty()
             || self.scheduled_repetitive_capture.is_some()
     }
@@ -615,6 +664,9 @@ impl eframe::App for WaveCraftApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(cancel) = &self.vna_run_cancel {
+            cancel.store(true, Ordering::Release);
+        }
         self.save_pending_window_size();
         self.save_global_settings();
         self.system_trace.cleanup_temporary_history();
@@ -669,6 +721,8 @@ impl WaveCraftApp {
         context.request_repaint_after(CPU_LOAD_SAMPLE_INTERVAL);
         self.poll_calibration_progress();
         self.poll_worker();
+        self.poll_vna_connection();
+        self.poll_vna_sweep();
         self.poll_system_trace_events();
         self.poll_system_trace_connection();
         self.reconcile_capture_settings_tab();
@@ -694,6 +748,8 @@ impl WaveCraftApp {
 
         if self.system_trace_view_is_active() {
             self.paint_system_trace_setup_panel(context, &mut actions);
+        } else if self.vna_view_is_active() {
+            self.paint_vna_setup_panel(context, &mut actions);
         } else {
             self.paint_capture_setup_panel(context, &frame, &mut actions);
         }
@@ -743,6 +799,8 @@ impl WaveCraftApp {
 
         let save_manual_values = self.paint_manual_calibration_window(context);
 
+        self.paint_vna_calibration_notice(context);
+
         paint_scope_marker_editor(
             context,
             &mut self.scope_marker_editor,
@@ -762,6 +820,21 @@ impl WaveCraftApp {
         }
 
         self.apply_toolbar_actions(&mut actions, &frame);
+        if actions.vna_sweep_clicked {
+            self.begin_vna_sweep();
+        }
+        if actions.vna_connection_clicked {
+            self.toggle_vna_connection();
+        }
+        if actions.vna_run_stop_clicked {
+            self.toggle_vna_run();
+        }
+        if let Some(standard) = actions.vna_calibration_standard {
+            self.begin_vna_calibration_capture(standard);
+        }
+        if actions.vna_clear_calibration {
+            self.clear_vna_calibration();
+        }
         self.apply_system_trace_action(actions.system_trace_action);
         match actions.calibration_action {
             Some(ScopeCalibrationAction::Auto) => {
@@ -808,6 +881,9 @@ impl WaveCraftApp {
         self.apply_scope_frontend_changes(&actions, &frame);
         if self.pending.is_some()
             || !self.captures.is_empty()
+            || self.vna_connection_pending.is_some()
+            || self.vna_pending.is_some()
+            || self.vna_run_active
             || self.system_trace_connection.needs_fast_poll()
         {
             context.request_repaint_after(Duration::from_millis(16));

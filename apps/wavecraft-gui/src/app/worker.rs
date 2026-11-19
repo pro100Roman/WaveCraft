@@ -8,11 +8,11 @@ use crate::{
     CompletionStatus, DebugProbeDiscoveryReport, DeviceDescriptor, DeviceEntry, DiscoveredDevice,
     DsCopeCalibrationValues, DsCopeCaptureConfig, DsCopeRuntimeTriggerControl, DsCopeTriggerSource,
     DsLogicCaptureConfig, FileDecodedDataRecorder, FileRecorder, GuiRecordingSettings, HashSet,
-    InstrumentKind, LoadedRecording, LogicDecodeWorker, ManualCalibrationEditor, Path, PathBuf,
-    ProtocolAnalyzerInstance, ProtocolCaptureDecoder, ProtocolDecodeSnapshot, RadioDiscoveryReport,
-    RadioSingleTrigger, ScopeMeasurementCache, TryRecvError, WaveformStore, WaveformTab,
-    WorkerSuccess, WorkspaceView, DSCOPE_VOLTS_PER_DIV_MV, NETWORK_BMP_PROBE_SELECTION,
-    NETWORK_CMSIS_DAP_PROBE_SELECTION, NETWORK_JLINK_PROBE_SELECTION,
+    InstrumentKind, LiteVnaDevice, LoadedRecording, LogicDecodeWorker, ManualCalibrationEditor,
+    Path, PathBuf, ProtocolAnalyzerInstance, ProtocolCaptureDecoder, ProtocolDecodeSnapshot,
+    RadioDiscoveryReport, RadioSingleTrigger, ScopeMeasurementCache, TryRecvError, WaveformStore,
+    WaveformTab, WorkerSuccess, WorkspaceView, DSCOPE_VOLTS_PER_DIV_MV,
+    NETWORK_BMP_PROBE_SELECTION, NETWORK_CMSIS_DAP_PROBE_SELECTION, NETWORK_JLINK_PROBE_SELECTION,
 };
 
 use crate::WaveCraftApp;
@@ -152,7 +152,8 @@ impl WaveCraftApp {
                 usb,
                 radio,
                 debug_probes,
-            }) => self.handle_devices_found(usb, radio, debug_probes),
+                vna,
+            }) => self.handle_devices_found(usb, radio, debug_probes, vna),
             Ok(WorkerSuccess::Capture(ready)) => self.handle_capture_ready(*ready),
             Ok(WorkerSuccess::RecordingLoaded { path, recording }) => {
                 self.handle_recording_loaded(path, recording)
@@ -205,6 +206,7 @@ impl WaveCraftApp {
         usb: Vec<DiscoveredDevice>,
         radio: RadioDiscoveryReport,
         debug_probes: DebugProbeDiscoveryReport,
+        vna: Result<Vec<LiteVnaDevice>, String>,
     ) {
         self.usb_speed_warning = usb_speed_warning(&usb);
         self.devices = usb
@@ -216,6 +218,16 @@ impl WaveCraftApp {
         self.debug_probes = debug_probes.probes;
         self.debug_probe_target_groups = debug_probes.target_groups;
         self.debug_probe_discovery_error = debug_probes.error;
+        match vna {
+            Ok(devices) => {
+                self.vna_devices = devices;
+                self.vna_discovery_error = None;
+            }
+            Err(error) => {
+                self.vna_devices.clear();
+                self.vna_discovery_error = Some(error);
+            }
+        }
         let selected_probe_is_available = self
             .system_trace_settings
             .probe_connection_id
@@ -238,7 +250,11 @@ impl WaveCraftApp {
                 .map(|probe| probe.connection_id.clone());
         }
         self.reconcile_device_selections();
-        let detected_count = self.devices.len() + self.radios.len() + self.debug_probes.len();
+        self.reconcile_vna_selection();
+        let detected_count = self.devices.len()
+            + self.radios.len()
+            + self.debug_probes.len()
+            + self.vna_devices.len();
         self.status = if detected_count == 0 {
             "No supported instruments detected".to_owned()
         } else {
@@ -989,6 +1005,7 @@ mod tests {
                 usb: Vec::new(),
                 radio: RadioDiscoveryReport::default(),
                 debug_probes: DebugProbeDiscoveryReport::default(),
+                vna: Ok(Vec::new()),
             }),
         );
 
@@ -1015,6 +1032,7 @@ mod tests {
             vec![fast, slow],
             RadioDiscoveryReport::default(),
             DebugProbeDiscoveryReport::default(),
+            Ok(Vec::new()),
         );
 
         assert_eq!(app.devices.len(), 2);
@@ -1053,6 +1071,7 @@ mod tests {
                 target_groups: vec![target_group.clone()],
                 error: None,
             },
+            Ok(Vec::new()),
         );
 
         assert_eq!(app.debug_probes, [probe]);
@@ -1088,6 +1107,7 @@ mod tests {
                     probes: vec![local_jlink.clone()],
                     ..DebugProbeDiscoveryReport::default()
                 },
+                Ok(Vec::new()),
             );
 
             assert_eq!(

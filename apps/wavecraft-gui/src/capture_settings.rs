@@ -73,6 +73,7 @@ pub(crate) enum SavedWorkspaceView {
     Lissajous,
     RadioSpectrum,
     Combined,
+    Vna,
     SystemTrace,
 }
 
@@ -114,6 +115,8 @@ pub(crate) struct CaptureSettingsProfiles {
     pub(crate) oscilloscope: Option<CaptureSettingsProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) radio_frequency: Option<CaptureSettingsProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vector_network_analyzer: Option<CaptureSettingsProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_trace: Option<CaptureSettingsProfile>,
 }

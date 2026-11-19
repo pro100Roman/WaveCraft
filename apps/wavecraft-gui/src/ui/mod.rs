@@ -19,4 +19,5 @@ pub mod status_bar;
 pub mod system_trace;
 pub mod toolbar;
 pub mod view_tabs;
+pub mod vna;
 pub mod waveform_tabs;

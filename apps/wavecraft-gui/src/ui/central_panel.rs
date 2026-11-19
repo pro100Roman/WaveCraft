@@ -130,6 +130,10 @@ impl WaveCraftApp {
         frame: &FrameState,
         snapshot_clicked: bool,
     ) {
+        if self.vna_view_is_active() {
+            self.paint_vna_central_panel(context, snapshot_clicked);
+            return;
+        }
         if self.system_trace_view_is_active() {
             self.paint_system_trace_central_panel(context);
             return;

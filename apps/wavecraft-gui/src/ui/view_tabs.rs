@@ -5,22 +5,25 @@ use crate::CaptureTarget;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkspaceView {
     Waveform(WaveformTab),
+    Vna,
     SystemTrace,
 }
 
 impl WorkspaceView {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Waveform(WaveformTab::LogicAnalyzer),
         Self::Waveform(WaveformTab::Oscilloscope),
         Self::Waveform(WaveformTab::Lissajous),
         Self::Waveform(WaveformTab::RadioReceiver),
         Self::Waveform(WaveformTab::Combined),
+        Self::Vna,
         Self::SystemTrace,
     ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Waveform(tab) => tab.label(),
+            Self::Vna => "VNA",
             Self::SystemTrace => "System Trace",
         }
     }
@@ -112,6 +115,7 @@ pub(crate) enum SavedCaptureSettingsKind {
     LogicAnalyzer,
     Oscilloscope,
     RadioFrequency,
+    VectorNetworkAnalyzer,
     SystemTrace,
 }
 
@@ -121,6 +125,7 @@ impl SavedCaptureSettingsKind {
             Self::LogicAnalyzer => "LA",
             Self::Oscilloscope => "OSC",
             Self::RadioFrequency => "RF",
+            Self::VectorNetworkAnalyzer => "VNA",
             Self::SystemTrace => "TRACE",
         }
     }
@@ -222,7 +227,7 @@ pub(crate) fn workspace_views(waveform_tabs: &[WaveformTab]) -> Vec<WorkspaceVie
         .iter()
         .copied()
         .map(WorkspaceView::Waveform)
-        .chain(std::iter::once(WorkspaceView::SystemTrace))
+        .chain([WorkspaceView::Vna, WorkspaceView::SystemTrace])
         .collect()
 }
 
@@ -262,11 +267,15 @@ mod tests {
 
     #[test]
     fn system_trace_is_a_workspace_view_not_a_waveform() {
-        assert_eq!(workspace_views(&[]), vec![WorkspaceView::SystemTrace]);
+        assert_eq!(
+            workspace_views(&[]),
+            vec![WorkspaceView::Vna, WorkspaceView::SystemTrace]
+        );
         assert_eq!(
             workspace_views(&[WaveformTab::LogicAnalyzer]),
             vec![
                 WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
+                WorkspaceView::Vna,
                 WorkspaceView::SystemTrace,
             ]
         );
@@ -287,6 +296,7 @@ mod tests {
                 WorkspaceView::Waveform(WaveformTab::Lissajous),
                 WorkspaceView::Waveform(WaveformTab::RadioReceiver),
                 WorkspaceView::Waveform(WaveformTab::Combined),
+                WorkspaceView::Vna,
             ]
         );
         assert!(!layout.take_layout_changed());

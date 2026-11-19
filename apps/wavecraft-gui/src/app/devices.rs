@@ -5,12 +5,19 @@ use crate::{
     mpsc, normalize_radio_settings, radio_registry, selected_device_for_role, selected_radio,
     thread, DeviceRole, DiscoveredDevice, WorkerSuccess,
 };
+use wavecraft_vna::discover_litevna_devices;
 
 use crate::WaveCraftApp;
 
 impl WaveCraftApp {
     pub(crate) fn begin_refresh(&mut self) {
-        if self.pending.is_some() || !self.captures.is_empty() {
+        if self.pending.is_some()
+            || self.vna_connection_pending.is_some()
+            || self.vna_pending.is_some()
+            || self.vna_run_active
+            || self.vna_session.is_some()
+            || !self.captures.is_empty()
+        {
             return;
         }
         let (sender, receiver) = mpsc::channel();
@@ -28,11 +35,13 @@ impl WaveCraftApp {
         thread::spawn(move || {
             let radio = radio_registry().discover();
             let debug_probes = discover_debug_probes();
+            let vna = discover_litevna_devices().map_err(|error| error.to_string());
             let result = discover_supported_devices()
                 .map(|report| WorkerSuccess::Devices {
                     usb: report.devices,
                     radio,
                     debug_probes,
+                    vna,
                 })
                 .map_err(|error| error.to_string());
             let _ = sender.send(result);

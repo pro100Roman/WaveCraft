@@ -16,6 +16,7 @@ members = [
     "crates/wavecraft-trace",
     "crates/wavecraft-trace-recording",
     "crates/wavecraft-usb",
+    "crates/wavecraft-vna",
 ]
 exclude = ["crates/wavecraft-probe-rs"]
 resolver = "2"

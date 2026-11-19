@@ -70,6 +70,7 @@ impl WaveCraftApp {
         if let Some(view) = selected_view {
             match view {
                 WorkspaceView::Waveform(tab) => self.select_waveform_tab(tab),
+                WorkspaceView::Vna => self.select_vna_view(),
                 WorkspaceView::SystemTrace => self.select_system_trace_view(),
             }
         }
@@ -166,6 +167,7 @@ mod tests {
                 WorkspaceView::Waveform(crate::WaveformTab::Lissajous),
                 WorkspaceView::Waveform(crate::WaveformTab::RadioReceiver),
                 WorkspaceView::Waveform(crate::WaveformTab::Combined),
+                WorkspaceView::Vna,
             ]
         );
         assert_eq!(app.workspace_view_layout.dragged_view(), None);
