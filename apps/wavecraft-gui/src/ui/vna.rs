@@ -10,8 +10,60 @@ use crate::{
 const VNA_PANEL_WIDTH: f32 = 300.0;
 const SMITH_GRID: Color32 = Color32::from_rgb(54, 68, 81);
 const SMITH_TRACE: Color32 = Color32::from_rgb(78, 205, 196);
+const SMITH_MIN_ZOOM: f32 = 0.5;
+const SMITH_MAX_ZOOM: f32 = 32.0;
 const POINT_COUNTS: [u16; 6] = [51, 101, 201, 401, 801, 1024];
 const AVERAGING_VALUES: [u8; 7] = [1, 2, 4, 8, 16, 32, 64];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SmithChartViewport {
+    zoom: f32,
+    center_gamma: (f64, f64),
+}
+
+impl Default for SmithChartViewport {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            center_gamma: (0.0, 0.0),
+        }
+    }
+}
+
+impl SmithChartViewport {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn zoom_about(&mut self, plot_center: Pos2, radius: f32, pointer: Pos2, factor: f32) {
+        if radius <= f32::EPSILON || !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let old_zoom = self.zoom.clamp(SMITH_MIN_ZOOM, SMITH_MAX_ZOOM);
+        let new_zoom = (old_zoom * factor).clamp(SMITH_MIN_ZOOM, SMITH_MAX_ZOOM);
+        if (new_zoom - old_zoom).abs() <= f32::EPSILON {
+            self.zoom = new_zoom;
+            return;
+        }
+        let anchor_gamma = self.gamma_at(plot_center, radius, pointer);
+        let new_scale = f64::from(radius * new_zoom);
+        let pointer_dx = f64::from(pointer.x - plot_center.x);
+        let pointer_dy = f64::from(pointer.y - plot_center.y);
+        self.center_gamma = (
+            anchor_gamma.0 - pointer_dx / new_scale,
+            anchor_gamma.1 + pointer_dy / new_scale,
+        );
+        self.zoom = new_zoom;
+    }
+
+    fn gamma_at(self, plot_center: Pos2, radius: f32, position: Pos2) -> (f64, f64) {
+        let scale = f64::from((radius * self.zoom).max(f32::EPSILON));
+        (
+            self.center_gamma.0 + f64::from(position.x - plot_center.x) / scale,
+            self.center_gamma.1 - f64::from(position.y - plot_center.y) / scale,
+        )
+    }
+}
 
 impl WaveCraftApp {
     pub(crate) fn paint_vna_calibration_notice(&mut self, context: &egui::Context) {
@@ -335,9 +387,15 @@ impl WaveCraftApp {
                     ui.add_space(12.0);
                     let available = ui.available_size();
                     let plot_size = Vec2::new(available.x.max(120.0), available.y.max(120.0));
-                    let (rect, response) = ui.allocate_exact_size(plot_size, Sense::hover());
+                    let (rect, response) = ui.allocate_exact_size(plot_size, Sense::click());
                     plot_rect = Some(rect);
-                    paint_smith_chart(ui, rect, self.vna_sweep.as_ref(), &response);
+                    paint_smith_chart(
+                        ui,
+                        rect,
+                        self.vna_sweep.as_ref(),
+                        &response,
+                        &mut self.vna_smith_viewport,
+                    );
                 });
             });
         self.snapshot_plot_rect = plot_rect;
@@ -563,24 +621,54 @@ fn paint_calibration_controls(ui: &mut egui::Ui, app: &WaveCraftApp, actions: &m
 }
 
 fn paint_smith_chart(
-    ui: &egui::Ui,
+    ui: &mut egui::Ui,
     rect: Rect,
     sweep: Option<&wavecraft_vna::VnaSweep>,
     response: &egui::Response,
+    viewport: &mut SmithChartViewport,
 ) {
+    let radius = rect.width().min(rect.height()) * 0.43;
+    if response.double_clicked() {
+        viewport.reset();
+        ui.ctx().request_repaint();
+    }
+    if response.hovered() {
+        let (scroll_delta, native_zoom) = ui.input_mut(|input| {
+            let scroll_delta = input.raw_scroll_delta.y;
+            let native_zoom = input.zoom_delta();
+            if scroll_delta.abs() > f32::EPSILON {
+                input.raw_scroll_delta.y = 0.0;
+                input.smooth_scroll_delta.y = 0.0;
+            }
+            (scroll_delta, native_zoom)
+        });
+        let factor = if (native_zoom - 1.0).abs() > f32::EPSILON {
+            native_zoom
+        } else {
+            (scroll_delta * 0.002).exp()
+        };
+        if (factor - 1.0).abs() > f32::EPSILON {
+            if let Some(pointer) = response.hover_pos() {
+                viewport.zoom_about(rect.center(), radius, pointer, factor);
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+
     let painter = ui.painter_at(rect);
     painter.rect_filled(
         rect,
         egui::Rounding::same(8.0),
         Color32::from_rgb(14, 19, 25),
     );
-    let radius = rect.width().min(rect.height()) * 0.43;
     let center = rect.center();
-    painter.circle_stroke(center, radius, Stroke::new(1.5_f32, GRID));
+    let unit_center = chart_position(center, radius, (0.0, 0.0), *viewport);
+    let unit_radius = radius * viewport.zoom;
+    painter.circle_stroke(unit_center, unit_radius, Stroke::new(1.5_f32, GRID));
     painter.line_segment(
         [
-            Pos2::new(center.x - radius, center.y),
-            Pos2::new(center.x + radius, center.y),
+            chart_position(center, radius, (-1.0, 0.0), *viewport),
+            chart_position(center, radius, (1.0, 0.0), *viewport),
         ],
         Stroke::new(1.0_f32, SMITH_GRID),
     );
@@ -589,7 +677,7 @@ fn paint_smith_chart(
         let points = (-160..=160)
             .map(|index| f64::from(index) / 8.0)
             .map(|reactance| impedance_to_gamma(resistance, reactance))
-            .map(|gamma| chart_position(center, radius, gamma))
+            .map(|gamma| chart_position(center, radius, gamma, *viewport))
             .collect::<Vec<_>>();
         painter.add(egui::Shape::line(points, Stroke::new(0.75_f32, SMITH_GRID)));
     }
@@ -598,7 +686,7 @@ fn paint_smith_chart(
             let points = (0..=240)
                 .map(|index| 30.0 * f64::from(index) / 240.0)
                 .map(|resistance| impedance_to_gamma(resistance, sign * reactance))
-                .map(|gamma| chart_position(center, radius, gamma))
+                .map(|gamma| chart_position(center, radius, gamma, *viewport))
                 .collect::<Vec<_>>();
             painter.add(egui::Shape::line(points, Stroke::new(0.75_f32, SMITH_GRID)));
         }
@@ -606,7 +694,7 @@ fn paint_smith_chart(
 
     for resistance in [0.0_f64, 0.2, 0.5, 1.0, 2.0, 5.0] {
         let gamma = impedance_to_gamma(resistance, 0.0);
-        let position = chart_position(center, radius, gamma);
+        let position = chart_position(center, radius, gamma, *viewport);
         painter.text(
             position + Vec2::new(3.0, 3.0),
             egui::Align2::LEFT_TOP,
@@ -632,7 +720,14 @@ fn paint_smith_chart(
     let trace = sweep
         .points
         .iter()
-        .map(|point| chart_position(center, radius, (point.s11_real, point.s11_imaginary)))
+        .map(|point| {
+            chart_position(
+                center,
+                radius,
+                (point.s11_real, point.s11_imaginary),
+                *viewport,
+            )
+        })
         .collect::<Vec<_>>();
     painter.add(egui::Shape::line(
         trace.clone(),
@@ -716,16 +811,23 @@ fn impedance_to_gamma(resistance: f64, reactance: f64) -> (f64, f64) {
     )
 }
 
-fn chart_position(center: Pos2, radius: f32, gamma: (f64, f64)) -> Pos2 {
+fn chart_position(
+    center: Pos2,
+    radius: f32,
+    gamma: (f64, f64),
+    viewport: SmithChartViewport,
+) -> Pos2 {
     let magnitude = gamma.0.hypot(gamma.1);
     let scale = if magnitude > 1.08 {
         1.08 / magnitude
     } else {
         1.0
     };
+    let gamma = (gamma.0 * scale, gamma.1 * scale);
+    let view_scale = f64::from(radius * viewport.zoom);
     Pos2::new(
-        center.x + (gamma.0 * scale) as f32 * radius,
-        center.y - (gamma.1 * scale) as f32 * radius,
+        center.x + ((gamma.0 - viewport.center_gamma.0) * view_scale) as f32,
+        center.y - ((gamma.1 - viewport.center_gamma.1) * view_scale) as f32,
     )
 }
 
@@ -830,6 +932,36 @@ mod tests {
         let right_hint = smith_hint_rect(plot, plot.right_center(), content);
         assert!(left_hint.left() > plot.left_center().x);
         assert!(right_hint.right() < plot.right_center().x);
+    }
+
+    #[test]
+    fn smith_zoom_keeps_the_gamma_under_the_pointer_fixed() {
+        let center = Pos2::new(300.0, 220.0);
+        let pointer = Pos2::new(390.0, 155.0);
+        let radius = 180.0;
+        let mut viewport = SmithChartViewport::default();
+        let anchor = viewport.gamma_at(center, radius, pointer);
+
+        viewport.zoom_about(center, radius, pointer, 2.0);
+
+        let position = chart_position(center, radius, anchor, viewport);
+        assert!(position.distance(pointer) < 1.0e-3);
+    }
+
+    #[test]
+    fn smith_zoom_scales_real_and_imaginary_directions_equally() {
+        let center = Pos2::new(300.0, 220.0);
+        let radius = 180.0;
+        let viewport = SmithChartViewport {
+            zoom: 2.5,
+            center_gamma: (0.0, 0.0),
+        };
+        let distances = [(0.5, 0.0), (-0.5, 0.0), (0.0, 0.5), (0.0, -0.5)]
+            .map(|gamma| chart_position(center, radius, gamma, viewport).distance(center));
+
+        for distance in distances.iter().skip(1) {
+            assert!((distance - distances[0]).abs() < 1.0e-3);
+        }
     }
 
     #[test]
