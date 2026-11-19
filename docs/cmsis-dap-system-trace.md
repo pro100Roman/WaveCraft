@@ -236,53 +236,133 @@ tests, all 22 WaveCraft probe-adapter tests, the complete WaveCraft workspace
 suite, Clippy with warnings denied, formatting, and diff checks. Sustained USB
 and TCP captures remain the decisive hardware tests.
 
-## Network CMSIS-DAP today
+## Network CMSIS-DAP implementation and measurements
 
 WaveCraft accepts network selectors in the form
 `wavecraft:cmsis-dap-network:<host>:<port>`. The adapter connects to the remote
-CMSIS-DAP TCP server through a local, framing-aware proxy so probe-rs can use
-its CMSIS-DAP TCP backend.
+CMSIS-DAP TCP server through a local proxy so probe-rs can use its existing TCP
+backend without treating a network endpoint as a USB device.
 
-The proxy currently:
+Four independent batching limits caused the original roughly 15-24 KiB/s
+throughput:
 
-- validates the `DAP\0` frame header, request or response type, and payload
-  length;
-- preserves the `DAP_Info` packet count and all other request and response
-  payloads;
-- enables `TCP_NODELAY`; and
-- uses an abortive close so a stalled ESP32JTAG/lwIP session does not retain
-  the single remote client slot after timeout or helper termination.
+- ESP32JTAG exposed USB-sized 64-byte packets and an eight-packet queue over
+  TCP, even though the TCP framing can carry larger commands.
+- Probe-rs pipelined only adjacent block commands. TAR setup transfers divided
+  each RTT memory window into a separate network round trip.
+- WaveCraft's framing-aware proxy parsed a coalesced probe-rs write and emitted
+  one TCP write per DAP frame. That destroyed the batching before it reached
+  the ESP32JTAG receive loop.
+- The firmware's 5,760-byte lwIP send buffer could not hold a complete response
+  batch.
 
-The SWD clock fix applies to the command engine shared by USB and network
-CMSIS-DAP, but it does not validate the Wi-Fi/TCP transport. CMSIS-DAP TCP has
-no USB product descriptor, so the probe-rs fork explicitly routes WaveCraft's
-TCP selector through the same ESP32JTAG compatibility rule. Block transfers,
-the reported packet pipeline, and eight idle cycles are now consistent between
-USB and TCP.
+The ESP32JTAG TCP server now reports a transport-specific 1,024-byte packet
+capacity and 32-packet queue, allocates matching request and response batches,
+and uses a 32 KiB TCP send buffer. The USB descriptor and CherryDAP USB queue
+remain 64 bytes and eight packets. GDB port 4242, XVC port 2542, the logic
+analyzer routing, and their application protocols are unchanged.
 
-## Network follow-up plan
+The probe-rs fork now lowers a complete consecutive SWD transfer segment into
+ordered `DAP_Transfer` and `DAP_TransferBlock` commands. Up to 32 mixed commands
+remain in flight across TAR auto-increment boundaries, so eight 1 KiB RTT
+windows can share one network round trip. Probe-rs deliberately caps the
+logical TCP packet size at 576 bytes even when the firmware advertises 1,024.
+At 576 bytes each 1 KiB window needs two block commands plus its TAR setup, so
+eight windows need 24 commands and fit in the firmware queue. Larger packets
+reduced utilization of the ESP32 TCP send window; smaller packets needed more
+than one queue drain.
 
-Use corrected USB firmware as the behavioral baseline and investigate network
-CMSIS-DAP in this order:
+WaveCraft's local CMSIS-DAP proxy is now a transparent, 32 KiB buffered
+bidirectional byte-stream relay. It no longer splits a coalesced TCP write at
+DAP frame boundaries. Both sockets use `TCP_NODELAY`, and the remote side uses
+an abortive close so a terminated helper does not retain ESP32JTAG's single
+client slot.
 
-1. Run the same target image and SystemView event load through USB and network,
-   recording sustained throughput and command latency.
-2. Capture CMSIS-DAP request and reply sequence numbers, frame sizes, RTT
-   occupancy, timeout location, and the last completed command when a stall
-   occurs.
-3. Exercise start, sustained capture, stop, disconnect, helper termination,
-   network loss, and immediate reconnect. Confirm that both the local proxy and
-   ESP32JTAG server release their sockets.
-4. If a stall remains with `01b5b6d4`, determine whether it originates in the
-   firmware server task, Wi-Fi/lwIP transport, shared command engine, WaveCraft
-   proxy, or probe-rs timeout handling before changing batching or retry policy.
-5. Tune logical RTT read size and helper batching separately from CMSIS-DAP
-   packet pipelining. A large serialized memory read can improve throughput but
-   delay stop or disconnect commands.
-6. Add opt-in hardware tests for sustained capture, overflow accounting,
-   cancellation, target liveness, and reconnect. Keep the default workspace
-   suite independent of debug hardware.
+The connected nRF52832 produced these repeated 8 KiB RAM-read results at a
+requested 6 MHz SWD clock:
 
-Success means capture is not bounded by a transport stall, target and display
-loss remain separately measurable, stop and disconnect complete in bounded
-time, the target remains alive, and a new session can attach without a reset.
+| Path | Sustained throughput |
+| --- | ---: |
+| Original network path | about 15-24 KiB/s |
+| Direct probe-rs TCP after firmware and pipeline changes | about 192 KiB/s |
+| WaveCraft network selector before the transparent proxy fix | 24.1 KiB/s |
+| WaveCraft network selector after the proxy fix | 203-219 KiB/s |
+| USB CMSIS-DAP regression check | 275.8 KiB/s |
+
+Three immediate network connect/attach/read/close cycles completed at 203.3,
+218.8, and 210.8 KiB/s without a timeout or stale previous connection. This
+also verifies that the close path releases the ESP32JTAG client slot.
+
+The final full-rate SystemView drop count still requires a clean target run.
+The available target currently stops deterministically in its separate
+`sensor.c:339` DPS310 startup assert after a debugger reset
+(`DHCSR=0x01030003`), producing no trace bytes. A run in that state is not a
+network CMSIS-DAP failure and must not be used to judge event loss. Fully
+power-cycle the target and sensor, start capture without another debugger
+reset, then record received bytes, target drops, display skips, and final core
+state.
+
+### Non-halting trace attach
+
+A clean power-cycle exposed a second attach-time failure which was independent
+of RTT polling. `probe-rs::Session::new()` unconditionally called
+`clear_all_hw_breakpoints()`. That operation uses `halted_access()`, briefly
+halts every running core, clears FPB comparators, and resumes the cores. The
+pause is short over a local probe but long enough over ESP32JTAG Wi-Fi to break
+Nordic SoftDevice radio timing.
+
+The resulting target state was deterministic: `DHCSR=0x01030003` showed a
+halted Cortex-M, `DFSR=0x00000003` reported a breakpoint, and the PC was the
+`BKPT` in `app_error_fault_handler`. The saved handler arguments were
+`id=1`, `pc=0x1100a`, and `info=0`, identifying
+`NRF_FAULT_ID_SD_ASSERT` inside the binary SoftDevice rather than an RTT or SWD
+transport lockup.
+
+The probe-rs fork now provides an opt-in attach which preserves existing
+hardware breakpoints and skips breakpoint cleanup both when the session opens
+and when it is dropped. WaveCraft selects it only for CMSIS-DAP. Existing
+probe-rs attach behavior remains the default, and the separate J-Link network
+backend is unchanged.
+
+A five-second network capture with this change kept
+`DHCSR=0x01010001` and `DFSR=0` before RTT attach, after trace start, and during
+every periodic check. The target no longer stopped at connect or during trace.
+
+### Remaining network throughput limit
+
+With the attach failure removed, the old eight-idle-cycle TCP workaround could
+be measured independently. Removing those cycles only for CMSIS-DAP TCP raised
+the three-second trace rate from about 78.1 KiB/s to 104.5 KiB/s, and the
+target remained running with `DFSR=0` during that short test. A longer GUI run
+disproved the change: normal trace traffic ended after roughly 3.26 seconds,
+the application became unresponsive while the Cortex-M still reported running,
+and 55,079 target-dropped events accumulated. The no-idle optimization was
+therefore reverted. ESP32JTAG keeps eight idle cycles over both USB and TCP;
+J-Link is unaffected.
+
+The short no-idle run reported 26,907 dropped events while WaveCraft received
+326,330 bytes and decoded 56,145 events. The producer emits
+roughly 175 KiB/s, while the 8 KiB SystemView ring exposed only about 4.6 KiB
+per RTT drain. Every drain must read the producer and consumer pointers before
+the payload, so Wi-Fi round-trip latency prevents the host from reaching the
+raw-memory rate even though block RAM reads exceed 200 KiB/s.
+
+An experimental full-ring snapshot with a deferred consumer-pointer update was
+also measured and reverted. It reduced throughput to 89.9 KiB/s and increased
+reported loss to 35,926 events because it transferred the complete ring on
+every poll and kept the target-visible buffer occupied longer.
+
+The practical next target-side change is to increase the SystemView RTT up
+buffer from 8 KiB to at least 16 KiB, preferably 32 KiB when RAM permits. A
+larger ring both absorbs Wi-Fi jitter and amortizes each dependent pointer
+round trip over more payload. WaveCraft now uses the network CMSIS-DAP channel
+descriptor to request as much as the ring's usable capacity, up to 64 KiB, and
+automatically reduces the helper batch count so one request never exceeds its
+64 KiB IPC limit. USB and J-Link keep their existing 16 KiB maximum read size.
+
+All new packet-size, queue-depth, and mixed-command pipeline behavior is
+selected only for CMSIS-DAP TCP. USB CMSIS-DAP retains its existing transfer
+limits. J-Link uses a different backend and is unaffected. GDB and XVC retain
+their ports and handlers; the only shared network setting is the larger lwIP
+send queue, which changes buffering capacity rather than protocol behavior.
+
