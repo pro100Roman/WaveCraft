@@ -464,6 +464,7 @@ impl WaveCraftApp {
                             self.vna_sweep.as_ref(),
                             &response,
                             &mut self.vna_smith_viewport,
+                            &mut self.vna_smith_pinned_point,
                         ),
                         VnaPlotTab::LogMagnitudePhase => paint_log_magnitude_phase_chart(
                             ui,
@@ -707,6 +708,7 @@ fn paint_smith_chart(
     sweep: Option<&wavecraft_vna::VnaSweep>,
     response: &egui::Response,
     viewport: &mut SmithChartViewport,
+    pinned_point: &mut Option<usize>,
 ) {
     let radius = rect.width().min(rect.height()) * 0.43;
     if response.double_clicked() {
@@ -824,38 +826,65 @@ fn paint_smith_chart(
         painter.circle_filled(*last, 4.0, SCOPE_COLORS[1]);
     }
 
-    if let Some(pointer) = response.hover_pos() {
-        if let Some((index, distance)) = trace
+    if pinned_point.is_some_and(|index| index >= trace.len()) {
+        *pinned_point = None;
+    }
+    let hovered_point = response.hover_pos().and_then(|pointer| {
+        trace
             .iter()
             .enumerate()
             .map(|(index, position)| (index, position.distance(pointer)))
             .min_by(|left, right| left.1.total_cmp(&right.1))
-        {
-            if distance <= 16.0 {
-                let point = sweep.points[index];
-                let position = trace[index];
-                painter.circle_stroke(position, 5.5, Stroke::new(1.5_f32, Color32::WHITE));
-                let text = point_label(point);
-                let galley = painter.layout_no_wrap(text, FontId::monospace(11.0), Color32::WHITE);
-                let hint_rect = smith_hint_rect(rect, position, galley.size());
-                painter.rect_filled(
-                    hint_rect,
-                    egui::Rounding::same(4.0),
-                    Color32::from_rgba_unmultiplied(8, 12, 16, 238),
-                );
-                painter.rect_stroke(
-                    hint_rect,
-                    egui::Rounding::same(4.0),
-                    Stroke::new(1.0_f32, SMITH_GRID),
-                );
-                painter.galley(
-                    hint_rect.min + Vec2::splat(SMITH_HINT_PADDING),
-                    galley,
-                    Color32::WHITE,
-                );
-            }
-        }
+            .filter(|(_, distance)| *distance <= 16.0)
+            .map(|(index, _)| index)
+    });
+    if response.clicked() && !response.double_clicked() {
+        *pinned_point = match hovered_point {
+            Some(index) if *pinned_point == Some(index) => None,
+            Some(index) => Some(index),
+            None => None,
+        };
     }
+    if let Some(index) = hovered_point.or(*pinned_point) {
+        let point = sweep.points[index];
+        let position = trace[index];
+        painter.circle_stroke(position, 5.5, Stroke::new(1.5_f32, Color32::WHITE));
+        let instruction = if *pinned_point == Some(index) {
+            "Pinned · select text and copy"
+        } else {
+            "Click trace to pin · select text to copy"
+        };
+        let text = format!("{}\n\n{instruction}", point_label(point));
+        let galley = painter.layout_no_wrap(text.clone(), FontId::monospace(11.0), Color32::WHITE);
+        let hint_rect = smith_hint_rect(rect, position, galley.size());
+        paint_selectable_smith_hint(ui.ctx(), hint_rect, text);
+    }
+}
+
+fn paint_selectable_smith_hint(context: &egui::Context, rect: Rect, text: String) {
+    egui::Area::new(egui::Id::new("vna_smith_selectable_hint"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(rect.min)
+        .movable(false)
+        .interactable(true)
+        .show(context, |ui| {
+            egui::Frame::none()
+                .fill(Color32::from_rgba_unmultiplied(8, 12, 16, 238))
+                .stroke(Stroke::new(1.0_f32, SMITH_GRID))
+                .rounding(egui::Rounding::same(4.0))
+                .inner_margin(egui::Margin::same(SMITH_HINT_PADDING))
+                .show(ui, |ui| {
+                    ui.style_mut().interaction.selectable_labels = true;
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(text)
+                                .font(FontId::monospace(11.0))
+                                .color(Color32::WHITE),
+                        )
+                        .selectable(true),
+                    );
+                });
+        });
 }
 
 const LOG_MAG_DB_FLOOR: f64 = -200.0;
@@ -1266,6 +1295,226 @@ fn format_resistance(resistance: f64) -> String {
     }
 }
 
+const VNA_REFERENCE_IMPEDANCE_OHMS: f64 = 50.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReactiveComponent {
+    Inductor(f64),
+    Capacitor(f64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LMatchTopology {
+    ShuntOnReferenceSide,
+    ShuntOnLoadSide,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LMatchSolution {
+    topology: LMatchTopology,
+    series_reactance_ohms: f64,
+    shunt_susceptance_siemens: f64,
+}
+
+fn impedance_from_gamma(gamma: (f64, f64)) -> Option<(f64, f64)> {
+    let denominator = (1.0 - gamma.0).powi(2) + gamma.1.powi(2);
+    if denominator <= f64::EPSILON {
+        return None;
+    }
+    let resistance = VNA_REFERENCE_IMPEDANCE_OHMS
+        * (1.0 - gamma.0.mul_add(gamma.0, gamma.1 * gamma.1))
+        / denominator;
+    let reactance = VNA_REFERENCE_IMPEDANCE_OHMS * 2.0 * gamma.1 / denominator;
+    (resistance.is_finite() && reactance.is_finite()).then_some((resistance, reactance))
+}
+
+fn component_for_series_reactance(
+    reactance_ohms: f64,
+    frequency_hz: f64,
+) -> Option<ReactiveComponent> {
+    let angular_frequency = std::f64::consts::TAU * frequency_hz;
+    if !angular_frequency.is_finite() || angular_frequency <= 0.0 || reactance_ohms.abs() <= 1.0e-9
+    {
+        return None;
+    }
+    if reactance_ohms > 0.0 {
+        Some(ReactiveComponent::Inductor(
+            reactance_ohms / angular_frequency,
+        ))
+    } else {
+        Some(ReactiveComponent::Capacitor(
+            -1.0 / (angular_frequency * reactance_ohms),
+        ))
+    }
+}
+
+fn component_for_shunt_susceptance(
+    susceptance_siemens: f64,
+    frequency_hz: f64,
+) -> Option<ReactiveComponent> {
+    let angular_frequency = std::f64::consts::TAU * frequency_hz;
+    if !angular_frequency.is_finite()
+        || angular_frequency <= 0.0
+        || susceptance_siemens.abs() <= 1.0e-12
+    {
+        return None;
+    }
+    if susceptance_siemens > 0.0 {
+        Some(ReactiveComponent::Capacitor(
+            susceptance_siemens / angular_frequency,
+        ))
+    } else {
+        Some(ReactiveComponent::Inductor(
+            -1.0 / (angular_frequency * susceptance_siemens),
+        ))
+    }
+}
+
+fn l_match_solution(resistance: f64, reactance: f64) -> Option<LMatchSolution> {
+    if !resistance.is_finite()
+        || !reactance.is_finite()
+        || resistance <= 0.0
+        || (resistance - VNA_REFERENCE_IMPEDANCE_OHMS).abs() <= 1.0e-9
+    {
+        return None;
+    }
+    let mut candidates = Vec::with_capacity(2);
+    if resistance < VNA_REFERENCE_IMPEDANCE_OHMS {
+        let transformed_reactance =
+            (resistance * (VNA_REFERENCE_IMPEDANCE_OHMS - resistance)).sqrt();
+        for sign in [-1.0_f64, 1.0] {
+            let total_reactance = sign * transformed_reactance;
+            candidates.push(LMatchSolution {
+                topology: LMatchTopology::ShuntOnReferenceSide,
+                series_reactance_ohms: total_reactance - reactance,
+                shunt_susceptance_siemens: total_reactance
+                    / (resistance * VNA_REFERENCE_IMPEDANCE_OHMS),
+            });
+        }
+    } else {
+        let load_denominator = resistance.mul_add(resistance, reactance * reactance);
+        let conductance = resistance / load_denominator;
+        let load_susceptance = -reactance / load_denominator;
+        let transformed_susceptance = (conductance / VNA_REFERENCE_IMPEDANCE_OHMS
+            - conductance * conductance)
+            .max(0.0)
+            .sqrt();
+        for sign in [-1.0_f64, 1.0] {
+            let total_susceptance = sign * transformed_susceptance;
+            candidates.push(LMatchSolution {
+                topology: LMatchTopology::ShuntOnLoadSide,
+                series_reactance_ohms: VNA_REFERENCE_IMPEDANCE_OHMS * total_susceptance
+                    / conductance,
+                shunt_susceptance_siemens: total_susceptance - load_susceptance,
+            });
+        }
+    }
+    candidates
+        .into_iter()
+        .min_by(|left, right| l_match_complexity(*left).total_cmp(&l_match_complexity(*right)))
+}
+
+fn l_match_complexity(solution: LMatchSolution) -> f64 {
+    solution.series_reactance_ohms.abs() / VNA_REFERENCE_IMPEDANCE_OHMS
+        + solution.shunt_susceptance_siemens.abs() * VNA_REFERENCE_IMPEDANCE_OHMS
+}
+
+fn format_reactive_component(component: ReactiveComponent) -> String {
+    match component {
+        ReactiveComponent::Inductor(henries) => {
+            let (value, unit) = if henries >= 1.0e-3 {
+                (henries * 1.0e3, "mH")
+            } else if henries >= 1.0e-6 {
+                (henries * 1.0e6, "µH")
+            } else if henries >= 1.0e-9 {
+                (henries * 1.0e9, "nH")
+            } else {
+                (henries * 1.0e12, "pH")
+            };
+            format!("L {} {unit}", format_component_value(value))
+        }
+        ReactiveComponent::Capacitor(farads) => {
+            let (value, unit) = if farads >= 1.0e-6 {
+                (farads * 1.0e6, "µF")
+            } else if farads >= 1.0e-9 {
+                (farads * 1.0e9, "nF")
+            } else if farads >= 1.0e-12 {
+                (farads * 1.0e12, "pF")
+            } else {
+                (farads * 1.0e15, "fF")
+            };
+            format!("C {} {unit}", format_component_value(value))
+        }
+    }
+}
+
+fn format_component_value(value: f64) -> String {
+    if value >= 100.0 {
+        format!("{value:.0}")
+    } else if value >= 10.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+fn matching_label(frequency_hz: f64, resistance: f64, reactance: f64) -> String {
+    let mut lines = Vec::new();
+    let nature = if reactance > 1.0e-6 {
+        "inductive"
+    } else if reactance < -1.0e-6 {
+        "capacitive"
+    } else {
+        "resistive"
+    };
+    let sign = if reactance < 0.0 { "−" } else { "+" };
+    lines.push(format!(
+        "Z {resistance:.2} {sign} j{:.2} Ω · {nature}",
+        reactance.abs()
+    ));
+
+    if let Some(component) = component_for_series_reactance(-reactance, frequency_hz) {
+        let label = if (resistance - VNA_REFERENCE_IMPEDANCE_OHMS).abs() <= 0.5 {
+            "Series match"
+        } else {
+            "Series resonance"
+        };
+        lines.push(format!(
+            "{label}: {} → {resistance:.1} Ω",
+            format_reactive_component(component)
+        ));
+    } else if (resistance - VNA_REFERENCE_IMPEDANCE_OHMS).abs() <= 0.5 {
+        lines.push("Already matched to 50 Ω".to_owned());
+    }
+
+    if (resistance - VNA_REFERENCE_IMPEDANCE_OHMS).abs() > 0.5 {
+        if let Some(solution) = l_match_solution(resistance, reactance) {
+            let series =
+                component_for_series_reactance(solution.series_reactance_ohms, frequency_hz)
+                    .map(format_reactive_component)
+                    .unwrap_or_else(|| "no series element".to_owned());
+            let shunt =
+                component_for_shunt_susceptance(solution.shunt_susceptance_siemens, frequency_hz)
+                    .map(format_reactive_component)
+                    .unwrap_or_else(|| "no shunt element".to_owned());
+            lines.push("50 Ω L-match (ideal):".to_owned());
+            match solution.topology {
+                LMatchTopology::ShuntOnReferenceSide => {
+                    lines.push(format!("  Shunt {shunt} on 50 Ω side"));
+                    lines.push(format!("  Series {series}"));
+                }
+                LMatchTopology::ShuntOnLoadSide => {
+                    lines.push(format!("  Series {series}"));
+                    lines.push(format!("  Shunt {shunt} at antenna"));
+                }
+            }
+        } else if resistance <= 0.0 {
+            lines.push("Passive L-match unavailable for this Z".to_owned());
+        }
+    }
+    lines.join("\n")
+}
+
 fn point_label(point: VnaPoint) -> String {
     let magnitude = point.s11_magnitude();
     let return_loss = if magnitude > 0.0 {
@@ -1278,14 +1527,25 @@ fn point_label(point: VnaPoint) -> String {
     } else {
         f64::INFINITY
     };
-    format!(
+    let mut label = format!(
         "{:.6} MHz\nS11 {:+.4} {:+.4}j\nRL {:.2} dB · VSWR {:.2}",
         point.frequency_hz as f64 / 1_000_000.0,
         point.s11_real,
         point.s11_imaginary,
         return_loss,
-        vswr
-    )
+        vswr,
+    );
+    if let Some((resistance, reactance)) =
+        impedance_from_gamma((point.s11_real, point.s11_imaginary))
+    {
+        label.push('\n');
+        label.push_str(&matching_label(
+            point.frequency_hz as f64,
+            resistance,
+            reactance,
+        ));
+    }
+    label
 }
 
 #[cfg(test)]
@@ -1335,6 +1595,83 @@ mod tests {
     fn impedance_transform_places_open_at_right_edge() {
         let gamma = impedance_to_gamma(1.0e12, 0.0);
         assert!((gamma.0 - 1.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn gamma_converts_back_to_resistance_and_reactance() {
+        let gamma = impedance_to_gamma(0.7, -0.4);
+        let impedance = impedance_from_gamma(gamma).unwrap();
+
+        assert!((impedance.0 - 35.0).abs() < 1.0e-9);
+        assert!((impedance.1 + 20.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn capacitive_load_recommends_a_series_inductor_for_resonance() {
+        let component = component_for_series_reactance(20.0, 100_000_000.0).unwrap();
+
+        let ReactiveComponent::Inductor(henries) = component else {
+            panic!("expected an inductor");
+        };
+        assert!((henries - 31.830_988_618e-9).abs() < 1.0e-15);
+    }
+
+    #[test]
+    fn l_match_solutions_transform_low_and_high_resistance_loads_to_50_ohms() {
+        for load in [(35.0, -20.0), (100.0, 30.0)] {
+            let solution = l_match_solution(load.0, load.1).unwrap();
+            let input = l_match_input_impedance(load, solution);
+
+            assert!((input.0 - VNA_REFERENCE_IMPEDANCE_OHMS).abs() < 1.0e-9);
+            assert!(input.1.abs() < 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn smith_point_label_includes_impedance_and_matching_components() {
+        let gamma = impedance_to_gamma(0.7, -0.4);
+        let label = point_label(VnaPoint {
+            frequency_hz: 100_000_000,
+            s11_real: gamma.0,
+            s11_imaginary: gamma.1,
+            s21_real: 0.0,
+            s21_imaginary: 0.0,
+        });
+
+        assert!(label.contains("Z 35.00 − j20.00 Ω · capacitive"));
+        assert!(label.contains("Series resonance: L 31.8 nH → 35.0 Ω"));
+        assert!(label.contains("50 Ω L-match (ideal):"));
+        assert!(label.contains("Shunt L"));
+        assert!(label.contains("Series C"));
+    }
+
+    fn l_match_input_impedance(load: (f64, f64), solution: LMatchSolution) -> (f64, f64) {
+        match solution.topology {
+            LMatchTopology::ShuntOnReferenceSide => {
+                let branch_reactance = load.1 + solution.series_reactance_ohms;
+                let branch_denominator =
+                    load.0.mul_add(load.0, branch_reactance * branch_reactance);
+                let conductance = load.0 / branch_denominator;
+                let susceptance =
+                    -branch_reactance / branch_denominator + solution.shunt_susceptance_siemens;
+                let input_denominator = conductance.mul_add(conductance, susceptance * susceptance);
+                (
+                    conductance / input_denominator,
+                    -susceptance / input_denominator,
+                )
+            }
+            LMatchTopology::ShuntOnLoadSide => {
+                let load_denominator = load.0.mul_add(load.0, load.1 * load.1);
+                let conductance = load.0 / load_denominator;
+                let susceptance = -load.1 / load_denominator + solution.shunt_susceptance_siemens;
+                let parallel_denominator =
+                    conductance.mul_add(conductance, susceptance * susceptance);
+                (
+                    conductance / parallel_denominator,
+                    -susceptance / parallel_denominator + solution.series_reactance_ohms,
+                )
+            }
+        }
     }
 
     #[test]
