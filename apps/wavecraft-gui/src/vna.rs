@@ -60,12 +60,83 @@ impl From<&ActiveVnaCalibration> for VnaCalibrationFile {
     }
 }
 
+pub(crate) const VNA_MATCHING_Q_MIN: f64 = 0.1;
+pub(crate) const VNA_MATCHING_Q_MAX: f64 = 20.0;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum VnaMatchingNetwork {
+    #[default]
+    All,
+    L,
+    Pi,
+    T,
+}
+
+impl VnaMatchingNetwork {
+    pub(crate) const ALL: [Self; 4] = [Self::All, Self::L, Self::Pi, Self::T];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::All => "All (L / π / T)",
+            Self::L => "L",
+            Self::Pi => "π",
+            Self::T => "T",
+        }
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::All => "Show L, π, and T matching alternatives in the Smith-chart point hint.",
+            Self::L => "Two-element L network. Its Q is fixed by the impedance transformation, so the configurable Q value does not apply.",
+            Self::Pi => "Three-element shunt-series-shunt network. The configured design Q selects one solution from the possible π networks.",
+            Self::T => "Three-element series-shunt-series network. The configured design Q selects one solution from the possible T networks.",
+        }
+    }
+
+    pub(crate) fn persisted_value(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::L => "l",
+            Self::Pi => "pi",
+            Self::T => "t",
+        }
+    }
+
+    pub(crate) fn from_persisted_value(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "l" => Some(Self::L),
+            "pi" => Some(Self::Pi),
+            "t" => Some(Self::T),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn shows_l(self) -> bool {
+        matches!(self, Self::All | Self::L)
+    }
+
+    pub(crate) fn shows_pi(self) -> bool {
+        matches!(self, Self::All | Self::Pi)
+    }
+
+    pub(crate) fn shows_t(self) -> bool {
+        matches!(self, Self::All | Self::T)
+    }
+
+    pub(crate) fn uses_configurable_q(self) -> bool {
+        matches!(self, Self::All | Self::Pi | Self::T)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct VnaSettings {
     pub(crate) start_mhz: f64,
     pub(crate) stop_mhz: f64,
     pub(crate) points: u16,
     pub(crate) averaging: u8,
+    pub(crate) matching_network: VnaMatchingNetwork,
+    pub(crate) matching_q: f64,
 }
 
 impl Default for VnaSettings {
@@ -75,6 +146,8 @@ impl Default for VnaSettings {
             stop_mhz: 100.0,
             points: 201,
             averaging: 1,
+            matching_network: VnaMatchingNetwork::All,
+            matching_q: 1.0,
         }
     }
 }
@@ -99,6 +172,11 @@ impl VnaSettings {
         };
         config.validate().map_err(|error| error.to_string())?;
         Ok(config)
+    }
+
+    pub(crate) fn matching_q_is_valid(self) -> bool {
+        self.matching_q.is_finite()
+            && (VNA_MATCHING_Q_MIN..=VNA_MATCHING_Q_MAX).contains(&self.matching_q)
     }
 }
 
@@ -893,6 +971,7 @@ mod tests {
             stop_mhz: 20.75,
             points: 101,
             averaging: 4,
+            ..VnaSettings::default()
         }
         .sweep_config()
         .unwrap();

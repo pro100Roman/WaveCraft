@@ -8,8 +8,8 @@ use crate::{
     scope_settings_from_recording_metadata, waveform_tabs, AcquisitionMode, CaptureSettingsProfile,
     CaptureSettingsTab, CombinedSessionSettings, DeviceModel, LogicSessionSettings,
     SavedCaptureSettingsKind, SavedTraceEventView, SavedTraceInstrument,
-    SavedTraceInstrumentHeights, SavedWorkspaceView, ScopeSessionSettings, WaveformTab,
-    WorkspaceView,
+    SavedTraceInstrumentHeights, SavedWorkspaceView, ScopeSessionSettings, VnaMatchingNetwork,
+    WaveformTab, WorkspaceView,
 };
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -330,7 +330,23 @@ impl WaveCraftApp {
                 recording_metadata_value(&profile.values, "vna.points").unwrap_or(settings.points);
             settings.averaging = recording_metadata_value(&profile.values, "vna.averaging")
                 .unwrap_or(settings.averaging);
-            if settings.sweep_config().is_ok() {
+            if let Some(network) = profile
+                .values
+                .get("vna.matching_network")
+                .and_then(|value| VnaMatchingNetwork::from_persisted_value(value))
+            {
+                settings.matching_network = network;
+            }
+            if let Some(matching_q) =
+                recording_metadata_value::<f64>(&profile.values, "vna.matching_q")
+            {
+                let mut candidate = settings;
+                candidate.matching_q = matching_q;
+                if candidate.matching_q_is_valid() {
+                    settings.matching_q = matching_q;
+                }
+            }
+            if settings.sweep_config().is_ok() && settings.matching_q_is_valid() {
                 self.vna_settings = settings;
                 self.vna_start_frequency_input = settings.start_mhz.to_string();
                 self.vna_stop_frequency_input = settings.stop_mhz.to_string();
@@ -419,6 +435,17 @@ impl WaveCraftApp {
                 values.insert(
                     "vna.averaging".to_owned(),
                     self.vna_settings.averaging.to_string(),
+                );
+                values.insert(
+                    "vna.matching_network".to_owned(),
+                    self.vna_settings
+                        .matching_network
+                        .persisted_value()
+                        .to_owned(),
+                );
+                values.insert(
+                    "vna.matching_q".to_owned(),
+                    self.vna_settings.matching_q.to_string(),
                 );
                 if let Some(calibration) = &self.vna_calibration {
                     let serialized = match serde_json::to_string(&calibration.calibration) {
@@ -1004,6 +1031,8 @@ mod tests {
         values.insert("vna.stop_mhz".to_owned(), "20".to_owned());
         values.insert("vna.points".to_owned(), "2".to_owned());
         values.insert("vna.averaging".to_owned(), "4".to_owned());
+        values.insert("vna.matching_network".to_owned(), "pi".to_owned());
+        values.insert("vna.matching_q".to_owned(), "1.5".to_owned());
         values.insert(
             "vna.calibration_name".to_owned(),
             "Bench antenna fixture".to_owned(),
@@ -1027,6 +1056,11 @@ mod tests {
         assert_eq!(restored.vna_settings.stop_mhz, 20.0);
         assert_eq!(restored.vna_settings.points, 2);
         assert_eq!(restored.vna_settings.averaging, 4);
+        assert_eq!(
+            restored.vna_settings.matching_network,
+            VnaMatchingNetwork::Pi
+        );
+        assert_eq!(restored.vna_settings.matching_q, 1.5);
         let restored_calibration = restored
             .vna_calibration
             .expect("the calibration should be restored");

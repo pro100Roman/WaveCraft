@@ -3,8 +3,9 @@
 use crate::{
     apply_setup_panel_typography, card_frame, egui, paint_capture_settings_save_button,
     toolbar_action_button, CalibrationStandard, Color32, FontId, FrameActions, PendingSnapshot,
-    Pos2, Rect, RichText, SavedCaptureSettingsKind, Sense, Stroke, Vec2, VnaPoint, WaveCraftApp,
-    ACCENT, BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
+    Pos2, Rect, RichText, SavedCaptureSettingsKind, SelectableHoverText, Sense, Stroke, Vec2,
+    VnaMatchingNetwork, VnaPoint, WaveCraftApp, ACCENT, BACKGROUND, GRID, ORANGE, PANEL,
+    SCOPE_COLORS, TEXT_MUTED, VNA_MATCHING_Q_MAX, VNA_MATCHING_Q_MIN,
 };
 
 const VNA_PANEL_WIDTH: f32 = 300.0;
@@ -477,6 +478,10 @@ impl WaveCraftApp {
                             &response,
                             &mut self.vna_smith_viewport,
                             &mut self.vna_smith_pinned_point,
+                            (
+                                self.vna_settings.matching_network,
+                                self.vna_settings.matching_q,
+                            ),
                         ),
                         VnaPlotTab::LogMagnitudePhase => paint_log_magnitude_phase_chart(
                             ui,
@@ -516,65 +521,27 @@ fn paint_vna_settings_card(ui: &mut egui::Ui, app: &mut WaveCraftApp, actions: &
             let content_width = (card_width - 20.0).max(0.0);
             ui.set_width(content_width);
             ui.set_max_width(content_width);
+            ui.spacing_mut().indent = 10.0;
             ui.label(RichText::new("LiteVNA 64").strong());
             ui.add_space(10.0);
-            ui.label(RichText::new("SWEEP").strong().color(TEXT_MUTED));
-            ui.add_space(8.0);
-            ui.add_enabled_ui(app.vna_pending.is_none() && !app.vna_run_active, |ui| {
-                ui.label(RichText::new("Start frequency").color(TEXT_MUTED));
-                let start_changed = paint_frequency_input(
-                    ui,
-                    "vna_start_frequency",
-                    &mut app.vna_start_frequency_input,
-                );
-                if start_changed {
-                    update_frequency_setting(
-                        &app.vna_start_frequency_input,
-                        &mut app.vna_settings.start_mhz,
-                    );
-                }
-                ui.add_space(7.0);
-                ui.label(RichText::new("Stop frequency").color(TEXT_MUTED));
-                let stop_changed = paint_frequency_input(
-                    ui,
-                    "vna_stop_frequency",
-                    &mut app.vna_stop_frequency_input,
-                );
-                if stop_changed {
-                    update_frequency_setting(
-                        &app.vna_stop_frequency_input,
-                        &mut app.vna_settings.stop_mhz,
-                    );
-                }
-                ui.add_space(7.0);
-                ui.label(RichText::new("Sweep points").color(TEXT_MUTED));
-                egui::ComboBox::from_id_salt("vna_points")
-                    .width(ui.available_width())
-                    .selected_text(app.vna_settings.points.to_string())
-                    .show_ui(ui, |ui| {
-                        for points in POINT_COUNTS {
-                            ui.selectable_value(
-                                &mut app.vna_settings.points,
-                                points,
-                                points.to_string(),
-                            );
-                        }
-                    });
-                ui.add_space(7.0);
-                ui.label(RichText::new("Averaging").color(TEXT_MUTED));
-                egui::ComboBox::from_id_salt("vna_averaging")
-                    .width(ui.available_width())
-                    .selected_text(format!("{}×", app.vna_settings.averaging))
-                    .show_ui(ui, |ui| {
-                        for averaging in AVERAGING_VALUES {
-                            ui.selectable_value(
-                                &mut app.vna_settings.averaging,
-                                averaging,
-                                format!("{averaging}×"),
-                            );
-                        }
-                    });
-            });
+            let sweep_section =
+                egui::CollapsingHeader::new(RichText::new("Sweep settings").strong())
+                    .id_salt("vna_sweep_settings_section")
+                    .default_open(true)
+                    .show(ui, |ui| paint_vna_sweep_settings(ui, app));
+            sweep_section.header_response.on_hover_selectable_text(
+                "Frequency range, point count, and averaging used by LiteVNA sweeps and calibration captures.",
+            );
+
+            ui.separator();
+            let matching_section =
+                egui::CollapsingHeader::new(RichText::new("Matching").strong())
+                    .id_salt("vna_matching_settings_section")
+                    .default_open(true)
+                    .show(ui, |ui| paint_vna_matching_settings(ui, app));
+            matching_section.header_response.on_hover_selectable_text(
+                "Select which ideal 50 Ω matching network is calculated for the hovered Smith-chart point. L-network Q is fixed by the impedance ratio; π and T networks use the configurable design Q.",
+            );
 
             paint_calibration_controls(ui, app, actions);
             ui.add_space(12.0);
@@ -596,6 +563,104 @@ fn paint_vna_settings_card(ui: &mut egui::Ui, app: &mut WaveCraftApp, actions: &
         });
 }
 
+fn paint_vna_sweep_settings(ui: &mut egui::Ui, app: &mut WaveCraftApp) {
+    ui.add_enabled_ui(app.vna_pending.is_none() && !app.vna_run_active, |ui| {
+        ui.label(RichText::new("Start frequency").color(TEXT_MUTED));
+        let start_changed = paint_frequency_input(
+            ui,
+            "vna_start_frequency",
+            &mut app.vna_start_frequency_input,
+        );
+        if start_changed {
+            update_frequency_setting(
+                &app.vna_start_frequency_input,
+                &mut app.vna_settings.start_mhz,
+            );
+        }
+        ui.add_space(7.0);
+        ui.label(RichText::new("Stop frequency").color(TEXT_MUTED));
+        let stop_changed =
+            paint_frequency_input(ui, "vna_stop_frequency", &mut app.vna_stop_frequency_input);
+        if stop_changed {
+            update_frequency_setting(
+                &app.vna_stop_frequency_input,
+                &mut app.vna_settings.stop_mhz,
+            );
+        }
+        ui.add_space(7.0);
+        ui.label(RichText::new("Sweep points").color(TEXT_MUTED));
+        egui::ComboBox::from_id_salt("vna_points")
+            .width(ui.available_width())
+            .selected_text(app.vna_settings.points.to_string())
+            .show_ui(ui, |ui| {
+                for points in POINT_COUNTS {
+                    ui.selectable_value(&mut app.vna_settings.points, points, points.to_string());
+                }
+            });
+        ui.add_space(7.0);
+        ui.label(RichText::new("Averaging").color(TEXT_MUTED));
+        egui::ComboBox::from_id_salt("vna_averaging")
+            .width(ui.available_width())
+            .selected_text(format!("{}×", app.vna_settings.averaging))
+            .show_ui(ui, |ui| {
+                for averaging in AVERAGING_VALUES {
+                    ui.selectable_value(
+                        &mut app.vna_settings.averaging,
+                        averaging,
+                        format!("{averaging}×"),
+                    );
+                }
+            });
+    });
+}
+
+const MATCHING_NETWORK_HELP: &str = "Choose the ideal network shown in the Smith-chart point hint. L uses two reactive components and has Q = √(Rhigh / Rlow − 1), fixed by the impedance transformation. π uses shunt–series–shunt components. T uses series–shunt–series components. All shows every alternative.";
+const MATCHING_Q_HELP: &str = "Dimensionless design Q used only for π and T synthesis. For a series branch Q = |X| / R; for a parallel branch Q = R / |X|. Approximate fractional bandwidth is Δf / f₀ ≈ 1 / Q: lower Q is broader and less sensitive, while higher Q is narrower and stores more reactive energy. The actual antenna bandwidth also depends on its impedance curve, component losses, and the accepted VSWR.";
+
+fn paint_vna_matching_settings(ui: &mut egui::Ui, app: &mut WaveCraftApp) {
+    ui.label(RichText::new("Network shown in hint").color(TEXT_MUTED))
+        .on_hover_selectable_text(MATCHING_NETWORK_HELP);
+    let combo = egui::ComboBox::from_id_salt("vna_matching_network")
+        .width(ui.available_width())
+        .selected_text(app.vna_settings.matching_network.label())
+        .show_ui(ui, |ui| {
+            for network in VnaMatchingNetwork::ALL {
+                ui.selectable_value(
+                    &mut app.vna_settings.matching_network,
+                    network,
+                    network.label(),
+                )
+                .on_hover_selectable_text(network.description());
+            }
+        });
+    combo
+        .response
+        .on_hover_selectable_text(MATCHING_NETWORK_HELP);
+
+    if app.vna_settings.matching_network.uses_configurable_q() {
+        ui.add_space(7.0);
+        ui.label(RichText::new("Design Q (π / T)").color(TEXT_MUTED))
+            .on_hover_selectable_text(MATCHING_Q_HELP);
+        ui.add(
+            egui::DragValue::new(&mut app.vna_settings.matching_q)
+                .range(VNA_MATCHING_Q_MIN..=VNA_MATCHING_Q_MAX)
+                .speed(0.1)
+                .min_decimals(1)
+                .max_decimals(2),
+        )
+        .on_hover_selectable_text(MATCHING_Q_HELP);
+    }
+
+    ui.add_space(7.0);
+    ui.small(
+        RichText::new(
+            "Results are calculated at the hovered point frequency and shown in its chart hint.",
+        )
+        .color(TEXT_MUTED),
+    )
+    .on_hover_selectable_text(MATCHING_Q_HELP);
+}
+
 fn vna_frequency_inputs_are_valid(app: &WaveCraftApp) -> bool {
     let Ok(start_mhz) = app.vna_start_frequency_input.trim().parse::<f64>() else {
         return false;
@@ -603,14 +668,15 @@ fn vna_frequency_inputs_are_valid(app: &WaveCraftApp) -> bool {
     let Ok(stop_mhz) = app.vna_stop_frequency_input.trim().parse::<f64>() else {
         return false;
     };
-    crate::VnaSettings {
+    let settings = crate::VnaSettings {
         start_mhz,
         stop_mhz,
         points: app.vna_settings.points,
         averaging: app.vna_settings.averaging,
-    }
-    .sweep_config()
-    .is_ok()
+        matching_network: app.vna_settings.matching_network,
+        matching_q: app.vna_settings.matching_q,
+    };
+    settings.sweep_config().is_ok() && settings.matching_q_is_valid()
 }
 
 fn paint_frequency_input(ui: &mut egui::Ui, id: &'static str, input: &mut String) -> bool {
@@ -751,7 +817,9 @@ fn paint_smith_chart(
     response: &egui::Response,
     viewport: &mut SmithChartViewport,
     pinned_point: &mut Option<usize>,
+    matching: (VnaMatchingNetwork, f64),
 ) {
+    let (matching_network, matching_q) = matching;
     let radius = rect.width().min(rect.height()) * 0.43;
     if response.double_clicked() {
         viewport.reset();
@@ -891,7 +959,7 @@ fn paint_smith_chart(
         let point = sweep.points[index];
         let position = trace[index];
         painter.circle_stroke(position, 5.5, Stroke::new(1.5_f32, Color32::WHITE));
-        let text = point_label(point);
+        let text = point_label(point, matching_network, matching_q);
         let layout = smith_hint_layout(&text, vswr_color(point_vswr(point)));
         let galley = painter.layout_job(layout.clone());
         let hint_rect = smith_hint_rect(rect, position, galley.size());
@@ -949,7 +1017,7 @@ fn smith_hint_line_color(line: &str) -> Color32 {
         S_PARAMETER
     } else if line.starts_with("Z ") {
         IMPEDANCE
-    } else if line.starts_with("50 Ω L-match") {
+    } else if line.starts_with("50 Ω ") && line.contains("-match") {
         MATCH_TITLE
     } else if trimmed.starts_with("Series ") {
         ORANGE
@@ -1405,6 +1473,20 @@ struct LMatchSolution {
     shunt_susceptance_siemens: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PiMatchSolution {
+    source_shunt_susceptance_siemens: f64,
+    series_reactance_ohms: f64,
+    load_shunt_susceptance_siemens: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TMatchSolution {
+    source_series_reactance_ohms: f64,
+    shunt_susceptance_siemens: f64,
+    load_series_reactance_ohms: f64,
+}
+
 fn impedance_from_gamma(gamma: (f64, f64)) -> Option<(f64, f64)> {
     let denominator = (1.0 - gamma.0).powi(2) + gamma.1.powi(2);
     if denominator <= f64::EPSILON {
@@ -1508,6 +1590,116 @@ fn l_match_complexity(solution: LMatchSolution) -> f64 {
         + solution.shunt_susceptance_siemens.abs() * VNA_REFERENCE_IMPEDANCE_OHMS
 }
 
+fn pi_match_solution(resistance: f64, reactance: f64, design_q: f64) -> Option<PiMatchSolution> {
+    if !resistance.is_finite()
+        || !reactance.is_finite()
+        || !design_q.is_finite()
+        || !(VNA_MATCHING_Q_MIN..=VNA_MATCHING_Q_MAX).contains(&design_q)
+        || resistance <= 0.0
+        || (resistance - VNA_REFERENCE_IMPEDANCE_OHMS).abs() <= 1.0e-9
+    {
+        return None;
+    }
+    let load_denominator = resistance.mul_add(resistance, reactance * reactance);
+    let load_conductance = resistance / load_denominator;
+    let load_susceptance = -reactance / load_denominator;
+    if !load_conductance.is_finite() || load_conductance <= 0.0 {
+        return None;
+    }
+
+    let maximum_intermediate_resistance = VNA_REFERENCE_IMPEDANCE_OHMS.min(1.0 / load_conductance);
+    let intermediate_resistance = maximum_intermediate_resistance / design_q.mul_add(design_q, 1.0);
+    let total_load_susceptance = (load_conductance / intermediate_resistance
+        - load_conductance * load_conductance)
+        .max(0.0)
+        .sqrt();
+    let total_series_reactance = (intermediate_resistance
+        * (VNA_REFERENCE_IMPEDANCE_OHMS - intermediate_resistance))
+        .max(0.0)
+        .sqrt();
+
+    let mut candidates = Vec::with_capacity(4);
+    for load_sign in [-1.0_f64, 1.0] {
+        let load_node_susceptance = load_sign * total_load_susceptance;
+        let shunted_load_reactance =
+            -load_node_susceptance * intermediate_resistance / load_conductance;
+        for series_sign in [-1.0_f64, 1.0] {
+            let branch_reactance = series_sign * total_series_reactance;
+            let solution = PiMatchSolution {
+                source_shunt_susceptance_siemens: branch_reactance
+                    / (intermediate_resistance * VNA_REFERENCE_IMPEDANCE_OHMS),
+                series_reactance_ohms: branch_reactance - shunted_load_reactance,
+                load_shunt_susceptance_siemens: load_node_susceptance - load_susceptance,
+            };
+            if pi_match_complexity(solution).is_finite() {
+                candidates.push(solution);
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .min_by(|left, right| pi_match_complexity(*left).total_cmp(&pi_match_complexity(*right)))
+}
+
+fn pi_match_complexity(solution: PiMatchSolution) -> f64 {
+    (solution.source_shunt_susceptance_siemens.abs()
+        + solution.load_shunt_susceptance_siemens.abs())
+        * VNA_REFERENCE_IMPEDANCE_OHMS
+        + solution.series_reactance_ohms.abs() / VNA_REFERENCE_IMPEDANCE_OHMS
+}
+
+fn t_match_solution(resistance: f64, reactance: f64, design_q: f64) -> Option<TMatchSolution> {
+    if !resistance.is_finite()
+        || !reactance.is_finite()
+        || !design_q.is_finite()
+        || !(VNA_MATCHING_Q_MIN..=VNA_MATCHING_Q_MAX).contains(&design_q)
+        || resistance <= 0.0
+        || (resistance - VNA_REFERENCE_IMPEDANCE_OHMS).abs() <= 1.0e-9
+    {
+        return None;
+    }
+
+    let maximum_intermediate_conductance =
+        (1.0 / resistance).min(1.0 / VNA_REFERENCE_IMPEDANCE_OHMS);
+    let intermediate_conductance =
+        maximum_intermediate_conductance / design_q.mul_add(design_q, 1.0);
+    let total_load_reactance = (resistance / intermediate_conductance - resistance * resistance)
+        .max(0.0)
+        .sqrt();
+    let total_node_susceptance = (intermediate_conductance / VNA_REFERENCE_IMPEDANCE_OHMS
+        - intermediate_conductance * intermediate_conductance)
+        .max(0.0)
+        .sqrt();
+
+    let mut candidates = Vec::with_capacity(4);
+    for load_sign in [-1.0_f64, 1.0] {
+        let load_branch_reactance = load_sign * total_load_reactance;
+        let load_branch_susceptance =
+            -load_branch_reactance * intermediate_conductance / resistance;
+        for shunt_sign in [-1.0_f64, 1.0] {
+            let node_susceptance = shunt_sign * total_node_susceptance;
+            let solution = TMatchSolution {
+                source_series_reactance_ohms: node_susceptance * VNA_REFERENCE_IMPEDANCE_OHMS
+                    / intermediate_conductance,
+                shunt_susceptance_siemens: node_susceptance - load_branch_susceptance,
+                load_series_reactance_ohms: load_branch_reactance - reactance,
+            };
+            if t_match_complexity(solution).is_finite() {
+                candidates.push(solution);
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .min_by(|left, right| t_match_complexity(*left).total_cmp(&t_match_complexity(*right)))
+}
+
+fn t_match_complexity(solution: TMatchSolution) -> f64 {
+    (solution.source_series_reactance_ohms.abs() + solution.load_series_reactance_ohms.abs())
+        / VNA_REFERENCE_IMPEDANCE_OHMS
+        + solution.shunt_susceptance_siemens.abs() * VNA_REFERENCE_IMPEDANCE_OHMS
+}
+
 fn format_reactive_component(component: ReactiveComponent) -> String {
     match component {
         ReactiveComponent::Inductor(henries) => {
@@ -1547,7 +1739,22 @@ fn format_component_value(value: f64) -> String {
     }
 }
 
-fn matching_label(frequency_hz: f64, resistance: f64, reactance: f64) -> String {
+fn format_matching_q(value: f64) -> String {
+    if value.fract().abs() <= 1.0e-9 {
+        format!("{value:.0}")
+    } else {
+        let formatted = format!("{value:.2}");
+        formatted.trim_end_matches('0').to_owned()
+    }
+}
+
+fn matching_label(
+    frequency_hz: f64,
+    resistance: f64,
+    reactance: f64,
+    matching_network: VnaMatchingNetwork,
+    matching_q: f64,
+) -> String {
     let mut lines = Vec::new();
     let nature = if reactance > 1.0e-6 {
         "inductive"
@@ -1577,34 +1784,96 @@ fn matching_label(frequency_hz: f64, resistance: f64, reactance: f64) -> String 
     }
 
     if (resistance - VNA_REFERENCE_IMPEDANCE_OHMS).abs() > 0.5 {
-        if let Some(solution) = l_match_solution(resistance, reactance) {
-            let series =
-                component_for_series_reactance(solution.series_reactance_ohms, frequency_hz)
-                    .map(format_reactive_component)
-                    .unwrap_or_else(|| "no series element".to_owned());
-            let shunt =
-                component_for_shunt_susceptance(solution.shunt_susceptance_siemens, frequency_hz)
-                    .map(format_reactive_component)
-                    .unwrap_or_else(|| "no shunt element".to_owned());
-            lines.push("50 Ω L-match (ideal):".to_owned());
-            match solution.topology {
-                LMatchTopology::ShuntOnReferenceSide => {
-                    lines.push(format!("  Shunt {shunt} on 50 Ω side"));
-                    lines.push(format!("  Series {series}"));
+        if matching_network.shows_l() {
+            if let Some(solution) = l_match_solution(resistance, reactance) {
+                let series =
+                    component_for_series_reactance(solution.series_reactance_ohms, frequency_hz)
+                        .map(format_reactive_component)
+                        .unwrap_or_else(|| "no series element".to_owned());
+                let shunt = component_for_shunt_susceptance(
+                    solution.shunt_susceptance_siemens,
+                    frequency_hz,
+                )
+                .map(format_reactive_component)
+                .unwrap_or_else(|| "no shunt element".to_owned());
+                lines.push("50 Ω L-match (ideal):".to_owned());
+                match solution.topology {
+                    LMatchTopology::ShuntOnReferenceSide => {
+                        lines.push(format!("  Shunt {shunt} on 50 Ω side"));
+                        lines.push(format!("  Series {series}"));
+                    }
+                    LMatchTopology::ShuntOnLoadSide => {
+                        lines.push(format!("  Series {series}"));
+                        lines.push(format!("  Shunt {shunt} at antenna"));
+                    }
                 }
-                LMatchTopology::ShuntOnLoadSide => {
-                    lines.push(format!("  Series {series}"));
-                    lines.push(format!("  Shunt {shunt} at antenna"));
-                }
+            } else if resistance <= 0.0 {
+                lines.push("Passive L-match unavailable for this Z".to_owned());
             }
-        } else if resistance <= 0.0 {
-            lines.push("Passive L-match unavailable for this Z".to_owned());
+        }
+
+        if matching_network.shows_pi() {
+            if let Some(solution) = pi_match_solution(resistance, reactance, matching_q) {
+                let source_shunt = component_for_shunt_susceptance(
+                    solution.source_shunt_susceptance_siemens,
+                    frequency_hz,
+                )
+                .map(format_reactive_component)
+                .unwrap_or_else(|| "no source shunt element".to_owned());
+                let series =
+                    component_for_series_reactance(solution.series_reactance_ohms, frequency_hz)
+                        .map(format_reactive_component)
+                        .unwrap_or_else(|| "no series element".to_owned());
+                let load_shunt = component_for_shunt_susceptance(
+                    solution.load_shunt_susceptance_siemens,
+                    frequency_hz,
+                )
+                .map(format_reactive_component)
+                .unwrap_or_else(|| "no load shunt element".to_owned());
+                lines.push(format!(
+                    "50 Ω π-match (ideal, Q≈{}):",
+                    format_matching_q(matching_q)
+                ));
+                lines.push(format!("  Shunt {source_shunt} on 50 Ω side"));
+                lines.push(format!("  Series {series}"));
+                lines.push(format!("  Shunt {load_shunt} at antenna"));
+            }
+        }
+
+        if matching_network.shows_t() {
+            if let Some(solution) = t_match_solution(resistance, reactance, matching_q) {
+                let source_series = component_for_series_reactance(
+                    solution.source_series_reactance_ohms,
+                    frequency_hz,
+                )
+                .map(format_reactive_component)
+                .unwrap_or_else(|| "no source series element".to_owned());
+                let shunt = component_for_shunt_susceptance(
+                    solution.shunt_susceptance_siemens,
+                    frequency_hz,
+                )
+                .map(format_reactive_component)
+                .unwrap_or_else(|| "no shunt element".to_owned());
+                let load_series = component_for_series_reactance(
+                    solution.load_series_reactance_ohms,
+                    frequency_hz,
+                )
+                .map(format_reactive_component)
+                .unwrap_or_else(|| "no load series element".to_owned());
+                lines.push(format!(
+                    "50 Ω T-match (ideal, Q≈{}):",
+                    format_matching_q(matching_q)
+                ));
+                lines.push(format!("  Series {source_series} on 50 Ω side"));
+                lines.push(format!("  Shunt {shunt}"));
+                lines.push(format!("  Series {load_series} at antenna"));
+            }
         }
     }
     lines.join("\n")
 }
 
-fn point_label(point: VnaPoint) -> String {
+fn point_label(point: VnaPoint, matching_network: VnaMatchingNetwork, matching_q: f64) -> String {
     let magnitude = point.s11_magnitude();
     let return_loss = if magnitude > 0.0 {
         -20.0 * magnitude.log10()
@@ -1628,6 +1897,8 @@ fn point_label(point: VnaPoint) -> String {
             point.frequency_hz as f64,
             resistance,
             reactance,
+            matching_network,
+            matching_q,
         ));
     }
     label
@@ -1750,21 +2021,64 @@ mod tests {
     }
 
     #[test]
+    fn pi_and_t_match_solutions_transform_complex_loads_to_50_ohms() {
+        for load in [(35.0, -20.0), (100.0, 30.0), (12.0, 80.0)] {
+            let pi_input =
+                pi_match_input_impedance(load, pi_match_solution(load.0, load.1, 1.0).unwrap());
+            assert!((pi_input.0 - VNA_REFERENCE_IMPEDANCE_OHMS).abs() < 1.0e-8);
+            assert!(pi_input.1.abs() < 1.0e-8);
+
+            let t_input =
+                t_match_input_impedance(load, t_match_solution(load.0, load.1, 1.0).unwrap());
+            assert!((t_input.0 - VNA_REFERENCE_IMPEDANCE_OHMS).abs() < 1.0e-8);
+            assert!(t_input.1.abs() < 1.0e-8);
+        }
+    }
+
+    #[test]
     fn smith_point_label_includes_impedance_and_matching_components() {
         let gamma = impedance_to_gamma(0.7, -0.4);
-        let label = point_label(VnaPoint {
-            frequency_hz: 100_000_000,
-            s11_real: gamma.0,
-            s11_imaginary: gamma.1,
-            s21_real: 0.0,
-            s21_imaginary: 0.0,
-        });
+        let label = point_label(
+            VnaPoint {
+                frequency_hz: 100_000_000,
+                s11_real: gamma.0,
+                s11_imaginary: gamma.1,
+                s21_real: 0.0,
+                s21_imaginary: 0.0,
+            },
+            VnaMatchingNetwork::All,
+            2.0,
+        );
 
         assert!(label.contains("Z 35.00 − j20.00 Ω · capacitive"));
         assert!(label.contains("Series resonance: L 31.8 nH → 35.0 Ω"));
         assert!(label.contains("50 Ω L-match (ideal):"));
         assert!(label.contains("Shunt L"));
         assert!(label.contains("Series C"));
+        assert!(label.contains("50 Ω π-match (ideal, Q≈2):"));
+        assert!(label.contains("50 Ω T-match (ideal, Q≈2):"));
+    }
+
+    #[test]
+    fn matching_network_selection_and_q_control_the_point_hint() {
+        let gamma = impedance_to_gamma(0.7, -0.4);
+        let point = VnaPoint {
+            frequency_hz: 100_000_000,
+            s11_real: gamma.0,
+            s11_imaginary: gamma.1,
+            s21_real: 0.0,
+            s21_imaginary: 0.0,
+        };
+
+        let pi_only = point_label(point, VnaMatchingNetwork::Pi, 1.5);
+        assert!(pi_only.contains("50 Ω π-match (ideal, Q≈1.5):"));
+        assert!(!pi_only.contains("L-match"));
+        assert!(!pi_only.contains("T-match"));
+
+        let all = point_label(point, VnaMatchingNetwork::All, 1.0);
+        assert!(all.contains("50 Ω L-match (ideal):"));
+        assert!(all.contains("50 Ω π-match (ideal, Q≈1):"));
+        assert!(all.contains("50 Ω T-match (ideal, Q≈1):"));
     }
 
     #[test]
@@ -1834,6 +2148,40 @@ mod tests {
                 )
             }
         }
+    }
+
+    fn reciprocal(value: (f64, f64)) -> (f64, f64) {
+        let denominator = value.0.mul_add(value.0, value.1 * value.1);
+        (value.0 / denominator, -value.1 / denominator)
+    }
+
+    fn pi_match_input_impedance(load: (f64, f64), solution: PiMatchSolution) -> (f64, f64) {
+        let load_admittance = reciprocal(load);
+        let shunted_load = reciprocal((
+            load_admittance.0,
+            load_admittance.1 + solution.load_shunt_susceptance_siemens,
+        ));
+        let branch_admittance = reciprocal((
+            shunted_load.0,
+            shunted_load.1 + solution.series_reactance_ohms,
+        ));
+        reciprocal((
+            branch_admittance.0,
+            branch_admittance.1 + solution.source_shunt_susceptance_siemens,
+        ))
+    }
+
+    fn t_match_input_impedance(load: (f64, f64), solution: TMatchSolution) -> (f64, f64) {
+        let load_branch_admittance =
+            reciprocal((load.0, load.1 + solution.load_series_reactance_ohms));
+        let node_impedance = reciprocal((
+            load_branch_admittance.0,
+            load_branch_admittance.1 + solution.shunt_susceptance_siemens,
+        ));
+        (
+            node_impedance.0,
+            node_impedance.1 + solution.source_series_reactance_ohms,
+        )
     }
 
     #[test]
@@ -1995,6 +2343,13 @@ mod tests {
         });
         assert!(texts.iter().any(|(text, _)| text == "LiteVNA 64"));
         assert!(texts.iter().any(|(text, _)| text == "▶ Open"));
+        assert!(texts.iter().any(|(text, _)| text == "Sweep settings"));
+        assert!(texts.iter().any(|(text, _)| text == "Matching"));
+        assert!(texts
+            .iter()
+            .any(|(text, _)| text == "Network shown in hint"));
+        assert!(texts.iter().any(|(text, _)| text == "Design Q (π / T)"));
+        assert!(texts.iter().any(|(text, _)| text == "All (L / π / T)"));
         assert!(texts.iter().any(|(text, _)| text == "Start frequency"));
         assert_eq!(texts.iter().filter(|(text, _)| text == "MHz").count(), 2);
         assert!(texts.iter().any(|(text, _)| text == "Save to file"));
@@ -2018,6 +2373,10 @@ mod tests {
         assert!(!vna_frequency_inputs_are_valid(&app));
 
         app.vna_stop_frequency_input = "0.5".to_owned();
+        assert!(!vna_frequency_inputs_are_valid(&app));
+
+        app.vna_stop_frequency_input = "100".to_owned();
+        app.vna_settings.matching_q = 0.0;
         assert!(!vna_frequency_inputs_are_valid(&app));
     }
 }
