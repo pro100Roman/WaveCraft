@@ -131,14 +131,15 @@ impl WaveCraftApp {
         let mut open = self.vna_calibration_notice_open;
         let mut acknowledged = false;
         egui::Window::new("VNA calibration recommended")
-            .id(egui::Id::new("vna_calibration_notice"))
+            .id(egui::Id::new("vna_calibration_notice_compact"))
             .open(&mut open)
             .order(egui::Order::Foreground)
             .collapsible(false)
-            .resizable(false)
+            .auto_sized()
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .default_width(560.0)
             .show(context, |ui| {
+                ui.set_width(680.0);
+                ui.set_max_width(680.0);
                 ui.label(
                     RichText::new("Calibrate before precision measurements")
                         .strong()
@@ -197,10 +198,13 @@ impl WaveCraftApp {
                         );
                     }
                 }
-                ui.add_space(12.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
                     if ui
-                        .add(toolbar_action_button("Got it", ACCENT))
+                        .add_sized(
+                            [160.0, 30.0],
+                            toolbar_action_button("Got it", ORANGE),
+                        )
                         .clicked()
                     {
                         acknowledged = true;
@@ -307,10 +311,13 @@ impl WaveCraftApp {
                         ui.label(RichText::new("VNA SETUP").strong().color(TEXT_MUTED));
                         ui.add_space(10.0);
                         ui.label(RichText::new("Instrument").color(TEXT_MUTED));
-                        let selected_text = self
-                            .selected_vna()
-                            .map(|device| device.display_name.clone())
-                            .unwrap_or_else(|| "No LiteVNA detected".to_owned());
+                        let selected_text = if self.vna_discovery_error.is_some() {
+                            "LiteVNA discovery failed".to_owned()
+                        } else {
+                            self.selected_vna()
+                                .map(|device| device.display_name.clone())
+                                .unwrap_or_else(|| "No LiteVNA detected".to_owned())
+                        };
                         ui.add_enabled_ui(
                             self.vna_session.is_none() && self.vna_connection_pending.is_none(),
                             |ui| {
@@ -328,6 +335,7 @@ impl WaveCraftApp {
                                     });
                             },
                         );
+                        ui.add_space(6.0);
                         let connection_pending = self.vna_connection_pending.is_some();
                         let connection_open = self.vna_session.is_some();
                         let connection_label = if connection_pending {
@@ -356,25 +364,6 @@ impl WaveCraftApp {
                             .clicked()
                         {
                             actions.vna_connection_clicked = true;
-                        }
-                        if connection_open {
-                            ui.small(
-                                RichText::new("Port open · persistent USB session").color(ACCENT),
-                            );
-                        }
-                        if let Some(error) = &self.vna_discovery_error {
-                            ui.small(RichText::new(error).color(Color32::LIGHT_RED));
-                        } else if let Some(device) = self.selected_vna() {
-                            ui.small(
-                                RichText::new(device.port_name.clone())
-                                    .monospace()
-                                    .color(TEXT_MUTED),
-                            );
-                        } else {
-                            ui.small(
-                                RichText::new("Connect LiteVNA and press Refresh")
-                                    .color(TEXT_MUTED),
-                            );
                         }
 
                         ui.add_space(14.0);
@@ -1490,6 +1479,9 @@ mod tests {
         assert_eq!(texts.iter().filter(|(text, _)| text == "MHz").count(), 2);
         assert!(texts.iter().any(|(text, _)| text == "💾 Save VNA settings"));
         assert!(!texts.iter().any(|(text, _)| text == "▶ Single Sweep"));
+        assert!(!texts
+            .iter()
+            .any(|(text, _)| text == "Connect LiteVNA and press Refresh"));
     }
 
     #[test]
