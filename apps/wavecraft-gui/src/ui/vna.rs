@@ -4,7 +4,7 @@ use crate::{
     apply_setup_panel_typography, card_frame, egui, paint_capture_settings_save_button,
     toolbar_action_button, CalibrationStandard, Color32, FontId, FrameActions, PendingSnapshot,
     Pos2, Rect, RichText, SavedCaptureSettingsKind, Sense, Stroke, Vec2, VnaPoint, WaveCraftApp,
-    ACCENT, BACKGROUND, GRID, PANEL, SCOPE_COLORS, TEXT_MUTED,
+    ACCENT, BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
 };
 
 const VNA_PANEL_WIDTH: f32 = 300.0;
@@ -14,6 +14,49 @@ const SMITH_MIN_ZOOM: f32 = 0.5;
 const SMITH_MAX_ZOOM: f32 = 32.0;
 const POINT_COUNTS: [u16; 6] = [51, 101, 201, 401, 801, 1024];
 const AVERAGING_VALUES: [u8; 7] = [1, 2, 4, 8, 16, 32, 64];
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum VnaPlotTab {
+    #[default]
+    SmithChart,
+    LogMagnitudePhase,
+}
+
+impl VnaPlotTab {
+    const ALL: [Self; 2] = [Self::SmithChart, Self::LogMagnitudePhase];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SmithChart => "SMITH CHART",
+            Self::LogMagnitudePhase => "LOG MAG / PHASE",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum VnaChannel {
+    #[default]
+    S11,
+    S21,
+}
+
+impl VnaChannel {
+    const ALL: [Self; 2] = [Self::S11, Self::S21];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::S11 => "S11",
+            Self::S21 => "S21",
+        }
+    }
+
+    fn complex(self, point: VnaPoint) -> (f64, f64) {
+        match self {
+            Self::S11 => (point.s11_real, point.s11_imaginary),
+            Self::S21 => (point.s21_real, point.s21_imaginary),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SmithChartViewport {
@@ -356,15 +399,18 @@ impl WaveCraftApp {
                 card_frame(12.0).show(ui, |ui| {
                     ui.set_min_height(ui.available_height());
                     ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("SMITH CHART").strong().color(ACCENT));
-                            let subtitle = if self.vna_sweep_calibrated {
-                                "SOL-calibrated S11 · Z₀ = 50 Ω"
-                            } else {
-                                "Raw S11 reflection coefficient · Z₀ = 50 Ω"
-                            };
-                            ui.label(RichText::new(subtitle).color(TEXT_MUTED));
-                        });
+                        for tab in VnaPlotTab::ALL {
+                            let selected = self.vna_plot_tab == tab;
+                            ui.selectable_value(
+                                &mut self.vna_plot_tab,
+                                tab,
+                                RichText::new(tab.label()).strong().color(if selected {
+                                    ACCENT
+                                } else {
+                                    TEXT_MUTED
+                                }),
+                            );
+                        }
                         if let Some(sweep) = &self.vna_sweep {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -384,18 +430,64 @@ impl WaveCraftApp {
                             );
                         }
                     });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let subtitle = match self.vna_plot_tab {
+                            VnaPlotTab::SmithChart if self.vna_sweep_calibrated => {
+                                "SOL-calibrated S11 · Z₀ = 50 Ω"
+                            }
+                            VnaPlotTab::SmithChart => "Raw S11 reflection coefficient · Z₀ = 50 Ω",
+                            VnaPlotTab::LogMagnitudePhase => {
+                                "Log magnitude in dB and phase in degrees"
+                            }
+                        };
+                        ui.label(RichText::new(subtitle).color(TEXT_MUTED));
+                        if self.vna_plot_tab == VnaPlotTab::LogMagnitudePhase {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    egui::ComboBox::from_id_salt("vna_plot_channel")
+                                        .width(72.0)
+                                        .selected_text(self.vna_plot_channel.label())
+                                        .show_ui(ui, |ui| {
+                                            for channel in VnaChannel::ALL {
+                                                ui.selectable_value(
+                                                    &mut self.vna_plot_channel,
+                                                    channel,
+                                                    channel.label(),
+                                                );
+                                            }
+                                        });
+                                    ui.label(RichText::new("Source").color(TEXT_MUTED));
+                                },
+                            );
+                        }
+                    });
                     ui.add_space(12.0);
                     let available = ui.available_size();
                     let plot_size = Vec2::new(available.x.max(120.0), available.y.max(120.0));
                     let (rect, response) = ui.allocate_exact_size(plot_size, Sense::click());
                     plot_rect = Some(rect);
-                    paint_smith_chart(
-                        ui,
-                        rect,
-                        self.vna_sweep.as_ref(),
-                        &response,
-                        &mut self.vna_smith_viewport,
-                    );
+                    match self.vna_plot_tab {
+                        VnaPlotTab::SmithChart => paint_smith_chart(
+                            ui,
+                            rect,
+                            self.vna_sweep.as_ref(),
+                            &response,
+                            &mut self.vna_smith_viewport,
+                        ),
+                        VnaPlotTab::LogMagnitudePhase => paint_log_magnitude_phase_chart(
+                            ui,
+                            rect,
+                            self.vna_sweep.as_ref(),
+                            &response,
+                            self.vna_plot_channel,
+                            (
+                                self.vna_settings.start_mhz * 1_000_000.0,
+                                self.vna_settings.stop_mhz * 1_000_000.0,
+                            ),
+                        ),
+                    }
                 });
             });
         self.snapshot_plot_rect = plot_rect;
@@ -777,6 +869,350 @@ fn paint_smith_chart(
     }
 }
 
+const LOG_MAG_DB_FLOOR: f64 = -200.0;
+const LOG_MAG_COLOR: Color32 = SMITH_TRACE;
+const PHASE_COLOR: Color32 = ORANGE;
+const CARTESIAN_GRID_DIVISIONS_X: usize = 5;
+const CARTESIAN_GRID_DIVISIONS_Y: usize = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LogMagnitudePhasePoint {
+    frequency_hz: f64,
+    log_magnitude_db: f64,
+    phase_degrees: f64,
+}
+
+fn log_magnitude_phase_point(point: VnaPoint, channel: VnaChannel) -> LogMagnitudePhasePoint {
+    let (real, imaginary) = channel.complex(point);
+    let magnitude = real.hypot(imaginary);
+    let log_magnitude_db = if magnitude > 0.0 {
+        (20.0 * magnitude.log10()).max(LOG_MAG_DB_FLOOR)
+    } else {
+        LOG_MAG_DB_FLOOR
+    };
+    LogMagnitudePhasePoint {
+        frequency_hz: point.frequency_hz as f64,
+        log_magnitude_db,
+        phase_degrees: imaginary.atan2(real).to_degrees(),
+    }
+}
+
+fn paint_log_magnitude_phase_chart(
+    ui: &egui::Ui,
+    rect: Rect,
+    sweep: Option<&wavecraft_vna::VnaSweep>,
+    response: &egui::Response,
+    channel: VnaChannel,
+    frequency_hint_hz: (f64, f64),
+) {
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(
+        rect,
+        egui::Rounding::same(8.0),
+        Color32::from_rgb(14, 19, 25),
+    );
+    let plot = Rect::from_min_max(
+        rect.min + Vec2::new(70.0, 34.0),
+        rect.max - Vec2::new(62.0, 46.0),
+    );
+    if plot.width() < 40.0 || plot.height() < 40.0 {
+        return;
+    }
+
+    let points = sweep
+        .into_iter()
+        .flat_map(|sweep| sweep.points.iter().copied())
+        .map(|point| log_magnitude_phase_point(point, channel))
+        .filter(|point| {
+            point.frequency_hz.is_finite()
+                && point.log_magnitude_db.is_finite()
+                && point.phase_degrees.is_finite()
+        })
+        .collect::<Vec<_>>();
+    let (frequency_min, frequency_max) = if points.is_empty() {
+        frequency_hint_hz
+    } else {
+        (
+            points
+                .iter()
+                .map(|point| point.frequency_hz)
+                .fold(f64::INFINITY, f64::min),
+            points
+                .iter()
+                .map(|point| point.frequency_hz)
+                .fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+    let (frequency_min, frequency_max) = nonzero_axis_range(frequency_min, frequency_max, 1.0);
+    let (log_magnitude_min, log_magnitude_max) = if points.is_empty() {
+        (-120.0, 0.0)
+    } else {
+        log_magnitude_axis_range(&points)
+    };
+
+    paint_log_magnitude_phase_grid(
+        &painter,
+        plot,
+        frequency_min,
+        frequency_max,
+        log_magnitude_min,
+        log_magnitude_max,
+    );
+    paint_log_magnitude_phase_legend(&painter, plot, channel);
+    if points.is_empty() {
+        painter.text(
+            plot.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("Run a sweep to display {}", channel.label()),
+            FontId::proportional(15.0),
+            TEXT_MUTED,
+        );
+        return;
+    }
+
+    let magnitude_trace = points
+        .iter()
+        .map(|point| {
+            Pos2::new(
+                frequency_x(plot, point.frequency_hz, frequency_min, frequency_max),
+                magnitude_y(
+                    plot,
+                    point.log_magnitude_db,
+                    log_magnitude_min,
+                    log_magnitude_max,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let phase_trace = points
+        .iter()
+        .map(|point| {
+            Pos2::new(
+                frequency_x(plot, point.frequency_hz, frequency_min, frequency_max),
+                phase_y(plot, point.phase_degrees),
+            )
+        })
+        .collect::<Vec<_>>();
+    painter.add(egui::Shape::line(
+        magnitude_trace.clone(),
+        Stroke::new(2.0_f32, LOG_MAG_COLOR),
+    ));
+    painter.add(egui::Shape::line(
+        phase_trace.clone(),
+        Stroke::new(1.75_f32, PHASE_COLOR),
+    ));
+    paint_cartesian_trace_endpoints(&painter, &magnitude_trace, LOG_MAG_COLOR);
+    paint_cartesian_trace_endpoints(&painter, &phase_trace, PHASE_COLOR);
+
+    if let Some(pointer) = response
+        .hover_pos()
+        .filter(|pointer| plot.contains(*pointer))
+    {
+        if let Some((index, _)) = magnitude_trace
+            .iter()
+            .enumerate()
+            .map(|(index, position)| (index, (position.x - pointer.x).abs()))
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+        {
+            let magnitude_position = magnitude_trace[index];
+            let phase_position = phase_trace[index];
+            let point = points[index];
+            painter.line_segment(
+                [
+                    Pos2::new(magnitude_position.x, plot.top()),
+                    Pos2::new(magnitude_position.x, plot.bottom()),
+                ],
+                Stroke::new(1.0_f32, TEXT_MUTED.gamma_multiply(0.65)),
+            );
+            painter.circle_filled(magnitude_position, 4.0, LOG_MAG_COLOR);
+            painter.circle_filled(phase_position, 4.0, PHASE_COLOR);
+            let text = format!(
+                "{:.6} MHz\n{}  {:+.2} dB\nPhase  {:+.2}°",
+                point.frequency_hz / 1_000_000.0,
+                channel.label(),
+                point.log_magnitude_db,
+                point.phase_degrees,
+            );
+            let galley = painter.layout_no_wrap(text, FontId::monospace(11.0), Color32::WHITE);
+            let hint_rect = smith_hint_rect(rect, magnitude_position, galley.size());
+            painter.rect_filled(
+                hint_rect,
+                egui::Rounding::same(4.0),
+                Color32::from_rgba_unmultiplied(8, 12, 16, 238),
+            );
+            painter.rect_stroke(
+                hint_rect,
+                egui::Rounding::same(4.0),
+                Stroke::new(1.0_f32, SMITH_GRID),
+            );
+            painter.galley(
+                hint_rect.min + Vec2::splat(SMITH_HINT_PADDING),
+                galley,
+                Color32::WHITE,
+            );
+        }
+    }
+}
+
+fn paint_log_magnitude_phase_grid(
+    painter: &egui::Painter,
+    plot: Rect,
+    frequency_min: f64,
+    frequency_max: f64,
+    log_magnitude_min: f64,
+    log_magnitude_max: f64,
+) {
+    for index in 0..=CARTESIAN_GRID_DIVISIONS_Y {
+        let fraction = index as f64 / CARTESIAN_GRID_DIVISIONS_Y as f64;
+        let y = plot.bottom() - plot.height() * fraction as f32;
+        painter.line_segment(
+            [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+            Stroke::new(0.75_f32, SMITH_GRID),
+        );
+        let magnitude = log_magnitude_min + fraction * (log_magnitude_max - log_magnitude_min);
+        let phase = -180.0 + fraction * 360.0;
+        painter.text(
+            Pos2::new(plot.left() - 8.0, y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{magnitude:.0}"),
+            FontId::monospace(10.0),
+            LOG_MAG_COLOR,
+        );
+        painter.text(
+            Pos2::new(plot.right() + 8.0, y),
+            egui::Align2::LEFT_CENTER,
+            format!("{phase:.0}°"),
+            FontId::monospace(10.0),
+            PHASE_COLOR,
+        );
+    }
+    for index in 0..=CARTESIAN_GRID_DIVISIONS_X {
+        let fraction = index as f64 / CARTESIAN_GRID_DIVISIONS_X as f64;
+        let x = plot.left() + plot.width() * fraction as f32;
+        painter.line_segment(
+            [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+            Stroke::new(0.75_f32, SMITH_GRID),
+        );
+        let frequency_hz = frequency_min + fraction * (frequency_max - frequency_min);
+        painter.text(
+            Pos2::new(x, plot.bottom() + 8.0),
+            egui::Align2::CENTER_TOP,
+            format_frequency_mhz(frequency_hz),
+            FontId::monospace(10.0),
+            TEXT_MUTED,
+        );
+    }
+    painter.rect_stroke(plot, egui::Rounding::ZERO, Stroke::new(1.0_f32, GRID));
+    painter.text(
+        Pos2::new(plot.left(), plot.top() - 8.0),
+        egui::Align2::LEFT_BOTTOM,
+        "LOG MAG (dB)",
+        FontId::monospace(10.0),
+        LOG_MAG_COLOR,
+    );
+    painter.text(
+        Pos2::new(plot.right(), plot.top() - 8.0),
+        egui::Align2::RIGHT_BOTTOM,
+        "PHASE (°)",
+        FontId::monospace(10.0),
+        PHASE_COLOR,
+    );
+    painter.text(
+        Pos2::new(plot.center().x, plot.bottom() + 30.0),
+        egui::Align2::CENTER_CENTER,
+        "FREQUENCY (MHz)",
+        FontId::monospace(10.0),
+        TEXT_MUTED,
+    );
+}
+
+fn paint_log_magnitude_phase_legend(painter: &egui::Painter, plot: Rect, channel: VnaChannel) {
+    let y = plot.top() + 14.0;
+    let first_x = plot.left() + 14.0;
+    painter.line_segment(
+        [Pos2::new(first_x, y), Pos2::new(first_x + 24.0, y)],
+        Stroke::new(2.0_f32, LOG_MAG_COLOR),
+    );
+    painter.text(
+        Pos2::new(first_x + 30.0, y),
+        egui::Align2::LEFT_CENTER,
+        format!("{} LOG MAG", channel.label()),
+        FontId::monospace(10.0),
+        LOG_MAG_COLOR,
+    );
+    let second_x = first_x + 126.0;
+    painter.line_segment(
+        [Pos2::new(second_x, y), Pos2::new(second_x + 24.0, y)],
+        Stroke::new(1.75_f32, PHASE_COLOR),
+    );
+    painter.text(
+        Pos2::new(second_x + 30.0, y),
+        egui::Align2::LEFT_CENTER,
+        "PHASE",
+        FontId::monospace(10.0),
+        PHASE_COLOR,
+    );
+}
+
+fn paint_cartesian_trace_endpoints(painter: &egui::Painter, trace: &[Pos2], color: Color32) {
+    if let Some(first) = trace.first() {
+        painter.circle_filled(*first, 3.5, color);
+    }
+    if let Some(last) = trace.last() {
+        painter.circle_filled(*last, 3.5, color);
+    }
+}
+
+fn nonzero_axis_range(minimum: f64, maximum: f64, minimum_span: f64) -> (f64, f64) {
+    if maximum - minimum >= minimum_span {
+        (minimum, maximum)
+    } else {
+        let center = (minimum + maximum) * 0.5;
+        (center - minimum_span * 0.5, center + minimum_span * 0.5)
+    }
+}
+
+fn log_magnitude_axis_range(points: &[LogMagnitudePhasePoint]) -> (f64, f64) {
+    let minimum = points
+        .iter()
+        .map(|point| point.log_magnitude_db)
+        .fold(f64::INFINITY, f64::min);
+    let maximum = points
+        .iter()
+        .map(|point| point.log_magnitude_db)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let span = maximum - minimum;
+    let padding = (span * 0.08).max(2.0);
+    let required_lower = ((minimum - padding) / 10.0).floor() * 10.0;
+    let upper = ((maximum + padding) / 10.0).ceil() * 10.0;
+    let required_span = (upper - required_lower).max(60.0);
+    let axis_span = (required_span / 60.0).ceil() * 60.0;
+    (upper - axis_span, upper)
+}
+
+fn frequency_x(plot: Rect, frequency_hz: f64, minimum_hz: f64, maximum_hz: f64) -> f32 {
+    plot.left() + plot.width() * ((frequency_hz - minimum_hz) / (maximum_hz - minimum_hz)) as f32
+}
+
+fn magnitude_y(plot: Rect, value: f64, minimum: f64, maximum: f64) -> f32 {
+    plot.bottom() - plot.height() * ((value - minimum) / (maximum - minimum)) as f32
+}
+
+fn phase_y(plot: Rect, phase_degrees: f64) -> f32 {
+    plot.bottom() - plot.height() * ((phase_degrees + 180.0) / 360.0) as f32
+}
+
+fn format_frequency_mhz(frequency_hz: f64) -> String {
+    let frequency_mhz = frequency_hz / 1_000_000.0;
+    if frequency_mhz.abs() >= 1_000.0 {
+        format!("{frequency_mhz:.1}")
+    } else if frequency_mhz.abs() >= 10.0 {
+        format!("{frequency_mhz:.2}")
+    } else {
+        format!("{frequency_mhz:.3}")
+    }
+}
+
 const SMITH_HINT_PADDING: f32 = 6.0;
 const SMITH_HINT_GAP: f32 = 10.0;
 const SMITH_HINT_MARGIN: f32 = 6.0;
@@ -913,6 +1349,41 @@ mod tests {
     }
 
     #[test]
+    fn log_magnitude_and_phase_follow_the_selected_s_parameter() {
+        let point = VnaPoint {
+            frequency_hz: 10_000_000,
+            s11_real: 0.5,
+            s11_imaginary: 0.0,
+            s21_real: 0.0,
+            s21_imaginary: 1.0,
+        };
+
+        let s11 = log_magnitude_phase_point(point, VnaChannel::S11);
+        let s21 = log_magnitude_phase_point(point, VnaChannel::S21);
+
+        assert!((s11.log_magnitude_db + 6.020_599_913).abs() < 1.0e-6);
+        assert!(s11.phase_degrees.abs() < 1.0e-12);
+        assert!(s21.log_magnitude_db.abs() < 1.0e-12);
+        assert!((s21.phase_degrees - 90.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn zero_magnitude_uses_a_finite_decibel_floor() {
+        let point = VnaPoint {
+            frequency_hz: 10_000_000,
+            s11_real: 0.0,
+            s11_imaginary: 0.0,
+            s21_real: 0.0,
+            s21_imaginary: 0.0,
+        };
+
+        let plotted = log_magnitude_phase_point(point, VnaChannel::S21);
+
+        assert_eq!(plotted.log_magnitude_db, LOG_MAG_DB_FLOOR);
+        assert!(plotted.phase_degrees.is_finite());
+    }
+
+    #[test]
     fn smith_hint_switches_sides_and_stays_inside_the_plot() {
         let plot = Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(500.0, 320.0));
         let content = Vec2::new(170.0, 55.0);
@@ -982,6 +1453,28 @@ mod tests {
         assert!(!texts
             .iter()
             .any(|(text, _)| text == "LiteVNA ready" || text == "No LiteVNA"));
+    }
+
+    #[test]
+    fn vna_card_has_smith_and_log_magnitude_phase_tabs_with_a_channel_source() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let texts = painted_text(&context, |context| {
+            app.paint_vna_central_panel(context, false);
+        });
+        assert!(texts.iter().any(|(text, _)| text == "SMITH CHART"));
+        assert!(texts.iter().any(|(text, _)| text == "LOG MAG / PHASE"));
+
+        app.vna_plot_tab = VnaPlotTab::LogMagnitudePhase;
+        app.vna_plot_channel = VnaChannel::S21;
+        let texts = painted_text(&context, |context| {
+            app.paint_vna_central_panel(context, false);
+        });
+        assert!(texts.iter().any(|(text, _)| text == "Source"));
+        assert!(texts.iter().any(|(text, _)| text == "S21"));
+        assert!(texts
+            .iter()
+            .any(|(text, _)| text == "Run a sweep to display S21"));
     }
 
     #[test]

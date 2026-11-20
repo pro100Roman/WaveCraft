@@ -102,7 +102,7 @@ use ui::radio_settings::*;
 use ui::scope_settings::*;
 use ui::system_trace::*;
 use ui::view_tabs::*;
-use ui::vna::SmithChartViewport;
+use ui::vna::{SmithChartViewport, VnaChannel, VnaPlotTab};
 use vna::*;
 use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureEvent, CaptureFrame, CaptureSession, CaptureSource,
@@ -408,6 +408,8 @@ struct WaveCraftApp {
     vna_calibration: Option<OnePortCalibration>,
     vna_sweep_calibrated: bool,
     vna_calibration_notice_open: bool,
+    vna_plot_tab: VnaPlotTab,
+    vna_plot_channel: VnaChannel,
     vna_smith_viewport: SmithChartViewport,
     radio_settings: RadioSettings,
     radio_view: RefCell<RadioViewState>,
@@ -552,6 +554,8 @@ impl WaveCraftApp {
             vna_calibration: None,
             vna_sweep_calibrated: false,
             vna_calibration_notice_open: restored_workspace_view == Some(WorkspaceView::Vna),
+            vna_plot_tab: VnaPlotTab::default(),
+            vna_plot_channel: VnaChannel::default(),
             vna_smith_viewport: SmithChartViewport::default(),
             radio_settings: RadioSettings::default(),
             radio_view: RefCell::new(RadioViewState::default()),
