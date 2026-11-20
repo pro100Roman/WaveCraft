@@ -891,19 +891,78 @@ fn paint_smith_chart(
         let point = sweep.points[index];
         let position = trace[index];
         painter.circle_stroke(position, 5.5, Stroke::new(1.5_f32, Color32::WHITE));
-        let instruction = if *pinned_point == Some(index) {
-            "Pinned · select text and copy"
-        } else {
-            "Click trace to pin · select text to copy"
-        };
-        let text = format!("{}\n\n{instruction}", point_label(point));
-        let galley = painter.layout_no_wrap(text.clone(), FontId::monospace(11.0), Color32::WHITE);
+        let text = point_label(point);
+        let layout = smith_hint_layout(&text, vswr_color(point_vswr(point)));
+        let galley = painter.layout_job(layout.clone());
         let hint_rect = smith_hint_rect(rect, position, galley.size());
-        paint_selectable_smith_hint(ui.ctx(), hint_rect, text);
+        paint_selectable_smith_hint(ui.ctx(), hint_rect, layout);
     }
 }
 
-fn paint_selectable_smith_hint(context: &egui::Context, rect: Rect, text: String) {
+fn smith_hint_layout(text: &str, vswr_color: Color32) -> egui::text::LayoutJob {
+    let mut layout = egui::text::LayoutJob::default();
+    let append = |layout: &mut egui::text::LayoutJob, text: &str, color| {
+        layout.append(
+            text,
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::monospace(11.0),
+                color,
+                ..egui::TextFormat::default()
+            },
+        );
+    };
+    for line in text.split_inclusive('\n') {
+        let (content, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |content| (content, "\n"));
+        if let Some(vswr_start) = content.find("VSWR ") {
+            let prefix = &content[..vswr_start];
+            if content.starts_with("RL ") {
+                let separator_start = prefix.rfind(" · ").unwrap_or(prefix.len());
+                append(&mut layout, &prefix[..separator_start], vswr_color);
+                append(&mut layout, &prefix[separator_start..], Color32::WHITE);
+            } else {
+                append(&mut layout, prefix, Color32::WHITE);
+            }
+            append(&mut layout, &content[vswr_start..], vswr_color);
+            append(&mut layout, newline, Color32::WHITE);
+        } else {
+            append(&mut layout, content, smith_hint_line_color(content));
+            append(&mut layout, newline, Color32::WHITE);
+        }
+    }
+    layout
+}
+
+fn smith_hint_line_color(line: &str) -> Color32 {
+    const FREQUENCY: Color32 = Color32::from_rgb(178, 255, 102);
+    const S_PARAMETER: Color32 = Color32::from_rgb(190, 120, 255);
+    const IMPEDANCE: Color32 = Color32::from_rgb(99, 179, 255);
+    const MATCH_TITLE: Color32 = Color32::from_rgb(255, 204, 74);
+    const BAD_MATCH: Color32 = Color32::from_rgb(235, 72, 72);
+
+    let trimmed = line.trim_start();
+    if line.ends_with(" MHz") {
+        FREQUENCY
+    } else if line.starts_with("S11 ") {
+        S_PARAMETER
+    } else if line.starts_with("Z ") {
+        IMPEDANCE
+    } else if line.starts_with("50 Ω L-match") {
+        MATCH_TITLE
+    } else if trimmed.starts_with("Series ") {
+        ORANGE
+    } else if trimmed.starts_with("Shunt ") || line.starts_with("Already matched") {
+        ACCENT
+    } else if line.starts_with("Passive L-match") {
+        BAD_MATCH
+    } else {
+        Color32::WHITE
+    }
+}
+
+fn paint_selectable_smith_hint(context: &egui::Context, rect: Rect, layout: egui::text::LayoutJob) {
     egui::Area::new(egui::Id::new("vna_smith_selectable_hint"))
         .order(egui::Order::Tooltip)
         .fixed_pos(rect.min)
@@ -917,14 +976,8 @@ fn paint_selectable_smith_hint(context: &egui::Context, rect: Rect, text: String
                 .inner_margin(egui::Margin::same(SMITH_HINT_PADDING))
                 .show(ui, |ui| {
                     ui.style_mut().interaction.selectable_labels = true;
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(text)
-                                .font(FontId::monospace(11.0))
-                                .color(Color32::WHITE),
-                        )
-                        .selectable(true),
-                    );
+                    ui.set_min_width((rect.width() - 2.0 * SMITH_HINT_PADDING).max(0.0));
+                    ui.add(egui::Label::new(layout).selectable(true));
                 });
         });
 }
@@ -1263,11 +1316,16 @@ fn format_frequency_mhz(frequency_hz: f64) -> String {
 }
 
 const SMITH_HINT_PADDING: f32 = 6.0;
+const SMITH_HINT_EXTRA_WIDTH: f32 = 32.0;
 const SMITH_HINT_GAP: f32 = 10.0;
 const SMITH_HINT_MARGIN: f32 = 6.0;
 
 fn smith_hint_rect(plot: Rect, anchor: Pos2, content_size: Vec2) -> Rect {
-    let size = content_size + Vec2::splat(2.0 * SMITH_HINT_PADDING);
+    let size = content_size
+        + Vec2::new(
+            2.0 * SMITH_HINT_PADDING + SMITH_HINT_EXTRA_WIDTH,
+            2.0 * SMITH_HINT_PADDING,
+        );
     let inner = plot.shrink(SMITH_HINT_MARGIN);
     let preferred_x = if anchor.x + SMITH_HINT_GAP + size.x <= inner.right() {
         anchor.x + SMITH_HINT_GAP
@@ -1553,11 +1611,7 @@ fn point_label(point: VnaPoint) -> String {
     } else {
         f64::INFINITY
     };
-    let vswr = if magnitude < 1.0 {
-        (1.0 + magnitude) / (1.0 - magnitude)
-    } else {
-        f64::INFINITY
-    };
+    let vswr = point_vswr(point);
     let mut label = format!(
         "{:.6} MHz\nS11 {:+.4} {:+.4}j\nRL {:.2} dB · VSWR {:.2}",
         point.frequency_hz as f64 / 1_000_000.0,
@@ -1577,6 +1631,43 @@ fn point_label(point: VnaPoint) -> String {
         ));
     }
     label
+}
+
+fn point_vswr(point: VnaPoint) -> f64 {
+    let magnitude = point.s11_magnitude();
+    if magnitude < 1.0 {
+        (1.0 + magnitude) / (1.0 - magnitude)
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn vswr_color(vswr: f64) -> Color32 {
+    const GOOD: Color32 = ACCENT;
+    const WARNING: Color32 = Color32::from_rgb(255, 204, 74);
+    const BAD: Color32 = Color32::from_rgb(235, 72, 72);
+
+    let level = if vswr.is_finite() {
+        ((vswr - 1.0) / 2.0).clamp(0.0, 1.0) as f32
+    } else {
+        1.0
+    };
+    if level <= 0.5 {
+        mix_color(GOOD, WARNING, level * 2.0)
+    } else {
+        mix_color(WARNING, BAD, (level - 0.5) * 2.0)
+    }
+}
+
+fn mix_color(from: Color32, to: Color32, amount: f32) -> Color32 {
+    let channel = |from: u8, to: u8| {
+        (f32::from(from) + (f32::from(to) - f32::from(from)) * amount).round() as u8
+    };
+    Color32::from_rgb(
+        channel(from.r(), to.r()),
+        channel(from.g(), to.g()),
+        channel(from.b(), to.b()),
+    )
 }
 
 #[cfg(test)]
@@ -1676,6 +1767,46 @@ mod tests {
         assert!(label.contains("Series C"));
     }
 
+    #[test]
+    fn vswr_label_changes_from_green_through_yellow_to_red() {
+        let green = ACCENT;
+        let yellow = Color32::from_rgb(255, 204, 74);
+        let red = Color32::from_rgb(235, 72, 72);
+
+        assert_eq!(vswr_color(1.0), green);
+        assert_eq!(vswr_color(2.0), yellow);
+        assert_eq!(vswr_color(3.0), red);
+        assert_eq!(vswr_color(12.0), red);
+        assert_eq!(vswr_color(f64::INFINITY), red);
+
+        let layout = smith_hint_layout(
+            "100.000000 MHz\nS11 +0.1000 -0.2000j\nRL 9.54 dB · VSWR 2.00\nZ 50.00 + j0.00 Ω · resistive\nSeries resonance: C 10 pF\n50 Ω L-match (ideal):\n  Shunt L 12 nH\n  Series C 8 pF",
+            yellow,
+        );
+        let span_color = |prefix: &str| {
+            layout
+                .sections
+                .iter()
+                .find(|section| layout.text[section.byte_range.clone()].starts_with(prefix))
+                .map(|section| section.format.color)
+        };
+        assert_eq!(
+            span_color("100.000000 MHz"),
+            Some(Color32::from_rgb(178, 255, 102))
+        );
+        assert_eq!(span_color("S11 "), Some(Color32::from_rgb(190, 120, 255)));
+        assert_eq!(span_color("RL "), Some(yellow));
+        assert_eq!(span_color("VSWR "), Some(yellow));
+        assert_eq!(span_color("Z "), Some(Color32::from_rgb(99, 179, 255)));
+        assert_eq!(span_color("Series resonance"), Some(ORANGE));
+        assert_eq!(
+            span_color("50 Ω L-match"),
+            Some(Color32::from_rgb(255, 204, 74))
+        );
+        assert_eq!(span_color("  Shunt"), Some(ACCENT));
+        assert_eq!(span_color("  Series"), Some(ORANGE));
+    }
+
     fn l_match_input_impedance(load: (f64, f64), solution: LMatchSolution) -> (f64, f64) {
         match solution.topology {
             LMatchTopology::ShuntOnReferenceSide => {
@@ -1760,6 +1891,8 @@ mod tests {
         let right_hint = smith_hint_rect(plot, plot.right_center(), content);
         assert!(left_hint.left() > plot.left_center().x);
         assert!(right_hint.right() < plot.right_center().x);
+        assert_eq!(left_hint.width(), content.x + 44.0);
+        assert_eq!(left_hint.height(), content.y + 12.0);
     }
 
     #[test]
