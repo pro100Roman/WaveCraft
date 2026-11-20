@@ -125,6 +125,43 @@ pub(crate) enum VnaSweepPurpose {
     Calibration(CalibrationStandard),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VnaSweepProgress {
+    pub(crate) purpose: VnaSweepPurpose,
+    pub(crate) completed_points: usize,
+    pub(crate) total_points: usize,
+}
+
+impl VnaSweepProgress {
+    fn new(purpose: VnaSweepPurpose, total_points: usize) -> Self {
+        Self {
+            purpose,
+            completed_points: 0,
+            total_points,
+        }
+    }
+
+    pub(crate) fn fraction(self) -> f32 {
+        if self.total_points == 0 {
+            return 0.0;
+        }
+        (self.completed_points as f32 / self.total_points as f32).clamp(0.0, 1.0)
+    }
+
+    pub(crate) fn label(self) -> String {
+        let operation = match self.purpose {
+            VnaSweepPurpose::Measurement => "Sweep".to_owned(),
+            VnaSweepPurpose::Calibration(standard) => {
+                format!("{} calibration", standard.label())
+            }
+        };
+        format!(
+            "{operation} · {}/{} points",
+            self.completed_points, self.total_points
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VnaCalibrationCaptures {
     open: Option<VnaSweep>,
@@ -287,7 +324,11 @@ fn read_vna_calibration_file(path: &Path) -> Result<ActiveVnaCalibration, String
 }
 
 pub(crate) type VnaWorkerResult = Result<VnaSweep, String>;
-pub(crate) type VnaWorkerReceiver = Receiver<VnaWorkerResult>;
+pub(crate) enum VnaWorkerEvent {
+    PartialSweep(VnaSweep),
+    Finished(VnaWorkerResult),
+}
+pub(crate) type VnaWorkerReceiver = Receiver<VnaWorkerEvent>;
 pub(crate) type VnaSharedSession = Arc<Mutex<LiteVnaSession>>;
 pub(crate) type VnaConnectionResult = Result<Option<VnaSharedSession>, String>;
 pub(crate) type VnaConnectionReceiver = Receiver<VnaConnectionResult>;
@@ -435,6 +476,12 @@ impl WaveCraftApp {
         self.vna_run_stop_requested = false;
         self.vna_run_cancel = Some(cancel);
         self.vna_run_events = Some(receiver);
+        self.vna_sweep_progress = Some(VnaSweepProgress::new(
+            VnaSweepPurpose::Measurement,
+            usize::from(config.points),
+        ));
+        self.vna_sweep = None;
+        self.vna_sweep_calibrated = false;
         self.status = format!(
             "Running LiteVNA from {:.3} to {:.3} MHz…",
             self.vna_settings.start_mhz, self.vna_settings.stop_mhz
@@ -444,16 +491,21 @@ impl WaveCraftApp {
             let mut session = match session.lock() {
                 Ok(session) => session,
                 Err(_) => {
-                    let _ = sender.send(Err("LiteVNA session lock was poisoned".to_owned()));
+                    let _ = sender.send(VnaWorkerEvent::Finished(Err(
+                        "LiteVNA session lock was poisoned".to_owned(),
+                    )));
                     return;
                 }
             };
             while !worker_cancel.load(Ordering::Acquire) {
+                let partial_sender = sender.clone();
                 let result = session
-                    .acquire_sweep(config)
+                    .acquire_sweep_streaming(config, move |partial_sweep| {
+                        let _ = partial_sender.send(VnaWorkerEvent::PartialSweep(partial_sweep));
+                    })
                     .map_err(|error| error.to_string());
                 let failed = result.is_err();
-                if sender.send(result).is_err() || failed {
+                if sender.send(VnaWorkerEvent::Finished(result)).is_err() || failed {
                     break;
                 }
             }
@@ -491,6 +543,9 @@ impl WaveCraftApp {
         let (sender, receiver) = mpsc::channel();
         self.vna_pending = Some(receiver);
         self.vna_pending_purpose = Some(purpose);
+        self.vna_sweep_progress = Some(VnaSweepProgress::new(purpose, usize::from(config.points)));
+        self.vna_sweep = None;
+        self.vna_sweep_calibrated = false;
         self.status = match purpose {
             VnaSweepPurpose::Measurement => format!(
                 "Sweeping LiteVNA from {:.3} to {:.3} MHz…",
@@ -506,12 +561,18 @@ impl WaveCraftApp {
         self.last_error = None;
         thread::spawn(move || {
             let result = match session.lock() {
-                Ok(mut session) => session
-                    .acquire_sweep(config)
-                    .map_err(|error| error.to_string()),
+                Ok(mut session) => {
+                    let partial_sender = sender.clone();
+                    session
+                        .acquire_sweep_streaming(config, move |partial_sweep| {
+                            let _ =
+                                partial_sender.send(VnaWorkerEvent::PartialSweep(partial_sweep));
+                        })
+                        .map_err(|error| error.to_string())
+                }
                 Err(_) => Err("LiteVNA session lock was poisoned".to_owned()),
             };
-            let _ = sender.send(result);
+            let _ = sender.send(VnaWorkerEvent::Finished(result));
         });
     }
 
@@ -607,14 +668,29 @@ impl WaveCraftApp {
         let Some(receiver) = self.vna_pending.as_ref() else {
             return;
         };
-        let result = match receiver.try_recv() {
-            Ok(result) => result,
+        let event = match receiver.try_recv() {
+            Ok(event) => event,
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err("LiteVNA sweep worker ended unexpectedly".to_owned())
+                self.vna_pending = None;
+                self.vna_pending_purpose = None;
+                self.vna_sweep_progress = None;
+                self.set_error("LiteVNA sweep worker ended unexpectedly".to_owned());
+                return;
             }
         };
+        let result = match event {
+            VnaWorkerEvent::PartialSweep(sweep) => {
+                let purpose = self
+                    .vna_pending_purpose
+                    .unwrap_or(VnaSweepPurpose::Measurement);
+                self.display_vna_partial_sweep(purpose, sweep);
+                return;
+            }
+            VnaWorkerEvent::Finished(result) => result,
+        };
         self.vna_pending = None;
+        self.vna_sweep_progress = None;
         let purpose = self
             .vna_pending_purpose
             .take()
@@ -636,6 +712,7 @@ impl WaveCraftApp {
                 self.vna_run_events = None;
                 self.vna_run_cancel = None;
                 self.vna_run_active = false;
+                self.vna_sweep_progress = None;
                 let stopped = std::mem::take(&mut self.vna_run_stop_requested);
                 if stopped && self.last_error.is_none() {
                     self.status = "VNA run stopped; LiteVNA returned to local mode".to_owned();
@@ -646,23 +723,56 @@ impl WaveCraftApp {
             }
         };
         match event {
-            Some(Ok(sweep)) => {
-                self.finish_vna_sweep(VnaSweepPurpose::Measurement, sweep);
-                if self.last_error.is_some() {
-                    if let Some(cancel) = &self.vna_run_cancel {
-                        cancel.store(true, Ordering::Release);
+            Some(VnaWorkerEvent::PartialSweep(sweep)) => {
+                self.display_vna_partial_sweep(VnaSweepPurpose::Measurement, sweep);
+            }
+            Some(VnaWorkerEvent::Finished(result)) => match result {
+                Ok(sweep) => {
+                    let total_points = sweep.points.len();
+                    self.finish_vna_sweep(VnaSweepPurpose::Measurement, sweep);
+                    if self.last_error.is_some() {
+                        if let Some(cancel) = &self.vna_run_cancel {
+                            cancel.store(true, Ordering::Release);
+                        }
+                    } else {
+                        self.vna_sweep_progress = Some(VnaSweepProgress::new(
+                            VnaSweepPurpose::Measurement,
+                            total_points,
+                        ));
                     }
                 }
-            }
-            Some(Err(error)) => {
-                self.vna_run_events = None;
-                self.vna_run_cancel = None;
-                self.vna_run_active = false;
-                self.vna_run_stop_requested = false;
-                self.set_error(error);
-            }
+                Err(error) => {
+                    self.vna_run_events = None;
+                    self.vna_run_cancel = None;
+                    self.vna_run_active = false;
+                    self.vna_run_stop_requested = false;
+                    self.vna_sweep_progress = None;
+                    self.set_error(error);
+                }
+            },
             None => {}
         }
+    }
+
+    fn display_vna_partial_sweep(&mut self, purpose: VnaSweepPurpose, mut sweep: VnaSweep) {
+        let completed_points = sweep.points.len();
+        let total_points = usize::from(sweep.requested.points);
+        self.vna_sweep_progress = Some(VnaSweepProgress {
+            purpose,
+            completed_points,
+            total_points,
+        });
+        self.vna_sweep_calibrated = false;
+        if purpose == VnaSweepPurpose::Measurement {
+            if let Some(active) = &self.vna_calibration {
+                if active.calibration.matches_config(sweep.requested)
+                    && active.calibration.apply_prefix(&mut sweep).is_ok()
+                {
+                    self.vna_sweep_calibrated = true;
+                }
+            }
+        }
+        self.vna_sweep = Some(sweep);
     }
 
     fn finish_vna_sweep(&mut self, purpose: VnaSweepPurpose, mut sweep: VnaSweep) {
@@ -735,6 +845,7 @@ impl WaveCraftApp {
 mod tests {
     use super::*;
     use crate::app::test_support::app;
+    use wavecraft_vna::{LiteVnaIdentity, VnaPoint};
 
     fn test_active_calibration() -> ActiveVnaCalibration {
         let calibration = serde_json::from_str(
@@ -747,6 +858,32 @@ mod tests {
         )
         .unwrap();
         ActiveVnaCalibration::from_completed_sol(calibration, 8)
+    }
+
+    fn test_partial_sweep(s11_real: f64) -> VnaSweep {
+        VnaSweep {
+            identity: LiteVnaIdentity {
+                device_variant: 2,
+                protocol_version: 1,
+                hardware_revision: 2,
+                firmware_major: 2,
+                firmware_minor: 2,
+            },
+            requested: SweepConfig {
+                start_hz: 10_000_000,
+                stop_hz: 20_000_000,
+                points: 2,
+                averaging: 8,
+            },
+            actual_stop_hz: 20_000_000,
+            points: vec![VnaPoint {
+                frequency_hz: 10_000_000,
+                s11_real,
+                s11_imaginary: 0.0,
+                s21_real: 0.5,
+                s21_imaginary: 0.0,
+            }],
+        }
     }
 
     #[test]
@@ -763,6 +900,50 @@ mod tests {
         assert_eq!(config.stop_hz, 20_750_000);
         assert_eq!(config.points, 101);
         assert_eq!(config.averaging, 4);
+    }
+
+    #[test]
+    fn sweep_progress_reports_measurement_and_calibration_points() {
+        let measurement = VnaSweepProgress {
+            purpose: VnaSweepPurpose::Measurement,
+            completed_points: 512,
+            total_points: 1024,
+        };
+        let calibration = VnaSweepProgress {
+            purpose: VnaSweepPurpose::Calibration(CalibrationStandard::Open),
+            completed_points: 64,
+            total_points: 1024,
+        };
+
+        assert_eq!(measurement.fraction(), 0.5);
+        assert_eq!(measurement.label(), "Sweep · 512/1024 points");
+        assert_eq!(calibration.fraction(), 0.0625);
+        assert_eq!(calibration.label(), "OPEN calibration · 64/1024 points");
+    }
+
+    #[test]
+    fn partial_measurements_and_calibration_standards_are_displayed_while_arriving() {
+        let mut app = app();
+        app.vna_calibration = Some(test_active_calibration());
+
+        app.display_vna_partial_sweep(VnaSweepPurpose::Measurement, test_partial_sweep(0.25));
+
+        assert!(app.vna_sweep_calibrated);
+        assert_eq!(app.vna_sweep.as_ref().unwrap().points.len(), 1);
+        assert_eq!(app.vna_sweep_progress.unwrap().completed_points, 1);
+        assert_eq!(app.vna_sweep_progress.unwrap().total_points, 2);
+
+        app.display_vna_partial_sweep(
+            VnaSweepPurpose::Calibration(CalibrationStandard::Open),
+            test_partial_sweep(0.75),
+        );
+
+        assert!(!app.vna_sweep_calibrated);
+        assert_eq!(app.vna_sweep.as_ref().unwrap().points[0].s11_real, 0.75);
+        assert_eq!(
+            app.vna_sweep_progress.unwrap().purpose,
+            VnaSweepPurpose::Calibration(CalibrationStandard::Open)
+        );
     }
 
     #[test]

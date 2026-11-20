@@ -14,6 +14,7 @@ const SERIAL_BAUD_RATE: u32 = 115_200;
 const SERIAL_TIMEOUT: Duration = Duration::from_secs(12);
 const RECORD_BYTES: usize = 32;
 const MAX_FIFO_READ: usize = u8::MAX as usize;
+const PROGRESS_FIFO_READ: usize = 64;
 
 const COMMAND_INDICATE: u8 = 0x0d;
 const COMMAND_READ: u8 = 0x10;
@@ -279,6 +280,15 @@ impl OnePortCalibration {
                 .all(|(frequency, point)| *frequency == point.frequency_hz)
     }
 
+    pub fn matches_sweep_prefix(&self, sweep: &VnaSweep) -> bool {
+        sweep.points.len() <= self.frequencies_hz.len()
+            && self
+                .frequencies_hz
+                .iter()
+                .zip(&sweep.points)
+                .all(|(frequency, point)| *frequency == point.frequency_hz)
+    }
+
     pub fn matches_config(&self, config: SweepConfig) -> bool {
         let Ok(step_hz) = config.step_hz() else {
             return false;
@@ -299,7 +309,23 @@ impl OnePortCalibration {
                 "sweep frequency grid does not match the saved calibration".to_owned(),
             ));
         }
-        for (index, point) in sweep.points.iter_mut().enumerate() {
+        self.apply_points(&mut sweep.points)
+    }
+
+    /// Applies calibration to a cumulative prefix of the calibrated frequency
+    /// grid, allowing a sweep to be drawn while it is still arriving.
+    pub fn apply_prefix(&self, sweep: &mut VnaSweep) -> Result<(), LiteVnaError> {
+        self.validate()?;
+        if !self.matches_sweep_prefix(sweep) {
+            return Err(LiteVnaError::Calibration(
+                "partial sweep frequency grid does not match the saved calibration".to_owned(),
+            ));
+        }
+        self.apply_points(&mut sweep.points)
+    }
+
+    fn apply_points(&self, points: &mut [VnaPoint]) -> Result<(), LiteVnaError> {
+        for (index, point) in points.iter_mut().enumerate() {
             let measured = s11(*point);
             let offset = measured.subtract(self.directivity[index]);
             let denominator =
@@ -527,7 +553,44 @@ impl LiteVnaSession {
 
     pub fn acquire_sweep(&mut self, config: SweepConfig) -> Result<VnaSweep, LiteVnaError> {
         config.validate()?;
-        acquire_sweep_from_port(self.port.as_mut(), self.identity, config)
+        let mut ignore_partial_sweep = |_: VnaSweep| {};
+        acquire_sweep_from_port(
+            self.port.as_mut(),
+            self.identity,
+            config,
+            MAX_FIFO_READ,
+            &mut ignore_partial_sweep,
+        )
+    }
+
+    /// Acquires a sweep and reports the number of fully received frequency
+    /// points after every FIFO block.
+    pub fn acquire_sweep_with_progress(
+        &mut self,
+        config: SweepConfig,
+        mut progress: impl FnMut(usize, usize),
+    ) -> Result<VnaSweep, LiteVnaError> {
+        self.acquire_sweep_streaming(config, |partial_sweep| {
+            progress(partial_sweep.points.len(), usize::from(config.points));
+        })
+    }
+
+    /// Acquires a sweep and publishes the cumulative, fully parsed points
+    /// after every FIFO block. Each partial sweep starts at the configured
+    /// start frequency and can be rendered immediately.
+    pub fn acquire_sweep_streaming(
+        &mut self,
+        config: SweepConfig,
+        mut partial_sweep: impl FnMut(VnaSweep),
+    ) -> Result<VnaSweep, LiteVnaError> {
+        config.validate()?;
+        acquire_sweep_from_port(
+            self.port.as_mut(),
+            self.identity,
+            config,
+            PROGRESS_FIFO_READ,
+            &mut partial_sweep,
+        )
     }
 }
 
@@ -550,30 +613,39 @@ fn acquire_sweep_from_port(
     port: &mut dyn SerialPort,
     identity: LiteVnaIdentity,
     config: SweepConfig,
+    maximum_fifo_read: usize,
+    partial_sweep: &mut dyn FnMut(VnaSweep),
 ) -> Result<VnaSweep, LiteVnaError> {
     configure_sweep_on_port(port, config)?;
     let step_hz = config.step_hz()?;
 
-    let mut raw = Vec::with_capacity(usize::from(config.points) * RECORD_BYTES);
-    let mut remaining = usize::from(config.points);
+    let total = usize::from(config.points);
+    let actual_stop_hz = config
+        .start_hz
+        .saturating_add(step_hz.saturating_mul(u64::from(config.points - 1)));
+    let mut points = Vec::with_capacity(total);
+    let mut remaining = total;
     while remaining > 0 {
-        let requested = remaining.min(MAX_FIFO_READ);
+        let requested = remaining.min(maximum_fifo_read);
         let requested_u8 = u8::try_from(requested).map_err(|_| {
             LiteVnaError::Communication("FIFO request length overflowed".to_owned())
         })?;
         port.write_all(&[COMMAND_READ_FIFO, REGISTER_VALUES_FIFO, requested_u8])
             .map_err(|error| communication("request sweep FIFO", error))?;
-        let previous_len = raw.len();
-        raw.resize(previous_len + requested * RECORD_BYTES, 0);
-        port.read_exact(&mut raw[previous_len..])
+        let mut raw = vec![0; requested * RECORD_BYTES];
+        port.read_exact(&mut raw)
             .map_err(|error| communication("read sweep FIFO", error))?;
+        let block = parse_points_at(&raw, points.len(), config.start_hz, step_hz)?;
+        points.extend(block);
         remaining -= requested;
+        partial_sweep(VnaSweep {
+            identity,
+            requested: config,
+            actual_stop_hz,
+            points: points.clone(),
+        });
     }
 
-    let points = parse_points(&raw, config.start_hz, step_hz)?;
-    let actual_stop_hz = config
-        .start_hz
-        .saturating_add(step_hz.saturating_mul(u64::from(config.points - 1)));
     Ok(VnaSweep {
         identity,
         requested: config,
@@ -652,7 +724,12 @@ fn communication(context: &str, error: impl Display) -> LiteVnaError {
     LiteVnaError::Communication(format!("{context}: {error}"))
 }
 
-fn parse_points(raw: &[u8], start_hz: u64, step_hz: u64) -> Result<Vec<VnaPoint>, LiteVnaError> {
+fn parse_points_at(
+    raw: &[u8],
+    start_position: usize,
+    start_hz: u64,
+    step_hz: u64,
+) -> Result<Vec<VnaPoint>, LiteVnaError> {
     if raw.len() % RECORD_BYTES != 0 {
         return Err(LiteVnaError::UnexpectedResponse(format!(
             "FIFO returned {} bytes, not a multiple of {RECORD_BYTES}",
@@ -661,7 +738,7 @@ fn parse_points(raw: &[u8], start_hz: u64, step_hz: u64) -> Result<Vec<VnaPoint>
     }
     raw.chunks_exact(RECORD_BYTES)
         .enumerate()
-        .map(|(position, record)| parse_point(record, position, start_hz, step_hz))
+        .map(|(position, record)| parse_point(record, start_position + position, start_hz, step_hz))
         .collect()
 }
 
@@ -748,7 +825,7 @@ mod tests {
             .into_iter()
             .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>();
-        let points = parse_points(&raw, 1_000_000, 25_000).unwrap();
+        let points = parse_points_at(&raw, 0, 1_000_000, 25_000).unwrap();
         assert_eq!(points.len(), 1);
         assert!((points[0].s11_real - 0.5).abs() < 1.0e-12);
         assert!(points[0].s11_imaginary.abs() < 1.0e-12);
@@ -858,6 +935,12 @@ mod tests {
         let calibration = OnePortCalibration::from_sweeps(&open, &short, &load).unwrap();
 
         let actual = ComplexValue::new(0.3, -0.2);
+        let mut partial = test_sweep(&standards(actual));
+        partial.points.truncate(1);
+        calibration.apply_prefix(&mut partial).unwrap();
+        assert!((partial.points[0].s11_real - actual.real).abs() < 1.0e-12);
+        assert!((partial.points[0].s11_imaginary - actual.imaginary).abs() < 1.0e-12);
+
         let mut measured = test_sweep(&standards(actual));
         calibration.apply(&mut measured).unwrap();
 

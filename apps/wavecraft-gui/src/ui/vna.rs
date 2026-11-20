@@ -431,23 +431,35 @@ impl WaveCraftApp {
                             }
                         };
                         ui.label(RichText::new(subtitle).color(TEXT_MUTED));
-                        if self.vna_plot_tab == VnaPlotTab::LogMagnitudePhase {
+                        if self.vna_plot_tab == VnaPlotTab::LogMagnitudePhase
+                            || self.vna_sweep_progress.is_some()
+                        {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    egui::ComboBox::from_id_salt("vna_plot_channel")
-                                        .width(72.0)
-                                        .selected_text(self.vna_plot_channel.label())
-                                        .show_ui(ui, |ui| {
-                                            for channel in VnaChannel::ALL {
-                                                ui.selectable_value(
-                                                    &mut self.vna_plot_channel,
-                                                    channel,
-                                                    channel.label(),
-                                                );
-                                            }
-                                        });
-                                    ui.label(RichText::new("Source").color(TEXT_MUTED));
+                                    if let Some(progress) = self.vna_sweep_progress {
+                                        ui.add(
+                                            egui::ProgressBar::new(progress.fraction())
+                                                .desired_width(260.0)
+                                                .text(progress.label())
+                                                .animate(true),
+                                        );
+                                    }
+                                    if self.vna_plot_tab == VnaPlotTab::LogMagnitudePhase {
+                                        egui::ComboBox::from_id_salt("vna_plot_channel")
+                                            .width(72.0)
+                                            .selected_text(self.vna_plot_channel.label())
+                                            .show_ui(ui, |ui| {
+                                                for channel in VnaChannel::ALL {
+                                                    ui.selectable_value(
+                                                        &mut self.vna_plot_channel,
+                                                        channel,
+                                                        channel.label(),
+                                                    );
+                                                }
+                                            });
+                                        ui.label(RichText::new("Source").color(TEXT_MUTED));
+                                    }
                                 },
                             );
                         }
@@ -967,6 +979,9 @@ fn paint_log_magnitude_phase_chart(
         return;
     }
 
+    let (frequency_min, frequency_max) = sweep.map_or(frequency_hint_hz, |sweep| {
+        (sweep.requested.start_hz as f64, sweep.actual_stop_hz as f64)
+    });
     let points = sweep
         .into_iter()
         .flat_map(|sweep| sweep.points.iter().copied())
@@ -977,20 +992,6 @@ fn paint_log_magnitude_phase_chart(
                 && point.phase_degrees.is_finite()
         })
         .collect::<Vec<_>>();
-    let (frequency_min, frequency_max) = if points.is_empty() {
-        frequency_hint_hz
-    } else {
-        (
-            points
-                .iter()
-                .map(|point| point.frequency_hz)
-                .fold(f64::INFINITY, f64::min),
-            points
-                .iter()
-                .map(|point| point.frequency_hz)
-                .fold(f64::NEG_INFINITY, f64::max),
-        )
-    };
     let (frequency_min, frequency_max) = nonzero_axis_range(frequency_min, frequency_max, 1.0);
     let (log_magnitude_min, log_magnitude_max) = if points.is_empty() {
         (-120.0, 0.0)
@@ -1831,6 +1832,25 @@ mod tests {
         assert!(texts
             .iter()
             .any(|(text, _)| text == "Run a sweep to display S21"));
+    }
+
+    #[test]
+    fn vna_card_shows_sweep_progress_below_the_device_version_area() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.vna_sweep_progress = Some(crate::VnaSweepProgress {
+            purpose: crate::VnaSweepPurpose::Calibration(CalibrationStandard::Open),
+            completed_points: 64,
+            total_points: 1024,
+        });
+
+        let texts = painted_text(&context, |context| {
+            app.paint_vna_central_panel(context, false);
+        });
+
+        assert!(texts
+            .iter()
+            .any(|(text, _)| text == "OPEN calibration · 64/1024 points"));
     }
 
     #[test]
