@@ -32,6 +32,8 @@ pub(crate) struct FrameActions {
     pub(crate) vna_run_stop_clicked: bool,
     pub(crate) vna_calibration_standard: Option<CalibrationStandard>,
     pub(crate) vna_clear_calibration: bool,
+    pub(crate) vna_save_calibration: bool,
+    pub(crate) vna_load_calibration: bool,
 }
 
 impl WaveCraftApp {

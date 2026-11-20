@@ -113,10 +113,10 @@ impl WaveCraftApp {
         if !self.vna_calibration_notice_open {
             return;
         }
-        let calibration_state = self.vna_calibration.as_ref().map(|calibration| {
+        let calibration_state = self.vna_calibration.as_ref().map(|active| {
             self.vna_settings
                 .sweep_config()
-                .is_ok_and(|config| calibration.matches_config(config))
+                .is_ok_and(|config| active.calibration.matches_config(config))
         });
         let sweep_grid_description = self.vna_settings.sweep_config().ok().and_then(|config| {
             let step_hz = config.step_hz().ok()?;
@@ -661,7 +661,8 @@ fn paint_calibration_controls(ui: &mut egui::Ui, app: &WaveCraftApp, actions: &m
         }
     }
     ui.add_space(6.0);
-    if let Some(calibration) = &app.vna_calibration {
+    if let Some(active) = &app.vna_calibration {
+        let calibration = &active.calibration;
         let matches = app
             .vna_settings
             .sweep_config()
@@ -673,32 +674,61 @@ fn paint_calibration_controls(ui: &mut egui::Ui, app: &WaveCraftApp, actions: &m
             calibration.point_count()
         );
         let state = if matches {
-            "Active"
+            "Matches current sweep"
         } else {
-            "Saved; sweep differs"
+            "Current sweep differs"
         };
+        ui.small(RichText::new(format!("Active: {}", active.name)).color(ACCENT));
         ui.small(
-            RichText::new(format!("{state} · {range}")).color(if matches {
-                ACCENT
-            } else {
-                TEXT_MUTED
-            }),
+            RichText::new(format!(
+                "{state} · {range} · averaging {}×",
+                active.averaging
+            ))
+            .color(if matches { ACCENT } else { TEXT_MUTED }),
         );
+    } else {
+        ui.small(RichText::new("No active calibration").color(TEXT_MUTED));
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let button_width = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
         if ui
             .add_enabled(
-                !app.is_busy(),
-                toolbar_action_button("Clear calibration", Color32::LIGHT_RED)
-                    .min_size(Vec2::new(ui.available_width(), 28.0)),
+                app.vna_calibration.is_some() && !app.is_busy(),
+                toolbar_action_button("Save to file", ACCENT)
+                    .min_size(Vec2::new(button_width, 28.0)),
             )
             .clicked()
         {
-            actions.vna_clear_calibration = true;
+            actions.vna_save_calibration = true;
         }
-    } else {
-        ui.small(RichText::new("No saved calibration").color(TEXT_MUTED));
+        if ui
+            .add_enabled(
+                !app.is_busy(),
+                toolbar_action_button("Load from file", ORANGE)
+                    .min_size(Vec2::new(button_width, 28.0)),
+            )
+            .clicked()
+        {
+            actions.vna_load_calibration = true;
+        }
+    });
+    if app.vna_calibration.is_some()
+        && ui
+            .add_enabled(
+                !app.is_busy(),
+                toolbar_action_button("Clear active calibration", Color32::LIGHT_RED)
+                    .min_size(Vec2::new(ui.available_width(), 28.0)),
+            )
+            .clicked()
+    {
+        actions.vna_clear_calibration = true;
     }
     ui.small(
-        RichText::new("Coefficients are stored in WaveCraft, not in LiteVNA.").color(TEXT_MUTED),
+        RichText::new(
+            "The active calibration survives app restarts. Clear does not modify calibration files.",
+        )
+        .color(TEXT_MUTED),
     );
 }
 
@@ -1814,6 +1844,11 @@ mod tests {
         assert!(texts.iter().any(|(text, _)| text == "▶ Open"));
         assert!(texts.iter().any(|(text, _)| text == "Start frequency"));
         assert_eq!(texts.iter().filter(|(text, _)| text == "MHz").count(), 2);
+        assert!(texts.iter().any(|(text, _)| text == "Save to file"));
+        assert!(texts.iter().any(|(text, _)| text == "Load from file"));
+        assert!(texts
+            .iter()
+            .any(|(text, _)| text == "No active calibration"));
         assert!(texts.iter().any(|(text, _)| text == "💾 Save VNA settings"));
         assert!(!texts.iter().any(|(text, _)| text == "▶ Single Sweep"));
         assert!(!texts

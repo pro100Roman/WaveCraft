@@ -1,12 +1,64 @@
 //! GUI-side LiteVNA state and asynchronous sweep orchestration.
 
 use crate::{
-    mpsc, thread, LiteVnaDevice, OnePortCalibration, Receiver, SavedCaptureSettingsKind, VnaSweep,
-    WaveCraftApp,
+    mpsc, thread, LiteVnaDevice, Receiver, SavedCaptureSettingsKind, VnaSweep, WaveCraftApp,
 };
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use wavecraft_vna::{LiteVnaSession, SweepConfig};
+use wavecraft_vna::{LiteVnaSession, OnePortCalibration, SweepConfig};
+
+const VNA_CALIBRATION_FILE_FORMAT: &str = "wavecraft-vna-calibration";
+const VNA_CALIBRATION_FILE_VERSION: u32 = 1;
+const VNA_CALIBRATION_FILE_EXTENSION: &str = "wcvnacal";
+
+#[derive(Clone, Debug)]
+pub(crate) struct ActiveVnaCalibration {
+    pub(crate) name: String,
+    pub(crate) averaging: u8,
+    pub(crate) calibration: OnePortCalibration,
+}
+
+impl ActiveVnaCalibration {
+    pub(crate) fn from_completed_sol(calibration: OnePortCalibration, averaging: u8) -> Self {
+        Self {
+            name: default_vna_calibration_name(&calibration),
+            averaging,
+            calibration,
+        }
+    }
+
+    pub(crate) fn default_file_name(&self) -> String {
+        let base_name = sanitize_file_name(&self.name);
+        format!(
+            "{base_name} - averaging {}x.{VNA_CALIBRATION_FILE_EXTENSION}",
+            self.averaging
+        )
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VnaCalibrationFile {
+    format: String,
+    version: u32,
+    name: String,
+    averaging: u8,
+    calibration: OnePortCalibration,
+}
+
+impl From<&ActiveVnaCalibration> for VnaCalibrationFile {
+    fn from(active: &ActiveVnaCalibration) -> Self {
+        Self {
+            format: VNA_CALIBRATION_FILE_FORMAT.to_owned(),
+            version: VNA_CALIBRATION_FILE_VERSION,
+            name: active.name.clone(),
+            averaging: active.averaging,
+            calibration: active.calibration.clone(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct VnaSettings {
@@ -128,6 +180,110 @@ fn same_frequency_grid(left: &VnaSweep, right: &VnaSweep) -> bool {
             .iter()
             .zip(&right.points)
             .all(|(left, right)| left.frequency_hz == right.frequency_hz)
+}
+
+fn default_vna_calibration_name(calibration: &OnePortCalibration) -> String {
+    let start = format_calibration_frequency(calibration.start_hz().unwrap_or_default());
+    let stop = format_calibration_frequency(calibration.stop_hz().unwrap_or_default());
+    format!(
+        "SOL {start}-{stop} MHz {} points",
+        calibration.point_count()
+    )
+}
+
+fn format_calibration_frequency(frequency_hz: u64) -> String {
+    let frequency_mhz = frequency_hz as f64 / 1_000_000.0;
+    if frequency_hz % 1_000_000 == 0 {
+        format!("{frequency_mhz:.0}")
+    } else {
+        format!("{frequency_mhz:.6}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    }
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    let sanitized = name
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_end_matches([' ', '.']);
+    if sanitized.is_empty() {
+        "VNA calibration".to_owned()
+    } else {
+        sanitized.to_owned()
+    }
+}
+
+fn normalize_vna_calibration_path(mut path: PathBuf) -> PathBuf {
+    let has_expected_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(VNA_CALIBRATION_FILE_EXTENSION));
+    if !has_expected_extension {
+        path.set_extension(VNA_CALIBRATION_FILE_EXTENSION);
+    }
+    path
+}
+
+fn write_vna_calibration_file(path: &Path, active: &ActiveVnaCalibration) -> Result<(), String> {
+    let document = VnaCalibrationFile::from(active);
+    let encoded = serde_json::to_vec_pretty(&document)
+        .map_err(|error| format!("failed to encode VNA calibration: {error}"))?;
+    fs::write(path, encoded).map_err(|error| {
+        format!(
+            "failed to save VNA calibration to {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn read_vna_calibration_file(path: &Path) -> Result<ActiveVnaCalibration, String> {
+    let encoded = fs::read(path).map_err(|error| {
+        format!(
+            "failed to read VNA calibration from {}: {error}",
+            path.display()
+        )
+    })?;
+    let document: VnaCalibrationFile = serde_json::from_slice(&encoded)
+        .map_err(|error| format!("failed to parse VNA calibration file: {error}"))?;
+    if document.format != VNA_CALIBRATION_FILE_FORMAT {
+        return Err("the selected file is not a WaveCraft VNA calibration".to_owned());
+    }
+    if document.version != VNA_CALIBRATION_FILE_VERSION {
+        return Err(format!(
+            "unsupported VNA calibration file version {}; expected {}",
+            document.version, VNA_CALIBRATION_FILE_VERSION
+        ));
+    }
+    if document.name.trim().is_empty() {
+        return Err("VNA calibration name cannot be empty".to_owned());
+    }
+    if document.averaging == 0 {
+        return Err("VNA calibration averaging must be at least 1x".to_owned());
+    }
+    document
+        .calibration
+        .validate()
+        .map_err(|error| format!("invalid VNA calibration coefficients: {error}"))?;
+    Ok(ActiveVnaCalibration {
+        name: document.name.trim().to_owned(),
+        averaging: document.averaging,
+        calibration: document.calibration,
+    })
 }
 
 pub(crate) type VnaWorkerResult = Result<VnaSweep, String>;
@@ -390,6 +546,62 @@ impl WaveCraftApp {
         }
     }
 
+    pub(crate) fn save_vna_calibration_to_file(&mut self) {
+        let Some(active) = self.vna_calibration.clone() else {
+            self.set_error(
+                "Complete OPEN, SHORT, and LOAD calibration before saving a calibration file"
+                    .to_owned(),
+            );
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save VNA calibration")
+            .add_filter(
+                "WaveCraft VNA calibration",
+                &[VNA_CALIBRATION_FILE_EXTENSION],
+            )
+            .set_file_name(active.default_file_name())
+            .save_file()
+            .map(normalize_vna_calibration_path)
+        else {
+            return;
+        };
+        match write_vna_calibration_file(&path, &active) {
+            Ok(()) => {
+                self.status = format!("VNA calibration saved to {}", path.display());
+                self.last_error = None;
+            }
+            Err(error) => self.set_error(error),
+        }
+    }
+
+    pub(crate) fn load_vna_calibration_from_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Load VNA calibration")
+            .add_filter(
+                "WaveCraft VNA calibration",
+                &[VNA_CALIBRATION_FILE_EXTENSION],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+        match read_vna_calibration_file(&path) {
+            Ok(active) => {
+                let name = active.name.clone();
+                self.vna_calibration_captures.clear();
+                self.vna_calibration = Some(active);
+                self.vna_sweep_calibrated = false;
+                self.persist_vna_settings_if_available();
+                self.status = format!(
+                    "VNA calibration '{name}' loaded and active; it will be applied to the next matching sweep"
+                );
+                self.last_error = None;
+            }
+            Err(error) => self.set_error(error),
+        }
+    }
+
     pub(crate) fn poll_vna_sweep(&mut self) {
         self.poll_vna_run();
         let Some(receiver) = self.vna_pending.as_ref() else {
@@ -461,9 +673,9 @@ impl WaveCraftApp {
                 let stop_mhz = sweep.actual_stop_hz as f64 / 1_000_000.0;
                 let mut calibration_note = "raw";
                 self.vna_sweep_calibrated = false;
-                if let Some(calibration) = &self.vna_calibration {
-                    if calibration.matches_sweep(&sweep) {
-                        if let Err(error) = calibration.apply(&mut sweep) {
+                if let Some(active) = &self.vna_calibration {
+                    if active.calibration.matches_sweep(&sweep) {
+                        if let Err(error) = active.calibration.apply(&mut sweep) {
                             self.set_error(error.to_string());
                             return;
                         }
@@ -489,7 +701,10 @@ impl WaveCraftApp {
                     }
                 };
                 if let Some(calibration) = calibration {
-                    self.vna_calibration = Some(calibration);
+                    self.vna_calibration = Some(ActiveVnaCalibration::from_completed_sol(
+                        calibration,
+                        self.vna_settings.averaging,
+                    ));
                     self.vna_calibration_captures.clear();
                     self.vna_sweep_calibrated = false;
                     self.persist_vna_settings_if_available();
@@ -520,6 +735,19 @@ impl WaveCraftApp {
 mod tests {
     use super::*;
     use crate::app::test_support::app;
+
+    fn test_active_calibration() -> ActiveVnaCalibration {
+        let calibration = serde_json::from_str(
+            r#"{
+                "frequencies_hz":[10000000,20000000],
+                "directivity":[{"real":0.0,"imaginary":0.0},{"real":0.0,"imaginary":0.0}],
+                "source_match":[{"real":0.0,"imaginary":0.0},{"real":0.0,"imaginary":0.0}],
+                "reflection_tracking":[{"real":1.0,"imaginary":0.0},{"real":1.0,"imaginary":0.0}]
+            }"#,
+        )
+        .unwrap();
+        ActiveVnaCalibration::from_completed_sol(calibration, 8)
+    }
 
     #[test]
     fn gui_settings_convert_megahertz_to_protocol_hertz() {
@@ -562,5 +790,50 @@ mod tests {
             Some("Open the selected LiteVNA port before starting a sweep")
         );
         assert!(app.vna_pending.is_none());
+    }
+
+    #[test]
+    fn calibration_file_name_contains_the_active_name_and_averaging() {
+        let active = test_active_calibration();
+
+        assert_eq!(
+            active.default_file_name(),
+            "SOL 10-20 MHz 2 points - averaging 8x.wcvnacal"
+        );
+    }
+
+    #[test]
+    fn calibration_file_round_trip_preserves_the_active_calibration() {
+        let active = test_active_calibration();
+        let path = std::env::temp_dir().join(format!(
+            "wavecraft-vna-calibration-round-trip-{}.wcvnacal",
+            std::process::id()
+        ));
+
+        write_vna_calibration_file(&path, &active).unwrap();
+        let loaded = read_vna_calibration_file(&path).unwrap();
+
+        assert_eq!(loaded.name, active.name);
+        assert_eq!(loaded.averaging, active.averaging);
+        assert_eq!(loaded.calibration, active.calibration);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clearing_the_active_calibration_does_not_delete_its_file() {
+        let active = test_active_calibration();
+        let path = std::env::temp_dir().join(format!(
+            "wavecraft-vna-calibration-clear-{}.wcvnacal",
+            std::process::id()
+        ));
+        write_vna_calibration_file(&path, &active).unwrap();
+        let mut app = app();
+        app.vna_calibration = Some(active);
+
+        app.clear_vna_calibration();
+
+        assert!(app.vna_calibration.is_none());
+        assert!(path.exists());
+        fs::remove_file(path).unwrap();
     }
 }

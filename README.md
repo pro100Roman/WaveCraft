@@ -2,8 +2,8 @@
 
 A Rust reimplementation of [DSView](https://github.com/DreamSourceLab/DSView)
 designed to capture concurrently from logic analyzers (DSLogic), oscilloscopes
-(DSCope), and SDR radio receivers (HackRF One), and to analyze SystemView-based
-system and RTOS traces.
+(DSCope), SDR radio receivers (HackRF One), and LiteVNA vector network analyzers,
+and to analyze SystemView-based system and RTOS traces.
 
 ## Application views
 
@@ -18,6 +18,22 @@ system and RTOS traces.
 ### Radio Receiver (RF)
 
 ![WaveCraft RF view with spectrum, waterfall, and decoded raw data](docs/images/wavecraft-rf-spectrum.png)
+
+### Vector Network Analyzer (VNA)
+
+![WaveCraft VNA view with LiteVNA calibration controls, Smith chart, and matching guidance](docs/images/wavecraft-vna.png)
+
+The **VNA** workspace controls a LiteVNA 64 over USB, displays calibrated S11 on
+an interactive Smith chart, and provides LOG MAG / PHASE plots for S11 or S21.
+Point hints report impedance, return loss, VSWR, series resonance, and an ideal
+50 Ω L-match; hints can be pinned, selected, and copied.
+
+One-port calibration captures OPEN, SHORT, and LOAD across the configured
+frequency grid. The most recently completed or loaded calibration becomes
+active and survives application restarts. Completed calibrations can also be
+saved as `.wcvnacal` files and loaded later; the default filename contains the
+active calibration name and averaging value. Clearing the active calibration
+does not modify a saved calibration file.
 
 ### Combined view
 
@@ -56,6 +72,7 @@ In project discussions and feature requests, these abbreviations are used:
 - **LA** — Logic Analyzer
 - **OSC** — Oscilloscope
 - **RF** — Radio Frequency
+- **VNA** — Vector Network Analyzer
 - **SDR** — Software-Defined Radio
 - **IQ** — In-phase and Quadrature radio samples
 - **FSK/GFSK** — Frequency-Shift Keying / Gaussian Frequency-Shift Keying
@@ -76,6 +93,9 @@ The repository contains a working vertical slice of the new capture engine:
   boundaries;
 - a generic RF Spectrum workbench with live spectrum and waterfall views,
   Run/Single acquisition, spectrum-level triggering, and raw-IQ recording;
+- a LiteVNA 64 workbench with persistent OPEN/SHORT/LOAD calibration,
+  importable and exportable calibration files, Smith and log-magnitude/phase
+  plots, cursor-centered zoom, impedance readout, and matching guidance;
 - multi-channel FSK/GFSK analysis with adaptive timing, raw-message and packet
   views, per-channel sync words, detected-sync-word suggestions, and robust
   separation of consecutive bursts near the noise floor;

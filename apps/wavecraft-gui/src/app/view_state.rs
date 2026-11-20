@@ -336,9 +336,28 @@ impl WaveCraftApp {
                 self.vna_stop_frequency_input = settings.stop_mhz.to_string();
             }
             if let Some(serialized) = profile.values.get("vna.one_port_calibration") {
-                match serde_json::from_str::<crate::OnePortCalibration>(serialized) {
+                match serde_json::from_str::<wavecraft_vna::OnePortCalibration>(serialized) {
                     Ok(calibration) => match calibration.validate() {
-                        Ok(()) => self.vna_calibration = Some(calibration),
+                        Ok(()) => {
+                            let averaging = recording_metadata_value(
+                                &profile.values,
+                                "vna.calibration_averaging",
+                            )
+                            .unwrap_or(settings.averaging);
+                            let mut active = crate::ActiveVnaCalibration::from_completed_sol(
+                                calibration,
+                                averaging,
+                            );
+                            if let Some(name) = profile
+                                .values
+                                .get("vna.calibration_name")
+                                .map(|name| name.trim())
+                                .filter(|name| !name.is_empty())
+                            {
+                                active.name = name.to_owned();
+                            }
+                            self.vna_calibration = Some(active);
+                        }
                         Err(error) => {
                             self.last_error =
                                 Some(format!("Saved VNA calibration was ignored: {error}"));
@@ -402,7 +421,7 @@ impl WaveCraftApp {
                     self.vna_settings.averaging.to_string(),
                 );
                 if let Some(calibration) = &self.vna_calibration {
-                    let serialized = match serde_json::to_string(calibration) {
+                    let serialized = match serde_json::to_string(&calibration.calibration) {
                         Ok(serialized) => serialized,
                         Err(error) => {
                             self.set_error(format!("failed to serialize VNA calibration: {error}"));
@@ -410,6 +429,11 @@ impl WaveCraftApp {
                         }
                     };
                     values.insert("vna.one_port_calibration".to_owned(), serialized);
+                    values.insert("vna.calibration_name".to_owned(), calibration.name.clone());
+                    values.insert(
+                        "vna.calibration_averaging".to_owned(),
+                        calibration.averaging.to_string(),
+                    );
                 }
                 CaptureSettingsProfile::new(values)
             }
@@ -981,6 +1005,11 @@ mod tests {
         values.insert("vna.points".to_owned(), "2".to_owned());
         values.insert("vna.averaging".to_owned(), "4".to_owned());
         values.insert(
+            "vna.calibration_name".to_owned(),
+            "Bench antenna fixture".to_owned(),
+        );
+        values.insert("vna.calibration_averaging".to_owned(), "8".to_owned());
+        values.insert(
             "vna.one_port_calibration".to_owned(),
             calibration.to_owned(),
         );
@@ -1001,7 +1030,9 @@ mod tests {
         let restored_calibration = restored
             .vna_calibration
             .expect("the calibration should be restored");
-        assert!(restored_calibration.matches_config(
+        assert_eq!(restored_calibration.name, "Bench antenna fixture");
+        assert_eq!(restored_calibration.averaging, 8);
+        assert!(restored_calibration.calibration.matches_config(
             restored
                 .vna_settings
                 .sweep_config()

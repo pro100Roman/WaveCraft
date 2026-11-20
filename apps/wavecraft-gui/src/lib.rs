@@ -144,7 +144,7 @@ use wavecraft_usb::{
     DSCOPE_VERTICAL_OFFSET_MIN, DSCOPE_VOLTS_PER_DIV_MV, DSLOGIC_SAMPLE_ALIGNMENT,
     DSLOGIC_SAMPLE_RATES_HZ, DSLOGIC_TRIGGER_STAGE_COUNT, REQUIRED_RESOURCE_FILES,
 };
-use wavecraft_vna::{LiteVnaDevice, OnePortCalibration, VnaPoint, VnaSweep};
+use wavecraft_vna::{LiteVnaDevice, VnaPoint, VnaSweep};
 use waveform::chrome::*;
 use waveform::combined::*;
 use waveform::logic::*;
@@ -405,7 +405,7 @@ struct WaveCraftApp {
     vna_run_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     vna_pending_purpose: Option<VnaSweepPurpose>,
     vna_calibration_captures: VnaCalibrationCaptures,
-    vna_calibration: Option<OnePortCalibration>,
+    vna_calibration: Option<ActiveVnaCalibration>,
     vna_sweep_calibrated: bool,
     vna_calibration_notice_open: bool,
     vna_plot_tab: VnaPlotTab,
@@ -843,6 +843,12 @@ impl WaveCraftApp {
         }
         if actions.vna_clear_calibration {
             self.clear_vna_calibration();
+        }
+        if actions.vna_save_calibration {
+            self.save_vna_calibration_to_file();
+        }
+        if actions.vna_load_calibration {
+            self.load_vna_calibration_from_file();
         }
         self.apply_system_trace_action(actions.system_trace_action);
         match actions.calibration_action {
