@@ -78,8 +78,110 @@ const RADIO_CHANNEL_SYNC_WORD_WIDTH: f32 = 72.0;
 /// Most characters of a channel's sync word: eight bytes with a space between.
 const RADIO_CHANNEL_SYNC_WORD_CHARACTERS: usize = 24;
 const ANALYZER_CHANNELS_HELP: &str = "All modulation, framing, and whitening settings above are shared by every channel, except that a channel can have a sync word of its own.";
+const HACKRF_BASEBAND_BANDWIDTH_HELP: &str = "Selects the HackRF analog baseband low-pass filter width. A narrower filter rejects more out-of-band noise and interference. Keep it at or below the sample rate to limit aliasing; about 75% of the sample rate leaves useful transition-band margin.\n\nSample rate | Recommended bandwidth\n20 MHz      | 15 MHz\n19 MHz      | 14 MHz\n16 MHz      | 12 MHz\n10 MHz      | 7 MHz\n8 MHz       | 6 MHz";
 
 pub(crate) const RADIO_GAIN_HANDLE_ASPECT_RATIO: f32 = 1.8;
+
+/// A compact numeric editor for RF settings that accepts typed input without
+/// changing its value when the pointer is dragged horizontally. Gain controls
+/// deliberately keep using sliders instead.
+struct ManualRadioValue<'a, Num: egui::emath::Numeric> {
+    value: &'a mut Num,
+    speed: Option<f64>,
+    range: Option<RangeInclusive<f64>>,
+    clamp_existing_to_range: Option<bool>,
+    min_decimals: Option<usize>,
+    max_decimals: Option<usize>,
+    hexadecimal: Option<(usize, bool, bool)>,
+}
+
+impl<'a, Num: egui::emath::Numeric> ManualRadioValue<'a, Num> {
+    fn new(value: &'a mut Num) -> Self {
+        Self {
+            value,
+            speed: None,
+            range: None,
+            clamp_existing_to_range: None,
+            min_decimals: None,
+            max_decimals: None,
+            hexadecimal: None,
+        }
+    }
+
+    fn speed(mut self, speed: impl Into<f64>) -> Self {
+        self.speed = Some(speed.into());
+        self
+    }
+
+    fn range<RangeNum: egui::emath::Numeric>(mut self, range: RangeInclusive<RangeNum>) -> Self {
+        self.range = Some(range.start().to_f64()..=range.end().to_f64());
+        self
+    }
+
+    fn clamp_existing_to_range(mut self, clamp: bool) -> Self {
+        self.clamp_existing_to_range = Some(clamp);
+        self
+    }
+
+    fn min_decimals(mut self, decimals: usize) -> Self {
+        self.min_decimals = Some(decimals);
+        self
+    }
+
+    fn max_decimals(mut self, decimals: usize) -> Self {
+        self.max_decimals = Some(decimals);
+        self
+    }
+
+    fn hexadecimal(mut self, min_width: usize, twos_complement: bool, upper: bool) -> Self {
+        self.hexadecimal = Some((min_width, twos_complement, upper));
+        self
+    }
+}
+
+impl<Num: egui::emath::Numeric> egui::Widget for ManualRadioValue<'_, Num> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let Self {
+            value,
+            speed,
+            range,
+            clamp_existing_to_range,
+            min_decimals,
+            max_decimals,
+            hexadecimal,
+        } = self;
+        let old_value = *value;
+        let mut editor = egui::DragValue::new(&mut *value);
+        if let Some(speed) = speed {
+            editor = editor.speed(speed);
+        }
+        if let Some(range) = range {
+            editor = editor.range(range);
+        }
+        if let Some(clamp) = clamp_existing_to_range {
+            editor = editor.clamp_existing_to_range(clamp);
+        }
+        if let Some(decimals) = min_decimals {
+            editor = editor.min_decimals(decimals);
+        }
+        if let Some(decimals) = max_decimals {
+            editor = editor.max_decimals(decimals);
+        }
+        if let Some((min_width, twos_complement, upper)) = hexadecimal {
+            editor = editor.hexadecimal(min_width, twos_complement, upper);
+        }
+
+        let explanation_tooltips = ui.style().explanation_tooltips;
+        ui.style_mut().explanation_tooltips = false;
+        let mut response = ui.add(editor);
+        ui.style_mut().explanation_tooltips = explanation_tooltips;
+        if response.dragged() {
+            *value = old_value;
+            response.changed = false;
+        }
+        response.on_hover_cursor(egui::CursorIcon::Text)
+    }
+}
 
 pub(crate) fn add_left_aligned_sized(
     ui: &mut egui::Ui,
@@ -152,7 +254,7 @@ pub(crate) fn paint_radio_mhz_value(ui: &mut egui::Ui, value_hz: &mut u64, domai
         ValueDomain::Stepped { range, .. } => Some((*range.start(), *range.end())),
     };
     let mut value_mhz = *value_hz as f64 / 1_000_000.0;
-    let mut editor = egui::DragValue::new(&mut value_mhz)
+    let mut editor = ManualRadioValue::new(&mut value_mhz)
         .speed(0.001)
         .min_decimals(3)
         .max_decimals(6);
@@ -195,7 +297,7 @@ pub(crate) fn paint_radio_bandwidth_value(
                 if add_left_aligned_sized(
                     ui,
                     editor_size,
-                    egui::DragValue::new(&mut value_mhz)
+                    ManualRadioValue::new(&mut value_mhz)
                         .range(
                             *range.start() as f64 / 1_000_000.0..=*range.end() as f64 / 1_000_000.0,
                         )
@@ -316,7 +418,7 @@ pub(crate) fn paint_scaled_u64_value(
             let changed = add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut scaled)
+                ManualRadioValue::new(&mut scaled)
                     .range(range)
                     .clamp_existing_to_range(false)
                     .speed(0.001)
@@ -346,7 +448,7 @@ pub(crate) fn paint_scaled_i64_value(
             let changed = add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut scaled)
+                ManualRadioValue::new(&mut scaled)
                     .range(range)
                     .clamp_existing_to_range(false)
                     .speed(0.001)
@@ -594,13 +696,13 @@ fn paint_filter_tap_count_value(
             settings.effective_channel_bandwidth_hz(),
         );
         ui.add_enabled_ui(false, |ui| {
-            add_left_aligned_sized(ui, size, egui::DragValue::new(&mut shown).range(3..=4_095));
+            add_left_aligned_sized(ui, size, ManualRadioValue::new(&mut shown).range(3..=4_095));
         });
     } else {
         add_left_aligned_sized(
             ui,
             size,
-            egui::DragValue::new(&mut settings.filter_tap_count)
+            ManualRadioValue::new(&mut settings.filter_tap_count)
                 .range(3..=4_095)
                 .speed(2),
         );
@@ -656,7 +758,7 @@ fn paint_radio_analyzer_symbol_rows(
             if add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut bt)
+                ManualRadioValue::new(&mut bt)
                     .range(0.01..=2.0)
                     .speed(0.01)
                     .min_decimals(2)
@@ -686,7 +788,7 @@ fn paint_radio_analyzer_preamble_rows(
             add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut settings.preamble_byte)
+                ManualRadioValue::new(&mut settings.preamble_byte)
                     .range(0..=u8::MAX)
                     .speed(1)
                     .hexadecimal(2, false, true),
@@ -706,7 +808,7 @@ fn paint_radio_analyzer_preamble_rows(
             add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut settings.preamble_bytes)
+                ManualRadioValue::new(&mut settings.preamble_bytes)
                     .range(0..=256)
                     .speed(1),
             );
@@ -737,7 +839,7 @@ fn paint_radio_analyzer_sync_word_rows(
             add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut settings.sync_word)
+                ManualRadioValue::new(&mut settings.sync_word)
                     .range(0..=u64::MAX)
                     .speed(1)
                     .hexadecimal(2, false, true),
@@ -761,7 +863,7 @@ fn paint_radio_analyzer_sync_word_rows(
             add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut settings.sync_word_bytes)
+                ManualRadioValue::new(&mut settings.sync_word_bytes)
                     .range(if settings.data_mode == RadioDataMode::Packets {
                         1..=8
                     } else {
@@ -854,7 +956,7 @@ fn paint_radio_analyzer_timing_rows(
             if add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut bandwidth)
+                ManualRadioValue::new(&mut bandwidth)
                     .range(0.001..=1.0)
                     .speed(0.001)
                     .min_decimals(3)
@@ -877,7 +979,7 @@ fn paint_radio_analyzer_timing_rows(
                 add_left_aligned_sized(
                     ui,
                     egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                    egui::DragValue::new(&mut settings.max_clock_error_ppm)
+                    ManualRadioValue::new(&mut settings.max_clock_error_ppm)
                         .range(0..=250_000)
                         .speed(100),
                 );
@@ -907,7 +1009,7 @@ fn paint_radio_analyzer_acquisition_rows(
             add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut settings.maximum_preamble_bit_errors)
+                ManualRadioValue::new(&mut settings.maximum_preamble_bit_errors)
                     .range(0..=64)
                     .speed(1),
             );
@@ -937,7 +1039,7 @@ fn paint_radio_analyzer_acquisition_rows(
             if add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut confidence)
+                ManualRadioValue::new(&mut confidence)
                     .range(0.0..=1.0)
                     .speed(0.01)
                     .min_decimals(2)
@@ -960,7 +1062,7 @@ fn paint_radio_analyzer_acquisition_rows(
                 add_left_aligned_sized(
                     ui,
                     egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                    egui::DragValue::new(&mut settings.maximum_uncertain_bits)
+                    ManualRadioValue::new(&mut settings.maximum_uncertain_bits)
                         .range(0..=1_000_000)
                         .speed(1),
                 );
@@ -1066,7 +1168,7 @@ fn paint_radio_whitening_register_rows(
             add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut settings.whitening_width)
+                ManualRadioValue::new(&mut settings.whitening_width)
                     .range(1..=64)
                     .speed(1),
             );
@@ -1093,7 +1195,7 @@ fn paint_radio_whitening_register_rows(
                 add_left_aligned_sized(
                     ui,
                     egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                    egui::DragValue::new(value)
+                    ManualRadioValue::new(value)
                         .range(0..=u64::MAX)
                         .speed(1)
                         .hexadecimal(2, false, true),
@@ -1164,7 +1266,7 @@ fn paint_radio_whitening_range_rows(
             add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut settings.whitening_start_bit).speed(1),
+                ManualRadioValue::new(&mut settings.whitening_start_bit).speed(1),
             );
             ui.label("bit");
         });
@@ -1185,7 +1287,7 @@ fn paint_radio_whitening_range_rows(
             }
             if let Some(end) = &mut settings.whitening_end_bit {
                 ui.add(
-                    egui::DragValue::new(end)
+                    ManualRadioValue::new(end)
                         .range(settings.whitening_start_bit.saturating_add(1)..=usize::MAX)
                         .speed(1),
                 );
@@ -1448,7 +1550,7 @@ fn paint_radio_frequency_correction_row(
             if add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut correction_ppm)
+                ManualRadioValue::new(&mut correction_ppm)
                     .range(-200.0..=200.0)
                     .speed(0.001)
                     .min_decimals(3)
@@ -1503,7 +1605,7 @@ fn paint_radio_single_duration_row(ui: &mut egui::Ui, settings: &mut RadioSettin
             if add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut duration_seconds)
+                ManualRadioValue::new(&mut duration_seconds)
                     .range(0.001..=3_600.0)
                     .speed(0.01)
                     .min_decimals(3)
@@ -1554,7 +1656,7 @@ fn paint_radio_post_trigger_row(ui: &mut egui::Ui, settings: &mut RadioSettings,
             if add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut milliseconds)
+                ManualRadioValue::new(&mut milliseconds)
                     .range(0.0..=RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS as f64 / 1_000.0)
                     .speed(0.001)
                     .min_decimals(3)
@@ -1588,7 +1690,7 @@ fn paint_radio_trigger_level_row(ui: &mut egui::Ui, settings: &mut RadioSettings
             if add_left_aligned_sized(
                 ui,
                 egui::vec2(RADIO_VALUE_WIDTH, ui.spacing().interact_size.y),
-                egui::DragValue::new(&mut level_dbfs)
+                ManualRadioValue::new(&mut level_dbfs)
                     .range(-120.0..=0.0)
                     .speed(0.1)
                     .min_decimals(1)
@@ -1611,9 +1713,8 @@ fn paint_radio_bandwidth_row(
     settings: &mut RadioSettings,
     tuning_enabled: bool,
 ) {
-    let bandwidth_help = (radio.provider == RadioProvider::HackRf).then_some(
-        "Selects the HackRF analog baseband low-pass filter width. A narrower filter rejects more out-of-band noise and interference. Keep it at or below the sample rate to limit aliasing.",
-    );
+    let bandwidth_help =
+        (radio.provider == RadioProvider::HackRf).then_some(HACKRF_BASEBAND_BANDWIDTH_HELP);
     paint_radio_parameter_label(ui, "Baseband bandwidth", bandwidth_help);
     ui.add_enabled_ui(tuning_enabled, |ui| {
         paint_radio_bandwidth_value(
@@ -2123,6 +2224,12 @@ mod tests {
                 .any(|(painted, _)| painted.starts_with(prefix))
         }
 
+        fn contains(&self, fragment: &str) -> bool {
+            self.texts
+                .iter()
+                .any(|(painted, _)| painted.contains(fragment))
+        }
+
         fn center_of(&self, text: &str) -> Pos2 {
             let matches = self
                 .texts
@@ -2515,6 +2622,32 @@ mod tests {
             ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings()).stopped();
         panel.drag_right("24");
         assert_eq!(panel.settings.gains_db["lna"], 24);
+    }
+
+    #[test]
+    fn receive_numeric_fields_ignore_horizontal_pointer_drags() {
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings());
+        let before = panel.settings.clone();
+
+        for shown in ["433.920", "1.234", "8.000", "5.000", "1.500", "-50.0"] {
+            panel.drag_right(shown);
+        }
+
+        assert_eq!(panel.settings, before);
+    }
+
+    #[test]
+    fn analyzer_numeric_fields_ignore_horizontal_pointer_drags() {
+        let mut panel =
+            ReceivePanel::new(receive_radio(RadioProvider::HackRf), analyzer_settings())
+                .analyzer_section();
+        let before = panel.settings.clone();
+
+        for shown in ["19.200", "35.000", "0.50"] {
+            panel.drag_right(shown);
+        }
+
+        assert_eq!(panel.settings, before);
     }
 
     #[test]
@@ -3012,6 +3145,28 @@ mod tests {
                     "{provider:?} {row:?} help"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn hackrf_bandwidth_help_lists_recommended_sample_rate_pairs() {
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings());
+        let position = panel.painted().center_of("Baseband bandwidth");
+
+        let painted = panel.hover(position);
+
+        for recommendation in [
+            "Sample rate | Recommended bandwidth",
+            "20 MHz      | 15 MHz",
+            "19 MHz      | 14 MHz",
+            "16 MHz      | 12 MHz",
+            "10 MHz      | 7 MHz",
+            "8 MHz       | 6 MHz",
+        ] {
+            assert!(
+                painted.contains(recommendation),
+                "missing bandwidth recommendation {recommendation:?}"
+            );
         }
     }
 
