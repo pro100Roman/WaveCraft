@@ -68,6 +68,10 @@ pub(crate) fn format_radio_mhz_number(value_hz: u64) -> String {
 }
 
 pub(crate) const RADIO_VALUE_WIDTH: f32 = 80.0;
+const SAMPLE_RATE_EDITOR_WIDTH: f32 = 61.0;
+const SAMPLE_RATE_DROPDOWN_WIDTH: f32 = 18.0;
+const SAMPLE_RATE_DROPDOWN_GAP: f32 = 1.0;
+const SAMPLE_RATE_DROPDOWN_STEP_HZ: u64 = 1_000_000;
 /// How far the body of a collapsible section is indented in the radio card.
 /// The default indent leaves the settings grids a few pixels too little room
 /// in the 300 px setup panel, which then grows past the width of the logic
@@ -270,6 +274,80 @@ pub(crate) fn paint_radio_mhz_value(ui: &mut egui::Ui, value_hz: &mut u64, domai
         })
         .inner;
     if changed {
+        *value_hz = radio_hz_from_mhz(domain, value_mhz);
+    }
+}
+
+fn whole_mhz_sample_rates(domain: &ValueDomain) -> Vec<u64> {
+    let (minimum_hz, maximum_hz) = match domain {
+        ValueDomain::Discrete(values) => {
+            let Some(bounds) = values
+                .iter()
+                .copied()
+                .min()
+                .zip(values.iter().copied().max())
+            else {
+                return Vec::new();
+            };
+            bounds
+        }
+        ValueDomain::Stepped { range, .. } => (*range.start(), *range.end()),
+    };
+    let first = minimum_hz.saturating_add(SAMPLE_RATE_DROPDOWN_STEP_HZ - 1)
+        / SAMPLE_RATE_DROPDOWN_STEP_HZ
+        * SAMPLE_RATE_DROPDOWN_STEP_HZ;
+    (first..=maximum_hz)
+        .step_by(SAMPLE_RATE_DROPDOWN_STEP_HZ as usize)
+        .filter(|choice| nearest_domain_value(domain, *choice) == *choice)
+        .collect()
+}
+
+fn paint_hackrf_sample_rate_value(ui: &mut egui::Ui, value_hz: &mut u64, domain: &ValueDomain) {
+    let bounds = match domain {
+        ValueDomain::Discrete(values) => values
+            .iter()
+            .copied()
+            .min()
+            .zip(values.iter().copied().max()),
+        ValueDomain::Stepped { range, .. } => Some((*range.start(), *range.end())),
+    };
+    let mut value_mhz = *value_hz as f64 / 1_000_000.0;
+    let mut editor = ManualRadioValue::new(&mut value_mhz)
+        .speed(0.001)
+        .min_decimals(3)
+        .max_decimals(6);
+    if let Some((minimum_hz, maximum_hz)) = bounds {
+        editor = editor.range(minimum_hz as f64 / 1_000_000.0..=maximum_hz as f64 / 1_000_000.0);
+    }
+    let choices = whole_mhz_sample_rates(domain);
+    let typed = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = SAMPLE_RATE_DROPDOWN_GAP;
+            let typed = add_left_aligned_sized(
+                ui,
+                egui::vec2(SAMPLE_RATE_EDITOR_WIDTH, ui.spacing().interact_size.y),
+                editor,
+            )
+            .changed();
+            egui::ComboBox::from_id_salt("radio_sample_rate")
+                .width(SAMPLE_RATE_DROPDOWN_WIDTH)
+                .selected_text("")
+                .show_ui(ui, |ui| {
+                    for choice in choices {
+                        ui.selectable_value(
+                            value_hz,
+                            choice,
+                            format!("{} MHz", choice / SAMPLE_RATE_DROPDOWN_STEP_HZ),
+                        );
+                    }
+                })
+                .response
+                .on_hover_text("Choose a whole-MHz sample rate");
+            ui.label("MHz");
+            typed
+        })
+        .inner;
+    if typed {
         *value_hz = radio_hz_from_mhz(domain, value_mhz);
     }
 }
@@ -1576,15 +1654,23 @@ fn paint_radio_sample_rate_row(
     enabled: bool,
 ) {
     let sample_rate_help = (radio.provider == RadioProvider::HackRf).then_some(
-        "Sets the I/Q sampling rate and the captured RF frequency span. Supported range: 2–20 MHz. Step: 1 Hz (0.000001 MHz). HackRF supports any whole-Hz value in this range; 8 MHz or higher is recommended.",
+        "Sets the I/Q sampling rate and the captured RF frequency span. Use the drop-down for 1 MHz steps, or type any whole-Hz value manually (0.000001 MHz resolution). Supported range: 2–20 MHz; 8 MHz or higher is recommended.",
     );
     paint_radio_parameter_label(ui, "Sample rate", sample_rate_help);
     ui.add_enabled_ui(enabled, |ui| {
-        paint_radio_mhz_value(
-            ui,
-            &mut settings.capture.sample_rate_hz,
-            &radio.capabilities.sample_rates_hz,
-        );
+        if radio.provider == RadioProvider::HackRf {
+            paint_hackrf_sample_rate_value(
+                ui,
+                &mut settings.capture.sample_rate_hz,
+                &radio.capabilities.sample_rates_hz,
+            );
+        } else {
+            paint_radio_mhz_value(
+                ui,
+                &mut settings.capture.sample_rate_hz,
+                &radio.capabilities.sample_rates_hz,
+            );
+        }
     });
     ui.end_row();
 }
@@ -2111,6 +2197,35 @@ mod tests {
         assert_eq!(format_radio_mhz_number(1_750_000), "1.75");
         assert_eq!(format_radio_mhz_number(5_500_000), "5.5");
         assert_eq!(format_radio_mhz_number(20_000_000), "20");
+    }
+
+    #[test]
+    fn sample_rate_dropdown_lists_whole_mhz_steps_within_the_domain() {
+        let domain = ValueDomain::Stepped {
+            range: 2_000_000..=20_000_000,
+            step: 1,
+        };
+
+        let choices = whole_mhz_sample_rates(&domain);
+
+        assert_eq!(
+            choices,
+            (2..=20).map(|mhz| mhz * 1_000_000).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sample_rate_accepts_a_dropdown_choice_and_typed_value_in_the_same_control() {
+        let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings());
+
+        let dropdown = panel.painted().center_of("8.000") + Vec2::new(50.0, 0.0);
+        panel.click(dropdown);
+        let choice = panel.painted().center_of("9 MHz");
+        panel.click(choice);
+        assert_eq!(panel.settings.capture.sample_rate_hz, 9_000_000);
+
+        panel.type_into("9.000", "12.5");
+        assert_eq!(panel.settings.capture.sample_rate_hz, 12_500_000);
     }
 
     fn receive_radio(provider: RadioProvider) -> DiscoveredRadio {
@@ -2654,6 +2769,8 @@ mod tests {
     fn typed_values_are_converted_to_the_units_of_the_settings() {
         let mut panel = ReceivePanel::new(receive_radio(RadioProvider::HackRf), receive_settings());
 
+        panel.type_into("8.000", "12.345678");
+        assert_eq!(panel.settings.capture.sample_rate_hz, 12_345_678);
         panel.type_into("1.234", "-2.5");
         assert_eq!(panel.settings.frequency_correction_milli_ppm, -2_500);
         panel.type_into("5.000", "2.5");
