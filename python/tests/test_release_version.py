@@ -1,3 +1,4 @@
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -7,7 +8,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from set_release_version import normalize_release_version, set_release_version
+from set_release_version import (
+    latest_release_tag,
+    normalize_release_version,
+    semver_precedence,
+    set_release_version,
+)
 
 
 class ReleaseVersionTests(unittest.TestCase):
@@ -21,6 +27,39 @@ class ReleaseVersionTests(unittest.TestCase):
     def test_rejects_non_semver_release_tag(self):
         with self.assertRaisesRegex(ValueError, "is not SemVer"):
             normalize_release_version("release-latest")
+
+    def test_orders_semver_tags_by_precedence(self):
+        tags = [
+            "v1.9.0",
+            "v1.10.0-rc.2",
+            "v1.10.0-rc.10",
+            "v1.10.0",
+        ]
+        self.assertEqual(max(tags, key=semver_precedence), "v1.10.0")
+
+    def test_finds_latest_semver_tag_in_git_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=WaveCraft Tests",
+                    "-c",
+                    "user.email=tests@wavecraft.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "initial",
+                ],
+                cwd=root,
+                check=True,
+            )
+            for tag in ("v0.9.0", "not-a-release", "v0.12.0", "v0.11.1"):
+                subprocess.run(["git", "tag", tag], cwd=root, check=True)
+
+            self.assertEqual(latest_release_tag(root), "v0.12.0")
 
     def test_updates_app_manifests_lockfile_and_macos_bundle(self):
         with tempfile.TemporaryDirectory() as directory:

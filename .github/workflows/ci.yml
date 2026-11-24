@@ -40,9 +40,10 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
-        if: github.ref_type == 'tag'
         with:
           python-version: "3.12"
 
@@ -55,12 +56,16 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Set application version from release tag
-        if: github.ref_type == 'tag'
+      - name: Set application version from Git tags
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        shell: bash
         run: |
-          python scripts/set_release_version.py "$RELEASE_TAG"
+          if [[ -n "$RELEASE_TAG" ]]; then
+            python scripts/set_release_version.py "$RELEASE_TAG"
+          else
+            python scripts/set_release_version.py
+          fi
           cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
       - name: Install Linux window-system dependencies
@@ -95,9 +100,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
-        if: github.ref_type == 'tag'
         with:
           python-version: "3.12"
 
@@ -112,13 +118,16 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Set application version from release tag
-        if: github.ref_type == 'tag'
+      - name: Set application version from Git tags
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         shell: bash
         run: |
-          python scripts/set_release_version.py "$RELEASE_TAG"
+          if [[ -n "$RELEASE_TAG" ]]; then
+            python scripts/set_release_version.py "$RELEASE_TAG"
+          else
+            python scripts/set_release_version.py
+          fi
           cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
       - name: Install universal macOS targets
