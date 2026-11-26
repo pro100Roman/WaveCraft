@@ -12,12 +12,19 @@ custom value; use the arrow to show all standard rates through 3,000,000.
 
 The graph and raw-data pane share the available height. Drag their divider to
 resize them; double-click it to restore the default split. On the graph, scroll
-to zoom the time range, drag to inspect earlier points, and use **Follow** or
-**Fit** to return to incoming data. **PLOTTED FIELDS** in setup is the single
-place to choose field colors and line styles. The style selector shows the
-actual stroke: solid, dashed, dotted, dash-dot, or dash-dot-dot. These choices
-apply to retained traces and are saved with the other serial settings; binary
-channels have independent styles too. The graph does not repeat the field list.
+to zoom the time range and drag to inspect earlier points. **Follow** tracks
+incoming plotted values; **Fit** fits all retained plotted samples to the graph
+width. Fit uses actual point timestamps, including sub-millisecond recordings,
+and ignores trailing raw bytes with no matching values. Time-axis labels use
+seconds, milliseconds, microseconds or nanoseconds as appropriate.
+
+**PLOTTED FIELDS** in setup is the single place to choose field colors and line
+styles. The style selector shows the actual stroke: solid, dashed, dotted,
+dash-dot, dash-dot-dot, or a line with filled star or triangle markers in the
+same color as the line. Markers stay evenly spaced on screen at different
+sample densities. These choices apply to retained traces and are saved with
+the other serial settings; binary channels have independent styles too. The
+graph does not repeat the field list.
 
 With **no text fields** or **no binary schema**, Start still reads the port and
 shows only raw data in the lower pane. A schema is never required for receiving.
@@ -30,7 +37,9 @@ Save raw exports that retained window, not an unlimited recording. Open raw
 accepts up to 8 MiB and processes it using the current decoding settings.
 Live graph timestamps are host receive times; multiple records in one read
 share that timestamp. Imported raw bytes have no timestamps, so their time axis
-is estimated from the configured baud rate and UART frame size.
+is estimated from the configured baud rate and UART frame size. Multiple
+decoded records in one file-read block are distributed over that estimated
+interval; live records continue to share their receive timestamp.
 
 ## Text fields
 
@@ -76,8 +85,13 @@ Fields appear consecutively in JSON order without implicit padding:
 | `bit_width` | Number of bits, from 1 to the remaining storage width |
 | `signed` | Optional two's-complement interpretation of a bit field; default `false` |
 
+After loading JSON, **PLOTTED FIELDS** lists the decoded field names with an
+independent color and line-style selector for each channel. Fields containing
+`bits` show their parent JSON name above the child bit-field controls. Reloading
+a schema keeps colors and styles for retained channel names.
+
 For a storage field containing `bits`, each named bit field gets its own graph
-line and color. The parent storage field consumes its stated byte width once.
+line, color and style. The parent storage field consumes its stated byte width once.
 Other fields produce one graph line each. Up to 64 storage fields and 128 graph
 lines are supported. Values use the graph's `f64` representation, so integers
 larger than 2^53 can lose precision; retained raw bytes remain exact. Unknown JSON

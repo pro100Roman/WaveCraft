@@ -2,7 +2,9 @@
 
 use super::serial_line_style::{line_style_picker, paint_serial_line, LINE_STYLE_PICKER_WIDTH};
 use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel};
-use crate::serial::{SerialMode, SerialSettings, SerialState, TextField, COLORS};
+use crate::serial::{
+    SerialMode, SerialSettings, SerialState, TextField, COLORS, MIN_GRAPH_TIME_WINDOW_SECONDS,
+};
 use crate::{
     egui, toolbar_action_button, RichText, WaveCraftApp, WorkspaceView, ACCENT, BACKGROUND, GRID,
     TEXT_MUTED,
@@ -117,9 +119,11 @@ impl WaveCraftApp {
                     + self.serial.settings.data_bits
                     + self.serial.settings.stop_bits
                     + u8::from(self.serial.settings.parity != "None");
-                self.serial.ingest(
-                    count as f64 * f64::from(bits_per_byte)
-                        / f64::from(self.serial.settings.baud.max(1)),
+                let seconds_per_byte =
+                    f64::from(bits_per_byte) / f64::from(self.serial.settings.baud.max(1));
+                self.serial.ingest_imported(
+                    (count - read) as f64 * seconds_per_byte,
+                    count as f64 * seconds_per_byte,
                     &buffer[..read],
                 );
             }
@@ -616,28 +620,7 @@ fn binary_settings(ui: &mut egui::Ui, state: &mut SerialState) {
             .small()
             .color(TEXT_MUTED),
         );
-        ui.label(RichText::new("PLOTTED FIELDS").small().color(TEXT_MUTED));
-        for (index, name) in schema.channel_names().into_iter().enumerate() {
-            ui.push_id(("binary_plot_field", index), |ui| {
-                ui.horizontal(|ui| {
-                    let color = settings
-                        .binary_colors
-                        .entry(name.clone())
-                        .or_insert(COLORS[index % COLORS.len()]);
-                    ui.color_edit_button_srgb(color);
-                    let name_width = (ui.available_width()
-                        - LINE_STYLE_PICKER_WIDTH
-                        - ui.spacing().item_spacing.x)
-                        .max(32.0);
-                    ui.add_sized([name_width, 20.0], egui::Label::new(&name).truncate());
-                    line_style_picker(
-                        ui,
-                        settings.binary_line_styles.entry(name.clone()).or_default(),
-                        *color,
-                    );
-                });
-            });
-        }
+        paint_binary_plotted_fields(ui, settings, &schema);
     }
     ui.add_enabled_ui(!settings.schema_json.is_empty(), |ui| {
         hex_field(ui, "Start word (hex)", &mut settings.start_word);
@@ -705,6 +688,59 @@ fn binary_settings(ui: &mut egui::Ui, state: &mut SerialState) {
     }
 }
 
+/// Keep the JSON field hierarchy visible: bit fields are grouped under their
+/// parent, while each decoded channel owns its color and stroke settings.
+fn paint_binary_plotted_fields(
+    ui: &mut egui::Ui,
+    settings: &mut SerialSettings,
+    schema: &BinarySchema,
+) {
+    ui.add_space(8.0);
+    ui.label(RichText::new("PLOTTED FIELDS").small().color(TEXT_MUTED));
+    for (index, name) in schema.channel_names().into_iter().enumerate() {
+        settings
+            .binary_colors
+            .entry(name)
+            .or_insert(COLORS[index % COLORS.len()]);
+    }
+    for field in &schema.fields {
+        if field.bits.is_empty() {
+            binary_plotted_field(ui, settings, &field.name);
+        } else {
+            ui.label(RichText::new(&field.name).strong().color(TEXT_MUTED));
+            ui.indent((&field.name, "binary_bit_fields"), |ui| {
+                for bit in &field.bits {
+                    binary_plotted_field(ui, settings, &bit.name);
+                }
+            });
+        }
+    }
+}
+
+fn binary_plotted_field(ui: &mut egui::Ui, settings: &mut SerialSettings, name: &str) {
+    ui.push_id(("binary_plot_field", name), |ui| {
+        ui.horizontal(|ui| {
+            let color = settings
+                .binary_colors
+                .entry(name.to_owned())
+                .or_insert(COLORS[0]);
+            ui.color_edit_button_srgb(color);
+            let name_width =
+                (ui.available_width() - LINE_STYLE_PICKER_WIDTH - ui.spacing().item_spacing.x)
+                    .max(32.0);
+            ui.add_sized([name_width, 20.0], egui::Label::new(name).truncate());
+            line_style_picker(
+                ui,
+                settings
+                    .binary_line_styles
+                    .entry(name.to_owned())
+                    .or_default(),
+                *color,
+            );
+        });
+    });
+}
+
 fn hex_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.label(RichText::new(label).small().color(TEXT_MUTED));
     ui.add(
@@ -720,22 +756,18 @@ fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("GRAPH").strong().color(TEXT_MUTED));
             if ui.checkbox(&mut state.follow, "Follow").changed() {
-                state.graph_end = state.latest_time;
+                state.graph_end = state.graph_latest_time();
             }
             ui.add(
                 egui::DragValue::new(&mut state.time_window)
-                    .range(0.01..=3600.0)
+                    .range(MIN_GRAPH_TIME_WINDOW_SECONDS..=3600.0)
+                    .clamp_existing_to_range(false)
+                    .max_decimals(9)
                     .speed(0.1)
                     .suffix(" s"),
             );
             if ui.small_button("Fit").clicked() {
-                let first = state
-                    .series
-                    .iter()
-                    .filter_map(|series| series.points.front().map(|point| point[0]))
-                    .fold(state.latest_time, f64::min);
-                state.time_window = (state.latest_time - first).max(0.01);
-                state.follow = true;
+                state.fit_graph();
             }
         });
         let (surface, response) = ui.allocate_exact_size(
@@ -753,13 +785,13 @@ fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
         if response.hovered() {
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll != 0.0 {
-                state.time_window =
-                    (state.time_window * (-f64::from(scroll) * 0.005).exp()).clamp(0.01, 3600.0);
+                state.time_window = (state.time_window * (-f64::from(scroll) * 0.005).exp())
+                    .clamp(MIN_GRAPH_TIME_WINDOW_SECONDS, 3600.0);
             }
         }
         if response.dragged() {
             if state.follow {
-                state.graph_end = state.latest_time;
+                state.graph_end = state.graph_latest_time();
                 state.follow = false;
             }
             state.graph_end = (state.graph_end
@@ -767,13 +799,7 @@ fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
                     * state.time_window)
                 .max(0.0);
         }
-        let end = if state.follow {
-            state.latest_time
-        } else {
-            state.graph_end
-        };
-        let start = (end - state.time_window).max(0.0);
-        let end = (start + state.time_window).max(end);
+        let (start, end) = state.graph_time_range();
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
         for series in &state.series {
@@ -797,6 +823,8 @@ fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
         min -= span * 0.08;
         max += span * 0.08;
         let painter = ui.painter().with_clip_rect(surface);
+        let (time_unit, time_multiplier) = crate::time_scale_unit(end);
+        let time_precision = crate::time_scale_precision((end - start) * time_multiplier / 4.0);
         for step in 0..=4 {
             let fraction = step as f32 / 4.0;
             let y = egui::lerp(plot.y_range(), fraction);
@@ -831,7 +859,11 @@ fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
                 } else {
                     egui::Align2::CENTER_TOP
                 },
-                format!("{:.2}s", start + f64::from(fraction) * (end - start)),
+                format!(
+                    "{:.*}{time_unit}",
+                    time_precision,
+                    (start + f64::from(fraction) * (end - start)) * time_multiplier
+                ),
                 egui::FontId::monospace(10.0),
                 TEXT_MUTED,
             );
@@ -851,9 +883,7 @@ fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
                     )
                 })
                 .collect();
-            if points.len() == 1 {
-                painter.circle_filled(points[0], 2.5, color);
-            } else if !points.is_empty() {
+            if !points.is_empty() {
                 paint_serial_line(
                     &painter,
                     &points,
@@ -1010,6 +1040,160 @@ mod tests {
             } else {
                 text.contains("74 65 6D 70")
             }));
+        }
+    }
+
+    #[test]
+    fn parsed_binary_json_lists_scalar_and_bit_field_names_with_independent_styles() {
+        let mut state = SerialState::default();
+        state.settings.mode = SerialMode::Binary;
+        state
+            .load_schema(
+                "example.json".into(),
+                include_str!("../../../../docs/examples/serial-schema.json").into(),
+            )
+            .unwrap();
+        state
+            .settings
+            .binary_line_styles
+            .insert("temperature".into(), crate::serial::SerialLineStyle::Star);
+        state
+            .settings
+            .binary_line_styles
+            .insert("speed".into(), crate::serial::SerialLineStyle::Triangle);
+        let context = egui::Context::default();
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 1200.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| binary_settings(ui, &mut state));
+            },
+        );
+        let labels = texts(&output.shapes);
+        for name in [
+            "PLOTTED FIELDS",
+            "temperature",
+            "speed",
+            "status",
+            "enabled",
+            "fault",
+            "mode",
+        ] {
+            assert!(labels.iter().any(|text| text == name), "{name}");
+        }
+        assert_eq!(
+            state.settings.line_style("temperature"),
+            crate::serial::SerialLineStyle::Star
+        );
+        assert_eq!(
+            state.settings.line_style("speed"),
+            crate::serial::SerialLineStyle::Triangle
+        );
+        assert_ne!(
+            state.settings.binary_colors["temperature"],
+            state.settings.binary_colors["speed"]
+        );
+    }
+
+    #[test]
+    fn fit_button_fills_plot_width_for_short_and_long_traces_despite_trailing_raw_bytes() {
+        for (first, last) in [(0.0002, 0.0006), (0.3, 1.0), (1.0, 7201.0)] {
+            let mut app = crate::app::test_support::app();
+            app.serial.settings.fields.push(TextField {
+                name: "v".into(),
+                color: COLORS[0],
+                line_style: Default::default(),
+            });
+            app.serial.prepare().unwrap();
+            for (time, value) in [(first, 0), ((first + last) / 2.0, 1), (last, 2)] {
+                app.serial.ingest(time, format!("v={value}\n").as_bytes());
+            }
+            app.serial.ingest(last + 30.0, b"no matching values\n");
+            let context = egui::Context::default();
+            let output = render(&mut app, &context, vec![]);
+            let fit = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Fit" => {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .expect("Fit is visible");
+            for pressed in [true, false] {
+                let _ = render(
+                    &mut app,
+                    &context,
+                    vec![
+                        egui::Event::PointerMoved(fit),
+                        egui::Event::PointerButton {
+                            pos: fit,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            // Render again to catch the time-window editor clamping fitted spans
+            // back to its old 10 ms minimum or one-hour maximum.
+            let output = render(&mut app, &context, vec![]);
+            assert!((app.serial.time_window - (last - first)).abs() < 1e-9);
+            if last < 0.001 {
+                assert!(texts(&output.shapes)
+                    .iter()
+                    .any(|text| text.ends_with("µs")));
+            }
+            let color = egui::epaint::ColorMode::Solid(egui::Color32::from_rgb(
+                COLORS[0][0],
+                COLORS[0][1],
+                COLORS[0][2],
+            ));
+            let trace = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Path(path)
+                        if !path.closed && path.stroke.color == color && path.points.len() == 3 =>
+                    {
+                        Some(path)
+                    }
+                    _ => None,
+                })
+                .expect("the fitted trace is visible");
+            let top = trace
+                .points
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::INFINITY, f32::min);
+            let bottom = trace
+                .points
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let grid = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::LineSegment { points, stroke }
+                        if stroke.color == egui::epaint::ColorMode::Solid(GRID)
+                            && points[0].y == points[1].y
+                            && points[0].y > top
+                            && points[0].y < bottom =>
+                    {
+                        Some(points)
+                    }
+                    _ => None,
+                })
+                .expect("plot grid is visible");
+            assert!((trace.points[0].x - grid[0].x).abs() < 0.01);
+            assert!((trace.points[2].x - grid[1].x).abs() < 0.01);
         }
     }
 

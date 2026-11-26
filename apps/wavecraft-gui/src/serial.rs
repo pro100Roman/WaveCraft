@@ -12,6 +12,7 @@ use wavecraft_serial::{
 
 pub(crate) const RAW_CAPACITY: usize = 65_536;
 pub(crate) const POINT_CAPACITY: usize = 10_000;
+pub(crate) const MIN_GRAPH_TIME_WINDOW_SECONDS: f64 = 1e-9;
 pub(crate) const COLORS: [[u8; 3]; 10] = [
     [99, 179, 255],
     [255, 204, 74],
@@ -41,6 +42,8 @@ pub(crate) enum SerialLineStyle {
     Dotted,
     DashDot,
     DashDotDot,
+    Star,
+    Triangle,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -245,6 +248,47 @@ impl Default for SerialState {
 }
 
 impl SerialState {
+    pub fn graph_time_bounds(&self) -> Option<(f64, f64)> {
+        self.series
+            .iter()
+            .filter_map(|series| Some((series.points.front()?[0], series.points.back()?[0])))
+            .reduce(|(start, end), (other_start, other_end)| {
+                (start.min(other_start), end.max(other_end))
+            })
+    }
+
+    pub fn graph_latest_time(&self) -> f64 {
+        self.graph_time_bounds()
+            .map_or(self.latest_time, |(_, end)| end)
+    }
+
+    pub fn graph_time_range(&self) -> (f64, f64) {
+        let end = if self.follow {
+            self.graph_latest_time()
+        } else {
+            self.graph_end
+        };
+        // Keep a nonzero representable span, even for a single sample at a
+        // large timestamp or an extremely short imported recording.
+        let window = self
+            .time_window
+            .max(MIN_GRAPH_TIME_WINDOW_SECONDS)
+            .max(end.abs().max(1.0) * f64::EPSILON * 4.0);
+        let start = (end - window).max(0.0);
+        (start, (start + window).max(end))
+    }
+
+    pub fn fit_graph(&mut self) {
+        if let Some((start, end)) = self.graph_time_bounds() {
+            let span = (end - start).max(MIN_GRAPH_TIME_WINDOW_SECONDS);
+            // Reconstructing start from end - span can round above the first
+            // sample. Widen by a few floating-point ulps to keep it included.
+            self.time_window = span * (1.0 + f64::EPSILON * 4.0);
+            self.graph_end = end;
+            self.follow = true;
+        }
+    }
+
     pub fn invalidate_raw(&mut self) {
         self.raw_dirty = true;
     }
@@ -370,6 +414,17 @@ impl SerialState {
     }
 
     pub fn ingest(&mut self, seconds: f64, bytes: &[u8]) {
+        self.ingest_interval(seconds, seconds, bytes);
+    }
+
+    /// Raw files have no capture timestamps. Spread their decoded records over
+    /// the byte interval estimated from the UART baud rate, rather than giving
+    /// an entire read block one timestamp. Live receive timing stays unchanged.
+    pub fn ingest_imported(&mut self, start_seconds: f64, end_seconds: f64, bytes: &[u8]) {
+        self.ingest_interval(start_seconds, end_seconds, bytes);
+    }
+
+    fn ingest_interval(&mut self, start_seconds: f64, seconds: f64, bytes: &[u8]) {
         self.received_bytes += bytes.len() as u64;
         self.latest_time = seconds;
         self.raw.extend(bytes.iter().copied());
@@ -380,9 +435,12 @@ impl SerialState {
             let records = binary.feed(bytes);
             self.rejected_frames = binary.rejected_frames;
             self.discarded_bytes = binary.discarded_bytes;
-            for values in records {
+            let count = records.len();
+            for (index, values) in records.into_iter().enumerate() {
                 self.decoded_records += 1;
-                self.push_values(seconds, values.into_iter().map(Some));
+                let time =
+                    start_seconds + (seconds - start_seconds) * (index + 1) as f64 / count as f64;
+                self.push_values(time, values.into_iter().map(Some));
             }
         } else if self.settings.mode == SerialMode::Text && !self.series.is_empty() {
             let fields: Vec<_> = self
@@ -390,11 +448,15 @@ impl SerialState {
                 .iter()
                 .map(|series| series.name.clone())
                 .collect();
-            for values in self.text.feed(bytes, &fields) {
+            let records = self.text.feed(bytes, &fields);
+            let count = records.len();
+            for (index, values) in records.into_iter().enumerate() {
                 if values.iter().any(Option::is_some) {
                     self.decoded_records += 1;
                 }
-                self.push_values(seconds, values.into_iter());
+                let time =
+                    start_seconds + (seconds - start_seconds) * (index + 1) as f64 / count as f64;
+                self.push_values(time, values.into_iter());
             }
             self.rejected_frames = self.text.oversized_records;
         }
@@ -510,12 +572,32 @@ impl SerialState {
         let schema = BinarySchema::from_json(&json)?;
         self.settings.schema_name = name;
         self.settings.schema_json = json;
-        self.settings.binary_line_styles.clear();
-        self.settings.binary_colors = schema
-            .channel_names()
+        let names = schema.channel_names();
+        self.settings.binary_line_styles = names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    self.settings
+                        .binary_line_styles
+                        .get(name)
+                        .copied()
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        self.settings.binary_colors = names
             .into_iter()
             .enumerate()
-            .map(|(index, name)| (name, COLORS[index % COLORS.len()]))
+            .map(|(index, name)| {
+                let color = self
+                    .settings
+                    .binary_colors
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(COLORS[index % COLORS.len()]);
+                (name, color)
+            })
             .collect();
         Ok(())
     }
@@ -542,6 +624,93 @@ mod tests {
             assert_eq!(state.decoded_records, 0);
             assert!(!state.raw_lines().is_empty());
         }
+    }
+
+    #[test]
+    fn raw_import_separates_records_in_one_read_while_live_records_share_receive_time() {
+        for mode in [SerialMode::Text, SerialMode::Binary] {
+            let mut imported = SerialState::default();
+            imported.settings.mode = mode;
+            let bytes = if mode == SerialMode::Text {
+                imported.settings.fields.push(TextField {
+                    name: "v".into(),
+                    color: COLORS[0],
+                    line_style: SerialLineStyle::Solid,
+                });
+                b"v=1\nv=2\nv=3\n".to_vec()
+            } else {
+                imported
+                    .load_schema(
+                        "example.json".into(),
+                        include_str!("../../../docs/examples/serial-schema.json").into(),
+                    )
+                    .unwrap();
+                let crc = CrcConfiguration {
+                    width: 16,
+                    polynomial: 0x1021,
+                    seed: 0xffff,
+                    reflect_input: false,
+                    reflect_output: false,
+                    xor_output: 0,
+                    byte_order: ByteOrder::Little,
+                    include_start_word: false,
+                };
+                let mut bytes = Vec::new();
+                for value in [1.0_f32, 2.0, 3.0] {
+                    let mut payload = value.to_le_bytes().to_vec();
+                    payload.extend_from_slice(&[0, 0, 0]);
+                    bytes.extend_from_slice(&[0xaa, 0x55]);
+                    bytes.extend_from_slice(&payload);
+                    bytes
+                        .extend_from_slice(&(crc.checksum(&payload).unwrap() as u16).to_le_bytes());
+                    bytes.extend_from_slice(b"\r\n");
+                }
+                bytes
+            };
+            let mut live = SerialState {
+                settings: imported.settings.clone(),
+                ..Default::default()
+            };
+            imported.prepare().unwrap();
+            live.prepare().unwrap();
+            imported.ingest_imported(0.0, 0.0006, &bytes);
+            live.ingest(0.0006, &bytes);
+            assert_eq!(imported.decoded_records, 3, "{mode:?}");
+            let points = &imported.series[0].points;
+            assert!(points
+                .iter()
+                .zip(points.iter().skip(1))
+                .all(|(a, b)| a[0] < b[0]));
+            assert!(live.series[0].points.iter().all(|point| point[0] == 0.0006));
+            assert_eq!(imported.raw.iter().copied().collect::<Vec<_>>(), bytes);
+            let point_start = points.front().unwrap()[0];
+            let point_end = points.back().unwrap()[0];
+            imported.fit_graph();
+            let (start, end) = imported.graph_time_range();
+            assert!((start - point_start).abs() < 1e-12);
+            assert!((end - point_end).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn fit_without_data_is_a_noop_and_a_single_sample_has_a_finite_visible_range() {
+        let mut state = SerialState {
+            time_window: 4.0,
+            ..Default::default()
+        };
+        state.fit_graph();
+        assert_eq!(state.time_window, 4.0);
+        state.settings.fields.push(TextField {
+            name: "v".into(),
+            color: COLORS[0],
+            line_style: SerialLineStyle::Solid,
+        });
+        state.prepare().unwrap();
+        state.ingest(1e12, b"v=1\n");
+        state.fit_graph();
+        let (start, end) = state.graph_time_range();
+        assert!(start.is_finite() && end.is_finite() && start < end);
+        assert!(start <= 1e12 && end >= 1e12);
     }
 
     #[test]
@@ -630,6 +799,48 @@ mod tests {
         state.settings.mode = SerialMode::Text;
         state.prepare().unwrap();
         assert!(state.series.is_empty());
+    }
+
+    #[test]
+    fn parsing_binary_fields_initializes_styles_and_keeps_customizations_for_retained_names() {
+        let mut state = SerialState::default();
+        state.settings.mode = SerialMode::Binary;
+        let original = include_str!("../../../docs/examples/serial-schema.json");
+        state
+            .load_schema("original.json".into(), original.into())
+            .unwrap();
+        assert_eq!(state.settings.binary_colors.len(), 5);
+        assert_eq!(state.settings.binary_line_styles.len(), 5);
+        state
+            .settings
+            .binary_colors
+            .insert("temperature".into(), [1, 2, 3]);
+        state
+            .settings
+            .binary_line_styles
+            .insert("temperature".into(), SerialLineStyle::Star);
+        state
+            .settings
+            .binary_line_styles
+            .insert("speed".into(), SerialLineStyle::Triangle);
+        state
+            .load_schema("updated.json".into(), original.replace("enabled", "ready"))
+            .unwrap();
+        assert_eq!(state.settings.binary_colors["temperature"], [1, 2, 3]);
+        assert_eq!(
+            state.settings.line_style("temperature"),
+            SerialLineStyle::Star
+        );
+        assert_eq!(
+            state.settings.line_style("speed"),
+            SerialLineStyle::Triangle
+        );
+        assert!(!state.settings.binary_colors.contains_key("enabled"));
+        assert!(!state.settings.binary_line_styles.contains_key("enabled"));
+        assert_eq!(state.settings.line_style("ready"), SerialLineStyle::Solid);
+        let serialized = serde_json::to_string(&state.settings).unwrap();
+        let restored: SerialSettings = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored, state.settings);
     }
 
     #[test]
