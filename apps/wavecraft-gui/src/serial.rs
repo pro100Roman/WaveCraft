@@ -32,10 +32,23 @@ pub(crate) enum SerialMode {
     Binary,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SerialLineStyle {
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+    DashDot,
+    DashDotDot,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TextField {
     pub name: String,
     pub color: [u8; 3],
+    #[serde(default)]
+    pub line_style: SerialLineStyle,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,6 +75,7 @@ pub(crate) struct SerialSettings {
     pub crc_big_endian: bool,
     pub crc_include_start: bool,
     pub binary_colors: BTreeMap<String, [u8; 3]>,
+    pub binary_line_styles: BTreeMap<String, SerialLineStyle>,
     pub graph_percent: u8,
 }
 
@@ -89,12 +103,25 @@ impl Default for SerialSettings {
             crc_big_endian: false,
             crc_include_start: false,
             binary_colors: BTreeMap::new(),
+            binary_line_styles: BTreeMap::new(),
             graph_percent: 65,
         }
     }
 }
 
 impl SerialSettings {
+    pub fn line_style(&self, name: &str) -> SerialLineStyle {
+        match self.mode {
+            SerialMode::Text => self
+                .fields
+                .iter()
+                .find(|field| field.name.trim() == name)
+                .map(|field| field.line_style),
+            SerialMode::Binary => self.binary_line_styles.get(name).copied(),
+        }
+        .unwrap_or_default()
+    }
+
     pub fn configuration(&self) -> Result<SerialConfiguration, CaptureError> {
         if self.port.trim().is_empty() {
             return Err("Select or enter a serial port".into());
@@ -483,6 +510,7 @@ impl SerialState {
         let schema = BinarySchema::from_json(&json)?;
         self.settings.schema_name = name;
         self.settings.schema_json = json;
+        self.settings.binary_line_styles.clear();
         self.settings.binary_colors = schema
             .channel_names()
             .into_iter()
@@ -523,10 +551,12 @@ mod tests {
             TextField {
                 name: "temp".into(),
                 color: COLORS[1],
+                line_style: Default::default(),
             },
             TextField {
                 name: "rpm".into(),
                 color: COLORS[2],
+                line_style: Default::default(),
             },
         ];
         state.prepare().unwrap();
@@ -567,6 +597,7 @@ mod tests {
         state.settings.fields.push(TextField {
             name: "v".into(),
             color: COLORS[0],
+            line_style: Default::default(),
         });
         state.prepare().unwrap();
         for index in 0..POINT_CAPACITY + 100 {
@@ -602,13 +633,37 @@ mod tests {
     }
 
     #[test]
+    fn old_serial_settings_default_to_solid_lines_in_both_modes() {
+        let mut settings: SerialSettings = serde_json::from_str(
+            r#"{
+            "fields": [{"name":"voltage", "color":[12,34,56]}]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(settings.line_style("voltage"), SerialLineStyle::Solid);
+        settings.fields[0].line_style = SerialLineStyle::DashDotDot;
+        assert_eq!(settings.line_style("voltage"), SerialLineStyle::DashDotDot);
+        settings.mode = SerialMode::Binary;
+        assert_eq!(settings.line_style("voltage"), SerialLineStyle::Solid);
+        settings
+            .binary_line_styles
+            .insert("voltage".into(), SerialLineStyle::Dashed);
+        assert_eq!(settings.line_style("voltage"), SerialLineStyle::Dashed);
+    }
+
+    #[test]
     fn serial_workspace_settings_restore_on_restart() {
         let mut app = crate::app::test_support::app();
         app.serial.settings.port = "/dev/test-uart".into();
         app.serial.settings.fields.push(TextField {
             name: "voltage".into(),
             color: [12, 34, 56],
+            line_style: SerialLineStyle::DashDot,
         });
+        app.serial
+            .settings
+            .binary_line_styles
+            .insert("flags.ready".into(), SerialLineStyle::Dotted);
         app.serial.settings.graph_percent = 40;
         app.active_workspace_view = Some(crate::WorkspaceView::Serial);
         app.save_global_settings();

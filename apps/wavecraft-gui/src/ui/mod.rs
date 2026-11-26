@@ -15,6 +15,7 @@ pub mod scope_frontend_changes;
 pub mod scope_settings;
 pub mod scope_tools_panel;
 pub mod serial;
+mod serial_line_style;
 pub mod session_tabs;
 pub(crate) mod setup_panel;
 pub mod status_bar;

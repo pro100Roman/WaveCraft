@@ -1,5 +1,6 @@
 //! Serial / UART workspace, matching the instrument toolbar, setup cards and split panes.
 
+use super::serial_line_style::{line_style_picker, paint_serial_line, LINE_STYLE_PICKER_WIDTH};
 use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel};
 use crate::serial::{SerialMode, SerialSettings, SerialState, TextField, COLORS};
 use crate::{
@@ -224,12 +225,6 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn paint_serial_central(&mut self, context: &egui::Context) {
-        let colors_before: Vec<_> = self
-            .serial
-            .series
-            .iter()
-            .map(|series| series.color)
-            .collect();
         workspace_panel(context, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("SERIAL / UART").strong().color(ACCENT));
@@ -313,33 +308,6 @@ impl WaveCraftApp {
                 },
             );
         });
-        if self
-            .serial
-            .series
-            .iter()
-            .map(|series| series.color)
-            .ne(colors_before)
-        {
-            for series in &self.serial.series {
-                if self.serial.settings.mode == SerialMode::Text {
-                    if let Some(field) = self
-                        .serial
-                        .settings
-                        .fields
-                        .iter_mut()
-                        .find(|field| field.name.trim() == series.name)
-                    {
-                        field.color = series.color;
-                    }
-                } else {
-                    self.serial
-                        .settings
-                        .binary_colors
-                        .insert(series.name.clone(), series.color);
-                }
-            }
-            self.save_global_settings();
-        }
     }
 }
 
@@ -546,12 +514,18 @@ fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
         ui.push_id(index, |ui| {
             ui.horizontal(|ui| {
                 ui.color_edit_button_srgb(&mut field.color);
-                ui.add(
+                let name_width = (ui.available_width()
+                    - LINE_STYLE_PICKER_WIDTH
+                    - 24.0
+                    - ui.spacing().item_spacing.x * 2.0)
+                    .max(32.0);
+                ui.add_sized(
+                    [name_width, 20.0],
                     egui::TextEdit::singleline(&mut field.name)
-                        .desired_width((ui.available_width() - 30.0).max(20.0))
                         .char_limit(64)
                         .hint_text("e.g. temperature"),
                 );
+                line_style_picker(ui, &mut field.line_style, field.color);
                 if ui.small_button("×").on_hover_text("Remove field").clicked() {
                     remove = Some(index);
                 }
@@ -571,6 +545,7 @@ fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
         settings.fields.push(TextField {
             name: String::new(),
             color: COLORS[settings.fields.len() % COLORS.len()],
+            line_style: Default::default(),
         });
     }
 }
@@ -610,6 +585,7 @@ fn binary_settings(ui: &mut egui::Ui, state: &mut SerialState) {
             state.settings.schema_json.clear();
             state.settings.schema_name.clear();
             state.settings.binary_colors.clear();
+            state.settings.binary_line_styles.clear();
         }
     });
     if state.settings.schema_json.is_empty() {
@@ -640,15 +616,26 @@ fn binary_settings(ui: &mut egui::Ui, state: &mut SerialState) {
             .small()
             .color(TEXT_MUTED),
         );
+        ui.label(RichText::new("PLOTTED FIELDS").small().color(TEXT_MUTED));
         for (index, name) in schema.channel_names().into_iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.color_edit_button_srgb(
-                    settings
+            ui.push_id(("binary_plot_field", index), |ui| {
+                ui.horizontal(|ui| {
+                    let color = settings
                         .binary_colors
                         .entry(name.clone())
-                        .or_insert(COLORS[index % COLORS.len()]),
-                );
-                ui.label(name);
+                        .or_insert(COLORS[index % COLORS.len()]);
+                    ui.color_edit_button_srgb(color);
+                    let name_width = (ui.available_width()
+                        - LINE_STYLE_PICKER_WIDTH
+                        - ui.spacing().item_spacing.x)
+                        .max(32.0);
+                    ui.add_sized([name_width, 20.0], egui::Label::new(&name).truncate());
+                    line_style_picker(
+                        ui,
+                        settings.binary_line_styles.entry(name.clone()).or_default(),
+                        *color,
+                    );
+                });
             });
         }
     }
@@ -751,34 +738,6 @@ fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
                 state.follow = true;
             }
         });
-        if !state.series.is_empty() {
-            egui::ScrollArea::horizontal()
-                .id_salt("serial_legend")
-                .max_height(24.0)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for series in &mut state.series {
-                            ui.color_edit_button_srgb(&mut series.color);
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}  {}",
-                                    series.name,
-                                    series
-                                        .points
-                                        .back()
-                                        .map(|point| format!("{:.3}", point[1]))
-                                        .unwrap_or_else(|| "—".into())
-                                ))
-                                .color(egui::Color32::from_rgb(
-                                    series.color[0],
-                                    series.color[1],
-                                    series.color[2],
-                                )),
-                            );
-                        }
-                    });
-                });
-        }
         let (surface, response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), ui.available_height().max(0.0)),
             egui::Sense::drag(),
@@ -895,7 +854,12 @@ fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
             if points.len() == 1 {
                 painter.circle_filled(points[0], 2.5, color);
             } else if !points.is_empty() {
-                painter.add(egui::Shape::line(points, egui::Stroke::new(1.5_f32, color)));
+                paint_serial_line(
+                    &painter,
+                    &points,
+                    state.settings.line_style(&series.name),
+                    color,
+                );
             }
         }
         if state.series.iter().all(|series| series.points.is_empty()) {
@@ -959,6 +923,7 @@ fn paint_raw(ui: &mut egui::Ui, state: &mut SerialState) {
                 .color(ACCENT),
             );
         });
+        ui.add_space(8.0);
         if state.raw.is_empty() {
             ui.label(
                 RichText::new("Start receiving or open a raw capture to inspect incoming bytes.")
@@ -1049,12 +1014,73 @@ mod tests {
     }
 
     #[test]
+    fn graph_does_not_repeat_field_controls_or_latest_value_legend() {
+        let mut app = crate::app::test_support::app();
+        app.serial.settings.fields.push(TextField {
+            name: "temperature".into(),
+            color: COLORS[0],
+            line_style: Default::default(),
+        });
+        app.serial.prepare().unwrap();
+        app.serial.ingest(1.0, b"temperature=42\n");
+        let context = egui::Context::default();
+        let _ = render(&mut app, &context, vec![]);
+        let output = render(&mut app, &context, vec![]);
+        let labels = texts(&output.shapes);
+        assert!(labels.iter().any(|text| text == "GRAPH"));
+        assert!(!labels
+            .iter()
+            .any(|text| text == "PLOTTED FIELDS" || text.starts_with("temperature  ")));
+        assert!(labels.iter().any(|text| text == "temperature=42"));
+    }
+
+    #[test]
+    fn raw_data_has_breathing_room_below_both_format_headers() {
+        for mode in [SerialMode::Text, SerialMode::Binary] {
+            let mut app = crate::app::test_support::app();
+            app.serial.settings.mode = mode;
+            app.serial.ingest(1.0, b"temperature=42\n");
+            let context = egui::Context::default();
+            let _ = render(&mut app, &context, vec![]);
+            let output = render(&mut app, &context, vec![]);
+            let text_shapes: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect();
+            let header_bottom = text_shapes
+                .iter()
+                .filter(|text| matches!(text.galley.text(), "RAW DATA" | "ASCII" | "HEX + ASCII"))
+                .map(|text| text.visual_bounding_rect().bottom())
+                .fold(f32::NEG_INFINITY, f32::max);
+            let first_data = text_shapes
+                .iter()
+                .find(|text| {
+                    if mode == SerialMode::Text {
+                        text.galley.text() == "temperature=42"
+                    } else {
+                        text.galley.text().contains("74 65 6D 70")
+                    }
+                })
+                .expect("raw data is visible");
+            assert!(
+                first_data.visual_bounding_rect().top() - header_bottom >= 8.0,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn splitter_accepts_small_drag_steps_and_persists_height() {
         let mut app = crate::app::test_support::app();
         app.active_workspace_view = Some(WorkspaceView::Serial);
         app.serial.settings.fields.push(TextField {
             name: "temperature".into(),
             color: COLORS[0],
+            line_style: Default::default(),
         });
         app.serial.prepare().unwrap();
         for index in 0..100 {

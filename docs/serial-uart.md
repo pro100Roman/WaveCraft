@@ -13,14 +13,17 @@ custom value; use the arrow to show all standard rates through 3,000,000.
 The graph and raw-data pane share the available height. Drag their divider to
 resize them; double-click it to restore the default split. On the graph, scroll
 to zoom the time range, drag to inspect earlier points, and use **Follow** or
-**Fit** to return to incoming data. Colors can be changed in setup or the graph
-legend and are saved with the other serial settings.
+**Fit** to return to incoming data. **PLOTTED FIELDS** in setup is the single
+place to choose field colors and line styles. The style selector shows the
+actual stroke: solid, dashed, dotted, dash-dot, or dash-dot-dot. These choices
+apply to retained traces and are saved with the other serial settings; binary
+channels have independent styles too. The graph does not repeat the field list.
 
 With **no text fields** or **no binary schema**, Start still reads the port and
 shows only raw data in the lower pane. A schema is never required for receiving.
 Text renders printable ASCII, CR/LF records and escaped nonprintable bytes.
-Binary renders byte offsets, hexadecimal bytes and printable ASCII. Copy copies
-the displayed representation; Save raw writes the retained bytes unchanged.
+Binary renders byte offsets, hexadecimal bytes and printable ASCII. Select text
+and use Cmd+C / Ctrl+C to copy it; Save raw writes the retained bytes unchanged.
 
 History is bounded to the latest 64 KiB of raw bytes and 10,000 points per field.
 Save raw exports that retained window, not an unlimited recording. Open raw
@@ -31,7 +34,7 @@ is estimated from the configured baud rate and UART frame size.
 
 ## Text fields
 
-Add up to ten named fields and choose each line's color. For example, fields
+Add up to ten named fields and choose each line's color and stroke style. For example, fields
 `temperature` and `rpm` match:
 
 ```text
