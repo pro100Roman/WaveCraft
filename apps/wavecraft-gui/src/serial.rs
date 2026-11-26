@@ -177,6 +177,7 @@ pub(crate) struct SerialState {
     pub status: String,
     pub error: Option<String>,
     pub setup_open: bool,
+    pub baud_draft: Option<String>,
     pub follow: bool,
     pub time_window: f64,
     pub latest_time: f64,
@@ -204,6 +205,7 @@ impl Default for SerialState {
             status: "Disconnected".into(),
             error: None,
             setup_open: true,
+            baud_draft: None,
             follow: true,
             time_window: 10.0,
             latest_time: 0.0,
@@ -232,7 +234,20 @@ impl SerialState {
         }
     }
 
+    fn apply_baud_draft(&mut self) -> Result<(), CaptureError> {
+        if let Some(draft) = &self.baud_draft {
+            self.settings.baud = draft
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|baud| (1..=12_000_000).contains(baud))
+                .ok_or_else(|| CaptureError::new("Baud rate must be between 1 and 12000000"))?;
+        }
+        Ok(())
+    }
+
     pub fn prepare(&mut self) -> Result<(), CaptureError> {
+        self.apply_baud_draft()?;
         let binary = self.settings.binary_decoder()?;
         if self.settings.fields.len() > wavecraft_serial::MAX_TEXT_FIELDS {
             return Err("At most 10 text fields are supported".into());
@@ -288,6 +303,7 @@ impl SerialState {
     }
 
     pub fn start(&mut self) -> Result<(), CaptureError> {
+        self.apply_baud_draft()?;
         let configuration = self.settings.configuration()?;
         self.prepare()?;
         self.session = Some(CaptureCoordinator::start(vec![Box::new(SerialSource(

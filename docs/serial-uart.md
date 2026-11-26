@@ -1,11 +1,14 @@
 # Serial / UART workspace
 
-Select **Serial / UART**, choose a discovered port (or type its path / COM name),
+Select **Serial / UART**, choose a discovered port from the dropdown,
 set the baud rate, data bits, parity, stop bits and flow control, and press
 **Start**. **Stop** releases the port; **Clear** resets the displayed history and
 partial decoder state. Port and decoding changes apply on the next Start or Open raw;
 color edits apply immediately.
-The workspace can receive alongside the other instruments.
+The workspace can receive alongside the other instruments. PORT and DATA FORMAT
+can be collapsed independently. Baud rate uses an editable field with a dropdown,
+like the System Trace target selector. Type to filter standard rates or enter a
+custom value; use the arrow to show all standard rates through 3,000,000.
 
 The graph and raw-data pane share the available height. Drag their divider to
 resize them; double-click it to restore the default split. On the graph, scroll

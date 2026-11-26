@@ -6,6 +6,12 @@ use crate::{
 };
 use wavecraft_serial::BinarySchema;
 
+const BAUD_RATES: &[u32] = &[
+    110, 300, 600, 1_200, 2_400, 4_800, 9_600, 14_400, 19_200, 28_800, 38_400, 57_600, 76_800,
+    115_200, 128_000, 153_600, 230_400, 256_000, 460_800, 500_000, 576_000, 921_600, 1_000_000,
+    1_152_000, 1_500_000, 2_000_000, 2_500_000, 3_000_000,
+];
+
 impl WaveCraftApp {
     pub(crate) fn serial_view_is_active(&self) -> bool {
         self.active_workspace_view == Some(WorkspaceView::Serial)
@@ -204,28 +210,28 @@ impl WaveCraftApp {
                                     .color(TEXT_MUTED),
                             );
                         }
-                        ui.add_enabled_ui(!running, |ui| {
-                            setup_card(ui, "PORT", |ui| port_settings(ui, &mut self.serial));
-                            ui.add_space(10.0);
-                            setup_card(ui, "DATA FORMAT", |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.selectable_value(
-                                        &mut self.serial.settings.mode,
-                                        SerialMode::Text,
-                                        "Text / ASCII",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.serial.settings.mode,
-                                        SerialMode::Binary,
-                                        "Binary",
-                                    );
-                                });
-                                if self.serial.settings.mode == SerialMode::Text {
-                                    text_settings(ui, &mut self.serial.settings);
-                                } else {
-                                    binary_settings(ui, &mut self.serial);
-                                }
+                        setup_card(ui, "PORT", !running, |ui| {
+                            port_settings(ui, &mut self.serial)
+                        });
+                        ui.add_space(10.0);
+                        setup_card(ui, "DATA FORMAT", !running, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    &mut self.serial.settings.mode,
+                                    SerialMode::Text,
+                                    "Text / ASCII",
+                                );
+                                ui.selectable_value(
+                                    &mut self.serial.settings.mode,
+                                    SerialMode::Binary,
+                                    "Binary",
+                                );
                             });
+                            if self.serial.settings.mode == SerialMode::Text {
+                                text_settings(ui, &mut self.serial.settings);
+                            } else {
+                                binary_settings(ui, &mut self.serial);
+                            }
                         });
                         ui.add_space(10.0);
                         ui.label(
@@ -400,7 +406,7 @@ impl WaveCraftApp {
     }
 }
 
-fn setup_card(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
+fn setup_card(ui: &mut egui::Ui, title: &str, enabled: bool, contents: impl FnOnce(&mut egui::Ui)) {
     let width = ui.available_width();
     egui::Frame::none()
         .fill(BACKGROUND)
@@ -408,83 +414,184 @@ fn setup_card(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::U
         .inner_margin(10.0)
         .show(ui, |ui| {
             ui.set_width((width - 20.0).max(0.0));
-            ui.label(RichText::new(title).strong().color(TEXT_MUTED));
-            ui.add_space(6.0);
-            contents(ui);
+            egui::CollapsingHeader::new(RichText::new(title).strong().color(TEXT_MUTED))
+                .id_salt(("serial_setup_card", title))
+                .default_open(true)
+                .show_unindented(ui, |ui| {
+                    ui.add_space(6.0);
+                    ui.add_enabled_ui(enabled, contents);
+                });
         });
 }
 
 fn port_settings(ui: &mut egui::Ui, state: &mut SerialState) {
     let settings = &mut state.settings;
+    let width = ui.available_width();
+    ui.label("Port");
     egui::ComboBox::from_id_salt("serial_ports")
-        .width(ui.available_width() - 8.0)
+        .width(width)
+        .truncate()
         .selected_text(if settings.port.is_empty() {
             "Select port"
         } else {
             &settings.port
         })
         .show_ui(ui, |ui| {
+            if state.ports.is_empty() {
+                ui.add_enabled(false, egui::Label::new("No serial ports found"));
+            }
             for port in &state.ports {
                 ui.selectable_value(&mut settings.port, port.clone(), port);
             }
         });
-    ui.add(
-        egui::TextEdit::singleline(&mut settings.port)
-            .hint_text("Or enter port path / COM name")
-            .desired_width(f32::INFINITY),
-    );
-    ui.horizontal(|ui| {
-        ui.label("Baud rate");
-        ui.add(
-            egui::DragValue::new(&mut settings.baud)
-                .range(1..=12_000_000)
-                .speed(100.0),
-        );
-    });
-    egui::Grid::new("serial_port_options")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Data bits");
-            egui::ComboBox::from_id_salt("serial_data_bits")
-                .selected_text(settings.data_bits.to_string())
-                .show_ui(ui, |ui| {
-                    for bits in 5..=8 {
-                        ui.selectable_value(&mut settings.data_bits, bits, bits.to_string());
-                    }
-                });
-            ui.end_row();
-            ui.label("Parity");
-            string_combo(
-                ui,
-                "serial_parity",
-                &mut settings.parity,
-                &["None", "Even", "Odd"],
-            );
-            ui.end_row();
-            ui.label("Stop bits");
-            egui::ComboBox::from_id_salt("serial_stop_bits")
-                .selected_text(settings.stop_bits.to_string())
-                .show_ui(ui, |ui| {
-                    for bits in 1..=2 {
-                        ui.selectable_value(&mut settings.stop_bits, bits, bits.to_string());
-                    }
-                });
-            ui.end_row();
-            ui.label("Flow control");
-            string_combo(
-                ui,
-                "serial_flow",
-                &mut settings.flow_control,
-                &["None", "RTS/CTS", "XON/XOFF"],
-            );
-            ui.end_row();
+
+    ui.label("Baud rate");
+    paint_baud_rate_selector(ui, &mut settings.baud, &mut state.baud_draft);
+
+    ui.label("Data bits");
+    egui::ComboBox::from_id_salt("serial_data_bits")
+        .width(width)
+        .selected_text(settings.data_bits.to_string())
+        .show_ui(ui, |ui| {
+            for bits in 5..=8 {
+                ui.selectable_value(&mut settings.data_bits, bits, bits.to_string());
+            }
         });
+    ui.label("Parity");
+    string_combo(
+        ui,
+        "serial_parity",
+        &mut settings.parity,
+        &["None", "Even", "Odd"],
+    );
+    ui.label("Stop bits");
+    egui::ComboBox::from_id_salt("serial_stop_bits")
+        .width(width)
+        .selected_text(settings.stop_bits.to_string())
+        .show_ui(ui, |ui| {
+            for bits in 1..=2 {
+                ui.selectable_value(&mut settings.stop_bits, bits, bits.to_string());
+            }
+        });
+    ui.label("Flow control");
+    string_combo(
+        ui,
+        "serial_flow",
+        &mut settings.flow_control,
+        &["None", "RTS/CTS", "XON/XOFF"],
+    );
+}
+
+fn paint_baud_rate_selector(ui: &mut egui::Ui, baud: &mut u32, draft: &mut Option<String>) {
+    let draft = draft.get_or_insert_with(|| baud.to_string());
+    let popup_id = ui.make_persistent_id("serial_baud_rate_popup");
+    let filter_id = popup_id.with("show_all");
+    let controls = ui.horizontal(|ui| {
+        let button_width = 24.0;
+        let text_width =
+            (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(button_width);
+        let text = ui
+            .add_sized(
+                [text_width, 20.0],
+                egui::TextEdit::singleline(draft)
+                    .hint_text("Type or select a baud rate")
+                    .char_limit(8),
+            )
+            .on_hover_text(
+                "Type a baud rate to filter the standard speeds, or enter a custom value",
+            );
+        let dropdown = ui
+            .add_sized([button_width, 20.0], egui::Button::new("▾"))
+            .on_hover_text("Show standard baud rates up to 3000000");
+        (text, dropdown)
+    });
+    let (text_response, dropdown_response) = controls.inner;
+    let anchor_response = text_response.clone().union(dropdown_response.clone());
+    if dropdown_response.clicked() {
+        ui.data_mut(|data| data.insert_temp(filter_id, true));
+        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+    } else if text_response.clicked() || text_response.gained_focus() || text_response.changed() {
+        ui.data_mut(|data| data.insert_temp(filter_id, false));
+        ui.memory_mut(|memory| memory.open_popup(popup_id));
+    }
+    let valid_baud = draft
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|baud| (1..=12_000_000).contains(baud));
+    if let Some(value) = valid_baud {
+        *baud = value;
+    }
+    if (text_response.has_focus() || text_response.lost_focus())
+        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        && valid_baud.is_some()
+    {
+        text_response.surrender_focus();
+        ui.memory_mut(egui::Memory::close_popup);
+    }
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &anchor_response,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |popup_ui| {
+            popup_ui.set_min_width(anchor_response.rect.width());
+            popup_ui.set_max_width(anchor_response.rect.width());
+            popup_ui.label(
+                RichText::new("Standard baud rates")
+                    .small()
+                    .color(TEXT_MUTED),
+            );
+            popup_ui.separator();
+            let show_all = popup_ui.data(|data| data.get_temp::<bool>(filter_id).unwrap_or(false));
+            let query = draft.trim();
+            let mut selected = None;
+            egui::ScrollArea::vertical()
+                .id_salt("serial_baud_rate_results")
+                .max_height(240.0)
+                .auto_shrink([false, false])
+                .show(popup_ui, |ui| {
+                    let mut matches = 0;
+                    for rate in BAUD_RATES
+                        .iter()
+                        .filter(|rate| show_all || rate.to_string().contains(query))
+                    {
+                        matches += 1;
+                        if ui
+                            .selectable_label(valid_baud == Some(*rate), rate.to_string())
+                            .clicked()
+                        {
+                            selected = Some(*rate);
+                        }
+                    }
+                    if matches == 0 {
+                        ui.label(
+                            RichText::new("No standard match · use the typed value")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                    }
+                });
+            if let Some(rate) = selected {
+                *baud = rate;
+                *draft = rate.to_string();
+                text_response.surrender_focus();
+                popup_ui.memory_mut(egui::Memory::close_popup);
+            }
+        },
+    );
+    if valid_baud.is_none() {
+        ui.colored_label(
+            egui::Color32::LIGHT_RED,
+            "Enter a baud rate from 1 to 12000000",
+        );
+    }
 }
 
 fn string_combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[&str]) {
     egui::ComboBox::from_id_salt(id)
         .selected_text(value.as_str())
-        .width(110.0)
+        .width(ui.available_width())
         .show_ui(ui, |ui| {
             for option in options {
                 ui.selectable_value(value, (*option).to_owned(), *option);

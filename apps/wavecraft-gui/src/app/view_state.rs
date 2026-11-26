@@ -230,6 +230,7 @@ impl WaveCraftApp {
     pub(crate) fn apply_saved_capture_settings(&mut self) {
         if let Some(settings) = &self.saved_capture_settings.global.serial {
             self.serial.settings = settings.clone();
+            self.serial.baud_draft = None;
             self.serial
                 .settings
                 .fields
