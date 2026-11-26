@@ -3,7 +3,9 @@
 use super::serial_graph::paint_graph;
 use super::serial_line_style::{line_style_picker, LINE_STYLE_PICKER_WIDTH};
 use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel};
-use crate::serial::{SerialMode, SerialSettings, SerialState, TextField, COLORS};
+use crate::serial::{
+    SerialMode, SerialSettings, SerialState, SerialTimestampUnit, TextField, COLORS,
+};
 use crate::{
     egui, toolbar_action_button, RichText, WaveCraftApp, WorkspaceView, ACCENT, GRID, TEXT_MUTED,
 };
@@ -160,6 +162,10 @@ impl WaveCraftApp {
                             binary_settings(ui, &mut app.serial);
                         }
                     });
+                    ui.add_space(10.0);
+                    setup_section(ui, "X AXIS", !running, |ui| {
+                        x_axis_settings(ui, &mut app.serial.settings)
+                    });
                 });
                 ui.add_space(10.0);
                 ui.label(
@@ -216,6 +222,10 @@ impl WaveCraftApp {
                         egui::Color32::LIGHT_RED,
                         format!("{} rejected", self.serial.rejected_frames),
                     );
+                }
+                if self.serial.invalid_x_records > 0 {
+                    ui.label(format!("{} invalid X values", self.serial.invalid_x_records))
+                        .on_hover_text("Missing, nonfinite or decreasing timestamps are excluded from plotting. Raw bytes are preserved.");
                 }
                 if self.serial.discarded_bytes > 0 {
                     ui.label(format!("{} unsynced bytes", self.serial.discarded_bytes));
@@ -541,6 +551,68 @@ fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
     }
 }
 
+fn x_axis_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
+    let names: Vec<String> = match settings.mode {
+        SerialMode::Text => settings
+            .fields
+            .iter()
+            .map(|field| field.name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .collect(),
+        SerialMode::Binary => BinarySchema::from_json(&settings.schema_json)
+            .map(|schema| schema.channel_names())
+            .unwrap_or_default(),
+    };
+    ui.label("Timestamp field");
+    egui::ComboBox::from_id_salt("serial_timestamp_field")
+        .width(ui.available_width())
+        .selected_text(if settings.timestamp_field.is_empty() {
+            "None"
+        } else {
+            &settings.timestamp_field
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut settings.timestamp_field, String::new(), "None");
+            for name in names {
+                ui.selectable_value(&mut settings.timestamp_field, name.clone(), name);
+            }
+        });
+    if !settings.timestamp_field.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label("Unit");
+            egui::ComboBox::from_id_salt("serial_timestamp_unit")
+                .selected_text(settings.timestamp_unit.label())
+                .show_ui(ui, |ui| {
+                    for unit in SerialTimestampUnit::ALL {
+                        ui.selectable_value(&mut settings.timestamp_unit, unit, unit.label());
+                    }
+                });
+        });
+        ui.label("Timestamp multiplier");
+        ui.add(
+            egui::TextEdit::singleline(&mut settings.timestamp_multiplier)
+                .desired_width(ui.available_width())
+                .hint_text("1"),
+        )
+        .on_hover_text(
+            "Time = timestamp × multiplier × unit. For ticks of 10 ms, choose ms and enter 10.",
+        );
+    }
+    ui.label("Sample rate (Hz)");
+    ui.add_enabled(settings.timestamp_field.is_empty(), egui::TextEdit::singleline(&mut settings.sample_rate)
+        .desired_width(ui.available_width()).hint_text("Optional — sample number if empty"))
+        .on_hover_text("Shared by ASCII and Binary. Without a timestamp, time = sample number / sample rate. A selected timestamp takes precedence.");
+    ui.label(
+        RichText::new(if settings.timestamp_field.is_empty() {
+            "No timestamp: sample numbers from 0, or time from sample rate."
+        } else {
+            "The selected field supplies X; other fields supply Y."
+        })
+        .small()
+        .color(TEXT_MUTED),
+    );
+}
+
 fn binary_settings(ui: &mut egui::Ui, state: &mut SerialState) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -780,6 +852,35 @@ fn paint_raw(ui: &mut egui::Ui, state: &mut SerialState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_labels_switch_from_sample_numbers_to_sample_rate_time_on_plot() {
+        let mut app = crate::app::test_support::app();
+        app.serial.settings.fields.push(TextField {
+            name: "temperature".into(),
+            separator: String::new(),
+            color: COLORS[0],
+            line_style: Default::default(),
+        });
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/examples/serial-ascii.txt");
+        app.serial.import_raw(&path).unwrap();
+        app.serial.fit_graph();
+        let context = egui::Context::default();
+        let labels = texts(&render(&mut app, &context, vec![]).shapes);
+        assert!(labels.iter().any(|label| label == "X: Sample"));
+        assert!(labels.iter().any(|label| label == "samples"));
+        app.serial.settings.sample_rate = "1000".into();
+        // Editing settings does not relabel the old graph before applying Plot.
+        assert!(texts(&render(&mut app, &context, vec![]).shapes)
+            .iter()
+            .any(|label| label == "X: Sample"));
+        app.serial.plot_imported().unwrap();
+        let labels = texts(&render(&mut app, &context, vec![]).shapes);
+        assert!(labels.iter().any(|label| label == "X: Time"));
+        assert!(labels.iter().any(|label| label.ends_with("ms")));
+        assert!(!labels.iter().any(|label| label == "samples"));
+    }
 
     #[test]
     fn plot_button_appears_left_of_start_and_replots_opened_file_with_name_in_status() {
@@ -1024,9 +1125,17 @@ mod tests {
                 color: COLORS[0],
                 line_style: Default::default(),
             });
+            app.serial.settings.fields.push(TextField {
+                name: "ts".into(),
+                separator: String::new(),
+                color: COLORS[1],
+                line_style: Default::default(),
+            });
+            app.serial.settings.timestamp_field = "ts".into();
             app.serial.prepare().unwrap();
             for (time, value) in [(first, 0), ((first + last) / 2.0, 1), (last, 2)] {
-                app.serial.ingest(time, format!("v={value}\n").as_bytes());
+                app.serial
+                    .ingest(0.0, format!("v={value} ts={time}\n").as_bytes());
             }
             app.serial.ingest(last + 30.0, b"no matching values\n");
             let context = egui::Context::default();

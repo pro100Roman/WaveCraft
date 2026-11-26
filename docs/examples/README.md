@@ -7,7 +7,7 @@ temperature ramps from 18 to 34, speed ramps from 0 to 96, and `enabled`, `fault
 and `mode` change in steps. They exercise multiple traces, line styles and zoom
 without a connected serial adapter. Both files fit within raw-data history.
 
-In **Serial / UART**, use **115200 baud, 8 data bits, no parity, 1 stop bit**:
+In **Serial / UART**, open the samples with these decoding settings:
 
 For raw viewing only, choose **Text / ASCII** or **Binary** and open the file;
 fields and JSON are optional. The setup below enables graph decoding as well.
@@ -27,9 +27,11 @@ framing/CRC settings. Each frame is 13 bytes: 2 start bytes, a little-endian
 2 stop bytes. Status packs `enabled` into bit 0, `fault` into bits 1–3, and
 `mode` into bits 4–7.
 
-After opening either sample, press **Fit** or double-click the graph. File
-timestamps are estimated from baud rate and byte count, so the same record
-sequence spans different durations in ASCII and Binary.
+After opening either sample, press **Fit** or double-click the graph. Neither
+sample contains a timestamp: with no timestamp field or sample rate selected,
+X shows sample numbers `0–511`. Set the shared **Sample rate (Hz)** to `1000`
+and press **Plot** to show `0–511 ms` in either format. Baud rate does not affect
+the file's graph coordinates.
 
 Reproduce both files and their schema from the workspace root with:
 

@@ -14,7 +14,7 @@ The graph and raw-data pane share the available height. Drag their divider to
 resize them; double-click it to restore the default split. On the graph, scroll
 to zoom horizontally; hold Ctrl or Cmd while scrolling to zoom both axes around
 the pointer. Ordinary scrolling preserves the vertical scale. Drag to inspect
-earlier points. Type the time span in seconds in the graph header; dragging
+earlier points. Type the X span (samples or seconds) in the graph header; dragging
 this text field does not change its value. The data readout appears below and
 to the right of the pointer, flips at plot edges, and stays inside the plot.
 Its width follows the text, and each field uses its trace color. Segments remain
@@ -52,11 +52,40 @@ and use Cmd+C / Ctrl+C to copy it; Save raw writes the retained bytes unchanged.
 History is bounded to the latest 64 KiB of raw bytes and 10,000 points per field.
 Save raw exports that retained window, not an unlimited recording. Open raw
 accepts up to 8 MiB and processes it using the current decoding settings.
-Live graph timestamps are host receive times; multiple records in one read
-share that timestamp. Imported raw bytes have no timestamps, so their time axis
-is estimated from the configured baud rate and UART frame size. Multiple
-decoded records in one file-read block are distributed over that estimated
-interval; live records continue to share their receive timestamp.
+
+## X axis
+
+The common **X AXIS** settings apply to both ASCII and Binary, for live data and
+opened files. Fields are never guessed to be timestamps:
+
+| Settings | X coordinate |
+| --- | --- |
+| No timestamp field, empty sample rate | Sample number, starting at 0 |
+| No timestamp field, positive sample rate in Hz | Sample number / sample rate, in seconds |
+| Explicitly selected timestamp field | Field value × timestamp multiplier × selected time unit |
+
+Configure the ASCII fields or load the binary schema, then choose **Timestamp
+field** from their names, or **None**. A selected timestamp field supplies X and
+is excluded from the Y traces. Select seconds, milliseconds, microseconds or
+nanoseconds, and enter a finite positive **Timestamp multiplier** (default 1).
+For ticks representing 10 ms, choose **ms** and multiplier **10**: values
+`1, 2, 3` become `10, 20, 30 ms`. The sample rate, time unit and multiplier are
+shared settings retained when switching between ASCII and Binary.
+
+Without a selected timestamp, **Sample rate (Hz)** is optional. For example,
+1000 Hz places samples `0, 1, 2` at `0, 1, 2 ms`. A selected timestamp takes
+precedence over sample rate. Baud rate and host receive timing do not determine
+the graph's X coordinates. Every decoded record containing a configured value
+advances the sample number; chunk/read boundaries do not affect it.
+
+Missing, nonfinite or decreasing timestamp values reject that record from the
+graph and increase the rejected/invalid-X counters; raw bytes remain available.
+Equal timestamps are accepted. There is no fallback to sample numbers for an
+individual record when a timestamp field has been selected.
+
+The graph header, axis labels and hover readout distinguish sample numbers from
+time. Apply settings with **Plot**, **Open raw…** or the next **Start**. **Clear**
+resets numbering to 0. Older saved settings default to sample numbers.
 
 ## Text fields
 

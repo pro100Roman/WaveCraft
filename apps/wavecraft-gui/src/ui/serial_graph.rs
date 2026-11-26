@@ -5,9 +5,7 @@ use super::{
     serial_line_style::paint_serial_line,
     view_shell::view_card,
 };
-use crate::serial::{
-    SerialGraphValueRange, SerialMode, SerialState, MIN_GRAPH_TIME_WINDOW_SECONDS,
-};
+use crate::serial::{SerialGraphValueRange, SerialMode, SerialState};
 use crate::{egui, RichText, BACKGROUND, GRID, TEXT_MUTED};
 
 pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
@@ -17,6 +15,15 @@ pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
             if ui.checkbox(&mut state.follow, "Follow").changed() {
                 state.graph_end = state.graph_latest_time();
             }
+            ui.label(
+                RichText::new(if state.x_axis.is_time() {
+                    "X: Time"
+                } else {
+                    "X: Sample"
+                })
+                .small()
+                .color(TEXT_MUTED),
+            );
             time_window_editor(ui, state);
             if ui.small_button("Fit").clicked() {
                 state.fit_graph();
@@ -45,7 +52,11 @@ pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
             scale,
         } = values;
         let painter = ui.painter().with_clip_rect(surface);
-        let (time_unit, time_multiplier) = crate::time_scale_unit(end);
+        let (time_unit, time_multiplier) = if state.x_axis.is_time() {
+            crate::time_scale_unit(end.abs().max(start.abs()))
+        } else {
+            ("", 1.0)
+        };
         let time_precision = crate::time_scale_precision((end - start) * time_multiplier / 4.0);
         for step in 0..=4 {
             let fraction = step as f32 / 4.0;
@@ -72,6 +83,13 @@ pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
                 [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
                 egui::Stroke::new(1.0_f32, GRID),
             );
+            let value = (start + f64::from(fraction) * (end - start)) * time_multiplier;
+            // Fit widens by a few ulps; do not show that padding as "-0.00 s".
+            let value = if value.abs() < 0.5 * 10.0_f64.powi(-(time_precision as i32)) {
+                0.0
+            } else {
+                value
+            };
             painter.text(
                 egui::pos2(x, plot.bottom() + 5.0),
                 if step == 0 {
@@ -81,11 +99,7 @@ pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
                 } else {
                     egui::Align2::CENTER_TOP
                 },
-                format!(
-                    "{:.*}{time_unit}",
-                    time_precision,
-                    (start + f64::from(fraction) * (end - start)) * time_multiplier
-                ),
+                format!("{:.*}{time_unit}", time_precision, value),
                 egui::FontId::monospace(10.0),
                 TEXT_MUTED,
             );
@@ -132,7 +146,12 @@ pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
                 ],
                 egui::Stroke::new(1.0_f32, TEXT_MUTED),
             );
-            let mut rows = vec![(format!("{time:.9} s"), ui.visuals().text_color())];
+            let coordinate = if state.x_axis.is_time() {
+                format!("{time:.9} s")
+            } else {
+                format!("Sample {time:.2}")
+            };
+            let mut rows = vec![(coordinate, ui.visuals().text_color())];
             for series in &state.series {
                 if let Some(point) = series
                     .points
@@ -289,7 +308,7 @@ fn time_window_editor(ui: &mut egui::Ui, state: &mut SerialState) -> egui::Respo
         .trim()
         .parse::<f64>()
         .ok()
-        .filter(|value| value.is_finite() && *value >= MIN_GRAPH_TIME_WINDOW_SECONDS);
+        .filter(|value| value.is_finite() && *value >= state.x_axis.minimum_span());
     if response.changed() {
         if let Some(value) = parsed {
             state.time_window = value;
@@ -298,11 +317,15 @@ fn time_window_editor(ui: &mut egui::Ui, state: &mut SerialState) -> egui::Respo
     if response.has_focus() {
         state.time_window_draft = Some(draft);
     }
-    ui.label("s");
-    response.on_hover_text(if parsed.is_some() {
-        "Time span in seconds. Type a value to edit."
+    ui.label(if state.x_axis.is_time() {
+        "s"
     } else {
-        "Enter a finite time span of at least 0.000000001 seconds."
+        "samples"
+    });
+    response.on_hover_text(if parsed.is_some() {
+        "Visible X span: seconds for time, sample count for sample numbers. Type to edit."
+    } else {
+        "Enter a finite positive span (at least 1 sample or 0.000000001 seconds)."
     })
 }
 
@@ -370,7 +393,7 @@ fn handle_graph_input(
         let (start, end) = state.graph_time_range();
         let shift =
             f64::from(ui.input(|input| input.pointer.delta().x) / plot.width()) * (end - start);
-        state.graph_end = (end - shift).max(end - start);
+        state.graph_end = (end - shift).max(state.x_axis.minimum_x() + end - start);
         state.follow = false;
         state.graph_value_range = Some(*values);
     }
@@ -388,8 +411,8 @@ fn zoom_graph(
     let (start, end) = state.graph_time_range();
     let x = f64::from((pointer.x - plot.left()) / plot.width());
     let anchor = start + x * (end - start);
-    let span = ((end - start) * factor).clamp(MIN_GRAPH_TIME_WINDOW_SECONDS, 1e12);
-    let start = (anchor - x * span).max(0.0);
+    let span = ((end - start) * factor).clamp(state.x_axis.minimum_span(), 1e12);
+    let start = (anchor - x * span).max(state.x_axis.minimum_x());
     state.time_window = span;
     state.graph_end = start + span;
     state.follow = false;
@@ -499,6 +522,7 @@ mod tests {
         let plot = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(900.0, 500.0));
         for both_axes in [false, true] {
             let mut state = SerialState::default();
+            state.x_axis = crate::serial::SerialXAxis::SampleRate(1.0);
             state.follow = false;
             state.graph_end = 10.0;
             let mut values = SerialGraphValueRange {
@@ -687,6 +711,7 @@ mod tests {
     fn time_editor_accepts_typed_values_but_dragging_does_not_change_time() {
         let context = egui::Context::default();
         let mut state = SerialState::default();
+        state.x_axis = crate::serial::SerialXAxis::SampleRate(1000.0);
         let rect = editor_frame(&context, &mut state, vec![]);
         let position = rect.center();
         for (pressed, pos) in [
