@@ -50,6 +50,17 @@ fi
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$default_deployment_target}"
 
 cd "$project_root"
+# Cargo reads package versions before build.rs runs. Synchronize the manifests,
+# lockfile, and bundle metadata on every packaging run, before either build path.
+if [[ "${GITHUB_ACTIONS:-}" == "true" && "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+    python3 "$script_directory/set_release_version.py" "${GITHUB_REF_NAME:?missing CI release tag}"
+else
+    if [[ "${GITHUB_ACTIONS:-}" != "true" ]]; then
+        git fetch --tags origin
+    fi
+    python3 "$script_directory/set_release_version.py"
+fi
+
 if "$universal"; then
     cargo build --release --locked -p wavecraft-gui \
         --target aarch64-apple-darwin

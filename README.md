@@ -315,6 +315,13 @@ with:
 ./scripts/package-macos.sh
 ```
 
+Each local packaging run fetches tags from `origin` and sets the CLI and GUI
+Cargo versions, `Cargo.lock`, and macOS bundle versions to the highest SemVer
+tag before building. This requires access to `origin` and updates those version
+fields in the working tree. A failed fetch stops packaging instead of building
+with a stale version. CI release builds use the triggering tag, even when a
+newer tag exists.
+
 Pass `--universal` to build a bundle containing both ARM64 and x86-64 executable
 slices. The two Rust targets must be installed before making a universal build:
 
