@@ -1,0 +1,2 @@
+# UART samples are raw wire bytes; preserve CRLF record separators.
+docs/examples/serial-ascii.txt -text

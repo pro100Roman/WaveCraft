@@ -202,6 +202,12 @@ pub(crate) struct SerialGraphValueRange {
     pub scale: f64,
 }
 
+#[derive(Clone)]
+pub(crate) struct ImportedSerialFile {
+    path: std::path::PathBuf,
+    bytes: std::sync::Arc<[u8]>,
+}
+
 pub(crate) struct SerialState {
     pub settings: SerialSettings,
     pub ports: Vec<String>,
@@ -209,6 +215,7 @@ pub(crate) struct SerialState {
     pub stopping: bool,
     pub series: Vec<Series>,
     pub raw: VecDeque<u8>,
+    pub imported_file: Option<ImportedSerialFile>,
     pub received_bytes: u64,
     pub decoded_records: u64,
     pub rejected_frames: u64,
@@ -238,6 +245,7 @@ impl Default for SerialState {
             stopping: false,
             series: Vec::new(),
             raw: VecDeque::new(),
+            imported_file: None,
             received_bytes: 0,
             decoded_records: 0,
             rejected_frames: 0,
@@ -410,6 +418,9 @@ impl SerialState {
     }
 
     pub fn clear_data(&mut self) {
+        if self.imported_file.take().is_some() {
+            self.status = "Disconnected".into();
+        }
         self.raw.clear();
         self.raw_dirty = true;
         self.received_bytes = 0;
@@ -439,6 +450,80 @@ impl SerialState {
     /// an entire read block one timestamp. Live receive timing stays unchanged.
     pub fn ingest_imported(&mut self, start_seconds: f64, end_seconds: f64, bytes: &[u8]) {
         self.ingest_interval(start_seconds, end_seconds, bytes);
+    }
+
+    /// Raw viewing is independent of graph configuration. Invalid or unfinished
+    /// decoding settings must not prevent opening the underlying bytes.
+    pub fn import_raw(&mut self, path: &std::path::Path) -> Result<(), CaptureError> {
+        use std::io::Read;
+        const MAX_IMPORT_BYTES: usize = 8 * 1024 * 1024;
+        let file = std::fs::File::open(path).map_err(|error| {
+            CaptureError::new(format!(
+                "Could not open raw file {}: {error}",
+                path.display()
+            ))
+        })?;
+        let mut bytes = Vec::new();
+        file.take((MAX_IMPORT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| CaptureError::new(format!("Could not read raw file: {error}")))?;
+        if bytes.len() > MAX_IMPORT_BYTES {
+            return Err("Raw imports are limited to 8 MiB".into());
+        }
+        if let Err(error) = self.prepare() {
+            self.clear_data();
+            self.binary = None;
+            self.series.clear();
+            self.error = Some(format!(
+                "Raw data imported; graph decoding unavailable: {error}"
+            ));
+        }
+        self.ingest_file(ImportedSerialFile {
+            path: path.to_owned(),
+            bytes: bytes.into(),
+        });
+        Ok(())
+    }
+
+    pub fn plot_imported(&mut self) -> Result<(), CaptureError> {
+        let file = self
+            .imported_file
+            .clone()
+            .ok_or_else(|| CaptureError::new("Open a raw file before plotting"))?;
+        if self.settings.mode == SerialMode::Text && self.settings.fields.is_empty() {
+            return Err("Add text fields before plotting the opened file".into());
+        }
+        if self.settings.mode == SerialMode::Binary && self.settings.schema_json.is_empty() {
+            return Err("Load a binary JSON schema before plotting the opened file".into());
+        }
+        self.prepare()?;
+        self.ingest_file(file);
+        self.fit_graph();
+        Ok(())
+    }
+
+    fn ingest_file(&mut self, file: ImportedSerialFile) {
+        let bits_per_byte = 1
+            + u32::from(self.settings.data_bits)
+            + u32::from(self.settings.stop_bits)
+            + u32::from(self.settings.parity != "None");
+        let seconds_per_byte = f64::from(bits_per_byte) / f64::from(self.settings.baud.max(1));
+        let mut count = 0;
+        for chunk in file.bytes.chunks(4096) {
+            let start = count;
+            count += chunk.len();
+            self.ingest_imported(
+                start as f64 * seconds_per_byte,
+                count as f64 * seconds_per_byte,
+                chunk,
+            );
+        }
+        let name = file.path.file_name().map_or_else(
+            || file.path.to_string_lossy(),
+            |name| name.to_string_lossy(),
+        );
+        self.status = format!("Imported · {name} · estimated UART timing");
+        self.imported_file = Some(file);
     }
 
     fn ingest_interval(&mut self, start_seconds: f64, seconds: f64, bytes: &[u8]) {
@@ -623,6 +708,169 @@ impl SerialState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opened_file_can_be_plotted_after_configuring_fields_or_schema() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples");
+        for mode in [SerialMode::Text, SerialMode::Binary] {
+            let mut state = SerialState::default();
+            state.settings.mode = mode;
+            let name = if mode == SerialMode::Text {
+                "serial-ascii.txt"
+            } else {
+                "serial-binary.bin"
+            };
+            state.import_raw(&root.join(name)).unwrap();
+            assert!(state.status.contains(name));
+            assert!(state.series.is_empty());
+            let raw = state.raw.clone();
+            assert!(state.plot_imported().is_err());
+            assert_eq!(state.raw, raw);
+            assert!(state.imported_file.is_some());
+            if mode == SerialMode::Text {
+                state.settings.fields.push(TextField {
+                    name: "temperature".into(),
+                    color: COLORS[1],
+                    line_style: SerialLineStyle::Dashed,
+                });
+            } else {
+                state
+                    .load_schema(
+                        "serial-schema.json".into(),
+                        include_str!("../../../docs/examples/serial-schema.json").into(),
+                    )
+                    .unwrap();
+                state
+                    .settings
+                    .binary_colors
+                    .insert("temperature".into(), COLORS[1]);
+            }
+            for _ in 0..2 {
+                state.plot_imported().unwrap();
+                assert_eq!(state.decoded_records, 512);
+                assert_eq!(state.series[0].points.len(), 512);
+                assert_eq!(state.series[0].color, COLORS[1]);
+                assert_eq!(state.raw, raw);
+                assert!(state.status.contains(name));
+                assert!(state.imported_file.is_some());
+                assert!(state.error.is_none());
+                let (start, end) = state.graph_time_range();
+                let (first, last) = state.graph_time_bounds().unwrap();
+                assert!(start <= first && end >= last);
+            }
+            state.clear_data();
+            assert!(state.imported_file.is_none());
+            assert!(!state.status.contains(name));
+        }
+    }
+
+    #[test]
+    fn plotting_uses_full_file_snapshot_and_new_fields_and_timing() {
+        let mut state = SerialState::default();
+        let bytes = include_bytes!("../../../docs/examples/serial-ascii.txt").repeat(4);
+        assert!(bytes.len() > RAW_CAPACITY);
+        let total = bytes.len();
+        state.ingest_file(ImportedSerialFile {
+            path: "no-longer-on-disk.txt".into(),
+            bytes: bytes.into(),
+        });
+        let raw = state.raw.clone();
+        assert_eq!(raw.len(), RAW_CAPACITY);
+        state.settings.fields.push(TextField {
+            name: "temperature".into(),
+            color: COLORS[0],
+            line_style: Default::default(),
+        });
+        state.plot_imported().unwrap();
+        assert_eq!(state.received_bytes, total as u64);
+        assert_eq!(state.decoded_records, 2048);
+        assert_eq!(state.series[0].points.len(), 2048);
+        let original_end = state.graph_latest_time();
+        state.baud_draft = Some("57600".into());
+        state.settings.fields[0].name = "speed".into();
+        state.plot_imported().unwrap();
+        assert_eq!(state.series[0].name, "speed");
+        assert_eq!(state.series[0].points.len(), 2048);
+        assert!((state.graph_latest_time() - original_end * 2.0).abs() < 1e-10);
+        assert_eq!(state.raw, raw);
+        state.settings.fields[0].name.clear();
+        assert!(state.plot_imported().is_err());
+        assert_eq!(state.series[0].points.len(), 2048);
+        assert_eq!(state.raw, raw);
+        assert!(state.status.contains("no-longer-on-disk.txt"));
+        // Preparing a new live capture releases the opened-file snapshot.
+        state.settings.fields[0].name = "speed".into();
+        state.prepare().unwrap();
+        assert!(state.imported_file.is_none());
+        assert!(!state.status.contains("no-longer-on-disk.txt"));
+    }
+
+    #[test]
+    fn raw_file_import_works_without_fields_or_schema_and_with_incomplete_settings() {
+        for mode in [SerialMode::Text, SerialMode::Binary] {
+            for incomplete in [false, true] {
+                let mut state = SerialState::default();
+                state.settings.mode = mode;
+                if incomplete {
+                    if mode == SerialMode::Text {
+                        state.settings.fields.push(TextField {
+                            name: String::new(),
+                            color: COLORS[0],
+                            line_style: Default::default(),
+                        });
+                    } else {
+                        state.settings.schema_json = "{".into();
+                    }
+                }
+                state.ingest(1.0, b"previous file");
+                let name = if mode == SerialMode::Text {
+                    "serial-ascii.txt"
+                } else {
+                    "serial-binary.bin"
+                };
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../docs/examples")
+                    .join(name);
+                let expected = std::fs::read(&path).unwrap();
+                state.import_raw(&path).unwrap();
+                assert_eq!(state.raw.iter().copied().collect::<Vec<_>>(), expected);
+                assert_eq!(state.received_bytes, expected.len() as u64);
+                assert_eq!(state.decoded_records, 0);
+                assert!(state.series.is_empty());
+                assert!(state.binary.is_none());
+                assert_eq!(state.error.is_some(), incomplete);
+                assert!(!state.raw_lines().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn raw_import_preserves_bytes_when_baud_draft_is_invalid_and_keeps_optional_decoding() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples");
+        let mut state = SerialState::default();
+        state.settings.mode = SerialMode::Binary;
+        state
+            .load_schema(
+                "serial-schema.json".into(),
+                include_str!("../../../docs/examples/serial-schema.json").into(),
+            )
+            .unwrap();
+        state.import_raw(&root.join("serial-binary.bin")).unwrap();
+        assert_eq!(state.decoded_records, 512);
+        assert_eq!(state.series.len(), 5);
+        assert!(state.error.is_none());
+        state.baud_draft = Some(String::new());
+        state.import_raw(&root.join("serial-binary.bin")).unwrap();
+        assert_eq!(state.received_bytes, 6656);
+        assert!(state.binary.is_none());
+        assert!(state.series.is_empty());
+        assert!(state.error.as_ref().unwrap().contains("Baud rate"));
+        let retained = state.raw.clone();
+        assert!(state
+            .import_raw(&root.join("missing-raw-file-for-import-test.bin"))
+            .is_err());
+        assert_eq!(state.raw, retained);
+    }
 
     #[test]
     fn absent_schema_or_fields_keeps_exact_raw_bytes_and_no_plotted_values() {

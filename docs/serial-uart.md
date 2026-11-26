@@ -3,7 +3,7 @@
 Select **Serial / UART**, choose a discovered port from the dropdown,
 set the baud rate, data bits, parity, stop bits and flow control, and press
 **Start**. **Stop** releases the port; **Clear** resets the displayed history and
-partial decoder state. Port and decoding changes apply on the next Start or Open raw;
+partial decoder state. Port and decoding changes apply on the next Start, Open raw or Plot;
 color edits apply immediately.
 The workspace can receive alongside the other instruments. PORT and DATA FORMAT
 can be collapsed independently. Baud rate uses an editable field with a dropdown,
@@ -36,6 +36,15 @@ graph does not repeat the field list.
 
 With **no text fields** or **no binary schema**, Start still reads the port and
 shows only raw data in the lower pane. A schema is never required for receiving.
+**Open raw…** also displays file bytes without fields or a schema. Incomplete or
+invalid decoding settings do not block raw imports; they disable plotting for
+that import and report the decoding problem in the common message area.
+The status shows the opened file's name. While a file is open, **Plot** appears
+immediately to the left of **Start**. Add or change text fields, load a binary
+JSON schema, or adjust decoding settings, then press **Plot** to rebuild and fit
+the graph from the opened bytes. Repeated plotting uses the full imported file
+held in memory, even when raw history shows only its latest 64 KiB. The file does
+not need to be reopened. **Clear** or starting a live capture releases that file.
 Text renders printable ASCII, CR/LF records and escaped nonprintable bytes.
 Binary renders byte offsets, hexadecimal bytes and printable ASCII. Select text
 and use Cmd+C / Ctrl+C to copy it; Save raw writes the retained bytes unchanged.
@@ -50,6 +59,9 @@ decoded records in one file-read block are distributed over that estimated
 interval; live records continue to share their receive timestamp.
 
 ## Text fields
+
+Ready-to-open ASCII and binary recordings, with setup instructions, are in
+[docs/examples](examples/README.md#serial--uart).
 
 Add up to ten named fields and choose each line's color and stroke style. For example, fields
 `temperature` and `rpm` match:

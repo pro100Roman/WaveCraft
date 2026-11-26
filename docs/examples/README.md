@@ -1,5 +1,46 @@
 # Example files
 
+## Serial / UART
+
+`serial-ascii.txt` and `serial-binary.bin` contain the same 512 synthetic records:
+temperature ramps from 18 to 34, speed ramps from 0 to 96, and `enabled`, `fault`
+and `mode` change in steps. They exercise multiple traces, line styles and zoom
+without a connected serial adapter. Both files fit within raw-data history.
+
+In **Serial / UART**, use **115200 baud, 8 data bits, no parity, 1 stop bit**:
+
+For raw viewing only, choose **Text / ASCII** or **Binary** and open the file;
+fields and JSON are optional. The setup below enables graph decoding as well.
+You can also configure fields or load JSON after opening the file, then press
+**Plot** (to the left of **Start**) to draw it. The status shows the opened file's name.
+
+| Sample | Setup before **Open raw…** |
+| --- | --- |
+| [serial-ascii.txt](serial-ascii.txt) | Choose **Text / ASCII** and add fields `temperature`, `speed`, `enabled`, `fault`, `mode` under **PLOTTED FIELDS**. |
+| [serial-binary.bin](serial-binary.bin) | Choose **Binary**, load [serial-schema.json](serial-schema.json), and use the framing/CRC settings below. |
+
+For Binary, use start word `AA 55`, stop word `0D 0A`, and CRC-16 with polynomial
+`1021`, seed `FFFF`, final XOR `0000`, no input/output reflection, little-endian
+CRC bytes, and **Include start word in CRC** off. These are the default Serial
+framing/CRC settings. Each frame is 13 bytes: 2 start bytes, a little-endian
+`f32` temperature, a little-endian `u16` speed, a status byte, 2 CRC bytes, and
+2 stop bytes. Status packs `enabled` into bit 0, `fault` into bits 1–3, and
+`mode` into bits 4–7.
+
+After opening either sample, press **Fit** or double-click the graph. File
+timestamps are estimated from baud rate and byte count, so the same record
+sequence spans different durations in ASCII and Binary.
+
+Reproduce both files and their schema from the workspace root with:
+
+```console
+cargo run -p wavecraft-serial --example generate_serial_samples -- docs/examples
+```
+
+The generator verifies all records with WaveCraft's streaming ASCII and binary
+decoders before writing the files, including CRC checks and fragmented reads.
+See [Serial / UART workspace](../serial-uart.md) for decoding details.
+
 ## System Trace
 
 `nrf52832-freertos.SVDat` is a deterministic SEGGER SystemView-compatible

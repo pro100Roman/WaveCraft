@@ -85,50 +85,28 @@ impl WaveCraftApp {
                         self.serial.error = Some(error.to_string());
                     }
                 }
+                if self.serial.imported_file.is_some() && ui
+                    .add_enabled(!running, toolbar_action_button("Plot", ACCENT))
+                    .on_hover_text("Plot the opened file using the current fields, schema and UART timing settings")
+                    .clicked()
+                {
+                    if let Err(error) = self.serial.plot_imported() {
+                        self.serial.error = Some(error.to_string());
+                    }
+                }
             });
         });
         self.settings_open |= settings_clicked;
     }
 
     fn open_serial_raw(&mut self) {
-        use std::io::Read;
         let Some(path) = rfd::FileDialog::new()
             .set_title("Open raw serial bytes")
             .pick_file()
         else {
             return;
         };
-        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-            let file = std::fs::File::open(&path)?;
-            if file.metadata()?.len() > 8 * 1024 * 1024 {
-                return Err("Raw imports are limited to 8 MiB".into());
-            }
-            self.serial.prepare()?;
-            let mut reader = file.take(8 * 1024 * 1024);
-            let mut buffer = [0; 4096];
-            let mut count = 0;
-            loop {
-                let read = reader.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                count += read;
-                let bits_per_byte = 1
-                    + self.serial.settings.data_bits
-                    + self.serial.settings.stop_bits
-                    + u8::from(self.serial.settings.parity != "None");
-                let seconds_per_byte =
-                    f64::from(bits_per_byte) / f64::from(self.serial.settings.baud.max(1));
-                self.serial.ingest_imported(
-                    (count - read) as f64 * seconds_per_byte,
-                    count as f64 * seconds_per_byte,
-                    &buffer[..read],
-                );
-            }
-            self.serial.status = "Imported · estimated UART timing".into();
-            Ok(())
-        })();
-        if let Err(error) = result {
+        if let Err(error) = self.serial.import_raw(&path) {
             self.serial.error = Some(error.to_string());
         }
     }
@@ -153,7 +131,7 @@ impl WaveCraftApp {
                     );
                 } else {
                     ui.label(
-                        RichText::new("Decoding changes apply on the next Start / Open.")
+                        RichText::new("Decoding changes apply on Start / Open / Plot.")
                             .small()
                             .color(TEXT_MUTED),
                     );
@@ -792,6 +770,87 @@ fn paint_raw(ui: &mut egui::Ui, state: &mut SerialState) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn plot_button_appears_left_of_start_and_replots_opened_file_with_name_in_status() {
+        let mut app = crate::app::test_support::app();
+        app.active_workspace_view = Some(WorkspaceView::Serial);
+        let context = egui::Context::default();
+        crate::configure_style(&context);
+        let frame = |app: &mut WaveCraftApp, events| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    app.paint_serial_toolbar(context);
+                    app.paint_status_bar(context);
+                    app.paint_serial_central(context);
+                },
+            )
+        };
+        assert!(!texts(&frame(&mut app, vec![]).shapes)
+            .iter()
+            .any(|text| text == "Plot"));
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/examples/serial-ascii.txt");
+        app.serial.import_raw(&path).unwrap();
+        let raw = app.serial.raw.clone();
+        let output = frame(&mut app, vec![]);
+        let bounds = |label: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{label} is visible"))
+        };
+        let plot = bounds("Plot");
+        assert!(plot.right() < bounds("▶ Start").left());
+        assert!(texts(&output.shapes)
+            .iter()
+            .any(|text| text.contains("serial-ascii.txt")));
+        app.serial.settings.fields.push(TextField {
+            name: "temperature".into(),
+            color: COLORS[0],
+            line_style: Default::default(),
+        });
+        for pressed in [true, false] {
+            let position = plot.center();
+            let _ = frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.serial.decoded_records, 512);
+        assert_eq!(app.serial.series[0].points.len(), 512);
+        assert_eq!(app.serial.raw, raw);
+        let labels = texts(&frame(&mut app, vec![]).shapes);
+        assert!(labels.iter().any(|text| text.contains("serial-ascii.txt")));
+        assert!(labels.iter().any(|text| text == "Plot"));
+        app.serial.clear_data();
+        let labels = texts(&frame(&mut app, vec![]).shapes);
+        assert!(!labels
+            .iter()
+            .any(|text| text == "Plot" || text.contains("serial-ascii.txt")));
+    }
+
     fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
         fn collect(shape: &egui::Shape, output: &mut Vec<String>) {
             match shape {
@@ -850,6 +909,39 @@ mod tests {
             } else {
                 text.contains("74 65 6D 70")
             }));
+        }
+    }
+
+    #[test]
+    fn imported_files_are_visible_in_raw_panels_without_fields_or_json() {
+        for mode in [SerialMode::Text, SerialMode::Binary] {
+            let mut app = crate::app::test_support::app();
+            app.active_workspace_view = Some(WorkspaceView::Serial);
+            app.serial.settings.mode = mode;
+            let file = if mode == SerialMode::Text {
+                "serial-ascii.txt"
+            } else {
+                "serial-binary.bin"
+            };
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/examples")
+                .join(file);
+            app.serial.import_raw(&path).unwrap();
+            let last_line = app.serial.raw_lines().last().unwrap().clone();
+            let context = egui::Context::default();
+            crate::configure_style(&context);
+            let _ = render(&mut app, &context, vec![]);
+            let labels = texts(&render(&mut app, &context, vec![]).shapes);
+            assert!(labels.iter().any(|text| text == "RAW DATA"));
+            assert!(labels.iter().any(|text| text
+                == if mode == SerialMode::Text {
+                    "ASCII"
+                } else {
+                    "HEX + ASCII"
+                }));
+            assert!(labels.contains(&last_line));
+            assert!(app.serial.series.is_empty());
+            assert!(app.serial.error.is_none());
         }
     }
 
