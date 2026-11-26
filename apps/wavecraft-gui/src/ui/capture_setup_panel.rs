@@ -1,11 +1,13 @@
 //! The fixed left panel: device selectors and per-instrument capture settings.
 
+use super::view_shell::SetupPanel;
+
 use crate::{
-    apply_setup_panel_typography, egui, paint_capture_settings, paint_radio_capture_settings,
-    paint_radio_device_selector, selected_device_for_role, selected_radio,
-    ui::frame_state::FrameState, CaptureSettingsAvailability, CaptureSettingsTab, DeviceEntry,
-    DeviceRole, LogicCaptureSettingsEditor, RadioPanelState, RichText, SavedCaptureSettingsKind,
-    ScopeCaptureSettingsEditor, ScopeVisualizationSettingsEditor, WaveformTab, PANEL, TEXT_MUTED,
+    egui, paint_capture_settings, paint_radio_capture_settings, paint_radio_device_selector,
+    selected_device_for_role, selected_radio, ui::frame_state::FrameState,
+    CaptureSettingsAvailability, CaptureSettingsTab, DeviceEntry, DeviceRole,
+    LogicCaptureSettingsEditor, RadioPanelState, RichText, SavedCaptureSettingsKind,
+    ScopeCaptureSettingsEditor, ScopeVisualizationSettingsEditor, WaveformTab, TEXT_MUTED,
 };
 
 use crate::{ui::frame_actions::FrameActions, WaveCraftApp};
@@ -40,139 +42,110 @@ impl WaveCraftApp {
 
         let sync_word_suggestions = self.displayed_sync_word_suggestions();
 
-        egui::SidePanel::left("capture_setup_fixed")
-            .resizable(false)
-            .exact_width(300.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::same(14.0)),
-            )
-            .show(context, |ui| {
-                apply_setup_panel_typography(ui);
-                let available_capture_settings_tabs = self.available_capture_settings_tabs();
-                let content_width = ui.available_width();
-                egui::ScrollArea::vertical()
-                    .max_width(content_width)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(content_width);
-                        ui.set_max_width(content_width);
-                        ui.label(RichText::new("CAPTURE SETUP").strong().color(TEXT_MUTED));
-                        ui.add_space(8.0);
-                        let (logic_changed, scope_changed) = paint_capture_device_selectors(
-                            ui,
-                            self.active_waveform_tab,
-                            &self.devices,
-                            &mut self.selected_logic_device_id,
-                            &mut self.selected_scope_device_id,
-                            capture_settings_enabled && self.manual_calibration.is_none(),
+        let available_capture_settings_tabs = self.available_capture_settings_tabs();
+        SetupPanel::new("capture_setup_fixed", "CAPTURE SETUP").show(context, |ui| {
+            let (logic_changed, scope_changed) = paint_capture_device_selectors(
+                ui,
+                self.active_waveform_tab,
+                &self.devices,
+                &mut self.selected_logic_device_id,
+                &mut self.selected_scope_device_id,
+                capture_settings_enabled && self.manual_calibration.is_none(),
+            );
+            actions.logic_device_selection_changed |= logic_changed;
+            actions.scope_device_selection_changed |= scope_changed;
+            if self.active_waveform_tab == Some(WaveformTab::RadioReceiver) {
+                actions.radio_device_selection_changed |= paint_radio_device_selector(
+                    ui,
+                    &self.radios,
+                    &mut self.selected_radio_id,
+                    capture_settings_enabled,
+                );
+                if actions.radio_device_selection_changed {
+                    self.reconcile_radio_settings();
+                }
+                if let Some(radio) =
+                    selected_radio(&self.radios, self.selected_radio_id.as_deref()).cloned()
+                {
+                    if paint_radio_capture_settings(
+                        ui,
+                        &radio,
+                        &mut self.radio_settings,
+                        RadioPanelState {
+                            enabled: capture_settings_enabled,
+                            runtime_enabled: radio_runtime_controls_enabled,
+                            trigger_runtime_enabled: radio_trigger_runtime_controls_enabled,
+                            show_save_button: true,
+                            sync_word_suggestions: &sync_word_suggestions,
+                        },
+                    ) {
+                        actions.save_capture_settings_kind =
+                            Some(SavedCaptureSettingsKind::RadioFrequency);
+                    }
+                }
+            }
+            if self.active_waveform_tab.is_some() {
+                ui.add_space(12.0);
+            }
+            if available_capture_settings_tabs.len() > 1 {
+                ui.horizontal(|ui| {
+                    for tab in &available_capture_settings_tabs {
+                        ui.selectable_value(
+                            &mut self.active_capture_settings_tab,
+                            *tab,
+                            tab.label(),
                         );
-                        actions.logic_device_selection_changed |= logic_changed;
-                        actions.scope_device_selection_changed |= scope_changed;
-                        if self.active_waveform_tab == Some(WaveformTab::RadioReceiver) {
-                            actions.radio_device_selection_changed |= paint_radio_device_selector(
-                                ui,
-                                &self.radios,
-                                &mut self.selected_radio_id,
-                                capture_settings_enabled,
-                            );
-                            if actions.radio_device_selection_changed {
-                                self.reconcile_radio_settings();
-                            }
-                            if let Some(radio) =
-                                selected_radio(&self.radios, self.selected_radio_id.as_deref())
-                                    .cloned()
-                            {
-                                if paint_radio_capture_settings(
-                                    ui,
-                                    &radio,
-                                    &mut self.radio_settings,
-                                    RadioPanelState {
-                                        enabled: capture_settings_enabled,
-                                        runtime_enabled: radio_runtime_controls_enabled,
-                                        trigger_runtime_enabled:
-                                            radio_trigger_runtime_controls_enabled,
-                                        show_save_button: true,
-                                        sync_word_suggestions: &sync_word_suggestions,
-                                    },
-                                ) {
-                                    actions.save_capture_settings_kind =
-                                        Some(SavedCaptureSettingsKind::RadioFrequency);
-                                }
-                            }
-                        }
-                        if self.active_waveform_tab.is_some() {
-                            ui.add_space(12.0);
-                        }
-                        if available_capture_settings_tabs.len() > 1 {
-                            ui.horizontal(|ui| {
-                                for tab in &available_capture_settings_tabs {
-                                    ui.selectable_value(
-                                        &mut self.active_capture_settings_tab,
-                                        *tab,
-                                        tab.label(),
-                                    );
-                                }
-                            });
-                            ui.add_space(6.0);
-                        }
-                        if available_capture_settings_tabs.is_empty()
-                            && self.active_waveform_tab != Some(WaveformTab::RadioReceiver)
-                        {
-                            ui.label(
-                                RichText::new(
-                                    "Connect a supported instrument to configure capture.",
-                                )
-                                .color(TEXT_MUTED),
-                            );
-                        } else if self.active_waveform_tab != Some(WaveformTab::RadioReceiver)
-                            && paint_capture_settings(
-                                ui,
-                                self.active_capture_settings_tab,
-                                LogicCaptureSettingsEditor {
-                                    settings: &mut self.logic_settings,
-                                    speed: logic_settings_speed,
-                                    acquisition_mode: &mut self.logic_acquisition_mode,
-                                    repetitive_interval_seconds: &mut self
-                                        .repetitive_interval_seconds,
-                                    smart_timing_enabled: &mut self.logic_smart_timing_enabled,
-                                    marker_settings: &mut self.logic_marker_settings,
-                                    protocol_analyzer: &mut self.protocol_analyzer,
-                                    displayed_sample_count: displayed_logic_sample_count,
-                                    displayed_sample_rate_hz: displayed_logic_sample_rate_hz,
-                                },
-                                ScopeCaptureSettingsEditor {
-                                    settings: &mut self.scope_settings,
-                                    auto_sample_rate: &mut self.scope_auto_sample_rate,
-                                    smart_timing_enabled: &mut self.scope_smart_timing_enabled,
-                                },
-                                ScopeVisualizationSettingsEditor {
-                                    channel_colors: &mut self.scope_channel_colors,
-                                    scope_channel_names: &mut self.scope_channel_names,
-                                },
-                                CaptureSettingsAvailability {
-                                    capture: capture_settings_enabled,
-                                    sample_rate: frontend_controls_enabled,
-                                    channel_enable: frontend_controls_enabled,
-                                    input_range: frontend_controls_enabled,
-                                    manual_calibration: manual_calibration_enabled,
-                                },
-                                &mut actions.calibration_action,
-                            )
-                        {
-                            actions.save_capture_settings_kind =
-                                Some(match self.active_capture_settings_tab {
-                                    CaptureSettingsTab::DsLogic => {
-                                        SavedCaptureSettingsKind::LogicAnalyzer
-                                    }
-                                    CaptureSettingsTab::DsCope => {
-                                        SavedCaptureSettingsKind::Oscilloscope
-                                    }
-                                });
-                        }
-                    });
-            });
+                    }
+                });
+                ui.add_space(6.0);
+            }
+            if available_capture_settings_tabs.is_empty()
+                && self.active_waveform_tab != Some(WaveformTab::RadioReceiver)
+            {
+                ui.label(
+                    RichText::new("Connect a supported instrument to configure capture.")
+                        .color(TEXT_MUTED),
+                );
+            } else if self.active_waveform_tab != Some(WaveformTab::RadioReceiver)
+                && paint_capture_settings(
+                    ui,
+                    self.active_capture_settings_tab,
+                    LogicCaptureSettingsEditor {
+                        settings: &mut self.logic_settings,
+                        speed: logic_settings_speed,
+                        acquisition_mode: &mut self.logic_acquisition_mode,
+                        repetitive_interval_seconds: &mut self.repetitive_interval_seconds,
+                        smart_timing_enabled: &mut self.logic_smart_timing_enabled,
+                        marker_settings: &mut self.logic_marker_settings,
+                        protocol_analyzer: &mut self.protocol_analyzer,
+                        displayed_sample_count: displayed_logic_sample_count,
+                        displayed_sample_rate_hz: displayed_logic_sample_rate_hz,
+                    },
+                    ScopeCaptureSettingsEditor {
+                        settings: &mut self.scope_settings,
+                        auto_sample_rate: &mut self.scope_auto_sample_rate,
+                        smart_timing_enabled: &mut self.scope_smart_timing_enabled,
+                    },
+                    ScopeVisualizationSettingsEditor {
+                        channel_colors: &mut self.scope_channel_colors,
+                        scope_channel_names: &mut self.scope_channel_names,
+                    },
+                    CaptureSettingsAvailability {
+                        capture: capture_settings_enabled,
+                        sample_rate: frontend_controls_enabled,
+                        channel_enable: frontend_controls_enabled,
+                        input_range: frontend_controls_enabled,
+                        manual_calibration: manual_calibration_enabled,
+                    },
+                    &mut actions.calibration_action,
+                )
+            {
+                actions.save_capture_settings_kind = Some(match self.active_capture_settings_tab {
+                    CaptureSettingsTab::DsLogic => SavedCaptureSettingsKind::LogicAnalyzer,
+                    CaptureSettingsTab::DsCope => SavedCaptureSettingsKind::Oscilloscope,
+                });
+            }
+        });
     }
 }
 

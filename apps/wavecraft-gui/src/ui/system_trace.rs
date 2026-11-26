@@ -1,5 +1,7 @@
 //! Independent System Trace workspace and decoded-event instruments.
 
+use super::view_shell::{card_frame, settings_card, view_toolbar, workspace_panel, SetupPanel};
+
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::system_trace::{
@@ -15,11 +17,9 @@ use crate::system_trace::{
 };
 use crate::waveform::chrome::half_transparent_plate;
 use crate::{
-    apply_setup_panel_typography, collapsed_side_panel_frame, egui, fill_card_height,
-    format_frequency, paint_capture_settings_save_button, toolbar_action_button,
+    egui, format_frequency, paint_capture_settings_save_button, toolbar_action_button,
     ui::frame_actions::FrameActions, RichText, SavedCaptureSettingsKind, WaveCraftApp, ACCENT,
-    BACKGROUND, COLLAPSED_SIDE_PANEL_WIDTH, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, ORANGE, PANEL,
-    SCOPE_COLORS, TEXT_MUTED,
+    BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
 };
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugTargetDescriptor, ProbeDescriptor, ProbeProvider, ProbeSelector,
@@ -75,7 +75,6 @@ const TIMELINE_LANE_COLORS: [egui::Color32; 12] = [
     egui::Color32::from_rgb(255, 184, 92),
 ];
 const TARGET_DROPDOWN_RESULT_LIMIT: usize = 200;
-const CONNECTION_STATUS_FONT_SIZE: f32 = 10.0;
 const DEFAULT_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 1_000_000;
 const MAX_TIMESTAMP_FREQUENCY_OVERRIDE_HZ: u64 = 10_000_000_000;
 const APPLICATION_ELF_HELP: &str = "Resolves _SEGGER_RTT, resource symbols, and .sv-data messages";
@@ -399,110 +398,84 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
-        egui::TopBottomPanel::top("toolbar")
-            .frame(
-                egui::Frame::none()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::same(12.0)),
-            )
-            .show(context, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("WAVECRAFT").strong().size(18.0).color(ACCENT));
-                    ui.separator();
-                    ui.menu_button("App", |ui| {
-                        if ui.button("Settings…").clicked() {
-                            self.settings_open = true;
-                            ui.close_menu();
-                        }
-                    });
-                    ui.separator();
-                    ui.label(RichText::new("System and RTOS trace").color(TEXT_MUTED));
-                    ui.separator();
-                    actions.refresh_clicked = ui
-                        .add_enabled(
-                            !self.is_busy() && self.system_trace_connection.is_disconnected(),
-                            toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
-                        )
-                        .on_hover_text("Scan for debug probes, DSLogic, DSCope, and radio devices")
-                        .clicked();
-                    ui.separator();
-                    let can_record = !self.is_busy()
-                        && matches!(
-                            self.system_trace_connection,
-                            SystemTraceConnectionState::Attached {
-                                systemview_enabled: true,
-                                ..
-                            }
-                        );
-                    if ui
-                        .add_enabled(
-                            can_record,
-                            toolbar_action_button(
-                                "● Record…",
-                                egui::Color32::from_rgb(245, 96, 96),
-                            ),
-                        )
-                        .on_hover_text("Record the raw SystemView stream to an .SVDat file")
-                        .clicked()
-                    {
-                        actions.system_trace_action = Some(SystemTraceAction::Record);
+        let settings_clicked = view_toolbar(context, "System and RTOS trace", |ui| {
+            actions.refresh_clicked = ui
+                .add_enabled(
+                    !self.is_busy() && self.system_trace_connection.is_disconnected(),
+                    toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
+                )
+                .on_hover_text("Scan for debug probes, DSLogic, DSCope, and radio devices")
+                .clicked();
+            ui.separator();
+            let can_record = !self.is_busy()
+                && matches!(
+                    self.system_trace_connection,
+                    SystemTraceConnectionState::Attached {
+                        systemview_enabled: true,
+                        ..
                     }
-                    if ui
-                        .add_enabled(
-                            !self.is_busy() && self.system_trace_connection.is_disconnected(),
-                            toolbar_action_button("📂 Open", TEXT_MUTED),
-                        )
-                        .on_hover_text("Open a raw SEGGER SystemView event stream")
-                        .clicked()
-                    {
-                        actions.system_trace_action = Some(SystemTraceAction::Open);
-                    }
-                    let can_save_history = !self.is_busy()
-                        && self.system_trace.history_is_temporary()
-                        && matches!(
-                            self.system_trace_connection,
-                            SystemTraceConnectionState::Disconnected
-                                | SystemTraceConnectionState::Error(_)
-                                | SystemTraceConnectionState::Attached { .. }
-                        );
-                    if ui
-                        .add_enabled(
-                            can_save_history,
-                            toolbar_action_button("💾 Save", TEXT_MUTED),
-                        )
-                        .on_hover_text("Save the complete temporary trace history as .SVDat")
-                        .clicked()
-                    {
-                        actions.system_trace_action = Some(SystemTraceAction::Save);
-                    }
-                    ui.separator();
-                    paint_connection_control(
-                        ui,
-                        &self.system_trace_connection,
-                        self.system_trace_settings.probe_connection_id.is_some(),
-                        actions,
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        paint_trace_run_control(
-                            ui,
-                            &self.system_trace_connection,
-                            self.is_busy(),
-                            actions,
-                        );
-                        if ui
-                            .add_enabled(
-                                !self.system_trace.events().is_empty()
-                                    || !self.system_trace.terminal_lines().is_empty(),
-                                toolbar_action_button("Clear", TEXT_MUTED),
-                            )
-                            .on_hover_text("Clear trace events and RTT terminal output")
-                            .clicked()
-                        {
-                            self.system_trace.clear();
-                        }
-                    });
-                });
+                );
+            if ui
+                .add_enabled(
+                    can_record,
+                    toolbar_action_button("● Record…", egui::Color32::from_rgb(245, 96, 96)),
+                )
+                .on_hover_text("Record the raw SystemView stream to an .SVDat file")
+                .clicked()
+            {
+                actions.system_trace_action = Some(SystemTraceAction::Record);
+            }
+            if ui
+                .add_enabled(
+                    !self.is_busy() && self.system_trace_connection.is_disconnected(),
+                    toolbar_action_button("📂 Open", TEXT_MUTED),
+                )
+                .on_hover_text("Open a raw SEGGER SystemView event stream")
+                .clicked()
+            {
+                actions.system_trace_action = Some(SystemTraceAction::Open);
+            }
+            let can_save_history = !self.is_busy()
+                && self.system_trace.history_is_temporary()
+                && matches!(
+                    self.system_trace_connection,
+                    SystemTraceConnectionState::Disconnected
+                        | SystemTraceConnectionState::Error(_)
+                        | SystemTraceConnectionState::Attached { .. }
+                );
+            if ui
+                .add_enabled(
+                    can_save_history,
+                    toolbar_action_button("💾 Save", TEXT_MUTED),
+                )
+                .on_hover_text("Save the complete temporary trace history as .SVDat")
+                .clicked()
+            {
+                actions.system_trace_action = Some(SystemTraceAction::Save);
+            }
+            ui.separator();
+            paint_connection_control(
+                ui,
+                &self.system_trace_connection,
+                self.system_trace_settings.probe_connection_id.is_some(),
+                actions,
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                paint_trace_run_control(ui, &self.system_trace_connection, self.is_busy(), actions);
+                if ui
+                    .add_enabled(
+                        !self.system_trace.events().is_empty()
+                            || !self.system_trace.terminal_lines().is_empty(),
+                        toolbar_action_button("Clear", TEXT_MUTED),
+                    )
+                    .on_hover_text("Clear trace events and RTT terminal output")
+                    .clicked()
+                {
+                    self.system_trace.clear();
+                }
             });
+        });
+        self.settings_open |= settings_clicked;
     }
 
     pub(crate) fn paint_system_trace_setup_panel(
@@ -510,55 +483,10 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
-        if !self.system_trace_setup_panel_open {
-            self.paint_collapsed_system_trace_setup_panel(context);
-            return;
-        }
-
-        let mut collapse_clicked = false;
-        egui::SidePanel::left("system_trace_setup")
-            .resizable(false)
-            .exact_width(300.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::same(14.0)),
-            )
-            .show(context, |ui| {
-                apply_setup_panel_typography(ui);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("SYSTEM TRACE SETUP")
-                            .strong()
-                            .color(TEXT_MUTED),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_sized(
-                                DECODED_PANEL_ACTION_BUTTON_SIZE,
-                                toolbar_action_button("◀", ACCENT),
-                            )
-                            .on_hover_text("Collapse System Trace setup")
-                            .clicked()
-                        {
-                            collapse_clicked = true;
-                        }
-                    });
-                });
-                ui.add_space(12.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
+        let mut open = self.system_trace_setup_panel_open;
+        SetupPanel::new("system_trace_setup", "SYSTEM TRACE SETUP").show_collapsible(context, &mut open, |ui| {
                         ui.set_width(ui.available_width());
-                        let menu_width = ui.available_width();
-                        egui::Frame::none()
-                            .fill(BACKGROUND)
-                            .rounding(egui::Rounding::same(6.0))
-                            .inner_margin(egui::Margin::same(10.0))
-                            .show(ui, |ui| {
-                                let content_width = (menu_width - 20.0).max(0.0);
-                                ui.set_width(content_width);
-                                ui.set_max_width(content_width);
+                        settings_card(ui, |ui| {
                                 let probe_header =
                                     egui::CollapsingHeader::new(RichText::new("Probe").strong())
                                         .id_salt("system_trace_probe_settings")
@@ -1149,116 +1077,52 @@ impl WaveCraftApp {
                                 }
                             });
 
-                        ui.add_space(16.0);
-                        if let SystemTraceConnectionState::Attached {
-                            channels,
-                            systemview_enabled,
-                        } = &self.system_trace_connection
-                        {
-                            ui.label(
-                                RichText::new(format!(
-                                    "Attached with {} RTT channel(s); {}",
-                                    channels.len(),
-                                    if *systemview_enabled {
-                                        "SystemView ready"
-                                    } else {
-                                        "terminal only"
-                                    }
-                                ))
-                                .size(CONNECTION_STATUS_FONT_SIZE)
-                                .color(ACCENT),
-                            );
-                        }
-                        if let SystemTraceConnectionState::Error(error) =
-                            &self.system_trace_connection
-                        {
-                            ui.label(
-                                RichText::new(error)
-                                    .size(CONNECTION_STATUS_FONT_SIZE)
-                                    .color(egui::Color32::from_rgb(245, 96, 96)),
-                            );
-                        }
-                    });
-            });
-        if collapse_clicked {
-            self.system_trace_setup_panel_open = false;
-        }
-    }
-
-    fn paint_collapsed_system_trace_setup_panel(&mut self, context: &egui::Context) {
-        let mut expand_clicked = false;
-        egui::SidePanel::left("system_trace_setup_collapsed")
-            .resizable(false)
-            .exact_width(COLLAPSED_SIDE_PANEL_WIDTH)
-            .frame(egui::Frame::none().fill(BACKGROUND))
-            .show(context, |ui| {
-                collapsed_side_panel_frame().show(ui, |ui| {
-                    fill_card_height(ui);
-                    if ui
-                        .add_sized(
-                            DECODED_PANEL_ACTION_BUTTON_SIZE,
-                            toolbar_action_button("▶", ACCENT),
-                        )
-                        .on_hover_text("Expand System Trace setup")
-                        .clicked()
-                    {
-                        expand_clicked = true;
-                    }
-                });
-            });
-        if expand_clicked {
-            self.system_trace_setup_panel_open = true;
-        }
+        });
+        self.system_trace_setup_panel_open = open;
     }
 
     pub(crate) fn paint_system_trace_central_panel(&mut self, context: &egui::Context) {
         let timestamp_frequency_override_hz =
             self.system_trace_settings.timestamp_frequency_override_hz;
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(BACKGROUND)
-                    .inner_margin(egui::Margin::same(16.0)),
-            )
-            .show(context, |ui| {
-                paint_trace_summary(ui, &self.system_trace);
-                ui.add_space(10.0);
-                let pane_spacing = ui.spacing().item_spacing.y * 2.0;
-                let available_pane_height =
-                    (ui.available_height() - TRACE_SPLITTER_HEIGHT - pane_spacing).max(0.0);
-                self.system_trace
-                    .fit_trace_instruments_to_height(available_pane_height);
-                let pane_width = ui.available_width();
-                let order = *self.system_trace.trace_instrument_order();
-                let mut pane_rects = Vec::with_capacity(order.len());
-                for (index, instrument) in order.into_iter().enumerate() {
-                    let pane_height = match instrument {
-                        TraceInstrument::Timeline => self.system_trace.timeline_view_height(),
-                        TraceInstrument::Analysis => self.system_trace.event_view_height(),
-                    };
-                    let pane = ui.allocate_ui_with_layout(
-                        egui::vec2(pane_width, pane_height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| match instrument {
-                            TraceInstrument::Timeline => paint_timeline_instrument(
-                                ui,
-                                &mut self.system_trace,
-                                timestamp_frequency_override_hz,
-                            ),
-                            TraceInstrument::Analysis => paint_event_instrument(
-                                ui,
-                                &mut self.system_trace,
-                                timestamp_frequency_override_hz,
-                            ),
-                        },
-                    );
-                    pane_rects.push((instrument, pane.response.rect));
-                    if index == 0 {
-                        paint_trace_instrument_splitter(ui, &mut self.system_trace);
-                    }
+        workspace_panel(context, |ui| {
+            paint_trace_summary(ui, &self.system_trace);
+            ui.add_space(10.0);
+            let pane_spacing = ui.spacing().item_spacing.y * 2.0;
+            let available_pane_height =
+                (ui.available_height() - TRACE_SPLITTER_HEIGHT - pane_spacing).max(0.0);
+            self.system_trace
+                .fit_trace_instruments_to_height(available_pane_height);
+            let pane_width = ui.available_width();
+            let order = *self.system_trace.trace_instrument_order();
+            let mut pane_rects = Vec::with_capacity(order.len());
+            for (index, instrument) in order.into_iter().enumerate() {
+                let pane_height = match instrument {
+                    TraceInstrument::Timeline => self.system_trace.timeline_view_height(),
+                    TraceInstrument::Analysis => self.system_trace.event_view_height(),
+                };
+                let pane = ui.allocate_ui_with_layout(
+                    egui::vec2(pane_width, pane_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| match instrument {
+                        TraceInstrument::Timeline => paint_timeline_instrument(
+                            ui,
+                            &mut self.system_trace,
+                            timestamp_frequency_override_hz,
+                        ),
+                        TraceInstrument::Analysis => paint_event_instrument(
+                            ui,
+                            &mut self.system_trace,
+                            timestamp_frequency_override_hz,
+                        ),
+                    },
+                );
+                pane_rects.push((instrument, pane.response.rect));
+                if index == 0 {
+                    paint_trace_instrument_splitter(ui, &mut self.system_trace);
                 }
-                update_trace_instrument_drag(&mut self.system_trace, &pane_rects, ui);
-            });
+            }
+            update_trace_instrument_drag(&mut self.system_trace, &pane_rects, ui);
+        });
     }
 
     pub(crate) fn apply_system_trace_action(&mut self, action: Option<SystemTraceAction>) {
@@ -1666,14 +1530,6 @@ fn probe_provider_label(provider: &ProbeProvider) -> &str {
     }
 }
 
-fn instrument_frame() -> egui::Frame {
-    egui::Frame::none()
-        .fill(PANEL)
-        .stroke(egui::Stroke::new(1.0_f32, GRID))
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::same(12.0))
-}
-
 fn paint_trace_instrument_drag_handle(
     ui: &mut egui::Ui,
     trace: &mut SystemTraceDisplayState,
@@ -1788,7 +1644,7 @@ fn paint_timeline_instrument(
     trace: &mut SystemTraceDisplayState,
     timestamp_frequency_override_hz: Option<u64>,
 ) {
-    instrument_frame().show(ui, |ui| {
+    card_frame(12.0).show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.set_max_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
@@ -3496,7 +3352,7 @@ fn paint_event_instrument(
     trace: &mut SystemTraceDisplayState,
     timestamp_frequency_override_hz: Option<u64>,
 ) {
-    instrument_frame().show(ui, |ui| {
+    card_frame(12.0).show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.set_max_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
@@ -6184,7 +6040,7 @@ mod tests {
         .expect("collapsed setup panel state is stored")
         .rect
         .width();
-        assert!((collapsed_width - COLLAPSED_SIDE_PANEL_WIDTH).abs() < 1.0);
+        assert!((collapsed_width - crate::COLLAPSED_SIDE_PANEL_WIDTH).abs() < 1.0);
         let expand = texts
             .iter()
             .find(|(text, _)| text == "▶")
@@ -6429,6 +6285,7 @@ mod tests {
             let context = egui::Context::default();
             let mut app = app();
             app.system_trace_connection = state;
+            app.active_workspace_view = Some(crate::WorkspaceView::SystemTrace);
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -6437,8 +6294,7 @@ mod tests {
                 ..egui::RawInput::default()
             };
             let output = context.run(input, |context| {
-                let mut actions = FrameActions::default();
-                app.paint_system_trace_setup_panel(context, &mut actions);
+                app.paint_status_bar(context);
             });
 
             fn find_size(shape: &egui::Shape, expected: &str) -> Option<f32> {
@@ -6471,14 +6327,14 @@ mod tests {
                 },
                 "Attached with 0 RTT channel(s); SystemView ready",
             ),
-            CONNECTION_STATUS_FONT_SIZE
+            crate::ui::status_bar::STATUS_MESSAGE_FONT_SIZE
         );
         assert_eq!(
             status_font_size(
                 SystemTraceConnectionState::Error("Probe connection failed".to_owned()),
                 "Probe connection failed",
             ),
-            CONNECTION_STATUS_FONT_SIZE
+            crate::ui::status_bar::STATUS_MESSAGE_FONT_SIZE
         );
     }
 

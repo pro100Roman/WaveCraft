@@ -1,20 +1,20 @@
 //! The central waveform area of the application window.
 
+use super::view_shell::{remaining_plot_rect, tools_panel, view_card, workspace_panel};
+
 use crate::{
-    card_frame, collapsed_side_panel_frame, combined_waveform_cards, egui, fill_card_height,
-    focus_logic_sample_range, format_radio_value, paint_decoded_data_panel, paint_logic,
-    paint_scope, paint_scope_lissajous, scope_channel_label, scope_channels_subtitle,
-    scope_tools_panel_is_visible, toolbar_action_button,
+    combined_waveform_cards, egui, focus_logic_sample_range, format_radio_value,
+    paint_decoded_data_panel, paint_logic, paint_scope, paint_scope_lissajous, scope_channel_label,
+    scope_channels_subtitle, scope_tools_panel_is_visible,
     ui::{frame_state::FrameState, scope_tools_panel::scope_tools_layout},
     waveform_card, Color32, CombinedWaveformViewports, LogicChannelSettingsDraft,
     LogicMarkerSettings, LogicWaveformOptions, PendingSnapshot, ProtocolAnalyzerSettings,
     ProtocolDecodeCache, ProtocolDecodeOutcome, ProtocolDecodeSnapshot, RadioDataMode,
     RadioViewOptions, Rect, RichText, ScopeCaptureSettings, ScopeFftViewport,
     ScopeLissajousPaintOptions, ScopeMarkerSettings, ScopeMeasurementCache, ScopePlotTab,
-    ScopeQuickTimeMeasurement, ScopeTriggerSettings, ScopeWaveformOptions, SelectableHoverText,
-    Sense, Stroke, Vec2, WaveCraftApp, WaveformStore, WaveformTab, WaveformViewport, ACCENT,
-    BACKGROUND, COLLAPSED_SIDE_PANEL_WIDTH, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID,
-    LOGIC_CHANNEL_COUNT, TEXT_MUTED,
+    ScopeQuickTimeMeasurement, ScopeTriggerSettings, ScopeWaveformOptions, Sense, Stroke, Vec2,
+    WaveCraftApp, WaveformStore, WaveformTab, WaveformViewport, ACCENT, COLLAPSED_SIDE_PANEL_WIDTH,
+    GRID, LOGIC_CHANNEL_COUNT, TEXT_MUTED,
 };
 
 /// App state that `paint_central_panel` moves out of [`WaveCraftApp`] while the
@@ -143,15 +143,9 @@ impl WaveCraftApp {
             return;
         }
         let mut state = PanelState::take_from(self);
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(BACKGROUND)
-                    .inner_margin(egui::Margin::same(16.0)),
-            )
-            .show(context, |ui| {
-                self.paint_waveform_views(ui, frame, &mut state);
-            });
+        workspace_panel(context, |ui| {
+            self.paint_waveform_views(ui, frame, &mut state);
+        });
         let snapshot_plot_rect = state.snapshot_plot_rect;
         state.restore_into(self);
         if snapshot_clicked {
@@ -215,8 +209,7 @@ impl WaveCraftApp {
         if self.active_waveform_tab == Some(WaveformTab::Oscilloscope) {
             // The child selector belongs to the scope card and shares its capture/session.
             let previous = self.scope_plot_tab;
-            card_frame(12.0).show(ui, |ui| {
-                ui.set_min_height(ui.available_height());
+            view_card(ui, |ui| {
                 ui.horizontal(|ui| {
                     for tab in ScopePlotTab::ALL {
                         let selected = self.scope_plot_tab == tab;
@@ -250,10 +243,7 @@ impl WaveCraftApp {
                 };
                 ui.label(RichText::new(subtitle).color(TEXT_MUTED));
                 ui.add_space(8.0);
-                let (rect, _) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), ui.available_height().max(64.0)),
-                    Sense::hover(),
-                );
+                let rect = remaining_plot_rect(ui);
                 self.paint_active_waveform_plot(ui, frame, state, Some(rect));
             });
             if previous != self.scope_plot_tab {
@@ -495,19 +485,12 @@ impl WaveCraftApp {
                 Vec2::new(COLLAPSED_SIDE_PANEL_WIDTH, available_size.y),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    collapsed_side_panel_frame().show(ui, |ui| {
-                        fill_card_height(ui);
-                        if ui
-                            .add_sized(
-                                DECODED_PANEL_ACTION_BUTTON_SIZE,
-                                toolbar_action_button("◀", ACCENT),
-                            )
-                            .on_hover_selectable_text("Expand decoded data")
-                            .clicked()
-                        {
-                            state.decoded_data_panel_open = true;
-                        }
-                    });
+                    tools_panel(
+                        ui,
+                        "DECODED DATA",
+                        &mut state.decoded_data_panel_open,
+                        |_| {},
+                    );
                 },
             );
         });
@@ -768,34 +751,20 @@ fn paint_decoded_data_side_panel(
     decoded_outcomes: &[ProtocolDecodeOutcome],
     sample_rate_hz: u64,
 ) -> Option<(u64, u64)> {
-    let mut selected_range = None;
-    card_frame(12.0).show(ui, |ui| {
-        fill_card_height(ui);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("DECODED DATA").strong().color(TEXT_MUTED));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_sized(
-                        DECODED_PANEL_ACTION_BUTTON_SIZE,
-                        toolbar_action_button("▶", ACCENT),
-                    )
-                    .on_hover_selectable_text("Collapse decoded data")
-                    .clicked()
-                {
-                    state.decoded_data_panel_open = false;
-                }
-            });
-        });
-        ui.add_space(8.0);
-        ui.set_width(ui.available_width());
-        selected_range = paint_decoded_data_panel(
-            ui,
-            &state.protocol_analyzer.analyzers,
-            decoded_outcomes,
-            sample_rate_hz,
-        );
-    });
-    selected_range
+    tools_panel(
+        ui,
+        "DECODED DATA",
+        &mut state.decoded_data_panel_open,
+        |ui| {
+            paint_decoded_data_panel(
+                ui,
+                &state.protocol_analyzer.analyzers,
+                decoded_outcomes,
+                sample_rate_hz,
+            )
+        },
+    )
+    .flatten()
 }
 
 #[cfg(test)]

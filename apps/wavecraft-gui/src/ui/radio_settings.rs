@@ -1,6 +1,8 @@
 //! Radio receiver settings panels: capture parameters, gains, and the analyzer
 //! (demodulation, packet, and whitening) configuration.
 
+use super::view_shell::settings_card;
+
 use crate::{
     automatic_filter_tap_count, egui, nearest_domain_value, normalize_gain_value,
     paint_capture_settings_save_button, selected_radio, Color32, DiscoveredRadio, FontId, Pos2,
@@ -8,8 +10,8 @@ use crate::{
     RadioProvider, RadioProviderFailure, RadioSettings, RadioWhiteningPreset, RangeInclusive,
     RichText, SavedCaptureSettingsKind, SelectableHoverText, SyncWordSetting, SyncWordSuggestion,
     ValueDomain, WhiteningDirection, AUTOMATIC_CHANNEL_BANDWIDTH_HZ, AUTOMATIC_FILTER_TAP_COUNT,
-    BACKGROUND, MAX_RADIO_ANALYZER_CHANNELS, RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS,
-    RAW_AUTOMATIC_PREAMBLE_BITS, TEXT_MUTED,
+    MAX_RADIO_ANALYZER_CHANNELS, RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS, RAW_AUTOMATIC_PREAMBLE_BITS,
+    TEXT_MUTED,
 };
 use std::collections::BTreeMap;
 use wavecraft_sdr::GainControlDescriptor;
@@ -419,68 +421,60 @@ pub(crate) fn paint_radio_capture_settings(
         sync_word_suggestions,
     } = state;
     ui.add_space(10.0);
-    let card_width = ui.available_width();
-    egui::Frame::none()
-        .fill(BACKGROUND)
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::same(10.0))
-        .show(ui, |ui| {
-            let content_width = (card_width - 20.0).max(0.0);
-            ui.set_width(content_width);
-            ui.set_max_width(content_width);
-            ui.spacing_mut().indent = RADIO_SECTION_INDENT;
-            egui::CollapsingHeader::new(RichText::new("Receive configuration").strong())
-                .id_salt("radio_receive_configuration_section")
-                .default_open(true)
-                .show(ui, |ui| {
-                    paint_radio_receive_configuration(
-                        ui,
-                        radio,
-                        settings,
-                        enabled,
-                        runtime_enabled,
-                        trigger_runtime_enabled,
-                    );
-                });
-            ui.separator();
-            egui::CollapsingHeader::new(RichText::new("Signal analyzer").strong())
-                .id_salt("radio_signal_analyzer_section")
-                .default_open(false)
-                .show(ui, |ui| {
-                    paint_radio_analyzer_configuration(
-                        ui,
-                        &mut settings.analyzer,
-                        settings.capture.sample_rate_hz,
-                        enabled,
-                        sync_word_suggestions,
-                    );
-                });
-            if settings.analyzer.is_enabled() {
-                ui.separator();
-                let channels_section =
-                    egui::CollapsingHeader::new(RichText::new("Analyzer channels").strong())
-                        .id_salt("radio_analyzer_channels_section")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            paint_radio_analyzer_channels(
-                                ui,
-                                &mut settings.analyzer,
-                                settings.capture.sample_rate_hz,
-                                enabled,
-                            );
-                        });
-                channels_section
-                    .header_response
-                    .on_hover_selectable_text(ANALYZER_CHANNELS_HELP);
-            }
-            show_save_button
-                && paint_capture_settings_save_button(
+    settings_card(ui, |ui| {
+        ui.spacing_mut().indent = RADIO_SECTION_INDENT;
+        egui::CollapsingHeader::new(RichText::new("Receive configuration").strong())
+            .id_salt("radio_receive_configuration_section")
+            .default_open(true)
+            .show(ui, |ui| {
+                paint_radio_receive_configuration(
                     ui,
-                    SavedCaptureSettingsKind::RadioFrequency,
+                    radio,
+                    settings,
                     enabled,
-                )
-        })
-        .inner
+                    runtime_enabled,
+                    trigger_runtime_enabled,
+                );
+            });
+        ui.separator();
+        egui::CollapsingHeader::new(RichText::new("Signal analyzer").strong())
+            .id_salt("radio_signal_analyzer_section")
+            .default_open(false)
+            .show(ui, |ui| {
+                paint_radio_analyzer_configuration(
+                    ui,
+                    &mut settings.analyzer,
+                    settings.capture.sample_rate_hz,
+                    enabled,
+                    sync_word_suggestions,
+                );
+            });
+        if settings.analyzer.is_enabled() {
+            ui.separator();
+            let channels_section =
+                egui::CollapsingHeader::new(RichText::new("Analyzer channels").strong())
+                    .id_salt("radio_analyzer_channels_section")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        paint_radio_analyzer_channels(
+                            ui,
+                            &mut settings.analyzer,
+                            settings.capture.sample_rate_hz,
+                            enabled,
+                        );
+                    });
+            channels_section
+                .header_response
+                .on_hover_selectable_text(ANALYZER_CHANNELS_HELP);
+        }
+        show_save_button
+            && paint_capture_settings_save_button(
+                ui,
+                SavedCaptureSettingsKind::RadioFrequency,
+                enabled,
+            )
+    })
+    .inner
 }
 
 pub(crate) fn paint_scaled_u64_value(
@@ -1927,23 +1921,17 @@ pub(crate) fn paint_radio_settings(
     let changed = paint_radio_device_selector(ui, radios, selected_id, enabled);
     for radio in radios {
         ui.add_space(4.0);
-        egui::Frame::none()
-            .fill(BACKGROUND)
-            .rounding(egui::Rounding::same(6.0))
-            .inner_margin(egui::Margin::same(10.0))
-            .show(ui, |ui| {
-                ui.label(RichText::new(&radio.descriptor.name).strong());
-                ui.small(RichText::new(displayed_radio_id(radio)).color(TEXT_MUTED));
-                ui.small(
-                    RichText::new(format!(
-                        "{:?} · {:?} · {} RX channel(s)",
-                        radio.provider,
-                        radio.connection_backend,
-                        radio.capabilities.receive_channels
-                    ))
-                    .color(TEXT_MUTED),
-                );
-            });
+        settings_card(ui, |ui| {
+            ui.label(RichText::new(&radio.descriptor.name).strong());
+            ui.small(RichText::new(displayed_radio_id(radio)).color(TEXT_MUTED));
+            ui.small(
+                RichText::new(format!(
+                    "{:?} · {:?} · {} RX channel(s)",
+                    radio.provider, radio.connection_backend, radio.capabilities.receive_channels
+                ))
+                .color(TEXT_MUTED),
+            );
+        });
     }
 
     for failure in failures {

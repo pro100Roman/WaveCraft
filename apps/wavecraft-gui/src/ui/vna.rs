@@ -1,14 +1,14 @@
 //! LiteVNA setup controls and Smith chart rendering.
 
+use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel, SetupPanel};
+
 use crate::{
-    apply_setup_panel_typography, card_frame, egui, paint_capture_settings_save_button,
-    toolbar_action_button, CalibrationStandard, Color32, FontId, FrameActions, PendingSnapshot,
-    Pos2, Rect, RichText, SavedCaptureSettingsKind, SelectableHoverText, Sense, Stroke, Vec2,
-    VnaMatchingNetwork, VnaPoint, WaveCraftApp, ACCENT, BACKGROUND, GRID, ORANGE, PANEL,
-    SCOPE_COLORS, TEXT_MUTED, VNA_MATCHING_Q_MAX, VNA_MATCHING_Q_MIN,
+    egui, paint_capture_settings_save_button, toolbar_action_button, CalibrationStandard, Color32,
+    FontId, FrameActions, PendingSnapshot, Pos2, Rect, RichText, SavedCaptureSettingsKind,
+    SelectableHoverText, Sense, Stroke, Vec2, VnaMatchingNetwork, VnaPoint, WaveCraftApp, ACCENT,
+    GRID, ORANGE, SCOPE_COLORS, TEXT_MUTED, VNA_MATCHING_Q_MAX, VNA_MATCHING_Q_MIN,
 };
 
-const VNA_PANEL_WIDTH: f32 = 300.0;
 const SMITH_GRID: Color32 = Color32::from_rgb(54, 68, 81);
 const SMITH_TRACE: Color32 = Color32::from_rgb(78, 205, 196);
 const SMITH_MIN_ZOOM: f32 = 0.5;
@@ -243,68 +243,50 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
-        egui::TopBottomPanel::top("vna_toolbar")
-            .frame(
-                egui::Frame::none()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::same(12.0)),
-            )
-            .show(context, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("WAVECRAFT").strong().size(18.0).color(ACCENT));
-                    ui.separator();
-                    ui.menu_button("App", |ui| {
-                        if ui.button("Settings…").clicked() {
-                            self.settings_open = true;
-                            ui.close_menu();
-                        }
-                    });
-                    ui.separator();
-                    ui.label(RichText::new("Vector network analyzer").color(TEXT_MUTED));
-                    ui.separator();
-                    actions.refresh_clicked = ui
-                        .add_enabled(
-                            !self.is_busy() && self.vna_session.is_none(),
-                            toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
-                        )
-                        .clicked();
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.snapshot_plot_rect.is_some() && self.pending_snapshot.is_none(),
-                            toolbar_action_button("📷", TEXT_MUTED),
-                        )
-                        .clicked()
-                    {
-                        actions.snapshot_clicked = true;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let can_start = self.vna_session.is_some() && !self.is_busy();
-                        if ui
-                            .add_enabled(
-                                (self.vna_run_active && !self.vna_run_stop_requested) || can_start,
-                                if self.vna_run_active {
-                                    toolbar_action_button("■ Stop", Color32::LIGHT_RED)
-                                } else {
-                                    toolbar_action_button("▶ Run", ACCENT)
-                                },
-                            )
-                            .clicked()
-                        {
-                            actions.vna_run_stop_clicked = true;
-                        }
-                        if ui
-                            .add_enabled(
-                                can_start,
-                                toolbar_action_button("▶ Single", SCOPE_COLORS[0]),
-                            )
-                            .clicked()
-                        {
-                            actions.vna_sweep_clicked = true;
-                        }
-                    });
-                });
+        let settings_clicked = view_toolbar(context, "Vector network analyzer", |ui| {
+            actions.refresh_clicked = ui
+                .add_enabled(
+                    !self.is_busy() && self.vna_session.is_none(),
+                    toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
+                )
+                .clicked();
+            ui.separator();
+            if ui
+                .add_enabled(
+                    self.snapshot_plot_rect.is_some() && self.pending_snapshot.is_none(),
+                    toolbar_action_button("📷", TEXT_MUTED),
+                )
+                .clicked()
+            {
+                actions.snapshot_clicked = true;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let can_start = self.vna_session.is_some() && !self.is_busy();
+                if ui
+                    .add_enabled(
+                        (self.vna_run_active && !self.vna_run_stop_requested) || can_start,
+                        if self.vna_run_active {
+                            toolbar_action_button("■ Stop", Color32::LIGHT_RED)
+                        } else {
+                            toolbar_action_button("▶ Run", ACCENT)
+                        },
+                    )
+                    .clicked()
+                {
+                    actions.vna_run_stop_clicked = true;
+                }
+                if ui
+                    .add_enabled(
+                        can_start,
+                        toolbar_action_button("▶ Single", SCOPE_COLORS[0]),
+                    )
+                    .clicked()
+                {
+                    actions.vna_sweep_clicked = true;
+                }
             });
+        });
+        self.settings_open |= settings_clicked;
     }
 
     pub(crate) fn paint_vna_setup_panel(
@@ -312,85 +294,66 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
-        egui::SidePanel::left("vna_setup")
-            .resizable(false)
-            .exact_width(VNA_PANEL_WIDTH)
-            .frame(
-                egui::Frame::none()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::same(14.0)),
-            )
-            .show(context, |ui| {
-                apply_setup_panel_typography(ui);
-                let content_width = ui.available_width();
-                egui::ScrollArea::vertical()
-                    .max_width(content_width)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(content_width);
-                        ui.set_max_width(content_width);
-                        ui.label(RichText::new("VNA SETUP").strong().color(TEXT_MUTED));
-                        ui.add_space(10.0);
-                        ui.label(RichText::new("Instrument").color(TEXT_MUTED));
-                        let selected_text = if self.vna_discovery_error.is_some() {
-                            "LiteVNA discovery failed".to_owned()
-                        } else {
-                            self.selected_vna()
-                                .map(|device| device.display_name.clone())
-                                .unwrap_or_else(|| "No LiteVNA detected".to_owned())
-                        };
-                        ui.add_enabled_ui(
-                            self.vna_session.is_none() && self.vna_connection_pending.is_none(),
-                            |ui| {
-                                egui::ComboBox::from_id_salt("vna_device")
-                                    .width(ui.available_width())
-                                    .selected_text(selected_text)
-                                    .show_ui(ui, |ui| {
-                                        for device in &self.vna_devices {
-                                            ui.selectable_value(
-                                                &mut self.selected_vna_port,
-                                                Some(device.port_name.clone()),
-                                                &device.display_name,
-                                            );
-                                        }
-                                    });
-                            },
-                        );
-                        ui.add_space(6.0);
-                        let connection_pending = self.vna_connection_pending.is_some();
-                        let connection_open = self.vna_session.is_some();
-                        let connection_label = if connection_pending {
-                            if self.vna_connection_closing {
-                                "Closing…"
-                            } else {
-                                "Opening…"
+        SetupPanel::new("vna_setup", "VNA SETUP").show(context, |ui| {
+            ui.label(RichText::new("Instrument").color(TEXT_MUTED));
+            let selected_text = if self.vna_discovery_error.is_some() {
+                "LiteVNA discovery failed".to_owned()
+            } else {
+                self.selected_vna()
+                    .map(|device| device.display_name.clone())
+                    .unwrap_or_else(|| "No LiteVNA detected".to_owned())
+            };
+            ui.add_enabled_ui(
+                self.vna_session.is_none() && self.vna_connection_pending.is_none(),
+                |ui| {
+                    egui::ComboBox::from_id_salt("vna_device")
+                        .width(ui.available_width())
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            for device in &self.vna_devices {
+                                ui.selectable_value(
+                                    &mut self.selected_vna_port,
+                                    Some(device.port_name.clone()),
+                                    &device.display_name,
+                                );
                             }
-                        } else if connection_open {
-                            "■ Close"
-                        } else {
-                            "▶ Open"
-                        };
-                        let connection_color = if connection_open || self.vna_connection_closing {
-                            Color32::LIGHT_RED
-                        } else {
-                            ACCENT
-                        };
-                        if ui
-                            .add_enabled(
-                                !connection_pending
-                                    && !self.is_busy()
-                                    && (connection_open || self.selected_vna().is_some()),
-                                toolbar_action_button(connection_label, connection_color),
-                            )
-                            .clicked()
-                        {
-                            actions.vna_connection_clicked = true;
-                        }
+                        });
+                },
+            );
+            ui.add_space(6.0);
+            let connection_pending = self.vna_connection_pending.is_some();
+            let connection_open = self.vna_session.is_some();
+            let connection_label = if connection_pending {
+                if self.vna_connection_closing {
+                    "Closing…"
+                } else {
+                    "Opening…"
+                }
+            } else if connection_open {
+                "■ Close"
+            } else {
+                "▶ Open"
+            };
+            let connection_color = if connection_open || self.vna_connection_closing {
+                Color32::LIGHT_RED
+            } else {
+                ACCENT
+            };
+            if ui
+                .add_enabled(
+                    !connection_pending
+                        && !self.is_busy()
+                        && (connection_open || self.selected_vna().is_some()),
+                    toolbar_action_button(connection_label, connection_color),
+                )
+                .clicked()
+            {
+                actions.vna_connection_clicked = true;
+            }
 
-                        ui.add_space(14.0);
-                        paint_vna_settings_card(ui, self, actions);
-                    });
-            });
+            ui.add_space(14.0);
+            paint_vna_settings_card(ui, self, actions);
+        });
     }
 
     pub(crate) fn paint_vna_central_panel(
@@ -399,122 +362,109 @@ impl WaveCraftApp {
         snapshot_clicked: bool,
     ) {
         let mut plot_rect = None;
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(BACKGROUND)
-                    .inner_margin(egui::Margin::same(16.0)),
-            )
-            .show(context, |ui| {
-                card_frame(12.0).show(ui, |ui| {
-                    ui.set_min_height(ui.available_height());
-                    ui.horizontal(|ui| {
-                        for tab in VnaPlotTab::ALL {
-                            let selected = self.vna_plot_tab == tab;
-                            ui.selectable_value(
-                                &mut self.vna_plot_tab,
-                                tab,
-                                RichText::new(tab.label()).strong().color(if selected {
-                                    ACCENT
-                                } else {
-                                    TEXT_MUTED
-                                }),
-                            );
-                        }
-                        if let Some(sweep) = &self.vna_sweep {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "FW {}.{} · HW {} · {} points",
-                                            sweep.identity.firmware_major,
-                                            sweep.identity.firmware_minor,
-                                            sweep.identity.hardware_revision,
-                                            sweep.points.len()
-                                        ))
-                                        .monospace()
-                                        .color(TEXT_MUTED),
-                                    );
-                                },
-                            );
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if self.vna_plot_tab == VnaPlotTab::SmithChart {
-                            let subtitle = if self.vna_sweep_calibrated {
-                                "SOL-calibrated S11 · Z₀ = 50 Ω"
+        workspace_panel(context, |ui| {
+            view_card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for tab in VnaPlotTab::ALL {
+                        let selected = self.vna_plot_tab == tab;
+                        ui.selectable_value(
+                            &mut self.vna_plot_tab,
+                            tab,
+                            RichText::new(tab.label()).strong().color(if selected {
+                                ACCENT
                             } else {
-                                "Raw S11 reflection coefficient · Z₀ = 50 Ω"
-                            };
-                            ui.label(RichText::new(subtitle).color(TEXT_MUTED));
-                        }
-                        if self.vna_plot_tab == VnaPlotTab::LogMagnitudePhase
-                            || self.vna_sweep_progress.is_some()
-                        {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if let Some(progress) = self.vna_sweep_progress {
-                                        ui.add(
-                                            egui::ProgressBar::new(progress.fraction())
-                                                .desired_width(260.0)
-                                                .text(progress.label())
-                                                .animate(true),
-                                        );
-                                    }
-                                    if self.vna_plot_tab == VnaPlotTab::LogMagnitudePhase {
-                                        egui::ComboBox::from_id_salt("vna_plot_channel")
-                                            .width(72.0)
-                                            .selected_text(self.vna_plot_channel.label())
-                                            .show_ui(ui, |ui| {
-                                                for channel in VnaChannel::ALL {
-                                                    ui.selectable_value(
-                                                        &mut self.vna_plot_channel,
-                                                        channel,
-                                                        channel.label(),
-                                                    );
-                                                }
-                                            });
-                                        ui.label(RichText::new("Source").color(TEXT_MUTED));
-                                    }
-                                },
+                                TEXT_MUTED
+                            }),
+                        );
+                    }
+                    if let Some(sweep) = &self.vna_sweep {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "FW {}.{} · HW {} · {} points",
+                                    sweep.identity.firmware_major,
+                                    sweep.identity.firmware_minor,
+                                    sweep.identity.hardware_revision,
+                                    sweep.points.len()
+                                ))
+                                .monospace()
+                                .color(TEXT_MUTED),
                             );
-                        }
-                    });
-                    ui.add_space(12.0);
-                    let available = ui.available_size();
-                    let plot_size = Vec2::new(available.x.max(120.0), available.y.max(120.0));
-                    let (rect, response) = ui.allocate_exact_size(plot_size, Sense::click());
-                    plot_rect = Some(rect);
-                    match self.vna_plot_tab {
-                        VnaPlotTab::SmithChart => paint_smith_chart(
-                            ui,
-                            rect,
-                            self.vna_sweep.as_ref(),
-                            &response,
-                            &mut self.vna_smith_viewport,
-                            &mut self.vna_smith_pinned_point,
-                            (
-                                self.vna_settings.matching_network,
-                                self.vna_settings.matching_q,
-                            ),
-                        ),
-                        VnaPlotTab::LogMagnitudePhase => paint_log_magnitude_phase_chart(
-                            ui,
-                            rect,
-                            self.vna_sweep.as_ref(),
-                            &response,
-                            self.vna_plot_channel,
-                            (
-                                self.vna_settings.start_mhz * 1_000_000.0,
-                                self.vna_settings.stop_mhz * 1_000_000.0,
-                            ),
-                        ),
+                        });
                     }
                 });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if self.vna_plot_tab == VnaPlotTab::SmithChart {
+                        let subtitle = if self.vna_sweep_calibrated {
+                            "SOL-calibrated S11 · Z₀ = 50 Ω"
+                        } else {
+                            "Raw S11 reflection coefficient · Z₀ = 50 Ω"
+                        };
+                        ui.label(RichText::new(subtitle).color(TEXT_MUTED));
+                    }
+                    if self.vna_plot_tab == VnaPlotTab::LogMagnitudePhase
+                        || self.vna_sweep_progress.is_some()
+                    {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some(progress) = self.vna_sweep_progress {
+                                ui.add(
+                                    egui::ProgressBar::new(progress.fraction())
+                                        .desired_width(260.0)
+                                        .text(progress.label())
+                                        .animate(true),
+                                );
+                            }
+                            if self.vna_plot_tab == VnaPlotTab::LogMagnitudePhase {
+                                egui::ComboBox::from_id_salt("vna_plot_channel")
+                                    .width(72.0)
+                                    .selected_text(self.vna_plot_channel.label())
+                                    .show_ui(ui, |ui| {
+                                        for channel in VnaChannel::ALL {
+                                            ui.selectable_value(
+                                                &mut self.vna_plot_channel,
+                                                channel,
+                                                channel.label(),
+                                            );
+                                        }
+                                    });
+                                ui.label(RichText::new("Source").color(TEXT_MUTED));
+                            }
+                        });
+                    }
+                });
+                ui.add_space(12.0);
+                let available = ui.available_size();
+                let plot_size = Vec2::new(available.x.max(120.0), available.y.max(120.0));
+                let (rect, response) = ui.allocate_exact_size(plot_size, Sense::click());
+                plot_rect = Some(rect);
+                match self.vna_plot_tab {
+                    VnaPlotTab::SmithChart => paint_smith_chart(
+                        ui,
+                        rect,
+                        self.vna_sweep.as_ref(),
+                        &response,
+                        &mut self.vna_smith_viewport,
+                        &mut self.vna_smith_pinned_point,
+                        (
+                            self.vna_settings.matching_network,
+                            self.vna_settings.matching_q,
+                        ),
+                    ),
+                    VnaPlotTab::LogMagnitudePhase => paint_log_magnitude_phase_chart(
+                        ui,
+                        rect,
+                        self.vna_sweep.as_ref(),
+                        &response,
+                        self.vna_plot_channel,
+                        (
+                            self.vna_settings.start_mhz * 1_000_000.0,
+                            self.vna_settings.stop_mhz * 1_000_000.0,
+                        ),
+                    ),
+                }
             });
+        });
         self.snapshot_plot_rect = plot_rect;
         if snapshot_clicked {
             if let Some(plot_rect) = plot_rect {
@@ -530,55 +480,45 @@ impl WaveCraftApp {
 }
 
 fn paint_vna_settings_card(ui: &mut egui::Ui, app: &mut WaveCraftApp, actions: &mut FrameActions) {
-    let card_width = ui.available_width();
-    egui::Frame::none()
-        .fill(BACKGROUND)
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::same(10.0))
-        .show(ui, |ui| {
-            let content_width = (card_width - 20.0).max(0.0);
-            ui.set_width(content_width);
-            ui.set_max_width(content_width);
-            ui.spacing_mut().indent = 10.0;
-            ui.label(RichText::new("LiteVNA 64").strong());
-            ui.add_space(10.0);
-            let sweep_section =
-                egui::CollapsingHeader::new(RichText::new("Sweep settings").strong())
-                    .id_salt("vna_sweep_settings_section")
-                    .default_open(true)
-                    .show(ui, |ui| paint_vna_sweep_settings(ui, app));
-            sweep_section.header_response.on_hover_selectable_text(
+    settings_card(ui, |ui| {
+        ui.spacing_mut().indent = 10.0;
+        ui.label(RichText::new("LiteVNA 64").strong());
+        ui.add_space(10.0);
+        let sweep_section = egui::CollapsingHeader::new(RichText::new("Sweep settings").strong())
+            .id_salt("vna_sweep_settings_section")
+            .default_open(true)
+            .show(ui, |ui| paint_vna_sweep_settings(ui, app));
+        sweep_section.header_response.on_hover_selectable_text(
                 "Frequency range, point count, and averaging used by LiteVNA sweeps and calibration captures.",
             );
 
-            ui.separator();
-            let matching_section =
-                egui::CollapsingHeader::new(RichText::new("Matching").strong())
-                    .id_salt("vna_matching_settings_section")
-                    .default_open(true)
-                    .show(ui, |ui| paint_vna_matching_settings(ui, app));
-            matching_section.header_response.on_hover_selectable_text(
+        ui.separator();
+        let matching_section = egui::CollapsingHeader::new(RichText::new("Matching").strong())
+            .id_salt("vna_matching_settings_section")
+            .default_open(true)
+            .show(ui, |ui| paint_vna_matching_settings(ui, app));
+        matching_section.header_response.on_hover_selectable_text(
                 "Select which ideal 50 Ω matching network is calculated for the hovered Smith-chart point. L-network Q is fixed by the impedance ratio; π and T networks use the configurable design Q.",
             );
 
-            paint_calibration_controls(ui, app, actions);
-            ui.add_space(12.0);
-            ui.small(
+        paint_calibration_controls(ui, app, actions);
+        ui.add_space(12.0);
+        ui.small(
                 RichText::new(
                     "USB sweeps contain raw data. WaveCraft applies its own calibration and returns LiteVNA to local mode afterward.",
                 )
                 .color(TEXT_MUTED),
             );
-            let settings_valid = vna_frequency_inputs_are_valid(app);
-            if paint_capture_settings_save_button(
-                ui,
-                SavedCaptureSettingsKind::VectorNetworkAnalyzer,
-                !app.is_busy() && settings_valid,
-            ) {
-                actions.save_capture_settings_kind =
-                    Some(SavedCaptureSettingsKind::VectorNetworkAnalyzer);
-            }
-        });
+        let settings_valid = vna_frequency_inputs_are_valid(app);
+        if paint_capture_settings_save_button(
+            ui,
+            SavedCaptureSettingsKind::VectorNetworkAnalyzer,
+            !app.is_busy() && settings_valid,
+        ) {
+            actions.save_capture_settings_kind =
+                Some(SavedCaptureSettingsKind::VectorNetworkAnalyzer);
+        }
+    });
 }
 
 fn paint_vna_sweep_settings(ui: &mut egui::Ui, app: &mut WaveCraftApp) {

@@ -2,46 +2,17 @@
 //! ruler, status line, and the common marker drawing helpers.
 
 use crate::{
-    egui, format_duration, Color32, Duration, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2,
-    WaveformTimeAxis, WaveformViewport, ACCENT, BACKGROUND, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID,
-    PANEL, SCOPE_HORIZONTAL_DIVISIONS, TEXT_MUTED, TIME_RULER_HEIGHT, WAVEFORM_STATUS_HEIGHT,
+    egui, format_duration, Color32, Duration, FontId, Pos2, Rect, RichText, Stroke, Vec2,
+    WaveformTimeAxis, WaveformViewport, ACCENT, BACKGROUND, GRID, PANEL,
+    SCOPE_HORIZONTAL_DIVISIONS, TEXT_MUTED, TIME_RULER_HEIGHT, WAVEFORM_STATUS_HEIGHT,
 };
 
-/// Width of the card outline.
-const CARD_STROKE_WIDTH: f32 = 1.0;
-/// Space between the edge of a collapsed side panel and its expand button.
-const COLLAPSED_SIDE_PANEL_MARGIN: f32 = 4.0;
-/// Width of the strip that stands in for a collapsed side panel: the expand
-/// button, its margin and the card outline.
-pub(crate) const COLLAPSED_SIDE_PANEL_WIDTH: f32 =
-    DECODED_PANEL_ACTION_BUTTON_SIZE[0] + 2.0 * (COLLAPSED_SIDE_PANEL_MARGIN + CARD_STROKE_WIDTH);
+use crate::ui::view_shell::{remaining_plot_rect, view_card};
 
 /// A floating waveform plate that lets half of the trace beneath it remain
 /// visible while retaining the source color.
 pub(crate) fn half_transparent_plate(color: Color32) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 128)
-}
-
-/// The outline every block of the central area shares: the waveform cards and
-/// the side panels beside them, so they all have the same corners and edge.
-pub(crate) fn card_frame(inner_margin: f32) -> egui::Frame {
-    egui::Frame::none()
-        .fill(PANEL)
-        .stroke(Stroke::new(CARD_STROKE_WIDTH, GRID))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(inner_margin))
-}
-
-/// The frame of a collapsed side panel, with the strip's height filled by
-/// [`fill_card_height`].
-pub(crate) fn collapsed_side_panel_frame() -> egui::Frame {
-    card_frame(COLLAPSED_SIDE_PANEL_MARGIN)
-}
-
-/// Stretches the contents of a [`card_frame`] to the height the frame was
-/// given, so a side panel is as tall as the waveform card beside it.
-pub(crate) fn fill_card_height(ui: &mut egui::Ui) {
-    ui.set_min_height(ui.available_height());
 }
 
 /// A card with a title row whose plot takes all the height that is left, and
@@ -52,23 +23,17 @@ pub(crate) fn waveform_card(
     subtitle: &str,
     paint: impl FnOnce(&mut egui::Ui, Rect),
 ) -> Rect {
-    card_frame(12.0)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::Label::new(RichText::new(title).strong().color(ACCENT)).selectable(true),
-                );
-                ui.add(
-                    egui::Label::new(RichText::new(subtitle).color(TEXT_MUTED)).selectable(true),
-                );
-            });
-            ui.add_space(8.0);
-            let size = Vec2::new(ui.available_width(), ui.available_height().max(64.0));
-            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-            paint(ui, rect);
-            rect
-        })
-        .inner
+    view_card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(RichText::new(title).strong().color(ACCENT)).selectable(true));
+            ui.add(egui::Label::new(RichText::new(subtitle).color(TEXT_MUTED)).selectable(true));
+        });
+        ui.add_space(8.0);
+        let rect = remaining_plot_rect(ui);
+        paint(ui, rect);
+        rect
+    })
+    .inner
 }
 
 pub(crate) fn paint_plot_background(ui: &egui::Ui, rect: Rect) {

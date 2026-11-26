@@ -1,5 +1,9 @@
 # GUI modularization and multi-SDR integration plan
 
+The shared visual layout contract is implemented in `ui/view_shell.rs`; see
+[Shared instrument view pattern](gui-view-pattern.md) for components, message
+placement and the recipe for adding a view.
+
 Status: the file split (migration steps 1-3 and 5-7) is done and `lib.rs` is
 down to 683 lines; the RF/SDR integration for HackRF One is implemented. What
 remains most of the long functions inside the moved code (`poll_worker` and

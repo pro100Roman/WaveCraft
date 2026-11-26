@@ -1,17 +1,12 @@
 //! The oscilloscope tools panel beside the waveform card.
 
-use crate::{
-    card_frame, collapsed_side_panel_frame, egui, fill_card_height, paint_scope_tools,
-    toolbar_action_button, Rect, RichText, ScopeToolsOptions, SelectableHoverText, ACCENT,
-    BACKGROUND, COLLAPSED_SIDE_PANEL_WIDTH, DECODED_PANEL_ACTION_BUTTON_SIZE, TEXT_MUTED,
-};
+use super::view_shell::{settings_card, settings_scroll, tools_panel, SETUP_PANEL_WIDTH};
+use crate::{egui, paint_scope_tools, Rect, ScopeToolsOptions, COLLAPSED_SIDE_PANEL_WIDTH};
 
 use crate::WaveCraftApp;
 
 /// Width of the expanded panel.
-const SCOPE_TOOLS_PANEL_WIDTH: f32 = 300.0;
-/// Space around the contents of the expanded panel.
-const SCOPE_TOOLS_PANEL_MARGIN: f32 = 14.0;
+const SCOPE_TOOLS_PANEL_WIDTH: f32 = SETUP_PANEL_WIDTH;
 
 /// How the central area is divided between the waveform view and the tools.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,88 +43,26 @@ impl WaveCraftApp {
         ui: &mut egui::Ui,
         trigger_controls_enabled: bool,
     ) {
-        if self.scope_tools_panel_open {
-            self.paint_expanded_scope_tools_panel(ui, trigger_controls_enabled);
-        } else {
-            self.paint_collapsed_scope_tools_panel(ui);
-        }
-    }
-
-    /// The "SCOPE TOOLS" panel; its header button collapses it.
-    fn paint_expanded_scope_tools_panel(
-        &mut self,
-        ui: &mut egui::Ui,
-        trigger_controls_enabled: bool,
-    ) {
-        let mut collapse_clicked = false;
-        card_frame(SCOPE_TOOLS_PANEL_MARGIN).show(ui, |ui| {
-            fill_card_height(ui);
-            let content_width = ui.available_width();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("SCOPE TOOLS").strong().color(TEXT_MUTED));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_sized(
-                            DECODED_PANEL_ACTION_BUTTON_SIZE,
-                            toolbar_action_button("▶", ACCENT),
-                        )
-                        .on_hover_selectable_text("Collapse scope tools")
-                        .clicked()
-                    {
-                        collapse_clicked = true;
-                    }
+        let mut open = self.scope_tools_panel_open;
+        tools_panel(ui, "SCOPE TOOLS", &mut open, |ui| {
+            settings_scroll(ui, |ui| {
+                settings_card(ui, |ui| {
+                    paint_scope_tools(
+                        ui,
+                        &mut self.scope_settings,
+                        &mut self.scope_function_settings,
+                        &mut self.scope_marker_settings,
+                        &mut self.scope_marker_editor,
+                        &self.scope_channel_names,
+                        ScopeToolsOptions {
+                            viewport: self.scope_viewport,
+                            trigger_controls_enabled,
+                        },
+                    );
                 });
             });
-            ui.add_space(8.0);
-            egui::ScrollArea::vertical()
-                .max_width(content_width)
-                .show(ui, |ui| {
-                    ui.set_width(content_width);
-                    egui::Frame::none()
-                        .fill(BACKGROUND)
-                        .rounding(egui::Rounding::same(6.0))
-                        .inner_margin(egui::Margin::same(10.0))
-                        .show(ui, |ui| {
-                            ui.set_width((content_width - 20.0).max(0.0));
-                            paint_scope_tools(
-                                ui,
-                                &mut self.scope_settings,
-                                &mut self.scope_function_settings,
-                                &mut self.scope_marker_settings,
-                                &mut self.scope_marker_editor,
-                                &self.scope_channel_names,
-                                ScopeToolsOptions {
-                                    viewport: self.scope_viewport,
-                                    trigger_controls_enabled,
-                                },
-                            );
-                        });
-                });
         });
-        if collapse_clicked {
-            self.scope_tools_panel_open = false;
-        }
-    }
-
-    /// The narrow strip that replaces the collapsed panel; its button expands it.
-    fn paint_collapsed_scope_tools_panel(&mut self, ui: &mut egui::Ui) {
-        let mut expand_clicked = false;
-        collapsed_side_panel_frame().show(ui, |ui| {
-            fill_card_height(ui);
-            if ui
-                .add_sized(
-                    DECODED_PANEL_ACTION_BUTTON_SIZE,
-                    toolbar_action_button("◀", ACCENT),
-                )
-                .on_hover_selectable_text("Expand scope tools")
-                .clicked()
-            {
-                expand_clicked = true;
-            }
-        });
-        if expand_clicked {
-            self.scope_tools_panel_open = true;
-        }
+        self.scope_tools_panel_open = open;
     }
 }
 

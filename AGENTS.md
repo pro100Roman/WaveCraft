@@ -6,6 +6,14 @@ This is a Cargo workspace for WaveCraft, a Rust rewrite of DSView. Device-indepe
 
 Keep hardware drivers independent of the UI. New device backends should implement `CaptureSource` and emit typed batches through `CaptureContext`.
 
+## Shared GUI View Pattern
+
+Every workspace view (LA, OSC, RF, Combined, VNA, System Trace, Serial, and future views) must reuse the instrument chrome in `apps/wavecraft-gui/src/ui/view_shell.rs`. Use `view_toolbar` for the application menu and control row, `SetupPanel` for left settings, `settings_card` for inset settings groups, `workspace_panel` and `view_card` for plots/tables, and `tools_panel` for collapsible auxiliary settings. Keep primary acquisition controls at the right end of the toolbar. Extend these shared components when a layout capability is missing instead of copying panel frames, margins, typography, or collapse controls into a view.
+
+Operational status and errors belong in the common bottom message area in `ui/status_bar.rs`, including view-specific connection and Serial errors. Adapt a view's state through `active_view_status`; do not paint operational messages in toolbars, setup panels, or over plots. All informational text (including status, errors, labels, and tooltips) must support text selection and native keyboard copying (Cmd+C / Ctrl+C); keep `style.interaction.selectable_labels` enabled and do not add dedicated message-copy buttons. Keep errors visible when settings are collapsed. Plot annotations, data quality counters, empty-state guidance, and actionable confirmation dialogs remain local to their content.
+
+The shell must stay independent of `WaveCraftApp`, capture lifecycle, and hardware drivers. Views supply their controls/content and retain domain state; apply requested actions through the existing application orchestration. See `docs/gui-view-pattern.md` for the component contract, extension recipe, and verification expectations.
+
 ## Build, Test, and Development Commands
 
 - `cargo run -p wavecraft-cli -- 2` — run simultaneous simulated capture for two seconds.

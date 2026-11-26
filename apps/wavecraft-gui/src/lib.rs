@@ -102,6 +102,7 @@ use ui::protocol_analyzer_dialog::*;
 use ui::radio_settings::*;
 use ui::scope_settings::*;
 use ui::system_trace::*;
+use ui::view_shell::COLLAPSED_SIDE_PANEL_WIDTH;
 use ui::view_tabs::*;
 use ui::vna::{SmithChartViewport, VnaChannel, VnaPlotTab};
 use vna::*;

@@ -19,6 +19,7 @@ pub mod session_tabs;
 pub mod status_bar;
 pub mod system_trace;
 pub mod toolbar;
+pub(crate) mod view_shell;
 pub mod view_tabs;
 pub mod vna;
 pub mod waveform_tabs;

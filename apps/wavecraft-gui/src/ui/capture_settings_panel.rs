@@ -1,6 +1,8 @@
 //! The capture-settings tab: logic and scope capture controls, trigger
 //! conditions, marker settings, and the save-as-default button.
 
+use super::view_shell::settings_card;
+
 use crate::{
     egui, format_duration, format_sample_count, format_sample_rate, logic_capture_duration_label,
     logic_capture_duration_options, logic_marker_color, logic_trigger_condition_label,
@@ -10,7 +12,7 @@ use crate::{
     DsCopeOperationMode, DsLogicInputFilter, DsLogicOperationMode, DsLogicStopOption,
     DsLogicTriggerCondition, Duration, LogicCaptureSettings, LogicMarkerSettings, LogicTriggerMode,
     ProtocolAnalyzerSettings, RichText, SavedCaptureSettingsKind, ScopeCalibrationAction,
-    ScopeCaptureSettings, SelectableHoverText, Stroke, UsbSpeedClass, Vec2, ACCENT, BACKGROUND,
+    ScopeCaptureSettings, SelectableHoverText, Stroke, UsbSpeedClass, Vec2, ACCENT,
     DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ, DSLOGIC_SAMPLE_RATES_HZ,
     DSLOGIC_TRIGGER_STAGE_COUNT, GRID, LOGIC_CHANNEL_COUNT, LOGIC_MARKER_LIMIT,
     LOGIC_MARKER_NAME_MAX_CHARS, SAMPLE_RATE_HZ, TEXT_MUTED,
@@ -114,49 +116,42 @@ pub(crate) fn paint_capture_settings(
         auto_sample_rate: scope_auto_sample_rate,
         smart_timing_enabled: scope_smart_timing_enabled,
     } = scope_editor;
-    let card_width = ui.available_width();
-    let save_clicked = egui::Frame::none()
-        .fill(BACKGROUND)
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::same(10.0))
-        .show(ui, |ui| {
-            let content_width = (card_width - 20.0).max(0.0);
-            ui.set_width(content_width);
-            ui.set_max_width(content_width);
-            ui.label(
-                RichText::new(match tab {
-                    CaptureSettingsTab::DsLogic => "DSLogic 16-channel analyzer",
-                    CaptureSettingsTab::DsCope => "DSCope U3P100",
-                })
-                .strong(),
-            );
-            ui.add_space(6.0);
-            match tab {
-                CaptureSettingsTab::DsLogic => {
-                    paint_logic_capture_settings(ui, logic_editor, availability, content_width);
-                }
-                CaptureSettingsTab::DsCope => {
-                    paint_scope_capture_settings(
-                        ui,
-                        scope_settings,
-                        scope_auto_sample_rate,
-                        scope_smart_timing_enabled,
-                        visualization_editor,
-                        availability,
-                        calibration_action,
-                    );
-                }
+    let save_clicked = settings_card(ui, |ui| {
+        let content_width = ui.available_width();
+        ui.label(
+            RichText::new(match tab {
+                CaptureSettingsTab::DsLogic => "DSLogic 16-channel analyzer",
+                CaptureSettingsTab::DsCope => "DSCope U3P100",
+            })
+            .strong(),
+        );
+        ui.add_space(6.0);
+        match tab {
+            CaptureSettingsTab::DsLogic => {
+                paint_logic_capture_settings(ui, logic_editor, availability, content_width);
             }
-            paint_capture_settings_save_button(
-                ui,
-                match tab {
-                    CaptureSettingsTab::DsLogic => SavedCaptureSettingsKind::LogicAnalyzer,
-                    CaptureSettingsTab::DsCope => SavedCaptureSettingsKind::Oscilloscope,
-                },
-                availability.capture,
-            )
-        })
-        .inner;
+            CaptureSettingsTab::DsCope => {
+                paint_scope_capture_settings(
+                    ui,
+                    scope_settings,
+                    scope_auto_sample_rate,
+                    scope_smart_timing_enabled,
+                    visualization_editor,
+                    availability,
+                    calibration_action,
+                );
+            }
+        }
+        paint_capture_settings_save_button(
+            ui,
+            match tab {
+                CaptureSettingsTab::DsLogic => SavedCaptureSettingsKind::LogicAnalyzer,
+                CaptureSettingsTab::DsCope => SavedCaptureSettingsKind::Oscilloscope,
+            },
+            availability.capture,
+        )
+    })
+    .inner;
     scope_settings.clamp_to_channel_limits();
     save_clicked
 }

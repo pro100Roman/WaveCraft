@@ -1,8 +1,10 @@
 //! Serial / UART workspace, matching the instrument toolbar, setup cards and split panes.
+
+use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel, SetupPanel};
 use crate::serial::{SerialMode, SerialSettings, SerialState, TextField, COLORS};
 use crate::{
-    apply_setup_panel_typography, egui, toolbar_action_button, RichText, WaveCraftApp,
-    WorkspaceView, ACCENT, BACKGROUND, GRID, PANEL, TEXT_MUTED,
+    egui, toolbar_action_button, RichText, WaveCraftApp, WorkspaceView, ACCENT, BACKGROUND, GRID,
+    TEXT_MUTED,
 };
 use wavecraft_serial::BinarySchema;
 
@@ -30,81 +32,61 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn paint_serial_toolbar(&mut self, context: &egui::Context) {
-        egui::TopBottomPanel::top("toolbar")
-            .frame(
-                egui::Frame::none()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::same(12.0)),
-            )
-            .show(context, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("WAVECRAFT").strong().size(18.0).color(ACCENT));
-                    ui.separator();
-                    ui.menu_button("App", |ui| {
-                        if ui.button("Settings…").clicked() {
-                            self.settings_open = true;
-                            ui.close_menu();
-                        }
-                    });
-                    ui.separator();
-                    let running = self.serial.session.is_some();
-                    if ui
-                        .add_enabled(!running, toolbar_action_button("↻ Refresh", TEXT_MUTED))
-                        .clicked()
-                    {
-                        self.serial.refresh();
+        let settings_clicked = view_toolbar(context, "Serial / UART", |ui| {
+            let running = self.serial.session.is_some();
+            if ui
+                .add_enabled(!running, toolbar_action_button("↻ Refresh", TEXT_MUTED))
+                .clicked()
+            {
+                self.serial.refresh();
+            }
+            if ui.add(toolbar_action_button("Clear", TEXT_MUTED)).clicked() {
+                self.serial.clear_data();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(!running, toolbar_action_button("📂 Open raw…", TEXT_MUTED))
+                .clicked()
+            {
+                self.open_serial_raw();
+            }
+            if ui
+                .add_enabled(
+                    !self.serial.raw.is_empty(),
+                    toolbar_action_button("Save raw…", TEXT_MUTED),
+                )
+                .on_hover_text("Save the retained raw bytes (latest 64 KiB)")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("serial-capture.bin")
+                    .save_file()
+                {
+                    let bytes: Vec<_> = self.serial.raw.iter().copied().collect();
+                    if let Err(error) = std::fs::write(path, bytes) {
+                        self.serial.error = Some(error.to_string());
                     }
-                    if running {
-                        if ui
-                            .add_enabled(
-                                !self.serial.stopping,
-                                toolbar_action_button("■ Stop", egui::Color32::LIGHT_RED),
-                            )
-                            .clicked()
-                        {
-                            self.serial.stop();
-                        }
-                    } else if ui.add(toolbar_action_button("▶ Start", ACCENT)).clicked() {
-                        if let Err(error) = self.serial.start() {
-                            self.serial.error = Some(error.to_string());
-                        }
-                    }
-                    if ui.add(toolbar_action_button("Clear", TEXT_MUTED)).clicked() {
-                        self.serial.clear_data();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(!running, toolbar_action_button("📂 Open raw…", TEXT_MUTED))
-                        .clicked()
-                    {
-                        self.open_serial_raw();
-                    }
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if running {
                     if ui
                         .add_enabled(
-                            !self.serial.raw.is_empty(),
-                            toolbar_action_button("Save raw…", TEXT_MUTED),
+                            !self.serial.stopping,
+                            toolbar_action_button("■ Stop", egui::Color32::LIGHT_RED),
                         )
-                        .on_hover_text("Save the retained raw bytes (latest 64 KiB)")
                         .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name("serial-capture.bin")
-                            .save_file()
-                        {
-                            let bytes: Vec<_> = self.serial.raw.iter().copied().collect();
-                            if let Err(error) = std::fs::write(path, bytes) {
-                                self.serial.error = Some(error.to_string());
-                            }
-                        }
+                        self.serial.stop();
                     }
-                    ui.separator();
-                    ui.label(RichText::new(&self.serial.status).color(if running {
-                        ACCENT
-                    } else {
-                        TEXT_MUTED
-                    }));
-                });
+                } else if ui.add(toolbar_action_button("▶ Start", ACCENT)).clicked() {
+                    if let Err(error) = self.serial.start() {
+                        self.serial.error = Some(error.to_string());
+                    }
+                }
             });
+        });
+        self.settings_open |= settings_clicked;
     }
 
     fn open_serial_raw(&mut self) {
@@ -149,107 +131,67 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn paint_serial_setup(&mut self, context: &egui::Context) {
-        if !self.serial.setup_open {
-            egui::SidePanel::left("serial_setup_collapsed")
-                .exact_width(crate::COLLAPSED_SIDE_PANEL_WIDTH)
-                .resizable(false)
-                .frame(crate::collapsed_side_panel_frame())
-                .show(context, |ui| {
-                    if ui
-                        .button("▶")
-                        .on_hover_text("Expand Serial setup")
-                        .clicked()
-                    {
-                        self.serial.setup_open = true;
-                    }
-                });
-            return;
-        }
         let before = self.serial.settings.clone();
-        egui::SidePanel::left("serial_setup")
-            .exact_width(300.0)
-            .resizable(false)
-            .frame(
-                egui::Frame::none()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::same(14.0)),
-            )
-            .show(context, |ui| {
-                apply_setup_panel_typography(ui);
-                ui.horizontal(|ui| {
+        let mut open = self.serial.setup_open;
+        SetupPanel::new("serial_setup", "SERIAL / UART SETUP").show_collapsible(
+            context,
+            &mut open,
+            |ui| {
+                let running = self.serial.session.is_some();
+                if running {
                     ui.label(
-                        RichText::new("SERIAL / UART SETUP")
-                            .strong()
+                        RichText::new("Stop to change port or decoding settings")
+                            .small()
                             .color(TEXT_MUTED),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button("◀")
-                            .on_hover_text("Collapse Serial setup")
-                            .clicked()
-                        {
-                            self.serial.setup_open = false;
+                } else {
+                    ui.label(
+                        RichText::new("Decoding changes apply on the next Start / Open.")
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                }
+                settings_card(ui, |ui| {
+                    setup_section(ui, "PORT", !running, |ui| {
+                        port_settings(ui, &mut self.serial)
+                    });
+                    ui.add_space(10.0);
+                    setup_section(ui, "DATA FORMAT", !running, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.serial.settings.mode,
+                                SerialMode::Text,
+                                "Text / ASCII",
+                            );
+                            ui.selectable_value(
+                                &mut self.serial.settings.mode,
+                                SerialMode::Binary,
+                                "Binary",
+                            );
+                        });
+                        if self.serial.settings.mode == SerialMode::Text {
+                            text_settings(ui, &mut self.serial.settings);
+                        } else {
+                            binary_settings(ui, &mut self.serial);
                         }
                     });
                 });
-                ui.add_space(12.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let running = self.serial.session.is_some();
-                        if running {
-                            ui.label(
-                                RichText::new("Stop to change port or decoding settings")
-                                    .small()
-                                    .color(TEXT_MUTED),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new("Decoding changes apply on the next Start / Open.")
-                                    .small()
-                                    .color(TEXT_MUTED),
-                            );
-                        }
-                        setup_card(ui, "PORT", !running, |ui| {
-                            port_settings(ui, &mut self.serial)
-                        });
-                        ui.add_space(10.0);
-                        setup_card(ui, "DATA FORMAT", !running, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(
-                                    &mut self.serial.settings.mode,
-                                    SerialMode::Text,
-                                    "Text / ASCII",
-                                );
-                                ui.selectable_value(
-                                    &mut self.serial.settings.mode,
-                                    SerialMode::Binary,
-                                    "Binary",
-                                );
-                            });
-                            if self.serial.settings.mode == SerialMode::Text {
-                                text_settings(ui, &mut self.serial.settings);
-                            } else {
-                                binary_settings(ui, &mut self.serial);
-                            }
-                        });
-                        ui.add_space(10.0);
-                        ui.label(
-                            RichText::new(
-                                "No fields or schema? Raw data is still received below the graph.",
-                            )
-                            .small()
-                            .color(TEXT_MUTED),
-                        );
-                        ui.label(
-                            RichText::new(
-                                "History: latest 64 KiB raw bytes and 10,000 points per field.",
-                            )
-                            .small()
-                            .color(TEXT_MUTED),
-                        );
-                    });
-            });
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(
+                        "No fields or schema? Raw data is still received below the graph.",
+                    )
+                    .small()
+                    .color(TEXT_MUTED),
+                );
+                ui.label(
+                    RichText::new("History: latest 64 KiB raw bytes and 10,000 points per field.")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+            },
+        );
+        self.serial.setup_open = open;
         if before != self.serial.settings {
             for series in &mut self.serial.series {
                 let color = if self.serial.settings.mode == SerialMode::Text {
@@ -283,99 +225,89 @@ impl WaveCraftApp {
             .iter()
             .map(|series| series.color)
             .collect();
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(BACKGROUND)
-                    .inner_margin(egui::Margin::same(16.0)),
-            )
-            .show(context, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("SERIAL / UART").strong().color(ACCENT));
-                    ui.separator();
-                    ui.label(format!("{} bytes", self.serial.received_bytes));
-                    ui.label(format!("{} records", self.serial.decoded_records));
-                    if self.serial.rejected_frames > 0 {
-                        ui.colored_label(
-                            egui::Color32::LIGHT_RED,
-                            format!("{} rejected", self.serial.rejected_frames),
-                        );
-                    }
-                    if self.serial.discarded_bytes > 0 {
-                        ui.label(format!("{} unsynced bytes", self.serial.discarded_bytes));
-                    }
-                });
-                if let Some(error) = &self.serial.error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+        workspace_panel(context, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("SERIAL / UART").strong().color(ACCENT));
+                ui.separator();
+                ui.label(format!("{} bytes", self.serial.received_bytes));
+                ui.label(format!("{} records", self.serial.decoded_records));
+                if self.serial.rejected_frames > 0 {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        format!("{} rejected", self.serial.rejected_frames),
+                    );
                 }
-                ui.add_space(6.0);
-                let total =
-                    (ui.available_height() - 10.0 - 2.0 * ui.spacing().item_spacing.y).max(0.0);
-                let min_height = 60.0_f32.min(total / 2.0);
-                let graph_height = (total * f32::from(self.serial.settings.graph_percent) / 100.0)
-                    .clamp(min_height, (total - min_height).max(min_height));
-                let width = ui.available_width();
-                let before = self.serial.settings.graph_percent;
-                ui.allocate_ui_with_layout(
-                    egui::vec2(width, graph_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.set_clip_rect(ui.max_rect());
-                        paint_graph(ui, &mut self.serial);
-                    },
-                );
-                let (rect, response) =
-                    ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::drag());
-                let response = response
-                    .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-                    .on_hover_text("Drag to resize Graph and Raw data");
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(rect.left() + 8.0, rect.center().y),
-                        egui::pos2(rect.right() - 8.0, rect.center().y),
-                    ],
-                    egui::Stroke::new(
-                        if response.hovered() || response.dragged() {
-                            2.0
-                        } else {
-                            1.0_f32
-                        },
-                        if response.hovered() || response.dragged() {
-                            ACCENT
-                        } else {
-                            GRID
-                        },
-                    ),
-                );
-                if response.drag_started() {
-                    self.serial.split_drag_origin = Some(graph_height);
+                if self.serial.discarded_bytes > 0 {
+                    ui.label(format!("{} unsynced bytes", self.serial.discarded_bytes));
                 }
-                if response.dragged() && total > 0.0 {
-                    let height = (self.serial.split_drag_origin.unwrap_or(graph_height)
-                        + response.drag_delta().y)
-                        .clamp(min_height, (total - min_height).max(min_height));
-                    self.serial.split_drag_origin = Some(height);
-                    self.serial.settings.graph_percent =
-                        (height / total * 100.0).round().clamp(10.0, 90.0) as u8;
-                }
-                if response.double_clicked() {
-                    self.serial.settings.graph_percent = 65;
-                }
-                if response.drag_stopped()
-                    || before != self.serial.settings.graph_percent && !response.dragged()
-                {
-                    self.serial.split_drag_origin = None;
-                    self.save_global_settings();
-                }
-                ui.allocate_ui_with_layout(
-                    egui::vec2(width, (total - graph_height).max(0.0)),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.set_clip_rect(ui.max_rect());
-                        paint_raw(ui, &mut self.serial);
-                    },
-                );
             });
+            ui.add_space(6.0);
+            let total = (ui.available_height() - 10.0 - 2.0 * ui.spacing().item_spacing.y).max(0.0);
+            let min_height = 60.0_f32.min(total / 2.0);
+            let graph_height = (total * f32::from(self.serial.settings.graph_percent) / 100.0)
+                .clamp(min_height, (total - min_height).max(min_height));
+            let width = ui.available_width();
+            let before = self.serial.settings.graph_percent;
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, graph_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_clip_rect(ui.max_rect());
+                    paint_graph(ui, &mut self.serial);
+                },
+            );
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::drag());
+            let response = response
+                .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+                .on_hover_text("Drag to resize Graph and Raw data");
+            ui.painter().line_segment(
+                [
+                    egui::pos2(rect.left() + 8.0, rect.center().y),
+                    egui::pos2(rect.right() - 8.0, rect.center().y),
+                ],
+                egui::Stroke::new(
+                    if response.hovered() || response.dragged() {
+                        2.0
+                    } else {
+                        1.0_f32
+                    },
+                    if response.hovered() || response.dragged() {
+                        ACCENT
+                    } else {
+                        GRID
+                    },
+                ),
+            );
+            if response.drag_started() {
+                self.serial.split_drag_origin = Some(graph_height);
+            }
+            if response.dragged() && total > 0.0 {
+                let height = (self.serial.split_drag_origin.unwrap_or(graph_height)
+                    + response.drag_delta().y)
+                    .clamp(min_height, (total - min_height).max(min_height));
+                self.serial.split_drag_origin = Some(height);
+                self.serial.settings.graph_percent =
+                    (height / total * 100.0).round().clamp(10.0, 90.0) as u8;
+            }
+            if response.double_clicked() {
+                self.serial.settings.graph_percent = 65;
+            }
+            if response.drag_stopped()
+                || before != self.serial.settings.graph_percent && !response.dragged()
+            {
+                self.serial.split_drag_origin = None;
+                self.save_global_settings();
+            }
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, (total - graph_height).max(0.0)),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_clip_rect(ui.max_rect());
+                    paint_raw(ui, &mut self.serial);
+                },
+            );
+        });
         if self
             .serial
             .series
@@ -406,21 +338,18 @@ impl WaveCraftApp {
     }
 }
 
-fn setup_card(ui: &mut egui::Ui, title: &str, enabled: bool, contents: impl FnOnce(&mut egui::Ui)) {
-    let width = ui.available_width();
-    egui::Frame::none()
-        .fill(BACKGROUND)
-        .rounding(6.0)
-        .inner_margin(10.0)
-        .show(ui, |ui| {
-            ui.set_width((width - 20.0).max(0.0));
-            egui::CollapsingHeader::new(RichText::new(title).strong().color(TEXT_MUTED))
-                .id_salt(("serial_setup_card", title))
-                .default_open(true)
-                .show_unindented(ui, |ui| {
-                    ui.add_space(6.0);
-                    ui.add_enabled_ui(enabled, contents);
-                });
+fn setup_section(
+    ui: &mut egui::Ui,
+    title: &str,
+    enabled: bool,
+    contents: impl FnOnce(&mut egui::Ui),
+) {
+    egui::CollapsingHeader::new(RichText::new(title).strong().color(TEXT_MUTED))
+        .id_salt(("serial_setup_card", title))
+        .default_open(true)
+        .show_unindented(ui, |ui| {
+            ui.add_space(6.0);
+            ui.add_enabled_ui(enabled, contents);
         });
 }
 
@@ -794,18 +723,8 @@ fn hex_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     );
 }
 
-fn instrument_frame() -> egui::Frame {
-    egui::Frame::none()
-        .fill(PANEL)
-        .stroke(egui::Stroke::new(1.0_f32, GRID))
-        .rounding(6.0)
-        .inner_margin(12.0)
-}
-
 fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
-    let size = ui.available_size();
-    instrument_frame().show(ui, |ui| {
-        ui.set_min_size((size - egui::vec2(24.0, 24.0)).max(egui::Vec2::ZERO));
+    view_card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("GRAPH").strong().color(TEXT_MUTED));
             if ui.checkbox(&mut state.follow, "Follow").changed() {
@@ -1022,9 +941,7 @@ fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
 }
 
 fn paint_raw(ui: &mut egui::Ui, state: &mut SerialState) {
-    let size = ui.available_size();
-    instrument_frame().show(ui, |ui| {
-        ui.set_min_size((size - egui::vec2(24.0, 24.0)).max(egui::Vec2::ZERO));
+    view_card(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("RAW DATA").strong().color(TEXT_MUTED));
             ui.label(
@@ -1036,9 +953,6 @@ fn paint_raw(ui: &mut egui::Ui, state: &mut SerialState) {
                 .small()
                 .color(ACCENT),
             );
-            if ui.small_button("Copy").clicked() {
-                ui.output_mut(|output| output.copied_text = state.raw_lines().join("\n"));
-            }
         });
         if state.raw.is_empty() {
             ui.label(
