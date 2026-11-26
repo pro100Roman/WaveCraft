@@ -485,7 +485,7 @@ fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
     ui.add_space(8.0);
     ui.label(RichText::new("PLOTTED FIELDS").small().color(TEXT_MUTED));
     ui.label(
-        RichText::new("Match name=value or name: value. Records end at CR or LF.")
+        RichText::new("Set a separator after each name, or leave it empty for automatic matching. Records end at CR or LF.")
             .small()
             .color(TEXT_MUTED),
     );
@@ -497,7 +497,8 @@ fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
                 let name_width = (ui.available_width()
                     - LINE_STYLE_PICKER_WIDTH
                     - 24.0
-                    - ui.spacing().item_spacing.x * 2.0)
+                    - 40.0
+                    - ui.spacing().item_spacing.x * 3.0)
                     .max(32.0);
                 ui.add_sized(
                     [name_width, 20.0],
@@ -505,6 +506,15 @@ fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
                         .char_limit(64)
                         .hint_text("e.g. temperature"),
                 );
+                let separator = ui.add_sized(
+                    [40.0, 20.0],
+                    egui::TextEdit::singleline(&mut field.separator)
+                        .char_limit(wavecraft_serial::MAX_TEXT_SEPARATOR_BYTES)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("auto"),
+                );
+                if separator.changed() { field.separator.retain(|character| character.is_ascii()); }
+                separator.on_hover_text("Field/value separator: up to 3 ASCII characters, matched literally after the name. Empty uses automatic matching (=, :, whitespace or JSON). Spaces are significant.");
                 line_style_picker(ui, &mut field.line_style, field.color);
                 if ui.small_button("×").on_hover_text("Remove field").clicked() {
                     remove = Some(index);
@@ -523,6 +533,7 @@ fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
         .clicked()
     {
         settings.fields.push(TextField {
+            separator: String::new(),
             name: String::new(),
             color: COLORS[settings.fields.len() % COLORS.len()],
             line_style: Default::default(),
@@ -819,6 +830,7 @@ mod tests {
             .iter()
             .any(|text| text.contains("serial-ascii.txt")));
         app.serial.settings.fields.push(TextField {
+            separator: String::new(),
             name: "temperature".into(),
             color: COLORS[0],
             line_style: Default::default(),
@@ -1007,6 +1019,7 @@ mod tests {
         for (first, last) in [(0.0002, 0.0006), (0.3, 1.0), (1.0, 7201.0)] {
             let mut app = crate::app::test_support::app();
             app.serial.settings.fields.push(TextField {
+                separator: String::new(),
                 name: "v".into(),
                 color: COLORS[0],
                 line_style: Default::default(),
@@ -1103,6 +1116,7 @@ mod tests {
     fn graph_does_not_repeat_field_controls_or_latest_value_legend() {
         let mut app = crate::app::test_support::app();
         app.serial.settings.fields.push(TextField {
+            separator: String::new(),
             name: "temperature".into(),
             color: COLORS[0],
             line_style: Default::default(),
@@ -1164,6 +1178,7 @@ mod tests {
         let mut app = crate::app::test_support::app();
         app.active_workspace_view = Some(WorkspaceView::Serial);
         app.serial.settings.fields.push(TextField {
+            separator: String::new(),
             name: "temperature".into(),
             color: COLORS[0],
             line_style: Default::default(),

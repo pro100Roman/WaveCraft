@@ -78,6 +78,23 @@ arbitrary serial read boundaries. Missing or nonfinite values produce no point
 for that field. Records longer than 64 KiB are discarded until the next record
 separator and counted as rejected.
 
+Each field has a separator input immediately after its name in **PLOTTED FIELDS**.
+Leave it empty (`auto`) to keep the matching above. Otherwise, enter a literal
+ASCII string of up to three characters, such as `|`, `->`, `::`, or ` : `.
+It must occur immediately after that field's name; spaces in the separator are
+significant. Whitespace between the matched separator and the number is allowed.
+Each field uses its own separator, and a custom separator does not fall back to
+automatic matching. For example, with `temperature` set to `->` and `rpm` set to
+`::`, this record plots both values:
+
+```text
+temperature->23.5 rpm::1200
+```
+
+Separators are saved with the field settings. Apply edits with **Plot** for an
+opened file, or on the next **Start** / **Open raw…**. Existing saved fields
+without a separator retain automatic matching.
+
 ## Binary schema
 
 Load [serial-schema.json](examples/serial-schema.json), or use **Save example

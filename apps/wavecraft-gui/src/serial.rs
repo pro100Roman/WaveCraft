@@ -6,8 +6,9 @@ use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureError, CaptureEvent, CaptureSession,
 };
 use wavecraft_serial::{
-    parse_hex_bytes, parse_hex_u32, BinaryDecoder, BinarySchema, ByteOrder, CrcConfiguration,
-    DataBits, FlowControl, Parity, SerialConfiguration, SerialSource, StopBits, TextDecoder,
+    parse_hex_bytes, parse_hex_u32, validate_text_separator, BinaryDecoder, BinarySchema,
+    ByteOrder, CrcConfiguration, DataBits, FlowControl, Parity, SerialConfiguration, SerialSource,
+    StopBits, TextDecoder, TextFieldSpec,
 };
 
 pub(crate) const RAW_CAPACITY: usize = 65_536;
@@ -49,6 +50,8 @@ pub(crate) enum SerialLineStyle {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TextField {
     pub name: String,
+    #[serde(default)]
+    pub separator: String,
     pub color: [u8; 3],
     #[serde(default)]
     pub line_style: SerialLineStyle,
@@ -358,6 +361,13 @@ impl SerialState {
         {
             return Err("Text field names must be nonempty and unique".into());
         }
+        if self.settings.mode == SerialMode::Text {
+            for field in &self.settings.fields {
+                validate_text_separator(&field.separator).map_err(|error| {
+                    CaptureError::new(format!("Field '{}': {error}", field.name))
+                })?;
+            }
+        }
         self.clear_data();
         self.binary = binary;
         self.series = match self.settings.mode {
@@ -548,9 +558,13 @@ impl SerialState {
             let fields: Vec<_> = self
                 .series
                 .iter()
-                .map(|series| series.name.clone())
+                .zip(&self.settings.fields)
+                .map(|(series, field)| TextFieldSpec {
+                    name: &series.name,
+                    separator: &field.separator,
+                })
                 .collect();
-            let records = self.text.feed(bytes, &fields);
+            let records = self.text.feed_with_fields(bytes, &fields);
             let count = records.len();
             for (index, values) in records.into_iter().enumerate() {
                 if values.iter().any(Option::is_some) {
@@ -710,6 +724,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ascii_separators_apply_to_live_records_and_can_be_changed_before_plot() {
+        let mut state = SerialState::default();
+        state.settings.fields = vec![
+            TextField {
+                name: "temperature".into(),
+                separator: "->".into(),
+                color: COLORS[0],
+                line_style: Default::default(),
+            },
+            TextField {
+                name: "speed".into(),
+                separator: "".into(),
+                color: COLORS[1],
+                line_style: Default::default(),
+            },
+        ];
+        state.prepare().unwrap();
+        state.ingest(0.5, b"temperature-");
+        state.ingest(1.0, b">-2.5 speed: 42\ntemperature=99 speed=43\n");
+        assert_eq!(
+            state.series[0]
+                .points
+                .iter()
+                .map(|point| point[1])
+                .collect::<Vec<_>>(),
+            vec![-2.5]
+        );
+        assert_eq!(
+            state.series[1]
+                .points
+                .iter()
+                .map(|point| point[1])
+                .collect::<Vec<_>>(),
+            vec![42.0, 43.0]
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/examples/serial-ascii.txt");
+        state.import_raw(&path).unwrap();
+        assert!(state.series[0].points.is_empty());
+        let raw = state.raw.clone();
+        state.settings.fields[0].separator = "=".into();
+        state.plot_imported().unwrap();
+        assert_eq!(state.series[0].points.len(), 512);
+        assert_eq!(state.raw, raw);
+        for separator in ["abcd", "→"] {
+            state.settings.fields[0].separator = separator.into();
+            let error = state.plot_imported().unwrap_err().to_string();
+            assert!(error.contains("temperature") && error.contains("3 ASCII"));
+            assert_eq!(state.series[0].points.len(), 512);
+            assert_eq!(state.raw, raw);
+        }
+        state.settings.fields[0].separator.clear();
+        state.plot_imported().unwrap();
+        assert_eq!(state.series[0].points.len(), 512);
+    }
+
+    #[test]
     fn opened_file_can_be_plotted_after_configuring_fields_or_schema() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples");
         for mode in [SerialMode::Text, SerialMode::Binary] {
@@ -729,6 +800,7 @@ mod tests {
             assert!(state.imported_file.is_some());
             if mode == SerialMode::Text {
                 state.settings.fields.push(TextField {
+                    separator: String::new(),
                     name: "temperature".into(),
                     color: COLORS[1],
                     line_style: SerialLineStyle::Dashed,
@@ -777,6 +849,7 @@ mod tests {
         let raw = state.raw.clone();
         assert_eq!(raw.len(), RAW_CAPACITY);
         state.settings.fields.push(TextField {
+            separator: String::new(),
             name: "temperature".into(),
             color: COLORS[0],
             line_style: Default::default(),
@@ -814,6 +887,7 @@ mod tests {
                 if incomplete {
                     if mode == SerialMode::Text {
                         state.settings.fields.push(TextField {
+                            separator: String::new(),
                             name: String::new(),
                             color: COLORS[0],
                             line_style: Default::default(),
@@ -898,6 +972,7 @@ mod tests {
             imported.settings.mode = mode;
             let bytes = if mode == SerialMode::Text {
                 imported.settings.fields.push(TextField {
+                    separator: String::new(),
                     name: "v".into(),
                     color: COLORS[0],
                     line_style: SerialLineStyle::Solid,
@@ -966,6 +1041,7 @@ mod tests {
         state.fit_graph();
         assert_eq!(state.time_window, 4.0);
         state.settings.fields.push(TextField {
+            separator: String::new(),
             name: "v".into(),
             color: COLORS[0],
             line_style: SerialLineStyle::Solid,
@@ -983,11 +1059,13 @@ mod tests {
         let mut state = SerialState::default();
         state.settings.fields = vec![
             TextField {
+                separator: String::new(),
                 name: "temp".into(),
                 color: COLORS[1],
                 line_style: Default::default(),
             },
             TextField {
+                separator: String::new(),
                 name: "rpm".into(),
                 color: COLORS[2],
                 line_style: Default::default(),
@@ -1029,6 +1107,7 @@ mod tests {
     fn retains_bounded_raw_and_plot_history_with_total_byte_counter() {
         let mut state = SerialState::default();
         state.settings.fields.push(TextField {
+            separator: String::new(),
             name: "v".into(),
             color: COLORS[0],
             line_style: Default::default(),
@@ -1117,6 +1196,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings.line_style("voltage"), SerialLineStyle::Solid);
+        assert!(settings.fields[0].separator.is_empty());
         settings.fields[0].line_style = SerialLineStyle::DashDotDot;
         assert_eq!(settings.line_style("voltage"), SerialLineStyle::DashDotDot);
         settings.mode = SerialMode::Binary;
@@ -1132,6 +1212,7 @@ mod tests {
         let mut app = crate::app::test_support::app();
         app.serial.settings.port = "/dev/test-uart".into();
         app.serial.settings.fields.push(TextField {
+            separator: "=>".into(),
             name: "voltage".into(),
             color: [12, 34, 56],
             line_style: SerialLineStyle::DashDot,

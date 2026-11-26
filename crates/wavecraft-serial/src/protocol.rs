@@ -3,6 +3,22 @@ use std::collections::HashSet;
 use wavecraft_core::CaptureError;
 
 pub const MAX_TEXT_FIELDS: usize = 10;
+pub const MAX_TEXT_SEPARATOR_BYTES: usize = 3;
+
+/// A literal separator is matched immediately after the field name. An empty
+/// separator keeps the automatic name/value matching used by `TextDecoder::feed`.
+#[derive(Clone, Copy)]
+pub struct TextFieldSpec<'a> {
+    pub name: &'a str,
+    pub separator: &'a str,
+}
+
+pub fn validate_text_separator(separator: &str) -> Result<(), CaptureError> {
+    if !separator.is_ascii() || separator.len() > MAX_TEXT_SEPARATOR_BYTES {
+        return Err("Text field separators must contain at most 3 ASCII characters".into());
+    }
+    Ok(())
+}
 const MAX_FRAME_BYTES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -352,6 +368,21 @@ pub struct TextDecoder {
 
 impl TextDecoder {
     pub fn feed(&mut self, bytes: &[u8], fields: &[String]) -> Vec<Vec<Option<f64>>> {
+        let fields: Vec<_> = fields
+            .iter()
+            .map(|name| TextFieldSpec {
+                name,
+                separator: "",
+            })
+            .collect();
+        self.feed_with_fields(bytes, &fields)
+    }
+
+    pub fn feed_with_fields(
+        &mut self,
+        bytes: &[u8],
+        fields: &[TextFieldSpec<'_>],
+    ) -> Vec<Vec<Option<f64>>> {
         let mut records = Vec::new();
         for byte in bytes {
             if matches!(*byte, b'\r' | b'\n') {
@@ -361,7 +392,7 @@ impl TextDecoder {
                         fields
                             .iter()
                             .take(MAX_TEXT_FIELDS)
-                            .map(|field| text_value(&line, field))
+                            .map(|field| text_value(&line, field.name, field.separator))
                             .collect(),
                     );
                 }
@@ -381,9 +412,9 @@ impl TextDecoder {
     }
 }
 
-fn text_value(line: &str, field: &str) -> Option<f64> {
+fn text_value(line: &str, field: &str, separator: &str) -> Option<f64> {
     let field = field.trim();
-    if field.is_empty() {
+    if field.is_empty() || validate_text_separator(separator).is_err() {
         return None;
     }
     for (index, _) in line.match_indices(field) {
@@ -392,12 +423,19 @@ fn text_value(line: &str, field: &str) -> Option<f64> {
             continue;
         }
         let tail = &line[index + field.len()..];
-        if tail.chars().next().is_some_and(boundary) {
-            continue;
-        }
-        let tail = tail.trim_start_matches(|c: char| {
-            c.is_ascii_whitespace() || matches!(c, '"' | '\'' | ':' | '=')
-        });
+        let tail = if separator.is_empty() {
+            if tail.chars().next().is_some_and(boundary) {
+                continue;
+            }
+            tail.trim_start_matches(|c: char| {
+                c.is_ascii_whitespace() || matches!(c, '"' | '\'' | ':' | '=')
+            })
+        } else {
+            let Some(tail) = tail.strip_prefix(separator) else {
+                continue;
+            };
+            tail.trim_start_matches(|c: char| c.is_ascii_whitespace())
+        };
         let end = tail
             .find(|c: char| !(c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | 'e' | 'E')))
             .unwrap_or(tail.len());
@@ -413,6 +451,61 @@ fn text_value(line: &str, field: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_field_separators_survive_fragmented_records_and_mix_with_auto_matching() {
+        let fields = [
+            TextFieldSpec {
+                name: "temperature",
+                separator: "->",
+            },
+            TextFieldSpec {
+                name: "rpm",
+                separator: "[=]",
+            },
+            TextFieldSpec {
+                name: "enabled",
+                separator: "",
+            },
+        ];
+        let bytes = b"temperature-> -2.5e1 rpm[=]1200 enabled: 1\r\ntemperature=99 rpm=99 {\"enabled\":0}\n";
+        let expected = vec![
+            vec![Some(-25.0), Some(1200.0), Some(1.0)],
+            vec![None, None, Some(0.0)],
+        ];
+        for split in 0..=bytes.len() {
+            let mut decoder = TextDecoder::default();
+            let mut records = decoder.feed_with_fields(&bytes[..split], &fields);
+            records.extend(decoder.feed_with_fields(&bytes[split..], &fields));
+            assert_eq!(records, expected, "split {split}");
+        }
+    }
+
+    #[test]
+    fn custom_separators_are_literal_ascii_including_spaces_letters_and_digits() {
+        for separator in ["=", "->", " : ", "abc", "123", "\t", "[=]", "\0", "\x1b["] {
+            validate_text_separator(separator).unwrap();
+            let line = format!("temp{separator}-2.5e+1");
+            assert_eq!(
+                text_value(&line, "temp", separator),
+                Some(-25.0),
+                "{separator:?}"
+            );
+        }
+        assert_eq!(
+            text_value("attempt->1 temperature->2 temp->3", "temp", "->"),
+            Some(3.0)
+        );
+        assert_eq!(text_value("temp ->3", "temp", "->"), None);
+        assert_eq!(text_value("temp=3", "temp", "->"), None);
+        for line in ["temp=3", "temp: 3", "temp 3", "{\"temp\":3}"] {
+            assert_eq!(text_value(line, "temp", ""), Some(3.0));
+        }
+        for separator in ["abcd", "→", "é"] {
+            assert!(validate_text_separator(separator).is_err());
+            assert_eq!(text_value("temp=3", "temp", separator), None);
+        }
+    }
 
     fn crc(width: u8, poly: u32, seed: u32, reflect: bool, xor: u32) -> CrcConfiguration {
         CrcConfiguration {
@@ -598,11 +691,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            text_value("attempt=3 temperature=3 temp=NaN temp=4", "temp"),
+            text_value("attempt=3 temperature=3 temp=NaN temp=4", "temp", ""),
             Some(4.0)
         );
-        assert_eq!(text_value("temp=1e999", "temp"), None);
-        assert_eq!(text_value("temp=42", ""), None);
+        assert_eq!(text_value("temp=1e999", "temp", ""), None);
+        assert_eq!(text_value("temp=42", "", ""), None);
     }
 
     #[test]
