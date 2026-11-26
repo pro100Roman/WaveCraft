@@ -815,8 +815,6 @@ impl WaveCraftApp {
 
         let save_manual_values = self.paint_manual_calibration_window(context);
 
-        self.paint_vna_calibration_notice(context);
-
         paint_scope_marker_editor(
             context,
             &mut self.scope_marker_editor,
@@ -834,6 +832,8 @@ impl WaveCraftApp {
             Some(CalibrationModalAction::Save(values)) => self.begin_save_auto_calibration(values),
             None => {}
         }
+
+        self.paint_vna_calibration_notice(context);
 
         self.apply_toolbar_actions(&mut actions, &frame);
         if actions.vna_sweep_clicked {

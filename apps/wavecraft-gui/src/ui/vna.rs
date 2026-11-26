@@ -114,6 +114,20 @@ impl WaveCraftApp {
         if !self.vna_calibration_notice_open {
             return;
         }
+        let screen_rect = context.screen_rect();
+        let backdrop = egui::Area::new(egui::Id::new("vna_calibration_notice_backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen_rect.min)
+            .movable(false)
+            .show(context, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen_rect.size(), Sense::click_and_drag());
+                ui.painter().rect_filled(
+                    rect,
+                    egui::Rounding::ZERO,
+                    Color32::from_black_alpha(112),
+                );
+            });
+        context.move_to_top(backdrop.response.layer_id);
         let calibration_state = self.vna_calibration.as_ref().map(|active| {
             self.vna_settings
                 .sweep_config()
@@ -131,7 +145,7 @@ impl WaveCraftApp {
         });
         let mut open = self.vna_calibration_notice_open;
         let mut acknowledged = false;
-        egui::Window::new("VNA calibration recommended")
+        let notice = egui::Window::new("VNA calibration recommended")
             .id(egui::Id::new("vna_calibration_notice_compact"))
             .open(&mut open)
             .order(egui::Order::Foreground)
@@ -201,17 +215,23 @@ impl WaveCraftApp {
                 }
                 ui.add_space(6.0);
                 ui.vertical_centered(|ui| {
-                    if ui
-                        .add_sized(
-                            [160.0, 30.0],
-                            toolbar_action_button("Got it", ORANGE),
-                        )
-                        .clicked()
-                    {
-                        acknowledged = true;
-                    }
+                    let response = ui.add_sized(
+                        [160.0, 30.0], toolbar_action_button("Got it", ORANGE),
+                    );
+                    // Keep keyboard navigation inside the modal as well as pointer input.
+                    response.request_focus();
+                    ui.memory_mut(|memory| memory.set_focus_lock_filter(response.id, egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        ..Default::default()
+                    }));
+                    acknowledged = response.clicked();
                 });
             });
+        if let Some(notice) = notice {
+            context.move_to_top(notice.response.layer_id);
+        }
         if acknowledged {
             open = false;
         }
@@ -422,16 +442,14 @@ impl WaveCraftApp {
                     });
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        let subtitle = match self.vna_plot_tab {
-                            VnaPlotTab::SmithChart if self.vna_sweep_calibrated => {
+                        if self.vna_plot_tab == VnaPlotTab::SmithChart {
+                            let subtitle = if self.vna_sweep_calibrated {
                                 "SOL-calibrated S11 · Z₀ = 50 Ω"
-                            }
-                            VnaPlotTab::SmithChart => "Raw S11 reflection coefficient · Z₀ = 50 Ω",
-                            VnaPlotTab::LogMagnitudePhase => {
-                                "Log magnitude in dB and phase in degrees"
-                            }
-                        };
-                        ui.label(RichText::new(subtitle).color(TEXT_MUTED));
+                            } else {
+                                "Raw S11 reflection coefficient · Z₀ = 50 Ω"
+                            };
+                            ui.label(RichText::new(subtitle).color(TEXT_MUTED));
+                        }
                         if self.vna_plot_tab == VnaPlotTab::LogMagnitudePhase
                             || self.vna_sweep_progress.is_some()
                         {
@@ -1975,6 +1993,77 @@ mod tests {
             collect(&clipped.shape, &mut texts);
         }
         texts
+    }
+
+    #[test]
+    fn calibration_notice_blocks_workspace_controls_until_acknowledged() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.select_vna_view();
+        let _ = painted_text(&context, |context| app.run_frame(context));
+        let texts = painted_text(&context, |context| app.run_frame(context));
+        let position = |label: &str| {
+            texts
+                .iter()
+                .find_map(|(text, position)| (text == label).then_some(*position))
+                .unwrap_or_else(|| panic!("{label} is visible"))
+        };
+        let logic = position("Logic Analyzer");
+        let app_menu = position("App");
+        let got_it = position("Got it");
+        let click = |app: &mut WaveCraftApp, position| {
+            for pressed in [true, false] {
+                let _ = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1200.0, 900.0),
+                        )),
+                        events: vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |context| app.run_frame(context),
+                );
+            }
+        };
+        click(&mut app, logic);
+        assert!(app.vna_view_is_active());
+        assert!(app.vna_calibration_notice_open);
+        click(&mut app, app_menu);
+        let texts = painted_text(&context, |context| app.run_frame(context));
+        assert!(!texts.iter().any(|(text, _)| text == "Settings…"));
+        let focused = context.memory(|memory| memory.focused());
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 900.0))),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |context| app.run_frame(context),
+        );
+        assert_eq!(context.memory(|memory| memory.focused()), focused);
+        click(&mut app, got_it);
+        assert!(!app.vna_calibration_notice_open);
+        let _ = painted_text(&context, |context| app.run_frame(context));
+        click(&mut app, logic);
+        assert_eq!(
+            app.active_waveform_view(),
+            Some(crate::WaveformTab::LogicAnalyzer)
+        );
     }
 
     #[test]
