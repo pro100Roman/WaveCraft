@@ -42,6 +42,8 @@ pub(crate) struct GlobalSettings {
     pub(crate) window_inner_size: Option<SavedWindowSize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) workspace_view_order: Option<Vec<SavedWorkspaceView>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) hidden_workspace_views: Vec<SavedWorkspaceView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_trace_event_view_order: Option<Vec<SavedTraceEventView>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

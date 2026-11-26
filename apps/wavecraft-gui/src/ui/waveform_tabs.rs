@@ -1,13 +1,13 @@
 //! The top strip that switches between waveform and System Trace views.
 
-use crate::{egui, workspace_views, RichText, WorkspaceView, PANEL, TEXT_MUTED};
+use crate::{egui, RichText, WorkspaceView, PANEL, TEXT_MUTED};
 
 use crate::WaveCraftApp;
 
 impl WaveCraftApp {
     /// Paints the available waveform views and the independent System Trace view.
     pub(crate) fn paint_waveform_tabs(&mut self, context: &egui::Context) {
-        let available_views = workspace_views(&self.available_waveform_tabs());
+        let available_views = self.available_workspace_views();
         let ordered_views = *self.workspace_view_layout.order();
         let active_view = self.active_workspace_view;
         let mut selected_view = None;
@@ -122,6 +122,23 @@ mod tests {
             collect(&clipped.shape, &mut texts);
         }
         texts
+    }
+
+    #[test]
+    fn hidden_views_are_not_painted_and_return_when_enabled() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let logic = WorkspaceView::Waveform(crate::WaveformTab::LogicAnalyzer);
+        app.set_workspace_view_visible(logic, false);
+        app.set_workspace_view_visible(WorkspaceView::SystemTrace, false);
+        let texts = paint_tabs(&context, &mut app, Vec::new());
+        assert!(!texts
+            .iter()
+            .any(|(text, _)| text == "Logic Analyzer" || text == "System Trace"));
+        assert!(texts.iter().any(|(text, _)| text == "Oscilloscope"));
+        app.set_workspace_view_visible(logic, true);
+        let texts = paint_tabs(&context, &mut app, Vec::new());
+        assert!(texts.iter().any(|(text, _)| text == "Logic Analyzer"));
     }
 
     #[test]

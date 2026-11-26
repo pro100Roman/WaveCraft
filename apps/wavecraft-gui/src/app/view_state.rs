@@ -143,6 +143,11 @@ impl WaveCraftApp {
             .copied()
             .map(SavedWorkspaceView::from)
             .collect::<Vec<_>>();
+        let hidden_workspace_views = WorkspaceView::ALL
+            .into_iter()
+            .filter(|view| !self.workspace_view_layout.is_visible(*view))
+            .map(SavedWorkspaceView::from)
+            .collect::<Vec<_>>();
         let event_view_order = self
             .system_trace
             .event_view_order()
@@ -162,7 +167,8 @@ impl WaveCraftApp {
             analysis: self.system_trace.event_view_height().round() as u32,
         };
         let timeline_label_width = self.system_trace.timeline_label_width().round() as u32;
-        if self.saved_capture_settings.global.last_active_view == Some(saved_view)
+        if self.saved_capture_settings.global.hidden_workspace_views == hidden_workspace_views
+            && self.saved_capture_settings.global.last_active_view == Some(saved_view)
             && self.saved_capture_settings.global.window_inner_size == window_inner_size
             && self
                 .saved_capture_settings
@@ -197,6 +203,7 @@ impl WaveCraftApp {
         }
 
         let mut document = self.saved_capture_settings.clone();
+        document.global.hidden_workspace_views = hidden_workspace_views;
         document.global.last_active_view = Some(saved_view);
         document.global.window_inner_size = window_inner_size;
         document.global.workspace_view_order = Some(workspace_view_order);
@@ -215,6 +222,10 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn apply_saved_capture_settings(&mut self) {
+        for view in &self.saved_capture_settings.global.hidden_workspace_views {
+            self.workspace_view_layout
+                .set_visible((*view).into(), false);
+        }
         if let Some(order) = self
             .saved_capture_settings
             .global
@@ -638,6 +649,37 @@ impl WaveCraftApp {
 
     pub(crate) fn available_waveform_tabs(&self) -> Vec<WaveformTab> {
         waveform_tabs(self.scope_function_settings.lissajous.enabled)
+            .into_iter()
+            .filter(|tab| {
+                self.workspace_view_layout
+                    .is_visible(WorkspaceView::Waveform(*tab))
+            })
+            .collect()
+    }
+
+    pub(crate) fn available_workspace_views(&self) -> Vec<WorkspaceView> {
+        let available = crate::workspace_views(&self.available_waveform_tabs());
+        self.workspace_view_layout
+            .order()
+            .iter()
+            .copied()
+            .filter(|view| available.contains(view) && self.workspace_view_layout.is_visible(*view))
+            .collect()
+    }
+
+    pub(crate) fn set_workspace_view_visible(&mut self, view: WorkspaceView, visible: bool) {
+        if !visible
+            && self.workspace_view_layout.is_visible(view)
+            && self
+                .available_workspace_views()
+                .iter()
+                .all(|candidate| *candidate == view)
+        {
+            return;
+        }
+        self.workspace_view_layout.set_visible(view, visible);
+        self.reconcile_waveform_tab();
+        self.save_global_settings();
     }
 
     pub(crate) fn select_waveform_tab(&mut self, tab: WaveformTab) {
@@ -733,6 +775,23 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn reconcile_waveform_tab(&mut self) {
+        let mut views = self.available_workspace_views();
+        if views.is_empty() {
+            // Recover from settings that hide every usable view.
+            let fallback = WorkspaceView::Waveform(WaveformTab::LogicAnalyzer);
+            self.workspace_view_layout.set_visible(fallback, true);
+            views.push(fallback);
+        }
+        if self
+            .active_workspace_view
+            .is_some_and(|view| !views.contains(&view))
+        {
+            match views[0] {
+                WorkspaceView::Waveform(tab) => self.select_waveform_tab(tab),
+                WorkspaceView::Vna => self.select_vna_view(),
+                WorkspaceView::SystemTrace => self.select_system_trace_view(),
+            }
+        }
         let available = self.available_waveform_tabs();
         if self
             .active_waveform_tab
@@ -757,7 +816,11 @@ impl WaveCraftApp {
         } else {
             self.active_waveform_tab = None;
             if !self.system_trace_view_is_active() && !self.vna_view_is_active() {
-                self.active_workspace_view = Some(WorkspaceView::SystemTrace);
+                match views[0] {
+                    WorkspaceView::Waveform(tab) => self.select_waveform_tab(tab),
+                    WorkspaceView::Vna => self.select_vna_view(),
+                    WorkspaceView::SystemTrace => self.select_system_trace_view(),
+                }
             }
         }
     }
@@ -854,6 +917,67 @@ mod tests {
         assert_eq!(restored.active_waveform_tab, Some(WaveformTab::Combined));
         assert!(restored.vna_calibration_notice_open);
         remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn view_visibility_persists_and_hidden_active_view_is_replaced() {
+        let repository = test_repository("view-visibility");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.select_waveform_tab(WaveformTab::LogicAnalyzer);
+        let logic = WorkspaceView::Waveform(WaveformTab::LogicAnalyzer);
+        app.set_workspace_view_visible(logic, false);
+        app.set_workspace_view_visible(WorkspaceView::Vna, false);
+        assert_ne!(app.active_workspace_view, Some(logic));
+        let saved = repository.load().expect("visibility saved");
+        let mut restored = WaveCraftApp::with_settings(None, saved);
+        restored.reconcile_waveform_tab();
+        assert!(!restored.available_workspace_views().contains(&logic));
+        assert!(!restored
+            .available_workspace_views()
+            .contains(&WorkspaceView::Vna));
+        assert_eq!(restored.active_workspace_view, app.active_workspace_view);
+        restored.set_workspace_view_visible(logic, true);
+        assert!(restored.available_workspace_views().contains(&logic));
+        assert_eq!(restored.workspace_view_layout.order(), &WorkspaceView::ALL);
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn last_available_view_cannot_be_hidden() {
+        let mut app = WaveCraftApp::with_settings(None, CaptureSettingsDocument::default());
+        app.select_system_trace_view();
+        for view in WorkspaceView::ALL {
+            app.set_workspace_view_visible(view, false);
+        }
+        assert_eq!(app.available_workspace_views().len(), 1);
+        assert!(app
+            .available_workspace_views()
+            .contains(&app.active_workspace_view.unwrap()));
+    }
+
+    #[test]
+    fn hidden_saved_active_view_and_all_hidden_settings_recover() {
+        let mut saved = CaptureSettingsDocument::default();
+        saved.global.last_active_view = Some(SavedWorkspaceView::Vna);
+        saved.global.hidden_workspace_views = vec![SavedWorkspaceView::Vna];
+        let mut app = WaveCraftApp::with_settings(None, saved.clone());
+        app.reconcile_waveform_tab();
+        assert!(!app.vna_view_is_active());
+        saved.global.hidden_workspace_views = WorkspaceView::ALL
+            .into_iter()
+            .map(SavedWorkspaceView::from)
+            .collect();
+        let mut app = WaveCraftApp::with_settings(None, saved);
+        app.reconcile_waveform_tab();
+        assert_eq!(
+            app.available_workspace_views(),
+            vec![WorkspaceView::Waveform(WaveformTab::LogicAnalyzer)]
+        );
+        assert_eq!(app.active_waveform_view(), Some(WaveformTab::LogicAnalyzer));
     }
 
     #[test]

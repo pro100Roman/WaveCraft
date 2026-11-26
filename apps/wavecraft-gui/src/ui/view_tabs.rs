@@ -32,6 +32,7 @@ impl WorkspaceView {
 #[derive(Clone, Debug)]
 pub(crate) struct WorkspaceViewLayout {
     order: [WorkspaceView; WorkspaceView::ALL.len()],
+    hidden_views: Vec<WorkspaceView>,
     dragged_view: Option<WorkspaceView>,
     layout_changed: bool,
 }
@@ -40,6 +41,7 @@ impl Default for WorkspaceViewLayout {
     fn default() -> Self {
         Self {
             order: WorkspaceView::ALL,
+            hidden_views: Vec::new(),
             dragged_view: None,
             layout_changed: false,
         }
@@ -61,6 +63,18 @@ impl WorkspaceViewLayout {
         }
         self.order.copy_from_slice(order);
         true
+    }
+
+    pub(crate) fn is_visible(&self, view: WorkspaceView) -> bool {
+        !self.hidden_views.contains(&view)
+    }
+
+    pub(crate) fn set_visible(&mut self, view: WorkspaceView, visible: bool) {
+        self.hidden_views.retain(|hidden| *hidden != view);
+        if !visible {
+            self.hidden_views.push(view);
+        }
+        self.finish_drag();
     }
 
     pub(crate) fn begin_drag(&mut self, view: WorkspaceView) {
