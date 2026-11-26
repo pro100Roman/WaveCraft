@@ -1223,6 +1223,11 @@ pub fn export_saleae_recording<R: Read, W: Write + Seek>(
                     destination.extend(source);
                 }
             }
+            CaptureBatch::Serial(_) => {
+                return Err(SaleaeConversionError::invalid(
+                    "serial captures cannot be exported as Saleae",
+                ));
+            }
             CaptureBatch::Iq(_) => {
                 return Err(SaleaeConversionError::invalid(
                     "Saleae export does not support RF IQ samples",

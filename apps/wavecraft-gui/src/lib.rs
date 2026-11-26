@@ -14,6 +14,7 @@ mod radio_analyzer;
 mod radio_trigger;
 mod recording;
 mod recording_metadata;
+mod serial;
 mod sessions;
 mod snapshot;
 mod system_trace;
@@ -430,6 +431,7 @@ struct WaveCraftApp {
     scope_plot_tab: ScopePlotTab,
     system_trace_settings: SystemTraceSettings,
     system_trace_setup_panel_open: bool,
+    serial: serial::SerialState,
     system_trace: system_trace::SystemTraceDisplayState,
     system_trace_events: Option<Receiver<system_trace::LiveTraceUpdate>>,
     system_trace_terminal_lines: Option<Receiver<wavecraft_debug_probe::RttTerminalLine>>,
@@ -504,7 +506,8 @@ impl WaveCraftApp {
             .map(WorkspaceView::from);
         let restored_waveform_tab = match restored_workspace_view {
             Some(WorkspaceView::Waveform(tab)) => Some(tab),
-            Some(WorkspaceView::Vna | WorkspaceView::SystemTrace) | None => None,
+            Some(WorkspaceView::Vna | WorkspaceView::SystemTrace | WorkspaceView::Serial)
+            | None => None,
         };
         let restored_scope_plot_tab = if saved_capture_settings.global.last_active_view
             == Some(SavedWorkspaceView::Lissajous)
@@ -582,6 +585,7 @@ impl WaveCraftApp {
             scope_plot_tab: restored_scope_plot_tab,
             system_trace_settings: SystemTraceSettings::default(),
             system_trace_setup_panel_open: true,
+            serial: serial::SerialState::default(),
             system_trace: system_trace::SystemTraceDisplayState::default(),
             system_trace_events: None,
             system_trace_terminal_lines: None,
@@ -683,6 +687,7 @@ impl eframe::App for WaveCraftApp {
         if let Some(cancel) = &self.vna_run_cancel {
             cancel.store(true, Ordering::Release);
         }
+        self.serial.stop();
         self.save_pending_window_size();
         self.save_global_settings();
         self.system_trace.cleanup_temporary_history();
@@ -739,6 +744,10 @@ impl WaveCraftApp {
         self.poll_worker();
         self.poll_vna_connection();
         self.poll_vna_sweep();
+        self.serial.poll();
+        if self.serial.session.is_some() {
+            context.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         self.poll_system_trace_events();
         self.poll_system_trace_connection();
         self.reconcile_capture_settings_tab();
@@ -762,7 +771,9 @@ impl WaveCraftApp {
             self.save_global_settings();
         }
 
-        if self.system_trace_view_is_active() {
+        if self.serial_view_is_active() {
+            self.paint_serial_setup(context);
+        } else if self.system_trace_view_is_active() {
             self.paint_system_trace_setup_panel(context, &mut actions);
         } else if self.vna_view_is_active() {
             self.paint_vna_setup_panel(context, &mut actions);

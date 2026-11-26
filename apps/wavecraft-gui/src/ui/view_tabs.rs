@@ -7,16 +7,18 @@ pub(crate) enum WorkspaceView {
     Waveform(WaveformTab),
     Vna,
     SystemTrace,
+    Serial,
 }
 
 impl WorkspaceView {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Waveform(WaveformTab::LogicAnalyzer),
         Self::Waveform(WaveformTab::Oscilloscope),
         Self::Waveform(WaveformTab::RadioReceiver),
         Self::Waveform(WaveformTab::Combined),
         Self::Vna,
         Self::SystemTrace,
+        Self::Serial,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -24,6 +26,7 @@ impl WorkspaceView {
             Self::Waveform(tab) => tab.label(),
             Self::Vna => "VNA",
             Self::SystemTrace => "System Trace",
+            Self::Serial => "Serial / UART",
         }
     }
 }
@@ -236,7 +239,11 @@ pub(crate) fn workspace_views(waveform_tabs: &[WaveformTab]) -> Vec<WorkspaceVie
         .iter()
         .copied()
         .map(WorkspaceView::Waveform)
-        .chain([WorkspaceView::Vna, WorkspaceView::SystemTrace])
+        .chain([
+            WorkspaceView::Vna,
+            WorkspaceView::SystemTrace,
+            WorkspaceView::Serial,
+        ])
         .collect()
 }
 
@@ -265,7 +272,11 @@ mod tests {
     fn system_trace_is_a_workspace_view_not_a_waveform() {
         assert_eq!(
             workspace_views(&[]),
-            vec![WorkspaceView::Vna, WorkspaceView::SystemTrace]
+            vec![
+                WorkspaceView::Vna,
+                WorkspaceView::SystemTrace,
+                WorkspaceView::Serial
+            ]
         );
         assert_eq!(
             workspace_views(&[WaveformTab::LogicAnalyzer]),
@@ -273,6 +284,7 @@ mod tests {
                 WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
                 WorkspaceView::Vna,
                 WorkspaceView::SystemTrace,
+                WorkspaceView::Serial,
             ]
         );
     }
@@ -292,6 +304,7 @@ mod tests {
                 WorkspaceView::Waveform(WaveformTab::RadioReceiver),
                 WorkspaceView::Waveform(WaveformTab::Combined),
                 WorkspaceView::Vna,
+                WorkspaceView::Serial,
             ]
         );
         assert!(!layout.take_layout_changed());

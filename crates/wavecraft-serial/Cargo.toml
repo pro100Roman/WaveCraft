@@ -1,0 +1,15 @@
+[package]
+name = "wavecraft-serial"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+wavecraft-core = { path = "../wavecraft-core" }
+serialport = { version = "4.10.1", default-features = false }
+serde.workspace = true
+serde_json.workspace = true

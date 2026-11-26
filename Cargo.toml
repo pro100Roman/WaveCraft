@@ -12,6 +12,7 @@ members = [
     "crates/wavecraft-radio",
     "crates/wavecraft-sdr",
     "crates/wavecraft-sim",
+    "crates/wavecraft-serial",
     "crates/wavecraft-systemview",
     "crates/wavecraft-trace",
     "crates/wavecraft-trace-recording",

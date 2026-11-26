@@ -37,6 +37,8 @@ impl Default for CaptureSettingsDocument {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub(crate) struct GlobalSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) serial: Option<crate::serial::SerialSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_active_view: Option<SavedWorkspaceView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) window_inner_size: Option<SavedWindowSize>,
@@ -98,6 +100,7 @@ pub(crate) enum SavedWorkspaceView {
     Combined,
     Vna,
     SystemTrace,
+    Serial,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]

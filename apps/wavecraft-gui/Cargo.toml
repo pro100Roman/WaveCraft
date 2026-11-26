@@ -9,6 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+wavecraft-serial = { path = "../../crates/wavecraft-serial" }
 wavecraft-core = { path = "../../crates/wavecraft-core" }
 wavecraft-decode = { path = "../../crates/wavecraft-decode" }
 wavecraft-debug-probe = { path = "../../crates/wavecraft-debug-probe" }

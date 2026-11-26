@@ -57,6 +57,7 @@ pub enum InstrumentKind {
     LogicAnalyzer,
     Oscilloscope,
     RadioReceiver,
+    Serial,
 }
 
 impl Display for InstrumentKind {
@@ -65,6 +66,7 @@ impl Display for InstrumentKind {
             Self::LogicAnalyzer => formatter.write_str("logic_analyzer"),
             Self::Oscilloscope => formatter.write_str("oscilloscope"),
             Self::RadioReceiver => formatter.write_str("radio_receiver"),
+            Self::Serial => formatter.write_str("serial"),
         }
     }
 }
@@ -75,6 +77,7 @@ impl From<CoreInstrumentKind> for InstrumentKind {
             CoreInstrumentKind::LogicAnalyzer => Self::LogicAnalyzer,
             CoreInstrumentKind::Oscilloscope => Self::Oscilloscope,
             CoreInstrumentKind::RadioReceiver => Self::RadioReceiver,
+            CoreInstrumentKind::Serial => Self::Serial,
         }
     }
 }
@@ -1112,6 +1115,12 @@ impl DeviceHandle {
             (InstrumentKind::Oscilloscope, DeviceBackend::Usb) => {
                 self.start_usb_scope_capture(requested_configuration, effective_configuration)
             }
+            (InstrumentKind::Serial, _) => Err(AutomationError::new(
+                AutomationErrorCode::UnsupportedConfiguration,
+                "use the Serial / UART workspace for serial capture",
+                "capture.start",
+                false,
+            )),
             (InstrumentKind::RadioReceiver, _) => Err(AutomationError::new(
                 AutomationErrorCode::UnsupportedConfiguration,
                 "radio receiver automation capture is not implemented",
@@ -1388,6 +1397,7 @@ impl DeviceHandle {
                 InstrumentKind::LogicAnalyzer => CoreInstrumentKind::LogicAnalyzer,
                 InstrumentKind::Oscilloscope => CoreInstrumentKind::Oscilloscope,
                 InstrumentKind::RadioReceiver => CoreInstrumentKind::RadioReceiver,
+                InstrumentKind::Serial => CoreInstrumentKind::Serial,
             },
         };
         let metadata = capture_metadata(
@@ -1962,6 +1972,11 @@ fn validate_capture_configuration(
         ));
     }
     match device.kind {
+        InstrumentKind::Serial => {
+            return Err(unsupported(
+                "use the Serial / UART workspace for serial capture".to_owned(),
+            ))
+        }
         InstrumentKind::LogicAnalyzer => {
             if configuration.trigger != CaptureTrigger::None || configuration.scope.is_some() {
                 return Err(unsupported(

@@ -1,0 +1,18 @@
+{
+  "start_word_bytes": 2,
+  "stop_word_bytes": 2,
+  "byte_order": "little",
+  "fields": [
+    { "name": "temperature", "size_bytes": 4, "kind": "float" },
+    { "name": "speed", "size_bytes": 2, "kind": "unsigned" },
+    {
+      "name": "status",
+      "size_bytes": 1,
+      "bits": [
+        { "name": "enabled", "bit_offset": 0, "bit_width": 1 },
+        { "name": "fault", "bit_offset": 1, "bit_width": 3 },
+        { "name": "mode", "bit_offset": 4, "bit_width": 4 }
+      ]
+    }
+  ]
+}

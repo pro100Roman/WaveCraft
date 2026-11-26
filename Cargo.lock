@@ -3310,6 +3310,7 @@ dependencies = [
  "wavecraft-radio",
  "wavecraft-recording",
  "wavecraft-sdr",
+ "wavecraft-serial",
  "wavecraft-systemview",
  "wavecraft-trace",
  "wavecraft-usb",
@@ -3349,6 +3350,16 @@ dependencies = [
 name = "wavecraft-sdr"
 version = "0.1.0"
 dependencies = [
+ "wavecraft-core",
+]
+
+[[package]]
+name = "wavecraft-serial"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serialport",
  "wavecraft-core",
 ]
 

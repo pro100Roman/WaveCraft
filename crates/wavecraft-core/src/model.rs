@@ -28,6 +28,7 @@ pub enum InstrumentKind {
     LogicAnalyzer,
     Oscilloscope,
     RadioReceiver,
+    Serial,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +81,7 @@ pub enum CaptureBatch {
     Logic(LogicBatch),
     Scope(ScopeBatch),
     Iq(IqBatch),
+    Serial(Vec<u8>),
 }
 
 impl CaptureBatch {
@@ -88,6 +90,7 @@ impl CaptureBatch {
             Self::Logic(batch) => batch.samples.len(),
             Self::Scope(batch) => batch.channels.first().map_or(0, Vec::len),
             Self::Iq(batch) => batch.samples.len(),
+            Self::Serial(bytes) => bytes.len(),
         }
     }
 }

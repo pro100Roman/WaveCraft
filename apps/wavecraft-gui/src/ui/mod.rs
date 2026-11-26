@@ -14,6 +14,7 @@ pub mod radio_settings;
 pub mod scope_frontend_changes;
 pub mod scope_settings;
 pub mod scope_tools_panel;
+pub mod serial;
 pub mod session_tabs;
 pub mod status_bar;
 pub mod system_trace;

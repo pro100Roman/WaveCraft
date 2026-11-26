@@ -318,6 +318,7 @@ mod tests {
                     trigger_sample_index: None,
                     channels: vec![vec![0.0, 1.0]],
                 }),
+                InstrumentKind::Serial => CaptureBatch::Serial(vec![1, 2]),
                 InstrumentKind::RadioReceiver => CaptureBatch::Iq(IqBatch {
                     sample_rate_hz: 1_000,
                     center_frequency_hz: 100_000_000,

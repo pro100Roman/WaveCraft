@@ -34,7 +34,7 @@ const MAX_METADATA_ENTRIES: usize = 4_096;
 const MAX_SCOPE_CHANNELS: usize = 256;
 
 const MIN_READABLE_FORMAT_VERSION: u16 = 1;
-pub const FORMAT_VERSION: u16 = 2;
+pub const FORMAT_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordingHeader {
@@ -496,6 +496,11 @@ fn encode_frame(frame: &CaptureFrame) -> Result<Vec<u8>, RecordingError> {
                 }
             }
         }
+        CaptureBatch::Serial(bytes) => {
+            payload.push(4);
+            push_length_u64(&mut payload, bytes.len(), "serial byte")?;
+            payload.extend_from_slice(bytes);
+        }
         CaptureBatch::Iq(batch) => {
             payload.push(3);
             push_u64(&mut payload, batch.sample_rate_hz);
@@ -532,6 +537,15 @@ fn decode_frame(payload: &[u8]) -> Result<CaptureFrame, RecordingError> {
     let captured_at = Duration::new(seconds, nanos);
     let payload_kind = reader.read_u8()?;
     let capture_payload = match payload_kind {
+        4 => {
+            let count = reader.read_length("serial byte")?;
+            reader.require_values(count, 1, "serial bytes")?;
+            let mut bytes = Vec::with_capacity(count);
+            for _ in 0..count {
+                bytes.push(reader.read_u8()?);
+            }
+            CaptureBatch::Serial(bytes)
+        }
         1 => {
             let sample_rate_hz = reader.read_u64()?;
             let channel_count = reader.read_u8()?;
@@ -635,6 +649,7 @@ fn encode_instrument_kind(kind: InstrumentKind) -> u8 {
         InstrumentKind::LogicAnalyzer => 1,
         InstrumentKind::Oscilloscope => 2,
         InstrumentKind::RadioReceiver => 3,
+        InstrumentKind::Serial => 4,
     }
 }
 
@@ -643,6 +658,7 @@ fn decode_instrument_kind(value: u8) -> Result<InstrumentKind, RecordingError> {
         1 => Ok(InstrumentKind::LogicAnalyzer),
         2 => Ok(InstrumentKind::Oscilloscope),
         3 => Ok(InstrumentKind::RadioReceiver),
+        4 => Ok(InstrumentKind::Serial),
         _ => Err(RecordingError::invalid(format!(
             "unknown instrument kind {value}"
         ))),
@@ -902,6 +918,43 @@ mod tests {
         assert_eq!(reader.header().devices, descriptors);
         assert_eq!(reader.read_event().unwrap(), Some(event));
         assert_eq!(reader.read_event().unwrap(), None);
+    }
+
+    #[test]
+    fn version_three_round_trips_serial_bytes_and_version_two_remains_readable() {
+        let descriptor = DeviceDescriptor {
+            id: DeviceId::new("serial:test"),
+            name: "UART".into(),
+            kind: InstrumentKind::Serial,
+        };
+        let event = CaptureEvent::Frame(CaptureFrame {
+            device_id: descriptor.id.clone(),
+            sequence: 7,
+            captured_at: Duration::from_millis(42),
+            payload: CaptureBatch::Serial(vec![0, 0xff, 13, 10]),
+        });
+        let mut bytes = Vec::new();
+        let mut writer = RecordingWriter::new(
+            &mut bytes,
+            std::slice::from_ref(&descriptor),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        writer.write_event(&event).unwrap();
+        writer.finish(CompletionStatus::Complete).unwrap();
+        let mut reader = RecordingReader::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.header().devices, [descriptor]);
+        assert_eq!(reader.read_event().unwrap(), Some(event));
+        assert!(reader.read_event().unwrap().is_none());
+
+        let mut old_bytes = Vec::new();
+        let mut writer =
+            RecordingWriter::new(&mut old_bytes, &descriptors(), BTreeMap::new()).unwrap();
+        writer.write_event(&logic_event()).unwrap();
+        writer.finish(CompletionStatus::Complete).unwrap();
+        old_bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+        let mut reader = RecordingReader::new(Cursor::new(old_bytes)).unwrap();
+        assert_eq!(reader.read_event().unwrap(), Some(logic_event()));
     }
 
     #[test]

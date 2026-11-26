@@ -28,6 +28,7 @@ impl From<WorkspaceView> for SavedWorkspaceView {
             WorkspaceView::Waveform(WaveformTab::Combined) => Self::Combined,
             WorkspaceView::Vna => Self::Vna,
             WorkspaceView::SystemTrace => Self::SystemTrace,
+            WorkspaceView::Serial => Self::Serial,
         }
     }
 }
@@ -43,6 +44,7 @@ impl From<SavedWorkspaceView> for WorkspaceView {
             SavedWorkspaceView::Combined => Self::Waveform(WaveformTab::Combined),
             SavedWorkspaceView::Vna => Self::Vna,
             SavedWorkspaceView::SystemTrace => Self::SystemTrace,
+            SavedWorkspaceView::Serial => Self::Serial,
         }
     }
 }
@@ -167,7 +169,8 @@ impl WaveCraftApp {
             analysis: self.system_trace.event_view_height().round() as u32,
         };
         let timeline_label_width = self.system_trace.timeline_label_width().round() as u32;
-        if self.saved_capture_settings.global.scope_plot_tab == self.scope_plot_tab
+        if self.saved_capture_settings.global.serial.as_ref() == Some(&self.serial.settings)
+            && self.saved_capture_settings.global.scope_plot_tab == self.scope_plot_tab
             && self.saved_capture_settings.global.hidden_workspace_views == hidden_workspace_views
             && self.saved_capture_settings.global.last_active_view == Some(saved_view)
             && self.saved_capture_settings.global.window_inner_size == window_inner_size
@@ -204,6 +207,7 @@ impl WaveCraftApp {
         }
 
         let mut document = self.saved_capture_settings.clone();
+        document.global.serial = Some(self.serial.settings.clone());
         document.global.scope_plot_tab = self.scope_plot_tab;
         document.global.hidden_workspace_views = hidden_workspace_views;
         document.global.last_active_view = Some(saved_view);
@@ -224,6 +228,14 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn apply_saved_capture_settings(&mut self) {
+        if let Some(settings) = &self.saved_capture_settings.global.serial {
+            self.serial.settings = settings.clone();
+            self.serial
+                .settings
+                .fields
+                .truncate(wavecraft_serial::MAX_TEXT_FIELDS);
+            self.serial.settings.graph_percent = self.serial.settings.graph_percent.clamp(10, 90);
+        }
         for view in &self.saved_capture_settings.global.hidden_workspace_views {
             // Lissajous visibility used to affect only the separate XY view.
             if *view != SavedWorkspaceView::Lissajous {
@@ -237,12 +249,21 @@ impl WaveCraftApp {
             .workspace_view_order
             .as_ref()
         {
-            let order = order
+            let mut order = order
                 .iter()
                 .copied()
                 .filter(|view| *view != SavedWorkspaceView::Lissajous)
                 .map(WorkspaceView::from)
                 .collect::<Vec<_>>();
+            if order.len() == WorkspaceView::ALL.len() - 1
+                && !order.contains(&WorkspaceView::Serial)
+                && WorkspaceView::ALL
+                    .iter()
+                    .filter(|view| **view != WorkspaceView::Serial)
+                    .all(|view| order.iter().filter(|candidate| *candidate == view).count() == 1)
+            {
+                order.push(WorkspaceView::Serial);
+            }
             self.workspace_view_layout.set_order(&order);
         }
         if let Some(order) = self
@@ -736,7 +757,8 @@ impl WaveCraftApp {
     pub(crate) fn active_waveform_view(&self) -> Option<WaveformTab> {
         match self.active_workspace_view {
             Some(WorkspaceView::Waveform(tab)) => Some(tab),
-            Some(WorkspaceView::Vna | WorkspaceView::SystemTrace) | None => None,
+            Some(WorkspaceView::Vna | WorkspaceView::SystemTrace | WorkspaceView::Serial)
+            | None => None,
         }
     }
 
@@ -796,6 +818,7 @@ impl WaveCraftApp {
                 WorkspaceView::Waveform(tab) => self.select_waveform_tab(tab),
                 WorkspaceView::Vna => self.select_vna_view(),
                 WorkspaceView::SystemTrace => self.select_system_trace_view(),
+                WorkspaceView::Serial => self.select_serial_view(),
             }
         }
         let available = self.available_waveform_tabs();
@@ -814,18 +837,25 @@ impl WaveCraftApp {
             available.first().copied()
         };
         if let Some(tab) = selected {
-            if self.system_trace_view_is_active() || self.vna_view_is_active() {
+            if self.system_trace_view_is_active()
+                || self.vna_view_is_active()
+                || self.serial_view_is_active()
+            {
                 self.active_waveform_tab = Some(tab);
             } else {
                 self.select_waveform_tab(tab);
             }
         } else {
             self.active_waveform_tab = None;
-            if !self.system_trace_view_is_active() && !self.vna_view_is_active() {
+            if !self.system_trace_view_is_active()
+                && !self.vna_view_is_active()
+                && !self.serial_view_is_active()
+            {
                 match views[0] {
                     WorkspaceView::Waveform(tab) => self.select_waveform_tab(tab),
                     WorkspaceView::Vna => self.select_vna_view(),
                     WorkspaceView::SystemTrace => self.select_system_trace_view(),
+                    WorkspaceView::Serial => self.select_serial_view(),
                 }
             }
         }
@@ -1077,6 +1107,7 @@ mod tests {
                 WorkspaceView::Waveform(WaveformTab::RadioReceiver),
                 WorkspaceView::Waveform(WaveformTab::Combined),
                 WorkspaceView::Vna,
+                WorkspaceView::Serial,
             ]
         );
         remove_test_repository(&repository);

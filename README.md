@@ -48,6 +48,15 @@ event streams and reconstructs task, interrupt, timer, scheduler, and idle
 execution. It combines an interactive timeline with event and log tables, CPU
 load, context statistics, a plain RTT terminal, and probe diagnostics.
 
+### Serial / UART
+
+![WaveCraft Serial / UART view with binary field plots and raw bytes](docs/images/wavecraft-serial-uart.png)
+
+The **Serial / UART** workspace receives ASCII or binary telemetry with live
+field plots, configurable CRC validation, and a resizable raw-data pane.
+See the [Serial / UART guide](docs/serial-uart.md) and
+[example binary schema](docs/examples/serial-schema.json).
+
 ## Release packages
 
 WaveCraft publishes one universal macOS package that runs natively on Apple

@@ -349,6 +349,9 @@ fn automation_capture_run(arguments: AutomationCaptureArguments) -> Result<(), B
             arguments.channels,
             &arguments.output,
         ),
+        AutomationInstrumentKind::Serial => {
+            return Err("use the Serial / UART workspace for serial capture".into())
+        }
         AutomationInstrumentKind::RadioReceiver => {
             return Err("radio receiver capture is not implemented by this command".into())
         }

@@ -23,6 +23,10 @@ impl WaveCraftApp {
         frame: &FrameState,
         actions: &mut FrameActions,
     ) {
+        if self.serial_view_is_active() {
+            self.paint_serial_toolbar(context);
+            return;
+        }
         if self.vna_view_is_active() {
             self.paint_vna_toolbar(context, actions);
             return;
