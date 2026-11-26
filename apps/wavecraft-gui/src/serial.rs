@@ -618,18 +618,26 @@ impl SerialState {
     }
 
     pub fn plot_imported(&mut self) -> Result<(), CaptureError> {
-        let file = self
-            .imported_file
-            .clone()
-            .ok_or_else(|| CaptureError::new("Open a raw file before plotting"))?;
+        if self.imported_file.is_none() {
+            return Err("Open a raw file before plotting".into());
+        }
         if self.settings.mode == SerialMode::Text && self.settings.fields.is_empty() {
             return Err("Add text fields before plotting the opened file".into());
         }
         if self.settings.mode == SerialMode::Binary && self.settings.schema_json.is_empty() {
             return Err("Load a binary JSON schema before plotting the opened file".into());
         }
+        self.rebuild_imported_axis()
+    }
+
+    pub fn rebuild_imported_axis(&mut self) -> Result<(), CaptureError> {
+        let file = self
+            .imported_file
+            .clone()
+            .ok_or_else(|| CaptureError::new("Open a raw file before plotting"))?;
         self.prepare()?;
         self.ingest_file(file);
+        self.time_window = self.time_window.max(self.x_axis.minimum_span());
         self.fit_graph();
         Ok(())
     }

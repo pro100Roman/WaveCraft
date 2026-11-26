@@ -69,7 +69,7 @@ pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
             let label = if value.abs() >= 1e5 || value != 0.0 && value.abs() < 0.001 {
                 format!("{value:.1e}")
             } else {
-                format!("{value:.3}")
+                format_graph_number(value, 3)
             };
             painter.text(
                 egui::pos2(plot.left() - 6.0, y),
@@ -84,12 +84,6 @@ pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
                 egui::Stroke::new(1.0_f32, GRID),
             );
             let value = (start + f64::from(fraction) * (end - start)) * time_multiplier;
-            // Fit widens by a few ulps; do not show that padding as "-0.00 s".
-            let value = if value.abs() < 0.5 * 10.0_f64.powi(-(time_precision as i32)) {
-                0.0
-            } else {
-                value
-            };
             painter.text(
                 egui::pos2(x, plot.bottom() + 5.0),
                 if step == 0 {
@@ -99,7 +93,7 @@ pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
                 } else {
                     egui::Align2::CENTER_TOP
                 },
-                format!("{:.*}{time_unit}", time_precision, value),
+                format!("{}{time_unit}", format_graph_number(value, time_precision)),
                 egui::FontId::monospace(10.0),
                 TEXT_MUTED,
             );
@@ -147,9 +141,9 @@ pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
                 egui::Stroke::new(1.0_f32, TEXT_MUTED),
             );
             let coordinate = if state.x_axis.is_time() {
-                format!("{time:.9} s")
+                format!("{} s", format_graph_number(time, 9))
             } else {
-                format!("Sample {time:.2}")
+                format!("Sample {}", format_graph_number(time, 2))
             };
             let mut rows = vec![(coordinate, ui.visuals().text_color())];
             for series in &state.series {
@@ -159,7 +153,7 @@ pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
                     .min_by(|a, b| (a[0] - time).abs().total_cmp(&(b[0] - time).abs()))
                 {
                     rows.push((
-                        format!("{}: {:.6}", series.name, point[1]),
+                        format!("{}: {}", series.name, format_graph_number(point[1], 6)),
                         egui::Color32::from_rgb(series.color[0], series.color[1], series.color[2]),
                     ));
                 }
@@ -330,10 +324,24 @@ fn time_window_editor(ui: &mut egui::Ui, state: &mut SerialState) -> egui::Respo
 }
 
 fn format_time_window(value: f64) -> String {
-    format!("{value:.9}")
+    let formatted = format_graph_number(value, 9);
+    if formatted == "0" {
+        return formatted;
+    }
+    formatted
         .trim_end_matches('0')
         .trim_end_matches('.')
         .to_owned()
+}
+
+/// Normalize the rendered number, including negative values that round to zero.
+fn format_graph_number(value: f64, precision: usize) -> String {
+    let formatted = format!("{value:.precision$}");
+    if formatted.parse::<f64>().is_ok_and(|rounded| rounded == 0.0) {
+        "0".into()
+    } else {
+        formatted
+    }
 }
 
 fn auto_value_range(state: &SerialState) -> SerialGraphValueRange {
@@ -430,6 +438,19 @@ fn zoom_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_labels_have_no_sign_or_fraction_while_real_negative_values_are_preserved() {
+        for precision in 0..=9 {
+            for value in [-0.0, 0.0, -1e-14, 1e-14] {
+                assert_eq!(format_graph_number(value, precision), "0");
+            }
+        }
+        assert_eq!(format_graph_number(-0.125, 3), "-0.125");
+        assert_eq!(format_graph_number(1.25, 2), "1.25");
+        assert_eq!(format_time_window(-0.0), "0");
+        assert_eq!(format_time_window(1e-9), "0.000000001");
+    }
 
     #[test]
     fn double_click_fits_both_axes_in_plot_and_axis_margins() {

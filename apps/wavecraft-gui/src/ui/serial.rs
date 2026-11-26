@@ -185,6 +185,7 @@ impl WaveCraftApp {
         );
 
         if before != self.serial.settings {
+            self.apply_serial_axis_changes(&before);
             for series in &mut self.serial.series {
                 let color = if self.serial.settings.mode == SerialMode::Text {
                     self.serial
@@ -207,6 +208,19 @@ impl WaveCraftApp {
             // Keep a stopped capture intact until a new Start/Open, but rebuild the raw representation on mode changes.
             self.serial.invalidate_raw();
             self.save_global_settings();
+        }
+    }
+
+    fn apply_serial_axis_changes(&mut self, before: &SerialSettings) {
+        let settings = &self.serial.settings;
+        let axis_changed = before.timestamp_field != settings.timestamp_field
+            || before.timestamp_unit != settings.timestamp_unit
+            || before.timestamp_multiplier != settings.timestamp_multiplier
+            || before.sample_rate != settings.sample_rate;
+        if axis_changed && self.serial.imported_file.is_some() {
+            if let Err(error) = self.serial.rebuild_imported_axis() {
+                self.serial.error = Some(error.to_string());
+            }
         }
     }
 
@@ -852,6 +866,88 @@ fn paint_raw(ui: &mut egui::Ui, state: &mut SerialState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_timestamp_and_rate_rebuilds_opened_files_with_sample_labels() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples");
+        for mode in [SerialMode::Text, SerialMode::Binary] {
+            let mut app = crate::app::test_support::app();
+            app.serial.settings.mode = mode;
+            let file = if mode == SerialMode::Text {
+                app.serial.settings.fields = ["temperature", "speed"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| TextField {
+                        name: name.into(),
+                        separator: String::new(),
+                        color: COLORS[index],
+                        line_style: Default::default(),
+                    })
+                    .collect();
+                "serial-ascii.txt"
+            } else {
+                app.serial
+                    .load_schema(
+                        "schema.json".into(),
+                        include_str!("../../../../docs/examples/serial-schema.json").into(),
+                    )
+                    .unwrap();
+                "serial-binary.bin"
+            };
+            app.serial.settings.timestamp_field = "speed".into();
+            app.serial.settings.timestamp_unit = SerialTimestampUnit::Milliseconds;
+            app.serial.settings.timestamp_multiplier = "10".into();
+            app.serial.import_raw(&root.join(file)).unwrap();
+            let raw = app.serial.raw.clone();
+            assert!(app.serial.x_axis.is_time());
+            let before = app.serial.settings.clone();
+            app.serial.settings.timestamp_field.clear();
+            app.apply_serial_axis_changes(&before);
+            assert_eq!(app.serial.x_axis, crate::serial::SerialXAxis::Samples);
+            assert_eq!(app.serial.decoded_records, 512);
+            let context = egui::Context::default();
+            let labels = texts(&render(&mut app, &context, vec![]).shapes);
+            assert!(labels.iter().any(|label| label == "X: Sample"));
+            assert!(labels.iter().any(|label| label == "samples"));
+            assert!(!labels.iter().any(|label| label == "s"
+                || label.ends_with("ms")
+                || label.ends_with("µs")
+                || label.ends_with("ns")));
+            let before = app.serial.settings.clone();
+            app.serial.settings.sample_rate = "1000".into();
+            app.apply_serial_axis_changes(&before);
+            assert!(app.serial.x_axis.is_time());
+            let before = app.serial.settings.clone();
+            app.serial.settings.sample_rate.clear();
+            app.apply_serial_axis_changes(&before);
+            assert_eq!(app.serial.x_axis, crate::serial::SerialXAxis::Samples);
+            assert_eq!(app.serial.raw, raw);
+            assert!(app.serial.error.is_none());
+        }
+    }
+
+    #[test]
+    fn empty_plot_updates_units_without_requiring_fields_or_json() {
+        let mut app = crate::app::test_support::app();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples");
+        for mode in [SerialMode::Text, SerialMode::Binary] {
+            app.serial.settings.mode = mode;
+            app.serial
+                .import_raw(&root.join("serial-ascii.txt"))
+                .unwrap();
+            let raw = app.serial.raw.clone();
+            let before = app.serial.settings.clone();
+            app.serial.settings.sample_rate = "1000".into();
+            app.apply_serial_axis_changes(&before);
+            assert!(app.serial.x_axis.is_time());
+            let before = app.serial.settings.clone();
+            app.serial.settings.sample_rate.clear();
+            app.apply_serial_axis_changes(&before);
+            assert!(!app.serial.x_axis.is_time());
+            assert_eq!(app.serial.raw, raw);
+            assert!(app.serial.error.is_none());
+        }
+    }
 
     #[test]
     fn graph_labels_switch_from_sample_numbers_to_sample_rate_time_on_plot() {

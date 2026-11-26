@@ -84,7 +84,9 @@ Equal timestamps are accepted. There is no fallback to sample numbers for an
 individual record when a timestamp field has been selected.
 
 The graph header, axis labels and hover readout distinguish sample numbers from
-time. Apply settings with **Plot**, **Open raw…** or the next **Start**. **Clear**
+time. Changing X-axis settings immediately rebuilds an opened file; field and
+schema edits can be applied with **Plot**. For live capture, settings apply on
+the next **Start**. **Clear**
 resets numbering to 0. Older saved settings default to sample numbers.
 
 ## Text fields
