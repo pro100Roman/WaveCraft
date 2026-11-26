@@ -5,11 +5,11 @@ use crate::{
     logic_settings_from_recording_metadata, parse_color, parse_logic_acquisition_mode,
     radio_settings_from_recording_metadata, recording_metadata_value,
     saved_logic_settings_metadata, saved_radio_settings_metadata, saved_scope_settings_metadata,
-    scope_settings_from_recording_metadata, waveform_tabs, AcquisitionMode, CaptureSettingsProfile,
-    CaptureSettingsTab, CombinedSessionSettings, DeviceModel, LogicSessionSettings,
-    SavedCaptureSettingsKind, SavedTraceEventView, SavedTraceInstrument,
-    SavedTraceInstrumentHeights, SavedWorkspaceView, ScopeSessionSettings, VnaMatchingNetwork,
-    WaveformTab, WorkspaceView,
+    scope_settings_from_recording_metadata, waveform_tabs, AcquisitionMode,
+    CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsTab, CombinedSessionSettings,
+    DeviceModel, LogicSessionSettings, SavedCaptureSettingsKind, SavedTraceEventView,
+    SavedTraceInstrument, SavedTraceInstrumentHeights, SavedWorkspaceView, ScopeSessionSettings,
+    VnaMatchingNetwork, WaveformTab, WorkspaceView,
 };
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -150,6 +150,11 @@ impl WaveCraftApp {
             .filter(|view| !self.workspace_view_layout.is_visible(*view))
             .map(SavedWorkspaceView::from)
             .collect::<Vec<_>>();
+        let collapsed_setup_views = WorkspaceView::ALL
+            .into_iter()
+            .filter(|view| !self.workspace_view_layout.setup_panel_open(*view))
+            .map(SavedWorkspaceView::from)
+            .collect::<Vec<_>>();
         let event_view_order = self
             .system_trace
             .event_view_order()
@@ -170,6 +175,7 @@ impl WaveCraftApp {
         };
         let timeline_label_width = self.system_trace.timeline_label_width().round() as u32;
         if self.saved_capture_settings.global.serial.as_ref() == Some(&self.serial.settings)
+            && self.saved_capture_settings.global.collapsed_setup_views == collapsed_setup_views
             && self.saved_capture_settings.global.scope_plot_tab == self.scope_plot_tab
             && self.saved_capture_settings.global.hidden_workspace_views == hidden_workspace_views
             && self.saved_capture_settings.global.last_active_view == Some(saved_view)
@@ -207,6 +213,7 @@ impl WaveCraftApp {
         }
 
         let mut document = self.saved_capture_settings.clone();
+        document.global.collapsed_setup_views = collapsed_setup_views;
         document.global.serial = Some(self.serial.settings.clone());
         document.global.scope_plot_tab = self.scope_plot_tab;
         document.global.hidden_workspace_views = hidden_workspace_views;
@@ -236,6 +243,10 @@ impl WaveCraftApp {
                 .fields
                 .truncate(wavecraft_serial::MAX_TEXT_FIELDS);
             self.serial.settings.graph_percent = self.serial.settings.graph_percent.clamp(10, 90);
+        }
+        for view in &self.saved_capture_settings.global.collapsed_setup_views {
+            self.workspace_view_layout
+                .set_setup_panel_open((*view).into(), false);
         }
         for view in &self.saved_capture_settings.global.hidden_workspace_views {
             // Lissajous visibility used to affect only the separate XY view.
@@ -433,110 +444,161 @@ impl WaveCraftApp {
         }
     }
 
-    pub(crate) fn save_capture_settings(&mut self, kind: SavedCaptureSettingsKind) {
-        let mut document = self.saved_capture_settings.clone();
-        let profile = match kind {
-            SavedCaptureSettingsKind::LogicAnalyzer => {
-                CaptureSettingsProfile::new(saved_logic_settings_metadata(
-                    self.logic_settings,
-                    self.logic_acquisition_mode,
-                    self.repetitive_interval_seconds,
-                    self.logic_smart_timing_enabled,
-                    &self.logic_channel_names,
-                ))
+    pub(crate) fn save_setup_settings(&mut self, view: WorkspaceView) {
+        match view {
+            WorkspaceView::Waveform(WaveformTab::LogicAnalyzer) => {
+                self.save_capture_settings(SavedCaptureSettingsKind::LogicAnalyzer)
             }
-            SavedCaptureSettingsKind::Oscilloscope => {
-                CaptureSettingsProfile::new(saved_scope_settings_metadata(
-                    self.scope_settings,
-                    self.scope_auto_sample_rate,
-                    self.scope_smart_timing_enabled,
-                    &self.scope_channel_names,
-                    self.scope_channel_colors,
-                ))
+            WorkspaceView::Waveform(WaveformTab::Oscilloscope) => {
+                self.save_capture_settings(SavedCaptureSettingsKind::Oscilloscope)
             }
-            SavedCaptureSettingsKind::RadioFrequency => {
-                CaptureSettingsProfile::new(saved_radio_settings_metadata(&self.radio_settings))
+            WorkspaceView::Waveform(WaveformTab::RadioReceiver) => {
+                self.save_capture_settings(SavedCaptureSettingsKind::RadioFrequency)
             }
-            SavedCaptureSettingsKind::VectorNetworkAnalyzer => {
-                let mut values = BTreeMap::new();
-                values.insert(
-                    "vna.start_mhz".to_owned(),
-                    self.vna_settings.start_mhz.to_string(),
-                );
-                values.insert(
-                    "vna.stop_mhz".to_owned(),
-                    self.vna_settings.stop_mhz.to_string(),
-                );
-                values.insert(
-                    "vna.points".to_owned(),
-                    self.vna_settings.points.to_string(),
-                );
-                values.insert(
-                    "vna.averaging".to_owned(),
-                    self.vna_settings.averaging.to_string(),
-                );
-                values.insert(
-                    "vna.matching_network".to_owned(),
-                    self.vna_settings
-                        .matching_network
-                        .persisted_value()
-                        .to_owned(),
-                );
-                values.insert(
-                    "vna.matching_q".to_owned(),
-                    self.vna_settings.matching_q.to_string(),
-                );
-                if let Some(calibration) = &self.vna_calibration {
-                    let serialized = match serde_json::to_string(&calibration.calibration) {
-                        Ok(serialized) => serialized,
-                        Err(error) => {
-                            self.set_error(format!("failed to serialize VNA calibration: {error}"));
-                            return;
-                        }
-                    };
-                    values.insert("vna.one_port_calibration".to_owned(), serialized);
-                    values.insert("vna.calibration_name".to_owned(), calibration.name.clone());
-                    values.insert(
-                        "vna.calibration_averaging".to_owned(),
-                        calibration.averaging.to_string(),
-                    );
+            WorkspaceView::Waveform(WaveformTab::Combined) => self.save_capture_profiles(
+                &[
+                    SavedCaptureSettingsKind::LogicAnalyzer,
+                    SavedCaptureSettingsKind::Oscilloscope,
+                ],
+                "Combined",
+            ),
+            WorkspaceView::Vna => {
+                self.save_capture_settings(SavedCaptureSettingsKind::VectorNetworkAnalyzer)
+            }
+            WorkspaceView::SystemTrace => {
+                self.save_capture_settings(SavedCaptureSettingsKind::SystemTrace)
+            }
+            WorkspaceView::Serial => {
+                let mut document = self.saved_capture_settings.clone();
+                document.global.serial = Some(self.serial.settings.clone());
+                if self.persist_setup_document(document, "Serial") {
+                    self.serial.status = self.status.clone();
                 }
-                CaptureSettingsProfile::new(values)
             }
-            SavedCaptureSettingsKind::SystemTrace => {
-                CaptureSettingsProfile::new(self.system_trace_settings.saved_values())
-            }
-        };
-        match kind {
-            SavedCaptureSettingsKind::LogicAnalyzer => {
-                document.profiles.logic_analyzer = Some(profile)
-            }
-            SavedCaptureSettingsKind::Oscilloscope => {
-                document.profiles.oscilloscope = Some(profile)
-            }
-            SavedCaptureSettingsKind::RadioFrequency => {
-                document.profiles.radio_frequency = Some(profile)
-            }
-            SavedCaptureSettingsKind::VectorNetworkAnalyzer => {
-                document.profiles.vector_network_analyzer = Some(profile)
-            }
-            SavedCaptureSettingsKind::SystemTrace => document.profiles.system_trace = Some(profile),
         }
+    }
 
+    pub(crate) fn save_capture_settings(&mut self, kind: SavedCaptureSettingsKind) {
+        self.save_capture_profiles(&[kind], kind.label());
+    }
+
+    fn save_capture_profiles(&mut self, kinds: &[SavedCaptureSettingsKind], label: &str) {
+        let mut document = self.saved_capture_settings.clone();
+        for &kind in kinds {
+            let profile = match kind {
+                SavedCaptureSettingsKind::LogicAnalyzer => {
+                    CaptureSettingsProfile::new(saved_logic_settings_metadata(
+                        self.logic_settings,
+                        self.logic_acquisition_mode,
+                        self.repetitive_interval_seconds,
+                        self.logic_smart_timing_enabled,
+                        &self.logic_channel_names,
+                    ))
+                }
+                SavedCaptureSettingsKind::Oscilloscope => {
+                    CaptureSettingsProfile::new(saved_scope_settings_metadata(
+                        self.scope_settings,
+                        self.scope_auto_sample_rate,
+                        self.scope_smart_timing_enabled,
+                        &self.scope_channel_names,
+                        self.scope_channel_colors,
+                    ))
+                }
+                SavedCaptureSettingsKind::RadioFrequency => {
+                    CaptureSettingsProfile::new(saved_radio_settings_metadata(&self.radio_settings))
+                }
+                SavedCaptureSettingsKind::VectorNetworkAnalyzer => {
+                    let mut values = BTreeMap::new();
+                    values.insert(
+                        "vna.start_mhz".to_owned(),
+                        self.vna_settings.start_mhz.to_string(),
+                    );
+                    values.insert(
+                        "vna.stop_mhz".to_owned(),
+                        self.vna_settings.stop_mhz.to_string(),
+                    );
+                    values.insert(
+                        "vna.points".to_owned(),
+                        self.vna_settings.points.to_string(),
+                    );
+                    values.insert(
+                        "vna.averaging".to_owned(),
+                        self.vna_settings.averaging.to_string(),
+                    );
+                    values.insert(
+                        "vna.matching_network".to_owned(),
+                        self.vna_settings
+                            .matching_network
+                            .persisted_value()
+                            .to_owned(),
+                    );
+                    values.insert(
+                        "vna.matching_q".to_owned(),
+                        self.vna_settings.matching_q.to_string(),
+                    );
+                    if let Some(calibration) = &self.vna_calibration {
+                        let serialized = match serde_json::to_string(&calibration.calibration) {
+                            Ok(serialized) => serialized,
+                            Err(error) => {
+                                self.set_error(format!(
+                                    "failed to serialize VNA calibration: {error}"
+                                ));
+                                return;
+                            }
+                        };
+                        values.insert("vna.one_port_calibration".to_owned(), serialized);
+                        values.insert("vna.calibration_name".to_owned(), calibration.name.clone());
+                        values.insert(
+                            "vna.calibration_averaging".to_owned(),
+                            calibration.averaging.to_string(),
+                        );
+                    }
+                    CaptureSettingsProfile::new(values)
+                }
+                SavedCaptureSettingsKind::SystemTrace => {
+                    CaptureSettingsProfile::new(self.system_trace_settings.saved_values())
+                }
+            };
+            match kind {
+                SavedCaptureSettingsKind::LogicAnalyzer => {
+                    document.profiles.logic_analyzer = Some(profile)
+                }
+                SavedCaptureSettingsKind::Oscilloscope => {
+                    document.profiles.oscilloscope = Some(profile)
+                }
+                SavedCaptureSettingsKind::RadioFrequency => {
+                    document.profiles.radio_frequency = Some(profile)
+                }
+                SavedCaptureSettingsKind::VectorNetworkAnalyzer => {
+                    document.profiles.vector_network_analyzer = Some(profile)
+                }
+                SavedCaptureSettingsKind::SystemTrace => {
+                    document.profiles.system_trace = Some(profile)
+                }
+            }
+        }
+        self.persist_setup_document(document, label);
+    }
+
+    fn persist_setup_document(&mut self, document: CaptureSettingsDocument, label: &str) -> bool {
         let Some(repository) = self.capture_settings_repository.as_ref() else {
             self.set_error(
                 "Capture settings cannot be saved because the configuration directory is unavailable"
                     .to_owned(),
             );
-            return;
+            return false;
         };
         match repository.save(&document) {
             Ok(()) => {
                 self.saved_capture_settings = document;
-                self.status = format!("{} settings saved", kind.label());
+                self.status = format!("{} settings saved", label);
                 self.last_error = None;
+                true
             }
-            Err(error) => self.set_error(error),
+            Err(error) => {
+                self.set_error(error);
+                false
+            }
         }
     }
 
@@ -882,6 +944,103 @@ mod tests {
         if let Some(parent) = repository.path().parent() {
             let _ = fs::remove_dir(parent);
         }
+    }
+
+    #[test]
+    fn setup_panel_visibility_persists_independently_for_every_workspace() {
+        let repository = test_repository("setup-panel-visibility");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        for view in WorkspaceView::ALL {
+            app.active_workspace_view = Some(view);
+            assert!(app.workspace_view_layout.setup_panel_open(view));
+            app.workspace_view_layout.set_setup_panel_open(view, false);
+            app.save_global_settings();
+            let saved = repository.load().expect("layout is saved");
+            let restored = WaveCraftApp::with_settings(None, saved);
+            for candidate in WorkspaceView::ALL {
+                assert_eq!(
+                    restored.workspace_view_layout.setup_panel_open(candidate),
+                    app.workspace_view_layout.setup_panel_open(candidate),
+                    "after {view:?}: {candidate:?}; saved={:?}",
+                    app.saved_capture_settings.global.collapsed_setup_views
+                );
+            }
+        }
+        app.workspace_view_layout
+            .set_setup_panel_open(WorkspaceView::Serial, true);
+        app.save_global_settings();
+        let restored =
+            WaveCraftApp::with_settings(None, repository.load().expect("layout is saved"));
+        assert!(restored
+            .workspace_view_layout
+            .setup_panel_open(WorkspaceView::Serial));
+        assert!(!restored
+            .workspace_view_layout
+            .setup_panel_open(WorkspaceView::Vna));
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn combined_save_persists_both_capture_profiles_and_preserves_other_views() {
+        let repository = test_repository("combined-setup-save");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.radio_settings.capture.center_frequency_hz = 123_000_000;
+        app.save_setup_settings(WorkspaceView::Waveform(WaveformTab::RadioReceiver));
+        let radio_profile = app.saved_capture_settings.profiles.radio_frequency.clone();
+        app.logic_channel_names[0] = "Combined logic".into();
+        app.scope_channel_names[0] = "Combined scope".into();
+        app.save_setup_settings(WorkspaceView::Waveform(WaveformTab::Combined));
+        assert!(app.last_error.is_none());
+        assert_eq!(app.status, "Combined settings saved");
+        let saved = repository.load().expect("combined settings are saved");
+        assert_eq!(saved.profiles.radio_frequency, radio_profile);
+        let restored = WaveCraftApp::with_settings(None, saved);
+        assert_eq!(restored.logic_channel_names[0], "Combined logic");
+        assert_eq!(restored.scope_channel_names[0], "Combined scope");
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn serial_setup_save_round_trips_settings_and_reports_success_or_failure() {
+        let repository = test_repository("serial-setup-save");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.serial.settings.baud = 230_400;
+        app.save_setup_settings(WorkspaceView::Serial);
+        assert!(app.last_error.is_none());
+        assert_eq!(app.serial.status, "Serial settings saved");
+        let restored = WaveCraftApp::with_settings(
+            None,
+            repository.load().expect("serial settings are saved"),
+        );
+        assert_eq!(restored.serial.settings.baud, 230_400);
+        app.capture_settings_repository = None;
+        app.serial.settings.baud = 115_200;
+        app.save_setup_settings(WorkspaceView::Serial);
+        assert!(app
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("configuration directory")));
+        assert_eq!(
+            app.saved_capture_settings
+                .global
+                .serial
+                .as_ref()
+                .map(|settings| settings.baud),
+            Some(230_400)
+        );
+        remove_test_repository(&repository);
     }
 
     #[test]

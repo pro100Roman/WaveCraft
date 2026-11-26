@@ -1,12 +1,12 @@
 //! LiteVNA setup controls and Smith chart rendering.
 
-use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel, SetupPanel};
+use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel};
 
 use crate::{
-    egui, paint_capture_settings_save_button, toolbar_action_button, CalibrationStandard, Color32,
-    FontId, FrameActions, PendingSnapshot, Pos2, Rect, RichText, SavedCaptureSettingsKind,
-    SelectableHoverText, Sense, Stroke, Vec2, VnaMatchingNetwork, VnaPoint, WaveCraftApp, ACCENT,
-    GRID, ORANGE, SCOPE_COLORS, TEXT_MUTED, VNA_MATCHING_Q_MAX, VNA_MATCHING_Q_MIN,
+    egui, toolbar_action_button, CalibrationStandard, Color32, FontId, FrameActions,
+    PendingSnapshot, Pos2, Rect, RichText, SelectableHoverText, Sense, Stroke, Vec2,
+    VnaMatchingNetwork, VnaPoint, WaveCraftApp, WorkspaceView, ACCENT, GRID, ORANGE, SCOPE_COLORS,
+    TEXT_MUTED, VNA_MATCHING_Q_MAX, VNA_MATCHING_Q_MIN,
 };
 
 const SMITH_GRID: Color32 = Color32::from_rgb(54, 68, 81);
@@ -294,25 +294,25 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
-        SetupPanel::new("vna_setup", "VNA SETUP").show(context, |ui| {
+        self.show_setup_panel(context, WorkspaceView::Vna, actions, |app, ui, actions| {
             ui.label(RichText::new("Instrument").color(TEXT_MUTED));
-            let selected_text = if self.vna_discovery_error.is_some() {
+            let selected_text = if app.vna_discovery_error.is_some() {
                 "LiteVNA discovery failed".to_owned()
             } else {
-                self.selected_vna()
+                app.selected_vna()
                     .map(|device| device.display_name.clone())
                     .unwrap_or_else(|| "No LiteVNA detected".to_owned())
             };
             ui.add_enabled_ui(
-                self.vna_session.is_none() && self.vna_connection_pending.is_none(),
+                app.vna_session.is_none() && app.vna_connection_pending.is_none(),
                 |ui| {
                     egui::ComboBox::from_id_salt("vna_device")
                         .width(ui.available_width())
                         .selected_text(selected_text)
                         .show_ui(ui, |ui| {
-                            for device in &self.vna_devices {
+                            for device in &app.vna_devices {
                                 ui.selectable_value(
-                                    &mut self.selected_vna_port,
+                                    &mut app.selected_vna_port,
                                     Some(device.port_name.clone()),
                                     &device.display_name,
                                 );
@@ -321,10 +321,10 @@ impl WaveCraftApp {
                 },
             );
             ui.add_space(6.0);
-            let connection_pending = self.vna_connection_pending.is_some();
-            let connection_open = self.vna_session.is_some();
+            let connection_pending = app.vna_connection_pending.is_some();
+            let connection_open = app.vna_session.is_some();
             let connection_label = if connection_pending {
-                if self.vna_connection_closing {
+                if app.vna_connection_closing {
                     "Closing…"
                 } else {
                     "Opening…"
@@ -334,7 +334,7 @@ impl WaveCraftApp {
             } else {
                 "▶ Open"
             };
-            let connection_color = if connection_open || self.vna_connection_closing {
+            let connection_color = if connection_open || app.vna_connection_closing {
                 Color32::LIGHT_RED
             } else {
                 ACCENT
@@ -342,8 +342,8 @@ impl WaveCraftApp {
             if ui
                 .add_enabled(
                     !connection_pending
-                        && !self.is_busy()
-                        && (connection_open || self.selected_vna().is_some()),
+                        && !app.is_busy()
+                        && (connection_open || app.selected_vna().is_some()),
                     toolbar_action_button(connection_label, connection_color),
                 )
                 .clicked()
@@ -352,7 +352,8 @@ impl WaveCraftApp {
             }
 
             ui.add_space(14.0);
-            paint_vna_settings_card(ui, self, actions);
+            paint_vna_settings_card(ui, app, actions);
+            !app.is_busy() && vna_frequency_inputs_are_valid(app)
         });
     }
 
@@ -509,15 +510,6 @@ fn paint_vna_settings_card(ui: &mut egui::Ui, app: &mut WaveCraftApp, actions: &
                 )
                 .color(TEXT_MUTED),
             );
-        let settings_valid = vna_frequency_inputs_are_valid(app);
-        if paint_capture_settings_save_button(
-            ui,
-            SavedCaptureSettingsKind::VectorNetworkAnalyzer,
-            !app.is_busy() && settings_valid,
-        ) {
-            actions.save_capture_settings_kind =
-                Some(SavedCaptureSettingsKind::VectorNetworkAnalyzer);
-        }
     });
 }
 
@@ -2386,7 +2378,7 @@ mod tests {
         assert!(texts
             .iter()
             .any(|(text, _)| text == "No active calibration"));
-        assert!(texts.iter().any(|(text, _)| text == "💾 Save VNA settings"));
+        assert!(texts.iter().any(|(text, _)| text == "💾 Save settings"));
         assert!(!texts.iter().any(|(text, _)| text == "▶ Single Sweep"));
         assert!(!texts
             .iter()

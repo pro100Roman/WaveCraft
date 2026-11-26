@@ -288,8 +288,10 @@ mod tests {
     #[test]
     fn collapsed_settings_do_not_hide_local_errors_and_duplicate_errors_appear_once() {
         let mut app = app();
-        app.serial.setup_open = false;
-        app.system_trace_setup_panel_open = false;
+        app.workspace_view_layout
+            .set_setup_panel_open(WorkspaceView::Serial, false);
+        app.workspace_view_layout
+            .set_setup_panel_open(WorkspaceView::SystemTrace, false);
         app.serial.error = Some("Serial port unavailable".into());
         app.system_trace_connection = SystemTraceConnectionState::Error("Probe unavailable".into());
         app.vna_discovery_error = Some("VNA discovery failed".into());

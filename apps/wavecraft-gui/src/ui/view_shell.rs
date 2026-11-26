@@ -62,31 +62,15 @@ impl<'a> SetupPanel<'a> {
         Self { id, title }
     }
 
-    pub(crate) fn show<R>(
-        self,
-        context: &egui::Context,
-        contents: impl FnOnce(&mut egui::Ui) -> R,
-    ) {
-        self.show_inner(context, None, contents);
-    }
-
-    /// Use a local copy of `open` when contents also borrow the view's state.
-    pub(crate) fn show_collapsible<R>(
+    /// Every setup panel has collapse/expand and a pinned save footer. The
+    /// content returns whether its edited settings may currently be saved.
+    pub(crate) fn show(
         self,
         context: &egui::Context,
         open: &mut bool,
-        contents: impl FnOnce(&mut egui::Ui) -> R,
-    ) {
-        self.show_inner(context, Some(open), contents);
-    }
-
-    fn show_inner<R>(
-        self,
-        context: &egui::Context,
-        mut open: Option<&mut bool>,
-        contents: impl FnOnce(&mut egui::Ui) -> R,
-    ) {
-        if open.as_deref() == Some(&false) {
+        contents: impl FnOnce(&mut egui::Ui) -> bool,
+    ) -> bool {
+        if !*open {
             egui::SidePanel::left(format!("{}_collapsed", self.id))
                 .resizable(false)
                 .exact_width(COLLAPSED_SIDE_PANEL_WIDTH)
@@ -94,12 +78,10 @@ impl<'a> SetupPanel<'a> {
                 .show(context, |ui| {
                     fill_card_height(ui);
                     if panel_toggle(ui, "▶", &format!("Expand {}", self.title)) {
-                        if let Some(open) = open.as_deref_mut() {
-                            *open = true;
-                        }
+                        *open = true;
                     }
                 });
-            return;
+            return false;
         }
         egui::SidePanel::left(self.id)
             .resizable(false)
@@ -107,10 +89,45 @@ impl<'a> SetupPanel<'a> {
             .frame(panel_frame(PANEL, 14.0))
             .show(context, |ui| {
                 apply_setup_panel_typography(ui);
-                panel_heading(ui, self.title, open, "◀");
+                panel_heading(ui, self.title, Some(open), "◀");
                 ui.add_space(8.0);
-                settings_scroll(ui, contents);
-            });
+                let available = ui.available_rect_before_wrap();
+                let footer_height = 36.0_f32.min(available.height().max(0.0));
+                let footer_top = available.bottom() - footer_height;
+                let body_rect = Rect::from_min_max(
+                    available.min,
+                    egui::pos2(available.right(), footer_top.max(available.top())),
+                );
+                let mut body = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("settings_body")
+                        .max_rect(body_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                body.set_clip_rect(ui.clip_rect().intersect(body_rect));
+                let save_enabled = settings_scroll(&mut body, contents);
+                let mut footer = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("settings_footer")
+                        .max_rect(Rect::from_min_max(
+                            egui::pos2(available.left(), footer_top),
+                            available.max,
+                        ))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                footer.separator();
+                let clicked = footer
+                    .add_enabled(
+                        save_enabled,
+                        toolbar_action_button("💾 Save settings", ACCENT)
+                            .min_size(egui::vec2(footer.available_width(), 24.0)),
+                    )
+                    .on_hover_text("Save the current settings as defaults for this view")
+                    .clicked();
+                ui.advance_cursor_after_rect(available);
+                clicked
+            })
+            .inner
     }
 }
 

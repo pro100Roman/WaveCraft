@@ -16,6 +16,7 @@ pub mod scope_settings;
 pub mod scope_tools_panel;
 pub mod serial;
 pub mod session_tabs;
+pub(crate) mod setup_panel;
 pub mod status_bar;
 pub mod system_trace;
 pub mod toolbar;

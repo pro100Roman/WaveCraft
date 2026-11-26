@@ -10,7 +10,7 @@ applies equally to LA, OSC, RF, Combined, VNA, System Trace, and Serial.
 | Component | Responsibility |
 | --- | --- |
 | `view_toolbar` | Common application identity, App menu, toolbar background and spacing; returns the Settings request |
-| `SetupPanel` | Fixed 300-point left panel, heading, typography, constrained vertical scrolling; optional collapse/expand |
+| `SetupPanel` | 300-point left panel, heading, typography, constrained scrolling, mandatory collapse/expand and pinned Save settings footer |
 | `settings_card` | Dark inset grouping settings sections, with shared width constraints and padding |
 | `workspace_panel` | Central background and outer margins |
 | `view_card` | Full-height plot/table card with a common outline, corner radius and padding |
@@ -33,7 +33,8 @@ the shared App menu. Use `theme::toolbar_action_button` for their appearance.
 1. Add the view identity and persistence mapping alongside `WorkspaceView`.
 2. Supply toolbar, setup, and central-content painters in `ui/`; register them
    with the existing application dispatch. Use the shell functions below.
-3. Retain settings, capture state, and workers with their existing application
+3. Register the setup panel identity in `ui/setup_panel.rs` and its save behavior
+   in `save_setup_settings`. Retain settings, capture state, and workers with their existing application
    owners. Return typed requests through `FrameActions` where applicable.
 4. Adapt any local connection status or errors in `active_view_status` in
    `ui/status_bar.rs`. The application paints that area once for every view.
@@ -48,14 +49,13 @@ let settings_clicked = view_toolbar(context, "Instrument description", |ui| {
 });
 self.settings_open |= settings_clicked;
 
-let mut open = self.instrument.setup_open;
-SetupPanel::new("instrument_setup", "INSTRUMENT SETUP")
-    .show_collapsible(context, &mut open, |ui| {
-        settings_card(ui, |ui| {
-            // Instrument settings sections.
-        });
+self.show_setup_panel(context, WorkspaceView::Instrument, actions, |app, ui, actions| {
+    settings_card(ui, |ui| {
+        // Instrument settings sections; edit app state and emit domain actions.
     });
-self.instrument.setup_open = open;
+    // Return availability after edits, including validation of new values.
+    settings_are_valid && !app.is_busy()
+});
 
 workspace_panel(context, |ui| {
     view_card(ui, |ui| {
@@ -66,10 +66,25 @@ workspace_panel(context, |ui| {
 });
 ```
 
-Use `SetupPanel::show` for a fixed panel without collapse state. Copy an open
-flag locally when the content closure also borrows the application's state,
-then write the flag back. Settings and data stay intact across collapsing.
-Keep panel IDs stable and distinct for independent scroll and interaction state.
+All left panels use `show_setup_panel` in `ui/setup_panel.rs`. This adapter
+connects the visual template to `WorkspaceViewLayout` and `FrameActions`.
+`SetupPanel::show` always requires an open flag and always renders the same
+`Save settings` footer below the scroll area. Views supply only their body and
+return whether the edited values may be saved; they do not paint save controls.
+The footer remains visible even when the settings body overflows or sections
+are collapsed.
+
+Collapse state is independent for each workspace and survives restarts through
+`GlobalSettings::collapsed_setup_views`. Older settings files default to open
+panels. Settings and captured data stay intact across collapse/expand.
+Panel IDs remain distinct per workspace to isolate scrolling and interaction.
+
+The adapter emits `FrameActions::save_setup_settings_view`. The frame applies
+that request through `save_setup_settings`, preserving the existing per-type
+capture profiles. Combined saves LA and OSC profiles together in one write;
+Serial saves `global.serial`, retaining compatibility with existing settings
+files and its automatic saves. Successful explicit saves and failures use the
+common message area.
 
 ## Status and errors
 

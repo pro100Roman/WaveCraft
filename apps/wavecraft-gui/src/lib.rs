@@ -431,7 +431,6 @@ struct WaveCraftApp {
     workspace_view_layout: WorkspaceViewLayout,
     scope_plot_tab: ScopePlotTab,
     system_trace_settings: SystemTraceSettings,
-    system_trace_setup_panel_open: bool,
     serial: serial::SerialState,
     system_trace: system_trace::SystemTraceDisplayState,
     system_trace_events: Option<Receiver<system_trace::LiveTraceUpdate>>,
@@ -585,7 +584,6 @@ impl WaveCraftApp {
             workspace_view_layout: WorkspaceViewLayout::default(),
             scope_plot_tab: restored_scope_plot_tab,
             system_trace_settings: SystemTraceSettings::default(),
-            system_trace_setup_panel_open: true,
             serial: serial::SerialState::default(),
             system_trace: system_trace::SystemTraceDisplayState::default(),
             system_trace_events: None,
@@ -773,7 +771,7 @@ impl WaveCraftApp {
         }
 
         if self.serial_view_is_active() {
-            self.paint_serial_setup(context);
+            self.paint_serial_setup(context, &mut actions);
         } else if self.system_trace_view_is_active() {
             self.paint_system_trace_setup_panel(context, &mut actions);
         } else if self.vna_view_is_active() {
@@ -782,8 +780,8 @@ impl WaveCraftApp {
             self.paint_capture_setup_panel(context, &frame, &mut actions);
         }
 
-        if let Some(kind) = actions.save_capture_settings_kind {
-            self.save_capture_settings(kind);
+        if let Some(view) = actions.save_setup_settings_view {
+            self.save_setup_settings(view);
         }
 
         paint_protocol_analyzer_modal(

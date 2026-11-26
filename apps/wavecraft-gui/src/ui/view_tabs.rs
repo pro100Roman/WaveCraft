@@ -35,6 +35,7 @@ impl WorkspaceView {
 pub(crate) struct WorkspaceViewLayout {
     order: [WorkspaceView; WorkspaceView::ALL.len()],
     hidden_views: Vec<WorkspaceView>,
+    collapsed_setup_views: Vec<WorkspaceView>,
     dragged_view: Option<WorkspaceView>,
     layout_changed: bool,
 }
@@ -44,6 +45,7 @@ impl Default for WorkspaceViewLayout {
         Self {
             order: WorkspaceView::ALL,
             hidden_views: Vec::new(),
+            collapsed_setup_views: Vec::new(),
             dragged_view: None,
             layout_changed: false,
         }
@@ -51,6 +53,21 @@ impl Default for WorkspaceViewLayout {
 }
 
 impl WorkspaceViewLayout {
+    pub(crate) fn setup_panel_open(&self, view: WorkspaceView) -> bool {
+        !self.collapsed_setup_views.contains(&view)
+    }
+
+    pub(crate) fn set_setup_panel_open(&mut self, view: WorkspaceView, open: bool) -> bool {
+        if self.setup_panel_open(view) == open {
+            return false;
+        }
+        self.collapsed_setup_views.retain(|entry| *entry != view);
+        if !open {
+            self.collapsed_setup_views.push(view);
+        }
+        true
+    }
+
     pub(crate) fn order(&self) -> &[WorkspaceView; WorkspaceView::ALL.len()] {
         &self.order
     }

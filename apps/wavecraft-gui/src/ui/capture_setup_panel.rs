@@ -1,13 +1,11 @@
 //! The fixed left panel: device selectors and per-instrument capture settings.
 
-use super::view_shell::SetupPanel;
-
 use crate::{
     egui, paint_capture_settings, paint_radio_capture_settings, paint_radio_device_selector,
     selected_device_for_role, selected_radio, ui::frame_state::FrameState,
-    CaptureSettingsAvailability, CaptureSettingsTab, DeviceEntry, DeviceRole,
-    LogicCaptureSettingsEditor, RadioPanelState, RichText, SavedCaptureSettingsKind,
-    ScopeCaptureSettingsEditor, ScopeVisualizationSettingsEditor, WaveformTab, TEXT_MUTED,
+    CaptureSettingsAvailability, DeviceEntry, DeviceRole, LogicCaptureSettingsEditor,
+    RadioPanelState, RichText, ScopeCaptureSettingsEditor, ScopeVisualizationSettingsEditor,
+    WaveformTab, WorkspaceView, TEXT_MUTED,
 };
 
 use crate::{ui::frame_actions::FrameActions, WaveCraftApp};
@@ -43,55 +41,53 @@ impl WaveCraftApp {
         let sync_word_suggestions = self.displayed_sync_word_suggestions();
 
         let available_capture_settings_tabs = self.available_capture_settings_tabs();
-        SetupPanel::new("capture_setup_fixed", "CAPTURE SETUP").show(context, |ui| {
+        let view =
+            WorkspaceView::Waveform(self.active_waveform_tab.unwrap_or(WaveformTab::Combined));
+        self.show_setup_panel(context, view, actions, |app, ui, actions| {
             let (logic_changed, scope_changed) = paint_capture_device_selectors(
                 ui,
-                self.active_waveform_tab,
-                &self.devices,
-                &mut self.selected_logic_device_id,
-                &mut self.selected_scope_device_id,
-                capture_settings_enabled && self.manual_calibration.is_none(),
+                app.active_waveform_tab,
+                &app.devices,
+                &mut app.selected_logic_device_id,
+                &mut app.selected_scope_device_id,
+                capture_settings_enabled && app.manual_calibration.is_none(),
             );
             actions.logic_device_selection_changed |= logic_changed;
             actions.scope_device_selection_changed |= scope_changed;
-            if self.active_waveform_tab == Some(WaveformTab::RadioReceiver) {
+            if app.active_waveform_tab == Some(WaveformTab::RadioReceiver) {
                 actions.radio_device_selection_changed |= paint_radio_device_selector(
                     ui,
-                    &self.radios,
-                    &mut self.selected_radio_id,
+                    &app.radios,
+                    &mut app.selected_radio_id,
                     capture_settings_enabled,
                 );
                 if actions.radio_device_selection_changed {
-                    self.reconcile_radio_settings();
+                    app.reconcile_radio_settings();
                 }
                 if let Some(radio) =
-                    selected_radio(&self.radios, self.selected_radio_id.as_deref()).cloned()
+                    selected_radio(&app.radios, app.selected_radio_id.as_deref()).cloned()
                 {
-                    if paint_radio_capture_settings(
+                    paint_radio_capture_settings(
                         ui,
                         &radio,
-                        &mut self.radio_settings,
+                        &mut app.radio_settings,
                         RadioPanelState {
                             enabled: capture_settings_enabled,
                             runtime_enabled: radio_runtime_controls_enabled,
                             trigger_runtime_enabled: radio_trigger_runtime_controls_enabled,
-                            show_save_button: true,
                             sync_word_suggestions: &sync_word_suggestions,
                         },
-                    ) {
-                        actions.save_capture_settings_kind =
-                            Some(SavedCaptureSettingsKind::RadioFrequency);
-                    }
+                    );
                 }
             }
-            if self.active_waveform_tab.is_some() {
+            if app.active_waveform_tab.is_some() {
                 ui.add_space(12.0);
             }
             if available_capture_settings_tabs.len() > 1 {
                 ui.horizontal(|ui| {
                     for tab in &available_capture_settings_tabs {
                         ui.selectable_value(
-                            &mut self.active_capture_settings_tab,
+                            &mut app.active_capture_settings_tab,
                             *tab,
                             tab.label(),
                         );
@@ -100,35 +96,35 @@ impl WaveCraftApp {
                 ui.add_space(6.0);
             }
             if available_capture_settings_tabs.is_empty()
-                && self.active_waveform_tab != Some(WaveformTab::RadioReceiver)
+                && app.active_waveform_tab != Some(WaveformTab::RadioReceiver)
             {
                 ui.label(
                     RichText::new("Connect a supported instrument to configure capture.")
                         .color(TEXT_MUTED),
                 );
-            } else if self.active_waveform_tab != Some(WaveformTab::RadioReceiver)
-                && paint_capture_settings(
+            } else if app.active_waveform_tab != Some(WaveformTab::RadioReceiver) {
+                paint_capture_settings(
                     ui,
-                    self.active_capture_settings_tab,
+                    app.active_capture_settings_tab,
                     LogicCaptureSettingsEditor {
-                        settings: &mut self.logic_settings,
+                        settings: &mut app.logic_settings,
                         speed: logic_settings_speed,
-                        acquisition_mode: &mut self.logic_acquisition_mode,
-                        repetitive_interval_seconds: &mut self.repetitive_interval_seconds,
-                        smart_timing_enabled: &mut self.logic_smart_timing_enabled,
-                        marker_settings: &mut self.logic_marker_settings,
-                        protocol_analyzer: &mut self.protocol_analyzer,
+                        acquisition_mode: &mut app.logic_acquisition_mode,
+                        repetitive_interval_seconds: &mut app.repetitive_interval_seconds,
+                        smart_timing_enabled: &mut app.logic_smart_timing_enabled,
+                        marker_settings: &mut app.logic_marker_settings,
+                        protocol_analyzer: &mut app.protocol_analyzer,
                         displayed_sample_count: displayed_logic_sample_count,
                         displayed_sample_rate_hz: displayed_logic_sample_rate_hz,
                     },
                     ScopeCaptureSettingsEditor {
-                        settings: &mut self.scope_settings,
-                        auto_sample_rate: &mut self.scope_auto_sample_rate,
-                        smart_timing_enabled: &mut self.scope_smart_timing_enabled,
+                        settings: &mut app.scope_settings,
+                        auto_sample_rate: &mut app.scope_auto_sample_rate,
+                        smart_timing_enabled: &mut app.scope_smart_timing_enabled,
                     },
                     ScopeVisualizationSettingsEditor {
-                        channel_colors: &mut self.scope_channel_colors,
-                        scope_channel_names: &mut self.scope_channel_names,
+                        channel_colors: &mut app.scope_channel_colors,
+                        scope_channel_names: &mut app.scope_channel_names,
                     },
                     CaptureSettingsAvailability {
                         capture: capture_settings_enabled,
@@ -138,13 +134,9 @@ impl WaveCraftApp {
                         manual_calibration: manual_calibration_enabled,
                     },
                     &mut actions.calibration_action,
-                )
-            {
-                actions.save_capture_settings_kind = Some(match self.active_capture_settings_tab {
-                    CaptureSettingsTab::DsLogic => SavedCaptureSettingsKind::LogicAnalyzer,
-                    CaptureSettingsTab::DsCope => SavedCaptureSettingsKind::Oscilloscope,
-                });
+                );
             }
+            capture_settings_enabled
         });
     }
 }

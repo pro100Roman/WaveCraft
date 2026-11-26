@@ -5,7 +5,7 @@ use crate::system_trace::SystemTraceAction;
 use crate::{
     choose_decoded_data_save_path, choose_recording_save_path, choose_recording_to_open,
     choose_saleae_export_path, ui::frame_state::FrameState, AcquisitionMode, CalibrationStandard,
-    CaptureTarget, SavedCaptureSettingsKind, ScopeCalibrationAction, WaveCraftApp,
+    CaptureTarget, ScopeCalibrationAction, WaveCraftApp, WorkspaceView,
 };
 
 /// What the user asked for this frame. Panels set fields while they paint; the
@@ -22,7 +22,7 @@ pub(crate) struct FrameActions {
     pub(crate) start_request: Option<(AcquisitionMode, CaptureTarget)>,
     pub(crate) stop_clicked: bool,
     pub(crate) calibration_action: Option<ScopeCalibrationAction>,
-    pub(crate) save_capture_settings_kind: Option<SavedCaptureSettingsKind>,
+    pub(crate) save_setup_settings_view: Option<WorkspaceView>,
     pub(crate) logic_device_selection_changed: bool,
     pub(crate) scope_device_selection_changed: bool,
     pub(crate) radio_device_selection_changed: bool,

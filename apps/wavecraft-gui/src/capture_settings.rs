@@ -46,6 +46,8 @@ pub(crate) struct GlobalSettings {
     pub(crate) workspace_view_order: Option<Vec<SavedWorkspaceView>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) hidden_workspace_views: Vec<SavedWorkspaceView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) collapsed_setup_views: Vec<SavedWorkspaceView>,
     #[serde(default)]
     pub(crate) scope_plot_tab: ScopePlotTab,
     #[serde(default, skip_serializing_if = "Option::is_none")]

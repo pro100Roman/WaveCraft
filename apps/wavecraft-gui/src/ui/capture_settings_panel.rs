@@ -8,14 +8,13 @@ use crate::{
     logic_capture_duration_options, logic_marker_color, logic_trigger_condition_label,
     marker_text_color, paint_protocol_analyzer_settings, paint_scope_channel_settings,
     set_logic_operation_mode_preserving_duration, set_logic_sample_rate_preserving_duration,
-    toolbar_action_button, AcquisitionMode, CaptureSettingsTab, Color32, DsCopeBandwidthLimit,
-    DsCopeOperationMode, DsLogicInputFilter, DsLogicOperationMode, DsLogicStopOption,
-    DsLogicTriggerCondition, Duration, LogicCaptureSettings, LogicMarkerSettings, LogicTriggerMode,
-    ProtocolAnalyzerSettings, RichText, SavedCaptureSettingsKind, ScopeCalibrationAction,
-    ScopeCaptureSettings, SelectableHoverText, Stroke, UsbSpeedClass, Vec2, ACCENT,
-    DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ, DSLOGIC_SAMPLE_RATES_HZ,
-    DSLOGIC_TRIGGER_STAGE_COUNT, GRID, LOGIC_CHANNEL_COUNT, LOGIC_MARKER_LIMIT,
-    LOGIC_MARKER_NAME_MAX_CHARS, SAMPLE_RATE_HZ, TEXT_MUTED,
+    AcquisitionMode, CaptureSettingsTab, Color32, DsCopeBandwidthLimit, DsCopeOperationMode,
+    DsLogicInputFilter, DsLogicOperationMode, DsLogicStopOption, DsLogicTriggerCondition, Duration,
+    LogicCaptureSettings, LogicMarkerSettings, LogicTriggerMode, ProtocolAnalyzerSettings,
+    RichText, ScopeCalibrationAction, ScopeCaptureSettings, SelectableHoverText, Stroke,
+    UsbSpeedClass, Vec2, ACCENT, DSCOPE_SAMPLE_COUNTS, DSCOPE_SAMPLE_RATES_HZ,
+    DSLOGIC_SAMPLE_RATES_HZ, DSLOGIC_TRIGGER_STAGE_COUNT, GRID, LOGIC_CHANNEL_COUNT,
+    LOGIC_MARKER_LIMIT, LOGIC_MARKER_NAME_MAX_CHARS, SAMPLE_RATE_HZ, TEXT_MUTED,
 };
 
 #[derive(Clone, Copy)]
@@ -110,13 +109,13 @@ pub(crate) fn paint_capture_settings(
     visualization_editor: ScopeVisualizationSettingsEditor<'_>,
     availability: CaptureSettingsAvailability,
     calibration_action: &mut Option<ScopeCalibrationAction>,
-) -> bool {
+) {
     let ScopeCaptureSettingsEditor {
         settings: scope_settings,
         auto_sample_rate: scope_auto_sample_rate,
         smart_timing_enabled: scope_smart_timing_enabled,
     } = scope_editor;
-    let save_clicked = settings_card(ui, |ui| {
+    settings_card(ui, |ui| {
         let content_width = ui.available_width();
         ui.label(
             RichText::new(match tab {
@@ -142,18 +141,8 @@ pub(crate) fn paint_capture_settings(
                 );
             }
         }
-        paint_capture_settings_save_button(
-            ui,
-            match tab {
-                CaptureSettingsTab::DsLogic => SavedCaptureSettingsKind::LogicAnalyzer,
-                CaptureSettingsTab::DsCope => SavedCaptureSettingsKind::Oscilloscope,
-            },
-            availability.capture,
-        )
-    })
-    .inner;
+    });
     scope_settings.clamp_to_channel_limits();
-    save_clicked
 }
 
 fn paint_logic_capture_settings(
@@ -1023,32 +1012,6 @@ fn paint_scope_options(
                 }
             });
         });
-}
-
-pub(crate) fn paint_capture_settings_save_button(
-    ui: &mut egui::Ui,
-    kind: SavedCaptureSettingsKind,
-    enabled: bool,
-) -> bool {
-    ui.add_space(10.0);
-    ui.separator();
-    ui.add_space(8.0);
-    ui.allocate_ui_with_layout(
-        Vec2::new(ui.available_width(), 20.0),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            ui.add_space(8.0);
-            ui.add_enabled(
-                enabled,
-                toolbar_action_button(&format!("💾 Save {} settings", kind.label()), ACCENT)
-                    .small()
-                    .min_size(Vec2::new(136.0, 20.0)),
-            )
-            .on_hover_selectable_text("Replace the saved defaults for this instrument type")
-            .clicked()
-        },
-    )
-    .inner
 }
 
 pub(crate) fn paint_logic_marker_settings(

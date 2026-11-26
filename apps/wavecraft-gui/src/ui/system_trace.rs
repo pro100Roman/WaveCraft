@@ -1,6 +1,6 @@
 //! Independent System Trace workspace and decoded-event instruments.
 
-use super::view_shell::{card_frame, settings_card, view_toolbar, workspace_panel, SetupPanel};
+use super::view_shell::{card_frame, settings_card, view_toolbar, workspace_panel};
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -17,9 +17,8 @@ use crate::system_trace::{
 };
 use crate::waveform::chrome::half_transparent_plate;
 use crate::{
-    egui, format_frequency, paint_capture_settings_save_button, toolbar_action_button,
-    ui::frame_actions::FrameActions, RichText, SavedCaptureSettingsKind, WaveCraftApp, ACCENT,
-    BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
+    egui, format_frequency, toolbar_action_button, ui::frame_actions::FrameActions, RichText,
+    WaveCraftApp, WorkspaceView, ACCENT, BACKGROUND, GRID, ORANGE, PANEL, SCOPE_COLORS, TEXT_MUTED,
 };
 use wavecraft_debug_probe::{
     AttachConfiguration, DebugTargetDescriptor, ProbeDescriptor, ProbeProvider, ProbeSelector,
@@ -483,8 +482,7 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
-        let mut open = self.system_trace_setup_panel_open;
-        SetupPanel::new("system_trace_setup", "SYSTEM TRACE SETUP").show_collapsible(context, &mut open, |ui| {
+        self.show_setup_panel(context, WorkspaceView::SystemTrace, actions, |app, ui, _actions| {
                         ui.set_width(ui.available_width());
                         settings_card(ui, |ui| {
                                 let probe_header =
@@ -493,26 +491,26 @@ impl WaveCraftApp {
                                         .default_open(true);
                                 let probe_section = probe_header.show(ui, |ui| {
                                 setup_label(ui, "Debug probe");
-                                let selected_probe = self
+                                let selected_probe = app
                                     .system_trace_settings
                                     .probe_connection_id
                                     .as_deref()
                                     .and_then(|connection_id| {
-                                        self.debug_probes.iter().find(|probe| {
+                                        app.debug_probes.iter().find(|probe| {
                                             probe.connection_id.as_str() == connection_id
                                         })
                                     });
-                                let network_bmp_selected = self
+                                let network_bmp_selected = app
                                     .system_trace_settings
                                     .probe_connection_id
                                     .as_deref()
                                     == Some(NETWORK_BMP_PROBE_SELECTION);
-                                let network_cmsis_dap_selected = self
+                                let network_cmsis_dap_selected = app
                                     .system_trace_settings
                                     .probe_connection_id
                                     .as_deref()
                                     == Some(NETWORK_CMSIS_DAP_PROBE_SELECTION);
-                                let network_jlink_selected = self
+                                let network_jlink_selected = app
                                     .system_trace_settings
                                     .probe_connection_id
                                     .as_deref()
@@ -552,16 +550,16 @@ impl WaveCraftApp {
                                     .width(ui.available_width())
                                     .selected_text(selected_probe_label)
                                     .show_ui(ui, |ui| {
-                                        if self.debug_probes.is_empty() {
+                                        if app.debug_probes.is_empty() {
                                             ui.add_enabled(
                                                 false,
                                                 egui::Label::new("No probes found"),
                                             );
                                         }
-                                        for probe in &self.debug_probes {
+                                        for probe in &app.debug_probes {
                                             probe_changed |= ui
                                                 .selectable_value(
-                                                    &mut self
+                                                    &mut app
                                                         .system_trace_settings
                                                         .probe_connection_id,
                                                     Some(probe.connection_id.clone()),
@@ -576,7 +574,7 @@ impl WaveCraftApp {
                                         ui.separator();
                                         probe_changed |= ui
                                             .selectable_value(
-                                                &mut self
+                                                &mut app
                                                     .system_trace_settings
                                                     .probe_connection_id,
                                                 Some(NETWORK_BMP_PROBE_SELECTION.to_owned()),
@@ -588,7 +586,7 @@ impl WaveCraftApp {
                                             .changed();
                                         probe_changed |= ui
                                             .selectable_value(
-                                                &mut self
+                                                &mut app
                                                     .system_trace_settings
                                                     .probe_connection_id,
                                                 Some(
@@ -602,7 +600,7 @@ impl WaveCraftApp {
                                             .changed();
                                         probe_changed |= ui
                                             .selectable_value(
-                                                &mut self
+                                                &mut app
                                                     .system_trace_settings
                                                     .probe_connection_id,
                                                 Some(NETWORK_JLINK_PROBE_SELECTION.to_owned()),
@@ -616,7 +614,7 @@ impl WaveCraftApp {
                                     .response
                                     .on_hover_text(selected_probe_hover);
                                 if probe_changed {
-                                    self.system_trace_settings.target_name.clear();
+                                    app.system_trace_settings.target_name.clear();
                                 }
                                 if network_bmp_selected {
                                     ui.add_space(8.0);
@@ -624,7 +622,7 @@ impl WaveCraftApp {
                                     ui.add_sized(
                                         [ui.available_width(), 20.0],
                                         egui::TextEdit::singleline(
-                                            &mut self.system_trace_settings.bmp_network_address,
+                                            &mut app.system_trace_settings.bmp_network_address,
                                         )
                                         .hint_text("192.168.1.100"),
                                     )
@@ -634,7 +632,7 @@ impl WaveCraftApp {
                                     setup_label(ui, "BMP port");
                                     ui.add(
                                         egui::DragValue::new(
-                                            &mut self.system_trace_settings.bmp_network_port,
+                                            &mut app.system_trace_settings.bmp_network_port,
                                         )
                                         .range(1..=u16::MAX),
                                     )
@@ -646,7 +644,7 @@ impl WaveCraftApp {
                                     ui.add_sized(
                                         [ui.available_width(), 20.0],
                                         egui::TextEdit::singleline(
-                                            &mut self
+                                            &mut app
                                                 .system_trace_settings
                                                 .cmsis_dap_network_address,
                                         )
@@ -658,7 +656,7 @@ impl WaveCraftApp {
                                     setup_label(ui, "CMSIS-DAP port");
                                     ui.add(
                                         egui::DragValue::new(
-                                            &mut self
+                                            &mut app
                                                 .system_trace_settings
                                                 .cmsis_dap_network_port,
                                         )
@@ -674,7 +672,7 @@ impl WaveCraftApp {
                                     ui.add_sized(
                                         [ui.available_width(), 20.0],
                                         egui::TextEdit::singleline(
-                                            &mut self.system_trace_settings.jlink_network_address,
+                                            &mut app.system_trace_settings.jlink_network_address,
                                         )
                                         .hint_text("192.168.1.101"),
                                     )
@@ -684,13 +682,13 @@ impl WaveCraftApp {
                                     setup_label(ui, "J-Link port");
                                     ui.add(
                                         egui::DragValue::new(
-                                            &mut self.system_trace_settings.jlink_network_port,
+                                            &mut app.system_trace_settings.jlink_network_port,
                                         )
                                         .range(1..=u16::MAX),
                                     )
                                     .on_hover_text("TCP/IP port used by the J-Link connection");
                                 }
-                                if let Some(error) = &self.debug_probe_discovery_error {
+                                if let Some(error) = &app.debug_probe_discovery_error {
                                     ui.label(
                                         RichText::new(error)
                                             .small()
@@ -712,7 +710,7 @@ impl WaveCraftApp {
                                 let targets = selected_provider
                                     .as_ref()
                                     .and_then(|provider| {
-                                        self.debug_probe_target_groups
+                                        app.debug_probe_target_groups
                                             .iter()
                                             .find(|group| &group.provider == provider)
                                     })
@@ -720,7 +718,7 @@ impl WaveCraftApp {
                                     .unwrap_or_default();
                                 paint_target_selector(
                                     ui,
-                                    &mut self.system_trace_settings.target_name,
+                                    &mut app.system_trace_settings.target_name,
                                     selected_provider.as_ref(),
                                     targets,
                                 );
@@ -728,7 +726,7 @@ impl WaveCraftApp {
                                 ui.add_space(10.0);
                                 setup_label(ui, "SWD speed (kHz)");
                                 let mut speed_khz =
-                                    u64::from(self.system_trace_settings.speed_khz);
+                                    u64::from(app.system_trace_settings.speed_khz);
                                 paint_typed_bounded_value(
                                     ui,
                                     "system_trace_swd_speed_khz",
@@ -738,12 +736,12 @@ impl WaveCraftApp {
                                 .on_hover_text(
                                     "Set the SWD clock in kHz. Reduce it if target communication is unreliable",
                                 );
-                                self.system_trace_settings.speed_khz = u32::try_from(speed_khz)
-                                    .unwrap_or(self.system_trace_settings.speed_khz);
+                                app.system_trace_settings.speed_khz = u32::try_from(speed_khz)
+                                    .unwrap_or(app.system_trace_settings.speed_khz);
 
                                 ui.add_space(10.0);
                                 ui.checkbox(
-                                    &mut self.system_trace_settings.reset_after_attach,
+                                    &mut app.system_trace_settings.reset_after_attach,
                                     "Reset target after attach",
                                 )
                                 .on_hover_text(
@@ -763,7 +761,7 @@ impl WaveCraftApp {
                                 setup_label(ui, "RTT control block");
                                 ui.add(
                                     egui::TextEdit::singleline(
-                                        &mut self.system_trace_settings.control_block_address,
+                                        &mut app.system_trace_settings.control_block_address,
                                     )
                                     .hint_text("Auto scan or 0x20000000"),
                                 )
@@ -774,16 +772,16 @@ impl WaveCraftApp {
                                 ui.add_space(10.0);
                                 ui.horizontal(|ui| {
                                     ui.checkbox(
-                                        &mut self.system_trace_settings.terminal_enabled,
+                                        &mut app.system_trace_settings.terminal_enabled,
                                         "Plain RTT terminal",
                                     )
                                     .on_hover_text(
                                         "Collect plain-text firmware output in the RTT TERMINAL tab",
                                     );
                                     ui.add_enabled(
-                                        self.system_trace_settings.terminal_enabled,
+                                        app.system_trace_settings.terminal_enabled,
                                         egui::DragValue::new(
-                                            &mut self
+                                            &mut app
                                                 .system_trace_settings
                                                 .terminal_up_channel,
                                         )
@@ -801,7 +799,7 @@ impl WaveCraftApp {
 
                                 ui.add_space(8.0);
                                 let detected_frequencies =
-                                    trace_target_frequencies(&self.system_trace);
+                                    trace_target_frequencies(&app.system_trace);
                                 let systemview_header = egui::CollapsingHeader::new(
                                     RichText::new("SystemView").strong(),
                                 )
@@ -809,7 +807,7 @@ impl WaveCraftApp {
                                 .default_open(true);
                                 let systemview_section = systemview_header.show(ui, |ui| {
                                     ui.checkbox(
-                                        &mut self.system_trace_settings.systemview_enabled,
+                                        &mut app.system_trace_settings.systemview_enabled,
                                         "SystemView binary trace",
                                     )
                                     .on_hover_text(
@@ -821,7 +819,7 @@ impl WaveCraftApp {
                                         "Application ELF",
                                         APPLICATION_ELF_HELP,
                                     );
-                                    let elf_path_hover = if self
+                                    let elf_path_hover = if app
                                         .system_trace_settings
                                         .elf_path
                                         .is_empty()
@@ -830,12 +828,12 @@ impl WaveCraftApp {
                                     } else {
                                         format!(
                                             "{}\n\n{APPLICATION_ELF_HELP}",
-                                            self.system_trace_settings.elf_path
+                                            app.system_trace_settings.elf_path
                                         )
                                     };
                                     ui.label(
                                         RichText::new(asset_path_label(
-                                            &self.system_trace_settings.elf_path,
+                                            &app.system_trace_settings.elf_path,
                                         ))
                                         .strong()
                                         .color(TEXT_MUTED),
@@ -852,18 +850,18 @@ impl WaveCraftApp {
                                                     Ok(elf) => {
                                                         let rtt_address = elf.rtt_control_block();
                                                         clear_elf_derived_control_block(
-                                                            &mut self.system_trace_settings,
-                                                            &self.system_trace,
+                                                            &mut app.system_trace_settings,
+                                                            &app.system_trace,
                                                         );
-                                                        self.system_trace.set_elf(Some(elf));
-                                                        self.system_trace_settings.elf_path =
+                                                        app.system_trace.set_elf(Some(elf));
+                                                        app.system_trace_settings.elf_path =
                                                             path.display().to_string();
                                                         if let Some(address) = rtt_address {
-                                                            self.system_trace_settings
+                                                            app.system_trace_settings
                                                                 .control_block_address =
                                                                 format!("0x{address:x}");
                                                         }
-                                                        self.status = rtt_address.map_or_else(
+                                                        app.status = rtt_address.map_or_else(
                                                             || {
                                                                 "Loaded application ELF; _SEGGER_RTT was not present"
                                                                     .to_owned()
@@ -874,25 +872,25 @@ impl WaveCraftApp {
                                                                 )
                                                             },
                                                         );
-                                                        self.last_error = None;
+                                                        app.last_error = None;
                                                     }
-                                                    Err(error) => self.last_error = Some(error),
+                                                    Err(error) => app.last_error = Some(error),
                                                 }
                                             }
                                         }
                                         if ui
                                             .add_enabled(
-                                                !self.system_trace_settings.elf_path.is_empty(),
+                                                !app.system_trace_settings.elf_path.is_empty(),
                                                 egui::Button::new("Clear"),
                                             )
                                             .clicked()
                                         {
                                             clear_elf_derived_control_block(
-                                                &mut self.system_trace_settings,
-                                                &self.system_trace,
+                                                &mut app.system_trace_settings,
+                                                &app.system_trace,
                                             );
-                                            self.system_trace_settings.elf_path.clear();
-                                            self.system_trace.set_elf(None);
+                                            app.system_trace_settings.elf_path.clear();
+                                            app.system_trace.set_elf(None);
                                         }
                                     });
 
@@ -902,7 +900,7 @@ impl WaveCraftApp {
                                         "API description",
                                         API_DESCRIPTION_HELP,
                                     );
-                                    let description_path_hover = if self
+                                    let description_path_hover = if app
                                         .system_trace_settings
                                         .description_path
                                         .is_empty()
@@ -913,12 +911,12 @@ impl WaveCraftApp {
                                     } else {
                                         format!(
                                             "{}\n\n{API_DESCRIPTION_HELP}",
-                                            self.system_trace_settings.description_path
+                                            app.system_trace_settings.description_path
                                         )
                                     };
                                     ui.label(
                                         RichText::new(asset_path_label(
-                                            &self.system_trace_settings.description_path,
+                                            &app.system_trace_settings.description_path,
                                         ))
                                         .strong()
                                         .color(TEXT_MUTED),
@@ -935,23 +933,23 @@ impl WaveCraftApp {
                                                     Ok(description) => {
                                                         let event_count =
                                                             description.events().count();
-                                                        self.system_trace
+                                                        app.system_trace
                                                             .set_description(Some(description));
-                                                        self.system_trace_settings
+                                                        app.system_trace_settings
                                                             .description_path =
                                                             path.display().to_string();
-                                                        self.status = format!(
+                                                        app.status = format!(
                                                             "Loaded SystemView description · {event_count} API events"
                                                         );
-                                                        self.last_error = None;
+                                                        app.last_error = None;
                                                     }
-                                                    Err(error) => self.last_error = Some(error),
+                                                    Err(error) => app.last_error = Some(error),
                                                 }
                                             }
                                         }
                                         if ui
                                             .add_enabled(
-                                                !self
+                                                !app
                                                     .system_trace_settings
                                                     .description_path
                                                     .is_empty(),
@@ -959,8 +957,8 @@ impl WaveCraftApp {
                                             )
                                             .clicked()
                                         {
-                                            self.system_trace_settings.description_path.clear();
-                                            self.system_trace.set_description(None);
+                                            app.system_trace_settings.description_path.clear();
+                                            app.system_trace.set_description(None);
                                         }
                                     });
 
@@ -968,9 +966,9 @@ impl WaveCraftApp {
                                     ui.horizontal(|ui| {
                                         setup_label(ui, "Up channel");
                                         ui.add_enabled(
-                                            self.system_trace_settings.systemview_enabled,
+                                            app.system_trace_settings.systemview_enabled,
                                             egui::DragValue::new(
-                                                &mut self.system_trace_settings.up_channel,
+                                                &mut app.system_trace_settings.up_channel,
                                             )
                                             .range(0..=255),
                                         )
@@ -979,9 +977,9 @@ impl WaveCraftApp {
                                         );
                                         setup_label(ui, "Down");
                                         ui.add_enabled(
-                                            self.system_trace_settings.systemview_enabled,
+                                            app.system_trace_settings.systemview_enabled,
                                             egui::DragValue::new(
-                                                &mut self.system_trace_settings.down_channel,
+                                                &mut app.system_trace_settings.down_channel,
                                             )
                                             .range(0..=255),
                                         )
@@ -1010,12 +1008,12 @@ impl WaveCraftApp {
 
                                     ui.add_space(10.0);
                                     setup_label(ui, "Timestamp frequency override");
-                                    let mut manual_override = self
+                                    let mut manual_override = app
                                         .system_trace_settings
                                         .timestamp_frequency_override_hz
                                         .is_some();
                                     ui.add_enabled_ui(
-                                        self.system_trace_settings.systemview_enabled,
+                                        app.system_trace_settings.systemview_enabled,
                                         |ui| {
                                             ui.horizontal(|ui| {
                                                 egui::ComboBox::from_id_salt(
@@ -1039,7 +1037,7 @@ impl WaveCraftApp {
                                                     );
                                                 });
                                                 if manual_override {
-                                                    let frequency = self
+                                                    let frequency = app
                                                         .system_trace_settings
                                                         .timestamp_frequency_override_hz
                                                         .get_or_insert(
@@ -1053,7 +1051,7 @@ impl WaveCraftApp {
                                                     );
                                                     ui.label("Hz");
                                                 } else {
-                                                    self.system_trace_settings
+                                                    app.system_trace_settings
                                                         .timestamp_frequency_override_hz = None;
                                                 }
                                             });
@@ -1067,18 +1065,11 @@ impl WaveCraftApp {
                                 systemview_section.header_response.on_hover_text(
                                     "Configure SystemView channels and timestamp clock interpretation",
                                 );
-                                if paint_capture_settings_save_button(
-                                    ui,
-                                    SavedCaptureSettingsKind::SystemTrace,
-                                    true,
-                                ) {
-                                    actions.save_capture_settings_kind =
-                                        Some(SavedCaptureSettingsKind::SystemTrace);
-                                }
+
                             });
 
+            true
         });
-        self.system_trace_setup_panel_open = open;
     }
 
     pub(crate) fn paint_system_trace_central_panel(&mut self, context: &egui::Context) {
@@ -6004,7 +5995,9 @@ mod tests {
         let mut app = app();
 
         let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
-        assert!(app.system_trace_setup_panel_open);
+        assert!(app
+            .workspace_view_layout
+            .setup_panel_open(WorkspaceView::SystemTrace));
         assert!(texts.iter().any(|(text, _)| text == "SYSTEM TRACE SETUP"));
         let expanded_width = egui::containers::panel::PanelState::load(
             &context,
@@ -6029,7 +6022,9 @@ mod tests {
             ],
         );
         let _ = paint_setup_panel(&context, &mut app, vec![pointer_button(collapse, false)]);
-        assert!(!app.system_trace_setup_panel_open);
+        assert!(!app
+            .workspace_view_layout
+            .setup_panel_open(WorkspaceView::SystemTrace));
 
         let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
         assert!(!texts.iter().any(|(text, _)| text == "SYSTEM TRACE SETUP"));
@@ -6056,7 +6051,9 @@ mod tests {
         );
         let _ = paint_setup_panel(&context, &mut app, vec![pointer_button(expand, false)]);
 
-        assert!(app.system_trace_setup_panel_open);
+        assert!(app
+            .workspace_view_layout
+            .setup_panel_open(WorkspaceView::SystemTrace));
     }
 
     #[test]
@@ -6102,7 +6099,7 @@ mod tests {
             .expect("SystemView section header is painted");
         let save = texts
             .iter()
-            .find(|(text, _)| text == "💾 Save TRACE settings")
+            .find(|(text, _)| text == "💾 Save settings")
             .map(|(_, position)| *position)
             .expect("save settings control is painted");
 
@@ -6385,7 +6382,7 @@ mod tests {
         let (_, texts) = paint_setup_panel(&context, &mut app, Vec::new());
         let save = texts
             .iter()
-            .find(|(text, _)| text == "💾 Save TRACE settings")
+            .find(|(text, _)| text == "💾 Save settings")
             .map(|(_, position)| *position)
             .expect("save settings button is painted");
 
@@ -6397,8 +6394,8 @@ mod tests {
         let (actions, _) = paint_setup_panel(&context, &mut app, vec![pointer_button(save, false)]);
 
         assert_eq!(
-            actions.save_capture_settings_kind,
-            Some(SavedCaptureSettingsKind::SystemTrace)
+            actions.save_setup_settings_view,
+            Some(WorkspaceView::SystemTrace)
         );
     }
 

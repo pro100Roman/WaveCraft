@@ -112,7 +112,6 @@ impl WaveCraftApp {
                                 enabled: !settings_locked,
                                 runtime_enabled: radio_runtime_controls_enabled,
                                 trigger_runtime_enabled: radio_trigger_runtime_controls_enabled,
-                                show_save_button: false,
                                 sync_word_suggestions: &sync_word_suggestions,
                             },
                         );

@@ -4,14 +4,13 @@
 use super::view_shell::settings_card;
 
 use crate::{
-    automatic_filter_tap_count, egui, nearest_domain_value, normalize_gain_value,
-    paint_capture_settings_save_button, selected_radio, Color32, DiscoveredRadio, FontId, Pos2,
-    RadioAnalyzerChannelSettings, RadioAnalyzerSettings, RadioDataMode, RadioDemodulation,
-    RadioProvider, RadioProviderFailure, RadioSettings, RadioWhiteningPreset, RangeInclusive,
-    RichText, SavedCaptureSettingsKind, SelectableHoverText, SyncWordSetting, SyncWordSuggestion,
-    ValueDomain, WhiteningDirection, AUTOMATIC_CHANNEL_BANDWIDTH_HZ, AUTOMATIC_FILTER_TAP_COUNT,
-    MAX_RADIO_ANALYZER_CHANNELS, RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS, RAW_AUTOMATIC_PREAMBLE_BITS,
-    TEXT_MUTED,
+    automatic_filter_tap_count, egui, nearest_domain_value, normalize_gain_value, selected_radio,
+    Color32, DiscoveredRadio, FontId, Pos2, RadioAnalyzerChannelSettings, RadioAnalyzerSettings,
+    RadioDataMode, RadioDemodulation, RadioProvider, RadioProviderFailure, RadioSettings,
+    RadioWhiteningPreset, RangeInclusive, RichText, SelectableHoverText, SyncWordSetting,
+    SyncWordSuggestion, ValueDomain, WhiteningDirection, AUTOMATIC_CHANNEL_BANDWIDTH_HZ,
+    AUTOMATIC_FILTER_TAP_COUNT, MAX_RADIO_ANALYZER_CHANNELS, RADIO_TRIGGER_POSTTRIGGER_MAX_MICROS,
+    RAW_AUTOMATIC_PREAMBLE_BITS, TEXT_MUTED,
 };
 use std::collections::BTreeMap;
 use wavecraft_sdr::GainControlDescriptor;
@@ -402,7 +401,6 @@ pub(crate) struct RadioPanelState<'a> {
     pub(crate) enabled: bool,
     pub(crate) runtime_enabled: bool,
     pub(crate) trigger_runtime_enabled: bool,
-    pub(crate) show_save_button: bool,
     /// Sync words that the raw messages on display have in common.
     pub(crate) sync_word_suggestions: &'a [SyncWordSuggestion],
 }
@@ -412,12 +410,11 @@ pub(crate) fn paint_radio_capture_settings(
     radio: &DiscoveredRadio,
     settings: &mut RadioSettings,
     state: RadioPanelState<'_>,
-) -> bool {
+) {
     let RadioPanelState {
         enabled,
         runtime_enabled,
         trigger_runtime_enabled,
-        show_save_button,
         sync_word_suggestions,
     } = state;
     ui.add_space(10.0);
@@ -467,14 +464,7 @@ pub(crate) fn paint_radio_capture_settings(
                 .header_response
                 .on_hover_selectable_text(ANALYZER_CHANNELS_HELP);
         }
-        show_save_button
-            && paint_capture_settings_save_button(
-                ui,
-                SavedCaptureSettingsKind::RadioFrequency,
-                enabled,
-            )
-    })
-    .inner
+    });
 }
 
 pub(crate) fn paint_scaled_u64_value(

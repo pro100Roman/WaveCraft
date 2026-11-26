@@ -1,6 +1,6 @@
 //! Serial / UART workspace, matching the instrument toolbar, setup cards and split panes.
 
-use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel, SetupPanel};
+use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel};
 use crate::serial::{SerialMode, SerialSettings, SerialState, TextField, COLORS};
 use crate::{
     egui, toolbar_action_button, RichText, WaveCraftApp, WorkspaceView, ACCENT, BACKGROUND, GRID,
@@ -130,14 +130,18 @@ impl WaveCraftApp {
         }
     }
 
-    pub(crate) fn paint_serial_setup(&mut self, context: &egui::Context) {
+    pub(crate) fn paint_serial_setup(
+        &mut self,
+        context: &egui::Context,
+        actions: &mut crate::FrameActions,
+    ) {
         let before = self.serial.settings.clone();
-        let mut open = self.serial.setup_open;
-        SetupPanel::new("serial_setup", "SERIAL / UART SETUP").show_collapsible(
+        self.show_setup_panel(
             context,
-            &mut open,
-            |ui| {
-                let running = self.serial.session.is_some();
+            WorkspaceView::Serial,
+            actions,
+            |app, ui, _actions| {
+                let running = app.serial.session.is_some();
                 if running {
                     ui.label(
                         RichText::new("Stop to change port or decoding settings")
@@ -153,26 +157,26 @@ impl WaveCraftApp {
                 }
                 settings_card(ui, |ui| {
                     setup_section(ui, "PORT", !running, |ui| {
-                        port_settings(ui, &mut self.serial)
+                        port_settings(ui, &mut app.serial)
                     });
                     ui.add_space(10.0);
                     setup_section(ui, "DATA FORMAT", !running, |ui| {
                         ui.horizontal(|ui| {
                             ui.selectable_value(
-                                &mut self.serial.settings.mode,
+                                &mut app.serial.settings.mode,
                                 SerialMode::Text,
                                 "Text / ASCII",
                             );
                             ui.selectable_value(
-                                &mut self.serial.settings.mode,
+                                &mut app.serial.settings.mode,
                                 SerialMode::Binary,
                                 "Binary",
                             );
                         });
-                        if self.serial.settings.mode == SerialMode::Text {
-                            text_settings(ui, &mut self.serial.settings);
+                        if app.serial.settings.mode == SerialMode::Text {
+                            text_settings(ui, &mut app.serial.settings);
                         } else {
-                            binary_settings(ui, &mut self.serial);
+                            binary_settings(ui, &mut app.serial);
                         }
                     });
                 });
@@ -189,9 +193,10 @@ impl WaveCraftApp {
                         .small()
                         .color(TEXT_MUTED),
                 );
+                true
             },
         );
-        self.serial.setup_open = open;
+
         if before != self.serial.settings {
             for series in &mut self.serial.series {
                 let color = if self.serial.settings.mode == SerialMode::Text {
