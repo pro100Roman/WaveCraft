@@ -193,6 +193,15 @@ pub(crate) struct Series {
     pub points: VecDeque<[f64; 2]>,
 }
 
+/// Voltage/value viewport stored in normalized coordinates to retain the
+/// existing overflow-safe scaling for very large decoded numbers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SerialGraphValueRange {
+    pub minimum: f64,
+    pub maximum: f64,
+    pub scale: f64,
+}
+
 pub(crate) struct SerialState {
     pub settings: SerialSettings,
     pub ports: Vec<String>,
@@ -209,6 +218,8 @@ pub(crate) struct SerialState {
     pub baud_draft: Option<String>,
     pub follow: bool,
     pub time_window: f64,
+    pub time_window_draft: Option<String>,
+    pub graph_value_range: Option<SerialGraphValueRange>,
     pub latest_time: f64,
     pub graph_end: f64,
     pub split_drag_origin: Option<f32>,
@@ -236,6 +247,8 @@ impl Default for SerialState {
             baud_draft: None,
             follow: true,
             time_window: 10.0,
+            time_window_draft: None,
+            graph_value_range: None,
             latest_time: 0.0,
             graph_end: 0.0,
             split_drag_origin: None,
@@ -279,6 +292,8 @@ impl SerialState {
     }
 
     pub fn fit_graph(&mut self) {
+        self.graph_value_range = None;
+        self.time_window_draft = None;
         if let Some((start, end)) = self.graph_time_bounds() {
             let span = (end - start).max(MIN_GRAPH_TIME_WINDOW_SECONDS);
             // Reconstructing start from end - span can round above the first
@@ -404,6 +419,8 @@ impl SerialState {
         self.latest_time = 0.0;
         self.graph_end = 0.0;
         self.follow = true;
+        self.graph_value_range = None;
+        self.time_window_draft = None;
         self.text = TextDecoder::default();
         if let Some(binary) = &mut self.binary {
             binary.clear();

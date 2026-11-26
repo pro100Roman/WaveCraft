@@ -12,10 +12,18 @@ custom value; use the arrow to show all standard rates through 3,000,000.
 
 The graph and raw-data pane share the available height. Drag their divider to
 resize them; double-click it to restore the default split. On the graph, scroll
-to zoom the time range and drag to inspect earlier points. **Follow** tracks
-incoming plotted values; **Fit** fits all retained plotted samples to the graph
-width. Fit uses actual point timestamps, including sub-millisecond recordings,
-and ignores trailing raw bytes with no matching values. Time-axis labels use
+to zoom horizontally; hold Ctrl or Cmd while scrolling to zoom both axes around
+the pointer. Ordinary scrolling preserves the vertical scale. Drag to inspect
+earlier points. Type the time span in seconds in the graph header; dragging
+this text field does not change its value. The data readout appears below and
+to the right of the pointer, flips at plot edges, and stays inside the plot.
+Its width follows the text, and each field uses its trace color. Segments remain
+visible when zooming between samples; the graph clips them at the viewport edges.
+**Follow** tracks incoming plotted values; **Fit** fits all retained plotted samples
+to the graph width and restores automatic vertical scaling. Fit uses actual point
+timestamps; double-click anywhere in the graph (including the axes) to apply Fit.
+This includes sub-millisecond recordings and ignores trailing raw bytes with no
+matching values. Time-axis labels use
 seconds, milliseconds, microseconds or nanoseconds as appropriate.
 
 **PLOTTED FIELDS** in setup is the single place to choose field colors and line
