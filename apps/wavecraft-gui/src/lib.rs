@@ -32,7 +32,7 @@ use acquisition::scope::*;
 use capture_settings::{
     CaptureSettingsDocument, CaptureSettingsProfile, CaptureSettingsRepository,
     SavedTraceEventView, SavedTraceInstrument, SavedTraceInstrumentHeights, SavedWindowSize,
-    SavedWorkspaceView,
+    SavedWorkspaceView, ScopePlotTab,
 };
 use debug_probes::*;
 use devices::{
@@ -427,6 +427,7 @@ struct WaveCraftApp {
     active_workspace_view: Option<WorkspaceView>,
     active_waveform_tab: Option<WaveformTab>,
     workspace_view_layout: WorkspaceViewLayout,
+    scope_plot_tab: ScopePlotTab,
     system_trace_settings: SystemTraceSettings,
     system_trace_setup_panel_open: bool,
     system_trace: system_trace::SystemTraceDisplayState,
@@ -505,10 +506,13 @@ impl WaveCraftApp {
             Some(WorkspaceView::Waveform(tab)) => Some(tab),
             Some(WorkspaceView::Vna | WorkspaceView::SystemTrace) | None => None,
         };
-        let mut restored_scope_function_settings = ScopeFunctionSettings::default();
-        if restored_waveform_tab == Some(WaveformTab::Lissajous) {
-            restored_scope_function_settings.lissajous.enabled = true;
-        }
+        let restored_scope_plot_tab = if saved_capture_settings.global.last_active_view
+            == Some(SavedWorkspaceView::Lissajous)
+        {
+            ScopePlotTab::Lissajous
+        } else {
+            saved_capture_settings.global.scope_plot_tab
+        };
         let mut app = Self {
             capture_settings_repository,
             saved_capture_settings,
@@ -568,13 +572,14 @@ impl WaveCraftApp {
             scope_settings: ScopeCaptureSettings::default(),
             scope_auto_sample_rate: true,
             scope_smart_timing_enabled: false,
-            scope_function_settings: restored_scope_function_settings,
+            scope_function_settings: ScopeFunctionSettings::default(),
             scope_marker_settings: ScopeMarkerSettings::default(),
             scope_quick_time_measurement: ScopeQuickTimeMeasurement::default(),
             scope_marker_editor: None,
             active_workspace_view: restored_workspace_view,
             active_waveform_tab: restored_waveform_tab,
             workspace_view_layout: WorkspaceViewLayout::default(),
+            scope_plot_tab: restored_scope_plot_tab,
             system_trace_settings: SystemTraceSettings::default(),
             system_trace_setup_panel_open: true,
             system_trace: system_trace::SystemTraceDisplayState::default(),

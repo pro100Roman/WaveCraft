@@ -641,10 +641,6 @@ fn waveform_tabs_target_their_matching_instruments() {
         CaptureTarget::Oscilloscope
     );
     assert_eq!(
-        WaveformTab::Lissajous.capture_target(),
-        CaptureTarget::Oscilloscope
-    );
-    assert_eq!(
         WaveformTab::RadioReceiver.capture_target(),
         CaptureTarget::RadioReceiver
     );
@@ -659,10 +655,6 @@ fn waveform_tabs_target_their_matching_instruments() {
     );
     assert_eq!(
         WaveformTab::Oscilloscope.capture_settings_tab(),
-        Some(CaptureSettingsTab::DsCope)
-    );
-    assert_eq!(
-        WaveformTab::Lissajous.capture_settings_tab(),
         Some(CaptureSettingsTab::DsCope)
     );
     assert_eq!(WaveformTab::RadioReceiver.capture_settings_tab(), None);

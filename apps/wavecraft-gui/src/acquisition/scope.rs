@@ -254,7 +254,6 @@ impl Default for ScopeFftSettings {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ScopeLissajousSettings {
-    pub(crate) enabled: bool,
     pub(crate) x_channel: usize,
     pub(crate) y_channel: usize,
 }
@@ -262,7 +261,6 @@ pub(crate) struct ScopeLissajousSettings {
 impl Default for ScopeLissajousSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
             x_channel: 0,
             y_channel: 1,
         }
@@ -294,9 +292,6 @@ impl ScopeFunctionSettings {
         }
         if !channels[self.lissajous.y_channel] {
             self.lissajous.y_channel = fallback;
-        }
-        if channels.into_iter().filter(|enabled| *enabled).count() < 2 {
-            self.lissajous.enabled = false;
         }
     }
 }

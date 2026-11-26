@@ -44,6 +44,8 @@ pub(crate) struct GlobalSettings {
     pub(crate) workspace_view_order: Option<Vec<SavedWorkspaceView>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) hidden_workspace_views: Vec<SavedWorkspaceView>,
+    #[serde(default)]
+    pub(crate) scope_plot_tab: ScopePlotTab,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_trace_event_view_order: Option<Vec<SavedTraceEventView>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,6 +66,25 @@ pub(crate) struct SavedWindowSize {
 pub(crate) struct SavedTraceInstrumentHeights {
     pub(crate) timeline: u32,
     pub(crate) analysis: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ScopePlotTab {
+    #[default]
+    Oscilloscope,
+    Lissajous,
+}
+
+impl ScopePlotTab {
+    pub(crate) const ALL: [Self; 2] = [Self::Oscilloscope, Self::Lissajous];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Oscilloscope => "OSCILLOSCOPE",
+            Self::Lissajous => "LISSAJOUS",
+        }
+    }
 }
 
 /// Stable persisted names for views, independent of the GUI enum layout.

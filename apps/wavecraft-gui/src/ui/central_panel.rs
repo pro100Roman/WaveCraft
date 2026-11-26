@@ -10,7 +10,7 @@ use crate::{
     LogicMarkerSettings, LogicWaveformOptions, PendingSnapshot, ProtocolAnalyzerSettings,
     ProtocolDecodeCache, ProtocolDecodeOutcome, ProtocolDecodeSnapshot, RadioDataMode,
     RadioViewOptions, Rect, RichText, ScopeCaptureSettings, ScopeFftViewport,
-    ScopeLissajousPaintOptions, ScopeMarkerSettings, ScopeMeasurementCache,
+    ScopeLissajousPaintOptions, ScopeMarkerSettings, ScopeMeasurementCache, ScopePlotTab,
     ScopeQuickTimeMeasurement, ScopeTriggerSettings, ScopeWaveformOptions, SelectableHoverText,
     Sense, Stroke, Vec2, WaveCraftApp, WaveformStore, WaveformTab, WaveformViewport, ACCENT,
     BACKGROUND, COLLAPSED_SIDE_PANEL_WIDTH, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID,
@@ -208,6 +208,65 @@ impl WaveCraftApp {
         frame: &FrameState,
         state: &mut PanelState,
     ) {
+        if self.active_waveform_tab == Some(WaveformTab::Oscilloscope) {
+            // The child selector belongs to the scope card and shares its capture/session.
+            let previous = self.scope_plot_tab;
+            card_frame(12.0).show(ui, |ui| {
+                ui.set_min_height(ui.available_height());
+                ui.horizontal(|ui| {
+                    for tab in ScopePlotTab::ALL {
+                        let selected = self.scope_plot_tab == tab;
+                        ui.selectable_value(
+                            &mut self.scope_plot_tab,
+                            tab,
+                            RichText::new(tab.label()).strong().color(if selected {
+                                ACCENT
+                            } else {
+                                TEXT_MUTED
+                            }),
+                        );
+                    }
+                });
+                ui.add_space(4.0);
+                let subtitle = match self.scope_plot_tab {
+                    ScopePlotTab::Oscilloscope => {
+                        scope_channels_subtitle(&self.scope_channel_names)
+                    }
+                    ScopePlotTab::Lissajous => format!(
+                        "DSCope · {} → X / {} → Y",
+                        scope_channel_label(
+                            self.scope_function_settings.lissajous.x_channel,
+                            &self.scope_channel_names
+                        ),
+                        scope_channel_label(
+                            self.scope_function_settings.lissajous.y_channel,
+                            &self.scope_channel_names
+                        )
+                    ),
+                };
+                ui.label(RichText::new(subtitle).color(TEXT_MUTED));
+                ui.add_space(8.0);
+                let (rect, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), ui.available_height().max(64.0)),
+                    Sense::hover(),
+                );
+                self.paint_active_waveform_plot(ui, frame, state, Some(rect));
+            });
+            if previous != self.scope_plot_tab {
+                self.save_global_settings();
+            }
+        } else {
+            self.paint_active_waveform_plot(ui, frame, state, None);
+        }
+    }
+
+    fn paint_active_waveform_plot(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &FrameState,
+        state: &mut PanelState,
+        scope_plot_rect: Option<Rect>,
+    ) {
         let empty_waveforms = WaveformStore::default();
         // Keep the last complete sweep visible while a time/div change
         // restarts the scope at a new automatic sample rate. The replacement
@@ -243,10 +302,22 @@ impl WaveCraftApp {
                 self.paint_logic_view(ui, waveforms, state, &mut edits);
             }
             Some(WaveformTab::Oscilloscope) => {
-                self.paint_scope_view(ui, waveforms, scope_settings, frame, state, &mut edits);
-            }
-            Some(WaveformTab::Lissajous) => {
-                self.paint_lissajous_view(ui, waveforms, scope_settings, state, &edits);
+                if let Some(rect) = scope_plot_rect {
+                    match self.scope_plot_tab {
+                        ScopePlotTab::Oscilloscope => self.paint_scope_view(
+                            ui,
+                            rect,
+                            waveforms,
+                            scope_settings,
+                            frame,
+                            &mut edits,
+                        ),
+                        ScopePlotTab::Lissajous => {
+                            self.paint_lissajous_view(ui, rect, waveforms, scope_settings, &edits)
+                        }
+                    }
+                    state.snapshot_plot_rect = Some(rect);
+                }
             }
             Some(WaveformTab::RadioReceiver) => {
                 self.paint_radio_view(ui, waveforms, frame, state);
@@ -441,10 +512,10 @@ impl WaveCraftApp {
     fn paint_scope_view(
         &self,
         ui: &mut egui::Ui,
+        rect: Rect,
         waveforms: &WaveformStore,
         scope_settings: ScopeCaptureSettings,
         frame: &FrameState,
-        state: &mut PanelState,
         edits: &mut WaveformViewEdits,
     ) {
         let FrameState {
@@ -452,53 +523,44 @@ impl WaveCraftApp {
             frontend_controls_enabled,
             ..
         } = *frame;
-        let subtitle = scope_channels_subtitle(&self.scope_channel_names);
-        state.snapshot_plot_rect =
-            Some(waveform_card(ui, "OSCILLOSCOPE", &subtitle, |ui, rect| {
-                paint_scope(
-                    ui,
-                    rect,
-                    waveforms,
-                    &mut edits.scope_viewport,
-                    &mut edits.scope_fft_viewport,
-                    ScopeWaveformOptions {
-                        settings: scope_settings,
-                        timebase_reconfigures_capture: self.scope_auto_sample_rate
-                            && frame.scope_capture_requested,
-                        smart_timing_enabled: self.scope_smart_timing_enabled,
-                        function_settings: self.scope_function_settings,
-                        channel_names: &self.scope_channel_names,
-                        measurement_caches: &mut edits.scope_measurement_caches,
-                        measurement_window_positions: &mut edits.scope_measurement_window_positions,
-                        marker_settings: &mut edits.scope_marker_settings,
-                        quick_time_measurement: &mut edits.scope_quick_time_measurement,
-                        channel_colors: self.scope_channel_colors,
-                        vertical_offsets: &mut edits.scope_vertical_offsets,
-                        trigger_settings: &mut edits.scope_trigger_settings,
-                        time_per_division_seconds: &mut edits.scope_time_per_division_seconds,
-                        timebase_changed: &mut edits.scope_timebase_changed,
-                        offset_controls_enabled: frontend_controls_enabled,
-                        trigger_controls_enabled,
-                        time_axis: None,
-                    },
-                )
-            }));
+        paint_scope(
+            ui,
+            rect,
+            waveforms,
+            &mut edits.scope_viewport,
+            &mut edits.scope_fft_viewport,
+            ScopeWaveformOptions {
+                settings: scope_settings,
+                timebase_reconfigures_capture: self.scope_auto_sample_rate
+                    && frame.scope_capture_requested,
+                smart_timing_enabled: self.scope_smart_timing_enabled,
+                function_settings: self.scope_function_settings,
+                channel_names: &self.scope_channel_names,
+                measurement_caches: &mut edits.scope_measurement_caches,
+                measurement_window_positions: &mut edits.scope_measurement_window_positions,
+                marker_settings: &mut edits.scope_marker_settings,
+                quick_time_measurement: &mut edits.scope_quick_time_measurement,
+                channel_colors: self.scope_channel_colors,
+                vertical_offsets: &mut edits.scope_vertical_offsets,
+                trigger_settings: &mut edits.scope_trigger_settings,
+                time_per_division_seconds: &mut edits.scope_time_per_division_seconds,
+                timebase_changed: &mut edits.scope_timebase_changed,
+                offset_controls_enabled: frontend_controls_enabled,
+                trigger_controls_enabled,
+                time_axis: None,
+            },
+        );
     }
 
     fn paint_lissajous_view(
         &self,
         ui: &mut egui::Ui,
+        rect: Rect,
         waveforms: &WaveformStore,
         scope_settings: ScopeCaptureSettings,
-        state: &mut PanelState,
         edits: &WaveformViewEdits,
     ) {
         let lissajous = self.scope_function_settings.lissajous;
-        let subtitle = format!(
-            "DSCope · {} → X / {} → Y",
-            scope_channel_label(lissajous.x_channel, &self.scope_channel_names),
-            scope_channel_label(lissajous.y_channel, &self.scope_channel_names)
-        );
         let mut lissajous_scope_settings = scope_settings;
         for (channel, vertical_offset) in lissajous_scope_settings
             .channels
@@ -507,20 +569,18 @@ impl WaveCraftApp {
         {
             channel.vertical_offset = vertical_offset;
         }
-        state.snapshot_plot_rect = Some(waveform_card(ui, "LISSAJOUS", &subtitle, |ui, rect| {
-            paint_scope_lissajous(
-                ui,
-                rect,
-                waveforms,
-                ScopeLissajousPaintOptions {
-                    viewport: edits.scope_viewport,
-                    settings: lissajous_scope_settings,
-                    lissajous,
-                    channel_colors: self.scope_channel_colors,
-                    channel_names: &self.scope_channel_names,
-                },
-            )
-        }));
+        paint_scope_lissajous(
+            ui,
+            rect,
+            waveforms,
+            ScopeLissajousPaintOptions {
+                viewport: edits.scope_viewport,
+                settings: lissajous_scope_settings,
+                lissajous,
+                channel_colors: self.scope_channel_colors,
+                channel_names: &self.scope_channel_names,
+            },
+        );
     }
 
     fn paint_radio_view(
@@ -736,6 +796,80 @@ fn paint_decoded_data_side_panel(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scope_child_tabs_switch_plots_without_switching_workspace() {
+        use crate::{egui, CaptureSettingsDocument, ScopePlotTab, WaveCraftApp, WaveformTab};
+        let mut app = WaveCraftApp::with_settings(None, CaptureSettingsDocument::default());
+        app.select_waveform_tab(WaveformTab::Oscilloscope);
+        let context = egui::Context::default();
+        let paint = |app: &mut WaveCraftApp, events| {
+            let frame = app.frame_state();
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |context| app.paint_central_panel(context, &frame, false),
+            )
+        };
+        fn find_text(shapes: &[egui::epaint::ClippedShape], label: &str) -> egui::Pos2 {
+            shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{label} should be visible"))
+        }
+        let output = paint(&mut app, vec![]);
+        let _ = find_text(&output.shapes, "OSCILLOSCOPE");
+        let lissajous = find_text(&output.shapes, "LISSAJOUS");
+        for pressed in [true, false] {
+            let _ = paint(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(lissajous),
+                    egui::Event::PointerButton {
+                        pos: lissajous,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.scope_plot_tab, ScopePlotTab::Lissajous);
+        assert_eq!(
+            app.saved_capture_settings.global.scope_plot_tab,
+            ScopePlotTab::Lissajous
+        );
+        assert_eq!(app.active_waveform_view(), Some(WaveformTab::Oscilloscope));
+        let output = paint(&mut app, vec![]);
+        let oscilloscope = find_text(&output.shapes, "OSCILLOSCOPE");
+        for pressed in [true, false] {
+            let _ = paint(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(oscilloscope),
+                    egui::Event::PointerButton {
+                        pos: oscilloscope,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.scope_plot_tab, ScopePlotTab::Oscilloscope);
+        assert_eq!(app.active_waveform_view(), Some(WaveformTab::Oscilloscope));
+    }
+
     use super::*;
     use crate::app::test_support::app;
     use crate::{ProtocolDecodeCacheKey, DSCOPE_SAMPLE_RATES_HZ};

@@ -676,7 +676,6 @@ mod tests {
                 window: ScopeFftWindow::Blackman,
             },
             lissajous: ScopeLissajousSettings {
-                enabled: true,
                 x_channel: 0,
                 y_channel: 0,
             },
@@ -691,7 +690,6 @@ mod tests {
         assert_eq!(settings.fft.window, ScopeFftWindow::Blackman);
         assert_eq!(settings.lissajous.x_channel, 1);
         assert_eq!(settings.lissajous.y_channel, 1);
-        assert!(!settings.lissajous.enabled);
         assert!(settings
             .measurements
             .channels

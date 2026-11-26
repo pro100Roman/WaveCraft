@@ -10,10 +10,9 @@ pub(crate) enum WorkspaceView {
 }
 
 impl WorkspaceView {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Waveform(WaveformTab::LogicAnalyzer),
         Self::Waveform(WaveformTab::Oscilloscope),
-        Self::Waveform(WaveformTab::Lissajous),
         Self::Waveform(WaveformTab::RadioReceiver),
         Self::Waveform(WaveformTab::Combined),
         Self::Vna,
@@ -179,9 +178,7 @@ pub(crate) fn capture_settings_tabs_for_view(
     let scope_available = has_scope_device || has_scope_capture;
     match active_waveform_tab {
         Some(WaveformTab::LogicAnalyzer) => capture_settings_tabs(logic_available, false),
-        Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
-            capture_settings_tabs(false, scope_available)
-        }
+        Some(WaveformTab::Oscilloscope) => capture_settings_tabs(false, scope_available),
         Some(WaveformTab::RadioReceiver) => Vec::new(),
         Some(WaveformTab::Combined) | None => {
             capture_settings_tabs(logic_available, scope_available)
@@ -193,7 +190,6 @@ pub(crate) fn capture_settings_tabs_for_view(
 pub(crate) enum WaveformTab {
     LogicAnalyzer,
     Oscilloscope,
-    Lissajous,
     RadioReceiver,
     Combined,
 }
@@ -203,7 +199,6 @@ impl WaveformTab {
         match self {
             Self::LogicAnalyzer => "Logic Analyzer",
             Self::Oscilloscope => "Oscilloscope",
-            Self::Lissajous => "Lissajous",
             Self::RadioReceiver => "RF Spectrum",
             Self::Combined => "Combined",
         }
@@ -212,7 +207,7 @@ impl WaveformTab {
     pub(crate) fn capture_target(self) -> CaptureTarget {
         match self {
             Self::LogicAnalyzer => CaptureTarget::LogicAnalyzer,
-            Self::Oscilloscope | Self::Lissajous => CaptureTarget::Oscilloscope,
+            Self::Oscilloscope => CaptureTarget::Oscilloscope,
             Self::RadioReceiver => CaptureTarget::RadioReceiver,
             Self::Combined => CaptureTarget::Combined,
         }
@@ -221,19 +216,19 @@ impl WaveformTab {
     pub(crate) fn capture_settings_tab(self) -> Option<CaptureSettingsTab> {
         match self {
             Self::LogicAnalyzer => Some(CaptureSettingsTab::DsLogic),
-            Self::Oscilloscope | Self::Lissajous => Some(CaptureSettingsTab::DsCope),
+            Self::Oscilloscope => Some(CaptureSettingsTab::DsCope),
             Self::RadioReceiver | Self::Combined => None,
         }
     }
 }
 
-pub(crate) fn waveform_tabs(show_lissajous: bool) -> Vec<WaveformTab> {
-    let mut tabs = vec![WaveformTab::LogicAnalyzer, WaveformTab::Oscilloscope];
-    if show_lissajous {
-        tabs.push(WaveformTab::Lissajous);
-    }
-    tabs.extend([WaveformTab::RadioReceiver, WaveformTab::Combined]);
-    tabs
+pub(crate) fn waveform_tabs() -> Vec<WaveformTab> {
+    vec![
+        WaveformTab::LogicAnalyzer,
+        WaveformTab::Oscilloscope,
+        WaveformTab::RadioReceiver,
+        WaveformTab::Combined,
+    ]
 }
 
 pub(crate) fn workspace_views(waveform_tabs: &[WaveformTab]) -> Vec<WorkspaceView> {
@@ -246,10 +241,7 @@ pub(crate) fn workspace_views(waveform_tabs: &[WaveformTab]) -> Vec<WorkspaceVie
 }
 
 pub(crate) fn scope_tools_panel_is_visible(active_tab: Option<WaveformTab>) -> bool {
-    matches!(
-        active_tab,
-        Some(WaveformTab::Oscilloscope) | Some(WaveformTab::Lissajous)
-    )
+    matches!(active_tab, Some(WaveformTab::Oscilloscope))
 }
 
 #[cfg(test)]
@@ -259,20 +251,10 @@ mod tests {
     #[test]
     fn waveform_tabs_do_not_require_connected_devices() {
         assert_eq!(
-            waveform_tabs(false),
+            waveform_tabs(),
             vec![
                 WaveformTab::LogicAnalyzer,
                 WaveformTab::Oscilloscope,
-                WaveformTab::RadioReceiver,
-                WaveformTab::Combined,
-            ]
-        );
-        assert_eq!(
-            waveform_tabs(true),
-            vec![
-                WaveformTab::LogicAnalyzer,
-                WaveformTab::Oscilloscope,
-                WaveformTab::Lissajous,
                 WaveformTab::RadioReceiver,
                 WaveformTab::Combined,
             ]
@@ -307,7 +289,6 @@ mod tests {
                 WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
                 WorkspaceView::SystemTrace,
                 WorkspaceView::Waveform(WaveformTab::Oscilloscope),
-                WorkspaceView::Waveform(WaveformTab::Lissajous),
                 WorkspaceView::Waveform(WaveformTab::RadioReceiver),
                 WorkspaceView::Waveform(WaveformTab::Combined),
                 WorkspaceView::Vna,
@@ -328,7 +309,6 @@ mod tests {
             WorkspaceView::SystemTrace,
             WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
             WorkspaceView::Waveform(WaveformTab::Oscilloscope),
-            WorkspaceView::Waveform(WaveformTab::Lissajous),
             WorkspaceView::Waveform(WaveformTab::RadioReceiver),
         ]));
         assert_eq!(layout.order(), &WorkspaceView::ALL);
@@ -339,7 +319,6 @@ mod tests {
         assert!(scope_tools_panel_is_visible(Some(
             WaveformTab::Oscilloscope
         )));
-        assert!(scope_tools_panel_is_visible(Some(WaveformTab::Lissajous)));
         assert!(!scope_tools_panel_is_visible(Some(
             WaveformTab::LogicAnalyzer
         )));

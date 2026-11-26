@@ -247,7 +247,7 @@ pub(crate) fn paint_capture_device_selectors(
                 enabled,
             );
         }
-        Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
+        Some(WaveformTab::Oscilloscope) => {
             scope_changed = paint_device_selector(
                 ui,
                 "scope_device_selector",

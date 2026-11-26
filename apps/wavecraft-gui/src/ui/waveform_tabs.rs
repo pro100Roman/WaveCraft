@@ -181,7 +181,6 @@ mod tests {
                 WorkspaceView::Waveform(crate::WaveformTab::LogicAnalyzer),
                 WorkspaceView::SystemTrace,
                 WorkspaceView::Waveform(crate::WaveformTab::Oscilloscope),
-                WorkspaceView::Waveform(crate::WaveformTab::Lissajous),
                 WorkspaceView::Waveform(crate::WaveformTab::RadioReceiver),
                 WorkspaceView::Waveform(crate::WaveformTab::Combined),
                 WorkspaceView::Vna,

@@ -243,15 +243,9 @@ fn plain_rtt_terminal_lines_reach_the_gui_through_the_worker_channel() {
 fn every_waveform_tab_paints_without_connected_instruments() {
     let mut app = app();
     let context = context();
-    // The Lissajous tab only exists once the user enables it from the scope
-    // view, and selecting a tab restores that view's saved settings, so enable
-    // it while the oscilloscope tab is active, as the UI does.
-    app.select_waveform_tab(WaveformTab::Oscilloscope);
-    app.scope_function_settings.lissajous.enabled = true;
     let expected = [
         WaveformTab::LogicAnalyzer,
         WaveformTab::Oscilloscope,
-        WaveformTab::Lissajous,
         WaveformTab::RadioReceiver,
         WaveformTab::Combined,
     ];

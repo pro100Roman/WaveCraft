@@ -405,11 +405,8 @@ pub(crate) fn paint_scope_function_settings(
 
             ui.add_space(6.0);
             let lissajous_available = channels.into_iter().filter(|enabled| *enabled).count() >= 2;
-            ui.add_enabled(
-                lissajous_available,
-                egui::Checkbox::new(&mut settings.lissajous.enabled, "Lissajous tab (XY)"),
-            );
-            ui.add_enabled_ui(settings.lissajous.enabled && lissajous_available, |ui| {
+            ui.label(RichText::new("Lissajous (XY)").strong());
+            ui.add_enabled_ui(lissajous_available, |ui| {
                 egui::Grid::new("dscope_lissajous_settings")
                     .num_columns(2)
                     .spacing([8.0, 6.0])

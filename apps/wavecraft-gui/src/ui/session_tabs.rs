@@ -159,7 +159,7 @@ impl WaveCraftApp {
                 names: self.logic_sessions.names(),
                 active: self.logic_sessions.active_index(),
             }),
-            Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => Some(SessionTabStrip {
+            Some(WaveformTab::Oscilloscope) => Some(SessionTabStrip {
                 target: CaptureTarget::Oscilloscope,
                 names: self.scope_sessions.names(),
                 active: self.scope_sessions.active_index(),
@@ -861,7 +861,7 @@ mod tests {
             assert!(view.texts().is_empty(), "{target:?}");
         }
         let mut scope = TabsView::new(CaptureTarget::Oscilloscope, 0);
-        scope.app.active_waveform_tab = Some(WaveformTab::Lissajous);
+        scope.app.scope_plot_tab = crate::ScopePlotTab::Lissajous;
         assert!(scope.texts().iter().any(|text| text == "Session 1"));
     }
 

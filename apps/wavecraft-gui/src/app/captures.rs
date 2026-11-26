@@ -964,9 +964,7 @@ impl WaveCraftApp {
     pub(crate) fn displayed_completed_capture(&self) -> Option<&CompletedCapture> {
         match self.active_waveform_tab {
             Some(WaveformTab::LogicAnalyzer) => self.logic_sessions.active_capture(),
-            Some(WaveformTab::Oscilloscope | WaveformTab::Lissajous) => {
-                self.scope_sessions.active_capture()
-            }
+            Some(WaveformTab::Oscilloscope) => self.scope_sessions.active_capture(),
             Some(WaveformTab::RadioReceiver) => self.radio_capture.as_ref(),
             Some(WaveformTab::Combined) => self.combined_capture.as_ref(),
             None => None,

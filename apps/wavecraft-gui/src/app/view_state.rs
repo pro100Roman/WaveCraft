@@ -24,7 +24,6 @@ impl From<WorkspaceView> for SavedWorkspaceView {
         match view {
             WorkspaceView::Waveform(WaveformTab::LogicAnalyzer) => Self::LogicAnalyzer,
             WorkspaceView::Waveform(WaveformTab::Oscilloscope) => Self::Oscilloscope,
-            WorkspaceView::Waveform(WaveformTab::Lissajous) => Self::Lissajous,
             WorkspaceView::Waveform(WaveformTab::RadioReceiver) => Self::RadioSpectrum,
             WorkspaceView::Waveform(WaveformTab::Combined) => Self::Combined,
             WorkspaceView::Vna => Self::Vna,
@@ -37,8 +36,9 @@ impl From<SavedWorkspaceView> for WorkspaceView {
     fn from(view: SavedWorkspaceView) -> Self {
         match view {
             SavedWorkspaceView::LogicAnalyzer => Self::Waveform(WaveformTab::LogicAnalyzer),
-            SavedWorkspaceView::Oscilloscope => Self::Waveform(WaveformTab::Oscilloscope),
-            SavedWorkspaceView::Lissajous => Self::Waveform(WaveformTab::Lissajous),
+            SavedWorkspaceView::Oscilloscope | SavedWorkspaceView::Lissajous => {
+                Self::Waveform(WaveformTab::Oscilloscope)
+            }
             SavedWorkspaceView::RadioSpectrum => Self::Waveform(WaveformTab::RadioReceiver),
             SavedWorkspaceView::Combined => Self::Waveform(WaveformTab::Combined),
             SavedWorkspaceView::Vna => Self::Vna,
@@ -167,7 +167,8 @@ impl WaveCraftApp {
             analysis: self.system_trace.event_view_height().round() as u32,
         };
         let timeline_label_width = self.system_trace.timeline_label_width().round() as u32;
-        if self.saved_capture_settings.global.hidden_workspace_views == hidden_workspace_views
+        if self.saved_capture_settings.global.scope_plot_tab == self.scope_plot_tab
+            && self.saved_capture_settings.global.hidden_workspace_views == hidden_workspace_views
             && self.saved_capture_settings.global.last_active_view == Some(saved_view)
             && self.saved_capture_settings.global.window_inner_size == window_inner_size
             && self
@@ -203,6 +204,7 @@ impl WaveCraftApp {
         }
 
         let mut document = self.saved_capture_settings.clone();
+        document.global.scope_plot_tab = self.scope_plot_tab;
         document.global.hidden_workspace_views = hidden_workspace_views;
         document.global.last_active_view = Some(saved_view);
         document.global.window_inner_size = window_inner_size;
@@ -223,8 +225,11 @@ impl WaveCraftApp {
 
     pub(crate) fn apply_saved_capture_settings(&mut self) {
         for view in &self.saved_capture_settings.global.hidden_workspace_views {
-            self.workspace_view_layout
-                .set_visible((*view).into(), false);
+            // Lissajous visibility used to affect only the separate XY view.
+            if *view != SavedWorkspaceView::Lissajous {
+                self.workspace_view_layout
+                    .set_visible((*view).into(), false);
+            }
         }
         if let Some(order) = self
             .saved_capture_settings
@@ -235,6 +240,7 @@ impl WaveCraftApp {
             let order = order
                 .iter()
                 .copied()
+                .filter(|view| *view != SavedWorkspaceView::Lissajous)
                 .map(WorkspaceView::from)
                 .collect::<Vec<_>>();
             self.workspace_view_layout.set_order(&order);
@@ -610,7 +616,7 @@ impl WaveCraftApp {
     pub(crate) fn save_waveform_view_settings(&mut self, tab: WaveformTab) {
         match tab {
             WaveformTab::LogicAnalyzer => self.save_active_logic_session_settings(),
-            WaveformTab::Oscilloscope | WaveformTab::Lissajous => {
+            WaveformTab::Oscilloscope => {
                 self.save_active_scope_session_settings();
             }
             WaveformTab::RadioReceiver => {}
@@ -626,7 +632,7 @@ impl WaveCraftApp {
                 let settings = self.logic_sessions.active_settings().clone();
                 self.apply_logic_session_settings(settings);
             }
-            WaveformTab::Oscilloscope | WaveformTab::Lissajous => {
+            WaveformTab::Oscilloscope => {
                 let settings = self.scope_sessions.active_settings().clone();
                 self.apply_scope_session_settings(settings);
             }
@@ -648,7 +654,7 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn available_waveform_tabs(&self) -> Vec<WaveformTab> {
-        waveform_tabs(self.scope_function_settings.lissajous.enabled)
+        waveform_tabs()
             .into_iter()
             .filter(|tab| {
                 self.workspace_view_layout
@@ -852,7 +858,6 @@ mod tests {
         for view in [
             WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
             WorkspaceView::Waveform(WaveformTab::Oscilloscope),
-            WorkspaceView::Waveform(WaveformTab::Lissajous),
             WorkspaceView::Waveform(WaveformTab::RadioReceiver),
             WorkspaceView::Waveform(WaveformTab::Combined),
             WorkspaceView::Vna,
@@ -871,26 +876,31 @@ mod tests {
             CaptureSettingsDocument::default(),
         );
 
-        app.select_waveform_tab(WaveformTab::Lissajous);
+        app.select_waveform_tab(WaveformTab::Oscilloscope);
+        app.scope_plot_tab = crate::ScopePlotTab::Lissajous;
+        app.save_global_settings();
 
         let saved = repository
             .load()
             .expect("the selected view should be saved");
         assert_eq!(
             saved.global.last_active_view,
-            Some(SavedWorkspaceView::Lissajous)
+            Some(SavedWorkspaceView::Oscilloscope)
         );
         let mut restored = WaveCraftApp::with_settings(None, saved);
         restored.reconcile_waveform_tab();
         assert_eq!(
             restored.active_workspace_view,
-            Some(WorkspaceView::Waveform(WaveformTab::Lissajous))
+            Some(WorkspaceView::Waveform(WaveformTab::Oscilloscope))
         );
-        assert_eq!(restored.active_waveform_tab, Some(WaveformTab::Lissajous));
-        assert!(restored.scope_function_settings.lissajous.enabled);
+        assert_eq!(
+            restored.active_waveform_tab,
+            Some(WaveformTab::Oscilloscope)
+        );
+        assert_eq!(restored.scope_plot_tab, crate::ScopePlotTab::Lissajous);
         assert!(restored
             .available_waveform_tabs()
-            .contains(&WaveformTab::Lissajous));
+            .contains(&WaveformTab::Oscilloscope));
 
         app.select_system_trace_view();
 
@@ -1064,7 +1074,6 @@ mod tests {
                 WorkspaceView::Waveform(WaveformTab::LogicAnalyzer),
                 WorkspaceView::SystemTrace,
                 WorkspaceView::Waveform(WaveformTab::Oscilloscope),
-                WorkspaceView::Waveform(WaveformTab::Lissajous),
                 WorkspaceView::Waveform(WaveformTab::RadioReceiver),
                 WorkspaceView::Waveform(WaveformTab::Combined),
                 WorkspaceView::Vna,
@@ -1220,6 +1229,50 @@ mod tests {
             })
         );
         assert!(app.window_size_save_due.is_some());
+    }
+
+    #[test]
+    fn legacy_lissajous_view_migrates_into_scope_without_losing_view_order() {
+        let mut saved = CaptureSettingsDocument::default();
+        saved.global.last_active_view = Some(SavedWorkspaceView::Lissajous);
+        saved.global.hidden_workspace_views =
+            vec![SavedWorkspaceView::Lissajous, SavedWorkspaceView::Vna];
+        saved.global.workspace_view_order = Some(vec![
+            SavedWorkspaceView::SystemTrace,
+            SavedWorkspaceView::Lissajous,
+            SavedWorkspaceView::Oscilloscope,
+            SavedWorkspaceView::LogicAnalyzer,
+            SavedWorkspaceView::Combined,
+            SavedWorkspaceView::RadioSpectrum,
+            SavedWorkspaceView::Vna,
+        ]);
+        let mut app = WaveCraftApp::with_settings(None, saved);
+        app.reconcile_waveform_tab();
+        assert_eq!(app.active_waveform_view(), Some(WaveformTab::Oscilloscope));
+        assert_eq!(app.scope_plot_tab, crate::ScopePlotTab::Lissajous);
+        assert_eq!(
+            app.workspace_view_layout.order()[0],
+            WorkspaceView::SystemTrace
+        );
+        assert_eq!(
+            app.workspace_view_layout.order()[1],
+            WorkspaceView::Waveform(WaveformTab::Oscilloscope)
+        );
+        assert!(app
+            .available_workspace_views()
+            .contains(&WorkspaceView::Waveform(WaveformTab::Oscilloscope)));
+        assert!(!app
+            .available_workspace_views()
+            .contains(&WorkspaceView::Vna));
+        app.save_global_settings();
+        assert_eq!(
+            app.saved_capture_settings.global.last_active_view,
+            Some(SavedWorkspaceView::Oscilloscope)
+        );
+        assert_eq!(
+            app.saved_capture_settings.global.scope_plot_tab,
+            crate::ScopePlotTab::Lissajous
+        );
     }
 
     #[test]
