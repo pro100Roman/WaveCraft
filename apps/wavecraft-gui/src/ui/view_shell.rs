@@ -20,6 +20,89 @@ fn panel_frame(fill: Color32, margin: f32) -> egui::Frame {
         .inner_margin(egui::Margin::same(margin))
 }
 
+/// Shared workspace navigation, visually joined to the instrument below it.
+pub(crate) fn workspace_tab_bar(context: &egui::Context, contents: impl FnOnce(&mut egui::Ui)) {
+    egui::TopBottomPanel::top("waveform_tabs")
+        .show_separator_line(false)
+        .frame(
+            egui::Frame::none()
+                .fill(BACKGROUND)
+                .inner_margin(egui::Margin {
+                    left: 14.0,
+                    right: 14.0,
+                    top: 6.0,
+                    bottom: 0.0,
+                }),
+        )
+        .show(context, |ui| {
+            let rect = ui.available_rect_before_wrap();
+            let baseline = rect.top() + 34.0;
+            ui.painter().hline(
+                ui.max_rect().x_range().expand(14.0),
+                baseline,
+                egui::Stroke::new(1.0_f32, GRID),
+            );
+            egui::ScrollArea::horizontal()
+                .id_salt("workspace_tabs_scroll")
+                .auto_shrink([false, true])
+                .drag_to_scroll(false)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        contents(ui);
+                    });
+                });
+        });
+}
+
+/// Tab styling stays in the shell; selection and reordering belong to the app.
+pub(crate) fn workspace_tab(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let response = ui
+        .scope(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(16.0, 8.0);
+            let visuals = ui.visuals_mut();
+            visuals.selection.bg_fill = PANEL;
+            visuals.selection.stroke = egui::Stroke::new(1.0_f32, GRID);
+            visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+            visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+            visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+            visuals.widgets.hovered.expansion = 0.0;
+            visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+            visuals.widgets.active.expansion = 0.0;
+            ui.add(
+                egui::Button::new(RichText::new(label).color(if selected {
+                    ACCENT
+                } else {
+                    TEXT_MUTED
+                }))
+                .selected(selected)
+                .rounding(egui::Rounding {
+                    nw: 7.0,
+                    ne: 7.0,
+                    sw: 0.0,
+                    se: 0.0,
+                })
+                .min_size(egui::vec2(0.0, 34.0))
+                .sense(egui::Sense::click_and_drag()),
+            )
+        })
+        .inner;
+    if selected {
+        let rect = response.rect;
+        ui.painter().hline(
+            (rect.left() + 1.0)..=(rect.right() - 1.0),
+            rect.bottom(),
+            egui::Stroke::new(2.0_f32, PANEL),
+        );
+        ui.painter().hline(
+            (rect.left() + 8.0)..=(rect.right() - 8.0),
+            rect.top() + 1.0,
+            egui::Stroke::new(2.0_f32, ACCENT),
+        );
+    }
+    response
+}
+
 #[derive(Default)]
 pub(crate) struct ViewToolbarResponse {
     pub settings_clicked: bool,

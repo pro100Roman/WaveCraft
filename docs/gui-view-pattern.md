@@ -10,6 +10,7 @@ applies equally to LA, OSC, RF, Combined, VNA, System Trace, and Serial.
 | Component | Responsibility |
 | --- | --- |
 | `view_toolbar` | Common application identity, App menu, Snapshot button, toolbar background and spacing; returns Settings and Snapshot requests |
+| `workspace_tab_bar` / `workspace_tab` | Scrollable workspace tabs, shared baseline, active outline and accent; the application owns selection, visibility and drag ordering |
 | `SetupPanel` | 300-point left panel, heading, typography, constrained scrolling, mandatory collapse/expand and pinned Save settings footer |
 | `settings_card` | Dark inset grouping settings sections, with shared width constraints and padding |
 | `workspace_panel` | Central background and outer margins |

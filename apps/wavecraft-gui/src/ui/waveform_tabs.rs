@@ -1,6 +1,7 @@
-//! The top strip that switches between waveform and System Trace views.
+//! Workspace tab selection and drag-to-reorder interaction.
 
-use crate::{egui, RichText, WorkspaceView, PANEL, TEXT_MUTED};
+use super::view_shell::{workspace_tab, workspace_tab_bar};
+use crate::{egui, WorkspaceView};
 
 use crate::WaveCraftApp;
 
@@ -11,62 +12,43 @@ impl WaveCraftApp {
         let ordered_views = *self.workspace_view_layout.order();
         let active_view = self.active_workspace_view;
         let mut selected_view = None;
-        egui::TopBottomPanel::top("waveform_tabs")
-            .frame(
-                egui::Frame::none()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(14.0, 7.0)),
-            )
-            .show(context, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("VIEW").strong().color(TEXT_MUTED));
-                    ui.separator();
-                    let (primary_down, pointer_position) = ui.input(|input| {
-                        (input.pointer.primary_down(), input.pointer.interact_pos())
+        workspace_tab_bar(context, |ui| {
+            let (primary_down, pointer_position) =
+                ui.input(|input| (input.pointer.primary_down(), input.pointer.interact_pos()));
+            for view in ordered_views
+                .into_iter()
+                .filter(|view| available_views.contains(view))
+            {
+                let dragging = self.workspace_view_layout.dragged_view().is_some();
+                let response = workspace_tab(ui, view.label(), active_view == Some(view))
+                    .on_hover_cursor(if dragging {
+                        egui::CursorIcon::Grabbing
+                    } else {
+                        egui::CursorIcon::Grab
                     });
-                    for view in ordered_views
-                        .into_iter()
-                        .filter(|view| available_views.contains(view))
-                    {
-                        let dragging = self.workspace_view_layout.dragged_view().is_some();
-                        let response = ui
-                            .add(
-                                egui::Button::new(view.label())
-                                    .selected(active_view == Some(view))
-                                    .sense(egui::Sense::click_and_drag()),
-                            )
-                            .on_hover_cursor(if dragging {
-                                egui::CursorIcon::Grabbing
-                            } else {
-                                egui::CursorIcon::Grab
-                            });
-                        if response.clicked() {
-                            selected_view = Some(view);
-                        }
-                        if primary_down
-                            && response.is_pointer_button_down_on()
-                            && self.workspace_view_layout.dragged_view().is_none()
-                        {
-                            self.workspace_view_layout.begin_drag(view);
-                        }
-                        if primary_down
-                            && pointer_position
-                                .is_some_and(|position| response.rect.contains(position))
-                            && self.workspace_view_layout.dragged_view().is_some()
-                        {
-                            self.workspace_view_layout.drag_to(view);
-                        }
-                        if !dragging {
-                            response.on_hover_text(
-                                "Drag with the left mouse button to reorder this view",
-                            );
-                        }
-                    }
-                    if !primary_down {
-                        self.workspace_view_layout.finish_drag();
-                    }
-                });
-            });
+                if response.clicked() {
+                    selected_view = Some(view);
+                }
+                if primary_down
+                    && response.is_pointer_button_down_on()
+                    && self.workspace_view_layout.dragged_view().is_none()
+                {
+                    self.workspace_view_layout.begin_drag(view);
+                }
+                if primary_down
+                    && pointer_position.is_some_and(|position| response.rect.contains(position))
+                    && self.workspace_view_layout.dragged_view().is_some()
+                {
+                    self.workspace_view_layout.drag_to(view);
+                }
+                if !dragging {
+                    response.on_hover_text("Drag with the left mouse button to reorder this view");
+                }
+            }
+            if !primary_down {
+                self.workspace_view_layout.finish_drag();
+            }
+        });
         if let Some(view) = selected_view {
             match view {
                 WorkspaceView::Waveform(tab) => self.select_waveform_tab(tab),
