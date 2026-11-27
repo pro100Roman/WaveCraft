@@ -9,6 +9,9 @@ use crate::{
 };
 
 pub(crate) const SETUP_PANEL_WIDTH: f32 = 300.0;
+pub(crate) const SETUP_FIELD_WIDTH: f32 = 96.0;
+pub(crate) const CONNECTION_FIELD_WIDTH: f32 = SETUP_FIELD_WIDTH * 1.35;
+const SETUP_LABEL_WIDTH: f32 = 112.0;
 const CARD_MARGIN: f32 = 12.0;
 const CARD_STROKE_WIDTH: f32 = 1.0;
 pub(crate) const PANE_SPLITTER_HEIGHT: f32 = 10.0;
@@ -347,6 +350,57 @@ pub(crate) fn settings_card<R>(
         ui.set_max_width(width);
         contents(ui)
     })
+}
+
+/// Fixed label, field and optional unit columns shared by instrument settings.
+/// Wider fields keep their right edge fixed by borrowing space from the label.
+pub(crate) fn setup_field_row<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    unit: &str,
+    help: &str,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let field_width = ui.spacing().interact_size.x.max(SETUP_FIELD_WIDTH);
+    // Keep the field's right edge and unit column fixed when widening controls.
+    let label_width = SETUP_LABEL_WIDTH + SETUP_FIELD_WIDTH - field_width;
+    ui.push_id(label, |ui| {
+        let row = ui.horizontal(|ui| {
+            let caption = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(label_width, 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(label_width);
+                        ui.add(egui::Label::new(label).wrap())
+                    },
+                )
+                .inner;
+            if !help.is_empty() {
+                caption
+                    .on_hover_selectable_text(help)
+                    .on_disabled_hover_selectable_text(help);
+            }
+            let result = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(field_width, 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(field_width);
+                        ui.spacing_mut().interact_size.x = field_width;
+                        content(ui)
+                    },
+                )
+                .inner;
+            ui.label(unit);
+            result
+        });
+        if !help.is_empty() {
+            row.response.on_hover_selectable_text(help);
+        }
+        row.inner
+    })
+    .inner
 }
 
 /// A collapsible section inside a shared settings card. IDs are scoped to the

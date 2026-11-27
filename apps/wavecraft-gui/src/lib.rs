@@ -894,6 +894,7 @@ impl WaveCraftApp {
 
         self.apply_toolbar_actions(&mut actions, &frame);
         self.apply_battery_actions(&actions);
+        self.apply_serial_actions(&actions);
         self.apply_pd_power_actions(&actions);
         if actions.vna_sweep_clicked {
             self.begin_vna_sweep();

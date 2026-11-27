@@ -3,13 +3,15 @@
 use super::serial_graph::paint_graph;
 use super::serial_line_style::{line_style_picker, LINE_STYLE_PICKER_WIDTH};
 use super::view_shell::{
-    settings_card, setup_section, view_card, view_toolbar, workspace_panel, ToolbarSection,
+    settings_card, setup_field_row, setup_section, view_card, view_toolbar, workspace_panel,
+    ToolbarSection, CONNECTION_FIELD_WIDTH,
 };
 use crate::serial::{
     SerialMode, SerialSettings, SerialState, SerialTimestampUnit, TextField, COLORS,
 };
 use crate::{
-    egui, toolbar_action_button, RichText, WaveCraftApp, WorkspaceView, ACCENT, GRID, TEXT_MUTED,
+    egui, toolbar_action_button, RichText, SelectableHoverText, WaveCraftApp, WorkspaceView,
+    ACCENT, GRID, TEXT_MUTED,
 };
 use wavecraft_serial::BinarySchema;
 
@@ -86,38 +88,32 @@ impl WaveCraftApp {
                 }
                 ToolbarSection::Controls => {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if running {
-                    if ui
-                        .add_enabled(
-                            !self.serial.stopping,
-                            toolbar_action_button("■ Stop", egui::Color32::LIGHT_RED),
-                        )
-                        .clicked()
-                    {
-                        self.serial.stop();
-                    }
-                } else if ui.add_enabled(self.serial.settings.mode != SerialMode::Csv, toolbar_action_button("▶ Start", ACCENT))
-                    .on_hover_text("Live UART capture is available in ASCII or Binary mode")
-                    .clicked() {
-                    if let Err(error) = self.serial.start() {
-                        self.serial.error = Some(error.to_string());
-                    }
-                }
-                if self.serial.imported_file.is_some() && ui
-                    .add_enabled(!running, toolbar_action_button("Plot", ACCENT))
-                    .on_hover_text("Plot the opened file using the current fields, columns and X-axis settings")
-                    .clicked()
-                {
-                    if let Err(error) = self.serial.plot_imported() {
-                        self.serial.error = Some(error.to_string());
-                    }
-                }
-            });
+                        if self.serial.imported_file.is_some()
+                            && ui
+                                .add_enabled(!running, toolbar_action_button("Plot", ACCENT))
+                                .on_hover_text("Plot the opened file using the current fields, columns and X-axis settings")
+                                .clicked()
+                        {
+                            if let Err(error) = self.serial.plot_imported() {
+                                self.serial.error = Some(error.to_string());
+                            }
+                        }
+                    });
                 }
             },
         );
         self.settings_open |= toolbar.settings_clicked;
         actions.snapshot_clicked |= toolbar.snapshot_clicked;
+    }
+
+    pub(crate) fn apply_serial_actions(&mut self, actions: &crate::FrameActions) {
+        if actions.serial_toggle_connection {
+            if self.serial.session.is_some() {
+                self.serial.stop();
+            } else if let Err(error) = self.serial.start() {
+                self.serial.error = Some(error.to_string());
+            }
+        }
     }
 
     fn open_serial_raw(&mut self) {
@@ -146,24 +142,26 @@ impl WaveCraftApp {
             context,
             WorkspaceView::Serial,
             actions,
-            |app, ui, _actions| {
+            |app, ui, actions| {
                 let running = app.serial.session.is_some();
                 if running {
                     ui.label(
-                        RichText::new("Stop to change port or decoding settings")
+                        RichText::new("Close the port to change connection or decoding settings")
                             .small()
                             .color(TEXT_MUTED),
                     );
                 } else {
                     ui.label(
-                        RichText::new("Decoding changes apply on Start / Open / Plot.")
-                            .small()
-                            .color(TEXT_MUTED),
+                        RichText::new(
+                            "Open the port or plot an imported file to apply decoding changes.",
+                        )
+                        .small()
+                        .color(TEXT_MUTED),
                     );
                 }
                 settings_card(ui, |ui| {
-                    setup_section(ui, "PORT", !running, |ui| {
-                        port_settings(ui, &mut app.serial)
+                    setup_section(ui, "CONNECTION", true, |ui| {
+                        port_settings(ui, &mut app.serial, actions)
                     });
                     ui.add_space(10.0);
                     setup_section(ui, "DATA FORMAT", !running, |ui| {
@@ -235,7 +233,7 @@ impl WaveCraftApp {
                     series.color = color;
                 }
             }
-            // Keep a stopped capture intact until a new Start/Open, but rebuild the raw representation on mode changes.
+            // Keep a stopped capture intact until a new port/file open, but rebuild the raw representation on mode changes.
             self.serial.invalidate_raw();
             self.save_global_settings();
         }
@@ -345,62 +343,95 @@ impl WaveCraftApp {
     }
 }
 
-fn port_settings(ui: &mut egui::Ui, state: &mut SerialState) {
-    let settings = &mut state.settings;
-    let width = ui.available_width();
-    ui.label("Port");
-    egui::ComboBox::from_id_salt("serial_ports")
-        .width(width)
-        .truncate()
-        .selected_text(if settings.port.is_empty() {
-            "Select port"
-        } else {
-            &settings.port
-        })
-        .show_ui(ui, |ui| {
-            if state.ports.is_empty() {
-                ui.add_enabled(false, egui::Label::new("No serial ports found"));
-            }
-            for port in &state.ports {
-                ui.selectable_value(&mut settings.port, port.clone(), port);
-            }
+fn port_settings(ui: &mut egui::Ui, state: &mut SerialState, actions: &mut crate::FrameActions) {
+    let running = state.session.is_some();
+    ui.spacing_mut().interact_size.x = CONNECTION_FIELD_WIDTH;
+    ui.add_enabled_ui(!running, |ui| {
+        setup_field_row(
+            ui,
+            "Port",
+            "",
+            "Serial port used for live UART capture",
+            |ui| {
+                egui::ComboBox::from_id_salt("serial_ports")
+                    .width(CONNECTION_FIELD_WIDTH)
+                    .truncate()
+                    .selected_text(if state.settings.port.is_empty() {
+                        "Select port"
+                    } else {
+                        &state.settings.port
+                    })
+                    .show_ui(ui, |ui| {
+                        if state.ports.is_empty() {
+                            ui.add_enabled(false, egui::Label::new("No serial ports found"));
+                        }
+                        for port in &state.ports {
+                            ui.selectable_value(&mut state.settings.port, port.clone(), port);
+                        }
+                    });
+            },
+        );
+    });
+    setup_field_row(ui, "", "", "", |ui| {
+        if ui.add_enabled(
+            !state.stopping && (running || (state.settings.mode != SerialMode::Csv && !state.settings.port.trim().is_empty())),
+            toolbar_action_button(if running { "Close" } else { "Open" }, if running { egui::Color32::LIGHT_RED } else { ACCENT })
+                .min_size(egui::vec2(CONNECTION_FIELD_WIDTH, 22.0)),
+        )
+        .on_hover_selectable_text("Open or close the selected serial port. Live UART capture is available in ASCII or Binary mode.")
+        .on_disabled_hover_selectable_text("Select a port and ASCII or Binary mode to open a live UART connection.")
+        .clicked() {
+            actions.serial_toggle_connection = true;
+        }
+    });
+    ui.add_enabled_ui(!running, |ui| {
+        let settings = &mut state.settings;
+        setup_field_row(
+            ui,
+            "Baud rate",
+            "",
+            "Type a baud rate or select a standard speed",
+            |ui| {
+                paint_baud_rate_selector(ui, &mut settings.baud, &mut state.baud_draft);
+            },
+        );
+        setup_field_row(ui, "Data bits", "", "", |ui| {
+            egui::ComboBox::from_id_salt("serial_data_bits")
+                .width(CONNECTION_FIELD_WIDTH)
+                .selected_text(settings.data_bits.to_string())
+                .show_ui(ui, |ui| {
+                    for bits in 5..=8 {
+                        ui.selectable_value(&mut settings.data_bits, bits, bits.to_string());
+                    }
+                });
         });
-
-    ui.label("Baud rate");
-    paint_baud_rate_selector(ui, &mut settings.baud, &mut state.baud_draft);
-
-    ui.label("Data bits");
-    egui::ComboBox::from_id_salt("serial_data_bits")
-        .width(width)
-        .selected_text(settings.data_bits.to_string())
-        .show_ui(ui, |ui| {
-            for bits in 5..=8 {
-                ui.selectable_value(&mut settings.data_bits, bits, bits.to_string());
-            }
+        setup_field_row(ui, "Parity", "", "", |ui| {
+            string_combo(
+                ui,
+                "serial_parity",
+                &mut settings.parity,
+                &["None", "Even", "Odd"],
+            );
         });
-    ui.label("Parity");
-    string_combo(
-        ui,
-        "serial_parity",
-        &mut settings.parity,
-        &["None", "Even", "Odd"],
-    );
-    ui.label("Stop bits");
-    egui::ComboBox::from_id_salt("serial_stop_bits")
-        .width(width)
-        .selected_text(settings.stop_bits.to_string())
-        .show_ui(ui, |ui| {
-            for bits in 1..=2 {
-                ui.selectable_value(&mut settings.stop_bits, bits, bits.to_string());
-            }
+        setup_field_row(ui, "Stop bits", "", "", |ui| {
+            egui::ComboBox::from_id_salt("serial_stop_bits")
+                .width(CONNECTION_FIELD_WIDTH)
+                .selected_text(settings.stop_bits.to_string())
+                .show_ui(ui, |ui| {
+                    for bits in 1..=2 {
+                        ui.selectable_value(&mut settings.stop_bits, bits, bits.to_string());
+                    }
+                });
         });
-    ui.label("Flow control");
-    string_combo(
-        ui,
-        "serial_flow",
-        &mut settings.flow_control,
-        &["None", "RTS/CTS", "XON/XOFF"],
-    );
+        setup_field_row(ui, "Flow control", "", "", |ui| {
+            string_combo(
+                ui,
+                "serial_flow",
+                &mut settings.flow_control,
+                &["None", "RTS/CTS", "XON/XOFF"],
+            );
+        });
+    });
 }
 
 fn paint_baud_rate_selector(ui: &mut egui::Ui, baud: &mut u32, draft: &mut Option<String>) {
@@ -932,7 +963,7 @@ fn paint_raw(ui: &mut egui::Ui, state: &mut SerialState) {
         ui.add_space(8.0);
         if state.raw.is_empty() {
             ui.label(
-                RichText::new("Start receiving or open a raw capture to inspect incoming bytes.")
+                RichText::new("Open the port or a raw capture to inspect incoming bytes.")
                     .color(TEXT_MUTED),
             );
         } else {
@@ -1126,8 +1157,157 @@ mod tests {
         assert!(!labels.iter().any(|label| label == "samples"));
     }
 
+    fn connection_frame(
+        app: &mut WaveCraftApp,
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, crate::FrameActions) {
+        let mut actions = crate::FrameActions::default();
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |context| {
+                app.paint_serial_toolbar(context, &mut actions);
+                app.paint_serial_setup(context, &mut actions);
+                app.paint_status_bar(context);
+                app.paint_serial_central(context);
+            },
+        );
+        (output, actions)
+    }
+
+    fn connection_text_rect(output: &egui::FullOutput, label: &str) -> egui::Rect {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.visual_bounding_rect())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{label} is visible"))
+    }
+
+    fn click_connection(
+        app: &mut WaveCraftApp,
+        context: &egui::Context,
+        position: egui::Pos2,
+    ) -> crate::FrameActions {
+        let mut actions = crate::FrameActions::default();
+        for pressed in [true, false] {
+            actions = connection_frame(
+                app,
+                context,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            )
+            .1;
+        }
+        actions
+    }
+
     #[test]
-    fn plot_button_appears_left_of_start_and_replots_opened_file_with_name_in_status() {
+    fn connection_has_aligned_fields_and_open_close_below_port() {
+        let mut app = crate::app::test_support::app();
+        app.active_workspace_view = Some(WorkspaceView::Serial);
+        app.serial.settings.port = "test-uart".into();
+        app.serial.ports = vec!["test-uart".into()];
+        let context = egui::Context::default();
+        crate::configure_style(&context);
+        connection_frame(&mut app, &context, vec![]);
+        let (output, _) = connection_frame(&mut app, &context, vec![]);
+        connection_text_rect(&output, "CONNECTION");
+        let port = connection_text_rect(&output, "Port");
+        let selected_port = connection_text_rect(&output, "test-uart");
+        let open = connection_text_rect(&output, "Open");
+        let baud = connection_text_rect(&output, "Baud rate");
+        let speed = connection_text_rect(&output, "115200");
+        assert!(selected_port.left() > port.right());
+        assert!((selected_port.center().y - port.center().y).abs() < 2.0);
+        assert!((speed.center().y - baud.center().y).abs() < 2.0);
+        assert!((selected_port.left() - speed.left()).abs() < 2.0);
+        assert!(open.top() > port.bottom() && open.bottom() < baud.top());
+        assert!(open.left() > port.right() && open.right() < 300.0);
+        for label in ["Data bits", "Parity", "Stop bits", "Flow control"] {
+            let rect = connection_text_rect(&output, label);
+            assert!((rect.left() - port.left()).abs() < 2.0, "{label}");
+        }
+        let labels = texts(&output.shapes);
+        assert!(!labels
+            .iter()
+            .any(|text| text == "PORT" || text == "▶ Start" || text == "■ Stop"));
+        assert_eq!(
+            labels.iter().filter(|text| text.as_str() == "Open").count(),
+            1
+        );
+        let actions = click_connection(&mut app, &context, open.center());
+        assert!(actions.serial_toggle_connection);
+        assert!(app.serial.session.is_none()); // Applied after painting, never from the editor.
+        app.serial.baud_draft = Some("invalid".into());
+        app.apply_serial_actions(&actions);
+        assert!(app.serial.error.is_some());
+        assert!(app.serial.session.is_none());
+
+        let ready = crate::app::test_support::ready(
+            &app,
+            wavecraft_core::InstrumentKind::Serial,
+            crate::AcquisitionMode::Run,
+            crate::CaptureTarget::LogicAnalyzer,
+        );
+        app.serial.session = Some(ready.session);
+        app.serial.baud_draft = None;
+        let (output, _) = connection_frame(&mut app, &context, vec![]);
+        let close = connection_text_rect(&output, "Close");
+        let port = connection_text_rect(&output, "Port");
+        assert!(close.top() > port.bottom());
+        assert!(close.bottom() < connection_text_rect(&output, "Baud rate").top());
+        let data_bits = connection_text_rect(&output, "8").center();
+        assert!(!click_connection(&mut app, &context, data_bits).serial_toggle_connection);
+        assert!(!context.memory(|memory| memory.any_popup_open()));
+        let actions = click_connection(&mut app, &context, close.center());
+        assert!(actions.serial_toggle_connection);
+        app.apply_serial_actions(&actions);
+        assert!(app.serial.stopping);
+        assert!(!click_connection(&mut app, &context, close.center()).serial_toggle_connection);
+    }
+
+    #[test]
+    fn open_is_disabled_without_a_port_or_in_csv_mode() {
+        let mut app = crate::app::test_support::app();
+        app.active_workspace_view = Some(WorkspaceView::Serial);
+        let context = egui::Context::default();
+        crate::configure_style(&context);
+        for mode in [SerialMode::Text, SerialMode::Binary, SerialMode::Csv] {
+            app.serial.settings.mode = mode;
+            app.serial.settings.port = if mode == SerialMode::Csv {
+                "test-uart".into()
+            } else {
+                String::new()
+            };
+            connection_frame(&mut app, &context, vec![]);
+            let (output, _) = connection_frame(&mut app, &context, vec![]);
+            let position = connection_text_rect(&output, "Open").center();
+            assert!(!click_connection(&mut app, &context, position).serial_toggle_connection);
+            assert!(app.serial.session.is_none());
+        }
+    }
+
+    #[test]
+    fn plot_button_stays_in_toolbar_and_replots_opened_file_with_name_in_status() {
         let mut app = crate::app::test_support::app();
         app.active_workspace_view = Some(WorkspaceView::Serial);
         let context = egui::Context::default();
@@ -1170,7 +1350,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("{label} is visible"))
         };
         let plot = bounds("Plot");
-        assert!(plot.right() < bounds("▶ Start").left());
+        assert!(plot.left() > bounds("📷 Snapshot").right());
+        assert!(plot.right() > 1100.0);
+        assert!(!texts(&output.shapes).iter().any(|text| text == "▶ Start"
+            || text == "■ Stop"
+            || text == "Close"
+            || text == "Open"));
         assert!(texts(&output.shapes)
             .iter()
             .any(|text| text.contains("serial-ascii.txt")));

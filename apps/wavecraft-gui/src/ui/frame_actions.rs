@@ -21,6 +21,7 @@ pub(crate) struct FrameActions {
     pub(crate) battery_calculate: Option<usize>,
     pub(crate) battery_save: Option<usize>,
     pub(crate) battery_load: Option<usize>,
+    pub(crate) serial_toggle_connection: bool,
     pub(crate) refresh_clicked: bool,
     pub(crate) snapshot_clicked: bool,
     pub(crate) record_now_clicked: bool,

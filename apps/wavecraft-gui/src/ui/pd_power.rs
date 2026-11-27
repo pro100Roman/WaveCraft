@@ -4,8 +4,9 @@ use super::{
     manual_value::ManualValue,
     plot_hover::{paint_plot_hover, plot_hover_pointer},
     view_shell::{
-        primary_toolbar_button, settings_card, setup_section, stacked_view_splitter, view_card,
-        view_toolbar, workspace_panel, ToolbarSection, PANE_SPLITTER_HEIGHT,
+        primary_toolbar_button, settings_card, setup_field_row, setup_section,
+        stacked_view_splitter, view_card, view_toolbar, workspace_panel, ToolbarSection,
+        CONNECTION_FIELD_WIDTH, PANE_SPLITTER_HEIGHT, SETUP_FIELD_WIDTH as FIELD_WIDTH,
     },
 };
 use crate::{
@@ -15,10 +16,6 @@ use crate::{
     GRID, SCOPE_COLORS, TEXT_MUTED,
 };
 use wavecraft_serial::pd_power::{Request, BAUD_RATES, MAX_POLL_HZ, MIN_POLL_HZ, UART_BAUD_RATES};
-
-const FIELD_WIDTH: f32 = 96.0;
-const CONNECTION_FIELD_WIDTH: f32 = FIELD_WIDTH * 1.35;
-const LABEL_WIDTH: f32 = 112.0;
 
 fn output_button(state: &PowerState) -> (&'static str, egui::Color32) {
     match state.output_is_on().filter(|_| state.connected) {
@@ -337,47 +334,7 @@ fn row<R>(
     unit: &str,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    let field_width = ui.spacing().interact_size.x.max(FIELD_WIDTH);
-    // Keep the field's right edge and unit column fixed when widening controls.
-    let label_width = LABEL_WIDTH + FIELD_WIDTH - field_width;
-    ui.push_id(label, |ui| {
-        let row = ui.horizontal(|ui| {
-            let caption = ui
-                .allocate_ui_with_layout(
-                    egui::vec2(label_width, 22.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.set_width(label_width);
-                        ui.add(egui::Label::new(label).wrap())
-                    },
-                )
-                .inner;
-            if !control_help(label).is_empty() {
-                caption
-                    .on_hover_selectable_text(control_help(label))
-                    .on_disabled_hover_selectable_text(control_help(label));
-            }
-            let result = ui
-                .allocate_ui_with_layout(
-                    egui::vec2(field_width, 22.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.set_width(field_width);
-                        ui.spacing_mut().interact_size.x = field_width;
-                        content(ui)
-                    },
-                )
-                .inner;
-            ui.label(unit);
-            result
-        });
-        let hint = control_help(label);
-        if !hint.is_empty() {
-            row.response.on_hover_selectable_text(hint);
-        }
-        row.inner
-    })
-    .inner
+    setup_field_row(ui, label, unit, control_help(label), content)
 }
 
 fn number<N: egui::emath::Numeric>(

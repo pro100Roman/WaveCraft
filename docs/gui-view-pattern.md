@@ -38,7 +38,13 @@ in a narrow window.
 Refresh and file operations occupy the left area after the shared App menu.
 The template places Snapshot immediately after this file section, between
 vertical dividers. Connection and instrument controls follow Snapshot, with
-primary Run/Stop/Single controls aligned to the far right. Views supply the
+primary Run/Stop/Single controls aligned to the far right. Serial / UART keeps
+its Open/Close connection button directly below Port in the left CONNECTION
+section; imported-file Plot remains at the toolbar's right end. Serial and PD
+Power share fixed label/field columns through `setup_field_row`, with parameter
+names on the left and equal-width editors on the right. Connection settings are
+disabled while a port is open; Close remains available until shutdown begins.
+Views supply the
 `ToolbarSection::Files` and `ToolbarSection::Controls` phases of one callback;
 the template owns Snapshot and both surrounding dividers. Use
 `theme::toolbar_action_button` for instrument buttons.
