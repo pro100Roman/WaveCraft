@@ -1,5 +1,6 @@
 mod acquisition;
 mod app;
+mod battery;
 mod capture_settings;
 mod debug_probes;
 mod devices;
@@ -432,6 +433,7 @@ struct WaveCraftApp {
     scope_plot_tab: ScopePlotTab,
     system_trace_settings: SystemTraceSettings,
     serial: serial::SerialState,
+    battery: battery::BatteryState,
     system_trace: system_trace::SystemTraceDisplayState,
     system_trace_events: Option<Receiver<system_trace::LiveTraceUpdate>>,
     system_trace_terminal_lines: Option<Receiver<wavecraft_debug_probe::RttTerminalLine>>,
@@ -507,7 +509,12 @@ impl WaveCraftApp {
             .map(WorkspaceView::from);
         let restored_waveform_tab = match restored_workspace_view {
             Some(WorkspaceView::Waveform(tab)) => Some(tab),
-            Some(WorkspaceView::Vna | WorkspaceView::SystemTrace | WorkspaceView::Serial)
+            Some(
+                WorkspaceView::Vna
+                | WorkspaceView::SystemTrace
+                | WorkspaceView::Serial
+                | WorkspaceView::Battery,
+            )
             | None => None,
         };
         let restored_scope_plot_tab = if saved_capture_settings.global.last_active_view
@@ -586,6 +593,7 @@ impl WaveCraftApp {
             scope_plot_tab: restored_scope_plot_tab,
             system_trace_settings: SystemTraceSettings::default(),
             serial: serial::SerialState::default(),
+            battery: battery::BatteryState::default(),
             system_trace: system_trace::SystemTraceDisplayState::default(),
             system_trace_events: None,
             system_trace_terminal_lines: None,
@@ -772,7 +780,9 @@ impl WaveCraftApp {
             self.save_global_settings();
         }
 
-        if self.serial_view_is_active() {
+        if self.battery_view_is_active() {
+            self.paint_battery_setup(context, &mut actions);
+        } else if self.serial_view_is_active() {
             self.paint_serial_setup(context, &mut actions);
         } else if self.system_trace_view_is_active() {
             self.paint_system_trace_setup_panel(context, &mut actions);
@@ -848,6 +858,7 @@ impl WaveCraftApp {
         self.paint_vna_calibration_notice(context);
 
         self.apply_toolbar_actions(&mut actions, &frame);
+        self.apply_battery_actions(&actions);
         if actions.vna_sweep_clicked {
             self.begin_vna_sweep();
         }

@@ -131,7 +131,9 @@ impl WaveCraftApp {
         snapshot_clicked: bool,
     ) {
         let workspace_rect = context.available_rect();
-        if self.serial_view_is_active() {
+        if self.battery_view_is_active() {
+            self.paint_battery_central(context);
+        } else if self.serial_view_is_active() {
             self.paint_serial_central(context);
             self.snapshot_plot_rect = Some(workspace_rect);
         } else if self.vna_view_is_active() {
@@ -786,7 +788,9 @@ mod tests {
             |context| {
                 let mut actions = FrameActions::default();
                 app.paint_toolbar(context, &frame, &mut actions);
-                if app.serial_view_is_active() {
+                if app.battery_view_is_active() {
+                    app.paint_battery_setup(context, &mut actions);
+                } else if app.serial_view_is_active() {
                     app.paint_serial_setup(context, &mut actions);
                 } else if app.system_trace_view_is_active() {
                     app.paint_system_trace_setup_panel(context, &mut actions);

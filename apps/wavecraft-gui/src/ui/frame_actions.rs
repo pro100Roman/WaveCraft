@@ -13,6 +13,9 @@ use crate::{
 /// or stops captures itself.
 #[derive(Default)]
 pub(crate) struct FrameActions {
+    pub(crate) battery_calculate: bool,
+    pub(crate) battery_save: bool,
+    pub(crate) battery_load: bool,
     pub(crate) refresh_clicked: bool,
     pub(crate) snapshot_clicked: bool,
     pub(crate) record_now_clicked: bool,

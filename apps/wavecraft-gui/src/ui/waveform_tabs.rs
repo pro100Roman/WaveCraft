@@ -279,6 +279,7 @@ mod tests {
                 WorkspaceView::Waveform(crate::WaveformTab::Combined),
                 WorkspaceView::Vna,
                 WorkspaceView::Serial,
+                WorkspaceView::Battery,
             ]
         );
         assert_eq!(app.workspace_view_layout.dragged_view(), None);

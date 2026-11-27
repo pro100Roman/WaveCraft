@@ -20,6 +20,7 @@ impl WaveCraftApp {
             WorkspaceView::Vna => ("vna_setup", "VNA SETUP"),
             WorkspaceView::SystemTrace => ("system_trace_setup", "SYSTEM TRACE SETUP"),
             WorkspaceView::Serial => ("serial_setup", "SERIAL / UART SETUP"),
+            WorkspaceView::Battery => ("battery_setup", "BATTERY SETUP"),
         };
         let mut open = self.workspace_view_layout.setup_panel_open(view);
         if SetupPanel::new(id, title).show(context, &mut open, |ui| contents(self, ui, actions)) {
@@ -66,6 +67,7 @@ mod tests {
                     app.paint_system_trace_setup_panel(context, &mut actions)
                 }
                 WorkspaceView::Serial => app.paint_serial_setup(context, &mut actions),
+                WorkspaceView::Battery => app.paint_battery_setup(context, &mut actions),
             },
         );
         let texts = output

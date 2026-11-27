@@ -29,6 +29,7 @@ impl From<WorkspaceView> for SavedWorkspaceView {
             WorkspaceView::Vna => Self::Vna,
             WorkspaceView::SystemTrace => Self::SystemTrace,
             WorkspaceView::Serial => Self::Serial,
+            WorkspaceView::Battery => Self::Battery,
         }
     }
 }
@@ -45,6 +46,7 @@ impl From<SavedWorkspaceView> for WorkspaceView {
             SavedWorkspaceView::Vna => Self::Vna,
             SavedWorkspaceView::SystemTrace => Self::SystemTrace,
             SavedWorkspaceView::Serial => Self::Serial,
+            SavedWorkspaceView::Battery => Self::Battery,
         }
     }
 }
@@ -235,6 +237,14 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn apply_saved_capture_settings(&mut self) {
+        if let Some(settings) = &self.saved_capture_settings.global.battery {
+            match settings.validate() {
+                Ok(()) => self.battery.settings = settings.clone(),
+                Err(error) => {
+                    self.battery.error = Some(format!("Saved battery settings ignored: {error}"))
+                }
+            }
+        }
         if let Some(settings) = &self.saved_capture_settings.global.serial {
             self.serial.settings = settings.clone();
             self.serial.baud_draft = None;
@@ -267,14 +277,11 @@ impl WaveCraftApp {
                 .filter(|view| *view != SavedWorkspaceView::Lissajous)
                 .map(WorkspaceView::from)
                 .collect::<Vec<_>>();
-            if order.len() == WorkspaceView::ALL.len() - 1
-                && !order.contains(&WorkspaceView::Serial)
-                && WorkspaceView::ALL
-                    .iter()
-                    .filter(|view| **view != WorkspaceView::Serial)
-                    .all(|view| order.iter().filter(|candidate| *candidate == view).count() == 1)
-            {
-                order.push(WorkspaceView::Serial);
+            // Append newly introduced views while retaining legacy tab ordering.
+            for view in WorkspaceView::ALL {
+                if !order.contains(&view) {
+                    order.push(view);
+                }
             }
             self.workspace_view_layout.set_order(&order);
         }
@@ -467,6 +474,18 @@ impl WaveCraftApp {
             }
             WorkspaceView::SystemTrace => {
                 self.save_capture_settings(SavedCaptureSettingsKind::SystemTrace)
+            }
+            WorkspaceView::Battery => {
+                if let Err(error) = self.battery.settings.validate() {
+                    self.battery.error = Some(error);
+                    return;
+                }
+                let mut document = self.saved_capture_settings.clone();
+                document.global.battery = Some(self.battery.settings.clone());
+                if self.persist_setup_document(document, "Battery") {
+                    self.battery.status = self.status.clone();
+                    self.battery.error = None;
+                }
             }
             WorkspaceView::Serial => {
                 let mut document = self.saved_capture_settings.clone();
@@ -768,6 +787,7 @@ impl WaveCraftApp {
             WorkspaceView::Vna => self.select_vna_view(),
             WorkspaceView::SystemTrace => self.select_system_trace_view(),
             WorkspaceView::Serial => self.select_serial_view(),
+            WorkspaceView::Battery => self.select_battery_view(),
         }
     }
 
@@ -834,7 +854,12 @@ impl WaveCraftApp {
     pub(crate) fn active_waveform_view(&self) -> Option<WaveformTab> {
         match self.active_workspace_view {
             Some(WorkspaceView::Waveform(tab)) => Some(tab),
-            Some(WorkspaceView::Vna | WorkspaceView::SystemTrace | WorkspaceView::Serial)
+            Some(
+                WorkspaceView::Vna
+                | WorkspaceView::SystemTrace
+                | WorkspaceView::Serial
+                | WorkspaceView::Battery,
+            )
             | None => None,
         }
     }
@@ -896,6 +921,7 @@ impl WaveCraftApp {
                 WorkspaceView::Vna => self.select_vna_view(),
                 WorkspaceView::SystemTrace => self.select_system_trace_view(),
                 WorkspaceView::Serial => self.select_serial_view(),
+                WorkspaceView::Battery => self.select_battery_view(),
             }
         }
         let available = self.available_waveform_tabs();
@@ -917,6 +943,7 @@ impl WaveCraftApp {
             if self.system_trace_view_is_active()
                 || self.vna_view_is_active()
                 || self.serial_view_is_active()
+                || self.battery_view_is_active()
             {
                 self.active_waveform_tab = Some(tab);
             } else {
@@ -927,12 +954,14 @@ impl WaveCraftApp {
             if !self.system_trace_view_is_active()
                 && !self.vna_view_is_active()
                 && !self.serial_view_is_active()
+                && !self.battery_view_is_active()
             {
                 match views[0] {
                     WorkspaceView::Waveform(tab) => self.select_waveform_tab(tab),
                     WorkspaceView::Vna => self.select_vna_view(),
                     WorkspaceView::SystemTrace => self.select_system_trace_view(),
                     WorkspaceView::Serial => self.select_serial_view(),
+                    WorkspaceView::Battery => self.select_battery_view(),
                 }
             }
         }
@@ -1324,6 +1353,7 @@ mod tests {
                 WorkspaceView::Waveform(WaveformTab::Combined),
                 WorkspaceView::Vna,
                 WorkspaceView::Serial,
+                WorkspaceView::Battery,
             ]
         );
         remove_test_repository(&repository);

@@ -8,10 +8,11 @@ pub(crate) enum WorkspaceView {
     Vna,
     SystemTrace,
     Serial,
+    Battery,
 }
 
 impl WorkspaceView {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Waveform(WaveformTab::LogicAnalyzer),
         Self::Waveform(WaveformTab::Oscilloscope),
         Self::Waveform(WaveformTab::RadioReceiver),
@@ -19,6 +20,7 @@ impl WorkspaceView {
         Self::Vna,
         Self::SystemTrace,
         Self::Serial,
+        Self::Battery,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -27,6 +29,7 @@ impl WorkspaceView {
             Self::Vna => "VNA",
             Self::SystemTrace => "System Trace",
             Self::Serial => "Serial / UART",
+            Self::Battery => "Battery",
         }
     }
 }
@@ -270,6 +273,7 @@ pub(crate) fn workspace_views(waveform_tabs: &[WaveformTab]) -> Vec<WorkspaceVie
             WorkspaceView::Vna,
             WorkspaceView::SystemTrace,
             WorkspaceView::Serial,
+            WorkspaceView::Battery,
         ])
         .collect()
 }
@@ -302,7 +306,8 @@ mod tests {
             vec![
                 WorkspaceView::Vna,
                 WorkspaceView::SystemTrace,
-                WorkspaceView::Serial
+                WorkspaceView::Serial,
+                WorkspaceView::Battery,
             ]
         );
         assert_eq!(
@@ -312,6 +317,7 @@ mod tests {
                 WorkspaceView::Vna,
                 WorkspaceView::SystemTrace,
                 WorkspaceView::Serial,
+                WorkspaceView::Battery,
             ]
         );
     }
@@ -332,6 +338,7 @@ mod tests {
                 WorkspaceView::Waveform(WaveformTab::Combined),
                 WorkspaceView::Vna,
                 WorkspaceView::Serial,
+                WorkspaceView::Battery,
             ]
         );
         assert!(!layout.take_layout_changed());

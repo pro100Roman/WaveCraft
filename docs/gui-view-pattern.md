@@ -3,7 +3,7 @@
 All workspaces use the same instrument chrome, based on the LA/OSC layout.
 `apps/wavecraft-gui/src/ui/view_shell.rs` owns visual structure; individual
 views own their settings editors, plot painters, and domain actions. This
-applies equally to LA, OSC, RF, Combined, VNA, System Trace, and Serial.
+applies equally to LA, OSC, RF, Combined, VNA, System Trace, Serial, and Battery.
 
 ## Components
 
@@ -143,3 +143,83 @@ Do not start another view-local `instrument_frame`, toolbar header, or settings
 panel frame. Keep the shell free of application state, capture operations,
 backend imports and worker ownership. The related repository-wide rule lives
 in `AGENTS.md`; broader ownership work is described in `gui-modularization.md`.
+
+
+## Battery lifetime workspace
+
+Battery uses the shared toolbar, setup adapter, settings card, central view card,
+Snapshot path, and bottom status messages. `Calc` occupies the primary acquisition
+position on the right; Load and Save file export the complete analysis as a
+versioned `wavecraft-battery` JSON document. The pinned Save settings footer saves
+the edited parameters into the application's global settings. Editing parameters
+retains the previous result with a visible recalculation reminder; loading a file
+clears the old result. Failed loads retain the current analysis.
+
+![Battery lifetime view](images/battery-view.png)
+
+[Example analysis](examples/battery-analysis.json) contains a Li-ion 18650 model
+and a repeating 100 mW / 100 ms, 1 mW / 900 ms consumption cycle. The native view
+supports wheel zoom on time, Ctrl/Cmd + wheel zoom on both axes, dragging to pan,
+and Fit by button or double-click. Axis labels and hover readouts are selectable.
+
+### Curve representation and approximation
+
+`src/battery.rs` owns the calculation without UI or hardware dependencies.
+All curves express `V(x) = V_initial × f(x)`, with `x` the fraction of rated
+capacity already discharged, from 0 to 1. The voltage input is the **initial/full
+voltage**, rather than nominal voltage. Cutoff is independent of the discharge
+function: increasing cutoff stops at an earlier point on the same curve.
+
+The chemistry defaults use a bounded empirical exponential/linear/knee shape:
+
+```text
+f(x) = 1 - (1 - V_end / V_full) × g(x)
+g(x) = a × (1 - exp(-20x)) / (1 - exp(-20))
+       + b × x + (1 - a - b) × x^k
+```
+
+`V_full`, `V_end`, `a`, `b`, and `k` select an illustrative shape per chemistry;
+these coefficients are engineering starting points, not manufacturer fits or a
+universal standard. Size is a freely editable label and does not silently change
+capacity or pack voltage. Actual voltage, capacity, and cutoff must describe the
+chosen cell or pack. For a pack, enter its aggregate voltage and capacity.
+
+For future measured curves, start with a **degree 5 polynomial** on normalized
+`x ∈ [0,1]`, keeping coefficients in ascending power order. This is a practical
+starting recommendation, not an assurance of fit quality: compare residuals and
+check monotonicity, especially near the end knee. Degrees 1–5 are editable.
+The initial polynomial is a monotone seed, not a fit of the default curve.
+
+The measured-table option already accepts 2–256 ordered `[x, V/V_initial]` points
+with linear interpolation, retaining exact samples for future fitting. A later
+monotone cubic (PCHIP) interpolator would preserve knees without high-degree
+polynomial oscillations. Tabulated voltage as a function of charge state is also
+an established modeling approach; see the [MathWorks table-based battery model](https://www.mathworks.com/help/simscape-battery/ref/batterytablebased.html).
+The current polynomial is checked over a 4096-interval grid; table ordering and
+monotonicity are checked at every knot.
+
+### Load and lifetime calculation
+
+The 1–50 patterns execute sequentially and repeat. Power is constant within each
+pattern and refers to battery-side mW; duration is a floating-point ms value.
+Zero-power sleep is supported, while an entirely zero-energy cycle is rejected.
+The solver locates cutoff by bisection, integrates `V(q) dq` in mWh over up to
+4096 intervals, then inverts the repeating load's cumulative energy to obtain
+time. It skips whole cycles algebraically and resolves the final partial pattern,
+so a low-duty-cycle device does not require billions of time steps. At an exact
+energy boundary it stops at the consuming pattern, before a trailing sleep.
+The plotted curve is a bounded sampled envelope; individual short pulses may
+not be visually resolved across a long lifetime.
+
+The result reports hours, days, usable mWh, average mW, and whether cutoff or
+rated capacity ended the run. This ideal energy model excludes self-discharge,
+aging, temperature, converter losses, current-dependent capacity (including
+Peukert effects), recovery, and internal-resistance voltage sag. These require
+additional measured parameters and should be separate future model extensions.
+
+JSON import validates the format/version, finite values, curve domain, and load
+limits before changing the view. Reads are capped at 1 MiB, and floating-point
+values round-trip without losing coefficient precision. Tests cover analytical
+constant and declining voltage cases, duration-weighted loads, partial cycles,
+sleep, every chemistry/curve combination, invalid data, JSON round trips,
+workspace migration/persistence, graph interactions, and the shared shell.

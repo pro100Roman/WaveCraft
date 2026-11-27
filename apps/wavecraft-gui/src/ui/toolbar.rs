@@ -25,6 +25,10 @@ impl WaveCraftApp {
         frame: &FrameState,
         actions: &mut FrameActions,
     ) {
+        if self.battery_view_is_active() {
+            self.paint_battery_toolbar(context, actions);
+            return;
+        }
         if self.serial_view_is_active() {
             self.paint_serial_toolbar(context, actions);
             return;

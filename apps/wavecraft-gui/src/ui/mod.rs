@@ -2,6 +2,7 @@
 //! that applies what the user did in them. Split out of the application module.
 
 pub mod app_windows;
+pub mod battery;
 pub mod capture_settings_panel;
 pub mod capture_setup_panel;
 pub mod central_panel;

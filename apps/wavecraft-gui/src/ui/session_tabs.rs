@@ -141,6 +141,7 @@ impl WaveCraftApp {
         if self.system_trace_view_is_active()
             || self.vna_view_is_active()
             || self.serial_view_is_active()
+            || self.battery_view_is_active()
         {
             return;
         }

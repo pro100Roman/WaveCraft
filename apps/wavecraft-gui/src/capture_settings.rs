@@ -12,7 +12,7 @@ const SETTINGS_FILE_NAME: &str = "capture-settings.json";
 /// Global settings describe application-wide behavior. Capture profiles can
 /// also back named, user-selected profile files later. Keeping instrument
 /// values as stable string keys avoids coupling them to private GUI types.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CaptureSettingsDocument {
     pub(crate) format_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -34,8 +34,10 @@ impl Default for CaptureSettingsDocument {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct GlobalSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) battery: Option<crate::battery::BatterySettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) serial: Option<crate::serial::SerialSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +105,7 @@ pub(crate) enum SavedWorkspaceView {
     Vna,
     SystemTrace,
     Serial,
+    Battery,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
