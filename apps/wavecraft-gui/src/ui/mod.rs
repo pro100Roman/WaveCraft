@@ -10,6 +10,7 @@ pub mod decoded_panel;
 pub mod dialogs;
 pub mod frame_actions;
 pub mod frame_state;
+pub(crate) mod manual_value;
 mod plot_hover;
 pub mod protocol_analyzer_dialog;
 pub mod radio_settings;

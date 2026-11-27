@@ -16,6 +16,8 @@ Every left setup panel must include the template's collapse/expand control and p
 
 Operational status and errors belong in the common bottom message area in `ui/status_bar.rs`, including view-specific connection and Serial errors. Adapt a view's state through `active_view_status`; do not paint operational messages in toolbars, setup panels, or over plots. All informational text (including status, errors, labels, and tooltips) must support text selection and native keyboard copying (Cmd+C / Ctrl+C); keep `style.interaction.selectable_labels` enabled and do not add dedicated message-copy buttons. Keep errors visible when settings are collapsed. Plot annotations, data quality counters, empty-state guidance, and actionable confirmation dialogs remain local to their content.
 
+Numeric parameters must use manual keyboard entry by default. Never add horizontal mouse dragging, value scrubbing, or sliders to change a parameter unless the user explicitly requests that interaction for the specific control. Use `ui/manual_value.rs` (`ManualValue`) for compact numeric fields instead of using `egui::DragValue` directly; it preserves typed input, precision, and bounds while ignoring pointer drags. This rule applies to every workspace and future UI work.
+
 The shell must stay independent of `WaveCraftApp`, capture lifecycle, and hardware drivers. Views supply their controls/content and retain domain state; apply requested actions through the existing application orchestration. See `docs/gui-view-pattern.md` for the component contract, extension recipe, and verification expectations.
 
 ## Build, Test, and Development Commands

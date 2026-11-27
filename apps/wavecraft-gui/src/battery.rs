@@ -1,12 +1,16 @@
-//! UI-independent, bounded energy integration for a repeating constant-power load.
+//! UI-independent, bounded integration for repeating power/current load patterns.
 //! Curves describe open-circuit V/V_initial versus discharged capacity (0..1).
+
+pub(crate) mod units;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use units::{CapacityUnit, CurrentUnit, PowerUnit, TimeUnit, VoltageUnit};
 
 pub(crate) const MAX_PATTERNS: usize = 50;
+pub(crate) const MAX_PATTERN_NAME_CHARS: usize = 128;
 const STEPS: usize = 4096;
-const HOURS_PER_YEAR: f64 = 365.25 * 24.0;
+pub(crate) const HOURS_PER_YEAR: f64 = 365.25 * 24.0;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,10 +126,67 @@ impl CurveKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LoadKind {
+    #[default]
+    Power,
+    Current,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LoadPattern {
+    #[serde(default)]
+    pub(crate) name: String,
     pub(crate) power_mw: f64,
+    #[serde(default)]
+    pub(crate) current_ma: f64,
+    #[serde(default)]
+    pub(crate) load_kind: LoadKind,
+    #[serde(default)]
+    pub(crate) power_unit: PowerUnit,
+    #[serde(default)]
+    pub(crate) current_unit: CurrentUnit,
     pub(crate) duration_ms: f64,
+    #[serde(default)]
+    pub(crate) duration_unit: TimeUnit,
+}
+
+impl Default for LoadPattern {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            power_mw: 1.0,
+            current_ma: 0.0,
+            load_kind: LoadKind::Power,
+            power_unit: PowerUnit::default(),
+            current_unit: CurrentUnit::default(),
+            duration_ms: 1000.0,
+            duration_unit: TimeUnit::default(),
+        }
+    }
+}
+
+impl LoadPattern {
+    pub(crate) fn power_at(&self, voltage: f64) -> f64 {
+        match self.load_kind {
+            LoadKind::Power => self.power_mw,
+            LoadKind::Current => self.current_ma * voltage,
+        }
+    }
+
+    pub(crate) fn set_kind(&mut self, kind: LoadKind, initial_voltage: f64) {
+        if kind == self.load_kind {
+            return;
+        }
+        if initial_voltage.is_finite() && initial_voltage > 0.0 {
+            match kind {
+                LoadKind::Current => self.current_ma = self.power_mw / initial_voltage,
+                LoadKind::Power => self.power_mw = self.current_ma * initial_voltage,
+            }
+        }
+        self.load_kind = kind;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -134,6 +195,10 @@ pub(crate) struct BatterySettings {
     pub(crate) size: String,
     pub(crate) initial_voltage: f64,
     pub(crate) capacity_mah: f64,
+    #[serde(default)]
+    pub(crate) voltage_unit: VoltageUnit,
+    #[serde(default)]
+    pub(crate) capacity_unit: CapacityUnit,
     /// Calendar capacity fade, compounded annually from the start of this run.
     #[serde(default)]
     pub(crate) aging_percent_per_year: f64,
@@ -157,6 +222,8 @@ impl Default for BatterySettings {
             size: "18650".into(),
             initial_voltage: 4.2,
             capacity_mah: 2600.0,
+            voltage_unit: VoltageUnit::default(),
+            capacity_unit: CapacityUnit::default(),
             aging_percent_per_year: 0.0,
             self_discharge_percent_per_year: 0.0,
             cutoff_voltage: 3.0,
@@ -166,12 +233,16 @@ impl Default for BatterySettings {
             table: Vec::new(),
             patterns: vec![
                 LoadPattern {
+                    name: "Active".into(),
                     power_mw: 100.0,
                     duration_ms: 100.0,
+                    ..LoadPattern::default()
                 },
                 LoadPattern {
+                    name: "Sleep".into(),
                     power_mw: 1.0,
                     duration_ms: 900.0,
+                    ..LoadPattern::default()
                 },
             ],
         };
@@ -316,18 +387,26 @@ impl BatterySettings {
         let mut duration = 0.0;
         let mut energy = 0.0;
         for (index, pattern) in self.patterns.iter().enumerate() {
+            if pattern.name.chars().count() > MAX_PATTERN_NAME_CHARS {
+                return Err(format!(
+                    "Pattern {} name must contain at most {MAX_PATTERN_NAME_CHARS} characters",
+                    index + 1
+                ));
+            }
             if !pattern.power_mw.is_finite()
                 || pattern.power_mw < 0.0
+                || !pattern.current_ma.is_finite()
+                || pattern.current_ma < 0.0
                 || !pattern.duration_ms.is_finite()
                 || pattern.duration_ms <= 0.0
             {
                 return Err(format!(
-                    "Pattern {} requires finite power ≥ 0 mW and duration > 0 ms",
+                    "Pattern {} requires finite power/current ≥ 0 and duration > 0 ms",
                     index + 1
                 ));
             }
             duration += pattern.duration_ms / 3_600_000.0;
-            energy += pattern.power_mw * (pattern.duration_ms / 3_600_000.0);
+            energy += pattern.power_at(self.initial_voltage) * (pattern.duration_ms / 3_600_000.0);
         }
         if !duration.is_finite()
             || duration <= 0.0
@@ -342,11 +421,47 @@ impl BatterySettings {
         Ok((duration, energy))
     }
 
+    fn same_calculation_as(&self, other: &Self) -> bool {
+        (
+            self.chemistry,
+            self.initial_voltage,
+            self.capacity_mah,
+            self.aging_percent_per_year,
+            self.self_discharge_percent_per_year,
+            self.cutoff_voltage,
+            self.curve,
+            self.polynomial_degree,
+            &self.coefficients,
+            &self.table,
+        ) == (
+            other.chemistry,
+            other.initial_voltage,
+            other.capacity_mah,
+            other.aging_percent_per_year,
+            other.self_discharge_percent_per_year,
+            other.cutoff_voltage,
+            other.curve,
+            other.polynomial_degree,
+            &other.coefficients,
+            &other.table,
+        ) && self.patterns.len() == other.patterns.len()
+            && self.patterns.iter().zip(&other.patterns).all(|(a, b)| {
+                a.duration_ms == b.duration_ms
+                    && a.load_kind == b.load_kind
+                    && match a.load_kind {
+                        LoadKind::Power => a.power_mw == b.power_mw,
+                        LoadKind::Current => a.current_ma == b.current_ma,
+                    }
+            })
+    }
+
     pub(crate) fn add_pattern(&mut self) {
         if self.patterns.len() < MAX_PATTERNS {
             self.patterns.push(LoadPattern {
+                name: format!("Pattern {}", self.patterns.len() + 1),
                 power_mw: 1.0,
                 duration_ms: 1000.0,
+                ..LoadPattern::default()
             });
         }
     }
@@ -356,6 +471,8 @@ impl BatterySettings {
 pub(crate) struct BatteryResult {
     /// [hours, volts]. At most STEPS + 1 points, independent of lifetime.
     pub(crate) points: Vec<[f64; 2]>,
+    /// Remaining SOC for each sampled point, relative to the current available capacity.
+    pub(crate) charge_remaining_percent: Vec<f64>,
     pub(crate) lifetime_hours: f64,
     pub(crate) energy_mwh: f64,
     pub(crate) average_power_mw: f64,
@@ -512,11 +629,15 @@ impl WeightedLoadCycle {
         if energy <= 0.0 {
             return 0.0;
         }
+        self.time_for_log_energy(energy.ln())
+    }
+
+    fn time_for_log_energy(&self, log_energy: f64) -> f64 {
         let rate = self.rate_per_hour;
         let cycle_exponent = rate * self.duration_hours;
         // Sum n exponentially weighted cycles, then invert the geometric series.
         let real_cycles =
-            log_one_plus_exp(energy.ln() + self.log_cycle_growth - self.log_cycle_energy)
+            log_one_plus_exp(log_energy + self.log_cycle_growth - self.log_cycle_energy)
                 / cycle_exponent;
         let mut cycles = real_cycles.floor();
         let mut fraction = real_cycles - cycles;
@@ -525,7 +646,7 @@ impl WeightedLoadCycle {
             fraction = 1.0;
         }
         let mut log_remaining = if cycles == 0.0 {
-            energy.ln()
+            log_energy
         } else {
             self.log_cycle_energy + log_expm1(fraction * cycle_exponent) - self.log_cycle_growth
         };
@@ -594,8 +715,13 @@ pub(crate) fn calculate(settings: &BatterySettings) -> Result<BatteryResult, Str
         }
         end = (low + high) * 0.5;
     }
-    if settings.self_discharge_percent_per_year > 0.0 {
-        return calculate_with_self_discharge(settings, cycle, end, cutoff_reached);
+    if settings.self_discharge_percent_per_year > 0.0
+        || settings
+            .patterns
+            .iter()
+            .any(|pattern| pattern.load_kind == LoadKind::Current)
+    {
+        return calculate_with_charge_intervals(settings, cycle, end, cutoff_reached);
     }
     let dq = settings.capacity_mah * end / STEPS as f64;
     let mut energy = 0.0;
@@ -621,6 +747,9 @@ pub(crate) fn calculate(settings: &BatterySettings) -> Result<BatteryResult, Str
     }
     Ok(BatteryResult {
         points,
+        charge_remaining_percent: (0..=STEPS)
+            .map(|i| 100.0 * (1.0 - end * i as f64 / STEPS as f64).max(0.0))
+            .collect(),
         lifetime_hours,
         energy_mwh: energy,
         average_power_mw: cycle.1 / cycle.0,
@@ -628,11 +757,11 @@ pub(crate) fn calculate(settings: &BatterySettings) -> Result<BatteryResult, Str
     })
 }
 
-/// Charge-domain integration: S' = -P(t)/(C₀ V(S) H(t)) - s S.
-/// Freeze voltage at each small charge interval's midpoint and integrate the
-/// resulting linear ODE exactly. Both the periodic load and exponential losses
-/// are resolved analytically within each of the bounded intervals.
-fn calculate_with_self_discharge(
+/// Charge-domain integration: S' = -P(t,S)/(C₀ V(S) H(t)) - s S.
+/// Hold voltage at each small charge interval's endpoint mean. Constant-current
+/// patterns then supply P = I × V, while power patterns retain constant P.
+/// Weighted periodic-load integrals retain exact pattern timing within a bin.
+fn calculate_with_charge_intervals(
     settings: &BatterySettings,
     cycle: (f64, f64),
     end: f64,
@@ -640,8 +769,16 @@ fn calculate_with_self_discharge(
 ) -> Result<BatteryResult, String> {
     let loss = annual_loss_rate(settings.self_discharge_percent_per_year);
     let growth = loss + annual_loss_rate(settings.aging_percent_per_year);
-    let clock = WeightedLoadCycle::new(settings, cycle.0, growth)
-        .ok_or_else(|| "Self-discharge rate is too small to calculate".to_owned())?;
+    let has_current = settings
+        .patterns
+        .iter()
+        .any(|p| p.load_kind == LoadKind::Current);
+    let mut effective = settings.clone();
+    for (target, original) in effective.patterns.iter_mut().zip(&settings.patterns) {
+        target.power_mw = original.power_at(settings.initial_voltage);
+        target.load_kind = LoadKind::Power;
+    }
+    let base_clock = WeightedLoadCycle::new(&effective, cycle.0, growth);
     let mut reference_energy = 0.0;
     let mut voltages = Vec::with_capacity(STEPS + 1);
     let mut previous = settings.initial_voltage;
@@ -657,18 +794,22 @@ fn calculate_with_self_discharge(
         return Err("Values are too large or too small for a finite lifetime calculation".into());
     }
     let upper = if cycle.1 > 0.0 {
-        let unaged = time_for_energy(settings, reference_energy, cycle);
-        // V ≤ V_initial: a constant-full-voltage cell is an upper bound on
-        // lifetime. This keeps root precision tight for decades-long low loads.
-        let full_voltage_bound =
-            clock.time_for_energy(settings.capacity_mah * settings.initial_voltage);
-        let charge_loss_bound = if end < 1.0 {
+        let unaged_energy = if has_current {
+            settings.capacity_mah * settings.initial_voltage * end
+        } else {
+            reference_energy
+        };
+        let unaged = time_for_energy(&effective, unaged_energy, cycle);
+        let full_voltage_bound = base_clock.as_ref().map_or(f64::INFINITY, |clock| {
+            clock.time_for_energy(settings.capacity_mah * settings.initial_voltage)
+        });
+        let charge_loss_bound = if loss > 0.0 && end < 1.0 {
             -(-end).ln_1p() / loss
         } else {
             f64::INFINITY
         };
         unaged.min(full_voltage_bound).min(charge_loss_bound)
-    } else if end < 1.0 {
+    } else if loss > 0.0 && end < 1.0 {
         -(-end).ln_1p() / loss
     } else {
         return Err("Self-discharge alone approaches zero charge asymptotically; use a cutoff above the curve's empty voltage or add a consuming pattern".into());
@@ -679,16 +820,61 @@ fn calculate_with_self_discharge(
     let mut points = Vec::with_capacity(STEPS + 1);
     points.push([0.0, settings.initial_voltage]);
     let mut hours = 0.0;
+    let mut delivered = 0.0;
     for i in 1..=STEPS {
         let soc_before = 1.0 - end * (i - 1) as f64 / STEPS as f64;
         let soc_after = (1.0 - end * i as f64 / STEPS as f64).max(0.0);
+        let voltage = (voltages[i - 1] + voltages[i]) * 0.5;
+        if has_current {
+            for (target, original) in effective.patterns.iter_mut().zip(&settings.patterns) {
+                target.power_mw = original.power_at(voltage);
+            }
+        }
+        let interval_cycle = if has_current {
+            (
+                cycle.0,
+                effective
+                    .patterns
+                    .iter()
+                    .map(|p| p.power_mw * (p.duration_ms / 3_600_000.0))
+                    .sum(),
+            )
+        } else {
+            cycle
+        };
+        let interval_clock = if has_current {
+            WeightedLoadCycle::new(&effective, cycle.0, growth)
+        } else {
+            None
+        };
+        let clock = interval_clock.as_ref().or(base_clock.as_ref());
+        let previous_hours = hours;
         if cycle.1 == 0.0 {
             hours = -(-end * i as f64 / STEPS as f64).ln_1p() / loss;
+        } else if loss == 0.0 {
+            let interval_energy = voltage * dq;
+            hours = if let Some(clock) = clock {
+                clock.time_for_log_energy(log_sum_exp(
+                    clock.log_energy_until(hours),
+                    interval_energy.ln(),
+                ))
+            } else {
+                time_for_energy(
+                    &effective,
+                    delivered_energy(&effective, hours, interval_cycle) + interval_energy,
+                    interval_cycle,
+                )
+            };
         } else {
-            let log_capacity_voltage =
-                settings.capacity_mah.ln() + ((voltages[i - 1] + voltages[i]) * 0.5).ln();
+            let log_capacity_voltage = settings.capacity_mah.ln() + voltage.ln();
+            let log_energy_until = |time| {
+                clock.map_or_else(
+                    || delivered_energy(&effective, time, interval_cycle).ln(),
+                    |clock| clock.log_energy_until(time),
+                )
+            };
             let target = log_sum_exp(
-                clock.log_energy_until(hours),
+                log_energy_until(hours),
                 log_capacity_voltage + soc_before.ln() + loss * hours,
             );
             let mut low = hours;
@@ -696,7 +882,7 @@ fn calculate_with_self_discharge(
             for _ in 0..48 {
                 let middle = low + (high - low) * 0.5;
                 let consumed = log_sum_exp(
-                    clock.log_energy_until(middle),
+                    log_energy_until(middle),
                     log_capacity_voltage + soc_after.ln() + loss * middle,
                 );
                 if consumed < target {
@@ -707,17 +893,29 @@ fn calculate_with_self_discharge(
             }
             hours = low + (high - low) * 0.5;
         }
+        if !hours.is_finite() || hours < previous_hours {
+            return Err("Values do not produce a finite ordered discharge curve".into());
+        }
+        delivered += (delivered_energy(&effective, hours, interval_cycle)
+            - delivered_energy(&effective, previous_hours, interval_cycle))
+        .max(0.0);
         points.push([hours, voltages[i]]);
     }
-    let energy = delivered_energy(settings, hours, cycle);
-    if !hours.is_finite() || hours <= 0.0 || !energy.is_finite() {
+    if !hours.is_finite() || hours <= 0.0 || !delivered.is_finite() {
         return Err("Values do not produce a finite lifetime".into());
     }
     Ok(BatteryResult {
         points,
+        charge_remaining_percent: (0..=STEPS)
+            .map(|i| 100.0 * (1.0 - end * i as f64 / STEPS as f64).max(0.0))
+            .collect(),
         lifetime_hours: hours,
-        energy_mwh: energy,
-        average_power_mw: cycle.1 / cycle.0,
+        energy_mwh: delivered,
+        average_power_mw: if has_current {
+            delivered / hours
+        } else {
+            cycle.1 / cycle.0
+        },
         cutoff_reached,
     })
 }
@@ -734,7 +932,15 @@ pub(crate) fn encode(settings: &BatterySettings) -> Result<String, String> {
     settings.validate()?;
     serde_json::to_string_pretty(&BatteryDocument {
         format: "wavecraft-battery".into(),
-        version: 1,
+        version: if settings
+            .patterns
+            .iter()
+            .any(|p| p.load_kind == LoadKind::Current)
+        {
+            2
+        } else {
+            1
+        },
         settings: settings.clone(),
     })
     .map_err(|error| error.to_string())
@@ -746,8 +952,17 @@ pub(crate) fn decode(json: &str) -> Result<BatterySettings, String> {
     }
     let document: BatteryDocument =
         serde_json::from_str(json).map_err(|error| error.to_string())?;
-    if document.format != "wavecraft-battery" || document.version != 1 {
+    if document.format != "wavecraft-battery" || ![1, 2].contains(&document.version) {
         return Err("Unsupported battery file format or version".into());
+    }
+    if document.version == 1
+        && document
+            .settings
+            .patterns
+            .iter()
+            .any(|p| p.load_kind == LoadKind::Current)
+    {
+        return Err("Constant-current patterns require battery file version 2".into());
     }
     document.settings.validate()?;
     Ok(document.settings)
@@ -804,7 +1019,7 @@ impl BatteryState {
     pub(crate) fn is_stale(&self) -> bool {
         self.calculated_settings
             .as_ref()
-            .is_some_and(|s| s != &self.settings)
+            .is_some_and(|s| !s.same_calculation_as(&self.settings))
     }
 }
 
@@ -821,8 +1036,10 @@ mod tests {
             polynomial_degree: 1,
             coefficients: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             patterns: vec![LoadPattern {
+                name: String::new(),
                 power_mw: power,
                 duration_ms: 1000.0,
+                ..LoadPattern::default()
             }],
             ..BatterySettings::default()
         }
@@ -853,12 +1070,16 @@ mod tests {
         let mut settings = constant(1.0, 0.75, 1.0);
         settings.patterns = vec![
             LoadPattern {
+                name: String::new(),
                 power_mw: 1.0,
                 duration_ms: 1_800_000.0,
+                ..LoadPattern::default()
             },
             LoadPattern {
+                name: String::new(),
                 power_mw: 0.0,
                 duration_ms: 1_800_000.0,
+                ..LoadPattern::default()
             },
         ];
         assert!((calculate(&settings).unwrap().lifetime_hours - 1.25).abs() < 1e-10);
@@ -873,12 +1094,16 @@ mod tests {
         let mut settings = constant(1.0, 1.0, 1.0);
         settings.patterns = vec![
             LoadPattern {
+                name: String::new(),
                 power_mw: 2.5,
                 duration_ms: 0.25,
+                ..LoadPattern::default()
             },
             LoadPattern {
+                name: String::new(),
                 power_mw: 0.5,
                 duration_ms: 0.75,
+                ..LoadPattern::default()
             },
         ];
         let result = calculate(&settings).unwrap();
@@ -920,12 +1145,16 @@ mod tests {
         settings.aging_percent_per_year = 20.0;
         settings.patterns = vec![
             LoadPattern {
+                name: String::new(),
                 power_mw: 1.0,
                 duration_ms: half_year * 3_600_000.0,
+                ..LoadPattern::default()
             },
             LoadPattern {
+                name: String::new(),
                 power_mw: 0.0,
                 duration_ms: half_year * 3_600_000.0,
+                ..LoadPattern::default()
             },
         ];
         let aged = calculate(&settings).unwrap();
@@ -1024,12 +1253,16 @@ mod tests {
         settings.aging_percent_per_year = 20.0;
         settings.patterns = vec![
             LoadPattern {
+                name: String::new(),
                 power_mw: 0.0,
                 duration_ms: 2.0 * HOURS_PER_YEAR * 3_600_000.0,
+                ..LoadPattern::default()
             },
             LoadPattern {
+                name: String::new(),
                 power_mw: 1.0,
                 duration_ms: 1.0,
+                ..LoadPattern::default()
             },
         ];
         let result = calculate(&settings).unwrap();
@@ -1101,12 +1334,16 @@ mod tests {
         pulsed.self_discharge_percent_per_year = 20.0;
         pulsed.patterns = vec![
             LoadPattern {
+                name: String::new(),
                 power_mw: 1.0,
                 duration_ms: half_year * 3_600_000.0,
+                ..LoadPattern::default()
             },
             LoadPattern {
+                name: String::new(),
                 power_mw: 0.0,
                 duration_ms: half_year * 3_600_000.0,
+                ..LoadPattern::default()
             },
         ];
         assert!((calculate(&pulsed).unwrap().lifetime_hours / half_year - 1.0).abs() < 1e-8);
@@ -1205,6 +1442,179 @@ mod tests {
             settings.table = table;
             assert!(calculate(&settings).is_err());
         }
+    }
+
+    #[test]
+    fn constant_current_tracks_charge_and_voltage_independently() {
+        let mut settings = constant(4.0, 1000.0, 1.0);
+        settings.cutoff_voltage = 3.0;
+        settings.coefficients[1] = -0.5;
+        settings.patterns = vec![LoadPattern {
+            load_kind: LoadKind::Current,
+            current_ma: 10.0,
+            power_mw: 0.0,
+            ..LoadPattern::default()
+        }];
+        let result = calculate(&settings).unwrap();
+        assert!(
+            (result.lifetime_hours - 50.0).abs() < 1e-7,
+            "{}",
+            result.lifetime_hours
+        );
+        assert!((result.energy_mwh - 1750.0).abs() < 1e-5);
+        assert!((result.charge_remaining_percent.last().unwrap() - 50.0).abs() < 1e-9);
+        assert_eq!(result.charge_remaining_percent.len(), result.points.len());
+    }
+
+    #[test]
+    fn mixed_current_and_power_loads_stop_inside_the_correct_pattern() {
+        let mut settings = constant(2.0, 80.0, 10.0);
+        settings.patterns = vec![
+            LoadPattern {
+                load_kind: LoadKind::Current,
+                current_ma: 100.0,
+                duration_ms: 1_800_000.0,
+                ..LoadPattern::default()
+            },
+            LoadPattern {
+                power_mw: 10.0,
+                duration_ms: 1_800_000.0,
+                ..LoadPattern::default()
+            },
+        ];
+        let result = calculate(&settings).unwrap();
+        assert!(
+            (result.lifetime_hours - 1.275).abs() < 1e-9,
+            "{}",
+            result.lifetime_hours
+        );
+        assert!((result.energy_mwh - 160.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn constant_current_with_both_annual_losses_matches_the_analytical_solution() {
+        let mut settings = constant(4.0, HOURS_PER_YEAR * 10.0, 1.0);
+        settings.patterns = vec![LoadPattern {
+            load_kind: LoadKind::Current,
+            current_ma: 1.0,
+            ..LoadPattern::default()
+        }];
+        for (aging, discharge) in [(0.0, 0.0), (10.0, 0.0), (0.0, 20.0), (10.0, 20.0)] {
+            settings.aging_percent_per_year = aging;
+            settings.self_discharge_percent_per_year = discharge;
+            let rate = annual_loss_rate(aging) + annual_loss_rate(discharge);
+            let expected = if rate > 0.0 {
+                (rate * settings.capacity_mah).ln_1p() / rate
+            } else {
+                settings.capacity_mah
+            };
+            let result = calculate(&settings).unwrap();
+            assert!(
+                (result.lifetime_hours / expected - 1.0).abs() < 1e-8,
+                "{aging}/{discharge}: {} != {expected}",
+                result.lifetime_hours
+            );
+            assert!(result.points.windows(2).all(|p| p[1][0] >= p[0][0]));
+        }
+    }
+
+    #[test]
+    fn switching_units_preserves_canonical_values_results_and_saved_preferences() {
+        use units::DisplayUnit;
+        let mut state = BatteryState::default();
+        state.calculate();
+        let before = state.result.as_ref().unwrap().points.clone();
+        state.settings.voltage_unit = VoltageUnit::Millivolts;
+        state.settings.capacity_unit = CapacityUnit::AmpHours;
+        state.settings.patterns[0].power_unit = PowerUnit::Microwatts;
+        state.settings.patterns[0].current_unit = CurrentUnit::Amps;
+        state.settings.patterns[0].duration_unit = TimeUnit::Nanoseconds;
+        assert_eq!(state.settings.initial_voltage, 4.2);
+        assert_eq!(
+            state
+                .settings
+                .capacity_unit
+                .to_display(state.settings.capacity_mah),
+            2.6
+        );
+        assert_eq!(
+            state
+                .settings
+                .voltage_unit
+                .to_display(state.settings.initial_voltage),
+            4200.0
+        );
+        assert_eq!(
+            state.settings.patterns[0].duration_unit.to_display(100.0),
+            100_000_000.0
+        );
+        assert!(!state.is_stale());
+        assert_eq!(calculate(&state.settings).unwrap().points, before);
+        assert_eq!(
+            decode(&encode(&state.settings).unwrap()).unwrap(),
+            state.settings
+        );
+        state.settings.patterns[0].set_kind(LoadKind::Current, state.settings.initial_voltage);
+        assert!(state.is_stale());
+        assert!((state.settings.patterns[0].power_at(4.2) - 100.0).abs() < 1e-10);
+
+        let mut document: serde_json::Value =
+            serde_json::from_str(&encode(&state.settings).unwrap()).unwrap();
+        assert_eq!(document["version"], 2);
+        let mut wrong_version = document.clone();
+        wrong_version["version"] = 1.into();
+        assert!(decode(&serde_json::to_string(&wrong_version).unwrap()).is_err());
+        document["version"] = 1.into();
+        let fields = document["settings"].as_object_mut().unwrap();
+        fields.remove("voltage_unit");
+        fields.remove("capacity_unit");
+        for pattern in fields["patterns"].as_array_mut().unwrap() {
+            for field in [
+                "load_kind",
+                "current_ma",
+                "power_unit",
+                "current_unit",
+                "duration_unit",
+            ] {
+                pattern.as_object_mut().unwrap().remove(field);
+            }
+        }
+        let legacy = decode(&serde_json::to_string(&document).unwrap()).unwrap();
+        assert_eq!(legacy.voltage_unit, VoltageUnit::Volts);
+        assert_eq!(legacy.capacity_unit, CapacityUnit::MilliampHours);
+        assert!(legacy
+            .patterns
+            .iter()
+            .all(|p| p.load_kind == LoadKind::Power && p.duration_unit == TimeUnit::Milliseconds));
+    }
+
+    #[test]
+    fn pattern_names_round_trip_and_legacy_unnamed_patterns_keep_their_calculation() {
+        let mut settings = BatterySettings::default();
+        let baseline = calculate(&settings).unwrap();
+        settings.patterns[0].name = "Передавання даних".into();
+        settings.patterns[1].name = "Сон 💤".into();
+        assert_eq!(decode(&encode(&settings).unwrap()).unwrap(), settings);
+        assert_eq!(calculate(&settings).unwrap().points, baseline.points);
+
+        let mut document: serde_json::Value =
+            serde_json::from_str(&encode(&settings).unwrap()).unwrap();
+        for pattern in document["settings"]["patterns"].as_array_mut().unwrap() {
+            pattern.as_object_mut().unwrap().remove("name");
+        }
+        let legacy = decode(&serde_json::to_string(&document).unwrap()).unwrap();
+        assert!(legacy
+            .patterns
+            .iter()
+            .all(|pattern| pattern.name.is_empty()));
+        assert_eq!(calculate(&legacy).unwrap().points, baseline.points);
+
+        settings.patterns[0].name = "я".repeat(MAX_PATTERN_NAME_CHARS);
+        assert!(encode(&settings).is_ok());
+        settings.patterns[0].name.push('я');
+        assert!(encode(&settings).is_err());
+        settings.add_pattern();
+        assert_eq!(settings.patterns.last().unwrap().name, "Pattern 3");
     }
 
     #[test]

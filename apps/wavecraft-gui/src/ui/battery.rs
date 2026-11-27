@@ -2,17 +2,21 @@
 
 use super::{
     frame_actions::FrameActions,
+    manual_value::ManualValue,
     plot_hover::{paint_plot_hover, plot_hover_pointer},
     view_shell::{remaining_plot_rect, settings_card, view_card, view_toolbar, workspace_panel},
 };
 use crate::{
-    battery::{BatterySettings, BatteryState, Chemistry, CurveKind, MAX_PATTERNS},
+    battery::{
+        units::DisplayUnit, BatterySettings, BatteryState, Chemistry, CurveKind, LoadKind,
+        HOURS_PER_YEAR, MAX_PATTERNS, MAX_PATTERN_NAME_CHARS,
+    },
     egui, toolbar_action_button, RichText, SelectableHoverText, WaveCraftApp, WorkspaceView,
-    ACCENT, BACKGROUND, GRID, TEXT_MUTED,
+    ACCENT, BACKGROUND, GRID, SCOPE_COLORS, TEXT_MUTED,
 };
 
-const VALUE_FIELD_WIDTH: f32 = 92.0;
-const UNIT_COLUMN_WIDTH: f32 = 28.0;
+const VALUE_FIELD_WIDTH: f32 = 82.0;
+const UNIT_COLUMN_WIDTH: f32 = 46.0;
 
 impl WaveCraftApp {
     pub(crate) fn battery_view_is_active(&self) -> bool {
@@ -85,14 +89,18 @@ impl WaveCraftApp {
                     if ui.small_button("Fit").clicked() {
                         self.battery.bounds = None;
                     }
-                    ui.label("Time (h) / Voltage (V)");
+                    ui.label(format!(
+                        "Time (h) / Voltage ({})",
+                        self.battery.settings.voltage_unit.symbol()
+                    ));
                 });
                 if let Some(result) = &self.battery.result {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!(
-                            "Lifetime: {:.3} h · {:.3} days",
+                            "Lifetime: {:.3} h · {:.3} days · {:.3} years",
                             result.lifetime_hours,
-                            result.lifetime_hours / 24.0
+                            result.lifetime_hours / 24.0,
+                            result.lifetime_hours / HOURS_PER_YEAR
                         ));
                         ui.label(format!(
                             "Energy: {:.3} mWh · Average: {:.4} mW",
@@ -201,18 +209,18 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
             .char_limit(128)
             .hint_text("Custom size / battery model"),
     );
-    number(
+    number_with_unit(
         ui,
         "Initial / full voltage",
         &mut settings.initial_voltage,
-        " V",
+        &mut settings.voltage_unit,
         0.01,
     );
-    number(
+    number_with_unit(
         ui,
         "Rated capacity",
         &mut settings.capacity_mah,
-        " mAh",
+        &mut settings.capacity_unit,
         1.0,
     );
     number(
@@ -232,11 +240,11 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
     .on_hover_selectable_text(
         "Loss of remaining charge, including sleep. 0 disables it; range: 0 to <100%/year.",
     );
-    number(
+    number_with_unit(
         ui,
         "Discharge cutoff",
         &mut settings.cutoff_voltage,
-        " V",
+        &mut settings.voltage_unit,
         0.01,
     );
     ui.add_space(8.0);
@@ -265,21 +273,19 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
             })
             .response
     });
+    let mut curve_hint =
+        "x = discharged capacity / rated capacity (0…1). V(x) = V₀ × f(x).".to_owned();
     if settings.curve == CurveKind::Chemistry {
-        curve_response.on_hover_selectable_text("Generic exponential drop + slope + end knee. Illustrative chemistry profile; size is a label, not a measured cell model.");
+        curve_hint.push_str("\n\nGeneric exponential drop + slope + end knee. Illustrative chemistry profile; size is a label, not a measured cell model.");
     }
-    ui.label(
-        RichText::new("x = discharged capacity / rated capacity (0…1). V(x) = V₀ × f(x).")
-            .small()
-            .color(TEXT_MUTED),
-    );
+    curve_response.on_hover_selectable_text(curve_hint);
     match settings.curve {
         CurveKind::Chemistry => {}
         CurveKind::Polynomial => {
             value_row(ui, "Degree", "", |ui| {
                 ui.add_sized(
                     [VALUE_FIELD_WIDTH, ui.spacing().interact_size.y],
-                    egui::DragValue::new(&mut settings.polynomial_degree).range(1..=5),
+                    ManualValue::new(&mut settings.polynomial_degree).range(1..=5),
                 )
             });
             ui.label(RichText::new("f(x) = c₀ + c₁x + … + cₙxⁿ. Start with degree 5; verify monotonicity against measured data.")
@@ -307,16 +313,12 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
                         ui.label("x");
                         ui.add_sized(
                             field_size,
-                            egui::DragValue::new(&mut point[0])
-                                .speed(0.001)
-                                .max_decimals(5),
+                            ManualValue::new(&mut point[0]).speed(0.001).max_decimals(5),
                         );
                         ui.label("V/V₀");
                         ui.add_sized(
                             field_size,
-                            egui::DragValue::new(&mut point[1])
-                                .speed(0.001)
-                                .max_decimals(5),
+                            ManualValue::new(&mut point[1]).speed(0.001).max_decimals(5),
                         );
                         if ui.small_button("×").clicked() {
                             remove = Some(i);
@@ -364,23 +366,42 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
         ))
         .strong()
         .color(TEXT_MUTED),
-    );
-    ui.label(
-        RichText::new("Patterns run in order and repeat until cutoff or capacity exhaustion.")
-            .small()
-            .color(TEXT_MUTED),
+    )
+    .on_hover_selectable_text(
+        "Patterns run in order and repeat until cutoff or capacity exhaustion.",
     );
     let mut remove = None;
     for (i, pattern) in settings.patterns.iter_mut().enumerate() {
         ui.push_id(("load", i), |ui| {
             ui.horizontal(|ui| {
-                ui.label(format!("Pattern {}", i + 1));
-                if ui.small_button("Remove").clicked() {
-                    remove = Some(i);
-                }
+                ui.label(format!("{}.", i + 1));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(i);
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut pattern.name)
+                            .desired_width(ui.available_width())
+                            .char_limit(MAX_PATTERN_NAME_CHARS)
+                            .hint_text(format!("Pattern {} name", i + 1)),
+                    );
+                });
             });
-            number(ui, "Power", &mut pattern.power_mw, " mW", 0.1);
-            number(ui, "Duration", &mut pattern.duration_ms, " ms", 0.1);
+            let mut kind = pattern.load_kind;
+            value_row(ui, "Load", "", |ui| {
+                egui::ComboBox::from_id_salt("load_kind").width(VALUE_FIELD_WIDTH)
+                    .selected_text(match kind { LoadKind::Power => "Power", LoadKind::Current => "Current" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut kind, LoadKind::Power, "Constant power");
+                        ui.selectable_value(&mut kind, LoadKind::Current, "Constant current");
+                    }).response
+            }).on_hover_selectable_text("Power mode holds power constant as voltage changes. Current mode holds current constant. Switching modes matches consumption at the battery's initial voltage.");
+            pattern.set_kind(kind, settings.initial_voltage);
+            match pattern.load_kind {
+                LoadKind::Power => { number_with_unit(ui, "Power", &mut pattern.power_mw, &mut pattern.power_unit, 0.1); }
+                LoadKind::Current => { number_with_unit(ui, "Current", &mut pattern.current_ma, &mut pattern.current_unit, 0.1); }
+            }
+            number_with_unit(ui, "Duration", &mut pattern.duration_ms, &mut pattern.duration_unit, 0.1);
         });
         ui.separator();
     }
@@ -405,34 +426,47 @@ fn value_row(
     unit: &str,
     editor: impl FnOnce(&mut egui::Ui) -> egui::Response,
 ) -> egui::Response {
-    ui.horizontal(|ui| {
-        let label = ui.label(label);
-        let controls = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let height = ui.spacing().interact_size.y;
-            let unit = ui
-                .allocate_ui_with_layout(
-                    egui::vec2(UNIT_COLUMN_WIDTH, height),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.set_width(UNIT_COLUMN_WIDTH);
-                        ui.label(unit.trim())
-                    },
-                )
-                .inner;
-            let editor = ui
-                .allocate_ui_with_layout(
-                    egui::vec2(VALUE_FIELD_WIDTH, height),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.set_width(VALUE_FIELD_WIDTH);
-                        ui.spacing_mut().interact_size.x = VALUE_FIELD_WIDTH;
-                        editor(ui)
-                    },
-                )
-                .inner;
-            editor.union(unit)
-        });
-        label.union(controls.inner)
+    value_row_with_unit(ui, label, |ui| ui.label(unit.trim()), editor)
+}
+
+fn value_row_with_unit(
+    ui: &mut egui::Ui,
+    label: &str,
+    unit: impl FnOnce(&mut egui::Ui) -> egui::Response,
+    editor: impl FnOnce(&mut egui::Ui) -> egui::Response,
+) -> egui::Response {
+    ui.push_id(label, |ui| {
+        ui.horizontal(|ui| {
+            let label = ui.label(label);
+            let controls = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let height = ui.spacing().interact_size.y;
+                let unit = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(UNIT_COLUMN_WIDTH, height),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_width(UNIT_COLUMN_WIDTH);
+                            unit(ui)
+                        },
+                    )
+                    .inner;
+                let editor = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(VALUE_FIELD_WIDTH, height),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_width(VALUE_FIELD_WIDTH);
+                            ui.spacing_mut().interact_size.x = VALUE_FIELD_WIDTH;
+                            editor(ui)
+                        },
+                    )
+                    .inner;
+                editor.union(unit)
+            });
+            label.union(controls.inner)
+        })
+        .inner
     })
     .inner
 }
@@ -447,9 +481,66 @@ fn number(
     value_row(ui, label, unit, |ui| {
         ui.add_sized(
             [VALUE_FIELD_WIDTH, ui.spacing().interact_size.y],
-            egui::DragValue::new(value).speed(speed).max_decimals(6),
+            ManualValue::new(value).speed(speed).max_decimals(6),
         )
     })
+}
+
+fn unit_picker<U: DisplayUnit>(ui: &mut egui::Ui, unit: &mut U) -> egui::Response {
+    let previous = *unit;
+    let mut response = ui
+        .scope(|ui| {
+            ui.spacing_mut().icon_width = 6.0;
+            ui.spacing_mut().icon_spacing = 2.0;
+            ui.spacing_mut().button_padding.x = 2.0;
+            egui::ComboBox::from_id_salt("unit")
+                .width(UNIT_COLUMN_WIDTH)
+                .truncate()
+                .selected_text(unit.symbol())
+                .show_ui(ui, |ui| {
+                    for candidate in U::ALL {
+                        ui.selectable_value(unit, *candidate, candidate.symbol());
+                    }
+                })
+                .response
+        })
+        .inner;
+    if previous != *unit {
+        response.mark_changed();
+    }
+    response
+}
+
+fn number_with_unit<U: DisplayUnit>(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f64,
+    unit: &mut U,
+    speed: f64,
+) -> egui::Response {
+    let previous_unit = *unit;
+    let mut displayed = previous_unit.to_display(*value);
+    let mut edited = false;
+    let response = value_row_with_unit(
+        ui,
+        label,
+        |ui| unit_picker(ui, unit),
+        |ui| {
+            let response = ui.add_sized(
+                [VALUE_FIELD_WIDTH, ui.spacing().interact_size.y],
+                ManualValue::new(&mut displayed)
+                    .speed(speed / previous_unit.scale())
+                    .max_decimals(6),
+            );
+            edited = response.changed();
+            response
+        },
+    );
+    // A unit-only change never rescales canonical data or accumulates rounding.
+    if edited {
+        *value = previous_unit.to_canonical(displayed);
+    }
+    response
 }
 
 fn fitted_bounds(result: &crate::battery::BatteryResult) -> [f64; 4] {
@@ -563,7 +654,19 @@ fn paint_graph(ui: &mut egui::Ui, rect: egui::Rect, state: &mut BatteryState) {
             .selectable(true),
         )
         .on_hover_selectable_text(time_label);
-        let voltage_label = format!("{:.3} V", top - f64::from(fraction) * (top - bottom));
+        let voltage_precision = if state.settings.voltage_unit.scale() < 1.0 {
+            0
+        } else {
+            3
+        };
+        let voltage_value = state
+            .settings
+            .voltage_unit
+            .to_display(top - f64::from(fraction) * (top - bottom));
+        let voltage_label = format!(
+            "{voltage_value:.voltage_precision$} {}",
+            state.settings.voltage_unit.symbol()
+        );
         ui.put(
             egui::Rect::from_min_size(
                 egui::pos2(rect.left() + 2.0, y - 8.0),
@@ -594,20 +697,41 @@ fn paint_graph(ui: &mut egui::Ui, rect: egui::Rect, state: &mut BatteryState) {
     ));
     if let Some(pointer) = plot_hover_pointer(ui, &response, plot) {
         let hours = left + f64::from((pointer.x - plot.left()) / plot.width()) * (right - left);
-        if let Some(point) = result
+        if let Some((index, point)) = result
             .points
             .iter()
-            .min_by(|a, b| (a[0] - hours).abs().total_cmp(&(b[0] - hours).abs()))
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (a[0] - hours).abs().total_cmp(&(b[0] - hours).abs()))
         {
-            paint_plot_hover(
-                ui,
-                pointer,
-                plot,
-                &[
-                    (format!("Time: {:.6} h", point[0]), ACCENT),
-                    (format!("Voltage: {:.6} V", point[1]), ACCENT),
-                ],
-            );
+            let voltage_precision = if state.settings.voltage_unit.scale() < 1.0 {
+                0
+            } else {
+                2
+            };
+            let mut rows = vec![
+                ("Time:".into(), ACCENT),
+                (format!("    {:.6} h", point[0]), ACCENT),
+                (format!("    {:.6} days", point[0] / 24.0), ACCENT),
+                (
+                    format!("    {:.6} years", point[0] / HOURS_PER_YEAR),
+                    ACCENT,
+                ),
+                (
+                    format!(
+                        "Voltage: {:.voltage_precision$} {}",
+                        state.settings.voltage_unit.to_display(point[1]),
+                        state.settings.voltage_unit.symbol()
+                    ),
+                    SCOPE_COLORS[1],
+                ),
+            ];
+            if let Some(charge) = result.charge_remaining_percent.get(index) {
+                rows.push((
+                    format!("Charge remaining: {charge:.1}% (SOC)"),
+                    SCOPE_COLORS[0],
+                ));
+            }
+            paint_plot_hover(ui, pointer, plot, &rows);
         }
     }
 }
@@ -706,6 +830,111 @@ mod tests {
         let error = label(&labels, "Capacity must be finite and greater than 0 mAh");
         assert!(error.y > 800.0);
         assert!(app.battery.is_stale());
+    }
+
+    #[test]
+    fn unit_menus_preserve_values_and_hover_shows_days_years_and_charge() {
+        use crate::battery::units::{CapacityUnit, VoltageUnit};
+        let mut app = app();
+        app.select_battery_view();
+        app.battery.calculate();
+        let before = app.battery.result.as_ref().unwrap().points.clone();
+        let ctx = egui::Context::default();
+        crate::configure_style(&ctx);
+        frame(&mut app, &ctx, vec![]);
+        let (_, labels) = frame(&mut app, &ctx, vec![]);
+        click(&mut app, &ctx, label(&labels, "V"));
+        let (_, labels) = frame(&mut app, &ctx, vec![]);
+        assert!(
+            labels.iter().any(|(text, _)| text == "mV"),
+            "unit menu labels: {labels:?}"
+        );
+        click(&mut app, &ctx, label(&labels, "mV"));
+        assert_eq!(app.battery.settings.voltage_unit, VoltageUnit::Millivolts);
+        assert_eq!(app.battery.settings.initial_voltage, 4.2);
+        assert_eq!(app.battery.settings.cutoff_voltage, 3.0);
+        assert!(!app.battery.is_stale());
+        let (_, labels) = frame(&mut app, &ctx, vec![]);
+        click(&mut app, &ctx, label(&labels, "mAh"));
+        let (_, labels) = frame(&mut app, &ctx, vec![]);
+        click(&mut app, &ctx, label(&labels, "Ah"));
+        assert_eq!(app.battery.settings.capacity_unit, CapacityUnit::AmpHours);
+        assert_eq!(app.battery.settings.capacity_mah, 2600.0);
+        assert!(!app.battery.is_stale());
+        assert_eq!(app.battery.result.as_ref().unwrap().points, before);
+        let pointer = app.snapshot_plot_rect.unwrap().center();
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(pointer)]);
+        let (_, labels) = frame(&mut app, &ctx, vec![]);
+        assert!(labels.iter().any(|(text, _)| text.starts_with("Time:")
+            && text.contains("days")
+            && text.contains("years")));
+        assert!(labels
+            .iter()
+            .any(|(text, _)| text.contains("Charge remaining:") && text.contains("% (SOC)")));
+        assert!(labels
+            .iter()
+            .any(|(text, _)| text.contains("Voltage:") && text.contains("mV")));
+    }
+
+    #[test]
+    fn numeric_parameters_ignore_pointer_drags_and_accept_typed_values() {
+        fn drag(app: &mut WaveCraftApp, ctx: &egui::Context, start: egui::Pos2, offset: f32) {
+            let end = start + egui::vec2(offset, 0.0);
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(
+                app,
+                ctx,
+                vec![egui::Event::PointerMoved(start), button(start, true)],
+            );
+            frame(app, ctx, vec![egui::Event::PointerMoved(end)]);
+            frame(app, ctx, vec![button(end, false)]);
+            frame(app, ctx, vec![]);
+        }
+        fn type_value(app: &mut WaveCraftApp, ctx: &egui::Context, pos: egui::Pos2, value: &str) {
+            click(app, ctx, pos);
+            frame(app, ctx, vec![egui::Event::Text(value.into())]);
+            frame(
+                app,
+                ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        let mut app = app();
+        app.select_battery_view();
+        let ctx = egui::Context::default();
+        crate::configure_style(&ctx);
+        frame(&mut app, &ctx, vec![]);
+        let (_, labels) = frame(&mut app, &ctx, vec![]);
+        let capacity = label(&labels, "2600");
+        let before = app.battery.settings.clone();
+        for offset in [80.0, -80.0] {
+            drag(&mut app, &ctx, capacity, offset);
+        }
+        assert_eq!(app.battery.settings, before);
+        type_value(&mut app, &ctx, capacity, "2750.5");
+        assert_eq!(app.battery.settings.capacity_mah, 2750.5);
+
+        app.battery.settings.curve = CurveKind::Polynomial;
+        frame(&mut app, &ctx, vec![]);
+        let (_, labels) = frame(&mut app, &ctx, vec![]);
+        let degree = label(&labels, "5");
+        for offset in [80.0, -80.0] {
+            drag(&mut app, &ctx, degree, offset);
+        }
+        assert_eq!(app.battery.settings.polynomial_degree, 5);
+        type_value(&mut app, &ctx, degree, "3");
+        assert_eq!(app.battery.settings.polynomial_degree, 3);
     }
 
     #[test]
@@ -820,6 +1049,7 @@ mod tests {
         app.select_battery_view();
         app.battery.settings.size = "Prototype cell".into();
         app.battery.settings.patterns[0].power_mw = 0.125;
+        app.battery.settings.patterns[0].name = "Передавання даних".into();
         app.battery.settings.aging_percent_per_year = 2.75;
         app.battery.settings.self_discharge_percent_per_year = 1.25;
         app.save_setup_settings(WorkspaceView::Battery);

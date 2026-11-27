@@ -136,6 +136,16 @@ keyboard copying. The global theme enables `selectable_labels`; shared message
 labels explicitly remain selectable. Do not disable selection in local styles
 or add dedicated message-copy controls.
 
+## Numeric parameter input
+
+Numeric parameters use keyboard/manual input by default. Adding horizontal
+pointer dragging, value scrubbing, or a slider to change a parameter requires an
+explicit user request for that control. Use the shared `ui/manual_value.rs`
+`ManualValue` widget for compact fields; it retains typed editing, numeric bounds,
+formatting, and the existing fixed-width layout without changing values on drag.
+Battery uses it for battery parameters, degree and coefficients, measured-table
+points, and consumption patterns. RF numeric fields reuse the same component.
+
 ## Changes to the pattern
 
 Extend the shell for new layout capabilities and migrate affected views to it.
@@ -200,8 +210,11 @@ monotonicity are checked at every knot.
 
 ### Load and lifetime calculation
 
-The 1–50 patterns execute sequentially and repeat. Power is constant within each
-pattern and refers to battery-side mW; duration is a floating-point ms value.
+The 1–50 patterns execute sequentially and repeat. Each has an editable name
+(up to 128 characters), retained in Save settings and JSON profiles. Older files
+without names remain valid and show a numbered name placeholder. Names do not
+affect the calculation. Each pattern holds either power or current constant and
+refers to the battery side. Durations are floating-point values.
 Zero-power sleep is supported. An entirely zero-energy cycle requires positive
 self-discharge and a voltage cutoff reached before zero remaining charge.
 The solver locates cutoff by bisection, integrates `V(q) dq` in mWh over up to
@@ -212,9 +225,45 @@ energy boundary it stops at the consuming pattern, before a trailing sleep.
 The plotted curve is a bounded sampled envelope; individual short pulses may
 not be visually resolved across a long lifetime.
 
-The result reports hours, days, delivered mWh, average cycle mW, and whether
+The result reports hours, days, years, delivered mWh, average cycle mW, and whether
 cutoff or rated capacity ended the run. Delivered energy excludes energy lost to
 aging and self-discharge.
+
+### Display units, current loads, and cursor readouts
+
+Unit menus remain outside the equal-width numeric fields. The fields and unit
+menus have fixed widths, so changing the selected unit does not shift the rows.
+They support:
+
+| Quantity | Units |
+| --- | --- |
+| Pattern duration | ns, ms, s, min |
+| Initial/cutoff voltage and graph voltage | mV, V |
+| Constant current | µA, mA, A |
+| Constant power | µW, mW, W |
+| Battery capacity | mAh, Ah |
+
+Voltage and capacity menus select the battery display units; each pattern retains
+its own time, power, and current display units. The solver and saved numeric
+values retain canonical V, mAh, mW, mA, and ms. Switching a unit only changes
+presentation, preserves the physical quantity exactly, and does not invalidate
+an existing calculation. Names and units persist with the analysis.
+
+Each pattern's Load menu selects constant power or constant current. Switching
+modes initializes the other quantity using the initial battery voltage. During
+calculation, current-mode power follows `P = I × V` as voltage changes; it is
+not treated as a fixed initial-power approximation. Mixed current/power cycles,
+partial patterns, aging, and self-discharge use the same charge-domain solver.
+Constant-current files export as version 2 so older readers reject unsupported
+load semantics; version 1 profiles remain supported with V/mAh/mW/ms defaults.
+
+The graph cursor reports hours, days, and years on separate indented lines under
+one Time heading, voltage in the selected unit (two decimal places for V, whole
+mV), and remaining state of charge to one decimal place in percent. Voltage is
+blue and SOC is yellow. SOC comes from the solver's sampled charge
+coordinate, not a linear estimate from elapsed time or voltage. It is relative
+to the capacity available after calendar aging. A voltage cutoff may leave a
+positive SOC. The displayed year uses the same 365.25-day definition as aging.
 
 ### Annual aging and self-discharge
 
@@ -241,9 +290,9 @@ dS/dt = -P(t) / (C_initial × V(1-S) × H(t)) - s × S
 ```
 
 Aging alone does not act as a charge drain during sleep. Self-discharge reduces
-SOC even with no load. Without self-discharge, exponentially weighted cycle
-energy is inverted analytically. With self-discharge, the solver uses 4096
-charge intervals, holds voltage at each interval's endpoint mean, and integrates
+SOC even with no load. Constant-power cycles without self-discharge use
+analytical energy inversion. For current-mode patterns or self-discharge, the
+solver uses 4096 charge intervals, holds voltage at each interval's endpoint mean, and integrates
 the resulting linear equation using exponential cycle sums and bounded root
 searches. Pattern order, sleep, and partial cycles remain part of the model;
 whole cycles are not simulated one by one. Pure shelf discharge is solved

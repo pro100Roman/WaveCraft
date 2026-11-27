@@ -68,12 +68,26 @@
     "patterns": [
       {
         "power_mw": 100.0,
-        "duration_ms": 100.0
+        "duration_ms": 100.0,
+        "name": "Active",
+        "load_kind": "power",
+        "current_ma": 0.0,
+        "power_unit": "milliwatts",
+        "current_unit": "milliamps",
+        "duration_unit": "milliseconds"
       },
       {
         "power_mw": 1.0,
-        "duration_ms": 900.0
+        "duration_ms": 900.0,
+        "name": "Sleep",
+        "load_kind": "power",
+        "current_ma": 0.0,
+        "power_unit": "milliwatts",
+        "current_unit": "milliamps",
+        "duration_unit": "milliseconds"
       }
-    ]
+    ],
+    "voltage_unit": "volts",
+    "capacity_unit": "milliamp_hours"
   }
 }

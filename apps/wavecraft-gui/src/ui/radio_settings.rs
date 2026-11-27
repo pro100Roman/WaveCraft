@@ -1,7 +1,7 @@
 //! Radio receiver settings panels: capture parameters, gains, and the analyzer
 //! (demodulation, packet, and whitening) configuration.
 
-use super::view_shell::settings_card;
+use super::{manual_value::ManualValue as ManualRadioValue, view_shell::settings_card};
 
 use crate::{
     automatic_filter_tap_count, egui, nearest_domain_value, normalize_gain_value, selected_radio,
@@ -86,107 +86,6 @@ const ANALYZER_CHANNELS_HELP: &str = "All modulation, framing, and whitening set
 const HACKRF_BASEBAND_BANDWIDTH_HELP: &str = "Selects the HackRF analog baseband low-pass filter width. A narrower filter rejects more out-of-band noise and interference. Keep it at or below the sample rate to limit aliasing; about 75% of the sample rate leaves useful transition-band margin.\n\nSample rate | Recommended bandwidth\n20 MHz      | 15 MHz\n19 MHz      | 14 MHz\n16 MHz      | 12 MHz\n10 MHz      | 7 MHz\n8 MHz       | 6 MHz";
 
 pub(crate) const RADIO_GAIN_HANDLE_ASPECT_RATIO: f32 = 1.8;
-
-/// A compact numeric editor for RF settings that accepts typed input without
-/// changing its value when the pointer is dragged horizontally. Gain controls
-/// deliberately keep using sliders instead.
-struct ManualRadioValue<'a, Num: egui::emath::Numeric> {
-    value: &'a mut Num,
-    speed: Option<f64>,
-    range: Option<RangeInclusive<f64>>,
-    clamp_existing_to_range: Option<bool>,
-    min_decimals: Option<usize>,
-    max_decimals: Option<usize>,
-    hexadecimal: Option<(usize, bool, bool)>,
-}
-
-impl<'a, Num: egui::emath::Numeric> ManualRadioValue<'a, Num> {
-    fn new(value: &'a mut Num) -> Self {
-        Self {
-            value,
-            speed: None,
-            range: None,
-            clamp_existing_to_range: None,
-            min_decimals: None,
-            max_decimals: None,
-            hexadecimal: None,
-        }
-    }
-
-    fn speed(mut self, speed: impl Into<f64>) -> Self {
-        self.speed = Some(speed.into());
-        self
-    }
-
-    fn range<RangeNum: egui::emath::Numeric>(mut self, range: RangeInclusive<RangeNum>) -> Self {
-        self.range = Some(range.start().to_f64()..=range.end().to_f64());
-        self
-    }
-
-    fn clamp_existing_to_range(mut self, clamp: bool) -> Self {
-        self.clamp_existing_to_range = Some(clamp);
-        self
-    }
-
-    fn min_decimals(mut self, decimals: usize) -> Self {
-        self.min_decimals = Some(decimals);
-        self
-    }
-
-    fn max_decimals(mut self, decimals: usize) -> Self {
-        self.max_decimals = Some(decimals);
-        self
-    }
-
-    fn hexadecimal(mut self, min_width: usize, twos_complement: bool, upper: bool) -> Self {
-        self.hexadecimal = Some((min_width, twos_complement, upper));
-        self
-    }
-}
-
-impl<Num: egui::emath::Numeric> egui::Widget for ManualRadioValue<'_, Num> {
-    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
-        let Self {
-            value,
-            speed,
-            range,
-            clamp_existing_to_range,
-            min_decimals,
-            max_decimals,
-            hexadecimal,
-        } = self;
-        let old_value = *value;
-        let mut editor = egui::DragValue::new(&mut *value);
-        if let Some(speed) = speed {
-            editor = editor.speed(speed);
-        }
-        if let Some(range) = range {
-            editor = editor.range(range);
-        }
-        if let Some(clamp) = clamp_existing_to_range {
-            editor = editor.clamp_existing_to_range(clamp);
-        }
-        if let Some(decimals) = min_decimals {
-            editor = editor.min_decimals(decimals);
-        }
-        if let Some(decimals) = max_decimals {
-            editor = editor.max_decimals(decimals);
-        }
-        if let Some((min_width, twos_complement, upper)) = hexadecimal {
-            editor = editor.hexadecimal(min_width, twos_complement, upper);
-        }
-
-        let explanation_tooltips = ui.style().explanation_tooltips;
-        ui.style_mut().explanation_tooltips = false;
-        let mut response = ui.add(editor);
-        ui.style_mut().explanation_tooltips = explanation_tooltips;
-        if response.dragged() {
-            *value = old_value;
-            response.changed = false;
-        }
-        response.on_hover_cursor(egui::CursorIcon::Text)
-    }
-}
 
 pub(crate) fn add_left_aligned_sized(
     ui: &mut egui::Ui,
