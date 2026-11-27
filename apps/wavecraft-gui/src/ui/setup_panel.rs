@@ -22,6 +22,10 @@ impl WaveCraftApp {
             WorkspaceView::Serial => ("serial_setup", "SERIAL / UART SETUP"),
             WorkspaceView::Battery => ("battery_setup", "BATTERY SETUP"),
             WorkspaceView::PdPower => ("pd_power_setup", "PD POWER SETUP"),
+            WorkspaceView::PdPower2 => ("pd_power_setup_2", "PD POWER 2 SETUP"),
+            WorkspaceView::PdPower3 => ("pd_power_setup_3", "PD POWER 3 SETUP"),
+            WorkspaceView::PdPower4 => ("pd_power_setup_4", "PD POWER 4 SETUP"),
+            WorkspaceView::PdPower5 => ("pd_power_setup_5", "PD POWER 5 SETUP"),
         };
         let mut open = self.workspace_view_layout.setup_panel_open(view);
         if SetupPanel::new(id, title).show(context, &mut open, |ui| contents(self, ui, actions)) {
@@ -69,7 +73,11 @@ mod tests {
                 }
                 WorkspaceView::Serial => app.paint_serial_setup(context, &mut actions),
                 WorkspaceView::Battery => app.paint_battery_setup(context, &mut actions),
-                WorkspaceView::PdPower => app.paint_pd_power_setup(context, &mut actions),
+                WorkspaceView::PdPower
+                | WorkspaceView::PdPower2
+                | WorkspaceView::PdPower3
+                | WorkspaceView::PdPower4
+                | WorkspaceView::PdPower5 => app.paint_pd_power_setup(context, &mut actions),
             },
         );
         let texts = output

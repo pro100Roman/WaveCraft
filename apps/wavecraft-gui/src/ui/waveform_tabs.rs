@@ -1,7 +1,7 @@
 //! Workspace tab selection and drag-to-reorder interaction.
 
 use super::view_shell::{workspace_tab, workspace_tab_bar};
-use crate::{egui, WorkspaceView};
+use crate::{egui, SelectableHoverText, WorkspaceView};
 
 use crate::WaveCraftApp;
 
@@ -11,6 +11,12 @@ impl WaveCraftApp {
         let available_views = self.available_workspace_views();
         let ordered_views = *self.workspace_view_layout.order();
         let active_view = self.active_workspace_view;
+        let selection_id = egui::Id::new("workspace_tab_last_selection");
+        let selection_changed =
+            context.data(|data| data.get_temp::<WorkspaceView>(selection_id)) != active_view;
+        if let Some(view) = active_view {
+            context.data_mut(|data| data.insert_temp(selection_id, view));
+        }
         let mut selected_view = None;
         let mut closed_view = None;
         let mut added_view = None;
@@ -32,6 +38,9 @@ impl WaveCraftApp {
                     );
                     if tab.close_clicked {
                         closed_view = Some(view);
+                    }
+                    if selection_changed && active_view == Some(view) {
+                        tab.response.scroll_to_me(None);
                     }
                     let response = tab.response.on_hover_cursor(if dragging {
                         egui::CursorIcon::Grabbing
@@ -64,14 +73,35 @@ impl WaveCraftApp {
             },
             |ui| {
                 for view in WorkspaceView::ALL {
-                    let already_open = available_views.contains(&view);
+                    if view.pd_power_index().is_some_and(|index| index != 0) {
+                        continue;
+                    }
+                    let next_power = WorkspaceView::PD_POWER
+                        .into_iter()
+                        .find(|view| !available_views.contains(view));
+                    let already_open = if view == WorkspaceView::PdPower {
+                        next_power.is_none()
+                    } else {
+                        available_views.contains(&view)
+                    };
                     let response = ui.add_enabled(!already_open, egui::Button::new(view.label()));
                     if response.clicked() {
-                        added_view = Some(view);
+                        added_view = Some(if view == WorkspaceView::PdPower {
+                            next_power.unwrap_or(view)
+                        } else {
+                            view
+                        });
                         ui.close_menu();
                     }
                     if already_open {
-                        response.on_hover_text("This view is already open");
+                        let hint = if view == WorkspaceView::PdPower {
+                            "Up to five PD Power views can be open"
+                        } else {
+                            "This view is already open"
+                        };
+                        response
+                            .on_hover_selectable_text(hint)
+                            .on_disabled_hover_selectable_text(hint);
                     }
                 }
             },
@@ -140,6 +170,60 @@ mod tests {
             collect(&clipped.shape, &mut texts);
         }
         texts
+    }
+
+    #[test]
+    fn plus_menu_adds_five_power_views_and_disables_the_sixth() {
+        let context = egui::Context::default();
+        let mut app = app();
+        for expected in WorkspaceView::PD_POWER.into_iter().skip(1) {
+            let texts = paint_tabs(&context, &mut app, vec![]);
+            click_tabs(
+                &context,
+                &mut app,
+                texts.iter().find(|(text, _)| text == "+").unwrap().1,
+            );
+            let texts = paint_tabs(&context, &mut app, vec![]);
+            // The generic add-menu label is the last matching text (the
+            // original primary tab can also be visible in the strip).
+            let item = texts
+                .iter()
+                .rev()
+                .find(|(text, _)| text == "PD Power")
+                .unwrap()
+                .1;
+            click_tabs(&context, &mut app, item);
+            assert_eq!(app.active_workspace_view, Some(expected));
+        }
+        assert_eq!(
+            app.available_workspace_views()
+                .iter()
+                .filter(|view| view.pd_power_index().is_some())
+                .count(),
+            5
+        );
+        let texts = paint_tabs(&context, &mut app, vec![]);
+        click_tabs(
+            &context,
+            &mut app,
+            texts.iter().find(|(text, _)| text == "+").unwrap().1,
+        );
+        let texts = paint_tabs(&context, &mut app, vec![]);
+        let item = texts
+            .iter()
+            .rev()
+            .find(|(text, _)| text == "PD Power")
+            .unwrap()
+            .1;
+        click_tabs(&context, &mut app, item);
+        assert_eq!(app.active_workspace_view, Some(WorkspaceView::PdPower5));
+        assert_eq!(
+            app.available_workspace_views()
+                .iter()
+                .filter(|view| view.pd_power_index().is_some())
+                .count(),
+            5
+        );
     }
 
     #[test]
@@ -281,6 +365,10 @@ mod tests {
                 WorkspaceView::Serial,
                 WorkspaceView::Battery,
                 WorkspaceView::PdPower,
+                WorkspaceView::PdPower2,
+                WorkspaceView::PdPower3,
+                WorkspaceView::PdPower4,
+                WorkspaceView::PdPower5,
             ]
         );
         assert_eq!(app.workspace_view_layout.dragged_view(), None);

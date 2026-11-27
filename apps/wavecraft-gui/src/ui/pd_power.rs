@@ -19,19 +19,78 @@ use wavecraft_serial::pd_power::{Request, BAUD_RATES, MAX_POLL_HZ, MIN_POLL_HZ, 
 const FIELD_WIDTH: f32 = 96.0;
 const LABEL_WIDTH: f32 = 112.0;
 
+fn output_button(state: &PowerState) -> (&'static str, egui::Color32) {
+    match state.output_is_on().filter(|_| state.connected) {
+        Some(true) => ("ON", ACCENT),
+        Some(false) => ("OFF", egui::Color32::LIGHT_RED),
+        None => ("ON/OFF", TEXT_MUTED),
+    }
+}
+
+fn section(ui: &mut egui::Ui, title: &str, enabled: bool, contents: impl FnOnce(&mut egui::Ui)) {
+    let hint = match title {
+        "CONNECTION" => "Select a USB CDC or UART port, then Connect. USB offers standard host baud rates; physical UART must match the rate selected in the device menu.",
+        "LIVE STATE" => "Measured output state and input supply information. Input voltage and PD status are unavailable on early firmware. Timer state reports whether a sequence is running, including its OFF phase.",
+        "OUTPUT / CC · CV" => "CV holds the target voltage. CC limits current automatically when the load reaches the current limit. Edit and write one of M0–M4, then activate it to use its voltage and current limits.",
+        "INPUT / PD" => "PD voltage requests require PD input, output OFF, and measured output below 5 V. Supported from V1 ≥ 1.0.2.0 or V1.1 ≥ 1.0.1.0. Early firmware cannot report input voltage or PD state.",
+        "DEVICE SETTINGS" => "Edit device protection, calibration, display and measurement filtering. Apply device settings writes edits; Store setup in device makes them survive power cycles. Unsupported settings are hidden for older firmware.",
+        "OUTPUT TIMER" => "Available from V1 ≥ 1.0.3.0 or V1.1 ≥ 1.0.2.0. Apply timer writes the mode and durations. The toolbar ON/OFF button starts or stops the sequence. OFF = 0 is one shot; ON = 0 prevents starting.",
+        _ => "Device identity and service controls. Store setup in device saves the current configuration to device memory; the pinned Save settings footer saves this WaveCraft view.",
+    };
+    setup_section(ui, title, enabled, contents).on_hover_selectable_text(hint);
+}
+
+fn control_help(label: &str) -> &'static str {
+    match label {
+        "Port" => "Serial port used by this view. Each connected PD Power view needs its own port. USB CDC and UART adapters are supported.",
+        "Baud rate" => "USB CDC host line-coding rate. Physical UART must match one of the seven rates selected in the device menu (9600–460800 baud). This is not the graph update frequency.",
+        "Protocol" => "USB CDC uses LF-terminated frames. Physical UART uses CRC8 and requires UART mode enabled in the device menu.",
+        "Polling rate" => "Requested host polling rate: 0.1–100 Hz. The API guarantees no ADC sampling frequency. Two serial reads per point, plus input state when supported; slow responses reduce the actual rate without catch-up bursts.",
+        "Time window" => "Visible graph duration in seconds, from 1 to 3600. Both voltage and current use the same time window.",
+        "Actual rate" => "Measured receipt rate over the last 100 points. It may be lower than the requested polling rate and settles after a rate change.",
+        "Regulation" | "Voltage target" | "Current limit" => "CV regulates the target voltage; CC automatically limits current when the load reaches this limit. The input supply and buck headroom may constrain the actual voltage/current.",
+        "Active preset" | "Edit preset" => "M0–M4 store voltage and current limits. Editing a preset does not activate it: write the preset, then use Activate preset.",
+        "PD target" | "PD requested" => "Requested PD supply voltage, not the measured input voltage. Writing requires PD input, output OFF, measured output below 5 V, and supported firmware.",
+        "Input voltage" | "Input source" => "Measured input voltage and PD/QC/DC negotiation state. Early firmware has no input-state read command; unavailable readings are shown as dashes.",
+        "OCP protection" => "Over-current protection shuts the output off after approximately 200 ms above the current limit. With OCP disabled, the supply can remain in constant-current regulation.",
+        "Calibration" => "Enable the stored factory calibration corrections for voltage/current setting and display. This switch does not rewrite the calibration table.",
+        "OC discharge" => "Discharge after an over-current condition to reduce voltage overshoot when a constant-current load is suddenly removed. Requires newer firmware.",
+        "Auto output" => "Automatically enable output when the device powers on. Apply writes the setting; Store setup in device persists it across power cycles.",
+        "Compensation" => "Enable firmware output error compensation (up to ±0.02 V and ±0.003 A). Requires supported firmware.",
+        "Brightness" => "Device LCD brightness from 1–100 percent. Apply device settings sends the edited value.",
+        "Filter window" => "Moving-average measurement filter length, from 1–200 samples. A larger window smooths displayed voltage/current but responds more slowly to changes; it does not set host polling frequency.",
+        "Voltage discharge" => "Write-only voltage-discharge control. The protocol provides no readback, so WaveCraft does not infer its current state from a click.",
+        "Timer mode" => "Enable or disable the timed output sequence. Apply timer writes this mode and both durations. ON/OFF in the toolbar starts or stops the sequence. Requires V1 ≥ 1.0.3.0 or V1.1 ≥ 1.0.2.0.",
+        "ON duration" => "Time output stays enabled in each timer cycle, in seconds (0–59999). Zero prevents the sequence from starting. Apply timer sends the edited duration.",
+        "OFF duration" => "Time output stays disabled between cycles, in seconds (0–59999). Zero ends the sequence after one ON phase; a nonzero duration repeats ON/OFF cycles.",
+        "Timer sequence" => "Reported timer activity, including its OFF phase. A running sequence may have its physical output temporarily disabled.",
+        "LCD type" => "Select the actual display panel: HAN or BOE. Changing this device-memory setting requires confirmation.",
+        _ => "",
+    }
+}
+
 impl WaveCraftApp {
     pub(crate) fn pd_power_view_is_active(&self) -> bool {
-        self.active_workspace_view == Some(WorkspaceView::PdPower)
+        self.active_workspace_view
+            .and_then(WorkspaceView::pd_power_index)
+            .is_some()
     }
 
-    pub(crate) fn select_pd_power_view(&mut self) {
+    pub(crate) fn active_pd_power_index(&self) -> usize {
+        self.active_workspace_view
+            .and_then(WorkspaceView::pd_power_index)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn select_pd_power_view(&mut self, view: WorkspaceView) {
+        let index = view.pd_power_index().unwrap_or(0);
         if let Some(active) = self.active_waveform_tab {
             self.save_waveform_view_settings(active);
         }
-        self.active_workspace_view = Some(WorkspaceView::PdPower);
+        self.active_workspace_view = Some(view);
         self.snapshot_plot_rect = None;
-        if self.pd_power.ports.is_empty() {
-            self.pd_power.refresh_ports();
+        if self.pd_power[index].ports.is_empty() {
+            self.pd_power[index].refresh_ports();
         }
         self.save_global_settings();
     }
@@ -41,15 +100,19 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
-        let state = &self.pd_power;
+        let index = self.active_pd_power_index();
+        let state = &self.pd_power[index];
         let toolbar = view_toolbar(
             context,
             "WeAct Studio PD Power Mini V1 Buck",
             self.pending_snapshot.is_none(),
             |ui| {
-                actions.pd_power_refresh_ports |= ui
+                if ui
                     .add(toolbar_action_button("Refresh ports", TEXT_MUTED))
-                    .clicked();
+                    .clicked()
+                {
+                    actions.pd_power_refresh_ports = Some(index);
+                }
                 if ui
                     .add_enabled(
                         state.connected,
@@ -57,40 +120,19 @@ impl WaveCraftApp {
                     )
                     .clicked()
                 {
-                    actions.pd_power_requests.push(Request::Refresh);
+                    actions.pd_power_requests.push((index, Request::Refresh));
                 }
-                actions.pd_power_clear |= ui
+                if ui
                     .add(toolbar_action_button("Clear graphs", TEXT_MUTED))
-                    .clicked();
+                    .clicked()
+                {
+                    actions.pd_power_clear = Some(index);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            state.connected,
-                            toolbar_action_button("Output OFF", egui::Color32::LIGHT_RED),
-                        )
-                        .clicked()
-                    {
-                        write(actions, 2, vec![0]);
-                    }
-                    if ui
-                        .add_enabled(state.connected, toolbar_action_button("Output ON", ACCENT))
-                        .clicked()
-                    {
-                        write(actions, 2, vec![1]);
-                    }
-                    actions.pd_power_connect |= ui
-                        .add_enabled(
-                            state.session.is_some() || !state.settings.port.trim().is_empty(),
-                            toolbar_action_button(
-                                if state.session.is_some() {
-                                    "Disconnect"
-                                } else {
-                                    "Connect"
-                                },
-                                ACCENT,
-                            ),
-                        )
-                        .clicked();
+                    let (label, color) = output_button(state);
+                    if ui.add_enabled(state.connected && state.latest.is_some() && !state.output_toggle_pending(), toolbar_action_button(label, color))
+                        .on_hover_selectable_text("Shows the reported output state. Click to toggle output ON/OFF. In timer mode, starts or stops the timer sequence. The color updates from device telemetry.")
+                        .clicked() { actions.pd_power_toggle_output = Some(index); }
                 });
             },
         );
@@ -103,45 +145,55 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
+        let index = self.active_pd_power_index();
         self.show_setup_panel(
             context,
-            WorkspaceView::PdPower,
+            WorkspaceView::PD_POWER[index],
             actions,
             |app, ui, actions| {
-                editor(ui, &mut app.pd_power, actions);
-                app.pd_power.settings.validate().is_ok()
+                editor(ui, &mut app.pd_power[index], index, actions);
+                app.pd_power[index].settings.validate().is_ok()
             },
         );
-        if let Some((command, data)) = self.pd_power.confirmation.clone() {
+        if let Some((command, data)) = self.pd_power[index].confirmation.clone() {
             let mut dismiss = false;
-            egui::Window::new("Confirm device command").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(context, |ui| {
+            egui::Window::new("Confirm device command").id(egui::Id::new(("pd_confirmation", index))).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(context, |ui| {
                 ui.set_max_width(380.0);
                 ui.label(match command { 0x40 => "Restart the device? The serial connection will close.", 0x45 => "Restore device factory defaults? Saved output settings will be replaced.", 0x47 => "Write factory calibration values? These values change measurement accuracy. Verify every value before continuing.", _ => "Write the LCD panel type to device memory?" });
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() { dismiss = true; }
-                    if ui.add_enabled(self.pd_power.connected, egui::Button::new("Confirm")).clicked() { write(actions, command, data); dismiss = true; }
+                    if ui.add_enabled(self.pd_power[index].connected, egui::Button::new("Confirm")).clicked() { write(actions, index, command, data); dismiss = true; }
                 });
             });
             if dismiss {
-                self.pd_power.confirmation = None;
+                self.pd_power[index].confirmation = None;
             }
         }
     }
 
     pub(crate) fn paint_pd_power_central(&mut self, context: &egui::Context) {
+        let index = self.active_pd_power_index();
         workspace_panel(context, |ui| {
             let bounds = ui.available_rect_before_wrap();
             let gap = PANE_SPLITTER_HEIGHT + ui.spacing().item_spacing.y * 2.0;
             let total_height = (bounds.height() - gap).max(0.0);
             let minimum = 100.0_f32.min(total_height * 0.5);
-            let upper_height =
-                (total_height * self.pd_power.plot_fraction).clamp(minimum, total_height - minimum);
-            for (index, title) in ["OUTPUT VOLTAGE", "OUTPUT CURRENT"].into_iter().enumerate() {
+            let upper_height = (total_height * self.pd_power[index].plot_fraction)
+                .clamp(minimum, total_height - minimum);
+            for (channel, title) in ["OUTPUT VOLTAGE", "OUTPUT CURRENT"].into_iter().enumerate() {
                 let rect = egui::Rect::from_min_size(
-                    bounds.min + egui::vec2(0.0, if index == 0 { 0.0 } else { upper_height + gap }),
+                    bounds.min
+                        + egui::vec2(
+                            0.0,
+                            if channel == 0 {
+                                0.0
+                            } else {
+                                upper_height + gap
+                            },
+                        ),
                     egui::vec2(
                         bounds.width(),
-                        if index == 0 {
+                        if channel == 0 {
                             upper_height
                         } else {
                             total_height - upper_height
@@ -150,14 +202,14 @@ impl WaveCraftApp {
                 );
                 let mut child = ui.new_child(
                     egui::UiBuilder::new()
-                        .id_salt(("pd_plot", index))
+                        .id_salt(("pd_plot", index, channel))
                         .max_rect(rect),
                 );
                 view_card(&mut child, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(title).strong().color(TEXT_MUTED));
-                        let value = self.pd_power.latest.map(|s| {
-                            if index == 0 {
+                        let value = self.pd_power[index].latest.map(|s| {
+                            if channel == 0 {
                                 s.voltage_mv
                             } else {
                                 s.current_ma
@@ -170,19 +222,24 @@ impl WaveCraftApp {
                                     format!(
                                         "{:.3} {}",
                                         f64::from(v) / 1000.0,
-                                        if index == 0 { "V" } else { "A" }
+                                        if channel == 0 { "V" } else { "A" }
                                     )
                                 },
                             ))
                             .monospace()
                             .size(22.0)
-                            .color(SCOPE_COLORS[index]),
+                            .color(SCOPE_COLORS[channel]),
                         );
                     });
-                    if self.pd_power.points.is_empty() {
+                    if self.pd_power[index].points.is_empty() {
                         ui.label("Connect the supply to display live measurements.");
                     }
-                    graph(ui, ui.available_rect_before_wrap(), &self.pd_power, index);
+                    graph(
+                        ui,
+                        ui.available_rect_before_wrap(),
+                        &self.pd_power[index],
+                        channel,
+                    );
                 });
             }
             let split_rect = egui::Rect::from_min_size(
@@ -202,39 +259,71 @@ impl WaveCraftApp {
             if response.dragged() && total_height > 0.0 {
                 let height = (upper_height + ui.input(|input| input.pointer.delta().y))
                     .clamp(minimum, total_height - minimum);
-                self.pd_power.plot_fraction = height / total_height;
+                self.pd_power[index].plot_fraction = height / total_height;
             }
             if response.drag_stopped() {
-                self.pd_power.layout_changed = true;
+                self.pd_power[index].layout_changed = true;
             }
             ui.advance_cursor_after_rect(bounds);
         });
     }
 
     pub(crate) fn apply_pd_power_actions(&mut self, actions: &FrameActions) {
-        if actions.pd_power_refresh_ports {
-            self.pd_power.refresh_ports();
-        }
-        if actions.pd_power_connect {
-            if self.pd_power.session.is_some() {
-                self.pd_power.stop();
-            } else if let Err(error) = self.pd_power.start() {
-                self.pd_power.error = Some(error.to_string());
+        if let Some(index) = actions.pd_power_refresh_ports {
+            if let Some(state) = self.pd_power.get_mut(index) {
+                state.refresh_ports();
             }
         }
-        if actions.pd_power_clear {
-            self.pd_power.points.clear();
+        if let Some(index) = actions.pd_power_connect {
+            let busy_port = self.pd_power.get(index).and_then(|state| {
+                self.pd_power
+                    .iter()
+                    .enumerate()
+                    .find(|(other, candidate)| {
+                        *other != index
+                            && candidate.session.is_some()
+                            && crate::pd_power::same_port(
+                                &candidate.settings.port,
+                                &state.settings.port,
+                            )
+                    })
+                    .map(|(other, _)| other)
+            });
+            if let Some(state) = self.pd_power.get_mut(index) {
+                if state.session.is_some() {
+                    state.stop();
+                } else if let Some(other) = busy_port {
+                    state.error = Some(format!(
+                        "This port is already connected in {}",
+                        WorkspaceView::PD_POWER[other].label()
+                    ));
+                } else if let Err(error) = state.start() {
+                    state.error = Some(error.to_string());
+                }
+            }
         }
-        for request in &actions.pd_power_requests {
-            self.pd_power.request(request.clone());
+        if let Some(index) = actions.pd_power_toggle_output {
+            if let Some(state) = self.pd_power.get_mut(index) {
+                state.toggle_output();
+            }
+        }
+        if let Some(index) = actions.pd_power_clear {
+            if let Some(state) = self.pd_power.get_mut(index) {
+                state.points.clear();
+            }
+        }
+        for (index, request) in &actions.pd_power_requests {
+            if let Some(state) = self.pd_power.get_mut(*index) {
+                state.request(request.clone());
+            }
         }
     }
 }
 
-fn write(actions: &mut FrameActions, command: u8, data: Vec<u8>) {
+fn write(actions: &mut FrameActions, index: usize, command: u8, data: Vec<u8>) {
     actions
         .pd_power_requests
-        .push(Request::Write { command, data });
+        .push((index, Request::Write { command, data }));
 }
 
 fn row<R>(
@@ -244,8 +333,13 @@ fn row<R>(
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     ui.push_id(label, |ui| {
-        ui.horizontal(|ui| {
-            ui.add_sized([LABEL_WIDTH, 22.0], egui::Label::new(label).wrap());
+        let row = ui.horizontal(|ui| {
+            let caption = ui.add_sized([LABEL_WIDTH, 22.0], egui::Label::new(label).wrap());
+            if !control_help(label).is_empty() {
+                caption
+                    .on_hover_selectable_text(control_help(label))
+                    .on_disabled_hover_selectable_text(control_help(label));
+            }
             let result = ui
                 .allocate_ui_with_layout(
                     egui::vec2(FIELD_WIDTH, 22.0),
@@ -259,8 +353,12 @@ fn row<R>(
                 .inner;
             ui.label(unit);
             result
-        })
-        .inner
+        });
+        let hint = control_help(label);
+        if !hint.is_empty() {
+            row.response.on_hover_selectable_text(hint);
+        }
+        row.inner
     })
     .inner
 }
@@ -281,6 +379,8 @@ fn number<N: egui::emath::Numeric>(
                 .min_decimals(decimals)
                 .max_decimals(decimals),
         )
+        .on_hover_selectable_text(control_help(label))
+        .on_disabled_hover_selectable_text(control_help(label))
         .changed()
     })
 }
@@ -300,9 +400,9 @@ fn field_combo(id: &str) -> egui::ComboBox {
         .truncate()
 }
 
-fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions) {
+fn editor(ui: &mut egui::Ui, state: &mut PowerState, index: usize, actions: &mut FrameActions) {
     settings_card(ui, |ui| {
-        setup_section(ui, "CONNECTION", true, |ui| {
+        section(ui, "CONNECTION", true, |ui| {
             ui.add_enabled_ui(state.session.is_none(), |ui| {
                 row(ui, "Port", "", |ui| {
                     field_combo("port")
@@ -317,6 +417,13 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions)
                             }
                         });
                 });
+            });
+            row(ui, "", "", |ui| {
+                if ui.add_enabled(state.session.is_some() || !state.settings.port.trim().is_empty(), toolbar_action_button(if state.session.is_some() { "Disconnect" } else { "Connect" }, ACCENT).min_size(egui::vec2(FIELD_WIDTH,22.0)))
+                    .on_hover_selectable_text("Open or close the selected USB CDC/UART connection. Connecting reads device settings without enabling the output.")
+                    .clicked() { actions.pd_power_connect = Some(index); }
+            });
+            ui.add_enabled_ui(state.session.is_none(), |ui| {
                 row(ui, "Baud rate", "", |ui| {
                     field_combo("baud")
                         .selected_text(state.settings.baud_rate.to_string())
@@ -363,7 +470,7 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions)
             ) {
                 actions
                     .pd_power_requests
-                    .push(Request::PollRate(state.settings.poll_hz));
+                    .push((index, Request::PollRate(state.settings.poll_hz)));
             }
             number(
                 ui,
@@ -381,10 +488,9 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions)
                     .map_or_else(|| "—".into(), |v| format!("{v:.1}")),
                 "Hz",
             );
-            ui.label("0.1–100 Hz requested; actual rate depends on the device and port. The API specifies no guaranteed sampling rate.").on_hover_selectable_text("Two serial reads per point, plus input state when supported by the firmware. Firmware filtering also affects the measurement response.");
         });
         ui.add_space(10.0);
-        setup_section(ui, "LIVE STATE", true, |ui| {
+        section(ui, "LIVE STATE", true, |ui| {
             let latest = state.latest;
             readout(ui, "Regulation", latest.map_or("—", output_mode), "");
             readout(
@@ -445,8 +551,7 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions)
             );
         });
         ui.add_space(10.0);
-        setup_section(ui, "OUTPUT / CC · CV", state.connected, |ui| {
-            ui.label("CV holds the target voltage. CC limits current automatically when the load reaches the current limit.");
+        section(ui, "OUTPUT / CC · CV", state.connected, |ui| {
             let device = &mut state.settings.device;
             readout(ui, "Active preset", format!("M{}", device.preset), "");
             row(ui, "Edit preset", "", |ui| {
@@ -476,18 +581,15 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions)
                     let mut data = vec![state.preset_editor as u8];
                     data.extend_from_slice(&preset[0].to_le_bytes());
                     data.extend_from_slice(&preset[1].to_le_bytes());
-                    write(actions, 4, data);
+                    write(actions, index, 4, data);
                 }
                 if ui.button("Activate preset").clicked() {
-                    write(actions, 3, vec![state.preset_editor as u8]);
+                    write(actions, index, 3, vec![state.preset_editor as u8]);
                 }
             });
         });
         ui.add_space(10.0);
-        setup_section(ui, "INPUT / PD", state.connected, |ui| {
-            if state.connected && !state.settings.device.input_state_supported {
-                ui.label("Input voltage and PD state are unavailable in this firmware.");
-            }
+        section(ui, "INPUT / PD", state.connected, |ui| {
             let can_pd = state.settings.device.supports_pd()
                 && state.latest.is_some_and(|s| {
                     s.output_state & 1 == 0 && s.voltage_mv < 5000 && s.input_state == 5
@@ -501,6 +603,7 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions)
                 if ui.button("Request PD voltage").clicked() {
                     write(
                         actions,
+                        index,
                         10,
                         state
                             .settings
@@ -512,10 +615,9 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions)
                     );
                 }
             });
-            ui.label("Requires PD, output OFF, measured output < 5 V and supported firmware.");
         });
         ui.add_space(10.0);
-        setup_section(ui, "DEVICE SETTINGS", state.connected, |ui| {
+        section(ui, "DEVICE SETTINGS", state.connected, |ui| {
             for (command, label) in [
                 (6, "OCP protection"),
                 (7, "Calibration"),
@@ -526,7 +628,8 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions)
                 if let Some(value) = &mut state.settings.device.values[command] {
                     row(ui, label, "", |ui| {
                         let mut enabled = *value != 0;
-                        ui.checkbox(&mut enabled, "Enabled");
+                        ui.checkbox(&mut enabled, "Enabled")
+                            .on_hover_selectable_text(control_help(label));
                         *value = u8::from(enabled);
                     });
                 }
@@ -537,57 +640,58 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions)
             if let Some(value) = &mut state.settings.device.values[13] {
                 number(ui, "Filter window", "", value, 1..=200, 0);
             }
-            if ui.button("Apply device settings").clicked() {
+            if ui.button("Apply device settings").on_hover_selectable_text("Write the edited protection, calibration, brightness, filter and compensation settings. Store setup in device saves them across power cycles.").clicked() {
                 for command in [6, 7, 8, 11, 12, 13, 14] {
                     if let Some(value) = state.settings.device.values[command] {
-                        write(actions, command as u8, vec![value]);
+                        write(actions, index, command as u8, vec![value]);
                     }
                 }
             }
             ui.horizontal(|ui| {
                 ui.label("Voltage discharge");
                 if ui.button("Enable").clicked() {
-                    write(actions, 9, vec![1]);
+                    write(actions, index, 9, vec![1]);
                 }
                 if ui.button("Disable").clicked() {
-                    write(actions, 9, vec![0]);
+                    write(actions, index, 9, vec![0]);
                 }
-            });
-            ui.label("Voltage discharge has a write command only; its state cannot be read.");
+            })
+            .response
+            .on_hover_selectable_text(control_help("Voltage discharge"));
         });
         ui.add_space(10.0);
-        setup_section(ui, "OUTPUT TIMER", state.connected, |ui| {
+        section(ui, "OUTPUT TIMER", state.connected, |ui| {
             if let Some(timer) = &mut state.settings.device.timer {
                 row(ui, "Timer mode", "", |ui| {
                     let mut enabled = timer[0] != 0;
-                    ui.checkbox(&mut enabled, "Enabled");
+                    ui.checkbox(&mut enabled, "Enabled")
+                        .on_hover_selectable_text(control_help("Timer mode"));
                     timer[0] = u16::from(enabled);
                 });
                 number(ui, "ON duration", "s", &mut timer[1], 0..=59999, 0);
                 number(ui, "OFF duration", "s", &mut timer[2], 0..=59999, 0);
-                if ui.button("Apply timer").clicked() {
+                if ui.button("Apply timer").on_hover_selectable_text("Write timer mode and ON/OFF durations. Use the toolbar ON/OFF button to start or stop the sequence. These settings require V1 ≥ 1.0.3.0 or V1.1 ≥ 1.0.2.0.").clicked() {
                     let mut data = vec![timer[0] as u8];
                     data.extend_from_slice(&timer[1].to_le_bytes());
                     data.extend_from_slice(&timer[2].to_le_bytes());
-                    write(actions, 15, data);
+                    write(actions, index, 15, data);
                 }
-                ui.label("OFF = 0: one shot; ON = 0: no start. Output ON/OFF starts or stops the sequence.");
             } else {
-                ui.label("Requires V1 ≥ 1.0.3.0 or V1.1 ≥ 1.0.2.0 firmware.");
+                readout(ui, "Timer mode", "Unavailable", "");
             }
         });
         ui.add_space(10.0);
-        setup_section(ui, "DEVICE INFORMATION", state.connected, |ui| {
+        section(ui, "DEVICE INFORMATION", state.connected, |ui| {
             ui.label(&state.settings.device.model);
             row(ui, "Firmware", "", |ui| {
                 ui.label(&state.settings.device.version);
             });
             ui.label(format!("Serial: {}", state.settings.device.serial));
-            if ui.button("Store setup in device").clicked() {
-                write(actions, 0x44, vec![]);
+            if ui.button("Store setup in device").on_hover_selectable_text("Save the current device configuration in its nonvolatile memory. The pinned Save settings footer saves this WaveCraft view instead.").clicked() {
+                write(actions, index, 0x44, vec![]);
             }
-            ui.label("Stores the current device configuration in its memory. Save settings below saves the WaveCraft workspace.");
-            ui.collapsing("Service / calibration", |ui| {
+
+            let service = ui.collapsing("Service / calibration", |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("Restart device").clicked() {
                         state.confirmation = Some((0x40, vec![]));
@@ -610,7 +714,7 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions)
                     }
                 }
                 if let Some(data) = &mut state.settings.device.factory_data {
-                    ui.label("Factory calibration: raw 16-bit values. Reserved word is preserved.");
+
                     for (i, value) in data.iter_mut().enumerate().take(31) {
                         let label = if i < 14 {
                             format!("V{} {}", i / 2, if i % 2 == 0 { "display" } else { "set" })
@@ -626,12 +730,13 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, actions: &mut FrameActions)
                         };
                         number(ui, &label, "", value, 0..=u16::MAX, 0);
                     }
-                    if ui.button("Write calibration…").clicked() {
+                    if ui.button("Write calibration…").on_hover_selectable_text("Write raw factory calibration values after confirmation. The reserved word is preserved.").clicked() {
                         state.confirmation =
                             Some((0x47, data.iter().flat_map(|v| v.to_le_bytes()).collect()));
                     }
                 }
             });
+            service.header_response.on_hover_selectable_text("Device restart, factory reset, LCD panel type, and factory calibration. Calibration fields are raw 16-bit values; the reserved word is preserved. Writes require explicit confirmation.");
         });
     });
 }
@@ -815,14 +920,14 @@ mod tests {
     fn uses_shared_setup_footer_and_stacks_voltage_above_current() {
         let mut app = app();
         app.active_workspace_view = Some(WorkspaceView::PdPower);
-        app.pd_power.latest = Some(PowerSample {
+        app.pd_power[0].latest = Some(PowerSample {
             voltage_mv: 5000,
             current_ma: 250,
             ..Default::default()
         });
-        app.pd_power.points.push_back(Point {
+        app.pd_power[0].points.push_back(Point {
             time: 1.0,
-            sample: app.pd_power.latest.unwrap(),
+            sample: app.pd_power[0].latest.unwrap(),
         });
         let context = egui::Context::default();
         crate::configure_style(&context);
@@ -911,13 +1016,16 @@ mod tests {
         let moved = splitter + egui::vec2(0.0, 60.0);
         let _ = frame_with_events(&mut app, &context, vec![egui::Event::PointerMoved(moved)]);
         let _ = frame_with_events(&mut app, &context, vec![button(moved, false)]);
-        assert!(app.pd_power.plot_fraction > 0.55);
+        assert!(app.pd_power[0].plot_fraction > 0.55);
         assert_eq!(
             app.saved_capture_settings.global.pd_power_plot_fraction,
-            Some(app.pd_power.plot_fraction)
+            Some(app.pd_power[0].plot_fraction)
         );
         let restored = WaveCraftApp::with_settings(None, app.saved_capture_settings.clone());
-        assert_eq!(restored.pd_power.plot_fraction, app.pd_power.plot_fraction);
+        assert_eq!(
+            restored.pd_power[0].plot_fraction,
+            app.pd_power[0].plot_fraction
+        );
     }
 
     #[test]
@@ -1025,6 +1133,260 @@ mod tests {
     }
 
     #[test]
+    fn toolbar_has_one_state_colored_toggle_and_connection_is_below_port() {
+        let mut app = app();
+        app.active_workspace_view = Some(WorkspaceView::PdPower);
+        app.pd_power[0].connected = true;
+        app.pd_power[0].latest = Some(PowerSample::default());
+        assert_eq!(
+            output_button(&app.pd_power[0]),
+            ("OFF", egui::Color32::LIGHT_RED)
+        );
+        let context = egui::Context::default();
+        crate::configure_style(&context);
+        let _ = frame(&mut app, &context);
+        let output = frame(&mut app, &context);
+        let port = text_rect(&output, "Port");
+        let connect = text_rect(&output, "Connect");
+        assert!(connect.top() > port.bottom());
+        assert!(connect.right() < 300.0);
+        assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "Output ON" || t.galley.text() == "Output OFF")));
+        let mut actions = FrameActions::default();
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            app.paint_pd_power_toolbar(ctx, &mut actions)
+        });
+        let position = text_rect(&output, "OFF").center();
+        for pressed in [true, false] {
+            let _ = context.run(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.paint_pd_power_toolbar(ctx, &mut actions),
+            );
+        }
+        assert_eq!(actions.pd_power_toggle_output, Some(0));
+        app.pd_power[0].latest = Some(PowerSample {
+            output_state: 1,
+            ..Default::default()
+        });
+        assert_eq!(output_button(&app.pd_power[0]), ("ON", ACCENT));
+        app.pd_power[0].latest = Some(PowerSample {
+            output_state: 8,
+            ..Default::default()
+        });
+        assert_eq!(output_button(&app.pd_power[0]), ("ON", ACCENT));
+    }
+
+    #[test]
+    fn five_power_views_persist_independent_profiles_layout_and_visibility() {
+        let path =
+            std::env::temp_dir().join(format!("wavecraft-five-power-{}.json", std::process::id()));
+        let repository = crate::CaptureSettingsRepository::at(path.clone());
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        assert_eq!(
+            app.available_workspace_views()
+                .iter()
+                .filter(|v| v.pd_power_index().is_some())
+                .count(),
+            1
+        );
+        for (index, view) in WorkspaceView::PD_POWER.into_iter().enumerate() {
+            app.open_workspace_view(view);
+            app.pd_power[index].settings.port = format!("power-port-{index}");
+            app.pd_power[index].settings.poll_hz = 10.0 + index as f64;
+            app.pd_power[index].plot_fraction = 0.3 + index as f32 * 0.1;
+            app.workspace_view_layout
+                .set_setup_panel_open(view, index % 2 == 0);
+            app.save_setup_settings(view);
+        }
+        app.save_global_settings();
+        let restored = WaveCraftApp::with_settings(None, repository.load().unwrap());
+        assert_eq!(
+            restored.active_workspace_view,
+            Some(WorkspaceView::PdPower5)
+        );
+        assert_eq!(
+            restored
+                .available_workspace_views()
+                .iter()
+                .filter(|v| v.pd_power_index().is_some())
+                .count(),
+            5
+        );
+        for (index, view) in WorkspaceView::PD_POWER.into_iter().enumerate() {
+            assert_eq!(
+                restored.pd_power[index].settings,
+                app.pd_power[index].settings
+            );
+            assert_eq!(
+                restored.pd_power[index].plot_fraction,
+                app.pd_power[index].plot_fraction
+            );
+            assert_eq!(
+                restored.workspace_view_layout.setup_panel_open(view),
+                index % 2 == 0
+            );
+        }
+        app.pd_power[0].points.push_back(Point {
+            time: 1.0,
+            sample: PowerSample::default(),
+        });
+        app.pd_power[4].points.push_back(Point {
+            time: 2.0,
+            sample: PowerSample::default(),
+        });
+        let actions = FrameActions {
+            pd_power_clear: Some(0),
+            ..Default::default()
+        };
+        app.apply_pd_power_actions(&actions);
+        assert!(app.pd_power[0].points.is_empty());
+        assert_eq!(app.pd_power[4].points.len(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn power_views_poll_independently_in_background_and_closing_one_stops_only_it() {
+        use crate::app::test_support::{ready_scripted, Script, SourceEnding};
+        use crate::{AcquisitionMode, CaptureTarget};
+        use wavecraft_core::{CaptureBatch, InstrumentKind};
+        let mut app = app();
+        for (index, view) in WorkspaceView::PD_POWER.into_iter().enumerate() {
+            app.workspace_view_layout.set_visible(view, true);
+            let sample = PowerSample {
+                voltage_mv: 1000 + index as u16,
+                current_ma: 100 + index as u16,
+                ..Default::default()
+            };
+            let ready = ready_scripted(
+                &app,
+                vec![(
+                    InstrumentKind::Serial,
+                    Script::sending(vec![CaptureBatch::Power(sample)], SourceEnding::Idle),
+                )],
+                AcquisitionMode::Run,
+                CaptureTarget::LogicAnalyzer,
+            );
+            app.pd_power[index].session = Some(ready.session);
+        }
+        app.active_workspace_view = Some(WorkspaceView::Battery);
+        let context = egui::Context::default();
+        crate::configure_style(&context);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.pd_power.iter().any(|state| state.points.is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            let _ = frame(&mut app, &context);
+        }
+        for (index, state) in app.pd_power.iter().enumerate() {
+            assert_eq!(state.latest.unwrap().voltage_mv, 1000 + index as u16);
+        }
+        app.pd_power[0].settings.port = "/dev/cu.shared-test".into();
+        app.pd_power[2].stop();
+        app.pd_power[2].settings.port = "/dev/tty.shared-test".into();
+        app.apply_pd_power_actions(&FrameActions {
+            pd_power_connect: Some(2),
+            ..Default::default()
+        });
+        assert!(app.pd_power[2].session.is_none());
+        assert!(app.pd_power[2]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("already connected"));
+        app.set_workspace_view_visible(WorkspaceView::PdPower4, false);
+        assert!(app.pd_power[3].session.is_none());
+        assert!(app.pd_power[0].session.is_some());
+        assert!(app.pd_power[1].session.is_some());
+        assert!(app.pd_power[4].session.is_some());
+    }
+
+    #[test]
+    fn legacy_settings_restore_only_one_power_tab() {
+        let legacy = serde_json::json!({"format_version":1,"profiles":{},"global":{"last_active_view":"pd_power","pd_power":{"port":"legacy-port","poll_hz":20.0},"pd_power_plot_fraction":0.65}});
+        let restored = WaveCraftApp::with_settings(None, serde_json::from_value(legacy).unwrap());
+        assert_eq!(restored.pd_power[0].settings.port, "legacy-port");
+        assert_eq!(restored.pd_power[0].plot_fraction, 0.65);
+        assert_eq!(
+            restored
+                .available_workspace_views()
+                .iter()
+                .filter(|v| v.pd_power_index().is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn every_device_setting_and_timer_field_has_help_without_inline_explanations() {
+        for label in [
+            "OCP protection",
+            "Calibration",
+            "OC discharge",
+            "Auto output",
+            "Compensation",
+            "Brightness",
+            "Filter window",
+            "Voltage discharge",
+            "Timer mode",
+            "ON duration",
+            "OFF duration",
+        ] {
+            assert!(!control_help(label).is_empty(), "{label}");
+        }
+        let mut app = app();
+        app.active_workspace_view = Some(WorkspaceView::PdPower);
+        let context = egui::Context::default();
+        crate::configure_style(&context);
+        let output = frame(&mut app, &context);
+        assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text().starts_with("CV holds") || t.galley.text().starts_with("0.1–100 Hz requested") || t.galley.text().starts_with("Requires PD"))));
+    }
+
+    #[test]
+    fn setting_explanation_is_shown_on_hover_only() {
+        let context = egui::Context::default();
+        crate::configure_style(&context);
+        let paint = |time, events| {
+            context.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut value = 10_u8;
+                        number(ui, "Brightness", "%", &mut value, 1..=100, 0);
+                    });
+                },
+            )
+        };
+        let output = paint(0.0, vec![]);
+        let position = text_rect(&output, "Brightness").center();
+        assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == control_help("Brightness"))));
+        let _ = paint(0.1, vec![egui::Event::PointerMoved(position)]);
+        let _ = paint(1.0, vec![]);
+        let output = paint(2.0, vec![]);
+        text_rect(&output, control_help("Brightness"));
+    }
+
+    #[test]
     fn saves_full_workspace_restores_tab_and_keeps_error_visible_when_collapsed() {
         let path =
             std::env::temp_dir().join(format!("wavecraft-pd-settings-{}.json", std::process::id()));
@@ -1032,8 +1394,8 @@ mod tests {
         let mut app =
             WaveCraftApp::with_settings(Some(repository), CaptureSettingsDocument::default());
         app.active_workspace_view = Some(WorkspaceView::PdPower);
-        app.pd_power.settings.poll_hz = 25.0;
-        app.pd_power.settings.device.presets[2] = [12000, 1000];
+        app.pd_power[0].settings.poll_hz = 25.0;
+        app.pd_power[0].settings.device.presets[2] = [12000, 1000];
         app.save_setup_settings(WorkspaceView::PdPower);
         app.workspace_view_layout
             .set_setup_panel_open(WorkspaceView::PdPower, false);
@@ -1043,11 +1405,11 @@ mod tests {
                 .unwrap();
         let mut restored = WaveCraftApp::with_settings(None, document);
         assert!(restored.pd_power_view_is_active());
-        assert_eq!(restored.pd_power.settings, app.pd_power.settings);
+        assert_eq!(restored.pd_power[0].settings, app.pd_power[0].settings);
         assert!(!restored
             .workspace_view_layout
             .setup_panel_open(WorkspaceView::PdPower));
-        restored.pd_power.error = Some("WeAct connection lost".into());
+        restored.pd_power[0].error = Some("WeAct connection lost".into());
         let context = egui::Context::default();
         crate::configure_style(&context);
         let output = frame(&mut restored, &context);

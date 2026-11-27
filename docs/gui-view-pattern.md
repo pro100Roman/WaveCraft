@@ -330,7 +330,24 @@ Serial workspace. Label and editor columns are fixed; dropdowns and numeric
 editors are both 96 points wide. The port is selected from the dropdown, and
 numeric inputs use keyboard-only `ManualValue`.
 
+The Connect/Disconnect button sits directly below Port in the setup panel.
+The toolbar has one output toggle: ON uses the accent color and OFF uses red.
+Its label and color follow device telemetry, including a running timer sequence;
+clicking sends the inverse state and waits for telemetry before changing color.
+Explanations are selectable hover tooltips on section headers, labels, fields,
+and action buttons, including every device setting and output timer parameter.
+
+The tab menu can open up to five independent PD Power workspaces. Each owns its
+connection, settings, history, plot split, and setup collapse state. All connected
+workspaces continue polling while another tab is selected. A physical serial
+port, including its `/dev/cu.` and `/dev/tty.` aliases, can belong to only one
+workspace at a time. Closing a tab stops only its connection. Saved single-view
+profiles migrate to the first workspace; additional tabs remain hidden until
+opened. The common footer saves the selected workspace's settings.
+
 ![PD Power workspace connected over USB](images/pd-power-view.png)
+
+![PD Power timer explanation shown on hover](images/pd-power-timer-tooltip.png)
 
 The protocol backend is `wavecraft-serial::pd_power`, independent of egui. Its
 `PowerSource` implements `CaptureSource` and emits typed `CaptureBatch::Power`
@@ -392,6 +409,11 @@ firmware and command validation, native-recording round trips, setup persistence
 common Snapshot/collapse/error placement, fixed fields, right margins, and real
 pointer dragging of the shared divider in headless egui frames. The native view
 was inspected while connected to the physical device on 2026-11-27.
+Additional coverage verifies five simultaneous independent simulated sessions,
+targeted actions after tab changes, the five-tab limit, legacy profile migration,
+per-workspace persistence, output-toggle inversion and debouncing, timer sequence
+state, and explanations appearing on hover. Native verification also opened all
+five tabs and monitored the USB device with firmware `V1.0.3.0_57ac5249`.
 
 The tested model is WeAct Studio PD Power Mini V1 BUCK, firmware
 `V1.0.0.1_e5298860`, on `/dev/cu.usbmodemacdec616b2961` (USB CDC, 115200 baud).

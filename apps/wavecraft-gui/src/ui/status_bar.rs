@@ -44,10 +44,11 @@ impl WaveCraftApp {
         };
         status.add_error(self.last_error.as_deref());
         if self.pd_power_view_is_active() {
-            status.message = &self.pd_power.status;
+            let state = &self.pd_power[self.active_pd_power_index()];
+            status.message = &state.status;
             status.detail = self.snapshot_message.as_deref().map(Cow::Borrowed);
-            status.active = self.pd_power.connected;
-            status.add_error(self.pd_power.error.as_deref());
+            status.active = state.connected;
+            status.add_error(state.error.as_deref());
         } else if self.battery_view_is_active() {
             status.message = &self.battery.status;
             status.detail = self.snapshot_message.as_deref().map(Cow::Borrowed);

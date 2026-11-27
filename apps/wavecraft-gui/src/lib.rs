@@ -435,7 +435,7 @@ struct WaveCraftApp {
     system_trace_settings: SystemTraceSettings,
     serial: serial::SerialState,
     battery: battery::BatteryState,
-    pd_power: pd_power::PowerState,
+    pd_power: [pd_power::PowerState; 5],
     system_trace: system_trace::SystemTraceDisplayState,
     system_trace_events: Option<Receiver<system_trace::LiveTraceUpdate>>,
     system_trace_terminal_lines: Option<Receiver<wavecraft_debug_probe::RttTerminalLine>>,
@@ -516,7 +516,11 @@ impl WaveCraftApp {
                 | WorkspaceView::SystemTrace
                 | WorkspaceView::Serial
                 | WorkspaceView::Battery
-                | WorkspaceView::PdPower,
+                | WorkspaceView::PdPower
+                | WorkspaceView::PdPower2
+                | WorkspaceView::PdPower3
+                | WorkspaceView::PdPower4
+                | WorkspaceView::PdPower5,
             )
             | None => None,
         };
@@ -597,7 +601,7 @@ impl WaveCraftApp {
             system_trace_settings: SystemTraceSettings::default(),
             serial: serial::SerialState::default(),
             battery: battery::BatteryState::default(),
-            pd_power: pd_power::PowerState::default(),
+            pd_power: std::array::from_fn(|_| pd_power::PowerState::default()),
             system_trace: system_trace::SystemTraceDisplayState::default(),
             system_trace_events: None,
             system_trace_terminal_lines: None,
@@ -701,7 +705,9 @@ impl eframe::App for WaveCraftApp {
             cancel.store(true, Ordering::Release);
         }
         self.serial.stop();
-        self.pd_power.stop();
+        for state in &mut self.pd_power {
+            state.stop();
+        }
         self.save_pending_window_size();
         self.save_global_settings();
         self.system_trace.cleanup_temporary_history();
@@ -758,8 +764,10 @@ impl WaveCraftApp {
         self.poll_worker();
         self.poll_vna_connection();
         self.poll_vna_sweep();
-        self.pd_power.poll();
-        if self.pd_power.session.is_some() {
+        for state in &mut self.pd_power {
+            state.poll();
+        }
+        if self.pd_power.iter().any(|state| state.session.is_some()) {
             context.request_repaint_after(std::time::Duration::from_millis(16));
         }
         self.serial.poll();
@@ -825,7 +833,11 @@ impl WaveCraftApp {
         self.paint_session_tabs(context);
 
         self.paint_central_panel(context, &frame, actions.snapshot_clicked);
-        if std::mem::take(&mut self.pd_power.layout_changed) {
+        let mut power_layout_changed = false;
+        for state in &mut self.pd_power {
+            power_layout_changed |= std::mem::take(&mut state.layout_changed);
+        }
+        if power_layout_changed {
             self.save_global_settings();
         }
         if self.system_trace.take_layout_changed() {

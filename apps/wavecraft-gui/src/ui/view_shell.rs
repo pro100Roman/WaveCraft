@@ -329,14 +329,15 @@ pub(crate) fn setup_section(
     title: &str,
     enabled: bool,
     contents: impl FnOnce(&mut egui::Ui),
-) {
+) -> egui::Response {
     egui::CollapsingHeader::new(RichText::new(title).strong().color(TEXT_MUTED))
         .id_salt(("setup_section", title))
         .default_open(true)
         .show_unindented(ui, |ui| {
             ui.add_space(6.0);
             ui.add_enabled_ui(enabled, contents);
-        });
+        })
+        .header_response
 }
 
 pub(crate) fn workspace_panel(context: &egui::Context, contents: impl FnOnce(&mut egui::Ui)) {

@@ -10,10 +10,14 @@ pub(crate) enum WorkspaceView {
     Serial,
     Battery,
     PdPower,
+    PdPower2,
+    PdPower3,
+    PdPower4,
+    PdPower5,
 }
 
 impl WorkspaceView {
-    pub(crate) const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::Waveform(WaveformTab::LogicAnalyzer),
         Self::Waveform(WaveformTab::Oscilloscope),
         Self::Waveform(WaveformTab::RadioReceiver),
@@ -23,7 +27,23 @@ impl WorkspaceView {
         Self::Serial,
         Self::Battery,
         Self::PdPower,
+        Self::PdPower2,
+        Self::PdPower3,
+        Self::PdPower4,
+        Self::PdPower5,
     ];
+
+    pub(crate) const PD_POWER: [Self; 5] = [
+        Self::PdPower,
+        Self::PdPower2,
+        Self::PdPower3,
+        Self::PdPower4,
+        Self::PdPower5,
+    ];
+
+    pub(crate) fn pd_power_index(self) -> Option<usize> {
+        Self::PD_POWER.iter().position(|view| *view == self)
+    }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -33,6 +53,10 @@ impl WorkspaceView {
             Self::Serial => "Serial / UART",
             Self::Battery => "Battery",
             Self::PdPower => "PD Power",
+            Self::PdPower2 => "PD Power 2",
+            Self::PdPower3 => "PD Power 3",
+            Self::PdPower4 => "PD Power 4",
+            Self::PdPower5 => "PD Power 5",
         }
     }
 }
@@ -50,7 +74,7 @@ impl Default for WorkspaceViewLayout {
     fn default() -> Self {
         Self {
             order: WorkspaceView::ALL,
-            hidden_views: Vec::new(),
+            hidden_views: WorkspaceView::PD_POWER[1..].to_vec(),
             collapsed_setup_views: Vec::new(),
             dragged_view: None,
             layout_changed: false,
@@ -278,6 +302,10 @@ pub(crate) fn workspace_views(waveform_tabs: &[WaveformTab]) -> Vec<WorkspaceVie
             WorkspaceView::Serial,
             WorkspaceView::Battery,
             WorkspaceView::PdPower,
+            WorkspaceView::PdPower2,
+            WorkspaceView::PdPower3,
+            WorkspaceView::PdPower4,
+            WorkspaceView::PdPower5,
         ])
         .collect()
 }
@@ -313,6 +341,10 @@ mod tests {
                 WorkspaceView::Serial,
                 WorkspaceView::Battery,
                 WorkspaceView::PdPower,
+                WorkspaceView::PdPower2,
+                WorkspaceView::PdPower3,
+                WorkspaceView::PdPower4,
+                WorkspaceView::PdPower5,
             ]
         );
         assert_eq!(
@@ -324,6 +356,10 @@ mod tests {
                 WorkspaceView::Serial,
                 WorkspaceView::Battery,
                 WorkspaceView::PdPower,
+                WorkspaceView::PdPower2,
+                WorkspaceView::PdPower3,
+                WorkspaceView::PdPower4,
+                WorkspaceView::PdPower5,
             ]
         );
     }
@@ -346,6 +382,10 @@ mod tests {
                 WorkspaceView::Serial,
                 WorkspaceView::Battery,
                 WorkspaceView::PdPower,
+                WorkspaceView::PdPower2,
+                WorkspaceView::PdPower3,
+                WorkspaceView::PdPower4,
+                WorkspaceView::PdPower5,
             ]
         );
         assert!(!layout.take_layout_changed());

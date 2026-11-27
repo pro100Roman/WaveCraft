@@ -1,6 +1,7 @@
 //! Power workspace state; transport and device protocol live in wavecraft-serial.
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 use wavecraft_core::{
     CaptureBatch, CaptureCoordinator, CaptureError, CaptureEvent, CaptureSession, PowerSample,
 };
@@ -61,6 +62,7 @@ pub(crate) struct Point {
 }
 
 pub(crate) struct PowerState {
+    output_toggle_due: Option<(Instant, bool)>,
     pub plot_fraction: f32,
     pub layout_changed: bool,
     pub settings: PowerSettings,
@@ -79,6 +81,7 @@ pub(crate) struct PowerState {
 impl Default for PowerState {
     fn default() -> Self {
         Self {
+            output_toggle_due: None,
             plot_fraction: 0.5,
             layout_changed: false,
             settings: PowerSettings::default(),
@@ -119,6 +122,7 @@ impl PowerState {
     }
 
     pub fn stop(&mut self) {
+        self.output_toggle_due = None;
         if let Some(session) = self.session.take() {
             session.request_stop();
         }
@@ -136,6 +140,29 @@ impl PowerState {
         }
     }
 
+    pub fn output_is_on(&self) -> Option<bool> {
+        self.latest.map(|sample| sample.output_state & 9 != 0)
+    }
+
+    pub fn output_toggle_pending(&self) -> bool {
+        self.output_toggle_due
+            .is_some_and(|(due, _)| Instant::now() < due)
+    }
+
+    pub fn toggle_output(&mut self) {
+        if !self.connected || self.output_toggle_pending() {
+            return;
+        }
+        if let Some(enabled) = self.output_is_on() {
+            self.request(Request::Write {
+                command: 2,
+                data: vec![u8::from(!enabled)],
+            });
+            // Block repeated clicks until fresh telemetry or a bounded timeout.
+            self.output_toggle_due = Some((Instant::now() + Duration::from_millis(500), !enabled));
+        }
+    }
+
     pub fn poll(&mut self) {
         if let Some(control) = &self.control {
             while let Ok(response) = control.responses.try_recv() {
@@ -150,9 +177,16 @@ impl PowerState {
                     }
                     Response::Applied(command) => {
                         self.error = None;
-                        self.status = format!("Command 0x{command:02X} sent · writes have no acknowledgement; readings show device state");
+                        self.status = if command == 2 {
+                            "Output change requested".into()
+                        } else {
+                            "Device settings sent".into()
+                        };
                     }
-                    Response::Rejected(error) => self.error = Some(error),
+                    Response::Rejected(error) => {
+                        self.output_toggle_due = None;
+                        self.error = Some(error);
+                    }
                 }
             }
         }
@@ -164,6 +198,12 @@ impl PowerState {
                     Ok(CaptureEvent::Frame(frame)) => {
                         if let CaptureBatch::Power(sample) = frame.payload {
                             self.latest = Some(sample);
+                            if self
+                                .output_toggle_due
+                                .is_some_and(|(_, desired)| self.output_is_on() == Some(desired))
+                            {
+                                self.output_toggle_due = None;
+                            }
                             self.points.push_back(Point {
                                 time: frame.captured_at.as_secs_f64(),
                                 sample,
@@ -201,6 +241,18 @@ impl PowerState {
     }
 }
 
+pub(crate) fn same_port(left: &str, right: &str) -> bool {
+    fn normalized(port: &str) -> String {
+        let path = std::fs::canonicalize(port)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| port.to_owned());
+        path.strip_prefix("/dev/cu.")
+            .map_or_else(|| path.clone(), |name| format!("/dev/tty.{name}"))
+    }
+    normalized(left) == normalized(right)
+}
+
 pub(crate) fn output_mode(sample: PowerSample) -> &'static str {
     match (sample.output_state >> 1) & 3 {
         2 => "OCP",
@@ -221,5 +273,51 @@ pub(crate) fn input_mode(state: u8) -> &'static str {
         6 => "DC",
         u8::MAX => "Unavailable",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn output_toggle_inverts_reported_state_and_debounces_pending_commands() {
+        let (requests, rx) = mpsc::sync_channel(8);
+        let (_tx, responses) = mpsc::sync_channel(8);
+        let mut state = PowerState {
+            connected: true,
+            latest: Some(PowerSample::default()),
+            control: Some(Control {
+                requests,
+                responses,
+            }),
+            ..Default::default()
+        };
+        state.toggle_output();
+        assert!(matches!(rx.try_recv(), Ok(Request::Write { command: 2, data }) if data == [1]));
+        state.toggle_output();
+        assert!(rx.try_recv().is_err());
+        state.output_toggle_due = None;
+        state.latest = Some(PowerSample {
+            output_state: 1,
+            ..Default::default()
+        });
+        state.toggle_output();
+        assert!(matches!(rx.try_recv(), Ok(Request::Write { command: 2, data }) if data == [0]));
+        state.output_toggle_due = None;
+        // Timer OFF phase still represents an active sequence.
+        state.latest = Some(PowerSample {
+            output_state: 8,
+            ..Default::default()
+        });
+        state.toggle_output();
+        assert!(matches!(rx.try_recv(), Ok(Request::Write { command: 2, data }) if data == [0]));
+    }
+
+    #[test]
+    fn serial_callout_and_tty_names_identify_the_same_device() {
+        assert!(same_port("/dev/cu.usbmodem123", "/dev/tty.usbmodem123"));
+        assert!(!same_port("/dev/cu.usbmodem123", "/dev/cu.usbmodem456"));
     }
 }
