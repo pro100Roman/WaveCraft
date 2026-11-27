@@ -15,6 +15,8 @@ pub(crate) const SETUP_PANEL_BODY_FONT_SIZE: f32 = 12.5;
 pub(crate) const SETUP_PANEL_SMALL_FONT_SIZE: f32 = 9.0;
 pub(crate) const SETUP_PANEL_MONOSPACE_FONT_SIZE: f32 = 12.0;
 const TOOLTIP_DELAY_SECONDS: f32 = 0.1;
+const UNICODE_FONT_NAME: &str = "Noto Sans";
+const UNICODE_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/NotoSans-Regular.ttf");
 const SYMBOL_FONT_NAME: &str = "Noto Sans Symbols2";
 const SYMBOL_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/NotoSansSymbols2-Regular.ttf");
 
@@ -72,6 +74,11 @@ fn wavecraft_font_definitions() -> egui::FontDefinitions {
     if !proportional.contains(&hack) {
         proportional.push(hack);
     }
+    // The existing fonts lack Latin subscripts/superscripts such as ₙ and ⁿ.
+    fonts.font_data.insert(
+        UNICODE_FONT_NAME.to_owned(),
+        egui::FontData::from_static(UNICODE_FONT_BYTES),
+    );
     fonts.font_data.insert(
         SYMBOL_FONT_NAME.to_owned(),
         egui::FontData::from_static(SYMBOL_FONT_BYTES).tweak(egui::FontTweak {
@@ -81,9 +88,11 @@ fn wavecraft_font_definitions() -> egui::FontDefinitions {
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         let family_fonts = fonts.families.entry(family).or_default();
-        let symbol_font = SYMBOL_FONT_NAME.to_owned();
-        if !family_fonts.contains(&symbol_font) {
-            family_fonts.push(symbol_font);
+        for fallback in [UNICODE_FONT_NAME, SYMBOL_FONT_NAME] {
+            let fallback = fallback.to_owned();
+            if !family_fonts.contains(&fallback) {
+                family_fonts.push(fallback);
+            }
         }
     }
     fonts
@@ -132,6 +141,28 @@ mod tests {
         });
 
         assert_eq!(supported, [true, true]);
+    }
+
+    #[test]
+    fn configured_fonts_contain_battery_formula_glyphs() {
+        let context = egui::Context::default();
+        configure_style(&context);
+
+        let _ = context.run(egui::RawInput::default(), |context| {
+            context.fonts(|fonts| {
+                for font_id in [
+                    egui::FontId::proportional(14.0),
+                    egui::FontId::monospace(14.0),
+                ] {
+                    for glyph in "f(x) = c₀ + c₁x + … + cₙxⁿ; V/V₀".chars() {
+                        assert!(
+                            fonts.has_glyph(&font_id, glyph),
+                            "Missing battery formula glyph {glyph:?} in {font_id:?}"
+                        );
+                    }
+                }
+            });
+        });
     }
 
     #[test]

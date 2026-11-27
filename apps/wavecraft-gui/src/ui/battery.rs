@@ -308,10 +308,24 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
             })
             .response
     });
-    let mut curve_hint =
-        "x = discharged capacity / rated capacity (0…1). V(x) = V₀ × f(x).".to_owned();
+    let mut curve_hint = if settings.curve == CurveKind::Table {
+        concat!(
+            "x = discharged capacity / rated capacity: 0 = start, 0.5 = 50% used, 1 = 100% used. This is a capacity fraction, not elapsed time.\n",
+            "V = battery voltage at x.\n",
+            "V₀ = initial voltage from Initial / full voltage.\n",
+            "V/V₀ = voltage relative to the initial voltage; for example, 0.9 means 90% of V₀.\n",
+            "V(x) = V₀ × f(x)."
+        )
+    } else {
+        "x = discharged capacity / rated capacity (0…1). V(x) = V₀ × f(x)."
+    }
+    .to_owned();
     if settings.curve == CurveKind::Chemistry {
-        curve_hint.push_str("\n\nGeneric exponential drop + slope + end knee. Illustrative chemistry profile; size is a label, not a measured cell model.");
+        curve_hint.push_str("\n\nGeneric exponential drop + slope + end knee. Illustrative chemistry profile; size is a label, not a measured cell model.\n\nIdeal battery-side power. No temperature, converter loss or voltage sag.");
+    } else if settings.curve == CurveKind::Polynomial {
+        curve_hint.push_str("\n\nf(x) = c₀ + c₁x + … + cₙxⁿ. Start with degree 5; verify monotonicity against measured data.");
+    } else if settings.curve == CurveKind::Table {
+        curve_hint.push_str("\n\nMeasured points: x and V/V₀. Linear interpolation; x increases from 0 to 1, voltage never increases.");
     }
     curve_response.on_hover_selectable_text(curve_hint);
     match settings.curve {
@@ -323,8 +337,6 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
                     ManualValue::new(&mut settings.polynomial_degree).range(1..=5),
                 )
             });
-            ui.label(RichText::new("f(x) = c₀ + c₁x + … + cₙxⁿ. Start with degree 5; verify monotonicity against measured data.")
-                .small().color(TEXT_MUTED));
             for i in 0..=usize::from(settings.polynomial_degree.min(5)) {
                 number(
                     ui,
@@ -336,8 +348,6 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
             }
         }
         CurveKind::Table => {
-            ui.label(RichText::new("Measured points: x and V/V₀. Linear interpolation; x increases from 0 to 1, voltage never increases.")
-                .small().color(TEXT_MUTED));
             let mut remove = None;
             for (i, point) in settings.table.iter_mut().enumerate() {
                 ui.push_id(i, |ui| {
@@ -388,11 +398,6 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
     if ui.small_button("Reset curve for chemistry").clicked() {
         settings.reset_curve();
     }
-    ui.label(
-        RichText::new("Ideal battery-side power. No temperature, converter loss or voltage sag.")
-            .small()
-            .color(TEXT_MUTED),
-    );
     ui.add_space(8.0);
     ui.label(
         RichText::new(format!(
