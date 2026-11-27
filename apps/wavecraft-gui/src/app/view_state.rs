@@ -898,21 +898,35 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn set_workspace_view_visible(&mut self, view: WorkspaceView, visible: bool) {
+        let available = self.available_workspace_views();
         if !visible
             && self.workspace_view_layout.is_visible(view)
-            && self
-                .available_workspace_views()
-                .iter()
-                .all(|candidate| *candidate == view)
+            && available.iter().all(|candidate| *candidate == view)
         {
             return;
         }
+        let next_active = if !visible && self.active_workspace_view == Some(view) {
+            available
+                .iter()
+                .position(|candidate| *candidate == view)
+                .and_then(|index| {
+                    available[..index]
+                        .last()
+                        .or_else(|| available.get(index + 1))
+                })
+                .copied()
+        } else {
+            None
+        };
         if !visible {
             if let Some(index) = view.pd_power_index() {
                 self.pd_power[index].stop();
             }
         }
         self.workspace_view_layout.set_visible(view, visible);
+        if let Some(next) = next_active {
+            self.select_workspace_view(next);
+        }
         self.reconcile_waveform_tab();
         self.save_global_settings();
     }
@@ -1315,6 +1329,62 @@ mod tests {
         assert!(restored.available_workspace_views().contains(&logic));
         assert_eq!(restored.workspace_view_layout.order(), &WorkspaceView::ALL);
         remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn closing_active_view_selects_its_visible_left_neighbor_in_tab_order() {
+        use WorkspaceView::{Battery, PdPower, PdPower2, PdPower3, SystemTrace};
+        let logic = WorkspaceView::Waveform(WaveformTab::LogicAnalyzer);
+        for (visible, active, closed, expected) in [
+            (
+                vec![logic, SystemTrace, Battery, PdPower, PdPower2],
+                PdPower2,
+                PdPower2,
+                PdPower,
+            ),
+            (
+                vec![logic, SystemTrace, PdPower3],
+                PdPower3,
+                PdPower3,
+                SystemTrace,
+            ),
+            (
+                vec![PdPower3, Battery, SystemTrace, logic],
+                SystemTrace,
+                SystemTrace,
+                Battery,
+            ),
+            (
+                vec![SystemTrace, Battery, logic],
+                SystemTrace,
+                SystemTrace,
+                Battery,
+            ),
+            (vec![logic, Battery, PdPower2], PdPower2, Battery, PdPower2),
+            (vec![SystemTrace], SystemTrace, SystemTrace, SystemTrace),
+        ] {
+            let mut app = WaveCraftApp::with_settings(None, CaptureSettingsDocument::default());
+            let mut order = visible.clone();
+            order.extend(
+                WorkspaceView::ALL
+                    .into_iter()
+                    .filter(|view| !visible.contains(view)),
+            );
+            assert!(app.workspace_view_layout.set_order(&order));
+            for view in WorkspaceView::ALL {
+                app.workspace_view_layout
+                    .set_visible(view, visible.contains(&view));
+            }
+            app.select_workspace_view(active);
+
+            app.set_workspace_view_visible(closed, false);
+
+            assert_eq!(app.active_workspace_view, Some(expected), "{visible:?}");
+            assert_eq!(
+                app.workspace_view_layout.is_visible(closed),
+                visible.len() == 1
+            );
+        }
     }
 
     #[test]

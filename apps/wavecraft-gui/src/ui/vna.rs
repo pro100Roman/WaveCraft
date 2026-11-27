@@ -1,6 +1,6 @@
 //! LiteVNA setup controls and Smith chart rendering.
 
-use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel};
+use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel, ToolbarSection};
 
 use crate::{
     egui, toolbar_action_button, CalibrationStandard, Color32, FontId, FrameActions, Pos2, Rect,
@@ -247,39 +247,42 @@ impl WaveCraftApp {
             context,
             "Vector network analyzer",
             self.pending_snapshot.is_none(),
-            |ui| {
-                actions.refresh_clicked = ui
-                    .add_enabled(
-                        !self.is_busy() && self.vna_session.is_none(),
-                        toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
-                    )
-                    .clicked();
-                ui.separator();
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let can_start = self.vna_session.is_some() && !self.is_busy();
-                    if ui
+            |ui, section| match section {
+                ToolbarSection::Files => {
+                    actions.refresh_clicked = ui
                         .add_enabled(
-                            (self.vna_run_active && !self.vna_run_stop_requested) || can_start,
-                            if self.vna_run_active {
-                                toolbar_action_button("■ Stop", Color32::LIGHT_RED)
-                            } else {
-                                toolbar_action_button("▶ Run", ACCENT)
-                            },
+                            !self.is_busy() && self.vna_session.is_none(),
+                            toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
                         )
-                        .clicked()
-                    {
-                        actions.vna_run_stop_clicked = true;
-                    }
-                    if ui
-                        .add_enabled(
-                            can_start,
-                            toolbar_action_button("▶ Single", SCOPE_COLORS[0]),
-                        )
-                        .clicked()
-                    {
-                        actions.vna_sweep_clicked = true;
-                    }
-                });
+                        .clicked();
+                }
+                ToolbarSection::Controls => {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_start = self.vna_session.is_some() && !self.is_busy();
+                        if ui
+                            .add_enabled(
+                                (self.vna_run_active && !self.vna_run_stop_requested) || can_start,
+                                if self.vna_run_active {
+                                    toolbar_action_button("■ Stop", Color32::LIGHT_RED)
+                                } else {
+                                    toolbar_action_button("▶ Run", ACCENT)
+                                },
+                            )
+                            .clicked()
+                        {
+                            actions.vna_run_stop_clicked = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                can_start,
+                                toolbar_action_button("▶ Single", SCOPE_COLORS[0]),
+                            )
+                            .clicked()
+                        {
+                            actions.vna_sweep_clicked = true;
+                        }
+                    });
+                }
             },
         );
         self.settings_open |= toolbar.settings_clicked;
@@ -2291,7 +2294,8 @@ mod tests {
                 .unwrap()
         };
         assert!(position("▶ Single").x < position("▶ Run").x);
-        assert!(position("📷 Snapshot").x < position("↻ Refresh").x);
+        assert!(position("↻ Refresh").x < position("📷 Snapshot").x);
+        assert!(position("📷 Snapshot").x < position("▶ Single").x);
         assert!(!texts
             .iter()
             .any(|(text, _)| text == "LiteVNA ready" || text == "No LiteVNA"));

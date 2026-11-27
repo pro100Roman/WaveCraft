@@ -278,7 +278,7 @@ mod tests {
         assert!(!app
             .available_workspace_views()
             .contains(&WorkspaceView::SystemTrace));
-        assert_ne!(app.active_workspace_view, Some(WorkspaceView::SystemTrace));
+        assert_eq!(app.active_workspace_view, Some(WorkspaceView::Vna));
         let texts = paint_tabs(&context, &mut app, Vec::new());
         let add_position = texts.iter().find(|(text, _)| text == "+").unwrap().1;
         click_tabs(&context, &mut app, add_position);

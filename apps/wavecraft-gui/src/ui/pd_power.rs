@@ -5,7 +5,7 @@ use super::{
     plot_hover::{paint_plot_hover, plot_hover_pointer},
     view_shell::{
         settings_card, setup_section, stacked_view_splitter, view_card, view_toolbar,
-        workspace_panel, PANE_SPLITTER_HEIGHT,
+        workspace_panel, ToolbarSection, PANE_SPLITTER_HEIGHT,
     },
 };
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
 use wavecraft_serial::pd_power::{Request, BAUD_RATES, MAX_POLL_HZ, MIN_POLL_HZ, UART_BAUD_RATES};
 
 const FIELD_WIDTH: f32 = 96.0;
+const CONNECTION_FIELD_WIDTH: f32 = FIELD_WIDTH * 1.35;
 const LABEL_WIDTH: f32 = 112.0;
 
 fn output_button(state: &PowerState) -> (&'static str, egui::Color32) {
@@ -106,34 +107,44 @@ impl WaveCraftApp {
             context,
             "WeAct Studio PD Power Mini V1 Buck",
             self.pending_snapshot.is_none(),
-            |ui| {
-                if ui
-                    .add(toolbar_action_button("Refresh ports", TEXT_MUTED))
-                    .clicked()
-                {
-                    actions.pd_power_refresh_ports = Some(index);
+            |ui, section| match section {
+                ToolbarSection::Files => {
+                    if ui
+                        .add(toolbar_action_button("Refresh ports", TEXT_MUTED))
+                        .clicked()
+                    {
+                        actions.pd_power_refresh_ports = Some(index);
+                    }
+                    if ui
+                        .add_enabled(
+                            state.connected,
+                            toolbar_action_button("Read settings", TEXT_MUTED),
+                        )
+                        .clicked()
+                    {
+                        actions.pd_power_requests.push((index, Request::Refresh));
+                    }
+                    if ui
+                        .add(toolbar_action_button("Clear graphs", TEXT_MUTED))
+                        .clicked()
+                    {
+                        actions.pd_power_clear = Some(index);
+                    }
                 }
-                if ui
-                    .add_enabled(
-                        state.connected,
-                        toolbar_action_button("Read settings", TEXT_MUTED),
-                    )
-                    .clicked()
-                {
-                    actions.pd_power_requests.push((index, Request::Refresh));
-                }
-                if ui
-                    .add(toolbar_action_button("Clear graphs", TEXT_MUTED))
-                    .clicked()
-                {
-                    actions.pd_power_clear = Some(index);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ToolbarSection::Controls => {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (label, color) = output_button(state);
-                    if ui.add_enabled(state.connected && state.latest.is_some() && !state.output_toggle_pending(), toolbar_action_button(label, color))
-                        .on_hover_selectable_text("Shows the reported output state. Click to toggle output ON/OFF. In timer mode, starts or stops the timer sequence. The color updates from device telemetry.")
+                    // Match System Trace's Start control and keep both output states equally wide.
+                    let run_button_width = ui.painter().layout_no_wrap(
+                        "▶ Start".into(),
+                        egui::TextStyle::Button.resolve(ui.style()),
+                        color,
+                    ).size().x + 2.0 * ui.spacing().button_padding.x;
+                    if ui.add_enabled(state.connected && state.latest.is_some() && !state.output_toggle_pending(), toolbar_action_button(label, color).min_size(egui::vec2(run_button_width, 0.0)))
+                        .on_hover_selectable_text("Shows the current physical output state read from the device, including changes made with its hardware button. ON is enabled; OFF is disabled, including a timer's OFF phase. Refreshes at the polling rate and changes only after fresh telemetry. Click to toggle output; in timer mode, starts or stops the sequence.")
                         .clicked() { actions.pd_power_toggle_output = Some(index); }
                 });
+                }
             },
         );
         self.settings_open |= toolbar.settings_clicked;
@@ -332,9 +343,21 @@ fn row<R>(
     unit: &str,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    let field_width = ui.spacing().interact_size.x.max(FIELD_WIDTH);
+    // Keep the field's right edge and unit column fixed when widening controls.
+    let label_width = LABEL_WIDTH + FIELD_WIDTH - field_width;
     ui.push_id(label, |ui| {
         let row = ui.horizontal(|ui| {
-            let caption = ui.add_sized([LABEL_WIDTH, 22.0], egui::Label::new(label).wrap());
+            let caption = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(label_width, 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(label_width);
+                        ui.add(egui::Label::new(label).wrap())
+                    },
+                )
+                .inner;
             if !control_help(label).is_empty() {
                 caption
                     .on_hover_selectable_text(control_help(label))
@@ -342,11 +365,11 @@ fn row<R>(
             }
             let result = ui
                 .allocate_ui_with_layout(
-                    egui::vec2(FIELD_WIDTH, 22.0),
+                    egui::vec2(field_width, 22.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        ui.set_width(FIELD_WIDTH);
-                        ui.spacing_mut().interact_size.x = FIELD_WIDTH;
+                        ui.set_width(field_width);
+                        ui.spacing_mut().interact_size.x = field_width;
                         content(ui)
                     },
                 )
@@ -373,7 +396,7 @@ fn number<N: egui::emath::Numeric>(
 ) -> bool {
     row(ui, label, unit, |ui| {
         ui.add_sized(
-            [FIELD_WIDTH, 22.0],
+            [ui.available_width(), 22.0],
             ManualValue::new(value)
                 .range(range)
                 .min_decimals(decimals)
@@ -388,7 +411,7 @@ fn number<N: egui::emath::Numeric>(
 fn readout(ui: &mut egui::Ui, label: &str, value: impl Into<String>, unit: &str) {
     row(ui, label, unit, |ui| {
         ui.add_sized(
-            [FIELD_WIDTH, 22.0],
+            [ui.available_width(), 22.0],
             egui::Label::new(RichText::new(value.into()).monospace()).wrap(),
         )
     });
@@ -403,9 +426,11 @@ fn field_combo(id: &str) -> egui::ComboBox {
 fn editor(ui: &mut egui::Ui, state: &mut PowerState, index: usize, actions: &mut FrameActions) {
     settings_card(ui, |ui| {
         section(ui, "CONNECTION", true, |ui| {
+            ui.spacing_mut().interact_size.x = CONNECTION_FIELD_WIDTH;
             ui.add_enabled_ui(state.session.is_none(), |ui| {
                 row(ui, "Port", "", |ui| {
                     field_combo("port")
+                        .width(CONNECTION_FIELD_WIDTH)
                         .selected_text(if state.settings.port.is_empty() {
                             "Select…"
                         } else {
@@ -419,13 +444,14 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, index: usize, actions: &mut
                 });
             });
             row(ui, "", "", |ui| {
-                if ui.add_enabled(state.session.is_some() || !state.settings.port.trim().is_empty(), toolbar_action_button(if state.session.is_some() { "Disconnect" } else { "Connect" }, ACCENT).min_size(egui::vec2(FIELD_WIDTH,22.0)))
+                if ui.add_enabled(state.session.is_some() || !state.settings.port.trim().is_empty(), toolbar_action_button(if state.session.is_some() { "Disconnect" } else { "Connect" }, ACCENT).min_size(egui::vec2(CONNECTION_FIELD_WIDTH,22.0)))
                     .on_hover_selectable_text("Open or close the selected USB CDC/UART connection. Connecting reads device settings without enabling the output.")
                     .clicked() { actions.pd_power_connect = Some(index); }
             });
             ui.add_enabled_ui(state.session.is_none(), |ui| {
                 row(ui, "Baud rate", "", |ui| {
                     field_combo("baud")
+                        .width(CONNECTION_FIELD_WIDTH)
                         .selected_text(state.settings.baud_rate.to_string())
                         .show_ui(ui, |ui| {
                             for &baud in if state.settings.crc8 {
@@ -443,6 +469,7 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, index: usize, actions: &mut
                 });
                 row(ui, "Protocol", "", |ui| {
                     field_combo("protocol")
+                        .width(CONNECTION_FIELD_WIDTH)
                         .selected_text(if state.settings.crc8 {
                             "UART CRC8"
                         } else {
@@ -1183,7 +1210,10 @@ mod tests {
             output_state: 8,
             ..Default::default()
         });
-        assert_eq!(output_button(&app.pd_power[0]), ("ON", ACCENT));
+        assert_eq!(
+            output_button(&app.pd_power[0]),
+            ("OFF", egui::Color32::LIGHT_RED)
+        );
     }
 
     #[test]

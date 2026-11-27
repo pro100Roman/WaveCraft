@@ -1,6 +1,6 @@
 //! The top toolbar: refresh, start/stop, recording, and snapshot controls.
 
-use super::view_shell::view_toolbar;
+use super::view_shell::{view_toolbar, ToolbarSection};
 
 use crate::{
     egui, toolbar_action_button, ui::frame_state::FrameState, AcquisitionMode, CaptureTarget,
@@ -57,35 +57,36 @@ impl WaveCraftApp {
             context,
             "USB and SDR capture workbench",
             self.pending_snapshot.is_none(),
-            |ui| {
-                actions.refresh_clicked = ui
-                    .add_enabled(
-                        !self.is_busy(),
-                        toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
-                    )
-                    .clicked();
-                ui.separator();
-                if ui
-                    .add_enabled(
-                        (control_target
-                            .is_some_and(|target| self.capture_target_can_start(target))
-                            && control_target_available)
-                            || can_attach_run_capture_recording,
-                        toolbar_action_button("⏺ Record", Color32::LIGHT_RED)
-                            .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
-                    )
-                    .on_hover_selectable_text(if can_attach_run_capture_recording {
-                        "Start recording the active Run acquisition to a .dsv file until Stop"
-                    } else if control_target == Some(CaptureTarget::RadioReceiver) {
-                        "Record continuous Run-mode raw IQ to a .dsv file until Stop"
-                    } else {
-                        "Record a complete Single capture to a .dsv file"
-                    })
-                    .clicked()
-                {
-                    actions.record_now_clicked = true;
-                }
-                if control_target == Some(CaptureTarget::RadioReceiver)
+            |ui, section| match section {
+                ToolbarSection::Files => {
+                    actions.refresh_clicked = ui
+                        .add_enabled(
+                            !self.is_busy(),
+                            toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
+                        )
+                        .clicked();
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            (control_target
+                                .is_some_and(|target| self.capture_target_can_start(target))
+                                && control_target_available)
+                                || can_attach_run_capture_recording,
+                            toolbar_action_button("⏺ Record", Color32::LIGHT_RED)
+                                .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
+                        )
+                        .on_hover_selectable_text(if can_attach_run_capture_recording {
+                            "Start recording the active Run acquisition to a .dsv file until Stop"
+                        } else if control_target == Some(CaptureTarget::RadioReceiver) {
+                            "Record continuous Run-mode raw IQ to a .dsv file until Stop"
+                        } else {
+                            "Record a complete Single capture to a .dsv file"
+                        })
+                        .clicked()
+                    {
+                        actions.record_now_clicked = true;
+                    }
+                    if control_target == Some(CaptureTarget::RadioReceiver)
                         && ui
                             .add_enabled(
                                 (self.capture_target_can_start(CaptureTarget::RadioReceiver)
@@ -101,32 +102,33 @@ impl WaveCraftApp {
                     {
                         actions.record_decoded_data_clicked = true;
                     }
-                if ui
-                    .add_enabled(
-                        capture_file_actions_enabled,
-                        toolbar_action_button("📂 Open", TEXT_MUTED)
-                            .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
-                    )
-                    .on_hover_selectable_text("Open a saved .dsv capture")
-                    .clicked()
-                {
-                    actions.open_recording_clicked = true;
+                    if ui
+                        .add_enabled(
+                            capture_file_actions_enabled,
+                            toolbar_action_button("📂 Open", TEXT_MUTED)
+                                .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
+                        )
+                        .on_hover_selectable_text("Open a saved .dsv capture")
+                        .clicked()
+                    {
+                        actions.open_recording_clicked = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            capture_file_actions_enabled && self.has_displayed_completed_capture(),
+                            toolbar_action_button("Export", TEXT_MUTED)
+                                .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
+                        )
+                        .on_hover_selectable_text(
+                            "Export the completed capture as a Saleae Logic 2 .sal file",
+                        )
+                        .clicked()
+                    {
+                        actions.export_saleae_clicked = true;
+                    }
                 }
-                if ui
-                    .add_enabled(
-                        capture_file_actions_enabled && self.has_displayed_completed_capture(),
-                        toolbar_action_button("Export", TEXT_MUTED)
-                            .min_size(Vec2::new(CAPTURE_FILE_BUTTON_WIDTH, 0.0)),
-                    )
-                    .on_hover_selectable_text(
-                        "Export the completed capture as a Saleae Logic 2 .sal file",
-                    )
-                    .clicked()
-                {
-                    actions.export_saleae_clicked = true;
-                }
-                ui.separator();
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ToolbarSection::Controls => {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let logic_only = control_target == Some(CaptureTarget::LogicAnalyzer);
                         let acquisition_active = control_target.is_some_and(|control| {
                             self.capture_for_target(control).is_some()
@@ -230,6 +232,7 @@ impl WaveCraftApp {
                             }
                         }
                     });
+                }
             },
         );
         self.settings_open |= toolbar.settings_clicked;

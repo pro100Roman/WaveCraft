@@ -4,7 +4,10 @@ use super::{
     frame_actions::FrameActions,
     manual_value::ManualValue,
     plot_hover::{paint_plot_hover, plot_hover_pointer},
-    view_shell::{remaining_plot_rect, settings_card, view_card, view_toolbar, workspace_panel},
+    view_shell::{
+        remaining_plot_rect, settings_card, view_card, view_toolbar, workspace_panel,
+        ToolbarSection,
+    },
 };
 use crate::{
     battery::{
@@ -41,20 +44,24 @@ impl WaveCraftApp {
             context,
             "Battery lifetime",
             self.pending_snapshot.is_none(),
-            |ui| {
-                actions.battery_load |= ui
-                    .add(toolbar_action_button("📂 Load…", TEXT_MUTED))
-                    .clicked();
-                actions.battery_save |= ui
-                    .add_enabled(
-                        self.battery.settings.validate().is_ok(),
-                        toolbar_action_button("Save file…", TEXT_MUTED),
-                    )
-                    .clicked();
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    actions.battery_calculate |=
-                        ui.add(toolbar_action_button("Calc", ACCENT)).clicked();
-                });
+            |ui, section| match section {
+                ToolbarSection::Files => {
+                    actions.battery_load |= ui
+                        .add(toolbar_action_button("📂 Load…", TEXT_MUTED))
+                        .clicked();
+                    actions.battery_save |= ui
+                        .add_enabled(
+                            self.battery.settings.validate().is_ok(),
+                            toolbar_action_button("Save file…", TEXT_MUTED),
+                        )
+                        .clicked();
+                }
+                ToolbarSection::Controls => {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        actions.battery_calculate |=
+                            ui.add(toolbar_action_button("Calc", ACCENT)).clicked();
+                    });
+                }
             },
         );
         self.settings_open |= toolbar.settings_clicked;

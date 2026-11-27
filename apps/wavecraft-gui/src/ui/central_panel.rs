@@ -831,6 +831,56 @@ mod tests {
                 })
                 .collect();
             assert_eq!(buttons.len(), 1, "{view:?}");
+            let snapshot = buttons[0];
+            let mut has_run_control_after_snapshot = false;
+            for shape in &output.shapes {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    let rect = text.visual_bounding_rect();
+                    if rect.center().y < snapshot.top() || rect.center().y > snapshot.bottom() {
+                        continue;
+                    }
+                    let label = text.galley.text();
+                    if matches!(
+                        label,
+                        "⏺ Record"
+                            | "⏺ Data"
+                            | "📂 Open"
+                            | "Export"
+                            | "📂 Open…"
+                            | "Save raw…"
+                            | "📂 Load…"
+                            | "Save file…"
+                            | "● Record…"
+                            | "💾 Save"
+                            | "↻ Refresh"
+                            | "Refresh ports"
+                    ) {
+                        assert!(rect.right() < snapshot.left(), "{view:?}: {}", label);
+                    }
+                    if matches!(
+                        label,
+                        "▶ Run" | "▶ Auto" | "▶ Update" | "▶ Start" | "Calc" | "ON/OFF"
+                    ) {
+                        assert!(snapshot.right() < rect.left(), "{view:?}: {label}");
+                        has_run_control_after_snapshot = true;
+                    }
+                }
+            }
+            assert!(
+                has_run_control_after_snapshot,
+                "{view:?}: primary control follows Snapshot"
+            );
+            assert!(
+                output.shapes.iter().any(|shape| matches!(
+                    &shape.shape,
+                    egui::Shape::LineSegment { points, .. }
+                        if (points[0].x - points[1].x).abs() < 0.1
+                            && points[0].x < snapshot.left()
+                            && points[0].x > snapshot.left() - 30.0
+                            && (points[0].y - points[1].y).abs() > 5.0
+                )),
+                "{view:?}: divider before Snapshot"
+            );
             let position = buttons[0].center();
             for pressed in [true, false] {
                 let output = snapshot_frame(

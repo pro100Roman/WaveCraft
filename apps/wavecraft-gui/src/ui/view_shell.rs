@@ -172,13 +172,19 @@ pub(crate) struct ViewToolbarResponse {
     pub snapshot_clicked: bool,
 }
 
-/// Every workspace receives the same App menu and Snapshot control. Views
-/// provide availability and apply the returned requests through orchestration.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ToolbarSection {
+    Files,
+    Controls,
+}
+
+/// Every workspace receives the same App menu and Snapshot after its file actions.
+/// The callback supplies each section; the shell owns the separating chrome.
 pub(crate) fn view_toolbar(
     context: &egui::Context,
     subtitle: &str,
     snapshot_enabled: bool,
-    controls: impl FnOnce(&mut egui::Ui),
+    mut contents: impl FnMut(&mut egui::Ui, ToolbarSection),
 ) -> ViewToolbarResponse {
     let mut response = ViewToolbarResponse::default();
     egui::TopBottomPanel::top("toolbar")
@@ -198,15 +204,17 @@ pub(crate) fn view_toolbar(
                     ui.label(RichText::new(subtitle).color(TEXT_MUTED));
                     ui.separator();
                 }
+                contents(ui, ToolbarSection::Files);
+                ui.separator();
                 response.snapshot_clicked = ui
                     .add_enabled(
                         snapshot_enabled,
                         toolbar_action_button("📷 Snapshot", TEXT_MUTED),
                     )
-                    .on_hover_text("Save the visible view content as a PNG snapshot")
+                    .on_hover_selectable_text("Save the visible view content as a PNG snapshot")
                     .clicked();
                 ui.separator();
-                controls(ui);
+                contents(ui, ToolbarSection::Controls);
             });
         });
     response

@@ -35,9 +35,13 @@ Settings contains instrument settings rather than workspace visibility controls.
 The add button stays outside the horizontal scroll area so it remains reachable
 in a narrow window.
 
-Primary Run/Stop/Single controls occupy the right end of the toolbar. Refresh,
-file operations, and instrument-specific actions occupy the left area after
-the shared App menu. Use `theme::toolbar_action_button` for their appearance.
+Refresh and file operations occupy the left area after the shared App menu.
+The template places Snapshot immediately after this file section, between
+vertical dividers. Connection and instrument controls follow Snapshot, with
+primary Run/Stop/Single controls aligned to the far right. Views supply the
+`ToolbarSection::Files` and `ToolbarSection::Controls` phases of one callback;
+the template owns Snapshot and both surrounding dividers. Use
+`theme::toolbar_action_button` for instrument buttons.
 
 ## Adding a view
 
@@ -55,8 +59,13 @@ the shared App menu. Use `theme::toolbar_action_button` for their appearance.
 The composition is intentionally small (illustrative Rust):
 
 ```rust,ignore
-let toolbar = view_toolbar(context, "Instrument description", self.pending_snapshot.is_none(), |ui| {
-    // Refresh and file actions, followed by right-aligned Run/Stop controls.
+let toolbar = view_toolbar(context, "Instrument description", self.pending_snapshot.is_none(), |ui, section| match section {
+    ToolbarSection::Files => {
+        // Refresh, Open, Import, Export, Save, and recording actions.
+    }
+    ToolbarSection::Controls => {
+        // Connection actions and right-aligned Run/Stop controls.
+    }
 });
 self.settings_open |= toolbar.settings_clicked;
 actions.snapshot_clicked |= toolbar.snapshot_clicked;
@@ -80,7 +89,7 @@ workspace_panel(context, |ui| {
 
 ## Snapshots
 
-Snapshot belongs to the toolbar template and appears once in every workspace,
+Snapshot belongs to the toolbar template and appears once after the file section in every workspace,
 including Serial/CSV and System Trace. Disable it while a screenshot request is
 pending. The frame dispatch in `paint_central_panel` queues the screenshot after
 painting the active view, using that frame's bounds and display scale. Views with
@@ -332,8 +341,11 @@ numeric inputs use keyboard-only `ManualValue`.
 
 The Connect/Disconnect button sits directly below Port in the setup panel.
 The toolbar has one output toggle: ON uses the accent color and OFF uses red.
-Its label and color follow device telemetry, including a running timer sequence;
-clicking sends the inverse state and waits for telemetry before changing color.
+Its label and color follow the physical output bit in device telemetry, including
+changes made with the hardware button. A timer's OFF phase displays OFF while
+Timer sequence separately reports Running. Clicking toggles the output, or
+starts/stops a timer sequence; the label waits for telemetry before changing.
+Hardware-button changes synchronize at the selected polling rate.
 Explanations are selectable hover tooltips on section headers, labels, fields,
 and action buttons, including every device setting and output timer parameter.
 

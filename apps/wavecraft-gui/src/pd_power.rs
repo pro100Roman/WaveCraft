@@ -141,6 +141,11 @@ impl PowerState {
     }
 
     pub fn output_is_on(&self) -> Option<bool> {
+        self.latest.map(|sample| sample.output_state & 1 != 0)
+    }
+
+    fn output_control_is_active(&self) -> Option<bool> {
+        // A timer can remain active while its physical output is in the OFF phase.
         self.latest.map(|sample| sample.output_state & 9 != 0)
     }
 
@@ -153,7 +158,7 @@ impl PowerState {
         if !self.connected || self.output_toggle_pending() {
             return;
         }
-        if let Some(enabled) = self.output_is_on() {
+        if let Some(enabled) = self.output_control_is_active() {
             self.request(Request::Write {
                 command: 2,
                 data: vec![u8::from(!enabled)],
@@ -198,10 +203,9 @@ impl PowerState {
                     Ok(CaptureEvent::Frame(frame)) => {
                         if let CaptureBatch::Power(sample) = frame.payload {
                             self.latest = Some(sample);
-                            if self
-                                .output_toggle_due
-                                .is_some_and(|(_, desired)| self.output_is_on() == Some(desired))
-                            {
+                            if self.output_toggle_due.is_some_and(|(_, desired)| {
+                                self.output_control_is_active() == Some(desired)
+                            }) {
                                 self.output_toggle_due = None;
                             }
                             self.points.push_back(Point {
@@ -280,6 +284,89 @@ pub(crate) fn input_mode(state: u8) -> &'static str {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use wavecraft_core::{
+        CaptureContext, CaptureSource, DeviceDescriptor, DeviceId, InstrumentKind,
+    };
+
+    struct OutputTelemetry(mpsc::Receiver<PowerSample>);
+
+    impl CaptureSource for OutputTelemetry {
+        fn descriptor(&self) -> DeviceDescriptor {
+            DeviceDescriptor {
+                id: DeviceId::new("external-output-changes"),
+                name: "External output changes".into(),
+                kind: InstrumentKind::Serial,
+            }
+        }
+
+        fn run(self: Box<Self>, context: CaptureContext) -> Result<(), CaptureError> {
+            context.synchronize_start()?;
+            let mut sequence = 0;
+            while !context.is_cancelled() {
+                match self.0.recv_timeout(Duration::from_millis(5)) {
+                    Ok(sample) => {
+                        context.emit(sequence, context.elapsed(), CaptureBatch::Power(sample))?;
+                        sequence += 1;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn output_display_follows_external_telemetry_and_waits_for_command_readback() {
+        let (samples, incoming) = mpsc::channel();
+        let (requests, commands) = mpsc::sync_channel(8);
+        let (replies, responses) = mpsc::sync_channel(8);
+        let mut state = PowerState {
+            connected: true,
+            session: Some(
+                CaptureCoordinator::start(vec![Box::new(OutputTelemetry(incoming))]).unwrap(),
+            ),
+            control: Some(Control {
+                requests,
+                responses,
+            }),
+            ..Default::default()
+        };
+        let receive = |state: &mut PowerState, output_state| {
+            let sample = PowerSample {
+                output_state,
+                ..Default::default()
+            };
+            samples.send(sample).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while state.latest != Some(sample) && Instant::now() < deadline {
+                state.poll();
+                std::thread::yield_now();
+            }
+            assert_eq!(state.latest, Some(sample));
+        };
+
+        receive(&mut state, 0);
+        state.toggle_output();
+        assert!(
+            matches!(commands.try_recv(), Ok(Request::Write { command: 2, data }) if data == [1])
+        );
+        assert_eq!(state.output_is_on(), Some(false));
+        replies.send(Response::Applied(2)).unwrap();
+        state.poll();
+        assert_eq!(state.output_is_on(), Some(false));
+        receive(&mut state, 1);
+        assert_eq!(state.output_is_on(), Some(true));
+        assert!(!state.output_toggle_pending());
+
+        // Hardware-button changes arrive without any request from the UI.
+        for output_state in [0, 1, 8, 9, 8, 0] {
+            receive(&mut state, output_state);
+            assert_eq!(state.output_is_on(), Some(output_state & 1 != 0));
+            assert!(commands.try_recv().is_err());
+        }
+        state.stop();
+    }
 
     #[test]
     fn output_toggle_inverts_reported_state_and_debounces_pending_commands() {
@@ -296,6 +383,7 @@ mod tests {
         };
         state.toggle_output();
         assert!(matches!(rx.try_recv(), Ok(Request::Write { command: 2, data }) if data == [1]));
+        assert_eq!(state.output_is_on(), Some(false));
         state.toggle_output();
         assert!(rx.try_recv().is_err());
         state.output_toggle_due = None;
@@ -306,11 +394,12 @@ mod tests {
         state.toggle_output();
         assert!(matches!(rx.try_recv(), Ok(Request::Write { command: 2, data }) if data == [0]));
         state.output_toggle_due = None;
-        // Timer OFF phase still represents an active sequence.
+        // Timer OFF phase displays OFF; clicking still stops the active sequence.
         state.latest = Some(PowerSample {
             output_state: 8,
             ..Default::default()
         });
+        assert_eq!(state.output_is_on(), Some(false));
         state.toggle_output();
         assert!(matches!(rx.try_recv(), Ok(Request::Write { command: 2, data }) if data == [0]));
     }

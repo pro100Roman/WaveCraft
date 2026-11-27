@@ -2,7 +2,9 @@
 
 use super::serial_graph::paint_graph;
 use super::serial_line_style::{line_style_picker, LINE_STYLE_PICKER_WIDTH};
-use super::view_shell::{settings_card, setup_section, view_card, view_toolbar, workspace_panel};
+use super::view_shell::{
+    settings_card, setup_section, view_card, view_toolbar, workspace_panel, ToolbarSection,
+};
 use crate::serial::{
     SerialMode, SerialSettings, SerialState, SerialTimestampUnit, TextField, COLORS,
 };
@@ -39,48 +41,51 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut crate::FrameActions,
     ) {
+        let running = self.serial.session.is_some();
         let toolbar = view_toolbar(
             context,
             "Serial / UART",
             self.pending_snapshot.is_none(),
-            |ui| {
-                let running = self.serial.session.is_some();
-                if ui
-                    .add_enabled(!running, toolbar_action_button("↻ Refresh", TEXT_MUTED))
-                    .clicked()
-                {
-                    self.serial.refresh();
-                }
-                if ui.add(toolbar_action_button("Clear", TEXT_MUTED)).clicked() {
-                    self.serial.clear_data();
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(!running, toolbar_action_button("📂 Open…", TEXT_MUTED))
-                    .on_hover_text("Open raw serial bytes or a CSV file")
-                    .clicked()
-                {
-                    self.open_serial_raw();
-                }
-                if ui
-                    .add_enabled(
-                        !self.serial.raw.is_empty(),
-                        toolbar_action_button("Save raw…", TEXT_MUTED),
-                    )
-                    .on_hover_text("Save the retained raw bytes (latest 64 KiB)")
-                    .clicked()
-                {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("serial-capture.bin")
-                        .save_file()
+            |ui, section| match section {
+                ToolbarSection::Files => {
+                    if ui
+                        .add_enabled(!running, toolbar_action_button("↻ Refresh", TEXT_MUTED))
+                        .clicked()
                     {
-                        let bytes: Vec<_> = self.serial.raw.iter().copied().collect();
-                        if let Err(error) = std::fs::write(path, bytes) {
-                            self.serial.error = Some(error.to_string());
+                        self.serial.refresh();
+                    }
+                    if ui.add(toolbar_action_button("Clear", TEXT_MUTED)).clicked() {
+                        self.serial.clear_data();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(!running, toolbar_action_button("📂 Open…", TEXT_MUTED))
+                        .on_hover_text("Open raw serial bytes or a CSV file")
+                        .clicked()
+                    {
+                        self.open_serial_raw();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.serial.raw.is_empty(),
+                            toolbar_action_button("Save raw…", TEXT_MUTED),
+                        )
+                        .on_hover_text("Save the retained raw bytes (latest 64 KiB)")
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name("serial-capture.bin")
+                            .save_file()
+                        {
+                            let bytes: Vec<_> = self.serial.raw.iter().copied().collect();
+                            if let Err(error) = std::fs::write(path, bytes) {
+                                self.serial.error = Some(error.to_string());
+                            }
                         }
                     }
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ToolbarSection::Controls => {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if running {
                     if ui
                         .add_enabled(
@@ -108,6 +113,7 @@ impl WaveCraftApp {
                     }
                 }
             });
+                }
             },
         );
         self.settings_open |= toolbar.settings_clicked;
