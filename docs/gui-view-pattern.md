@@ -202,7 +202,8 @@ monotonicity are checked at every knot.
 
 The 1–50 patterns execute sequentially and repeat. Power is constant within each
 pattern and refers to battery-side mW; duration is a floating-point ms value.
-Zero-power sleep is supported, while an entirely zero-energy cycle is rejected.
+Zero-power sleep is supported. An entirely zero-energy cycle requires positive
+self-discharge and a voltage cutoff reached before zero remaining charge.
 The solver locates cutoff by bisection, integrates `V(q) dq` in mWh over up to
 4096 intervals, then inverts the repeating load's cumulative energy to obtain
 time. It skips whole cycles algebraically and resolves the final partial pattern,
@@ -211,11 +212,53 @@ energy boundary it stops at the consuming pattern, before a trailing sleep.
 The plotted curve is a bounded sampled envelope; individual short pulses may
 not be visually resolved across a long lifetime.
 
-The result reports hours, days, usable mWh, average mW, and whether cutoff or
-rated capacity ended the run. This ideal energy model excludes self-discharge,
-aging, temperature, converter losses, current-dependent capacity (including
-Peukert effects), recovery, and internal-resistance voltage sag. These require
-additional measured parameters and should be separate future model extensions.
+The result reports hours, days, delivered mWh, average cycle mW, and whether
+cutoff or rated capacity ended the run. Delivered energy excludes energy lost to
+aging and self-discharge.
+
+### Annual aging and self-discharge
+
+The setup panel has two independent parameters, both defaulting to **0%/year**:
+
+- **Capacity loss / year**: calendar aging reduces available capacity as
+  `C(t) = C_initial × (1 - aging/100)^(t/8766)`.
+- **Self-discharge / year**: loss of the remaining charge, including during
+  zero-power sleep. With no load, `SOC(t) = (1 - self_discharge/100)^(t/8766)`.
+
+Rates are finite values from 0 up to, but excluding, 100%; 0 disables the effect.
+For example, 10%/year retains 90% after one year and 81% after two. A model year
+is 365.25 days (8766 hours). The calculation starts from the entered full battery
+at time zero; the rates describe future losses during the modeled lifetime.
+These are user-selected constant-rate approximations, not chemistry-calibrated
+aging predictions.
+
+With `H(t)` the remaining capacity fraction, `S` remaining state of charge,
+`k = -ln(1-aging/100)/8766` and `s = -ln(1-self_discharge/100)/8766`, the model is:
+
+```text
+H(t) = exp(-k t)
+dS/dt = -P(t) / (C_initial × V(1-S) × H(t)) - s × S
+```
+
+Aging alone does not act as a charge drain during sleep. Self-discharge reduces
+SOC even with no load. Without self-discharge, exponentially weighted cycle
+energy is inverted analytically. With self-discharge, the solver uses 4096
+charge intervals, holds voltage at each interval's endpoint mean, and integrates
+the resulting linear equation using exponential cycle sums and bounded root
+searches. Pattern order, sleep, and partial cycles remain part of the model;
+whole cycles are not simulated one by one. Pure shelf discharge is solved
+analytically; it reaches a positive-SOC voltage cutoff in finite time, while
+exactly zero charge is approached asymptotically.
+
+Both rates participate in stale-result detection, explicit Save settings, and
+portable JSON profiles. Missing fields in older files default to 0, preserving
+previous calculations. Tests include constant-voltage analytical solutions,
+combined losses, cutoff during sleep, pure shelf discharge, invalid rates,
+legacy files, and settings round trips.
+
+Temperature, converter losses, current-dependent capacity (including Peukert
+effects), recovery, and internal-resistance voltage sag remain outside this
+model and require additional measured parameters.
 
 JSON import validates the format/version, finite values, curve domain, and load
 limits before changing the view. Reads are capped at 1 MiB, and floating-point

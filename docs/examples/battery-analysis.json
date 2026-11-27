@@ -6,6 +6,8 @@
     "size": "18650",
     "initial_voltage": 4.2,
     "capacity_mah": 2600.0,
+    "aging_percent_per_year": 0.0,
+    "self_discharge_percent_per_year": 0.0,
     "cutoff_voltage": 3.0,
     "curve": "Chemistry",
     "polynomial_degree": 5,

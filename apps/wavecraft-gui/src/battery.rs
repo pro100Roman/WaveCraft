@@ -6,6 +6,7 @@ use std::path::Path;
 
 pub(crate) const MAX_PATTERNS: usize = 50;
 const STEPS: usize = 4096;
+const HOURS_PER_YEAR: f64 = 365.25 * 24.0;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +134,12 @@ pub(crate) struct BatterySettings {
     pub(crate) size: String,
     pub(crate) initial_voltage: f64,
     pub(crate) capacity_mah: f64,
+    /// Calendar capacity fade, compounded annually from the start of this run.
+    #[serde(default)]
+    pub(crate) aging_percent_per_year: f64,
+    /// Loss of the remaining charge per year, independent of capacity aging.
+    #[serde(default)]
+    pub(crate) self_discharge_percent_per_year: f64,
     pub(crate) cutoff_voltage: f64,
     pub(crate) curve: CurveKind,
     pub(crate) polynomial_degree: u8,
@@ -150,6 +157,8 @@ impl Default for BatterySettings {
             size: "18650".into(),
             initial_voltage: 4.2,
             capacity_mah: 2600.0,
+            aging_percent_per_year: 0.0,
+            self_discharge_percent_per_year: 0.0,
             cutoff_voltage: 3.0,
             curve: CurveKind::Chemistry,
             polynomial_degree: 5,
@@ -237,6 +246,22 @@ impl BatterySettings {
         if !self.capacity_mah.is_finite() || self.capacity_mah <= 0.0 {
             return Err("Capacity must be finite and greater than 0 mAh".into());
         }
+        if !self.aging_percent_per_year.is_finite()
+            || !(0.0..100.0).contains(&self.aging_percent_per_year)
+        {
+            return Err(
+                "Annual capacity loss must be finite and in the range 0 ≤ aging < 100 %/year"
+                    .into(),
+            );
+        }
+        if !self.self_discharge_percent_per_year.is_finite()
+            || !(0.0..100.0).contains(&self.self_discharge_percent_per_year)
+        {
+            return Err(
+                "Annual self-discharge must be finite and in the range 0 ≤ loss < 100 %/year"
+                    .into(),
+            );
+        }
         if self.size.trim().is_empty() || self.size.len() > 128 {
             return Err("Battery size must contain 1–128 bytes".into());
         }
@@ -307,11 +332,11 @@ impl BatterySettings {
         if !duration.is_finite()
             || duration <= 0.0
             || !energy.is_finite()
-            || energy <= 0.0
+            || (energy <= 0.0 && self.self_discharge_percent_per_year == 0.0)
             || !(energy / duration).is_finite()
         {
             return Err(
-                "The repeating cycle must have finite duration and positive finite energy".into(),
+                "The repeating cycle must have finite duration and positive finite energy, or positive self-discharge".into(),
             );
         }
         Ok((duration, energy))
@@ -363,9 +388,197 @@ fn time_for_energy(settings: &BatterySettings, energy: f64, cycle: (f64, f64)) -
     hours
 }
 
+/// Calendar health H(t) = exp(-k t). The discharge coordinate obeys
+/// dE_reference/dt = P(t)/H(t), equivalently dx/dt = I(t)/(C_initial H(t)).
+/// This reduces capacity without treating calendar fade as self-discharge.
+/// Logarithms keep the geometric cycle sums finite even for very long sleeps.
+struct WeightedLoadCycle {
+    rate_per_hour: f64,
+    duration_hours: f64,
+    log_cycle_energy: f64,
+    log_cycle_growth: f64,
+    patterns: Vec<WeightedLoadPattern>,
+}
+
+struct WeightedLoadPattern {
+    start: f64,
+    duration: f64,
+    power: f64,
+    log_energy: f64,
+    log_prefix: f64,
+}
+
+fn annual_loss_rate(percent: f64) -> f64 {
+    -(-percent / 100.0).ln_1p() / HOURS_PER_YEAR
+}
+
+fn log_expm1(value: f64) -> f64 {
+    if value < 50.0 {
+        value.exp_m1().ln()
+    } else {
+        value + (-(-value).exp()).ln_1p()
+    }
+}
+
+fn log_sum_exp(left: f64, right: f64) -> f64 {
+    let maximum = left.max(right);
+    if maximum == f64::NEG_INFINITY {
+        return maximum;
+    }
+    maximum + ((left.min(right) - maximum).exp()).ln_1p()
+}
+
+fn log_one_plus_exp(value: f64) -> f64 {
+    if value > 0.0 {
+        value + (-value).exp().ln_1p()
+    } else {
+        value.exp().ln_1p()
+    }
+}
+
+impl WeightedLoadCycle {
+    fn new(settings: &BatterySettings, duration_hours: f64, rate: f64) -> Option<Self> {
+        // Preserve the existing exact zero-aging path, including underflow-sized rates.
+        if rate == 0.0 || rate * duration_hours == 0.0 {
+            return None;
+        }
+        let mut start = 0.0;
+        let mut patterns = Vec::with_capacity(settings.patterns.len());
+        let mut log_cycle_energy = f64::NEG_INFINITY;
+        for pattern in &settings.patterns {
+            let duration = pattern.duration_ms / 3_600_000.0;
+            let log_energy = if pattern.power_mw > 0.0 {
+                pattern.power_mw.ln() + rate * start + log_expm1(rate * duration) - rate.ln()
+            } else {
+                f64::NEG_INFINITY
+            };
+            patterns.push(WeightedLoadPattern {
+                start,
+                duration,
+                power: pattern.power_mw,
+                log_energy,
+                log_prefix: log_cycle_energy,
+            });
+            if log_energy.is_finite() {
+                log_cycle_energy = log_sum_exp(log_cycle_energy, log_energy);
+            }
+            start += duration;
+        }
+        Some(Self {
+            rate_per_hour: rate,
+            duration_hours,
+            log_cycle_energy,
+            log_cycle_growth: log_expm1(rate * duration_hours),
+            patterns,
+        })
+    }
+
+    /// log ∫₀ᵗ P(u) exp(rate × u) du, evaluated without enumerating cycles.
+    fn log_energy_until(&self, hours: f64) -> f64 {
+        if hours <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        let cycles = (hours / self.duration_hours).floor();
+        let phase = (hours - cycles * self.duration_hours).max(0.0);
+        let exponent = self.rate_per_hour * (cycles * self.duration_hours);
+        let completed = if cycles > 0.0 {
+            self.log_cycle_energy + log_expm1(exponent) - self.log_cycle_growth
+        } else {
+            f64::NEG_INFINITY
+        };
+        let index = self
+            .patterns
+            .partition_point(|pattern| pattern.start <= phase)
+            .saturating_sub(1);
+        let Some(pattern) = self.patterns.get(index) else {
+            return completed;
+        };
+        let elapsed = (phase - pattern.start).clamp(0.0, pattern.duration);
+        let partial = if pattern.power > 0.0 && elapsed > 0.0 {
+            pattern.power.ln()
+                + self.rate_per_hour * pattern.start
+                + log_expm1(self.rate_per_hour * elapsed)
+                - self.rate_per_hour.ln()
+        } else {
+            f64::NEG_INFINITY
+        };
+        log_sum_exp(
+            completed,
+            exponent + log_sum_exp(pattern.log_prefix, partial),
+        )
+    }
+
+    fn time_for_energy(&self, energy: f64) -> f64 {
+        if energy <= 0.0 {
+            return 0.0;
+        }
+        let rate = self.rate_per_hour;
+        let cycle_exponent = rate * self.duration_hours;
+        // Sum n exponentially weighted cycles, then invert the geometric series.
+        let real_cycles =
+            log_one_plus_exp(energy.ln() + self.log_cycle_growth - self.log_cycle_energy)
+                / cycle_exponent;
+        let mut cycles = real_cycles.floor();
+        let mut fraction = real_cycles - cycles;
+        if fraction <= 1e-12 && cycles > 0.0 {
+            cycles -= 1.0;
+            fraction = 1.0;
+        }
+        let mut log_remaining = if cycles == 0.0 {
+            energy.ln()
+        } else {
+            self.log_cycle_energy + log_expm1(fraction * cycle_exponent) - self.log_cycle_growth
+        };
+        for &WeightedLoadPattern {
+            start,
+            duration,
+            power,
+            log_energy,
+            ..
+        } in &self.patterns
+        {
+            if power == 0.0 {
+                continue;
+            }
+            if log_remaining <= log_energy + 1e-12 {
+                let within =
+                    log_one_plus_exp(rate.ln() + log_remaining - rate * start - power.ln()) / rate;
+                return cycles * self.duration_hours + start + within.clamp(0.0, duration);
+            }
+            // log(exp(remaining) - exp(pattern)), stable near a boundary.
+            log_remaining += (-((log_energy - log_remaining).exp_m1())).ln();
+        }
+        (cycles + 1.0) * self.duration_hours
+    }
+}
+
+fn delivered_energy(settings: &BatterySettings, hours: f64, cycle: (f64, f64)) -> f64 {
+    let cycles = (hours / cycle.0).floor();
+    let mut remaining = (hours - cycles * cycle.0).max(0.0);
+    let mut energy = cycles * cycle.1;
+    for pattern in &settings.patterns {
+        let duration = pattern.duration_ms / 3_600_000.0;
+        let elapsed = remaining.min(duration);
+        energy += pattern.power_mw * elapsed;
+        remaining = (remaining - elapsed).max(0.0);
+    }
+    energy
+}
+
 pub(crate) fn calculate(settings: &BatterySettings) -> Result<BatteryResult, String> {
     settings.validate()?;
     let cycle = settings.cycle()?;
+    let aging = WeightedLoadCycle::new(
+        settings,
+        cycle.0,
+        annual_loss_rate(settings.aging_percent_per_year),
+    );
+    let time_for_energy = |energy| {
+        aging.as_ref().map_or_else(
+            || time_for_energy(settings, energy, cycle),
+            |aging| aging.time_for_energy(energy),
+        )
+    };
     let mut end = 1.0;
     let cutoff_reached = settings.voltage(1.0) <= settings.cutoff_voltage;
     if cutoff_reached {
@@ -381,6 +594,9 @@ pub(crate) fn calculate(settings: &BatterySettings) -> Result<BatteryResult, Str
         }
         end = (low + high) * 0.5;
     }
+    if settings.self_discharge_percent_per_year > 0.0 {
+        return calculate_with_self_discharge(settings, cycle, end, cutoff_reached);
+    }
     let dq = settings.capacity_mah * end / STEPS as f64;
     let mut energy = 0.0;
     let mut previous = settings.initial_voltage;
@@ -389,20 +605,117 @@ pub(crate) fn calculate(settings: &BatterySettings) -> Result<BatteryResult, Str
     for i in 1..=STEPS {
         let voltage = settings.voltage(end * i as f64 / STEPS as f64);
         energy += (previous + voltage) * 0.5 * dq;
-        let hours = time_for_energy(settings, energy, cycle);
+        let hours = time_for_energy(energy);
         if !energy.is_finite() || !hours.is_finite() {
             return Err("Values are too large for a finite lifetime calculation".into());
         }
         points.push([hours, voltage]);
         previous = voltage;
     }
-    let lifetime_hours = time_for_energy(settings, energy, cycle);
-    if lifetime_hours <= 0.0 || energy <= 0.0 {
+    let lifetime_hours = time_for_energy(energy);
+    if aging.is_some() {
+        energy = delivered_energy(settings, lifetime_hours, cycle);
+    }
+    if !energy.is_finite() || lifetime_hours <= 0.0 || energy <= 0.0 {
         return Err("Values are too small for a finite lifetime calculation".into());
     }
     Ok(BatteryResult {
         points,
         lifetime_hours,
+        energy_mwh: energy,
+        average_power_mw: cycle.1 / cycle.0,
+        cutoff_reached,
+    })
+}
+
+/// Charge-domain integration: S' = -P(t)/(C₀ V(S) H(t)) - s S.
+/// Freeze voltage at each small charge interval's midpoint and integrate the
+/// resulting linear ODE exactly. Both the periodic load and exponential losses
+/// are resolved analytically within each of the bounded intervals.
+fn calculate_with_self_discharge(
+    settings: &BatterySettings,
+    cycle: (f64, f64),
+    end: f64,
+    cutoff_reached: bool,
+) -> Result<BatteryResult, String> {
+    let loss = annual_loss_rate(settings.self_discharge_percent_per_year);
+    let growth = loss + annual_loss_rate(settings.aging_percent_per_year);
+    let clock = WeightedLoadCycle::new(settings, cycle.0, growth)
+        .ok_or_else(|| "Self-discharge rate is too small to calculate".to_owned())?;
+    let mut reference_energy = 0.0;
+    let mut voltages = Vec::with_capacity(STEPS + 1);
+    let mut previous = settings.initial_voltage;
+    voltages.push(previous);
+    let dq = settings.capacity_mah * end / STEPS as f64;
+    for i in 1..=STEPS {
+        let voltage = settings.voltage(end * i as f64 / STEPS as f64);
+        reference_energy += (previous + voltage) * 0.5 * dq;
+        voltages.push(voltage);
+        previous = voltage;
+    }
+    if !reference_energy.is_finite() || reference_energy <= 0.0 {
+        return Err("Values are too large or too small for a finite lifetime calculation".into());
+    }
+    let upper = if cycle.1 > 0.0 {
+        let unaged = time_for_energy(settings, reference_energy, cycle);
+        // V ≤ V_initial: a constant-full-voltage cell is an upper bound on
+        // lifetime. This keeps root precision tight for decades-long low loads.
+        let full_voltage_bound =
+            clock.time_for_energy(settings.capacity_mah * settings.initial_voltage);
+        let charge_loss_bound = if end < 1.0 {
+            -(-end).ln_1p() / loss
+        } else {
+            f64::INFINITY
+        };
+        unaged.min(full_voltage_bound).min(charge_loss_bound)
+    } else if end < 1.0 {
+        -(-end).ln_1p() / loss
+    } else {
+        return Err("Self-discharge alone approaches zero charge asymptotically; use a cutoff above the curve's empty voltage or add a consuming pattern".into());
+    };
+    if !upper.is_finite() || upper <= 0.0 {
+        return Err("Values do not produce a finite lifetime".into());
+    }
+    let mut points = Vec::with_capacity(STEPS + 1);
+    points.push([0.0, settings.initial_voltage]);
+    let mut hours = 0.0;
+    for i in 1..=STEPS {
+        let soc_before = 1.0 - end * (i - 1) as f64 / STEPS as f64;
+        let soc_after = (1.0 - end * i as f64 / STEPS as f64).max(0.0);
+        if cycle.1 == 0.0 {
+            hours = -(-end * i as f64 / STEPS as f64).ln_1p() / loss;
+        } else {
+            let log_capacity_voltage =
+                settings.capacity_mah.ln() + ((voltages[i - 1] + voltages[i]) * 0.5).ln();
+            let target = log_sum_exp(
+                clock.log_energy_until(hours),
+                log_capacity_voltage + soc_before.ln() + loss * hours,
+            );
+            let mut low = hours;
+            let mut high = upper;
+            for _ in 0..48 {
+                let middle = low + (high - low) * 0.5;
+                let consumed = log_sum_exp(
+                    clock.log_energy_until(middle),
+                    log_capacity_voltage + soc_after.ln() + loss * middle,
+                );
+                if consumed < target {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            hours = low + (high - low) * 0.5;
+        }
+        points.push([hours, voltages[i]]);
+    }
+    let energy = delivered_energy(settings, hours, cycle);
+    if !hours.is_finite() || hours <= 0.0 || !energy.is_finite() {
+        return Err("Values do not produce a finite lifetime".into());
+    }
+    Ok(BatteryResult {
+        points,
+        lifetime_hours: hours,
         energy_mwh: energy,
         average_power_mw: cycle.1 / cycle.0,
         cutoff_reached,
@@ -580,6 +893,223 @@ mod tests {
         let result = calculate(&settings).unwrap();
         assert!(result.points.len() <= STEPS + 1);
         assert!((result.lifetime_hours / 9e9 - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn calendar_aging_matches_constant_power_analytical_solution() {
+        let mut settings = constant(1.0, HOURS_PER_YEAR * 10.0, 1.0);
+        let original = calculate(&settings).unwrap();
+        settings.aging_percent_per_year = 10.0;
+        let rate = -0.9_f64.ln() / HOURS_PER_YEAR;
+        let expected_hours = (rate * original.lifetime_hours).ln_1p() / rate;
+        let aged = calculate(&settings).unwrap();
+        assert!((aged.lifetime_hours / expected_hours - 1.0).abs() < 1e-10);
+        assert!((aged.energy_mwh / expected_hours - 1.0).abs() < 1e-10);
+        assert!(aged.lifetime_hours < original.lifetime_hours);
+        assert!(aged.points.windows(2).all(|p| p[1][0] >= p[0][0]));
+    }
+
+    #[test]
+    fn aging_resolves_partial_patterns_and_capacity_fade_during_sleep() {
+        let rate = -0.8_f64.ln() / HOURS_PER_YEAR;
+        let half_year = HOURS_PER_YEAR / 2.0;
+        let first_active = (rate * half_year).exp_m1() / rate;
+        let final_active =
+            (rate * HOURS_PER_YEAR).exp() * (rate * HOURS_PER_YEAR / 4.0).exp_m1() / rate;
+        let mut settings = constant(1.0, first_active + final_active, 1.0);
+        settings.aging_percent_per_year = 20.0;
+        settings.patterns = vec![
+            LoadPattern {
+                power_mw: 1.0,
+                duration_ms: half_year * 3_600_000.0,
+            },
+            LoadPattern {
+                power_mw: 0.0,
+                duration_ms: half_year * 3_600_000.0,
+            },
+        ];
+        let aged = calculate(&settings).unwrap();
+        assert!((aged.lifetime_hours / (HOURS_PER_YEAR * 1.25) - 1.0).abs() < 1e-10);
+        assert!((aged.energy_mwh / (HOURS_PER_YEAR * 0.75) - 1.0).abs() < 1e-10);
+        // Stop at the first active interval's end, without adding the trailing sleep.
+        settings.capacity_mah = first_active;
+        assert!((calculate(&settings).unwrap().lifetime_hours / half_year - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn aging_handles_high_rates_long_patterns_and_approaches_zero_aging() {
+        let mut settings = constant(1.0, HOURS_PER_YEAR * 2.0, 1.0);
+        let original = calculate(&settings).unwrap();
+        settings.aging_percent_per_year = 1e-8;
+        assert!(
+            (calculate(&settings).unwrap().lifetime_hours / original.lifetime_hours - 1.0).abs()
+                < 1e-8
+        );
+        settings.aging_percent_per_year = 99.9;
+        settings.patterns[0].duration_ms = HOURS_PER_YEAR * 1000.0 * 3_600_000.0;
+        let rate = -0.001_f64.ln() / HOURS_PER_YEAR;
+        let expected = (rate * original.lifetime_hours).ln_1p() / rate;
+        assert!((calculate(&settings).unwrap().lifetime_hours / expected - 1.0).abs() < 1e-10);
+        let settings = BatterySettings {
+            aging_percent_per_year: 5.0,
+            ..BatterySettings::default()
+        };
+        let aged = calculate(&settings).unwrap();
+        assert!(aged
+            .points
+            .windows(2)
+            .all(|p| p[1][0] >= p[0][0] && p[1][1] <= p[0][1]));
+        assert!(
+            aged.lifetime_hours
+                < calculate(&BatterySettings::default())
+                    .unwrap()
+                    .lifetime_hours
+        );
+    }
+
+    #[test]
+    fn aging_validates_and_round_trips_with_backward_compatible_defaults() {
+        for rate in [-1.0, 100.0, 101.0, f64::NAN, f64::INFINITY] {
+            let settings = BatterySettings {
+                aging_percent_per_year: rate,
+                ..BatterySettings::default()
+            };
+            assert!(calculate(&settings).is_err());
+            assert!(encode(&settings).is_err());
+        }
+        let settings = BatterySettings {
+            aging_percent_per_year: 12.345,
+            ..BatterySettings::default()
+        };
+        assert_eq!(decode(&encode(&settings).unwrap()).unwrap(), settings);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&encode(&settings).unwrap()).unwrap();
+        document["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("aging_percent_per_year");
+        let legacy = decode(&serde_json::to_string(&document).unwrap()).unwrap();
+        assert_eq!(legacy.aging_percent_per_year, 0.0);
+        assert_eq!(
+            calculate(&legacy).unwrap().points,
+            calculate(&BatterySettings::default()).unwrap().points
+        );
+    }
+
+    #[test]
+    fn self_discharge_and_aging_match_constant_voltage_analytical_solution() {
+        let mut settings = constant(1.0, HOURS_PER_YEAR * 10.0, 1.0);
+        for (aging, discharge) in [(0.0, 10.0), (10.0, 20.0)] {
+            settings.aging_percent_per_year = aging;
+            settings.self_discharge_percent_per_year = discharge;
+            let rate = annual_loss_rate(aging) + annual_loss_rate(discharge);
+            let expected = (rate * settings.capacity_mah).ln_1p() / rate;
+            let result = calculate(&settings).unwrap();
+            assert!(
+                (result.lifetime_hours / expected - 1.0).abs() < 1e-8,
+                "{} != {expected}",
+                result.lifetime_hours
+            );
+            assert!((result.energy_mwh / expected - 1.0).abs() < 1e-8);
+            assert!(result.points.windows(2).all(|p| p[1][0] >= p[0][0]));
+        }
+    }
+
+    #[test]
+    fn self_discharge_reaches_cutoff_during_zero_power_sleep() {
+        let mut settings = constant(4.0, 1000.0, 1.0);
+        settings.cutoff_voltage = 3.0;
+        settings.coefficients[1] = -0.5; // Cutoff at 50% remaining charge.
+        settings.self_discharge_percent_per_year = 50.0;
+        settings.aging_percent_per_year = 20.0;
+        settings.patterns = vec![
+            LoadPattern {
+                power_mw: 0.0,
+                duration_ms: 2.0 * HOURS_PER_YEAR * 3_600_000.0,
+            },
+            LoadPattern {
+                power_mw: 1.0,
+                duration_ms: 1.0,
+            },
+        ];
+        let result = calculate(&settings).unwrap();
+        assert!((result.lifetime_hours / HOURS_PER_YEAR - 1.0).abs() < 1e-8);
+        assert_eq!(result.energy_mwh, 0.0);
+        assert!(result.cutoff_reached);
+        // Pure shelf discharge also works without a positive-power pattern.
+        settings.patterns.pop();
+        let shelf = calculate(&settings).unwrap();
+        assert!((shelf.lifetime_hours / HOURS_PER_YEAR - 1.0).abs() < 1e-10);
+        assert_eq!(shelf.energy_mwh, 0.0);
+        settings.curve = CurveKind::Polynomial;
+        settings.coefficients[1] = 0.0; // No positive-SOC voltage cutoff.
+        assert!(calculate(&settings).is_err());
+    }
+
+    #[test]
+    fn self_discharge_validates_and_preserves_json_compatibility() {
+        for rate in [-0.1, 100.0, f64::INFINITY, f64::NAN] {
+            let settings = BatterySettings {
+                self_discharge_percent_per_year: rate,
+                ..BatterySettings::default()
+            };
+            assert!(calculate(&settings).is_err());
+            assert!(encode(&settings).is_err());
+        }
+        let settings = BatterySettings {
+            aging_percent_per_year: 2.5,
+            self_discharge_percent_per_year: 3.75,
+            ..BatterySettings::default()
+        };
+        assert_eq!(decode(&encode(&settings).unwrap()).unwrap(), settings);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&encode(&settings).unwrap()).unwrap();
+        document["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("self_discharge_percent_per_year");
+        assert_eq!(
+            decode(&serde_json::to_string(&document).unwrap())
+                .unwrap()
+                .self_discharge_percent_per_year,
+            0.0
+        );
+    }
+
+    #[test]
+    fn self_discharge_follows_variable_voltage_and_preserves_pattern_timing() {
+        let mut settings = BatterySettings {
+            self_discharge_percent_per_year: 10.0,
+            ..BatterySettings::default()
+        };
+        let original = calculate(&BatterySettings::default()).unwrap();
+        let result = calculate(&settings).unwrap();
+        assert!(result.lifetime_hours < original.lifetime_hours);
+        assert!(result.energy_mwh < original.energy_mwh);
+        assert!(result
+            .points
+            .windows(2)
+            .all(|p| p[1][0] >= p[0][0] && p[1][1] <= p[0][1]));
+        settings.aging_percent_per_year = 5.0;
+        assert!(calculate(&settings).unwrap().lifetime_hours < result.lifetime_hours);
+
+        // Piecewise load inversion at a long active/sleep boundary.
+        let rate = annual_loss_rate(20.0);
+        let half_year = HOURS_PER_YEAR * 0.5;
+        let capacity = (rate * half_year).exp_m1() / rate;
+        let mut pulsed = constant(1.0, capacity, 1.0);
+        pulsed.self_discharge_percent_per_year = 20.0;
+        pulsed.patterns = vec![
+            LoadPattern {
+                power_mw: 1.0,
+                duration_ms: half_year * 3_600_000.0,
+            },
+            LoadPattern {
+                power_mw: 0.0,
+                duration_ms: half_year * 3_600_000.0,
+            },
+        ];
+        assert!((calculate(&pulsed).unwrap().lifetime_hours / half_year - 1.0).abs() < 1e-8);
     }
 
     #[test]

@@ -7,8 +7,8 @@ use super::{
 };
 use crate::{
     battery::{BatterySettings, BatteryState, Chemistry, CurveKind, MAX_PATTERNS},
-    egui, toolbar_action_button, RichText, WaveCraftApp, WorkspaceView, ACCENT, BACKGROUND, GRID,
-    TEXT_MUTED,
+    egui, toolbar_action_button, RichText, SelectableHoverText, WaveCraftApp, WorkspaceView,
+    ACCENT, BACKGROUND, GRID, TEXT_MUTED,
 };
 
 impl WaveCraftApp {
@@ -216,6 +216,23 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
     );
     number(
         ui,
+        "Capacity loss / year",
+        &mut settings.aging_percent_per_year,
+        " %",
+        0.1,
+    ).on_hover_selectable_text("Calendar aging: 0 disables it. 10%/year retains 90% after one year, 81% after two. Range: 0 to <100%.");
+    number(
+        ui,
+        "Self-discharge / year",
+        &mut settings.self_discharge_percent_per_year,
+        " %",
+        0.1,
+    )
+    .on_hover_selectable_text(
+        "Loss of remaining charge, including sleep. 0 disables it; range: 0 to <100%/year.",
+    );
+    number(
+        ui,
         "Discharge cutoff",
         &mut settings.cutoff_voltage,
         " V",
@@ -227,7 +244,7 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
             .strong()
             .color(TEXT_MUTED),
     );
-    egui::ComboBox::from_id_salt("battery_curve")
+    let curve_response = egui::ComboBox::from_id_salt("battery_curve")
         .width(ui.available_width())
         .selected_text(settings.curve.label())
         .show_ui(ui, |ui| {
@@ -238,17 +255,18 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
             ] {
                 ui.selectable_value(&mut settings.curve, kind, kind.label());
             }
-        });
+        })
+        .response;
+    if settings.curve == CurveKind::Chemistry {
+        curve_response.on_hover_selectable_text("Generic exponential drop + slope + end knee. Illustrative chemistry profile; size is a label, not a measured cell model.");
+    }
     ui.label(
         RichText::new("x = discharged capacity / rated capacity (0…1). V(x) = V₀ × f(x).")
             .small()
             .color(TEXT_MUTED),
     );
     match settings.curve {
-        CurveKind::Chemistry => {
-            ui.label(RichText::new("Generic exponential drop + slope + end knee. Illustrative chemistry profile; size is a label, not a measured cell model.")
-                .small().color(TEXT_MUTED));
-        }
+        CurveKind::Chemistry => {}
         CurveKind::Polynomial => {
             ui.horizontal(|ui| {
                 ui.label("Degree");
@@ -318,8 +336,11 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
     if ui.small_button("Reset curve for chemistry").clicked() {
         settings.reset_curve();
     }
-    ui.label(RichText::new("Ideal battery-side power. No temperature, aging, self-discharge, converter loss or voltage sag.")
-        .small().color(TEXT_MUTED));
+    ui.label(
+        RichText::new("Ideal battery-side power. No temperature, converter loss or voltage sag.")
+            .small()
+            .color(TEXT_MUTED),
+    );
     ui.add_space(8.0);
     ui.label(
         RichText::new(format!(
@@ -362,18 +383,26 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
     }
 }
 
-fn number(ui: &mut egui::Ui, label: &str, value: &mut f64, suffix: &str, speed: f64) {
+fn number(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f64,
+    suffix: &str,
+    speed: f64,
+) -> egui::Response {
     ui.horizontal(|ui| {
-        ui.label(label);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let label = ui.label(label);
+        let editor = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(
                 egui::DragValue::new(value)
                     .speed(speed)
                     .max_decimals(6)
                     .suffix(suffix),
-            );
+            )
         });
-    });
+        label.union(editor.inner)
+    })
+    .inner
 }
 
 fn fitted_bounds(result: &crate::battery::BatteryResult) -> [f64; 4] {
@@ -612,6 +641,8 @@ mod tests {
         let (_, labels) = frame(&mut app, &ctx, vec![]);
         assert_eq!(labels.iter().filter(|(s, _)| s == "📷 Snapshot").count(), 1);
         assert!(label(&labels, "Calc").x > 1250.0);
+        let _ = label(&labels, "Capacity loss / year");
+        let _ = label(&labels, "Self-discharge / year");
         assert!(label(&labels, "💾 Save settings").y > 840.0);
         assert_eq!(labels.iter().filter(|(s, _)| s == "+").count(), 1); // Workspace add only.
         click(&mut app, &ctx, label(&labels, "Calc"));
@@ -679,6 +710,8 @@ mod tests {
         app.select_battery_view();
         app.battery.settings.size = "Prototype cell".into();
         app.battery.settings.patterns[0].power_mw = 0.125;
+        app.battery.settings.aging_percent_per_year = 2.75;
+        app.battery.settings.self_discharge_percent_per_year = 1.25;
         app.save_setup_settings(WorkspaceView::Battery);
         for view in WorkspaceView::ALL {
             if view != WorkspaceView::Battery {
