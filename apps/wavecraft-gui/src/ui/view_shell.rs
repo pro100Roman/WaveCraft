@@ -220,6 +220,25 @@ pub(crate) fn view_toolbar(
     response
 }
 
+/// Match the System Trace Start control and keep short primary labels equally wide.
+pub(crate) fn primary_toolbar_button(
+    ui: &egui::Ui,
+    label: &str,
+    color: Color32,
+) -> egui::Button<'static> {
+    let width = ui
+        .painter()
+        .layout_no_wrap(
+            "▶ Start".into(),
+            egui::TextStyle::Button.resolve(ui.style()),
+            color,
+        )
+        .size()
+        .x
+        + 2.0 * ui.spacing().button_padding.x;
+    toolbar_action_button(label, color).min_size(egui::vec2(width, 0.0))
+}
+
 /// Left settings panel. A stable ID keeps scroll state isolated per workspace.
 pub(crate) struct SetupPanel<'a> {
     id: &'static str,

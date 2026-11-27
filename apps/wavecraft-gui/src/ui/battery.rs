@@ -5,8 +5,8 @@ use super::{
     manual_value::ManualValue,
     plot_hover::{paint_plot_hover, plot_hover_pointer},
     view_shell::{
-        remaining_plot_rect, settings_card, view_card, view_toolbar, workspace_panel,
-        ToolbarSection,
+        primary_toolbar_button, remaining_plot_rect, settings_card, view_card, view_toolbar,
+        workspace_panel, ToolbarSection,
     },
 };
 use crate::{
@@ -59,7 +59,7 @@ impl WaveCraftApp {
                 ToolbarSection::Controls => {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         actions.battery_calculate |=
-                            ui.add(toolbar_action_button("Calc", ACCENT)).clicked();
+                            ui.add(primary_toolbar_button(ui, "Calc", ACCENT)).clicked();
                     });
                 }
             },

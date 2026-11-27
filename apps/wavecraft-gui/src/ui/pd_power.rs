@@ -4,8 +4,8 @@ use super::{
     manual_value::ManualValue,
     plot_hover::{paint_plot_hover, plot_hover_pointer},
     view_shell::{
-        settings_card, setup_section, stacked_view_splitter, view_card, view_toolbar,
-        workspace_panel, ToolbarSection, PANE_SPLITTER_HEIGHT,
+        primary_toolbar_button, settings_card, setup_section, stacked_view_splitter, view_card,
+        view_toolbar, workspace_panel, ToolbarSection, PANE_SPLITTER_HEIGHT,
     },
 };
 use crate::{
@@ -134,13 +134,7 @@ impl WaveCraftApp {
                 ToolbarSection::Controls => {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (label, color) = output_button(state);
-                    // Match System Trace's Start control and keep both output states equally wide.
-                    let run_button_width = ui.painter().layout_no_wrap(
-                        "▶ Start".into(),
-                        egui::TextStyle::Button.resolve(ui.style()),
-                        color,
-                    ).size().x + 2.0 * ui.spacing().button_padding.x;
-                    if ui.add_enabled(state.connected && state.latest.is_some() && !state.output_toggle_pending(), toolbar_action_button(label, color).min_size(egui::vec2(run_button_width, 0.0)))
+                    if ui.add_enabled(state.connected && state.latest.is_some() && !state.output_toggle_pending(), primary_toolbar_button(ui, label, color))
                         .on_hover_selectable_text("Shows the current physical output state read from the device, including changes made with its hardware button. ON is enabled; OFF is disabled, including a timer's OFF phase. Refreshes at the polling rate and changes only after fresh telemetry. Click to toggle output; in timer mode, starts or stops the sequence.")
                         .clicked() { actions.pd_power_toggle_output = Some(index); }
                 });
