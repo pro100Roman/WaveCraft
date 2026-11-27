@@ -757,6 +757,20 @@ impl WaveCraftApp {
             .collect()
     }
 
+    pub(crate) fn open_workspace_view(&mut self, view: WorkspaceView) {
+        self.workspace_view_layout.open_view(view);
+        self.select_workspace_view(view);
+    }
+
+    pub(crate) fn select_workspace_view(&mut self, view: WorkspaceView) {
+        match view {
+            WorkspaceView::Waveform(tab) => self.select_waveform_tab(tab),
+            WorkspaceView::Vna => self.select_vna_view(),
+            WorkspaceView::SystemTrace => self.select_system_trace_view(),
+            WorkspaceView::Serial => self.select_serial_view(),
+        }
+    }
+
     pub(crate) fn set_workspace_view_visible(&mut self, view: WorkspaceView, visible: bool) {
         if !visible
             && self.workspace_view_layout.is_visible(view)
@@ -1143,6 +1157,48 @@ mod tests {
         restored.set_workspace_view_visible(logic, true);
         assert!(restored.available_workspace_views().contains(&logic));
         assert_eq!(restored.workspace_view_layout.order(), &WorkspaceView::ALL);
+        remove_test_repository(&repository);
+    }
+
+    #[test]
+    fn opening_a_workspace_tab_appends_selects_and_persists_it() {
+        let repository = test_repository("open-workspace-tab");
+        remove_test_repository(&repository);
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        app.select_waveform_tab(WaveformTab::LogicAnalyzer);
+        app.set_workspace_view_visible(WorkspaceView::SystemTrace, false);
+        app.set_workspace_view_visible(WorkspaceView::Vna, false);
+        app.open_workspace_view(WorkspaceView::SystemTrace);
+
+        let saved = repository
+            .load()
+            .expect("the tab changes are saved immediately");
+        let mut restored = WaveCraftApp::with_settings(None, saved);
+        restored.reconcile_waveform_tab();
+
+        assert_eq!(
+            restored.active_workspace_view,
+            Some(WorkspaceView::SystemTrace)
+        );
+        assert_eq!(
+            restored.available_workspace_views(),
+            app.available_workspace_views()
+        );
+        assert_eq!(
+            restored.available_workspace_views().last(),
+            Some(&WorkspaceView::SystemTrace)
+        );
+        assert!(!restored
+            .available_workspace_views()
+            .contains(&WorkspaceView::Vna));
+        restored.open_workspace_view(WorkspaceView::SystemTrace);
+        assert_eq!(
+            restored.available_workspace_views(),
+            app.available_workspace_views()
+        );
         remove_test_repository(&repository);
     }
 

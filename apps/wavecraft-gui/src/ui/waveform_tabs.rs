@@ -12,50 +12,76 @@ impl WaveCraftApp {
         let ordered_views = *self.workspace_view_layout.order();
         let active_view = self.active_workspace_view;
         let mut selected_view = None;
-        workspace_tab_bar(context, |ui| {
-            let (primary_down, pointer_position) =
-                ui.input(|input| (input.pointer.primary_down(), input.pointer.interact_pos()));
-            for view in ordered_views
-                .into_iter()
-                .filter(|view| available_views.contains(view))
-            {
-                let dragging = self.workspace_view_layout.dragged_view().is_some();
-                let response = workspace_tab(ui, view.label(), active_view == Some(view))
-                    .on_hover_cursor(if dragging {
+        let mut closed_view = None;
+        let mut added_view = None;
+        workspace_tab_bar(
+            context,
+            |ui| {
+                let (primary_down, pointer_position) =
+                    ui.input(|input| (input.pointer.primary_down(), input.pointer.interact_pos()));
+                for view in ordered_views
+                    .into_iter()
+                    .filter(|view| available_views.contains(view))
+                {
+                    let dragging = self.workspace_view_layout.dragged_view().is_some();
+                    let tab = workspace_tab(
+                        ui,
+                        view.label(),
+                        active_view == Some(view),
+                        available_views.len() > 1,
+                    );
+                    if tab.close_clicked {
+                        closed_view = Some(view);
+                    }
+                    let response = tab.response.on_hover_cursor(if dragging {
                         egui::CursorIcon::Grabbing
                     } else {
                         egui::CursorIcon::Grab
                     });
-                if response.clicked() {
-                    selected_view = Some(view);
+                    if response.clicked() {
+                        selected_view = Some(view);
+                    }
+                    if primary_down
+                        && response.is_pointer_button_down_on()
+                        && self.workspace_view_layout.dragged_view().is_none()
+                    {
+                        self.workspace_view_layout.begin_drag(view);
+                    }
+                    if primary_down
+                        && pointer_position.is_some_and(|position| response.rect.contains(position))
+                        && self.workspace_view_layout.dragged_view().is_some()
+                    {
+                        self.workspace_view_layout.drag_to(view);
+                    }
+                    if !dragging {
+                        response
+                            .on_hover_text("Drag with the left mouse button to reorder this view");
+                    }
                 }
-                if primary_down
-                    && response.is_pointer_button_down_on()
-                    && self.workspace_view_layout.dragged_view().is_none()
-                {
-                    self.workspace_view_layout.begin_drag(view);
+                if !primary_down {
+                    self.workspace_view_layout.finish_drag();
                 }
-                if primary_down
-                    && pointer_position.is_some_and(|position| response.rect.contains(position))
-                    && self.workspace_view_layout.dragged_view().is_some()
-                {
-                    self.workspace_view_layout.drag_to(view);
+            },
+            |ui| {
+                for view in WorkspaceView::ALL {
+                    let already_open = available_views.contains(&view);
+                    let response = ui.add_enabled(!already_open, egui::Button::new(view.label()));
+                    if response.clicked() {
+                        added_view = Some(view);
+                        ui.close_menu();
+                    }
+                    if already_open {
+                        response.on_hover_text("This view is already open");
+                    }
                 }
-                if !dragging {
-                    response.on_hover_text("Drag with the left mouse button to reorder this view");
-                }
-            }
-            if !primary_down {
-                self.workspace_view_layout.finish_drag();
-            }
-        });
-        if let Some(view) = selected_view {
-            match view {
-                WorkspaceView::Waveform(tab) => self.select_waveform_tab(tab),
-                WorkspaceView::Vna => self.select_vna_view(),
-                WorkspaceView::SystemTrace => self.select_system_trace_view(),
-                WorkspaceView::Serial => self.select_serial_view(),
-            }
+            },
+        );
+        if let Some(view) = closed_view {
+            self.set_workspace_view_visible(view, false);
+        } else if let Some(view) = added_view {
+            self.open_workspace_view(view);
+        } else if let Some(view) = selected_view {
+            self.select_workspace_view(view);
         }
     }
 }
@@ -79,10 +105,19 @@ mod tests {
         app: &mut WaveCraftApp,
         events: Vec<egui::Event>,
     ) -> Vec<(String, egui::Pos2)> {
+        paint_tabs_with_width(context, app, events, 1200.0)
+    }
+
+    fn paint_tabs_with_width(
+        context: &egui::Context,
+        app: &mut WaveCraftApp,
+        events: Vec<egui::Event>,
+        width: f32,
+    ) -> Vec<(String, egui::Pos2)> {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(1200.0, 800.0),
+                egui::vec2(width, 800.0),
             )),
             events,
             ..egui::RawInput::default()
@@ -122,6 +157,82 @@ mod tests {
         app.set_workspace_view_visible(logic, true);
         let texts = paint_tabs(&context, &mut app, Vec::new());
         assert!(texts.iter().any(|(text, _)| text == "Logic Analyzer"));
+    }
+
+    fn click_tabs(context: &egui::Context, app: &mut WaveCraftApp, position: egui::Pos2) {
+        paint_tabs(
+            context,
+            app,
+            vec![
+                egui::Event::PointerMoved(position),
+                pointer_button(position, true),
+            ],
+        );
+        paint_tabs(context, app, vec![pointer_button(position, false)]);
+    }
+
+    #[test]
+    fn a_closed_view_can_be_added_and_selected_from_the_plus_menu() {
+        let context = egui::Context::default();
+        let mut app = app();
+        app.select_system_trace_view();
+        let texts = paint_tabs(&context, &mut app, Vec::new());
+        let trace_position = texts
+            .iter()
+            .find(|(text, _)| text == "System Trace")
+            .unwrap()
+            .1;
+        let close_position = texts
+            .iter()
+            .filter(|(text, position)| text == "×" && position.x > trace_position.x)
+            .min_by(|(_, left), (_, right)| left.x.total_cmp(&right.x))
+            .unwrap()
+            .1;
+
+        click_tabs(&context, &mut app, close_position);
+
+        assert!(!app
+            .available_workspace_views()
+            .contains(&WorkspaceView::SystemTrace));
+        assert_ne!(app.active_workspace_view, Some(WorkspaceView::SystemTrace));
+        let texts = paint_tabs(&context, &mut app, Vec::new());
+        let add_position = texts.iter().find(|(text, _)| text == "+").unwrap().1;
+        click_tabs(&context, &mut app, add_position);
+        let texts = paint_tabs(&context, &mut app, Vec::new());
+        let trace_position = texts
+            .iter()
+            .find(|(text, _)| text == "System Trace")
+            .expect("the add menu offers the closed view")
+            .1;
+
+        click_tabs(&context, &mut app, trace_position);
+
+        assert_eq!(app.active_workspace_view, Some(WorkspaceView::SystemTrace));
+        assert_eq!(
+            app.available_workspace_views().last(),
+            Some(&WorkspaceView::SystemTrace)
+        );
+    }
+
+    #[test]
+    fn the_last_tab_stays_open_and_plus_remains_visible_in_a_narrow_strip() {
+        let context = egui::Context::default();
+        let mut app = app();
+        for view in WorkspaceView::ALL.into_iter().skip(1) {
+            app.set_workspace_view_visible(view, false);
+        }
+        let texts = paint_tabs(&context, &mut app, Vec::new());
+        let close_position = texts.iter().find(|(text, _)| text == "×").unwrap().1;
+        click_tabs(&context, &mut app, close_position);
+        assert_eq!(app.available_workspace_views().len(), 1);
+
+        for view in WorkspaceView::ALL {
+            app.open_workspace_view(view);
+        }
+        let texts = paint_tabs_with_width(&context, &mut app, Vec::new(), 500.0);
+        assert!(texts
+            .iter()
+            .any(|(text, position)| text == "+" && position.x < 500.0));
     }
 
     #[test]

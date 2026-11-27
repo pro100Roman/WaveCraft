@@ -10,7 +10,7 @@ applies equally to LA, OSC, RF, Combined, VNA, System Trace, and Serial.
 | Component | Responsibility |
 | --- | --- |
 | `view_toolbar` | Common application identity, App menu, Snapshot button, toolbar background and spacing; returns Settings and Snapshot requests |
-| `workspace_tab_bar` / `workspace_tab` | Scrollable workspace tabs, shared baseline, active outline and accent; the application owns selection, visibility and drag ordering |
+| `workspace_tab_bar` / `workspace_tab` | Scrollable workspace tabs, close buttons, add menu, shared baseline and active accent; the application owns selection, visibility and drag ordering |
 | `SetupPanel` | 300-point left panel, heading, typography, constrained scrolling, mandatory collapse/expand and pinned Save settings footer |
 | `settings_card` | Dark inset grouping settings sections, with shared width constraints and padding |
 | `workspace_panel` | Central background and outer margins |
@@ -24,6 +24,15 @@ applies equally to LA, OSC, RF, Combined, VNA, System Trace, and Serial.
 own height (for example the reorderable System Trace instruments). Waveform
 `waveform_card` composes `view_card` and `remaining_plot_rect`; generic chrome
 does not belong in a device-specific or waveform-specific renderer.
+
+Workspace tabs are managed in their strip: **+** offers all views, with already
+open views disabled, and **×** closes a tab while keeping at least one open.
+Adding a view appends and selects it. Closing a tab retains its instrument state.
+The existing global settings persist the open tabs, order and active view
+immediately, including compatibility with previously hidden views. Application
+Settings contains instrument settings rather than workspace visibility controls.
+The add button stays outside the horizontal scroll area so it remains reachable
+in a narrow window.
 
 Primary Run/Stop/Single controls occupy the right end of the toolbar. Refresh,
 file operations, and instrument-specific actions occupy the left area after

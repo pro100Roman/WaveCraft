@@ -96,6 +96,16 @@ impl WorkspaceViewLayout {
         self.finish_drag();
     }
 
+    /// Reopened views join the end of the tab strip, preserving existing tabs.
+    pub(crate) fn open_view(&mut self, view: WorkspaceView) {
+        if !self.is_visible(view) {
+            if let Some(index) = self.order.iter().position(|candidate| *candidate == view) {
+                self.order[index..].rotate_left(1);
+            }
+            self.set_visible(view, true);
+        }
+    }
+
     pub(crate) fn begin_drag(&mut self, view: WorkspaceView) {
         self.dragged_view = Some(view);
     }

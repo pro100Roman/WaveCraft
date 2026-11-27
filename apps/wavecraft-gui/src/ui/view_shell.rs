@@ -21,7 +21,11 @@ fn panel_frame(fill: Color32, margin: f32) -> egui::Frame {
 }
 
 /// Shared workspace navigation, visually joined to the instrument below it.
-pub(crate) fn workspace_tab_bar(context: &egui::Context, contents: impl FnOnce(&mut egui::Ui)) {
+pub(crate) fn workspace_tab_bar(
+    context: &egui::Context,
+    contents: impl FnOnce(&mut egui::Ui),
+    add_menu: impl FnOnce(&mut egui::Ui),
+) {
     egui::TopBottomPanel::top("waveform_tabs")
         .show_separator_line(false)
         .frame(
@@ -42,21 +46,46 @@ pub(crate) fn workspace_tab_bar(context: &egui::Context, contents: impl FnOnce(&
                 baseline,
                 egui::Stroke::new(1.0_f32, GRID),
             );
-            egui::ScrollArea::horizontal()
-                .id_salt("workspace_tabs_scroll")
-                .auto_shrink([false, true])
-                .drag_to_scroll(false)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 3.0;
-                        contents(ui);
+            ui.horizontal(|ui| {
+                let scroll_width = (ui.available_width() - 40.0).max(0.0);
+                egui::ScrollArea::horizontal()
+                    .id_salt("workspace_tabs_scroll")
+                    .max_width(scroll_width)
+                    .auto_shrink([true, true])
+                    .drag_to_scroll(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            contents(ui);
+                        });
                     });
-                });
+                workspace_add_menu(ui, add_menu);
+            });
         });
 }
 
+pub(crate) struct WorkspaceTabResponse {
+    pub response: egui::Response,
+    pub close_clicked: bool,
+}
+
 /// Tab styling stays in the shell; selection and reordering belong to the app.
-pub(crate) fn workspace_tab(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+pub(crate) fn workspace_tab(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: bool,
+    close_enabled: bool,
+) -> WorkspaceTabResponse {
+    let label_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(
+                label.to_owned(),
+                egui::TextStyle::Button.resolve(ui.style()),
+                TEXT_MUTED,
+            )
+            .size()
+            .x
+    });
     let response = ui
         .scope(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(16.0, 8.0);
@@ -82,7 +111,7 @@ pub(crate) fn workspace_tab(ui: &mut egui::Ui, label: &str, selected: bool) -> e
                     sw: 0.0,
                     se: 0.0,
                 })
-                .min_size(egui::vec2(0.0, 34.0))
+                .min_size(egui::vec2(label_width + 56.0, 34.0))
                 .sense(egui::Sense::click_and_drag()),
             )
         })
@@ -100,7 +129,39 @@ pub(crate) fn workspace_tab(ui: &mut egui::Ui, label: &str, selected: bool) -> e
             egui::Stroke::new(2.0_f32, ACCENT),
         );
     }
-    response
+    let close_rect = Rect::from_center_size(
+        egui::pos2(response.rect.right() - 15.0, response.rect.center().y),
+        egui::vec2(20.0, 22.0),
+    );
+    let close_clicked = ui
+        .push_id(label, |ui| {
+            ui.add_enabled_ui(close_enabled, |ui| {
+                ui.put(close_rect, egui::Button::new("×").frame(false))
+                    .on_hover_text(format!("Close {label}"))
+                    .clicked()
+            })
+            .inner
+        })
+        .inner;
+    if !close_enabled {
+        ui.interact(
+            close_rect,
+            response.id.with("last_tab_hint"),
+            egui::Sense::hover(),
+        )
+        .on_hover_text("Keep at least one workspace tab open");
+    }
+    WorkspaceTabResponse {
+        response,
+        close_clicked,
+    }
+}
+
+/// Keep the add-menu control consistent with the workspace strip.
+fn workspace_add_menu<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) {
+    ui.menu_button(RichText::new("+").size(20.0).color(ACCENT), contents)
+        .response
+        .on_hover_text("Add a workspace tab");
 }
 
 #[derive(Default)]

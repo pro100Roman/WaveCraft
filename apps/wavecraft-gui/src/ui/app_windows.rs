@@ -8,27 +8,6 @@ use crate::{
 };
 
 impl WaveCraftApp {
-    pub(crate) fn paint_view_visibility_settings(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("Views", |ui| {
-            for view in *self.workspace_view_layout.order() {
-                let mut visible = self.workspace_view_layout.is_visible(view);
-                let can_toggle = !visible
-                    || self
-                        .available_workspace_views()
-                        .iter()
-                        .any(|candidate| *candidate != view);
-                let response =
-                    ui.add_enabled(can_toggle, egui::Checkbox::new(&mut visible, view.label()));
-                if response.changed() {
-                    self.set_workspace_view_visible(view, visible);
-                }
-                if !can_toggle {
-                    response.on_hover_text("Keep at least one view visible");
-                }
-            }
-        });
-    }
-
     /// The instruments and radio settings window. `refresh_clicked` and
     /// `radio_device_selection_changed` accumulate across the whole frame, so
     /// they are updated in place rather than returned.
@@ -72,8 +51,6 @@ impl WaveCraftApp {
             .fixed_size([330.0, 420.0])
             .show(context, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.paint_view_visibility_settings(ui);
-                    ui.separator();
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("INSTRUMENTS").strong().color(ACCENT));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
