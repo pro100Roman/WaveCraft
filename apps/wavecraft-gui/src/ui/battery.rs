@@ -11,6 +11,9 @@ use crate::{
     ACCENT, BACKGROUND, GRID, TEXT_MUTED,
 };
 
+const VALUE_FIELD_WIDTH: f32 = 92.0;
+const UNIT_COLUMN_WIDTH: f32 = 28.0;
+
 impl WaveCraftApp {
     pub(crate) fn battery_view_is_active(&self) -> bool {
         self.active_workspace_view == Some(WorkspaceView::Battery)
@@ -108,8 +111,6 @@ impl WaveCraftApp {
                 } else {
                     ui.label("Set battery parameters and a repeating load cycle, then press Calc.");
                 }
-                ui.label(RichText::new("Wheel: horizontal zoom · Ctrl/Cmd + wheel: both axes · Drag: pan · Double-click: fit")
-                    .small().color(TEXT_MUTED));
                 let rect = remaining_plot_rect(ui);
                 self.snapshot_plot_rect = Some(rect);
                 paint_graph(ui, rect, &mut self.battery);
@@ -244,19 +245,26 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
             .strong()
             .color(TEXT_MUTED),
     );
-    let curve_response = egui::ComboBox::from_id_salt("battery_curve")
-        .width(ui.available_width())
-        .selected_text(settings.curve.label())
-        .show_ui(ui, |ui| {
-            for kind in [
-                CurveKind::Chemistry,
-                CurveKind::Polynomial,
-                CurveKind::Table,
-            ] {
-                ui.selectable_value(&mut settings.curve, kind, kind.label());
-            }
-        })
-        .response;
+    let curve_response = value_row(ui, "Model", "", |ui| {
+        egui::ComboBox::from_id_salt("battery_curve")
+            .width(VALUE_FIELD_WIDTH)
+            .wrap_mode(egui::TextWrapMode::Truncate)
+            .selected_text(match settings.curve {
+                CurveKind::Chemistry => "Chemistry",
+                CurveKind::Polynomial => "Polynomial",
+                CurveKind::Table => "Table",
+            })
+            .show_ui(ui, |ui| {
+                for kind in [
+                    CurveKind::Chemistry,
+                    CurveKind::Polynomial,
+                    CurveKind::Table,
+                ] {
+                    ui.selectable_value(&mut settings.curve, kind, kind.label());
+                }
+            })
+            .response
+    });
     if settings.curve == CurveKind::Chemistry {
         curve_response.on_hover_selectable_text("Generic exponential drop + slope + end knee. Illustrative chemistry profile; size is a label, not a measured cell model.");
     }
@@ -268,9 +276,11 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
     match settings.curve {
         CurveKind::Chemistry => {}
         CurveKind::Polynomial => {
-            ui.horizontal(|ui| {
-                ui.label("Degree");
-                ui.add(egui::DragValue::new(&mut settings.polynomial_degree).range(1..=5));
+            value_row(ui, "Degree", "", |ui| {
+                ui.add_sized(
+                    [VALUE_FIELD_WIDTH, ui.spacing().interact_size.y],
+                    egui::DragValue::new(&mut settings.polynomial_degree).range(1..=5),
+                )
             });
             ui.label(RichText::new("f(x) = c₀ + c₁x + … + cₙxⁿ. Start with degree 5; verify monotonicity against measured data.")
                 .small().color(TEXT_MUTED));
@@ -291,16 +301,21 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
             for (i, point) in settings.table.iter_mut().enumerate() {
                 ui.push_id(i, |ui| {
                     ui.horizontal(|ui| {
-                        ui.add(
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let field_size =
+                            egui::vec2(VALUE_FIELD_WIDTH, ui.spacing().interact_size.y);
+                        ui.label("x");
+                        ui.add_sized(
+                            field_size,
                             egui::DragValue::new(&mut point[0])
                                 .speed(0.001)
-                                .prefix("x ")
                                 .max_decimals(5),
                         );
-                        ui.add(
+                        ui.label("V/V₀");
+                        ui.add_sized(
+                            field_size,
                             egui::DragValue::new(&mut point[1])
                                 .speed(0.001)
-                                .prefix("V/V₀ ")
                                 .max_decimals(5),
                         );
                         if ui.small_button("×").clicked() {
@@ -383,26 +398,58 @@ fn battery_editor(ui: &mut egui::Ui, settings: &mut BatterySettings) {
     }
 }
 
+/// Keep settings controls and their external unit labels in aligned columns.
+fn value_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    unit: &str,
+    editor: impl FnOnce(&mut egui::Ui) -> egui::Response,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        let label = ui.label(label);
+        let controls = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let height = ui.spacing().interact_size.y;
+            let unit = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(UNIT_COLUMN_WIDTH, height),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(UNIT_COLUMN_WIDTH);
+                        ui.label(unit.trim())
+                    },
+                )
+                .inner;
+            let editor = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(VALUE_FIELD_WIDTH, height),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(VALUE_FIELD_WIDTH);
+                        ui.spacing_mut().interact_size.x = VALUE_FIELD_WIDTH;
+                        editor(ui)
+                    },
+                )
+                .inner;
+            editor.union(unit)
+        });
+        label.union(controls.inner)
+    })
+    .inner
+}
+
 fn number(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut f64,
-    suffix: &str,
+    unit: &str,
     speed: f64,
 ) -> egui::Response {
-    ui.horizontal(|ui| {
-        let label = ui.label(label);
-        let editor = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add(
-                egui::DragValue::new(value)
-                    .speed(speed)
-                    .max_decimals(6)
-                    .suffix(suffix),
-            )
-        });
-        label.union(editor.inner)
+    value_row(ui, label, unit, |ui| {
+        ui.add_sized(
+            [VALUE_FIELD_WIDTH, ui.spacing().interact_size.y],
+            egui::DragValue::new(value).speed(speed).max_decimals(6),
+        )
     })
-    .inner
 }
 
 fn fitted_bounds(result: &crate::battery::BatteryResult) -> [f64; 4] {
