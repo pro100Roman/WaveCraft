@@ -56,10 +56,11 @@ impl WaveCraftApp {
             status.active = false;
             status.add_error(state.error.as_deref());
         } else if self.serial_view_is_active() {
-            status.message = &self.serial.status;
+            let state = &self.serial[self.active_serial_index()];
+            status.message = &state.status;
             status.detail = self.snapshot_message.as_deref().map(Cow::Borrowed);
-            status.active = self.serial.session.is_some();
-            status.add_error(self.serial.error.as_deref());
+            status.active = state.session.is_some();
+            status.add_error(state.error.as_deref());
         } else if self.system_trace_view_is_active() {
             use SystemTraceConnectionState as Connection;
             status.detail = Some(match &self.system_trace_connection {
@@ -241,7 +242,7 @@ mod tests {
     fn serial_snapshot_feedback_preserves_the_opened_file_status() {
         let mut app = app();
         app.active_workspace_view = Some(WorkspaceView::Serial);
-        app.serial.status = "Imported · readings.csv".into();
+        app.serial[0].status = "Imported · readings.csv".into();
         app.report_snapshot_status("Snapshot saved to /tmp/wavecraft-snapshot.png".into());
         let status = app.active_view_status();
         assert!(status.message.contains("readings.csv"));
@@ -320,7 +321,7 @@ mod tests {
             .set_setup_panel_open(WorkspaceView::Serial, false);
         app.workspace_view_layout
             .set_setup_panel_open(WorkspaceView::SystemTrace, false);
-        app.serial.error = Some("Serial port unavailable".into());
+        app.serial[0].error = Some("Serial port unavailable".into());
         app.system_trace_connection = SystemTraceConnectionState::Error("Probe unavailable".into());
         app.vna_discovery_error = Some("VNA discovery failed".into());
         for (view, error) in [

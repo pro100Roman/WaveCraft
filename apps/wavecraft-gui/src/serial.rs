@@ -1775,28 +1775,28 @@ mod tests {
     #[test]
     fn serial_workspace_settings_restore_on_restart() {
         let mut app = crate::app::test_support::app();
-        app.serial.settings.port = "/dev/test-uart".into();
-        app.serial.settings.sample_rate = "1000".into();
-        app.serial.settings.timestamp_unit = SerialTimestampUnit::Milliseconds;
-        app.serial.settings.timestamp_multiplier = "10".into();
-        app.serial.settings.fields.push(TextField {
+        app.serial[0].settings.port = "/dev/test-uart".into();
+        app.serial[0].settings.sample_rate = "1000".into();
+        app.serial[0].settings.timestamp_unit = SerialTimestampUnit::Milliseconds;
+        app.serial[0].settings.timestamp_multiplier = "10".into();
+        app.serial[0].settings.fields.push(TextField {
             separator: "=>".into(),
             name: "voltage".into(),
             color: [12, 34, 56],
             line_style: SerialLineStyle::DashDot,
         });
-        app.serial
+        app.serial[0]
             .settings
             .binary_line_styles
             .insert("flags.ready".into(), SerialLineStyle::Dotted);
-        app.serial.settings.graph_percent = 40;
+        app.serial[0].settings.graph_percent = 40;
         app.active_workspace_view = Some(crate::WorkspaceView::Serial);
         app.save_global_settings();
         let mut restored = crate::WaveCraftApp::with_settings(None, app.saved_capture_settings);
         assert!(restored.serial_view_is_active());
         restored.reconcile_waveform_tab();
         assert!(restored.serial_view_is_active());
-        assert_eq!(restored.serial.settings, app.serial.settings);
-        assert!(restored.serial.session.is_none());
+        assert_eq!(restored.serial[0].settings, app.serial[0].settings);
+        assert!(restored.serial[0].session.is_none());
     }
 }

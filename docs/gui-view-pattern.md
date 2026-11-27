@@ -44,6 +44,15 @@ section; imported-file Plot remains at the toolbar's right end. Serial and PD
 Power share fixed label/field columns through `setup_field_row`, with parameter
 names on the left and equal-width editors on the right. Connection settings are
 disabled while a port is open; Close remains available until shutdown begins.
+The tab menu opens up to five independent Serial / UART workspaces. Each owns
+its port, decoding settings, imported file, raw bytes, graph viewport, splitter,
+and setup collapse state. Every open connection keeps receiving in the
+background; closing a tab stops only its own connection while retaining data
+for reopening. Settings, tab order, visibility, and selection survive restarts;
+legacy single-view settings restore into the first slot and new slots start
+hidden. The existing automatic settings saves also cover each slot. Connection
+requests target the originating slot after tab changes. Serial and PD Power
+share port ownership checks, including macOS `/dev/cu.` and `/dev/tty.` aliases.
 Views supply the
 `ToolbarSection::Files` and `ToolbarSection::Controls` phases of one callback;
 the template owns Snapshot and both surrounding dividers. Use
@@ -352,7 +361,12 @@ Both cards retain the workspace's 16-point right margin, including the final
 horizontal-axis label. Settings use one common background with collapsible sections shared with the
 Serial workspace. Label and editor columns are fixed; dropdowns and numeric
 editors are both 96 points wide. The port is selected from the dropdown, and
-numeric inputs use keyboard-only `ManualValue`.
+numeric inputs use keyboard-only `ManualValue`. Baud rate reuses Serial's shared
+text editor with a dropdown button on its right: type a value to filter speeds,
+or use the button to show the list. USB CDC accepts custom host rates from 1 to
+12,000,000 baud; UART accepts typed or selected values from its seven device-menu
+rates. Each PD Power slot retains its own edit draft. Invalid drafts cannot be
+saved or used to connect.
 
 The Connect/Disconnect button sits directly below Port in the setup panel.
 The toolbar has one output toggle: ON uses the accent color and OFF uses red.
@@ -387,7 +401,7 @@ Select a port and choose USB CDC (LF terminator) or UART CRC8 (polynomial 0x31,
 initial 0xFF). UART requires enabling UART mode in the device menu and selecting
 the matching baud rate; physical UART supports seven speeds from 9600–460800
 baud. USB CDC offers 28 standard host line-coding choices from 110–3,000,000
-baud; these do not imply the same measurement rate. The device menu's
+baud plus manual entry; these do not imply the same measurement rate. The device menu's
 UART configuration and display rotation have no documented remote commands.
 
 Polling defaults to 10 Hz; WaveCraft permits 0.1–100 Hz as a **host request rate**.

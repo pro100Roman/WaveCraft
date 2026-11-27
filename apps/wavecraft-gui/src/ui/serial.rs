@@ -1,5 +1,6 @@
 //! Serial / UART workspace, matching the instrument toolbar, setup cards and split panes.
 
+use super::baud_rate::{paint_baud_rate_selector, STANDARD_BAUD_RATES};
 use super::serial_graph::paint_graph;
 use super::serial_line_style::{line_style_picker, LINE_STYLE_PICKER_WIDTH};
 use super::view_shell::{
@@ -15,25 +16,28 @@ use crate::{
 };
 use wavecraft_serial::BinarySchema;
 
-const BAUD_RATES: &[u32] = &[
-    110, 300, 600, 1_200, 2_400, 4_800, 9_600, 14_400, 19_200, 28_800, 38_400, 57_600, 76_800,
-    115_200, 128_000, 153_600, 230_400, 256_000, 460_800, 500_000, 576_000, 921_600, 1_000_000,
-    1_152_000, 1_500_000, 2_000_000, 2_500_000, 3_000_000,
-];
-
 impl WaveCraftApp {
     pub(crate) fn serial_view_is_active(&self) -> bool {
-        self.active_workspace_view == Some(WorkspaceView::Serial)
+        self.active_workspace_view
+            .and_then(WorkspaceView::serial_index)
+            .is_some()
     }
 
-    pub(crate) fn select_serial_view(&mut self) {
+    pub(crate) fn active_serial_index(&self) -> usize {
+        self.active_workspace_view
+            .and_then(WorkspaceView::serial_index)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn select_serial_view(&mut self, view: WorkspaceView) {
+        let index = view.serial_index().unwrap_or(0);
         if let Some(active) = self.active_waveform_tab {
             self.save_waveform_view_settings(active);
         }
-        self.active_workspace_view = Some(WorkspaceView::Serial);
+        self.active_workspace_view = Some(view);
         self.snapshot_plot_rect = None;
-        if self.serial.ports.is_empty() {
-            self.serial.refresh();
+        if self.serial[index].ports.is_empty() {
+            self.serial[index].refresh();
         }
         self.save_global_settings();
     }
@@ -43,7 +47,8 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut crate::FrameActions,
     ) {
-        let running = self.serial.session.is_some();
+        let index = self.active_serial_index();
+        let running = self.serial[index].session.is_some();
         let toolbar = view_toolbar(
             context,
             "Serial / UART",
@@ -54,10 +59,10 @@ impl WaveCraftApp {
                         .add_enabled(!running, toolbar_action_button("↻ Refresh", TEXT_MUTED))
                         .clicked()
                     {
-                        self.serial.refresh();
+                        self.serial[index].refresh();
                     }
                     if ui.add(toolbar_action_button("Clear", TEXT_MUTED)).clicked() {
-                        self.serial.clear_data();
+                        self.serial[index].clear_data();
                     }
                     ui.separator();
                     if ui
@@ -65,11 +70,11 @@ impl WaveCraftApp {
                         .on_hover_text("Open raw serial bytes or a CSV file")
                         .clicked()
                     {
-                        self.open_serial_raw();
+                        self.open_serial_raw(index);
                     }
                     if ui
                         .add_enabled(
-                            !self.serial.raw.is_empty(),
+                            !self.serial[index].raw.is_empty(),
                             toolbar_action_button("Save raw…", TEXT_MUTED),
                         )
                         .on_hover_text("Save the retained raw bytes (latest 64 KiB)")
@@ -79,23 +84,23 @@ impl WaveCraftApp {
                             .set_file_name("serial-capture.bin")
                             .save_file()
                         {
-                            let bytes: Vec<_> = self.serial.raw.iter().copied().collect();
+                            let bytes: Vec<_> = self.serial[index].raw.iter().copied().collect();
                             if let Err(error) = std::fs::write(path, bytes) {
-                                self.serial.error = Some(error.to_string());
+                                self.serial[index].error = Some(error.to_string());
                             }
                         }
                     }
                 }
                 ToolbarSection::Controls => {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.serial.imported_file.is_some()
+                        if self.serial[index].imported_file.is_some()
                             && ui
                                 .add_enabled(!running, toolbar_action_button("Plot", ACCENT))
                                 .on_hover_text("Plot the opened file using the current fields, columns and X-axis settings")
                                 .clicked()
                         {
-                            if let Err(error) = self.serial.plot_imported() {
-                                self.serial.error = Some(error.to_string());
+                            if let Err(error) = self.serial[index].plot_imported() {
+                                self.serial[index].error = Some(error.to_string());
                             }
                         }
                     });
@@ -106,17 +111,50 @@ impl WaveCraftApp {
         actions.snapshot_clicked |= toolbar.snapshot_clicked;
     }
 
+    pub(crate) fn connected_serial_port_owner(
+        &self,
+        port: &str,
+        excluding: WorkspaceView,
+    ) -> Option<WorkspaceView> {
+        WorkspaceView::SERIAL
+            .into_iter()
+            .zip(&self.serial)
+            .filter(|(_, state)| state.session.is_some())
+            .map(|(view, state)| (view, state.settings.port.as_str()))
+            .chain(
+                WorkspaceView::PD_POWER
+                    .into_iter()
+                    .zip(&self.pd_power)
+                    .filter(|(_, state)| state.session.is_some())
+                    .map(|(view, state)| (view, state.settings.port.as_str())),
+            )
+            .find(|(view, candidate)| {
+                *view != excluding && crate::pd_power::same_port(candidate, port)
+            })
+            .map(|(view, _)| view)
+    }
+
     pub(crate) fn apply_serial_actions(&mut self, actions: &crate::FrameActions) {
-        if actions.serial_toggle_connection {
-            if self.serial.session.is_some() {
-                self.serial.stop();
-            } else if let Err(error) = self.serial.start() {
-                self.serial.error = Some(error.to_string());
+        if let Some(index) = actions.serial_toggle_connection {
+            let busy_view = self.serial.get(index).and_then(|state| {
+                self.connected_serial_port_owner(&state.settings.port, WorkspaceView::SERIAL[index])
+            });
+            if let Some(state) = self.serial.get_mut(index) {
+                if state.session.is_some() {
+                    state.stop();
+                } else if let Some(view) = busy_view {
+                    state.error = Some(format!(
+                        "This port is already connected in {}",
+                        view.label()
+                    ));
+                } else if let Err(error) = state.start() {
+                    state.error = Some(error.to_string());
+                }
             }
         }
     }
 
-    fn open_serial_raw(&mut self) {
+    fn open_serial_raw(&mut self, index: usize) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Open serial data or CSV")
             .add_filter("Serial data and CSV", &["bin", "txt", "csv", "raw"])
@@ -125,8 +163,8 @@ impl WaveCraftApp {
         else {
             return;
         };
-        if let Err(error) = self.serial.import_raw(&path) {
-            self.serial.error = Some(error.to_string());
+        if let Err(error) = self.serial[index].import_raw(&path) {
+            self.serial[index].error = Some(error.to_string());
         } else {
             self.save_global_settings();
         }
@@ -137,13 +175,14 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut crate::FrameActions,
     ) {
-        let before = self.serial.settings.clone();
+        let index = self.active_serial_index();
+        let before = self.serial[index].settings.clone();
         self.show_setup_panel(
             context,
-            WorkspaceView::Serial,
+            WorkspaceView::SERIAL[index],
             actions,
             |app, ui, actions| {
-                let running = app.serial.session.is_some();
+                let running = app.serial[index].session.is_some();
                 if running {
                     ui.label(
                         RichText::new("Close the port to change connection or decoding settings")
@@ -161,38 +200,38 @@ impl WaveCraftApp {
                 }
                 settings_card(ui, |ui| {
                     setup_section(ui, "CONNECTION", true, |ui| {
-                        port_settings(ui, &mut app.serial, actions)
+                        port_settings(ui, &mut app.serial[index], index, actions)
                     });
                     ui.add_space(10.0);
                     setup_section(ui, "DATA FORMAT", !running, |ui| {
                         ui.horizontal(|ui| {
                             ui.selectable_value(
-                                &mut app.serial.settings.mode,
+                                &mut app.serial[index].settings.mode,
                                 SerialMode::Text,
                                 "Text / ASCII",
                             );
                             ui.selectable_value(
-                                &mut app.serial.settings.mode,
+                                &mut app.serial[index].settings.mode,
                                 SerialMode::Binary,
                                 "Binary",
                             );
                             ui.selectable_value(
-                                &mut app.serial.settings.mode,
+                                &mut app.serial[index].settings.mode,
                                 SerialMode::Csv,
                                 "CSV",
                             );
                         });
-                        if app.serial.settings.mode == SerialMode::Text {
-                            text_settings(ui, &mut app.serial.settings, None);
-                        } else if app.serial.settings.mode == SerialMode::Csv {
-                            csv_settings(ui, &mut app.serial);
+                        if app.serial[index].settings.mode == SerialMode::Text {
+                            text_settings(ui, &mut app.serial[index].settings, None);
+                        } else if app.serial[index].settings.mode == SerialMode::Csv {
+                            csv_settings(ui, &mut app.serial[index]);
                         } else {
-                            binary_settings(ui, &mut app.serial);
+                            binary_settings(ui, &mut app.serial[index]);
                         }
                     });
                     ui.add_space(10.0);
                     setup_section(ui, "X AXIS", !running, |ui| {
-                        x_axis_settings(ui, &mut app.serial.settings)
+                        x_axis_settings(ui, &mut app.serial[index].settings)
                     });
                 });
                 ui.add_space(10.0);
@@ -212,18 +251,18 @@ impl WaveCraftApp {
             },
         );
 
-        if before != self.serial.settings {
+        if before != self.serial[index].settings {
             self.apply_serial_axis_changes(&before);
-            for series in &mut self.serial.series {
-                let color = if self.serial.settings.mode != SerialMode::Binary {
-                    self.serial
+            for series in &mut self.serial[index].series {
+                let color = if self.serial[index].settings.mode != SerialMode::Binary {
+                    self.serial[index]
                         .settings
                         .fields
                         .iter()
                         .find(|field| field.name.trim() == series.name)
                         .map(|field| field.color)
                 } else {
-                    self.serial
+                    self.serial[index]
                         .settings
                         .binary_colors
                         .get(&series.name)
@@ -234,116 +273,130 @@ impl WaveCraftApp {
                 }
             }
             // Keep a stopped capture intact until a new port/file open, but rebuild the raw representation on mode changes.
-            self.serial.invalidate_raw();
+            self.serial[index].invalidate_raw();
             self.save_global_settings();
         }
     }
 
     fn apply_serial_axis_changes(&mut self, before: &SerialSettings) {
-        let settings = &self.serial.settings;
+        let index = self.active_serial_index();
+        let settings = &self.serial[index].settings;
         let axis_changed = before.timestamp_field != settings.timestamp_field
             || before.timestamp_unit != settings.timestamp_unit
             || before.timestamp_multiplier != settings.timestamp_multiplier
             || before.sample_rate != settings.sample_rate;
-        if axis_changed && self.serial.imported_file.is_some() {
-            if let Err(error) = self.serial.rebuild_imported_axis() {
-                self.serial.error = Some(error.to_string());
+        if axis_changed && self.serial[index].imported_file.is_some() {
+            if let Err(error) = self.serial[index].rebuild_imported_axis() {
+                self.serial[index].error = Some(error.to_string());
             }
         }
     }
 
     pub(crate) fn paint_serial_central(&mut self, context: &egui::Context) {
+        let index = self.active_serial_index();
+        let mut layout_changed = false;
         workspace_panel(context, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("SERIAL / UART").strong().color(ACCENT));
-                ui.separator();
-                ui.label(format!("{} bytes", self.serial.received_bytes));
-                ui.label(format!("{} records", self.serial.decoded_records));
-                if self.serial.rejected_frames > 0 {
-                    ui.colored_label(
-                        egui::Color32::LIGHT_RED,
-                        format!("{} rejected", self.serial.rejected_frames),
-                    );
-                }
-                if self.serial.invalid_x_records > 0 {
-                    ui.label(format!("{} invalid X values", self.serial.invalid_x_records))
-                        .on_hover_text("Missing, nonfinite or decreasing timestamps are excluded from plotting. Raw bytes are preserved.");
-                }
-                if self.serial.discarded_bytes > 0 {
-                    ui.label(format!("{} unsynced bytes", self.serial.discarded_bytes));
-                }
-            });
-            ui.add_space(6.0);
-            let total = (ui.available_height() - 10.0 - 2.0 * ui.spacing().item_spacing.y).max(0.0);
-            let min_height = 60.0_f32.min(total / 2.0);
-            let graph_height = (total * f32::from(self.serial.settings.graph_percent) / 100.0)
-                .clamp(min_height, (total - min_height).max(min_height));
-            let width = ui.available_width();
-            let before = self.serial.settings.graph_percent;
-            ui.allocate_ui_with_layout(
-                egui::vec2(width, graph_height),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.set_clip_rect(ui.max_rect());
-                    paint_graph(ui, &mut self.serial);
-                },
-            );
-            let (rect, response) =
-                ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::drag());
-            let response = response
-                .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-                .on_hover_text("Drag to resize Graph and Raw data");
-            ui.painter().line_segment(
-                [
-                    egui::pos2(rect.left() + 8.0, rect.center().y),
-                    egui::pos2(rect.right() - 8.0, rect.center().y),
-                ],
-                egui::Stroke::new(
-                    if response.hovered() || response.dragged() {
-                        2.0
-                    } else {
-                        1.0_f32
-                    },
-                    if response.hovered() || response.dragged() {
-                        ACCENT
-                    } else {
-                        GRID
-                    },
-                ),
-            );
-            if response.drag_started() {
-                self.serial.split_drag_origin = Some(graph_height);
-            }
-            if response.dragged() && total > 0.0 {
-                let height = (self.serial.split_drag_origin.unwrap_or(graph_height)
-                    + response.drag_delta().y)
+            ui.push_id(("serial_workspace", index), |ui| {
+                let state = &mut self.serial[index];
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("SERIAL / UART").strong().color(ACCENT));
+                    ui.separator();
+                    ui.label(format!("{} bytes", state.received_bytes));
+                    ui.label(format!("{} records", state.decoded_records));
+                    if state.rejected_frames > 0 {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            format!("{} rejected", state.rejected_frames),
+                        );
+                    }
+                    if state.invalid_x_records > 0 {
+                        ui.label(format!("{} invalid X values", state.invalid_x_records))
+                            .on_hover_text("Missing, nonfinite or decreasing timestamps are excluded from plotting. Raw bytes are preserved.");
+                    }
+                    if state.discarded_bytes > 0 {
+                        ui.label(format!("{} unsynced bytes", state.discarded_bytes));
+                    }
+                });
+                ui.add_space(6.0);
+                let total = (ui.available_height() - 10.0 - 2.0 * ui.spacing().item_spacing.y).max(0.0);
+                let min_height = 60.0_f32.min(total / 2.0);
+                let graph_height = (total * f32::from(state.settings.graph_percent) / 100.0)
                     .clamp(min_height, (total - min_height).max(min_height));
-                self.serial.split_drag_origin = Some(height);
-                self.serial.settings.graph_percent =
-                    (height / total * 100.0).round().clamp(10.0, 90.0) as u8;
-            }
-            if response.double_clicked() {
-                self.serial.settings.graph_percent = 65;
-            }
-            if response.drag_stopped()
-                || before != self.serial.settings.graph_percent && !response.dragged()
-            {
-                self.serial.split_drag_origin = None;
-                self.save_global_settings();
-            }
-            ui.allocate_ui_with_layout(
-                egui::vec2(width, (total - graph_height).max(0.0)),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.set_clip_rect(ui.max_rect());
-                    paint_raw(ui, &mut self.serial);
-                },
-            );
+                let width = ui.available_width();
+                let before = state.settings.graph_percent;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, graph_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_clip_rect(ui.max_rect());
+                        paint_graph(ui, state);
+                    },
+                );
+                let (rect, response) =
+                    ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::drag());
+                let response = response
+                    .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+                    .on_hover_text("Drag to resize Graph and Raw data");
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(rect.left() + 8.0, rect.center().y),
+                        egui::pos2(rect.right() - 8.0, rect.center().y),
+                    ],
+                    egui::Stroke::new(
+                        if response.hovered() || response.dragged() {
+                            2.0
+                        } else {
+                            1.0_f32
+                        },
+                        if response.hovered() || response.dragged() {
+                            ACCENT
+                        } else {
+                            GRID
+                        },
+                    ),
+                );
+                if response.drag_started() {
+                    state.split_drag_origin = Some(graph_height);
+                }
+                if response.dragged() && total > 0.0 {
+                    let height = (state.split_drag_origin.unwrap_or(graph_height)
+                        + response.drag_delta().y)
+                        .clamp(min_height, (total - min_height).max(min_height));
+                    state.split_drag_origin = Some(height);
+                    state.settings.graph_percent =
+                        (height / total * 100.0).round().clamp(10.0, 90.0) as u8;
+                }
+                if response.double_clicked() {
+                    state.settings.graph_percent = 65;
+                }
+                if response.drag_stopped()
+                    || before != state.settings.graph_percent && !response.dragged()
+                {
+                    state.split_drag_origin = None;
+                    layout_changed = true;
+                }
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, (total - graph_height).max(0.0)),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_clip_rect(ui.max_rect());
+                        paint_raw(ui, state);
+                    },
+                );
+            });
         });
+        if layout_changed {
+            self.save_global_settings();
+        }
     }
 }
 
-fn port_settings(ui: &mut egui::Ui, state: &mut SerialState, actions: &mut crate::FrameActions) {
+fn port_settings(
+    ui: &mut egui::Ui,
+    state: &mut SerialState,
+    index: usize,
+    actions: &mut crate::FrameActions,
+) {
     let running = state.session.is_some();
     ui.spacing_mut().interact_size.x = CONNECTION_FIELD_WIDTH;
     ui.add_enabled_ui(!running, |ui| {
@@ -381,7 +434,7 @@ fn port_settings(ui: &mut egui::Ui, state: &mut SerialState, actions: &mut crate
         .on_hover_selectable_text("Open or close the selected serial port. Live UART capture is available in ASCII or Binary mode.")
         .on_disabled_hover_selectable_text("Select a port and ASCII or Binary mode to open a live UART connection.")
         .clicked() {
-            actions.serial_toggle_connection = true;
+            actions.serial_toggle_connection = Some(index);
         }
     });
     ui.add_enabled_ui(!running, |ui| {
@@ -392,7 +445,13 @@ fn port_settings(ui: &mut egui::Ui, state: &mut SerialState, actions: &mut crate
             "",
             "Type a baud rate or select a standard speed",
             |ui| {
-                paint_baud_rate_selector(ui, &mut settings.baud, &mut state.baud_draft);
+                paint_baud_rate_selector(
+                    ui,
+                    &mut settings.baud,
+                    &mut state.baud_draft,
+                    STANDARD_BAUD_RATES,
+                    true,
+                );
             },
         );
         setup_field_row(ui, "Data bits", "", "", |ui| {
@@ -432,112 +491,6 @@ fn port_settings(ui: &mut egui::Ui, state: &mut SerialState, actions: &mut crate
             );
         });
     });
-}
-
-fn paint_baud_rate_selector(ui: &mut egui::Ui, baud: &mut u32, draft: &mut Option<String>) {
-    let draft = draft.get_or_insert_with(|| baud.to_string());
-    let popup_id = ui.make_persistent_id("serial_baud_rate_popup");
-    let filter_id = popup_id.with("show_all");
-    let controls = ui.horizontal(|ui| {
-        let button_width = 24.0;
-        let text_width =
-            (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(button_width);
-        let text = ui
-            .add_sized(
-                [text_width, 20.0],
-                egui::TextEdit::singleline(draft)
-                    .hint_text("Type or select a baud rate")
-                    .char_limit(8),
-            )
-            .on_hover_text(
-                "Type a baud rate to filter the standard speeds, or enter a custom value",
-            );
-        let dropdown = ui
-            .add_sized([button_width, 20.0], egui::Button::new("▾"))
-            .on_hover_text("Show standard baud rates up to 3000000");
-        (text, dropdown)
-    });
-    let (text_response, dropdown_response) = controls.inner;
-    let anchor_response = text_response.clone().union(dropdown_response.clone());
-    if dropdown_response.clicked() {
-        ui.data_mut(|data| data.insert_temp(filter_id, true));
-        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
-    } else if text_response.clicked() || text_response.gained_focus() || text_response.changed() {
-        ui.data_mut(|data| data.insert_temp(filter_id, false));
-        ui.memory_mut(|memory| memory.open_popup(popup_id));
-    }
-    let valid_baud = draft
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|baud| (1..=12_000_000).contains(baud));
-    if let Some(value) = valid_baud {
-        *baud = value;
-    }
-    if (text_response.has_focus() || text_response.lost_focus())
-        && ui.input(|input| input.key_pressed(egui::Key::Enter))
-        && valid_baud.is_some()
-    {
-        text_response.surrender_focus();
-        ui.memory_mut(egui::Memory::close_popup);
-    }
-    egui::popup::popup_below_widget(
-        ui,
-        popup_id,
-        &anchor_response,
-        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
-        |popup_ui| {
-            popup_ui.set_min_width(anchor_response.rect.width());
-            popup_ui.set_max_width(anchor_response.rect.width());
-            popup_ui.label(
-                RichText::new("Standard baud rates")
-                    .small()
-                    .color(TEXT_MUTED),
-            );
-            popup_ui.separator();
-            let show_all = popup_ui.data(|data| data.get_temp::<bool>(filter_id).unwrap_or(false));
-            let query = draft.trim();
-            let mut selected = None;
-            egui::ScrollArea::vertical()
-                .id_salt("serial_baud_rate_results")
-                .max_height(240.0)
-                .auto_shrink([false, false])
-                .show(popup_ui, |ui| {
-                    let mut matches = 0;
-                    for rate in BAUD_RATES
-                        .iter()
-                        .filter(|rate| show_all || rate.to_string().contains(query))
-                    {
-                        matches += 1;
-                        if ui
-                            .selectable_label(valid_baud == Some(*rate), rate.to_string())
-                            .clicked()
-                        {
-                            selected = Some(*rate);
-                        }
-                    }
-                    if matches == 0 {
-                        ui.label(
-                            RichText::new("No standard match · use the typed value")
-                                .small()
-                                .color(TEXT_MUTED),
-                        );
-                    }
-                });
-            if let Some(rate) = selected {
-                *baud = rate;
-                *draft = rate.to_string();
-                text_response.surrender_focus();
-                popup_ui.memory_mut(egui::Memory::close_popup);
-            }
-        },
-    );
-    if valid_baud.is_none() {
-        ui.colored_label(
-            egui::Color32::LIGHT_RED,
-            "Enter a baud rate from 1 to 12000000",
-        );
-    }
 }
 
 fn string_combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[&str]) {
@@ -1023,8 +976,8 @@ mod tests {
         let mut app = crate::app::test_support::app();
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/examples/serial-samples.csv");
-        app.serial.import_raw(&path).unwrap();
-        let last_line = app.serial.raw_lines().last().unwrap().clone();
+        app.serial[0].import_raw(&path).unwrap();
+        let last_line = app.serial[0].raw_lines().last().unwrap().clone();
         let context = egui::Context::default();
         let _ = render(&mut app, &context, vec![]);
         let labels = texts(&render(&mut app, &context, vec![]).shapes);
@@ -1035,7 +988,7 @@ mod tests {
         let output = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
                 ui.set_width(300.0);
-                csv_settings(ui, &mut app.serial);
+                csv_settings(ui, &mut app.serial[0]);
             });
         });
         let labels = texts(&output.shapes);
@@ -1051,9 +1004,9 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples");
         for mode in [SerialMode::Text, SerialMode::Binary] {
             let mut app = crate::app::test_support::app();
-            app.serial.settings.mode = mode;
+            app.serial[0].settings.mode = mode;
             let file = if mode == SerialMode::Text {
-                app.serial.settings.fields = ["temperature", "speed"]
+                app.serial[0].settings.fields = ["temperature", "speed"]
                     .into_iter()
                     .enumerate()
                     .map(|(index, name)| TextField {
@@ -1065,7 +1018,7 @@ mod tests {
                     .collect();
                 "serial-ascii.txt"
             } else {
-                app.serial
+                app.serial[0]
                     .load_schema(
                         "schema.json".into(),
                         include_str!("../../../../docs/examples/serial-schema.json").into(),
@@ -1073,17 +1026,17 @@ mod tests {
                     .unwrap();
                 "serial-binary.bin"
             };
-            app.serial.settings.timestamp_field = "speed".into();
-            app.serial.settings.timestamp_unit = SerialTimestampUnit::Milliseconds;
-            app.serial.settings.timestamp_multiplier = "10".into();
-            app.serial.import_raw(&root.join(file)).unwrap();
-            let raw = app.serial.raw.clone();
-            assert!(app.serial.x_axis.is_time());
-            let before = app.serial.settings.clone();
-            app.serial.settings.timestamp_field.clear();
+            app.serial[0].settings.timestamp_field = "speed".into();
+            app.serial[0].settings.timestamp_unit = SerialTimestampUnit::Milliseconds;
+            app.serial[0].settings.timestamp_multiplier = "10".into();
+            app.serial[0].import_raw(&root.join(file)).unwrap();
+            let raw = app.serial[0].raw.clone();
+            assert!(app.serial[0].x_axis.is_time());
+            let before = app.serial[0].settings.clone();
+            app.serial[0].settings.timestamp_field.clear();
             app.apply_serial_axis_changes(&before);
-            assert_eq!(app.serial.x_axis, crate::serial::SerialXAxis::Samples);
-            assert_eq!(app.serial.decoded_records, 512);
+            assert_eq!(app.serial[0].x_axis, crate::serial::SerialXAxis::Samples);
+            assert_eq!(app.serial[0].decoded_records, 512);
             let context = egui::Context::default();
             let labels = texts(&render(&mut app, &context, vec![]).shapes);
             assert!(labels.iter().any(|label| label == "X: Sample"));
@@ -1092,16 +1045,16 @@ mod tests {
                 || label.ends_with("ms")
                 || label.ends_with("µs")
                 || label.ends_with("ns")));
-            let before = app.serial.settings.clone();
-            app.serial.settings.sample_rate = "1000".into();
+            let before = app.serial[0].settings.clone();
+            app.serial[0].settings.sample_rate = "1000".into();
             app.apply_serial_axis_changes(&before);
-            assert!(app.serial.x_axis.is_time());
-            let before = app.serial.settings.clone();
-            app.serial.settings.sample_rate.clear();
+            assert!(app.serial[0].x_axis.is_time());
+            let before = app.serial[0].settings.clone();
+            app.serial[0].settings.sample_rate.clear();
             app.apply_serial_axis_changes(&before);
-            assert_eq!(app.serial.x_axis, crate::serial::SerialXAxis::Samples);
-            assert_eq!(app.serial.raw, raw);
-            assert!(app.serial.error.is_none());
+            assert_eq!(app.serial[0].x_axis, crate::serial::SerialXAxis::Samples);
+            assert_eq!(app.serial[0].raw, raw);
+            assert!(app.serial[0].error.is_none());
         }
     }
 
@@ -1110,28 +1063,28 @@ mod tests {
         let mut app = crate::app::test_support::app();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples");
         for mode in [SerialMode::Text, SerialMode::Binary] {
-            app.serial.settings.mode = mode;
-            app.serial
+            app.serial[0].settings.mode = mode;
+            app.serial[0]
                 .import_raw(&root.join("serial-ascii.txt"))
                 .unwrap();
-            let raw = app.serial.raw.clone();
-            let before = app.serial.settings.clone();
-            app.serial.settings.sample_rate = "1000".into();
+            let raw = app.serial[0].raw.clone();
+            let before = app.serial[0].settings.clone();
+            app.serial[0].settings.sample_rate = "1000".into();
             app.apply_serial_axis_changes(&before);
-            assert!(app.serial.x_axis.is_time());
-            let before = app.serial.settings.clone();
-            app.serial.settings.sample_rate.clear();
+            assert!(app.serial[0].x_axis.is_time());
+            let before = app.serial[0].settings.clone();
+            app.serial[0].settings.sample_rate.clear();
             app.apply_serial_axis_changes(&before);
-            assert!(!app.serial.x_axis.is_time());
-            assert_eq!(app.serial.raw, raw);
-            assert!(app.serial.error.is_none());
+            assert!(!app.serial[0].x_axis.is_time());
+            assert_eq!(app.serial[0].raw, raw);
+            assert!(app.serial[0].error.is_none());
         }
     }
 
     #[test]
     fn graph_labels_switch_from_sample_numbers_to_sample_rate_time_on_plot() {
         let mut app = crate::app::test_support::app();
-        app.serial.settings.fields.push(TextField {
+        app.serial[0].settings.fields.push(TextField {
             name: "temperature".into(),
             separator: String::new(),
             color: COLORS[0],
@@ -1139,18 +1092,18 @@ mod tests {
         });
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/examples/serial-ascii.txt");
-        app.serial.import_raw(&path).unwrap();
-        app.serial.fit_graph();
+        app.serial[0].import_raw(&path).unwrap();
+        app.serial[0].fit_graph();
         let context = egui::Context::default();
         let labels = texts(&render(&mut app, &context, vec![]).shapes);
         assert!(labels.iter().any(|label| label == "X: Sample"));
         assert!(labels.iter().any(|label| label == "samples"));
-        app.serial.settings.sample_rate = "1000".into();
+        app.serial[0].settings.sample_rate = "1000".into();
         // Editing settings does not relabel the old graph before applying Plot.
         assert!(texts(&render(&mut app, &context, vec![]).shapes)
             .iter()
             .any(|label| label == "X: Sample"));
-        app.serial.plot_imported().unwrap();
+        app.serial[0].plot_imported().unwrap();
         let labels = texts(&render(&mut app, &context, vec![]).shapes);
         assert!(labels.iter().any(|label| label == "X: Time"));
         assert!(labels.iter().any(|label| label.ends_with("ms")));
@@ -1224,8 +1177,8 @@ mod tests {
     fn connection_has_aligned_fields_and_open_close_below_port() {
         let mut app = crate::app::test_support::app();
         app.active_workspace_view = Some(WorkspaceView::Serial);
-        app.serial.settings.port = "test-uart".into();
-        app.serial.ports = vec!["test-uart".into()];
+        app.serial[0].settings.port = "test-uart".into();
+        app.serial[0].ports = vec!["test-uart".into()];
         let context = egui::Context::default();
         crate::configure_style(&context);
         connection_frame(&mut app, &context, vec![]);
@@ -1255,12 +1208,12 @@ mod tests {
             1
         );
         let actions = click_connection(&mut app, &context, open.center());
-        assert!(actions.serial_toggle_connection);
-        assert!(app.serial.session.is_none()); // Applied after painting, never from the editor.
-        app.serial.baud_draft = Some("invalid".into());
+        assert_eq!(actions.serial_toggle_connection, Some(0));
+        assert!(app.serial[0].session.is_none()); // Applied after painting, never from the editor.
+        app.serial[0].baud_draft = Some("invalid".into());
         app.apply_serial_actions(&actions);
-        assert!(app.serial.error.is_some());
-        assert!(app.serial.session.is_none());
+        assert!(app.serial[0].error.is_some());
+        assert!(app.serial[0].session.is_none());
 
         let ready = crate::app::test_support::ready(
             &app,
@@ -1268,21 +1221,25 @@ mod tests {
             crate::AcquisitionMode::Run,
             crate::CaptureTarget::LogicAnalyzer,
         );
-        app.serial.session = Some(ready.session);
-        app.serial.baud_draft = None;
+        app.serial[0].session = Some(ready.session);
+        app.serial[0].baud_draft = None;
         let (output, _) = connection_frame(&mut app, &context, vec![]);
         let close = connection_text_rect(&output, "Close");
         let port = connection_text_rect(&output, "Port");
         assert!(close.top() > port.bottom());
         assert!(close.bottom() < connection_text_rect(&output, "Baud rate").top());
         let data_bits = connection_text_rect(&output, "8").center();
-        assert!(!click_connection(&mut app, &context, data_bits).serial_toggle_connection);
+        assert!(click_connection(&mut app, &context, data_bits)
+            .serial_toggle_connection
+            .is_none());
         assert!(!context.memory(|memory| memory.any_popup_open()));
         let actions = click_connection(&mut app, &context, close.center());
-        assert!(actions.serial_toggle_connection);
+        assert_eq!(actions.serial_toggle_connection, Some(0));
         app.apply_serial_actions(&actions);
-        assert!(app.serial.stopping);
-        assert!(!click_connection(&mut app, &context, close.center()).serial_toggle_connection);
+        assert!(app.serial[0].stopping);
+        assert!(click_connection(&mut app, &context, close.center())
+            .serial_toggle_connection
+            .is_none());
     }
 
     #[test]
@@ -1292,8 +1249,8 @@ mod tests {
         let context = egui::Context::default();
         crate::configure_style(&context);
         for mode in [SerialMode::Text, SerialMode::Binary, SerialMode::Csv] {
-            app.serial.settings.mode = mode;
-            app.serial.settings.port = if mode == SerialMode::Csv {
+            app.serial[0].settings.mode = mode;
+            app.serial[0].settings.port = if mode == SerialMode::Csv {
                 "test-uart".into()
             } else {
                 String::new()
@@ -1301,9 +1258,276 @@ mod tests {
             connection_frame(&mut app, &context, vec![]);
             let (output, _) = connection_frame(&mut app, &context, vec![]);
             let position = connection_text_rect(&output, "Open").center();
-            assert!(!click_connection(&mut app, &context, position).serial_toggle_connection);
-            assert!(app.serial.session.is_none());
+            assert!(click_connection(&mut app, &context, position)
+                .serial_toggle_connection
+                .is_none());
+            assert!(app.serial[0].session.is_none());
         }
+    }
+
+    #[test]
+    fn five_serial_views_restore_independent_settings_layout_and_legacy_profile() {
+        let path =
+            std::env::temp_dir().join(format!("wavecraft-five-serial-{}.json", std::process::id()));
+        let repository = crate::CaptureSettingsRepository::at(path.clone());
+        let mut saved = crate::CaptureSettingsDocument::default();
+        let legacy = SerialSettings {
+            port: "legacy-uart".into(),
+            baud: 230400,
+            ..Default::default()
+        };
+        saved.global.serial = Some(legacy.clone());
+        let mut app = WaveCraftApp::with_settings(Some(repository.clone()), saved);
+        assert_eq!(app.serial[0].settings, legacy);
+        assert_eq!(
+            app.available_workspace_views()
+                .iter()
+                .filter(|view| view.serial_index().is_some())
+                .count(),
+            1
+        );
+        for (index, view) in WorkspaceView::SERIAL.into_iter().enumerate() {
+            app.open_workspace_view(view);
+            app.serial[index].settings.port = format!("uart-{index}");
+            app.serial[index].settings.baud = 123456 + index as u32;
+            app.serial[index].settings.graph_percent = 40 + index as u8 * 5;
+            app.serial[index].settings.fields.push(TextField {
+                name: format!("value{index}"),
+                separator: "=".into(),
+                color: COLORS[index],
+                line_style: Default::default(),
+            });
+            app.workspace_view_layout
+                .set_setup_panel_open(view, index % 2 == 0);
+            app.save_setup_settings(view);
+        }
+        app.workspace_view_layout.begin_drag(WorkspaceView::Serial5);
+        app.workspace_view_layout.drag_to(WorkspaceView::Serial);
+        app.workspace_view_layout.finish_drag();
+        app.set_workspace_view_visible(WorkspaceView::Serial3, false);
+        app.save_global_settings();
+        let mut restored = WaveCraftApp::with_settings(None, repository.load().unwrap());
+        restored.reconcile_waveform_tab();
+        assert_eq!(restored.active_workspace_view, Some(WorkspaceView::Serial5));
+        assert_eq!(
+            restored.available_workspace_views(),
+            app.available_workspace_views()
+        );
+        assert_eq!(
+            restored.workspace_view_layout.order(),
+            app.workspace_view_layout.order()
+        );
+        for (index, view) in WorkspaceView::SERIAL.into_iter().enumerate() {
+            assert_eq!(restored.serial[index].settings, app.serial[index].settings);
+            assert_eq!(
+                restored.workspace_view_layout.setup_panel_open(view),
+                index % 2 == 0
+            );
+            assert!(restored.serial[index].session.is_none());
+        }
+        app.open_workspace_view(WorkspaceView::Serial3);
+        let context = egui::Context::default();
+        crate::configure_style(&context);
+        connection_frame(&mut app, &context, vec![]);
+        let (output, _) = connection_frame(&mut app, &context, vec![]);
+        let open = connection_text_rect(&output, "Open").center();
+        let actions = click_connection(&mut app, &context, open);
+        assert_eq!(actions.serial_toggle_connection, Some(2));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn serial_views_poll_in_background_and_stop_or_fail_independently() {
+        use crate::app::test_support::{ready_scripted, Script, SourceEnding};
+        use wavecraft_core::{CaptureBatch, InstrumentKind};
+        let mut app = crate::app::test_support::app();
+        for (index, view) in WorkspaceView::SERIAL.into_iter().enumerate() {
+            app.workspace_view_layout.set_visible(view, true);
+            app.serial[index].settings.fields.push(TextField {
+                name: "value".into(),
+                separator: "=".into(),
+                color: COLORS[index],
+                line_style: Default::default(),
+            });
+            app.serial[index].prepare().unwrap();
+            let ready = ready_scripted(
+                &app,
+                vec![(
+                    InstrumentKind::Serial,
+                    Script::sending(
+                        vec![CaptureBatch::Serial(
+                            format!("value={index}\n").into_bytes(),
+                        )],
+                        if index == 4 {
+                            SourceEnding::Fail("serial slot failure".into())
+                        } else {
+                            SourceEnding::Idle
+                        },
+                    ),
+                )],
+                crate::AcquisitionMode::Run,
+                crate::CaptureTarget::LogicAnalyzer,
+            );
+            app.serial[index].session = Some(ready.session);
+        }
+        app.active_workspace_view = Some(WorkspaceView::Battery);
+        let context = egui::Context::default();
+        crate::configure_style(&context);
+        let poll_frame = |app: &mut WaveCraftApp| {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| app.run_frame(context),
+            );
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while (app.serial.iter().any(|state| state.raw.is_empty())
+            || app.serial[4].session.is_some())
+            && std::time::Instant::now() < deadline
+        {
+            poll_frame(&mut app);
+        }
+        for (index, state) in app.serial.iter().enumerate() {
+            assert_eq!(
+                state.raw.iter().copied().collect::<Vec<_>>(),
+                format!("value={index}\n").into_bytes()
+            );
+            assert_eq!(state.decoded_records, 1);
+            assert_eq!(state.series[0].points[0][1], index as f64);
+        }
+        assert!(app.serial[4]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("serial slot failure"));
+        assert!(app.serial[..4]
+            .iter()
+            .all(|state| state.session.is_some() && state.error.is_none()));
+        app.set_workspace_view_visible(WorkspaceView::Serial3, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.serial[2].session.is_some() && std::time::Instant::now() < deadline {
+            poll_frame(&mut app);
+        }
+        assert!(app.serial[2].session.is_none());
+        for index in [0, 1, 3] {
+            assert!(app.serial[index].session.is_some());
+        }
+        app.open_workspace_view(WorkspaceView::Serial2);
+        app.apply_serial_actions(&crate::FrameActions {
+            serial_toggle_connection: Some(0),
+            ..Default::default()
+        });
+        assert!(app.serial[0].stopping);
+        assert!(app.serial[1].session.is_some() && !app.serial[1].stopping);
+        app.open_workspace_view(WorkspaceView::Serial3);
+        assert_eq!(app.serial[2].decoded_records, 1);
+    }
+
+    #[test]
+    fn imported_files_clear_actions_viewports_and_errors_stay_with_each_serial_view() {
+        let mut app = crate::app::test_support::app();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples");
+        let context = egui::Context::default();
+        crate::configure_style(&context);
+        for (index, view) in WorkspaceView::SERIAL.into_iter().enumerate() {
+            app.open_workspace_view(view);
+            let file = if index % 2 == 0 {
+                "serial-ascii.txt"
+            } else {
+                "serial-samples.csv"
+            };
+            app.serial[index].import_raw(&root.join(file)).unwrap();
+            app.serial[index].follow = false;
+            app.serial[index].time_window = 10.0 + index as f64;
+        }
+        let raw = app
+            .serial
+            .iter()
+            .map(|state| state.raw.clone())
+            .collect::<Vec<_>>();
+        connection_frame(&mut app, &context, vec![]);
+        let (output, _) = connection_frame(&mut app, &context, vec![]);
+        let clear = connection_text_rect(&output, "Clear").center();
+        click_connection(&mut app, &context, clear);
+        assert!(app.serial[4].raw.is_empty());
+        assert!(app.serial[4].imported_file.is_none());
+        for (index, expected) in raw.iter().enumerate().take(4) {
+            assert_eq!(&app.serial[index].raw, expected);
+            assert!(app.serial[index].imported_file.is_some());
+            assert_eq!(app.serial[index].time_window, 10.0 + index as f64);
+            assert!(!app.serial[index].follow);
+        }
+        app.serial[4].error = Some("Only serial five failed".into());
+        app.workspace_view_layout
+            .set_setup_panel_open(WorkspaceView::Serial5, false);
+        let (output, _) = connection_frame(&mut app, &context, vec![]);
+        assert!(connection_text_rect(&output, "Only serial five failed").top() > 800.0);
+        app.select_serial_view(WorkspaceView::Serial);
+        let (output, _) = connection_frame(&mut app, &context, vec![]);
+        assert!(!texts(&output.shapes)
+            .iter()
+            .any(|text| text == "Only serial five failed"));
+        assert!(texts(&output.shapes)
+            .iter()
+            .any(|text| text.contains("serial-ascii.txt")));
+    }
+
+    #[test]
+    fn serial_and_pd_power_views_cannot_open_a_port_owned_by_another_view() {
+        use crate::app::test_support::ready;
+        let mut app = crate::app::test_support::app();
+        let session = |app: &WaveCraftApp| {
+            ready(
+                app,
+                wavecraft_core::InstrumentKind::Serial,
+                crate::AcquisitionMode::Run,
+                crate::CaptureTarget::LogicAnalyzer,
+            )
+            .session
+        };
+        app.serial[0].settings.port = "/dev/cu.test-uart".into();
+        app.serial[0].session = Some(session(&app));
+        app.serial[1].settings.port = "/dev/tty.test-uart".into();
+        app.apply_serial_actions(&crate::FrameActions {
+            serial_toggle_connection: Some(1),
+            ..Default::default()
+        });
+        assert!(app.serial[1].session.is_none());
+        assert!(app.serial[1]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Serial / UART"));
+        app.pd_power[0].settings.port = "/dev/tty.test-uart".into();
+        app.apply_pd_power_actions(&crate::FrameActions {
+            pd_power_connect: Some(0),
+            ..Default::default()
+        });
+        assert!(app.pd_power[0].session.is_none());
+        assert!(app.pd_power[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Serial / UART"));
+        app.pd_power[3].settings.port = "/dev/cu.test-power".into();
+        app.pd_power[3].session = Some(session(&app));
+        app.serial[4].settings.port = "/dev/tty.test-power".into();
+        app.apply_serial_actions(&crate::FrameActions {
+            serial_toggle_connection: Some(4),
+            ..Default::default()
+        });
+        assert!(app.serial[4].session.is_none());
+        assert!(app.serial[4]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("PD Power 4"));
+        assert!(app.serial[0].session.is_some());
     }
 
     #[test]
@@ -1334,8 +1558,8 @@ mod tests {
             .any(|text| text == "Plot"));
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/examples/serial-ascii.txt");
-        app.serial.import_raw(&path).unwrap();
-        let raw = app.serial.raw.clone();
+        app.serial[0].import_raw(&path).unwrap();
+        let raw = app.serial[0].raw.clone();
         let output = frame(&mut app, vec![]);
         let bounds = |label: &str| {
             output
@@ -1359,7 +1583,7 @@ mod tests {
         assert!(texts(&output.shapes)
             .iter()
             .any(|text| text.contains("serial-ascii.txt")));
-        app.serial.settings.fields.push(TextField {
+        app.serial[0].settings.fields.push(TextField {
             separator: String::new(),
             name: "temperature".into(),
             color: COLORS[0],
@@ -1380,13 +1604,13 @@ mod tests {
                 ],
             );
         }
-        assert_eq!(app.serial.decoded_records, 512);
-        assert_eq!(app.serial.series[0].points.len(), 512);
-        assert_eq!(app.serial.raw, raw);
+        assert_eq!(app.serial[0].decoded_records, 512);
+        assert_eq!(app.serial[0].series[0].points.len(), 512);
+        assert_eq!(app.serial[0].raw, raw);
         let labels = texts(&frame(&mut app, vec![]).shapes);
         assert!(labels.iter().any(|text| text.contains("serial-ascii.txt")));
         assert!(labels.iter().any(|text| text == "Plot"));
-        app.serial.clear_data();
+        app.serial[0].clear_data();
         let labels = texts(&frame(&mut app, vec![]).shapes);
         assert!(!labels
             .iter()
@@ -1435,9 +1659,9 @@ mod tests {
         for mode in [SerialMode::Text, SerialMode::Binary] {
             let mut app = crate::app::test_support::app();
             app.active_workspace_view = Some(WorkspaceView::Serial);
-            app.serial.settings.mode = mode;
-            app.serial.prepare().unwrap();
-            app.serial.ingest(1.0, b"temperature=42\n");
+            app.serial[0].settings.mode = mode;
+            app.serial[0].prepare().unwrap();
+            app.serial[0].ingest(1.0, b"temperature=42\n");
             let context = egui::Context::default();
             crate::configure_style(&context);
             let _ = render(&mut app, &context, Vec::new());
@@ -1459,7 +1683,7 @@ mod tests {
         for mode in [SerialMode::Text, SerialMode::Binary] {
             let mut app = crate::app::test_support::app();
             app.active_workspace_view = Some(WorkspaceView::Serial);
-            app.serial.settings.mode = mode;
+            app.serial[0].settings.mode = mode;
             let file = if mode == SerialMode::Text {
                 "serial-ascii.txt"
             } else {
@@ -1468,8 +1692,8 @@ mod tests {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../docs/examples")
                 .join(file);
-            app.serial.import_raw(&path).unwrap();
-            let last_line = app.serial.raw_lines().last().unwrap().clone();
+            app.serial[0].import_raw(&path).unwrap();
+            let last_line = app.serial[0].raw_lines().last().unwrap().clone();
             let context = egui::Context::default();
             crate::configure_style(&context);
             let _ = render(&mut app, &context, vec![]);
@@ -1482,8 +1706,8 @@ mod tests {
                     "HEX + ASCII"
                 }));
             assert!(labels.contains(&last_line));
-            assert!(app.serial.series.is_empty());
-            assert!(app.serial.error.is_none());
+            assert!(app.serial[0].series.is_empty());
+            assert!(app.serial[0].error.is_none());
         }
     }
 
@@ -1548,25 +1772,24 @@ mod tests {
     fn fit_button_fills_plot_width_for_short_and_long_traces_despite_trailing_raw_bytes() {
         for (first, last) in [(0.0002, 0.0006), (0.3, 1.0), (1.0, 7201.0)] {
             let mut app = crate::app::test_support::app();
-            app.serial.settings.fields.push(TextField {
+            app.serial[0].settings.fields.push(TextField {
                 separator: String::new(),
                 name: "v".into(),
                 color: COLORS[0],
                 line_style: Default::default(),
             });
-            app.serial.settings.fields.push(TextField {
+            app.serial[0].settings.fields.push(TextField {
                 name: "ts".into(),
                 separator: String::new(),
                 color: COLORS[1],
                 line_style: Default::default(),
             });
-            app.serial.settings.timestamp_field = "ts".into();
-            app.serial.prepare().unwrap();
+            app.serial[0].settings.timestamp_field = "ts".into();
+            app.serial[0].prepare().unwrap();
             for (time, value) in [(first, 0), ((first + last) / 2.0, 1), (last, 2)] {
-                app.serial
-                    .ingest(0.0, format!("v={value} ts={time}\n").as_bytes());
+                app.serial[0].ingest(0.0, format!("v={value} ts={time}\n").as_bytes());
             }
-            app.serial.ingest(last + 30.0, b"no matching values\n");
+            app.serial[0].ingest(last + 30.0, b"no matching values\n");
             let context = egui::Context::default();
             let output = render(&mut app, &context, vec![]);
             let fit = output
@@ -1597,7 +1820,7 @@ mod tests {
             // Render again to catch the time-window editor clamping fitted spans
             // back to its old 10 ms minimum or one-hour maximum.
             let output = render(&mut app, &context, vec![]);
-            assert!((app.serial.time_window - (last - first)).abs() < 1e-9);
+            assert!((app.serial[0].time_window - (last - first)).abs() < 1e-9);
             if last < 0.001 {
                 assert!(texts(&output.shapes)
                     .iter()
@@ -1653,14 +1876,14 @@ mod tests {
     #[test]
     fn graph_does_not_repeat_field_controls_or_latest_value_legend() {
         let mut app = crate::app::test_support::app();
-        app.serial.settings.fields.push(TextField {
+        app.serial[0].settings.fields.push(TextField {
             separator: String::new(),
             name: "temperature".into(),
             color: COLORS[0],
             line_style: Default::default(),
         });
-        app.serial.prepare().unwrap();
-        app.serial.ingest(1.0, b"temperature=42\n");
+        app.serial[0].prepare().unwrap();
+        app.serial[0].ingest(1.0, b"temperature=42\n");
         let context = egui::Context::default();
         let _ = render(&mut app, &context, vec![]);
         let output = render(&mut app, &context, vec![]);
@@ -1676,8 +1899,8 @@ mod tests {
     fn raw_data_has_breathing_room_below_both_format_headers() {
         for mode in [SerialMode::Text, SerialMode::Binary] {
             let mut app = crate::app::test_support::app();
-            app.serial.settings.mode = mode;
-            app.serial.ingest(1.0, b"temperature=42\n");
+            app.serial[0].settings.mode = mode;
+            app.serial[0].ingest(1.0, b"temperature=42\n");
             let context = egui::Context::default();
             let _ = render(&mut app, &context, vec![]);
             let output = render(&mut app, &context, vec![]);
@@ -1715,15 +1938,15 @@ mod tests {
     fn splitter_accepts_small_drag_steps_and_persists_height() {
         let mut app = crate::app::test_support::app();
         app.active_workspace_view = Some(WorkspaceView::Serial);
-        app.serial.settings.fields.push(TextField {
+        app.serial[0].settings.fields.push(TextField {
             separator: String::new(),
             name: "temperature".into(),
             color: COLORS[0],
             line_style: Default::default(),
         });
-        app.serial.prepare().unwrap();
+        app.serial[0].prepare().unwrap();
         for index in 0..100 {
-            app.serial.ingest(
+            app.serial[0].ingest(
                 index as f64 * 0.01,
                 format!("temperature={index}\n").as_bytes(),
             );
@@ -1774,7 +1997,7 @@ mod tests {
                 modifiers: Default::default(),
             }],
         );
-        assert!(app.serial.settings.graph_percent > 68);
+        assert!(app.serial[0].settings.graph_percent > 68);
         assert_eq!(
             app.saved_capture_settings
                 .global
@@ -1782,7 +2005,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .graph_percent,
-            app.serial.settings.graph_percent
+            app.serial[0].settings.graph_percent
         );
     }
 
@@ -1795,7 +2018,7 @@ mod tests {
         crate::configure_style(&context);
         for size in [egui::vec2(1600.0, 900.0), egui::vec2(640.0, 420.0)] {
             for mode in [SerialMode::Text, SerialMode::Binary] {
-                app.serial.settings.mode = mode;
+                app.serial[0].settings.mode = mode;
                 let output = context.run(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),

@@ -867,7 +867,7 @@ mod tests {
                 }
             }
             assert!(
-                has_run_control_after_snapshot || view == WorkspaceView::Serial,
+                has_run_control_after_snapshot || view.serial_index().is_some(),
                 "{view:?}: primary control follows Snapshot"
             );
             assert!(

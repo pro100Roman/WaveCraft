@@ -75,12 +75,14 @@ impl WaveCraftApp {
                 for view in WorkspaceView::ALL {
                     if view.pd_power_index().is_some_and(|index| index != 0)
                         || view.battery_index().is_some_and(|index| index != 0)
+                        || view.serial_index().is_some_and(|index| index != 0)
                     {
                         continue;
                     }
                     let slots = match view {
                         WorkspaceView::PdPower => Some(WorkspaceView::PD_POWER.as_slice()),
                         WorkspaceView::Battery => Some(WorkspaceView::BATTERY.as_slice()),
+                        WorkspaceView::Serial => Some(WorkspaceView::SERIAL.as_slice()),
                         _ => None,
                     };
                     let next_view = if let Some(slots) = slots {
@@ -101,6 +103,7 @@ impl WaveCraftApp {
                         let hint = match view {
                             WorkspaceView::PdPower => "Up to five PD Power views can be open",
                             WorkspaceView::Battery => "Up to ten Battery views can be open",
+                            WorkspaceView::Serial => "Up to five Serial / UART views can be open",
                             _ => "This view is already open",
                         };
                         response
@@ -294,6 +297,69 @@ mod tests {
     }
 
     #[test]
+    fn plus_menu_adds_five_serial_views_limits_count_and_reuses_closed_slot() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let add_serial = |app: &mut WaveCraftApp| {
+            let texts = paint_tabs(&context, app, vec![]);
+            click_tabs(
+                &context,
+                app,
+                texts.iter().find(|(text, _)| text == "+").unwrap().1,
+            );
+            let texts = paint_tabs(&context, app, vec![]);
+            let item = texts
+                .iter()
+                .rev()
+                .find(|(text, _)| text == "Serial / UART")
+                .unwrap()
+                .1;
+            assert!(!texts.iter().any(|(text, _)| text == "Serial / UART 6"));
+            click_tabs(&context, app, item);
+        };
+        assert_eq!(
+            app.available_workspace_views()
+                .iter()
+                .filter(|v| v.serial_index().is_some())
+                .count(),
+            1
+        );
+        for expected in WorkspaceView::SERIAL.into_iter().skip(1) {
+            add_serial(&mut app);
+            assert_eq!(app.active_workspace_view, Some(expected));
+        }
+        add_serial(&mut app);
+        assert_eq!(app.active_workspace_view, Some(WorkspaceView::Serial5));
+        assert_eq!(
+            app.available_workspace_views()
+                .iter()
+                .filter(|v| v.serial_index().is_some())
+                .count(),
+            5
+        );
+        paint_tabs(
+            &context,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        app.serial[3].settings.baud = 123456;
+        app.set_workspace_view_visible(WorkspaceView::Serial4, false);
+        add_serial(&mut app);
+        assert_eq!(app.active_workspace_view, Some(WorkspaceView::Serial4));
+        assert_eq!(app.serial[3].settings.baud, 123456);
+        assert_eq!(
+            app.available_workspace_views().last(),
+            Some(&WorkspaceView::Serial4)
+        );
+    }
+
+    #[test]
     fn hidden_views_are_not_painted_and_return_when_enabled() {
         let context = egui::Context::default();
         let mut app = app();
@@ -445,6 +511,10 @@ mod tests {
                 WorkspaceView::PdPower3,
                 WorkspaceView::PdPower4,
                 WorkspaceView::PdPower5,
+                WorkspaceView::Serial2,
+                WorkspaceView::Serial3,
+                WorkspaceView::Serial4,
+                WorkspaceView::Serial5,
             ]
         );
         assert_eq!(app.workspace_view_layout.dragged_view(), None);

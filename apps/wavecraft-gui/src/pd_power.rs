@@ -66,6 +66,7 @@ pub(crate) struct PowerState {
     pub plot_fraction: f32,
     pub layout_changed: bool,
     pub settings: PowerSettings,
+    pub baud_draft: Option<String>,
     pub ports: Vec<String>,
     pub session: Option<CaptureSession>,
     control: Option<Control>,
@@ -85,6 +86,7 @@ impl Default for PowerState {
             plot_fraction: 0.5,
             layout_changed: false,
             settings: PowerSettings::default(),
+            baud_draft: None,
             ports: Vec::new(),
             session: None,
             control: None,
@@ -107,8 +109,20 @@ impl PowerState {
         }
     }
 
+    pub(crate) fn edited_settings(&self) -> Result<PowerSettings, CaptureError> {
+        let mut settings = self.settings.clone();
+        if let Some(draft) = &self.baud_draft {
+            settings.baud_rate = draft
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| CaptureError::new("Baud rate must be between 1 and 12000000"))?;
+        }
+        settings.validate()?;
+        Ok(settings)
+    }
+
     pub fn start(&mut self) -> Result<(), CaptureError> {
-        self.settings.validate()?;
+        self.settings = self.edited_settings()?;
         let (source, control) = PowerSource::new(self.settings.configuration())?;
         let session = CaptureCoordinator::start(vec![Box::new(source)])?;
         self.control = Some(control);

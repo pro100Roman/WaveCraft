@@ -50,6 +50,8 @@ pub(crate) struct GlobalSettings {
     pub(crate) battery_views: Vec<crate::battery::BatterySettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) serial: Option<crate::serial::SerialSettings>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) serial_views: Vec<crate::serial::SerialSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_active_view: Option<SavedWorkspaceView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +117,14 @@ pub(crate) enum SavedWorkspaceView {
     Vna,
     SystemTrace,
     Serial,
+    #[serde(rename = "serial_2")]
+    Serial2,
+    #[serde(rename = "serial_3")]
+    Serial3,
+    #[serde(rename = "serial_4")]
+    Serial4,
+    #[serde(rename = "serial_5")]
+    Serial5,
     Battery,
     #[serde(rename = "battery_2")]
     Battery2,

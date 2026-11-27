@@ -20,6 +20,10 @@ impl WaveCraftApp {
             WorkspaceView::Vna => ("vna_setup", "VNA SETUP"),
             WorkspaceView::SystemTrace => ("system_trace_setup", "SYSTEM TRACE SETUP"),
             WorkspaceView::Serial => ("serial_setup", "SERIAL / UART SETUP"),
+            WorkspaceView::Serial2 => ("serial_setup_2", "SERIAL / UART 2 SETUP"),
+            WorkspaceView::Serial3 => ("serial_setup_3", "SERIAL / UART 3 SETUP"),
+            WorkspaceView::Serial4 => ("serial_setup_4", "SERIAL / UART 4 SETUP"),
+            WorkspaceView::Serial5 => ("serial_setup_5", "SERIAL / UART 5 SETUP"),
             WorkspaceView::Battery => ("battery_setup", "BATTERY SETUP"),
             WorkspaceView::Battery2 => ("battery_setup_2", "BATTERY 2 SETUP"),
             WorkspaceView::Battery3 => ("battery_setup_3", "BATTERY 3 SETUP"),
@@ -80,7 +84,11 @@ mod tests {
                 WorkspaceView::SystemTrace => {
                     app.paint_system_trace_setup_panel(context, &mut actions)
                 }
-                WorkspaceView::Serial => app.paint_serial_setup(context, &mut actions),
+                WorkspaceView::Serial
+                | WorkspaceView::Serial2
+                | WorkspaceView::Serial3
+                | WorkspaceView::Serial4
+                | WorkspaceView::Serial5 => app.paint_serial_setup(context, &mut actions),
                 WorkspaceView::Battery
                 | WorkspaceView::Battery2
                 | WorkspaceView::Battery3

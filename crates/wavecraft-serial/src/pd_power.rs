@@ -32,8 +32,13 @@ pub struct Configuration {
 
 impl Configuration {
     pub fn validate(&self) -> Result<(), CaptureError> {
-        if self.port.trim().is_empty() || !BAUD_RATES.contains(&self.baud_rate) {
-            return Err(CaptureError::new("Select a port and a supported baud rate"));
+        if self.port.trim().is_empty() {
+            return Err(CaptureError::new("Select a serial port"));
+        }
+        if !(1..=12_000_000).contains(&self.baud_rate) {
+            return Err(CaptureError::new(
+                "Baud rate must be between 1 and 12000000",
+            ));
         }
         if self.crc8 && !UART_BAUD_RATES.contains(&self.baud_rate) {
             return Err(CaptureError::new("UART baud rate must match one of the device menu's rates (9600–460800); extended rates are available for USB CDC"));
@@ -703,6 +708,32 @@ mod tests {
         assert!(configuration.validate().is_err());
         configuration.baud_rate = 460800;
         assert!(configuration.validate().is_ok());
+    }
+
+    #[test]
+    fn custom_usb_baud_rates_validate_without_relaxing_uart_or_numeric_limits() {
+        let mut configuration = Configuration {
+            port: "usb".into(),
+            baud_rate: 123456,
+            crc8: false,
+            poll_hz: 10.0,
+        };
+        for baud in [1, 123456, 12_000_000] {
+            configuration.baud_rate = baud;
+            assert!(configuration.validate().is_ok());
+            configuration.crc8 = true;
+            assert!(configuration.validate().is_err());
+            configuration.crc8 = false;
+        }
+        for baud in [0, 12_000_001, u32::MAX] {
+            configuration.baud_rate = baud;
+            assert!(configuration.validate().is_err());
+        }
+        for baud in UART_BAUD_RATES {
+            configuration.baud_rate = baud;
+            configuration.crc8 = true;
+            assert!(configuration.validate().is_ok());
+        }
     }
 
     #[test]

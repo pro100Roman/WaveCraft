@@ -3,6 +3,7 @@
 
 pub mod app_windows;
 pub mod battery;
+mod baud_rate;
 pub mod capture_settings_panel;
 pub mod capture_setup_panel;
 pub mod central_panel;

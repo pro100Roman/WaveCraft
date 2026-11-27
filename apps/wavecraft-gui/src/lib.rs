@@ -433,7 +433,7 @@ struct WaveCraftApp {
     workspace_view_layout: WorkspaceViewLayout,
     scope_plot_tab: ScopePlotTab,
     system_trace_settings: SystemTraceSettings,
-    serial: serial::SerialState,
+    serial: [serial::SerialState; WorkspaceView::SERIAL.len()],
     battery: [battery::BatteryState; WorkspaceView::BATTERY.len()],
     pd_power: [pd_power::PowerState; 5],
     system_trace: system_trace::SystemTraceDisplayState,
@@ -515,6 +515,10 @@ impl WaveCraftApp {
                 WorkspaceView::Vna
                 | WorkspaceView::SystemTrace
                 | WorkspaceView::Serial
+                | WorkspaceView::Serial2
+                | WorkspaceView::Serial3
+                | WorkspaceView::Serial4
+                | WorkspaceView::Serial5
                 | WorkspaceView::Battery
                 | WorkspaceView::Battery2
                 | WorkspaceView::Battery3
@@ -608,7 +612,7 @@ impl WaveCraftApp {
             workspace_view_layout: WorkspaceViewLayout::default(),
             scope_plot_tab: restored_scope_plot_tab,
             system_trace_settings: SystemTraceSettings::default(),
-            serial: serial::SerialState::default(),
+            serial: std::array::from_fn(|_| serial::SerialState::default()),
             battery: std::array::from_fn(|_| battery::BatteryState::default()),
             pd_power: std::array::from_fn(|_| pd_power::PowerState::default()),
             system_trace: system_trace::SystemTraceDisplayState::default(),
@@ -713,7 +717,9 @@ impl eframe::App for WaveCraftApp {
         if let Some(cancel) = &self.vna_run_cancel {
             cancel.store(true, Ordering::Release);
         }
-        self.serial.stop();
+        for state in &mut self.serial {
+            state.stop();
+        }
         for state in &mut self.pd_power {
             state.stop();
         }
@@ -779,8 +785,10 @@ impl WaveCraftApp {
         if self.pd_power.iter().any(|state| state.session.is_some()) {
             context.request_repaint_after(std::time::Duration::from_millis(16));
         }
-        self.serial.poll();
-        if self.serial.session.is_some() {
+        for state in &mut self.serial {
+            state.poll();
+        }
+        if self.serial.iter().any(|state| state.session.is_some()) {
             context.request_repaint_after(std::time::Duration::from_millis(16));
         }
         self.poll_system_trace_events();

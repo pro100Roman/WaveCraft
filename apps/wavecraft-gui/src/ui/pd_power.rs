@@ -1,5 +1,6 @@
 //! WeAct supply workspace, composed entirely with the common instrument shell.
 use super::{
+    baud_rate::paint_baud_rate_selector,
     frame_actions::FrameActions,
     manual_value::ManualValue,
     plot_hover::{paint_plot_hover, plot_hover_pointer},
@@ -27,7 +28,7 @@ fn output_button(state: &PowerState) -> (&'static str, egui::Color32) {
 
 fn section(ui: &mut egui::Ui, title: &str, enabled: bool, contents: impl FnOnce(&mut egui::Ui)) {
     let hint = match title {
-        "CONNECTION" => "Select a USB CDC or UART port, then Connect. USB offers standard host baud rates; physical UART must match the rate selected in the device menu.",
+        "CONNECTION" => "Select a USB CDC or UART port, then Connect. USB allows typed host baud rates; physical UART must match the rate selected in the device menu.",
         "LIVE STATE" => "Measured output state and input supply information. Input voltage and PD status are unavailable on early firmware. Timer state reports whether a sequence is running, including its OFF phase.",
         "OUTPUT / CC · CV" => "CV holds the target voltage. CC limits current automatically when the load reaches the current limit. Edit and write one of M0–M4, then activate it to use its voltage and current limits.",
         "INPUT / PD" => "PD voltage requests require PD input, output OFF, and measured output below 5 V. Supported from V1 ≥ 1.0.2.0 or V1.1 ≥ 1.0.1.0. Early firmware cannot report input voltage or PD state.",
@@ -41,7 +42,7 @@ fn section(ui: &mut egui::Ui, title: &str, enabled: bool, contents: impl FnOnce(
 fn control_help(label: &str) -> &'static str {
     match label {
         "Port" => "Serial port used by this view. Each connected PD Power view needs its own port. USB CDC and UART adapters are supported.",
-        "Baud rate" => "USB CDC host line-coding rate. Physical UART must match one of the seven rates selected in the device menu (9600–460800 baud). This is not the graph update frequency.",
+        "Baud rate" => "Type a USB CDC host line-coding rate or select a standard speed. Physical UART must match one of the seven rates selected in the device menu (9600–460800 baud). This is not the graph update frequency.",
         "Protocol" => "USB CDC uses LF-terminated frames. Physical UART uses CRC8 and requires UART mode enabled in the device menu.",
         "Polling rate" => "Requested host polling rate: 0.1–100 Hz. The API guarantees no ADC sampling frequency. Two serial reads per point, plus input state when supported; slow responses reduce the actual rate without catch-up bursts.",
         "Time window" => "Visible graph duration in seconds, from 1 to 3600. Both voltage and current use the same time window.",
@@ -154,7 +155,7 @@ impl WaveCraftApp {
             actions,
             |app, ui, actions| {
                 editor(ui, &mut app.pd_power[index], index, actions);
-                app.pd_power[index].settings.validate().is_ok()
+                app.pd_power[index].edited_settings().is_ok()
             },
         );
         if let Some((command, data)) = self.pd_power[index].confirmation.clone() {
@@ -278,18 +279,10 @@ impl WaveCraftApp {
         }
         if let Some(index) = actions.pd_power_connect {
             let busy_port = self.pd_power.get(index).and_then(|state| {
-                self.pd_power
-                    .iter()
-                    .enumerate()
-                    .find(|(other, candidate)| {
-                        *other != index
-                            && candidate.session.is_some()
-                            && crate::pd_power::same_port(
-                                &candidate.settings.port,
-                                &state.settings.port,
-                            )
-                    })
-                    .map(|(other, _)| other)
+                self.connected_serial_port_owner(
+                    &state.settings.port,
+                    WorkspaceView::PD_POWER[index],
+                )
             });
             if let Some(state) = self.pd_power.get_mut(index) {
                 if state.session.is_some() {
@@ -297,7 +290,7 @@ impl WaveCraftApp {
                 } else if let Some(other) = busy_port {
                     state.error = Some(format!(
                         "This port is already connected in {}",
-                        WorkspaceView::PD_POWER[other].label()
+                        other.label()
                     ));
                 } else if let Err(error) = state.start() {
                     state.error = Some(error.to_string());
@@ -395,28 +388,23 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, index: usize, actions: &mut
                 });
             });
             row(ui, "", "", |ui| {
-                if ui.add_enabled(state.session.is_some() || !state.settings.port.trim().is_empty(), toolbar_action_button(if state.session.is_some() { "Disconnect" } else { "Connect" }, ACCENT).min_size(egui::vec2(CONNECTION_FIELD_WIDTH,22.0)))
+                if ui.add_enabled(state.session.is_some() || !state.settings.port.trim().is_empty(), toolbar_action_button(if state.session.is_some() { "Disconnect" } else { "Connect" }, if state.session.is_some() { egui::Color32::LIGHT_RED } else { ACCENT }).min_size(egui::vec2(CONNECTION_FIELD_WIDTH,22.0)))
                     .on_hover_selectable_text("Open or close the selected USB CDC/UART connection. Connecting reads device settings without enabling the output.")
                     .clicked() { actions.pd_power_connect = Some(index); }
             });
             ui.add_enabled_ui(state.session.is_none(), |ui| {
                 row(ui, "Baud rate", "", |ui| {
-                    field_combo("baud")
-                        .width(CONNECTION_FIELD_WIDTH)
-                        .selected_text(state.settings.baud_rate.to_string())
-                        .show_ui(ui, |ui| {
-                            for &baud in if state.settings.crc8 {
-                                UART_BAUD_RATES.as_slice()
-                            } else {
-                                BAUD_RATES.as_slice()
-                            } {
-                                ui.selectable_value(
-                                    &mut state.settings.baud_rate,
-                                    baud,
-                                    baud.to_string(),
-                                );
-                            }
-                        });
+                    paint_baud_rate_selector(
+                        ui,
+                        &mut state.settings.baud_rate,
+                        &mut state.baud_draft,
+                        if state.settings.crc8 {
+                            UART_BAUD_RATES.as_slice()
+                        } else {
+                            BAUD_RATES.as_slice()
+                        },
+                        !state.settings.crc8,
+                    );
                 });
                 row(ui, "Protocol", "", |ui| {
                     field_combo("protocol")
@@ -434,6 +422,7 @@ fn editor(ui: &mut egui::Ui, state: &mut PowerState, index: usize, actions: &mut
                                 && !UART_BAUD_RATES.contains(&state.settings.baud_rate)
                             {
                                 state.settings.baud_rate = 115200;
+                                state.baud_draft = None;
                             }
                         });
                 });
@@ -1365,6 +1354,41 @@ mod tests {
         let _ = paint(1.0, vec![]);
         let output = paint(2.0, vec![]);
         text_rect(&output, control_help("Brightness"));
+    }
+
+    #[test]
+    fn typed_baud_rates_persist_per_view_and_invalid_drafts_cannot_save_or_connect() {
+        let path =
+            std::env::temp_dir().join(format!("wavecraft-pd-baud-{}.json", std::process::id()));
+        let repository = crate::CaptureSettingsRepository::at(path.clone());
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            CaptureSettingsDocument::default(),
+        );
+        for (index, view) in WorkspaceView::PD_POWER.into_iter().enumerate() {
+            app.open_workspace_view(view);
+            app.pd_power[index].baud_draft = Some((123456 + index as u32).to_string());
+            app.save_setup_settings(view);
+        }
+        let saved = repository.load().unwrap();
+        let restored = WaveCraftApp::with_settings(None, saved.clone());
+        for (index, state) in restored.pd_power.iter().enumerate() {
+            assert_eq!(state.settings.baud_rate, 123456 + index as u32);
+        }
+        for draft in ["", "invalid", "0", "12000001"] {
+            app.pd_power[4].baud_draft = Some(draft.into());
+            app.save_setup_settings(WorkspaceView::PdPower5);
+            assert_eq!(repository.load().unwrap(), saved);
+            assert!(app.pd_power[4].start().is_err());
+            assert!(app.pd_power[4].session.is_none());
+            assert!(app.pd_power[0].error.is_none());
+        }
+        app.pd_power[4].settings.crc8 = true;
+        app.pd_power[4].baud_draft = Some("123456".into());
+        assert!(app.pd_power[4].edited_settings().is_err());
+        app.pd_power[4].baud_draft = Some("460800".into());
+        assert_eq!(app.pd_power[4].edited_settings().unwrap().baud_rate, 460800);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
