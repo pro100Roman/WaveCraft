@@ -142,6 +142,7 @@ impl WaveCraftApp {
             || self.vna_view_is_active()
             || self.serial_view_is_active()
             || self.battery_view_is_active()
+            || self.pd_power_view_is_active()
         {
             return;
         }

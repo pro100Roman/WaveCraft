@@ -280,6 +280,7 @@ mod tests {
                 WorkspaceView::Vna,
                 WorkspaceView::Serial,
                 WorkspaceView::Battery,
+                WorkspaceView::PdPower,
             ]
         );
         assert_eq!(app.workspace_view_layout.dragged_view(), None);

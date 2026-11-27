@@ -21,6 +21,7 @@ impl WaveCraftApp {
             WorkspaceView::SystemTrace => ("system_trace_setup", "SYSTEM TRACE SETUP"),
             WorkspaceView::Serial => ("serial_setup", "SERIAL / UART SETUP"),
             WorkspaceView::Battery => ("battery_setup", "BATTERY SETUP"),
+            WorkspaceView::PdPower => ("pd_power_setup", "PD POWER SETUP"),
         };
         let mut open = self.workspace_view_layout.setup_panel_open(view);
         if SetupPanel::new(id, title).show(context, &mut open, |ui| contents(self, ui, actions)) {
@@ -68,6 +69,7 @@ mod tests {
                 }
                 WorkspaceView::Serial => app.paint_serial_setup(context, &mut actions),
                 WorkspaceView::Battery => app.paint_battery_setup(context, &mut actions),
+                WorkspaceView::PdPower => app.paint_pd_power_setup(context, &mut actions),
             },
         );
         let texts = output

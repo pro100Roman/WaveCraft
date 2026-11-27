@@ -37,6 +37,10 @@ impl Default for CaptureSettingsDocument {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct GlobalSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pd_power: Option<crate::pd_power::PowerSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pd_power_plot_fraction: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) battery: Option<crate::battery::BatterySettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) serial: Option<crate::serial::SerialSettings>,
@@ -106,6 +110,7 @@ pub(crate) enum SavedWorkspaceView {
     SystemTrace,
     Serial,
     Battery,
+    PdPower,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]

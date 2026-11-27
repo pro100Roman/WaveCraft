@@ -8,6 +8,7 @@ mod format;
 #[cfg(test)]
 mod frame_tests;
 mod measurements;
+mod pd_power;
 mod process_stats;
 mod protocol_analyzer;
 mod protocol_decode_cache;
@@ -434,6 +435,7 @@ struct WaveCraftApp {
     system_trace_settings: SystemTraceSettings,
     serial: serial::SerialState,
     battery: battery::BatteryState,
+    pd_power: pd_power::PowerState,
     system_trace: system_trace::SystemTraceDisplayState,
     system_trace_events: Option<Receiver<system_trace::LiveTraceUpdate>>,
     system_trace_terminal_lines: Option<Receiver<wavecraft_debug_probe::RttTerminalLine>>,
@@ -513,7 +515,8 @@ impl WaveCraftApp {
                 WorkspaceView::Vna
                 | WorkspaceView::SystemTrace
                 | WorkspaceView::Serial
-                | WorkspaceView::Battery,
+                | WorkspaceView::Battery
+                | WorkspaceView::PdPower,
             )
             | None => None,
         };
@@ -594,6 +597,7 @@ impl WaveCraftApp {
             system_trace_settings: SystemTraceSettings::default(),
             serial: serial::SerialState::default(),
             battery: battery::BatteryState::default(),
+            pd_power: pd_power::PowerState::default(),
             system_trace: system_trace::SystemTraceDisplayState::default(),
             system_trace_events: None,
             system_trace_terminal_lines: None,
@@ -697,6 +701,7 @@ impl eframe::App for WaveCraftApp {
             cancel.store(true, Ordering::Release);
         }
         self.serial.stop();
+        self.pd_power.stop();
         self.save_pending_window_size();
         self.save_global_settings();
         self.system_trace.cleanup_temporary_history();
@@ -753,6 +758,10 @@ impl WaveCraftApp {
         self.poll_worker();
         self.poll_vna_connection();
         self.poll_vna_sweep();
+        self.pd_power.poll();
+        if self.pd_power.session.is_some() {
+            context.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         self.serial.poll();
         if self.serial.session.is_some() {
             context.request_repaint_after(std::time::Duration::from_millis(16));
@@ -780,7 +789,9 @@ impl WaveCraftApp {
             self.save_global_settings();
         }
 
-        if self.battery_view_is_active() {
+        if self.pd_power_view_is_active() {
+            self.paint_pd_power_setup(context, &mut actions);
+        } else if self.battery_view_is_active() {
             self.paint_battery_setup(context, &mut actions);
         } else if self.serial_view_is_active() {
             self.paint_serial_setup(context, &mut actions);
@@ -814,6 +825,9 @@ impl WaveCraftApp {
         self.paint_session_tabs(context);
 
         self.paint_central_panel(context, &frame, actions.snapshot_clicked);
+        if std::mem::take(&mut self.pd_power.layout_changed) {
+            self.save_global_settings();
+        }
         if self.system_trace.take_layout_changed() {
             self.save_global_settings();
         }
@@ -859,6 +873,7 @@ impl WaveCraftApp {
 
         self.apply_toolbar_actions(&mut actions, &frame);
         self.apply_battery_actions(&actions);
+        self.apply_pd_power_actions(&actions);
         if actions.vna_sweep_clicked {
             self.begin_vna_sweep();
         }

@@ -43,7 +43,12 @@ impl WaveCraftApp {
             errors: Vec::new(),
         };
         status.add_error(self.last_error.as_deref());
-        if self.battery_view_is_active() {
+        if self.pd_power_view_is_active() {
+            status.message = &self.pd_power.status;
+            status.detail = self.snapshot_message.as_deref().map(Cow::Borrowed);
+            status.active = self.pd_power.connected;
+            status.add_error(self.pd_power.error.as_deref());
+        } else if self.battery_view_is_active() {
             status.message = &self.battery.status;
             status.detail = self.snapshot_message.as_deref().map(Cow::Borrowed);
             status.active = false;

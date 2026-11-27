@@ -3,13 +3,15 @@
 //! It has no dependency on application state or device backends.
 
 use crate::{
-    apply_setup_panel_typography, egui, toolbar_action_button, Color32, Rect, RichText, ACCENT,
-    BACKGROUND, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, PANEL, TEXT_MUTED,
+    apply_setup_panel_typography, egui, toolbar_action_button, Color32, Rect, RichText,
+    SelectableHoverText, ACCENT, BACKGROUND, DECODED_PANEL_ACTION_BUTTON_SIZE, GRID, PANEL,
+    TEXT_MUTED,
 };
 
 pub(crate) const SETUP_PANEL_WIDTH: f32 = 300.0;
 const CARD_MARGIN: f32 = 12.0;
 const CARD_STROKE_WIDTH: f32 = 1.0;
+pub(crate) const PANE_SPLITTER_HEIGHT: f32 = 10.0;
 const COLLAPSED_PANEL_MARGIN: f32 = 4.0;
 pub(crate) const COLLAPSED_SIDE_PANEL_WIDTH: f32 =
     DECODED_PANEL_ACTION_BUTTON_SIZE[0] + 2.0 * (COLLAPSED_PANEL_MARGIN + CARD_STROKE_WIDTH);
@@ -320,10 +322,51 @@ pub(crate) fn settings_card<R>(
     })
 }
 
+/// A collapsible section inside a shared settings card. IDs are scoped to the
+/// caller's UI, so each workspace retains its own expanded sections.
+pub(crate) fn setup_section(
+    ui: &mut egui::Ui,
+    title: &str,
+    enabled: bool,
+    contents: impl FnOnce(&mut egui::Ui),
+) {
+    egui::CollapsingHeader::new(RichText::new(title).strong().color(TEXT_MUTED))
+        .id_salt(("setup_section", title))
+        .default_open(true)
+        .show_unindented(ui, |ui| {
+            ui.add_space(6.0);
+            ui.add_enabled_ui(enabled, contents);
+        });
+}
+
 pub(crate) fn workspace_panel(context: &egui::Context, contents: impl FnOnce(&mut egui::Ui)) {
     egui::CentralPanel::default()
         .frame(panel_frame(BACKGROUND, 16.0))
         .show(context, contents);
+}
+
+/// Common horizontal divider for vertically stacked, resizable instruments.
+/// Views own the pane sizes and apply the response's drag delta.
+pub(crate) fn stacked_view_splitter(ui: &mut egui::Ui, hint: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), PANE_SPLITTER_HEIGHT),
+        egui::Sense::drag(),
+    );
+    let response = response
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+        .on_hover_selectable_text(hint);
+    let active = response.hovered() || response.dragged();
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left() + 8.0, rect.center().y),
+            egui::pos2(rect.right() - 8.0, rect.center().y),
+        ],
+        egui::Stroke::new(
+            if active { 2.0_f32 } else { 1.0_f32 },
+            if active { ACCENT } else { GRID },
+        ),
+    );
+    response
 }
 
 /// Outline shared by plots, tables, and auxiliary tool panels.

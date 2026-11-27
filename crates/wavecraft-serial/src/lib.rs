@@ -1,6 +1,7 @@
 //! UART transport and bounded, incremental telemetry decoding, independent of UI.
 
 mod csv;
+pub mod pd_power;
 mod protocol;
 pub use csv::{CsvDelimiter, CsvReader};
 pub use protocol::*;

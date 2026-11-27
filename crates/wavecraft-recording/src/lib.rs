@@ -34,7 +34,7 @@ const MAX_METADATA_ENTRIES: usize = 4_096;
 const MAX_SCOPE_CHANNELS: usize = 256;
 
 const MIN_READABLE_FORMAT_VERSION: u16 = 1;
-pub const FORMAT_VERSION: u16 = 3;
+pub const FORMAT_VERSION: u16 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordingHeader {
@@ -496,6 +496,18 @@ fn encode_frame(frame: &CaptureFrame) -> Result<Vec<u8>, RecordingError> {
                 }
             }
         }
+        CaptureBatch::Power(sample) => {
+            payload.push(5);
+            for value in [
+                sample.voltage_mv,
+                sample.current_ma,
+                sample.input_voltage_mv,
+                sample.requested_pd_decivolts,
+            ] {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+            payload.extend_from_slice(&[sample.output_state, sample.input_state]);
+        }
         CaptureBatch::Serial(bytes) => {
             payload.push(4);
             push_length_u64(&mut payload, bytes.len(), "serial byte")?;
@@ -537,6 +549,19 @@ fn decode_frame(payload: &[u8]) -> Result<CaptureFrame, RecordingError> {
     let captured_at = Duration::new(seconds, nanos);
     let payload_kind = reader.read_u8()?;
     let capture_payload = match payload_kind {
+        5 => {
+            let mut word = || -> Result<u16, RecordingError> {
+                Ok(u16::from_le_bytes([reader.read_u8()?, reader.read_u8()?]))
+            };
+            CaptureBatch::Power(wavecraft_core::PowerSample {
+                voltage_mv: word()?,
+                current_ma: word()?,
+                input_voltage_mv: word()?,
+                requested_pd_decivolts: word()?,
+                output_state: reader.read_u8()?,
+                input_state: reader.read_u8()?,
+            })
+        }
         4 => {
             let count = reader.read_length("serial byte")?;
             reader.require_values(count, 1, "serial bytes")?;
@@ -955,6 +980,35 @@ mod tests {
         old_bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
         let mut reader = RecordingReader::new(Cursor::new(old_bytes)).unwrap();
         assert_eq!(reader.read_event().unwrap(), Some(logic_event()));
+    }
+
+    #[test]
+    fn version_four_round_trips_power_telemetry() {
+        let descriptor = DeviceDescriptor {
+            id: DeviceId::new("weact:test"),
+            name: "WeAct".into(),
+            kind: InstrumentKind::Serial,
+        };
+        let event = CaptureEvent::Frame(CaptureFrame {
+            device_id: descriptor.id.clone(),
+            sequence: 42,
+            captured_at: Duration::from_millis(123),
+            payload: CaptureBatch::Power(wavecraft_core::PowerSample {
+                voltage_mv: 5000,
+                current_ma: 1234,
+                input_voltage_mv: 24000,
+                requested_pd_decivolts: 240,
+                output_state: 3,
+                input_state: 5,
+            }),
+        });
+        let mut bytes = Vec::new();
+        let mut writer = RecordingWriter::new(&mut bytes, &[descriptor], BTreeMap::new()).unwrap();
+        writer.write_event(&event).unwrap();
+        writer.finish(CompletionStatus::Complete).unwrap();
+        let mut reader = RecordingReader::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.read_event().unwrap(), Some(event));
+        assert_eq!(reader.read_event().unwrap(), None);
     }
 
     #[test]

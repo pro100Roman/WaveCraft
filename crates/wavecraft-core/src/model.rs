@@ -82,6 +82,20 @@ pub enum CaptureBatch {
     Scope(ScopeBatch),
     Iq(IqBatch),
     Serial(Vec<u8>),
+    Power(PowerSample),
+}
+
+/// One polled supply measurement, preserving the native integer precision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PowerSample {
+    pub voltage_mv: u16,
+    pub current_ma: u16,
+    pub input_voltage_mv: u16,
+    pub requested_pd_decivolts: u16,
+    pub output_state: u8,
+    /// `u8::MAX` when the firmware has no input telemetry command. In that
+    /// case input voltage and requested PD voltage are unavailable.
+    pub input_state: u8,
 }
 
 impl CaptureBatch {
@@ -91,6 +105,7 @@ impl CaptureBatch {
             Self::Scope(batch) => batch.channels.first().map_or(0, Vec::len),
             Self::Iq(batch) => batch.samples.len(),
             Self::Serial(bytes) => bytes.len(),
+            Self::Power(_) => 1,
         }
     }
 }

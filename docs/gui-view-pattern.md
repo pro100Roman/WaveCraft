@@ -3,7 +3,7 @@
 All workspaces use the same instrument chrome, based on the LA/OSC layout.
 `apps/wavecraft-gui/src/ui/view_shell.rs` owns visual structure; individual
 views own their settings editors, plot painters, and domain actions. This
-applies equally to LA, OSC, RF, Combined, VNA, System Trace, Serial, and Battery.
+applies equally to LA, OSC, RF, Combined, VNA, System Trace, Serial, Battery, and PD Power.
 
 ## Components
 
@@ -13,6 +13,7 @@ applies equally to LA, OSC, RF, Combined, VNA, System Trace, Serial, and Battery
 | `workspace_tab_bar` / `workspace_tab` | Scrollable workspace tabs, close buttons, add menu, shared baseline and active accent; the application owns selection, visibility and drag ordering |
 | `SetupPanel` | 300-point left panel, heading, typography, constrained scrolling, mandatory collapse/expand and pinned Save settings footer |
 | `settings_card` | Dark inset grouping settings sections, with shared width constraints and padding |
+| `stacked_view_splitter` | Shared 10-point resizable divider, used by System Trace and PD Power; views own heights and persistence |
 | `workspace_panel` | Central background and outer margins |
 | `view_card` | Full-height plot/table card with a common outline, corner radius and padding |
 | `remaining_plot_rect` | Remaining plot area after a view's header; also usable for snapshot cropping |
@@ -315,3 +316,110 @@ values round-trip without losing coefficient precision. Tests cover analytical
 constant and declining voltage cases, duration-weighted loads, partial cycles,
 sleep, every chemistry/curve combination, invalid data, JSON round trips,
 workspace migration/persistence, graph interactions, and the shared shell.
+
+
+## WeAct PD Power Mini workspace
+
+PD Power uses the common toolbar, setup adapter, pinned Save settings footer,
+workspace cards, Snapshot path, and bottom message area. Voltage occupies the
+upper card and current the lower card. The shared System Trace splitter adjusts
+their heights; its fraction persists separately from edited device settings.
+Both cards retain the workspace's 16-point right margin, including the final
+horizontal-axis label. Settings use one common background with collapsible sections shared with the
+Serial workspace. Label and editor columns are fixed; dropdowns and numeric
+editors are both 96 points wide. The port is selected from the dropdown, and
+numeric inputs use keyboard-only `ManualValue`.
+
+![PD Power workspace connected over USB](images/pd-power-view.png)
+
+The protocol backend is `wavecraft-serial::pd_power`, independent of egui. Its
+`PowerSource` implements `CaptureSource` and emits typed `CaptureBatch::Power`
+measurements through the coordinator. The separate bounded control channel
+serializes requests and settings responses. Connecting performs reads only.
+The backend verifies the model, reads M0–M4, version, serial number, supported
+settings, LCD type, and the factory calibration block before monitoring.
+
+Select a port and choose USB CDC (LF terminator) or UART CRC8 (polynomial 0x31,
+initial 0xFF). UART requires enabling UART mode in the device menu and selecting
+the matching baud rate; physical UART supports seven speeds from 9600–460800
+baud. USB CDC offers 28 standard host line-coding choices from 110–3,000,000
+baud; these do not imply the same measurement rate. The device menu's
+UART configuration and display rotation have no documented remote commands.
+
+Polling defaults to 10 Hz; WaveCraft permits 0.1–100 Hz as a **host request rate**.
+The protocol documents no minimum, maximum, or guaranteed fresh ADC sampling
+rate, and has no command to set the hardware sampling frequency. Each point uses
+two serialized reads (output display and output state), plus input state when
+supported. Actual
+rate is measured over the most recent 100 points. Slow responses reduce the
+rate without catch-up bursts. UART requests include airtime and four-character
+idle gaps. Firmware filter-window changes also affect response to load changes.
+Graph history is bounded to 360,000 points; visible time span is 1–3600 seconds.
+
+The controls expose output ON/OFF; M0–M4 editing and activation; voltage target
+and current limit; PD requested voltage; OCP, calibration, brightness, discharge,
+auto output, filter window, compensation, output timer, device configuration
+save, restart, factory reset, LCD type, and factory calibration data. Voltage
+and current command limits for V1 follow the manufacturer's current web tool:
+0.500–20.000 V and 0.005–3.100 A (nominal product rating: 1–20 V / 0.05–3 A).
+The input supply and buck headroom may further constrain the actual output.
+CC/CV is the reported automatic regulation state, not a selectable mode command.
+The live state also shows input voltage, PD/QC/DC negotiation, power, OCP, and
+timer sequence state.
+
+Commands 0x0B–0x0F require V1 firmware ≥1.0.3.0 or V1.1 ≥1.0.2.0. PD-voltage
+writes require V1 ≥1.0.2.0 or V1.1 ≥1.0.1.0, confirmed PD input, output OFF, and
+measured output below 5 V. Both UI and backend enforce these preconditions.
+The backend conservatively retains the V1 voltage limits for V1.1 devices.
+Command 0x09 is write-only; its state is never inferred from the last click.
+Writes have no acknowledgement; readbacks and live measurements show the actual
+state. Device Save writes device memory; the common footer saves the WaveCraft
+workspace without automatically writing it back on reconnect. Service changes
+use explicit confirmation dialogs, and the factory block's reserved word is
+preserved.
+
+Protocol references (checked 2026-11-27):
+[manufacturer repository](https://github.com/WeActStudio/WeActStudio.PDPowerMiniV1-Buck),
+[official web tool](https://tools.weactstudio.com/PDPowerMini/),
+[Python reference](https://github.com/WeActStudio/WeActStudio.PDPowerMiniV1-Buck/blob/master/Communication%20protocol/com_pdpower.py),
+and the USB v1.3 / UART v1.2 workbooks in its Communication protocol directory.
+The workbooks reverse some boolean descriptions; the official web tool and
+Python implementation consistently use 1 for enabled, which WaveCraft follows.
+
+Verification covers USB and CRC8 UART with fragmented replies and embedded LF
+bytes, two-source ordering and cancellation, corrupted-reply propagation,
+firmware and command validation, native-recording round trips, setup persistence,
+common Snapshot/collapse/error placement, fixed fields, right margins, and real
+pointer dragging of the shared divider in headless egui frames. The native view
+was inspected while connected to the physical device on 2026-11-27.
+
+The tested model is WeAct Studio PD Power Mini V1 BUCK, firmware
+`V1.0.0.1_e5298860`, on `/dev/cu.usbmodemacdec616b2961` (USB CDC, 115200 baud).
+Configuration, M0–M4, output telemetry, LCD type, and factory calibration reads
+work. The output was OFF throughout verification. This firmware does not answer
+input-state command `0x0A`; connecting probes it once, then continues output
+monitoring without it. `PowerSample.input_state == 255` marks unavailable input
+telemetry; the UI shows dashes for input/PD voltages and disables PD controls.
+Partial, malformed, and corrupt replies still fail rather than being hidden as
+unsupported commands. Timer and other newer commands remain firmware-gated.
+
+The opt-in, read-only hardware test is reproducible with:
+
+```sh
+WEACT_PD_PORT=/dev/cu.usbmodemacdec616b2961 cargo test -p wavecraft-serial --test pd_power_hardware -- --ignored --nocapture
+```
+
+Observed rates over 30 measurements at each setting:
+
+| Requested | Actual |
+| --- | --- |
+| 10 Hz | 10.25 Hz |
+| 20 Hz | 19.81 Hz |
+| 50 Hz | 48.49 Hz |
+| 100 Hz | 90.07 Hz |
+
+These short runs measure host receipt timing, not independent fresh ADC samples.
+Native UI verification also confirmed live graphs, changing the polling rate
+from 50 to 100 and back to 10 Hz, equal-width editors/dropdowns, and collapsible
+sections on a common background. No output, presets, protection, calibration,
+firmware, or device-memory settings were changed by the hardware checks.

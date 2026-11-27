@@ -1223,7 +1223,7 @@ pub fn export_saleae_recording<R: Read, W: Write + Seek>(
                     destination.extend(source);
                 }
             }
-            CaptureBatch::Serial(_) => {
+            CaptureBatch::Serial(_) | CaptureBatch::Power(_) => {
                 return Err(SaleaeConversionError::invalid(
                     "serial captures cannot be exported as Saleae",
                 ));

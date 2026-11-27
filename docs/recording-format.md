@@ -1,16 +1,16 @@
 # WaveCraft recording format
 
 WaveCraft's native `.dsv` format is a lossless, little-endian stream of bounded
-records. Format version 3 preserves logic, scope, raw IQ, and serial byte events and
+records. Format version 4 preserves logic, scope, raw IQ, serial bytes, and power telemetry and
 can be written without retaining the complete capture in memory. Readers
-continue to accept version 1 logic/scope and version 2 IQ recordings unchanged.
+continue to accept versions 1–3 unchanged.
 
 ## File header
 
 | Field | Size | Value |
 | --- | ---: | --- |
 | Magic | 8 bytes | legacy `DSVIEW`, `0x1a`, newline |
-| Format version | `u16` | `3` (`1` and `2` remain readable) |
+| Format version | `u16` | `4` (`1`–`3` remain readable) |
 | Flags | `u16` | `0` |
 
 The header is immediately followed by one session-metadata record.
@@ -22,7 +22,7 @@ Every record has a 16-byte header followed by its payload:
 | Field | Size | Description |
 | --- | ---: | --- |
 | Kind | `u8` | Session, frame, source failure, source stopped, or footer |
-| Flags/reserved | 3 bytes | Zero in versions 1–3 |
+| Flags/reserved | 3 bytes | Zero in versions 1–4 |
 | Payload length | `u64` | Bounded to 256 MiB |
 | Payload CRC-32 | `u32` | CRC of payload bytes |
 
@@ -66,7 +66,17 @@ by a `u64` byte count and those raw bytes, preserving their original order.
 Serial payloads carry host receive timestamps in the common frame header and
 do not claim a sample rate. The Serial workspace's **Save raw** action exports
 the retained raw-byte window directly; it does not create a `.dsv` recording.
-The new reader accepts versions 1–3; older readers reject version 3 files.
+The reader accepts versions 1–4; older readers reject version 4 files.
+
+Version 4 adds payload kind `5` for one power-supply measurement: four `u16`
+little-endian fields (output mV, output mA, input mV, requested PD voltage in
+0.1 V units), followed by the `u8` output and input state bytes. It uses the
+Serial instrument kind for the serial-connected supply. Measurements carry the
+common monotonic host timestamp and sequence. Input state `255` indicates that
+the firmware has no input telemetry; input voltage and requested PD voltage
+are then unavailable. Measurements do not claim a hardware sample
+clock. The power workspace currently retains a bounded live history and offers
+the common PNG Snapshot action.
 
 The **Record** action can attach to an existing Logic Analyzer Loop or active
 Oscilloscope/RF Run acquisition and stream native `.dsv` frames until the

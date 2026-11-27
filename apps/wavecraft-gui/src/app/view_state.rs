@@ -30,6 +30,7 @@ impl From<WorkspaceView> for SavedWorkspaceView {
             WorkspaceView::SystemTrace => Self::SystemTrace,
             WorkspaceView::Serial => Self::Serial,
             WorkspaceView::Battery => Self::Battery,
+            WorkspaceView::PdPower => Self::PdPower,
         }
     }
 }
@@ -47,6 +48,7 @@ impl From<SavedWorkspaceView> for WorkspaceView {
             SavedWorkspaceView::SystemTrace => Self::SystemTrace,
             SavedWorkspaceView::Serial => Self::Serial,
             SavedWorkspaceView::Battery => Self::Battery,
+            SavedWorkspaceView::PdPower => Self::PdPower,
         }
     }
 }
@@ -176,7 +178,9 @@ impl WaveCraftApp {
             analysis: self.system_trace.event_view_height().round() as u32,
         };
         let timeline_label_width = self.system_trace.timeline_label_width().round() as u32;
-        if self.saved_capture_settings.global.serial.as_ref() == Some(&self.serial.settings)
+        if self.saved_capture_settings.global.pd_power_plot_fraction
+            == Some(self.pd_power.plot_fraction)
+            && self.saved_capture_settings.global.serial.as_ref() == Some(&self.serial.settings)
             && self.saved_capture_settings.global.collapsed_setup_views == collapsed_setup_views
             && self.saved_capture_settings.global.scope_plot_tab == self.scope_plot_tab
             && self.saved_capture_settings.global.hidden_workspace_views == hidden_workspace_views
@@ -215,6 +219,7 @@ impl WaveCraftApp {
         }
 
         let mut document = self.saved_capture_settings.clone();
+        document.global.pd_power_plot_fraction = Some(self.pd_power.plot_fraction);
         document.global.collapsed_setup_views = collapsed_setup_views;
         document.global.serial = Some(self.serial.settings.clone());
         document.global.scope_plot_tab = self.scope_plot_tab;
@@ -237,6 +242,19 @@ impl WaveCraftApp {
     }
 
     pub(crate) fn apply_saved_capture_settings(&mut self) {
+        if let Some(fraction) = self
+            .saved_capture_settings
+            .global
+            .pd_power_plot_fraction
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        {
+            self.pd_power.plot_fraction = fraction;
+        }
+        if let Some(settings) = &self.saved_capture_settings.global.pd_power {
+            if settings.validate().is_ok() {
+                self.pd_power.settings = settings.clone();
+            }
+        }
         if let Some(settings) = &self.saved_capture_settings.global.battery {
             match settings.validate() {
                 Ok(()) => self.battery.settings = settings.clone(),
@@ -474,6 +492,17 @@ impl WaveCraftApp {
             }
             WorkspaceView::SystemTrace => {
                 self.save_capture_settings(SavedCaptureSettingsKind::SystemTrace)
+            }
+            WorkspaceView::PdPower => {
+                if let Err(error) = self.pd_power.settings.validate() {
+                    self.pd_power.error = Some(error.to_string());
+                    return;
+                }
+                let mut document = self.saved_capture_settings.clone();
+                document.global.pd_power = Some(self.pd_power.settings.clone());
+                if self.persist_setup_document(document, "PD Power") {
+                    self.pd_power.status = self.status.clone();
+                }
             }
             WorkspaceView::Battery => {
                 if let Err(error) = self.battery.settings.validate() {
@@ -788,6 +817,7 @@ impl WaveCraftApp {
             WorkspaceView::SystemTrace => self.select_system_trace_view(),
             WorkspaceView::Serial => self.select_serial_view(),
             WorkspaceView::Battery => self.select_battery_view(),
+            WorkspaceView::PdPower => self.select_pd_power_view(),
         }
     }
 
@@ -858,7 +888,8 @@ impl WaveCraftApp {
                 WorkspaceView::Vna
                 | WorkspaceView::SystemTrace
                 | WorkspaceView::Serial
-                | WorkspaceView::Battery,
+                | WorkspaceView::Battery
+                | WorkspaceView::PdPower,
             )
             | None => None,
         }
@@ -922,6 +953,7 @@ impl WaveCraftApp {
                 WorkspaceView::SystemTrace => self.select_system_trace_view(),
                 WorkspaceView::Serial => self.select_serial_view(),
                 WorkspaceView::Battery => self.select_battery_view(),
+                WorkspaceView::PdPower => self.select_pd_power_view(),
             }
         }
         let available = self.available_waveform_tabs();
@@ -944,6 +976,7 @@ impl WaveCraftApp {
                 || self.vna_view_is_active()
                 || self.serial_view_is_active()
                 || self.battery_view_is_active()
+                || self.pd_power_view_is_active()
             {
                 self.active_waveform_tab = Some(tab);
             } else {
@@ -955,6 +988,7 @@ impl WaveCraftApp {
                 && !self.vna_view_is_active()
                 && !self.serial_view_is_active()
                 && !self.battery_view_is_active()
+                && !self.pd_power_view_is_active()
             {
                 match views[0] {
                     WorkspaceView::Waveform(tab) => self.select_waveform_tab(tab),
@@ -962,6 +996,7 @@ impl WaveCraftApp {
                     WorkspaceView::SystemTrace => self.select_system_trace_view(),
                     WorkspaceView::Serial => self.select_serial_view(),
                     WorkspaceView::Battery => self.select_battery_view(),
+                    WorkspaceView::PdPower => self.select_pd_power_view(),
                 }
             }
         }
@@ -1354,6 +1389,7 @@ mod tests {
                 WorkspaceView::Vna,
                 WorkspaceView::Serial,
                 WorkspaceView::Battery,
+                WorkspaceView::PdPower,
             ]
         );
         remove_test_repository(&repository);

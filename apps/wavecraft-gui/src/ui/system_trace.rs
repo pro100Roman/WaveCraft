@@ -1,6 +1,9 @@
 //! Independent System Trace workspace and decoded-event instruments.
 
-use super::view_shell::{card_frame, settings_card, view_toolbar, workspace_panel};
+use super::view_shell::{
+    card_frame, settings_card, stacked_view_splitter, view_toolbar, workspace_panel,
+    PANE_SPLITTER_HEIGHT as TRACE_SPLITTER_HEIGHT,
+};
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -48,7 +51,6 @@ const CPU_LOAD_GRAPH_HEADER_HEIGHT: f32 = 26.0;
 const CPU_LOAD_GRAPH_ROW_HEIGHT: f32 = 110.0;
 const CPU_LOAD_GRAPH_BIN_WIDTH: f32 = 7.0;
 const CONTEXT_STATISTICS_MINIMUM_WIDTH: f32 = 1_520.0;
-const TRACE_SPLITTER_HEIGHT: f32 = 10.0;
 const SELECTED_EVENT_FOOTER_HEIGHT: f32 = 36.0;
 const TERMINAL_TABLE_MINIMUM_WIDTH: f32 = 720.0;
 const TRACE_SELECTION_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 92);
@@ -1582,24 +1584,7 @@ fn update_trace_instrument_drag(
 }
 
 fn paint_trace_instrument_splitter(ui: &mut egui::Ui, trace: &mut SystemTraceDisplayState) {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), TRACE_SPLITTER_HEIGHT),
-        egui::Sense::drag(),
-    );
-    let response = response
-        .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-        .on_hover_text("Drag to resize Timeline and Events");
-    let active = response.hovered() || response.dragged();
-    ui.painter().line_segment(
-        [
-            egui::pos2(rect.left() + 8.0, rect.center().y),
-            egui::pos2(rect.right() - 8.0, rect.center().y),
-        ],
-        egui::Stroke::new(
-            if active { 2.0_f32 } else { 1.0_f32 },
-            if active { ACCENT } else { GRID },
-        ),
-    );
+    let response = stacked_view_splitter(ui, "Drag to resize Timeline and Events");
     if response.dragged() {
         trace.move_trace_instrument_splitter(ui.input(|input| input.pointer.delta().y));
     }

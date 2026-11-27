@@ -131,7 +131,10 @@ impl WaveCraftApp {
         snapshot_clicked: bool,
     ) {
         let workspace_rect = context.available_rect();
-        if self.battery_view_is_active() {
+        if self.pd_power_view_is_active() {
+            self.paint_pd_power_central(context);
+            self.snapshot_plot_rect = Some(workspace_rect);
+        } else if self.battery_view_is_active() {
             self.paint_battery_central(context);
         } else if self.serial_view_is_active() {
             self.paint_serial_central(context);

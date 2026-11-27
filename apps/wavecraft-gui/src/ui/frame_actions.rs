@@ -13,6 +13,10 @@ use crate::{
 /// or stops captures itself.
 #[derive(Default)]
 pub(crate) struct FrameActions {
+    pub(crate) pd_power_connect: bool,
+    pub(crate) pd_power_refresh_ports: bool,
+    pub(crate) pd_power_clear: bool,
+    pub(crate) pd_power_requests: Vec<wavecraft_serial::pd_power::Request>,
     pub(crate) battery_calculate: bool,
     pub(crate) battery_save: bool,
     pub(crate) battery_load: bool,

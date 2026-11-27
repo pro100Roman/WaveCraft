@@ -2,7 +2,7 @@
 
 use super::serial_graph::paint_graph;
 use super::serial_line_style::{line_style_picker, LINE_STYLE_PICKER_WIDTH};
-use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel};
+use super::view_shell::{settings_card, setup_section, view_card, view_toolbar, workspace_panel};
 use crate::serial::{
     SerialMode, SerialSettings, SerialState, SerialTimestampUnit, TextField, COLORS,
 };
@@ -337,21 +337,6 @@ impl WaveCraftApp {
             );
         });
     }
-}
-
-fn setup_section(
-    ui: &mut egui::Ui,
-    title: &str,
-    enabled: bool,
-    contents: impl FnOnce(&mut egui::Ui),
-) {
-    egui::CollapsingHeader::new(RichText::new(title).strong().color(TEXT_MUTED))
-        .id_salt(("serial_setup_card", title))
-        .default_open(true)
-        .show_unindented(ui, |ui| {
-            ui.add_space(6.0);
-            ui.add_enabled_ui(enabled, contents);
-        });
 }
 
 fn port_settings(ui: &mut egui::Ui, state: &mut SerialState) {
