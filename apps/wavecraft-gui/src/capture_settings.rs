@@ -46,6 +46,8 @@ pub(crate) struct GlobalSettings {
     pub(crate) pd_power_plot_fraction: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) battery: Option<crate::battery::BatterySettings>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) battery_views: Vec<crate::battery::BatterySettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) serial: Option<crate::serial::SerialSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,6 +116,24 @@ pub(crate) enum SavedWorkspaceView {
     SystemTrace,
     Serial,
     Battery,
+    #[serde(rename = "battery_2")]
+    Battery2,
+    #[serde(rename = "battery_3")]
+    Battery3,
+    #[serde(rename = "battery_4")]
+    Battery4,
+    #[serde(rename = "battery_5")]
+    Battery5,
+    #[serde(rename = "battery_6")]
+    Battery6,
+    #[serde(rename = "battery_7")]
+    Battery7,
+    #[serde(rename = "battery_8")]
+    Battery8,
+    #[serde(rename = "battery_9")]
+    Battery9,
+    #[serde(rename = "battery_10")]
+    Battery10,
     PdPower,
     #[serde(rename = "pd_power_2")]
     PdPower2,

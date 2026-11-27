@@ -21,6 +21,15 @@ impl WaveCraftApp {
             WorkspaceView::SystemTrace => ("system_trace_setup", "SYSTEM TRACE SETUP"),
             WorkspaceView::Serial => ("serial_setup", "SERIAL / UART SETUP"),
             WorkspaceView::Battery => ("battery_setup", "BATTERY SETUP"),
+            WorkspaceView::Battery2 => ("battery_setup_2", "BATTERY 2 SETUP"),
+            WorkspaceView::Battery3 => ("battery_setup_3", "BATTERY 3 SETUP"),
+            WorkspaceView::Battery4 => ("battery_setup_4", "BATTERY 4 SETUP"),
+            WorkspaceView::Battery5 => ("battery_setup_5", "BATTERY 5 SETUP"),
+            WorkspaceView::Battery6 => ("battery_setup_6", "BATTERY 6 SETUP"),
+            WorkspaceView::Battery7 => ("battery_setup_7", "BATTERY 7 SETUP"),
+            WorkspaceView::Battery8 => ("battery_setup_8", "BATTERY 8 SETUP"),
+            WorkspaceView::Battery9 => ("battery_setup_9", "BATTERY 9 SETUP"),
+            WorkspaceView::Battery10 => ("battery_setup_10", "BATTERY 10 SETUP"),
             WorkspaceView::PdPower => ("pd_power_setup", "PD POWER SETUP"),
             WorkspaceView::PdPower2 => ("pd_power_setup_2", "PD POWER 2 SETUP"),
             WorkspaceView::PdPower3 => ("pd_power_setup_3", "PD POWER 3 SETUP"),
@@ -72,7 +81,16 @@ mod tests {
                     app.paint_system_trace_setup_panel(context, &mut actions)
                 }
                 WorkspaceView::Serial => app.paint_serial_setup(context, &mut actions),
-                WorkspaceView::Battery => app.paint_battery_setup(context, &mut actions),
+                WorkspaceView::Battery
+                | WorkspaceView::Battery2
+                | WorkspaceView::Battery3
+                | WorkspaceView::Battery4
+                | WorkspaceView::Battery5
+                | WorkspaceView::Battery6
+                | WorkspaceView::Battery7
+                | WorkspaceView::Battery8
+                | WorkspaceView::Battery9
+                | WorkspaceView::Battery10 => app.paint_battery_setup(context, &mut actions),
                 WorkspaceView::PdPower
                 | WorkspaceView::PdPower2
                 | WorkspaceView::PdPower3

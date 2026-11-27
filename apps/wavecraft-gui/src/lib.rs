@@ -434,7 +434,7 @@ struct WaveCraftApp {
     scope_plot_tab: ScopePlotTab,
     system_trace_settings: SystemTraceSettings,
     serial: serial::SerialState,
-    battery: battery::BatteryState,
+    battery: [battery::BatteryState; WorkspaceView::BATTERY.len()],
     pd_power: [pd_power::PowerState; 5],
     system_trace: system_trace::SystemTraceDisplayState,
     system_trace_events: Option<Receiver<system_trace::LiveTraceUpdate>>,
@@ -516,6 +516,15 @@ impl WaveCraftApp {
                 | WorkspaceView::SystemTrace
                 | WorkspaceView::Serial
                 | WorkspaceView::Battery
+                | WorkspaceView::Battery2
+                | WorkspaceView::Battery3
+                | WorkspaceView::Battery4
+                | WorkspaceView::Battery5
+                | WorkspaceView::Battery6
+                | WorkspaceView::Battery7
+                | WorkspaceView::Battery8
+                | WorkspaceView::Battery9
+                | WorkspaceView::Battery10
                 | WorkspaceView::PdPower
                 | WorkspaceView::PdPower2
                 | WorkspaceView::PdPower3
@@ -600,7 +609,7 @@ impl WaveCraftApp {
             scope_plot_tab: restored_scope_plot_tab,
             system_trace_settings: SystemTraceSettings::default(),
             serial: serial::SerialState::default(),
-            battery: battery::BatteryState::default(),
+            battery: std::array::from_fn(|_| battery::BatteryState::default()),
             pd_power: std::array::from_fn(|_| pd_power::PowerState::default()),
             system_trace: system_trace::SystemTraceDisplayState::default(),
             system_trace_events: None,

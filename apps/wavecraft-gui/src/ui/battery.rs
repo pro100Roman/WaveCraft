@@ -23,14 +23,22 @@ const UNIT_COLUMN_WIDTH: f32 = 46.0;
 
 impl WaveCraftApp {
     pub(crate) fn battery_view_is_active(&self) -> bool {
-        self.active_workspace_view == Some(WorkspaceView::Battery)
+        self.active_workspace_view
+            .and_then(WorkspaceView::battery_index)
+            .is_some()
     }
 
-    pub(crate) fn select_battery_view(&mut self) {
+    pub(crate) fn active_battery_index(&self) -> usize {
+        self.active_workspace_view
+            .and_then(WorkspaceView::battery_index)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn select_battery_view(&mut self, view: WorkspaceView) {
         if let Some(active) = self.active_waveform_tab {
             self.save_waveform_view_settings(active);
         }
-        self.active_workspace_view = Some(WorkspaceView::Battery);
+        self.active_workspace_view = Some(view);
         self.snapshot_plot_rect = None;
         self.save_global_settings();
     }
@@ -40,26 +48,34 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
+        let index = self.active_battery_index();
         let toolbar = view_toolbar(
             context,
             "Battery lifetime",
             self.pending_snapshot.is_none(),
             |ui, section| match section {
                 ToolbarSection::Files => {
-                    actions.battery_load |= ui
+                    if ui
                         .add(toolbar_action_button("📂 Load…", TEXT_MUTED))
-                        .clicked();
-                    actions.battery_save |= ui
+                        .clicked()
+                    {
+                        actions.battery_load = Some(index);
+                    }
+                    if ui
                         .add_enabled(
-                            self.battery.settings.validate().is_ok(),
+                            self.battery[index].settings.validate().is_ok(),
                             toolbar_action_button("Save file…", TEXT_MUTED),
                         )
-                        .clicked();
+                        .clicked()
+                    {
+                        actions.battery_save = Some(index);
+                    }
                 }
                 ToolbarSection::Controls => {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        actions.battery_calculate |=
-                            ui.add(primary_toolbar_button(ui, "Calc", ACCENT)).clicked();
+                        if ui.add(primary_toolbar_button(ui, "Calc", ACCENT)).clicked() {
+                            actions.battery_calculate = Some(index);
+                        }
                     });
                 }
             },
@@ -73,69 +89,79 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
+        let index = self.active_battery_index();
         self.show_setup_panel(
             context,
-            WorkspaceView::Battery,
+            WorkspaceView::BATTERY[index],
             actions,
             |app, ui, _actions| {
-                settings_card(ui, |ui| battery_editor(ui, &mut app.battery.settings));
-                app.battery.settings.validate().is_ok()
+                settings_card(ui, |ui| {
+                    battery_editor(ui, &mut app.battery[index].settings)
+                });
+                app.battery[index].settings.validate().is_ok()
             },
         );
     }
 
     pub(crate) fn paint_battery_central(&mut self, context: &egui::Context) {
+        let index = self.active_battery_index();
         workspace_panel(context, |ui| {
-            view_card(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new("BATTERY DISCHARGE")
-                            .strong()
-                            .color(TEXT_MUTED),
-                    );
-                    if ui.small_button("Fit").clicked() {
-                        self.battery.bounds = None;
-                    }
-                    ui.label(format!(
-                        "Time (h) / Voltage ({})",
-                        self.battery.settings.voltage_unit.symbol()
-                    ));
-                });
-                if let Some(result) = &self.battery.result {
+            ui.push_id(("battery_workspace", index), |ui| {
+                view_card(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new("BATTERY DISCHARGE")
+                                .strong()
+                                .color(TEXT_MUTED),
+                        );
+                        if ui.small_button("Fit").clicked() {
+                            self.battery[index].bounds = None;
+                        }
                         ui.label(format!(
-                            "Lifetime: {:.3} h · {:.3} days · {:.3} years",
-                            result.lifetime_hours,
-                            result.lifetime_hours / 24.0,
-                            result.lifetime_hours / HOURS_PER_YEAR
-                        ));
-                        ui.label(format!(
-                            "Energy: {:.3} mWh · Average: {:.4} mW",
-                            result.energy_mwh, result.average_power_mw
+                            "Time (h) / Voltage ({})",
+                            self.battery[index].settings.voltage_unit.symbol()
                         ));
                     });
-                    if !result.cutoff_reached {
-                        ui.label("Rated capacity exhausted before the voltage cutoff.");
-                    }
-                    if self.battery.is_stale() {
-                        ui.label(
-                            RichText::new("Parameters changed — press Calc to update the curve.")
+                    if let Some(result) = &self.battery[index].result {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!(
+                                "Lifetime: {:.3} h · {:.3} days · {:.3} years",
+                                result.lifetime_hours,
+                                result.lifetime_hours / 24.0,
+                                result.lifetime_hours / HOURS_PER_YEAR
+                            ));
+                            ui.label(format!(
+                                "Energy: {:.3} mWh · Average: {:.4} mW",
+                                result.energy_mwh, result.average_power_mw
+                            ));
+                        });
+                        if !result.cutoff_reached {
+                            ui.label("Rated capacity exhausted before the voltage cutoff.");
+                        }
+                        if self.battery[index].is_stale() {
+                            ui.label(
+                                RichText::new(
+                                    "Parameters changed — press Calc to update the curve.",
+                                )
                                 .color(egui::Color32::YELLOW),
+                            );
+                        }
+                    } else {
+                        ui.label(
+                            "Set battery parameters and a repeating load cycle, then press Calc.",
                         );
                     }
-                } else {
-                    ui.label("Set battery parameters and a repeating load cycle, then press Calc.");
-                }
-                let rect = remaining_plot_rect(ui);
-                self.snapshot_plot_rect = Some(rect);
-                paint_graph(ui, rect, &mut self.battery);
+                    let rect = remaining_plot_rect(ui);
+                    self.snapshot_plot_rect = Some(rect);
+                    paint_graph(ui, rect, &mut self.battery[index]);
+                });
             });
         });
     }
 
     /// Apply file and calculation requests after all views finish editing.
     pub(crate) fn apply_battery_actions(&mut self, actions: &FrameActions) {
-        if actions.battery_load {
+        if let Some(index) = actions.battery_load {
             if let Some(path) = rfd::FileDialog::new()
                 .set_title("Load battery analysis")
                 .add_filter("WaveCraft battery analysis", &["json"])
@@ -143,21 +169,23 @@ impl WaveCraftApp {
             {
                 match crate::battery::load(&path) {
                     Ok(settings) => {
-                        self.battery.settings = settings;
-                        self.battery.result = None;
-                        self.battery.calculated_settings = None;
-                        self.battery.bounds = None;
-                        self.battery.error = None;
-                        self.battery.status = format!("Loaded {} — press Calc", path.display());
+                        self.battery[index].settings = settings;
+                        self.battery[index].result = None;
+                        self.battery[index].calculated_settings = None;
+                        self.battery[index].bounds = None;
+                        self.battery[index].error = None;
+                        self.battery[index].status =
+                            format!("Loaded {} — press Calc", path.display());
                     }
                     Err(error) => {
-                        self.battery.error = Some(format!("Could not load battery file: {error}"))
+                        self.battery[index].error =
+                            Some(format!("Could not load battery file: {error}"))
                     }
                 }
             }
         }
-        if actions.battery_save {
-            match crate::battery::encode(&self.battery.settings) {
+        if let Some(index) = actions.battery_save {
+            match crate::battery::encode(&self.battery[index].settings) {
                 Ok(json) => {
                     if let Some(path) = rfd::FileDialog::new()
                         .set_title("Save battery analysis")
@@ -167,21 +195,21 @@ impl WaveCraftApp {
                     {
                         match std::fs::write(&path, json) {
                             Ok(()) => {
-                                self.battery.error = None;
-                                self.battery.status = format!("Saved {}", path.display());
+                                self.battery[index].error = None;
+                                self.battery[index].status = format!("Saved {}", path.display());
                             }
                             Err(error) => {
-                                self.battery.error =
+                                self.battery[index].error =
                                     Some(format!("Could not save battery file: {error}"))
                             }
                         }
                     }
                 }
-                Err(error) => self.battery.error = Some(error),
+                Err(error) => self.battery[index].error = Some(error),
             }
         }
-        if actions.battery_calculate {
-            self.battery.calculate();
+        if let Some(index) = actions.battery_calculate {
+            self.battery[index].calculate();
         }
     }
 }
@@ -814,7 +842,7 @@ mod tests {
     #[test]
     fn full_frame_uses_shared_chrome_calculates_and_keeps_errors_visible_when_collapsed() {
         let mut app = app();
-        app.select_battery_view();
+        app.select_battery_view(WorkspaceView::Battery);
         let ctx = egui::Context::default();
         crate::configure_style(&ctx);
         frame(&mut app, &ctx, vec![]);
@@ -826,26 +854,26 @@ mod tests {
         assert!(label(&labels, "💾 Save settings").y > 840.0);
         assert_eq!(labels.iter().filter(|(s, _)| s == "+").count(), 1); // Workspace add only.
         click(&mut app, &ctx, label(&labels, "Calc"));
-        assert!(app.battery.result.is_some());
+        assert!(app.battery[0].result.is_some());
         let rect = app.snapshot_plot_rect.unwrap();
         assert!(rect.left() >= 300.0 && rect.bottom() < 880.0);
-        app.battery.settings.capacity_mah = -1.0;
-        app.battery.calculate();
+        app.battery[0].settings.capacity_mah = -1.0;
+        app.battery[0].calculate();
         app.workspace_view_layout
             .set_setup_panel_open(WorkspaceView::Battery, false);
         let (_, labels) = frame(&mut app, &ctx, vec![]);
         let error = label(&labels, "Capacity must be finite and greater than 0 mAh");
         assert!(error.y > 800.0);
-        assert!(app.battery.is_stale());
+        assert!(app.battery[0].is_stale());
     }
 
     #[test]
     fn unit_menus_preserve_values_and_hover_shows_days_years_and_charge() {
         use crate::battery::units::{CapacityUnit, VoltageUnit};
         let mut app = app();
-        app.select_battery_view();
-        app.battery.calculate();
-        let before = app.battery.result.as_ref().unwrap().points.clone();
+        app.select_battery_view(WorkspaceView::Battery);
+        app.battery[0].calculate();
+        let before = app.battery[0].result.as_ref().unwrap().points.clone();
         let ctx = egui::Context::default();
         crate::configure_style(&ctx);
         frame(&mut app, &ctx, vec![]);
@@ -857,18 +885,24 @@ mod tests {
             "unit menu labels: {labels:?}"
         );
         click(&mut app, &ctx, label(&labels, "mV"));
-        assert_eq!(app.battery.settings.voltage_unit, VoltageUnit::Millivolts);
-        assert_eq!(app.battery.settings.initial_voltage, 4.2);
-        assert_eq!(app.battery.settings.cutoff_voltage, 3.0);
-        assert!(!app.battery.is_stale());
+        assert_eq!(
+            app.battery[0].settings.voltage_unit,
+            VoltageUnit::Millivolts
+        );
+        assert_eq!(app.battery[0].settings.initial_voltage, 4.2);
+        assert_eq!(app.battery[0].settings.cutoff_voltage, 3.0);
+        assert!(!app.battery[0].is_stale());
         let (_, labels) = frame(&mut app, &ctx, vec![]);
         click(&mut app, &ctx, label(&labels, "mAh"));
         let (_, labels) = frame(&mut app, &ctx, vec![]);
         click(&mut app, &ctx, label(&labels, "Ah"));
-        assert_eq!(app.battery.settings.capacity_unit, CapacityUnit::AmpHours);
-        assert_eq!(app.battery.settings.capacity_mah, 2600.0);
-        assert!(!app.battery.is_stale());
-        assert_eq!(app.battery.result.as_ref().unwrap().points, before);
+        assert_eq!(
+            app.battery[0].settings.capacity_unit,
+            CapacityUnit::AmpHours
+        );
+        assert_eq!(app.battery[0].settings.capacity_mah, 2600.0);
+        assert!(!app.battery[0].is_stale());
+        assert_eq!(app.battery[0].result.as_ref().unwrap().points, before);
         let pointer = app.snapshot_plot_rect.unwrap().center();
         frame(&mut app, &ctx, vec![egui::Event::PointerMoved(pointer)]);
         let (_, labels) = frame(&mut app, &ctx, vec![]);
@@ -918,30 +952,30 @@ mod tests {
             );
         }
         let mut app = app();
-        app.select_battery_view();
+        app.select_battery_view(WorkspaceView::Battery);
         let ctx = egui::Context::default();
         crate::configure_style(&ctx);
         frame(&mut app, &ctx, vec![]);
         let (_, labels) = frame(&mut app, &ctx, vec![]);
         let capacity = label(&labels, "2600");
-        let before = app.battery.settings.clone();
+        let before = app.battery[0].settings.clone();
         for offset in [80.0, -80.0] {
             drag(&mut app, &ctx, capacity, offset);
         }
-        assert_eq!(app.battery.settings, before);
+        assert_eq!(app.battery[0].settings, before);
         type_value(&mut app, &ctx, capacity, "2750.5");
-        assert_eq!(app.battery.settings.capacity_mah, 2750.5);
+        assert_eq!(app.battery[0].settings.capacity_mah, 2750.5);
 
-        app.battery.settings.curve = CurveKind::Polynomial;
+        app.battery[0].settings.curve = CurveKind::Polynomial;
         frame(&mut app, &ctx, vec![]);
         let (_, labels) = frame(&mut app, &ctx, vec![]);
         let degree = label(&labels, "5");
         for offset in [80.0, -80.0] {
             drag(&mut app, &ctx, degree, offset);
         }
-        assert_eq!(app.battery.settings.polynomial_degree, 5);
+        assert_eq!(app.battery[0].settings.polynomial_degree, 5);
         type_value(&mut app, &ctx, degree, "3");
-        assert_eq!(app.battery.settings.polynomial_degree, 3);
+        assert_eq!(app.battery[0].settings.polynomial_degree, 3);
     }
 
     #[test]
@@ -967,15 +1001,15 @@ mod tests {
         for width in [800.0, 1400.0] {
             for calculated in [false, true] {
                 let mut app = app();
-                app.select_battery_view();
+                app.select_battery_view(WorkspaceView::Battery);
                 if calculated {
-                    app.battery.calculate();
+                    app.battery[0].calculate();
                 }
                 let ctx = egui::Context::default();
                 crate::configure_style(&ctx);
                 for zoomed in [false, true] {
                     if zoomed && calculated {
-                        app.battery.bounds = Some([0.0, 1e20, 2.0, 5.0]);
+                        app.battery[0].bounds = Some([0.0, 1e20, 2.0, 5.0]);
                     }
                     for _ in 0..2 {
                         let output = ctx.run(
@@ -1008,14 +1042,14 @@ mod tests {
     #[test]
     fn wheel_zoom_is_horizontal_unless_modified_and_double_click_fits() {
         let mut app = app();
-        app.select_battery_view();
-        app.battery.calculate();
+        app.select_battery_view(WorkspaceView::Battery);
+        app.battery[0].calculate();
         let ctx = egui::Context::default();
         crate::configure_style(&ctx);
         frame(&mut app, &ctx, vec![]);
         frame(&mut app, &ctx, vec![]);
         let pointer = app.snapshot_plot_rect.unwrap().center();
-        let original = app.battery.bounds.unwrap();
+        let original = app.battery[0].bounds.unwrap();
         let scroll = |modifiers| {
             vec![
                 egui::Event::PointerMoved(pointer),
@@ -1027,19 +1061,170 @@ mod tests {
             ]
         };
         frame(&mut app, &ctx, scroll(egui::Modifiers::NONE));
-        let horizontal = app.battery.bounds.unwrap();
+        let horizontal = app.battery[0].bounds.unwrap();
         assert!(horizontal[1] - horizontal[0] < original[1] - original[0]);
         assert_eq!(horizontal[2..], original[2..]);
         frame(&mut app, &ctx, scroll(egui::Modifiers::CTRL));
-        let both = app.battery.bounds.unwrap();
+        let both = app.battery[0].bounds.unwrap();
         assert!(both[3] - both[2] < horizontal[3] - horizontal[2]);
         click(&mut app, &ctx, pointer);
         click(&mut app, &ctx, pointer);
-        assert_eq!(app.battery.bounds.unwrap(), original);
-        app.battery.bounds = Some(both);
+        assert_eq!(app.battery[0].bounds.unwrap(), original);
+        app.battery[0].bounds = Some(both);
         let (_, labels) = frame(&mut app, &ctx, vec![]);
         click(&mut app, &ctx, label(&labels, "Fit"));
-        assert_eq!(app.battery.bounds.unwrap(), original);
+        assert_eq!(app.battery[0].bounds.unwrap(), original);
+    }
+
+    #[test]
+    fn ten_battery_views_persist_independent_profiles_order_and_visibility() {
+        let path =
+            std::env::temp_dir().join(format!("wavecraft-ten-battery-{}.json", std::process::id()));
+        let repository = crate::CaptureSettingsRepository::at(path.clone());
+        let mut app = WaveCraftApp::with_settings(
+            Some(repository.clone()),
+            crate::CaptureSettingsDocument::default(),
+        );
+        for (index, view) in WorkspaceView::BATTERY.into_iter().enumerate() {
+            app.open_workspace_view(view);
+            app.battery[index].settings.size = format!("Cell {index}");
+            app.battery[index].settings.capacity_mah = 100.0 + index as f64 * 200.0;
+            app.workspace_view_layout
+                .set_setup_panel_open(view, index % 2 == 0);
+            app.save_setup_settings(view);
+        }
+        let saved_primary = app.battery[0].settings.clone();
+        app.battery[0].settings.size = "Unsaved primary edit".into();
+        app.battery[9].settings.size = "Saved last slot".into();
+        app.save_setup_settings(WorkspaceView::Battery10);
+        app.workspace_view_layout
+            .begin_drag(WorkspaceView::Battery10);
+        app.workspace_view_layout.drag_to(WorkspaceView::Battery);
+        app.workspace_view_layout.finish_drag();
+        app.set_workspace_view_visible(WorkspaceView::Battery4, false);
+        app.save_global_settings();
+        let mut restored = WaveCraftApp::with_settings(None, repository.load().unwrap());
+        restored.reconcile_waveform_tab();
+        assert_eq!(
+            restored.active_workspace_view,
+            Some(WorkspaceView::Battery10)
+        );
+        assert_eq!(
+            restored.available_workspace_views(),
+            app.available_workspace_views()
+        );
+        assert_eq!(
+            restored.workspace_view_layout.order(),
+            app.workspace_view_layout.order()
+        );
+        assert_eq!(restored.battery[0].settings, saved_primary);
+        assert!(!restored
+            .workspace_view_layout
+            .is_visible(WorkspaceView::Battery4));
+        assert_eq!(
+            restored
+                .available_workspace_views()
+                .iter()
+                .filter(|v| v.battery_index().is_some())
+                .count(),
+            9
+        );
+        for (index, view) in WorkspaceView::BATTERY.into_iter().enumerate().skip(1) {
+            assert_eq!(
+                restored.battery[index].settings,
+                app.battery[index].settings
+            );
+            assert_eq!(
+                restored.workspace_view_layout.setup_panel_open(view),
+                index % 2 == 0
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn battery_actions_results_graph_bounds_and_errors_stay_with_their_slot() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        crate::configure_style(&ctx);
+        for (index, view) in WorkspaceView::BATTERY.into_iter().enumerate() {
+            app.open_workspace_view(view);
+            app.battery[index].settings.capacity_mah = 100.0 * (index + 1) as f64;
+            frame(&mut app, &ctx, vec![]);
+            let (_, labels) = frame(&mut app, &ctx, vec![]);
+            click(&mut app, &ctx, label(&labels, "Calc"));
+            assert!(app.battery[index].result.is_some(), "{view:?}");
+            app.battery[index].bounds = Some([0.0, (index + 1) as f64, 3.0, 4.2]);
+        }
+        for index in 1..10 {
+            assert!(
+                app.battery[index].result.as_ref().unwrap().lifetime_hours
+                    > app.battery[index - 1]
+                        .result
+                        .as_ref()
+                        .unwrap()
+                        .lifetime_hours
+            );
+        }
+        let actions = FrameActions {
+            battery_calculate: Some(0),
+            ..Default::default()
+        };
+        app.battery[0].settings.capacity_mah = -1.0;
+        app.apply_battery_actions(&actions);
+        assert!(app.battery[0].error.is_some());
+        assert!(app.battery[9].error.is_none());
+        assert_eq!(app.battery[9].bounds, Some([0.0, 10.0, 3.0, 4.2]));
+        let (_, labels) = frame(&mut app, &ctx, vec![]);
+        assert!(!labels
+            .iter()
+            .any(|(text, _)| text == "Capacity must be finite and greater than 0 mAh"));
+        app.select_battery_view(WorkspaceView::Battery);
+        app.workspace_view_layout
+            .set_setup_panel_open(WorkspaceView::Battery, false);
+        let (_, labels) = frame(&mut app, &ctx, vec![]);
+        let _ = label(&labels, "Capacity must be finite and greater than 0 mAh");
+        app.set_workspace_view_visible(WorkspaceView::Battery, false);
+        app.open_workspace_view(WorkspaceView::Battery10);
+        let before = app.battery[0].bounds;
+        let (_, labels) = frame(&mut app, &ctx, vec![]);
+        click(&mut app, &ctx, label(&labels, "Fit"));
+        assert_ne!(app.battery[9].bounds, Some([0.0, 10.0, 3.0, 4.2]));
+        assert_eq!(app.battery[0].bounds, before);
+    }
+
+    #[test]
+    fn legacy_battery_settings_restore_only_the_primary_slot() {
+        let path = std::env::temp_dir().join(format!(
+            "wavecraft-legacy-battery-{}.json",
+            std::process::id()
+        ));
+        let repository = crate::CaptureSettingsRepository::at(path.clone());
+        let mut saved = crate::CaptureSettingsDocument::default();
+        let settings = BatterySettings {
+            size: "Legacy cell".into(),
+            ..Default::default()
+        };
+        saved.global.battery = Some(settings.clone());
+        saved.global.workspace_view_order = Some(
+            WorkspaceView::ALL
+                .iter()
+                .copied()
+                .filter(|v| v.battery_index().map_or(true, |index| index == 0))
+                .map(crate::SavedWorkspaceView::from)
+                .collect(),
+        );
+        let mut app = WaveCraftApp::with_settings(Some(repository), saved);
+        assert_eq!(app.battery[0].settings, settings);
+        for (index, view) in WorkspaceView::BATTERY.into_iter().enumerate().skip(1) {
+            assert_eq!(app.battery[index].settings, BatterySettings::default());
+            assert!(!app.workspace_view_layout.is_visible(view));
+        }
+        app.open_workspace_view(WorkspaceView::Battery10);
+        app.save_setup_settings(WorkspaceView::Battery10);
+        assert_eq!(app.saved_capture_settings.global.battery_views[0], settings);
+        assert_eq!(app.saved_capture_settings.global.battery, Some(settings));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1053,12 +1238,12 @@ mod tests {
             Some(repository.clone()),
             crate::CaptureSettingsDocument::default(),
         );
-        app.select_battery_view();
-        app.battery.settings.size = "Prototype cell".into();
-        app.battery.settings.patterns[0].power_mw = 0.125;
-        app.battery.settings.patterns[0].name = "Передавання даних".into();
-        app.battery.settings.aging_percent_per_year = 2.75;
-        app.battery.settings.self_discharge_percent_per_year = 1.25;
+        app.select_battery_view(WorkspaceView::Battery);
+        app.battery[0].settings.size = "Prototype cell".into();
+        app.battery[0].settings.patterns[0].power_mw = 0.125;
+        app.battery[0].settings.patterns[0].name = "Передавання даних".into();
+        app.battery[0].settings.aging_percent_per_year = 2.75;
+        app.battery[0].settings.self_discharge_percent_per_year = 1.25;
         app.save_setup_settings(WorkspaceView::Battery);
         for view in WorkspaceView::ALL {
             if view != WorkspaceView::Battery {
@@ -1076,7 +1261,7 @@ mod tests {
             restored.available_workspace_views(),
             vec![WorkspaceView::Battery]
         );
-        assert_eq!(restored.battery.settings, app.battery.settings);
+        assert_eq!(restored.battery[0].settings, app.battery[0].settings);
         assert!(!restored
             .workspace_view_layout
             .setup_panel_open(WorkspaceView::Battery));

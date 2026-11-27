@@ -30,6 +30,15 @@ impl From<WorkspaceView> for SavedWorkspaceView {
             WorkspaceView::SystemTrace => Self::SystemTrace,
             WorkspaceView::Serial => Self::Serial,
             WorkspaceView::Battery => Self::Battery,
+            WorkspaceView::Battery2 => Self::Battery2,
+            WorkspaceView::Battery3 => Self::Battery3,
+            WorkspaceView::Battery4 => Self::Battery4,
+            WorkspaceView::Battery5 => Self::Battery5,
+            WorkspaceView::Battery6 => Self::Battery6,
+            WorkspaceView::Battery7 => Self::Battery7,
+            WorkspaceView::Battery8 => Self::Battery8,
+            WorkspaceView::Battery9 => Self::Battery9,
+            WorkspaceView::Battery10 => Self::Battery10,
             WorkspaceView::PdPower => Self::PdPower,
             WorkspaceView::PdPower2 => Self::PdPower2,
             WorkspaceView::PdPower3 => Self::PdPower3,
@@ -52,6 +61,15 @@ impl From<SavedWorkspaceView> for WorkspaceView {
             SavedWorkspaceView::SystemTrace => Self::SystemTrace,
             SavedWorkspaceView::Serial => Self::Serial,
             SavedWorkspaceView::Battery => Self::Battery,
+            SavedWorkspaceView::Battery2 => Self::Battery2,
+            SavedWorkspaceView::Battery3 => Self::Battery3,
+            SavedWorkspaceView::Battery4 => Self::Battery4,
+            SavedWorkspaceView::Battery5 => Self::Battery5,
+            SavedWorkspaceView::Battery6 => Self::Battery6,
+            SavedWorkspaceView::Battery7 => Self::Battery7,
+            SavedWorkspaceView::Battery8 => Self::Battery8,
+            SavedWorkspaceView::Battery9 => Self::Battery9,
+            SavedWorkspaceView::Battery10 => Self::Battery10,
             SavedWorkspaceView::PdPower => Self::PdPower,
             SavedWorkspaceView::PdPower2 => Self::PdPower2,
             SavedWorkspaceView::PdPower3 => Self::PdPower3,
@@ -290,9 +308,13 @@ impl WaveCraftApp {
                 state.plot_fraction = *fraction;
             }
         }
-        // Legacy layouts have one power tab. New layouts list every slot and
+        // Legacy layouts have one tab per instrument. New layouts list every slot and
         // persist visibility in the common hidden-view list.
-        for view in WorkspaceView::PD_POWER.into_iter().skip(1) {
+        for view in WorkspaceView::PD_POWER
+            .into_iter()
+            .skip(1)
+            .chain(WorkspaceView::BATTERY.into_iter().skip(1))
+        {
             let saved = SavedWorkspaceView::from(view);
             if self
                 .saved_capture_settings
@@ -313,9 +335,24 @@ impl WaveCraftApp {
         }
         if let Some(settings) = &self.saved_capture_settings.global.battery {
             match settings.validate() {
-                Ok(()) => self.battery.settings = settings.clone(),
+                Ok(()) => self.battery[0].settings = settings.clone(),
                 Err(error) => {
-                    self.battery.error = Some(format!("Saved battery settings ignored: {error}"))
+                    self.battery[0].error = Some(format!("Saved battery settings ignored: {error}"))
+                }
+            }
+        }
+        for (state, settings) in self
+            .battery
+            .iter_mut()
+            .zip(&self.saved_capture_settings.global.battery_views)
+        {
+            match settings.validate() {
+                Ok(()) => {
+                    state.settings = settings.clone();
+                    state.error = None;
+                }
+                Err(error) => {
+                    state.error = Some(format!("Saved battery settings ignored: {error}"))
                 }
             }
         }
@@ -576,16 +613,36 @@ impl WaveCraftApp {
                     self.pd_power[index].status = self.status.clone();
                 }
             }
-            WorkspaceView::Battery => {
-                if let Err(error) = self.battery.settings.validate() {
-                    self.battery.error = Some(error);
+            WorkspaceView::Battery
+            | WorkspaceView::Battery2
+            | WorkspaceView::Battery3
+            | WorkspaceView::Battery4
+            | WorkspaceView::Battery5
+            | WorkspaceView::Battery6
+            | WorkspaceView::Battery7
+            | WorkspaceView::Battery8
+            | WorkspaceView::Battery9
+            | WorkspaceView::Battery10 => {
+                let index = view.battery_index().unwrap_or(0);
+                if let Err(error) = self.battery[index].settings.validate() {
+                    self.battery[index].error = Some(error);
                     return;
                 }
                 let mut document = self.saved_capture_settings.clone();
-                document.global.battery = Some(self.battery.settings.clone());
-                if self.persist_setup_document(document, "Battery") {
-                    self.battery.status = self.status.clone();
-                    self.battery.error = None;
+                document.global.battery_views.resize_with(
+                    WorkspaceView::BATTERY.len(),
+                    crate::battery::BatterySettings::default,
+                );
+                if let Some(primary) = &document.global.battery {
+                    document.global.battery_views[0] = primary.clone();
+                }
+                document.global.battery_views[index] = self.battery[index].settings.clone();
+                if index == 0 {
+                    document.global.battery = Some(self.battery[0].settings.clone());
+                }
+                if self.persist_setup_document(document, view.label()) {
+                    self.battery[index].status = self.status.clone();
+                    self.battery[index].error = None;
                 }
             }
             WorkspaceView::Serial => {
@@ -888,7 +945,16 @@ impl WaveCraftApp {
             WorkspaceView::Vna => self.select_vna_view(),
             WorkspaceView::SystemTrace => self.select_system_trace_view(),
             WorkspaceView::Serial => self.select_serial_view(),
-            WorkspaceView::Battery => self.select_battery_view(),
+            battery @ (WorkspaceView::Battery
+            | WorkspaceView::Battery2
+            | WorkspaceView::Battery3
+            | WorkspaceView::Battery4
+            | WorkspaceView::Battery5
+            | WorkspaceView::Battery6
+            | WorkspaceView::Battery7
+            | WorkspaceView::Battery8
+            | WorkspaceView::Battery9
+            | WorkspaceView::Battery10) => self.select_battery_view(battery),
             WorkspaceView::PdPower
             | WorkspaceView::PdPower2
             | WorkspaceView::PdPower3
@@ -984,6 +1050,15 @@ impl WaveCraftApp {
                 | WorkspaceView::SystemTrace
                 | WorkspaceView::Serial
                 | WorkspaceView::Battery
+                | WorkspaceView::Battery2
+                | WorkspaceView::Battery3
+                | WorkspaceView::Battery4
+                | WorkspaceView::Battery5
+                | WorkspaceView::Battery6
+                | WorkspaceView::Battery7
+                | WorkspaceView::Battery8
+                | WorkspaceView::Battery9
+                | WorkspaceView::Battery10
                 | WorkspaceView::PdPower
                 | WorkspaceView::PdPower2
                 | WorkspaceView::PdPower3
@@ -1051,7 +1126,16 @@ impl WaveCraftApp {
                 WorkspaceView::Vna => self.select_vna_view(),
                 WorkspaceView::SystemTrace => self.select_system_trace_view(),
                 WorkspaceView::Serial => self.select_serial_view(),
-                WorkspaceView::Battery => self.select_battery_view(),
+                battery @ (WorkspaceView::Battery
+                | WorkspaceView::Battery2
+                | WorkspaceView::Battery3
+                | WorkspaceView::Battery4
+                | WorkspaceView::Battery5
+                | WorkspaceView::Battery6
+                | WorkspaceView::Battery7
+                | WorkspaceView::Battery8
+                | WorkspaceView::Battery9
+                | WorkspaceView::Battery10) => self.select_battery_view(battery),
                 power @ (WorkspaceView::PdPower
                 | WorkspaceView::PdPower2
                 | WorkspaceView::PdPower3
@@ -1098,7 +1182,16 @@ impl WaveCraftApp {
                     WorkspaceView::Vna => self.select_vna_view(),
                     WorkspaceView::SystemTrace => self.select_system_trace_view(),
                     WorkspaceView::Serial => self.select_serial_view(),
-                    WorkspaceView::Battery => self.select_battery_view(),
+                    battery @ (WorkspaceView::Battery
+                    | WorkspaceView::Battery2
+                    | WorkspaceView::Battery3
+                    | WorkspaceView::Battery4
+                    | WorkspaceView::Battery5
+                    | WorkspaceView::Battery6
+                    | WorkspaceView::Battery7
+                    | WorkspaceView::Battery8
+                    | WorkspaceView::Battery9
+                    | WorkspaceView::Battery10) => self.select_battery_view(battery),
                     power @ (WorkspaceView::PdPower
                     | WorkspaceView::PdPower2
                     | WorkspaceView::PdPower3
@@ -1552,6 +1645,15 @@ mod tests {
                 WorkspaceView::Vna,
                 WorkspaceView::Serial,
                 WorkspaceView::Battery,
+                WorkspaceView::Battery2,
+                WorkspaceView::Battery3,
+                WorkspaceView::Battery4,
+                WorkspaceView::Battery5,
+                WorkspaceView::Battery6,
+                WorkspaceView::Battery7,
+                WorkspaceView::Battery8,
+                WorkspaceView::Battery9,
+                WorkspaceView::Battery10,
                 WorkspaceView::PdPower,
                 WorkspaceView::PdPower2,
                 WorkspaceView::PdPower3,

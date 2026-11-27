@@ -327,6 +327,15 @@ sleep, every chemistry/curve combination, invalid data, JSON round trips,
 workspace migration/persistence, graph interactions, and the shared shell.
 
 
+The tab menu supports up to ten independent Battery workspaces, named Battery
+through Battery 10. Each retains its own parameters, calculation result, graph
+bounds, errors, and setup collapse state. Closing and reopening a slot retains
+its analysis for the current session. The pinned Save settings footer saves only
+the selected slot; profiles, tab order, visibility, and active view restore across
+restarts. Legacy single-view settings migrate to the first slot, with additional
+slots initially hidden. Load, Save file, and Calc requests target the slot where
+they were issued, even when the active tab changes before actions are applied.
+
 ## WeAct PD Power Mini workspace
 
 PD Power uses the common toolbar, setup adapter, pinned Save settings footer,

@@ -73,31 +73,35 @@ impl WaveCraftApp {
             },
             |ui| {
                 for view in WorkspaceView::ALL {
-                    if view.pd_power_index().is_some_and(|index| index != 0) {
+                    if view.pd_power_index().is_some_and(|index| index != 0)
+                        || view.battery_index().is_some_and(|index| index != 0)
+                    {
                         continue;
                     }
-                    let next_power = WorkspaceView::PD_POWER
-                        .into_iter()
-                        .find(|view| !available_views.contains(view));
-                    let already_open = if view == WorkspaceView::PdPower {
-                        next_power.is_none()
-                    } else {
-                        available_views.contains(&view)
+                    let slots = match view {
+                        WorkspaceView::PdPower => Some(WorkspaceView::PD_POWER.as_slice()),
+                        WorkspaceView::Battery => Some(WorkspaceView::BATTERY.as_slice()),
+                        _ => None,
                     };
-                    let response = ui.add_enabled(!already_open, egui::Button::new(view.label()));
+                    let next_view = if let Some(slots) = slots {
+                        slots
+                            .iter()
+                            .copied()
+                            .find(|view| !available_views.contains(view))
+                    } else {
+                        (!available_views.contains(&view)).then_some(view)
+                    };
+                    let response =
+                        ui.add_enabled(next_view.is_some(), egui::Button::new(view.label()));
                     if response.clicked() {
-                        added_view = Some(if view == WorkspaceView::PdPower {
-                            next_power.unwrap_or(view)
-                        } else {
-                            view
-                        });
+                        added_view = next_view;
                         ui.close_menu();
                     }
-                    if already_open {
-                        let hint = if view == WorkspaceView::PdPower {
-                            "Up to five PD Power views can be open"
-                        } else {
-                            "This view is already open"
+                    if next_view.is_none() {
+                        let hint = match view {
+                            WorkspaceView::PdPower => "Up to five PD Power views can be open",
+                            WorkspaceView::Battery => "Up to ten Battery views can be open",
+                            _ => "This view is already open",
                         };
                         response
                             .on_hover_selectable_text(hint)
@@ -223,6 +227,69 @@ mod tests {
                 .filter(|view| view.pd_power_index().is_some())
                 .count(),
             5
+        );
+    }
+
+    #[test]
+    fn plus_menu_adds_ten_battery_views_limits_count_and_reuses_closed_slot() {
+        let context = egui::Context::default();
+        let mut app = app();
+        let add_battery = |app: &mut WaveCraftApp| {
+            let texts = paint_tabs(&context, app, vec![]);
+            click_tabs(
+                &context,
+                app,
+                texts.iter().find(|(text, _)| text == "+").unwrap().1,
+            );
+            let texts = paint_tabs(&context, app, vec![]);
+            let item = texts
+                .iter()
+                .rev()
+                .find(|(text, _)| text == "Battery")
+                .unwrap()
+                .1;
+            assert!(!texts.iter().any(|(text, _)| text == "Battery 11"));
+            click_tabs(&context, app, item);
+        };
+        assert_eq!(
+            app.available_workspace_views()
+                .iter()
+                .filter(|v| v.battery_index().is_some())
+                .count(),
+            1
+        );
+        for expected in WorkspaceView::BATTERY.into_iter().skip(1) {
+            add_battery(&mut app);
+            assert_eq!(app.active_workspace_view, Some(expected));
+        }
+        add_battery(&mut app);
+        assert_eq!(app.active_workspace_view, Some(WorkspaceView::Battery10));
+        assert_eq!(
+            app.available_workspace_views()
+                .iter()
+                .filter(|v| v.battery_index().is_some())
+                .count(),
+            10
+        );
+        paint_tabs(
+            &context,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        app.battery[3].settings.size = "Retained cell".into();
+        app.set_workspace_view_visible(WorkspaceView::Battery4, false);
+        add_battery(&mut app);
+        assert_eq!(app.active_workspace_view, Some(WorkspaceView::Battery4));
+        assert_eq!(app.battery[3].settings.size, "Retained cell");
+        assert_eq!(
+            app.available_workspace_views().last(),
+            Some(&WorkspaceView::Battery4)
         );
     }
 
@@ -364,6 +431,15 @@ mod tests {
                 WorkspaceView::Vna,
                 WorkspaceView::Serial,
                 WorkspaceView::Battery,
+                WorkspaceView::Battery2,
+                WorkspaceView::Battery3,
+                WorkspaceView::Battery4,
+                WorkspaceView::Battery5,
+                WorkspaceView::Battery6,
+                WorkspaceView::Battery7,
+                WorkspaceView::Battery8,
+                WorkspaceView::Battery9,
+                WorkspaceView::Battery10,
                 WorkspaceView::PdPower,
                 WorkspaceView::PdPower2,
                 WorkspaceView::PdPower3,
