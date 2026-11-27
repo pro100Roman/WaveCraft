@@ -1,0 +1,38 @@
+{
+  "port": "/dev/cu.usbmodemacdec616b2961",
+  "captured_at": "2026-11-27T18:14:37.151885+00:00",
+  "model": "WeAct Studio PD Power Mini V1 BUCK",
+  "firmware": "V1.0.3.0_57ac5249",
+  "serial": "acdec616b296",
+  "output_state": 0,
+  "preset": 0,
+  "presets": [
+    [
+      1000,
+      200
+    ],
+    [
+      3300,
+      500
+    ],
+    [
+      5000,
+      1000
+    ],
+    [
+      9000,
+      2000
+    ],
+    [
+      12000,
+      3000
+    ]
+  ],
+  "settings": {
+    "06": 0,
+    "07": 1,
+    "08": 10,
+    "46": 1
+  },
+  "calibration_hex": "00000000d903ed03a60bbc0b83138d1311271927943aa63a494a494a000000002e00310059015b01eb02e602da05cd05c309ac09b80b9c0b0000000001000000"
+}

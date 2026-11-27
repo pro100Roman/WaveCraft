@@ -1,0 +1,55 @@
+Manufacturer-required factory reset completed; calibration unchanged.
+{
+  "port": "/dev/cu.usbmodemacdec616b2961",
+  "captured_at": "2026-11-27T18:14:37.736994+00:00",
+  "model": "WeAct Studio PD Power Mini V1 BUCK",
+  "firmware": "V1.0.3.0_57ac5249",
+  "serial": "acdec616b296",
+  "output_state": 0,
+  "preset": 2,
+  "presets": [
+    [
+      1000,
+      200
+    ],
+    [
+      5000,
+      1000
+    ],
+    [
+      3700,
+      50
+    ],
+    [
+      9000,
+      2000
+    ],
+    [
+      12000,
+      3000
+    ]
+  ],
+  "settings": {
+    "06": 0,
+    "07": 0,
+    "08": 10,
+    "46": 1
+  },
+  "input": {
+    "state": 5,
+    "voltage_mv": 5213,
+    "pd_decivolts": 240
+  },
+  "timer": {
+    "enabled": 0,
+    "on_seconds": 0,
+    "off_seconds": 0
+  },
+  "new_settings": {
+    "0b": 1,
+    "0c": 0,
+    "0d": 50,
+    "0e": 0
+  }
+}
+VERIFIED: upgraded, factory reset, original presets/settings restored, calibration unchanged, input and timer API responsive, output OFF.

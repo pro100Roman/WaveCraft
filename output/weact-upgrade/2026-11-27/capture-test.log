@@ -1,0 +1,22 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/pd_power_hardware.rs (target/debug/deps/pd_power_hardware-ff8f3a1b6fd292d6)
+
+running 1 test
+Port: /dev/cu.usbmodemacdec616b2961
+Model: WeAct Studio PD Power Mini V1 BUCK
+Firmware: V1.0.3.0_57ac5249
+Preset: M2
+Presets (mV/mA): [[1000, 200], [5000, 1000], [3700, 50], [9000, 2000], [12000, 3000]]
+Settings: [None, None, None, None, None, None, Some(0), Some(0), Some(10), None, None, Some(1), Some(0), Some(50), Some(0), None]
+Timer: Some([0, 0, 0])
+LCD: Some(1)
+Factory calibration available: true
+Requested 10 Hz; measured 9.96 Hz; Vout=0.000 V; Iout=0.000 A; Vin=5.213 V; PD request=24.0 V; output_state=0x00; input_state=5
+Requested 20 Hz; measured 19.75 Hz; Vout=0.000 V; Iout=0.000 A; Vin=5.213 V; PD request=24.0 V; output_state=0x00; input_state=5
+Requested 50 Hz; measured 49.42 Hz; Vout=0.000 V; Iout=0.000 A; Vin=5.213 V; PD request=24.0 V; output_state=0x00; input_state=5
+Requested 100 Hz; measured 94.66 Hz; Vout=0.000 V; Iout=0.000 A; Vin=5.207 V; PD request=24.0 V; output_state=0x00; input_state=5
+PASS: configuration, telemetry, rate changes, ordered frames, disconnect; no device write commands sent.
+test reads_configuration_and_live_telemetry_over_usb ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.39s
+

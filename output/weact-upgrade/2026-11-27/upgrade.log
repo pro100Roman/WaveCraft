@@ -1,0 +1,21 @@
+Using official WeAct upgrade/YModem implementation; package verified.
+[ℹ️ INFO] Opening /dev/cu.usbmodemacdec616b2961 to read upgrade mode response...
+[ℹ️ INFO] No upgrade mode detected, preparing to send command
+[ℹ️ INFO] Sending enter upgrade mode command, device will restart...
+[ℹ️ INFO] Waiting for port /dev/cu.usbmodemacdec616b2961 to enumerate...
+[✅ SUCCESS] Port /dev/cu.usbmodemacdec616b2961 found
+Checking existing port access (no chmod): /dev/cu.usbmodemacdec616b2961 True
+[ℹ️ INFO] Opening /dev/cu.usbmodemacdec616b2961 to read upgrade mode response...
+[ℹ️ INFO] Received C (1/2)
+[ℹ️ INFO] Received C (2/2)
+[ℹ️ INFO] Device already in upgrade mode
+[ℹ️ INFO] Serial port /dev/cu.usbmodemacdec616b2961 opened successfully
+[ℹ️ INFO] Starting Ymodem transfer: WeAct-PDPowerMiniV1_V1.0.3.0.fpk (42560 bytes)
+[⏳ WAIT] Waiting for receiver 'C' handshake...
+[ℹ️ INFO] Received handshake 'C'
+[ℹ️ INFO] Header packet acknowledged
+[⏳ PROGRESS]                                2.4%  Packet 1/42[⏳ PROGRESS] █                              4.8%  Packet 2/42[⏳ PROGRESS] ██                             7.1%  Packet 3/42[⏳ PROGRESS] ██                             9.5%  Packet 4/42[⏳ PROGRESS] ███                            11.9%  Packet 5/42[⏳ PROGRESS] ████                           14.3%  Packet 6/42[⏳ PROGRESS] █████                          16.7%  Packet 7/42[⏳ PROGRESS] █████                          19.0%  Packet 8/42[⏳ PROGRESS] ██████                         21.4%  Packet 9/42[⏳ PROGRESS] ███████                        23.8%  Packet 10/42[⏳ PROGRESS] ███████                        26.2%  Packet 11/42[⏳ PROGRESS] ████████                       28.6%  Packet 12/42[⏳ PROGRESS] █████████                      31.0%  Packet 13/42[⏳ PROGRESS] ██████████                     33.3%  Packet 14/42[⏳ PROGRESS] ██████████                     35.7%  Packet 15/42[⏳ PROGRESS] ███████████                    38.1%  Packet 16/42[⏳ PROGRESS] ████████████                   40.5%  Packet 17/42[⏳ PROGRESS] ████████████                   42.9%  Packet 18/42[⏳ PROGRESS] █████████████                  45.2%  Packet 19/42[⏳ PROGRESS] ██████████████                 47.6%  Packet 20/42[⏳ PROGRESS] ███████████████                50.0%  Packet 21/42[⏳ PROGRESS] ███████████████                52.4%  Packet 22/42[⏳ PROGRESS] ████████████████               54.8%  Packet 23/42[⏳ PROGRESS] █████████████████              57.1%  Packet 24/42[⏳ PROGRESS] █████████████████              59.5%  Packet 25/42[⏳ PROGRESS] ██████████████████             61.9%  Packet 26/42[⏳ PROGRESS] ███████████████████            64.3%  Packet 27/42[⏳ PROGRESS] ████████████████████           66.7%  Packet 28/42[⏳ PROGRESS] ████████████████████           69.0%  Packet 29/42[⏳ PROGRESS] █████████████████████          71.4%  Packet 30/42[⏳ PROGRESS] ██████████████████████         73.8%  Packet 31/42[⏳ PROGRESS] ██████████████████████         76.2%  Packet 32/42[⏳ PROGRESS] ███████████████████████        78.6%  Packet 33/42[⏳ PROGRESS] ████████████████████████       81.0%  Packet 34/42[⏳ PROGRESS] █████████████████████████      83.3%  Packet 35/42[⏳ PROGRESS] █████████████████████████      85.7%  Packet 36/42[⏳ PROGRESS] ██████████████████████████     88.1%  Packet 37/42[⏳ PROGRESS] ███████████████████████████    90.5%  Packet 38/42[⏳ PROGRESS] ███████████████████████████    92.9%  Packet 39/42[⏳ PROGRESS] ████████████████████████████   95.2%  Packet 40/42[⏳ PROGRESS] █████████████████████████████  97.6%  Packet 41/42[⏳ PROGRESS] ██████████████████████████████ 100.0%  Packet 42/42
+[ℹ️ INFO] Sending EOT (End of Transmission)
+[✅ SUCCESS] Ymodem transfer completed: WeAct-PDPowerMiniV1_V1.0.3.0.fpk
+[ℹ️ INFO] Serial port closed
+TRANSFER COMPLETE; verify firmware before declaring success.
