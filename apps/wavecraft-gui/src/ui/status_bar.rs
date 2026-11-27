@@ -45,6 +45,7 @@ impl WaveCraftApp {
         status.add_error(self.last_error.as_deref());
         if self.serial_view_is_active() {
             status.message = &self.serial.status;
+            status.detail = self.snapshot_message.as_deref().map(Cow::Borrowed);
             status.active = self.serial.session.is_some();
             status.add_error(self.serial.error.as_deref());
         } else if self.system_trace_view_is_active() {
@@ -223,6 +224,21 @@ fn paint_view_status(
 mod tests {
     use super::*;
     use crate::{app::test_support::app, ui::view_shell::workspace_panel, WorkspaceView};
+
+    #[test]
+    fn serial_snapshot_feedback_preserves_the_opened_file_status() {
+        let mut app = app();
+        app.active_workspace_view = Some(WorkspaceView::Serial);
+        app.serial.status = "Imported · readings.csv".into();
+        app.report_snapshot_status("Snapshot saved to /tmp/wavecraft-snapshot.png".into());
+        let status = app.active_view_status();
+        assert!(status.message.contains("readings.csv"));
+        assert!(status
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("wavecraft-snapshot.png"));
+    }
 
     fn paint(
         app: &WaveCraftApp,

@@ -9,7 +9,7 @@ applies equally to LA, OSC, RF, Combined, VNA, System Trace, and Serial.
 
 | Component | Responsibility |
 | --- | --- |
-| `view_toolbar` | Common application identity, App menu, toolbar background and spacing; returns the Settings request |
+| `view_toolbar` | Common application identity, App menu, Snapshot button, toolbar background and spacing; returns Settings and Snapshot requests |
 | `SetupPanel` | 300-point left panel, heading, typography, constrained scrolling, mandatory collapse/expand and pinned Save settings footer |
 | `settings_card` | Dark inset grouping settings sections, with shared width constraints and padding |
 | `workspace_panel` | Central background and outer margins |
@@ -44,10 +44,11 @@ the shared App menu. Use `theme::toolbar_action_button` for their appearance.
 The composition is intentionally small (illustrative Rust):
 
 ```rust,ignore
-let settings_clicked = view_toolbar(context, "Instrument description", |ui| {
+let toolbar = view_toolbar(context, "Instrument description", self.pending_snapshot.is_none(), |ui| {
     // Refresh and file actions, followed by right-aligned Run/Stop controls.
 });
-self.settings_open |= settings_clicked;
+self.settings_open |= toolbar.settings_clicked;
+actions.snapshot_clicked |= toolbar.snapshot_clicked;
 
 self.show_setup_panel(context, WorkspaceView::Instrument, actions, |app, ui, actions| {
     settings_card(ui, |ui| {
@@ -65,6 +66,21 @@ workspace_panel(context, |ui| {
     });
 });
 ```
+
+## Snapshots
+
+Snapshot belongs to the toolbar template and appears once in every workspace,
+including Serial/CSV and System Trace. Disable it while a screenshot request is
+pending. The frame dispatch in `paint_central_panel` queues the screenshot after
+painting the active view, using that frame's bounds and display scale. Views with
+a dedicated plot keep their plot crop; mixed views and tables use their visible
+central workspace. Setup panels, toolbars and status messages are excluded.
+
+`finish_pending_snapshot` receives the screenshot, crops it through the shared
+image helper, asks for an output directory, and saves a PNG without overwriting
+existing snapshots. Status and errors use the common message area. Serial keeps
+the imported file name visible alongside snapshot feedback. Do not implement
+additional per-view screenshot handlers or duplicate Snapshot buttons.
 
 All left panels use `show_setup_panel` in `ui/setup_panel.rs`. This adapter
 connects the visual template to `WorkspaceViewLayout` and `FrameActions`.

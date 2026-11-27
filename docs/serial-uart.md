@@ -215,6 +215,9 @@ bytes remain visible in **RAW DATA ASCII**. Original CSV bytes are retained for
 **Plot** and **Save raw…**, subject to the same import/history limits as raw files.
 CSV mode is for files; select ASCII or Binary for live UART capture.
 
+Column dropdowns keep a fixed width so line-style controls remain aligned.
+Long selected names are truncated; hover to read the full name.
+
 Timestamp columns are never selected automatically. Use **X AXIS** to choose one
 explicitly, including its shared time unit and multiplier. Otherwise X uses
 sample numbers, or time from the shared sample rate. Try

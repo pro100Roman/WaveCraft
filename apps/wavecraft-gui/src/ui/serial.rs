@@ -34,45 +34,53 @@ impl WaveCraftApp {
         self.save_global_settings();
     }
 
-    pub(crate) fn paint_serial_toolbar(&mut self, context: &egui::Context) {
-        let settings_clicked = view_toolbar(context, "Serial / UART", |ui| {
-            let running = self.serial.session.is_some();
-            if ui
-                .add_enabled(!running, toolbar_action_button("↻ Refresh", TEXT_MUTED))
-                .clicked()
-            {
-                self.serial.refresh();
-            }
-            if ui.add(toolbar_action_button("Clear", TEXT_MUTED)).clicked() {
-                self.serial.clear_data();
-            }
-            ui.separator();
-            if ui
-                .add_enabled(!running, toolbar_action_button("📂 Open…", TEXT_MUTED))
-                .on_hover_text("Open raw serial bytes or a CSV file")
-                .clicked()
-            {
-                self.open_serial_raw();
-            }
-            if ui
-                .add_enabled(
-                    !self.serial.raw.is_empty(),
-                    toolbar_action_button("Save raw…", TEXT_MUTED),
-                )
-                .on_hover_text("Save the retained raw bytes (latest 64 KiB)")
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_file_name("serial-capture.bin")
-                    .save_file()
+    pub(crate) fn paint_serial_toolbar(
+        &mut self,
+        context: &egui::Context,
+        actions: &mut crate::FrameActions,
+    ) {
+        let toolbar = view_toolbar(
+            context,
+            "Serial / UART",
+            self.pending_snapshot.is_none(),
+            |ui| {
+                let running = self.serial.session.is_some();
+                if ui
+                    .add_enabled(!running, toolbar_action_button("↻ Refresh", TEXT_MUTED))
+                    .clicked()
                 {
-                    let bytes: Vec<_> = self.serial.raw.iter().copied().collect();
-                    if let Err(error) = std::fs::write(path, bytes) {
-                        self.serial.error = Some(error.to_string());
+                    self.serial.refresh();
+                }
+                if ui.add(toolbar_action_button("Clear", TEXT_MUTED)).clicked() {
+                    self.serial.clear_data();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(!running, toolbar_action_button("📂 Open…", TEXT_MUTED))
+                    .on_hover_text("Open raw serial bytes or a CSV file")
+                    .clicked()
+                {
+                    self.open_serial_raw();
+                }
+                if ui
+                    .add_enabled(
+                        !self.serial.raw.is_empty(),
+                        toolbar_action_button("Save raw…", TEXT_MUTED),
+                    )
+                    .on_hover_text("Save the retained raw bytes (latest 64 KiB)")
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name("serial-capture.bin")
+                        .save_file()
+                    {
+                        let bytes: Vec<_> = self.serial.raw.iter().copied().collect();
+                        if let Err(error) = std::fs::write(path, bytes) {
+                            self.serial.error = Some(error.to_string());
+                        }
                     }
                 }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if running {
                     if ui
                         .add_enabled(
@@ -100,8 +108,10 @@ impl WaveCraftApp {
                     }
                 }
             });
-        });
-        self.settings_open |= settings_clicked;
+            },
+        );
+        self.settings_open |= toolbar.settings_clicked;
+        actions.snapshot_clicked |= toolbar.snapshot_clicked;
     }
 
     fn open_serial_raw(&mut self) {
@@ -539,14 +549,7 @@ fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings, csv_columns: 
                     - ui.spacing().item_spacing.x * 3.0)
                     .max(32.0);
                 if let Some(columns) = csv_columns {
-                    egui::ComboBox::from_id_salt("csv_column")
-                        .width(name_width)
-                        .selected_text(&field.name)
-                        .show_ui(ui, |ui| {
-                            for column in columns {
-                                ui.selectable_value(&mut field.name, column.clone(), column);
-                            }
-                        });
+                    csv_column_picker(ui, &mut field.name, columns, name_width);
                 } else {
                     ascii_field_inputs(ui, field, name_width);
                 }
@@ -586,6 +589,34 @@ fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings, csv_columns: 
             line_style: Default::default(),
         });
     }
+}
+
+fn csv_column_picker(
+    ui: &mut egui::Ui,
+    selected: &mut String,
+    columns: &[String],
+    width: f32,
+) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 20.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_width(width);
+            let preview = selected.replace(['\r', '\n'], " ");
+            egui::ComboBox::from_id_salt("csv_column")
+                .width(width)
+                .truncate()
+                .selected_text(preview)
+                .show_ui(ui, |ui| {
+                    for column in columns {
+                        ui.selectable_value(selected, column.clone(), column);
+                    }
+                })
+                .response
+                .on_hover_text(selected.as_str())
+        },
+    )
+    .inner
 }
 
 fn ascii_field_inputs(ui: &mut egui::Ui, field: &mut TextField, name_width: f32) {
@@ -937,6 +968,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn csv_column_width_and_line_style_position_do_not_depend_on_selected_name() {
+        let context = egui::Context::default();
+        let columns = vec![
+            "x".to_owned(),
+            "a_very_long_sensor_column_name_that_must_not_move_the_style_control".into(),
+            "two\nlines".into(),
+        ];
+        let mut previous = None;
+        for name in &columns {
+            let mut selected = name.clone();
+            let _ = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    ui.horizontal(|ui| {
+                        let rect = csv_column_picker(ui, &mut selected, &columns, 100.0).rect;
+                        let style_x = ui.cursor().left();
+                        assert!((rect.width() - 100.0).abs() < 0.1);
+                        let geometry = (rect.size(), style_x);
+                        if let Some(previous) = previous {
+                            assert_eq!(geometry, previous);
+                        }
+                        previous = Some(geometry);
+                        line_style_picker(ui, &mut Default::default(), COLORS[0]);
+                    });
+                });
+            });
+        }
+    }
+
+    #[test]
     fn csv_import_paints_graph_raw_ascii_and_column_settings() {
         let mut app = crate::app::test_support::app();
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1092,7 +1152,7 @@ mod tests {
                     ..Default::default()
                 },
                 |context| {
-                    app.paint_serial_toolbar(context);
+                    app.paint_serial_toolbar(context, &mut crate::FrameActions::default());
                     app.paint_status_bar(context);
                     app.paint_serial_central(context);
                 },

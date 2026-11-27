@@ -130,33 +130,31 @@ impl WaveCraftApp {
         frame: &FrameState,
         snapshot_clicked: bool,
     ) {
+        let workspace_rect = context.available_rect();
         if self.serial_view_is_active() {
             self.paint_serial_central(context);
-            return;
-        }
-        if self.vna_view_is_active() {
-            self.paint_vna_central_panel(context, snapshot_clicked);
-            return;
-        }
-        if self.system_trace_view_is_active() {
+            self.snapshot_plot_rect = Some(workspace_rect);
+        } else if self.vna_view_is_active() {
+            self.paint_vna_central_panel(context);
+        } else if self.system_trace_view_is_active() {
             self.paint_system_trace_central_panel(context);
-            return;
+            self.snapshot_plot_rect = Some(workspace_rect);
+        } else {
+            let mut state = PanelState::take_from(self);
+            workspace_panel(context, |ui| {
+                self.paint_waveform_views(ui, frame, &mut state);
+            });
+            state.restore_into(self);
         }
-        let mut state = PanelState::take_from(self);
-        workspace_panel(context, |ui| {
-            self.paint_waveform_views(ui, frame, &mut state);
-        });
-        let snapshot_plot_rect = state.snapshot_plot_rect;
-        state.restore_into(self);
-        if snapshot_clicked {
-            if let Some(plot_rect) = snapshot_plot_rect {
-                self.pending_snapshot = Some(PendingSnapshot {
-                    plot_rect,
-                    pixels_per_point: context.pixels_per_point(),
-                });
-                self.status = "Preparing snapshot…".to_owned();
-                context.send_viewport_cmd(egui::ViewportCommand::Screenshot);
-            }
+        let plot_rect = self.snapshot_plot_rect.unwrap_or(workspace_rect);
+        self.snapshot_plot_rect = Some(plot_rect);
+        if snapshot_clicked && self.pending_snapshot.is_none() && plot_rect.is_positive() {
+            self.pending_snapshot = Some(PendingSnapshot {
+                plot_rect,
+                pixels_per_point: context.pixels_per_point(),
+            });
+            self.report_snapshot_status("Preparing snapshot…".to_owned());
+            context.send_viewport_cmd(egui::ViewportCommand::Screenshot);
         }
     }
 
@@ -769,6 +767,136 @@ fn paint_decoded_data_side_panel(
 
 #[cfg(test)]
 mod tests {
+    fn snapshot_frame(
+        app: &mut crate::WaveCraftApp,
+        context: &crate::egui::Context,
+        events: Vec<crate::egui::Event>,
+    ) -> crate::egui::FullOutput {
+        use crate::{egui, FrameActions};
+        let frame = app.frame_state();
+        context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |context| {
+                let mut actions = FrameActions::default();
+                app.paint_toolbar(context, &frame, &mut actions);
+                if app.serial_view_is_active() {
+                    app.paint_serial_setup(context, &mut actions);
+                } else if app.system_trace_view_is_active() {
+                    app.paint_system_trace_setup_panel(context, &mut actions);
+                } else if app.vna_view_is_active() {
+                    app.paint_vna_setup_panel(context, &mut actions);
+                } else {
+                    app.paint_capture_setup_panel(context, &frame, &mut actions);
+                }
+                app.paint_status_bar(context);
+                app.paint_central_panel(context, &frame, actions.snapshot_clicked);
+            },
+        )
+    }
+
+    #[test]
+    fn every_view_has_one_template_snapshot_button_that_requests_a_valid_png_region() {
+        use crate::{egui, WorkspaceView};
+        for view in WorkspaceView::ALL {
+            let mut app = crate::app::test_support::app();
+            app.active_workspace_view = Some(view);
+            if let WorkspaceView::Waveform(tab) = view {
+                app.active_waveform_tab = Some(tab);
+            }
+            let context = egui::Context::default();
+            crate::configure_style(&context);
+            let output = snapshot_frame(&mut app, &context, vec![]);
+            let buttons: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "📷 Snapshot" => {
+                        Some(text.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(buttons.len(), 1, "{view:?}");
+            let position = buttons[0].center();
+            for pressed in [true, false] {
+                let output = snapshot_frame(
+                    &mut app,
+                    &context,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                if !pressed {
+                    assert!(
+                        output.viewport_output.values().any(|viewport| viewport
+                            .commands
+                            .iter()
+                            .any(|command| matches!(command, egui::ViewportCommand::Screenshot))),
+                        "{view:?}"
+                    );
+                }
+            }
+            let pending = app.pending_snapshot.expect("snapshot was requested");
+            assert!(
+                pending.plot_rect.left() >= 300.0,
+                "{view:?}: settings excluded"
+            );
+            assert!(
+                pending.plot_rect.top() > buttons[0].bottom(),
+                "{view:?}: toolbar excluded"
+            );
+            assert!(
+                pending.plot_rect.bottom() < 900.0,
+                "{view:?}: status excluded"
+            );
+            let screenshot = egui::ColorImage::new([1400, 900], egui::Color32::BLACK);
+            assert!(
+                crate::crop_snapshot_image(
+                    &screenshot,
+                    pending.plot_rect,
+                    pending.pixels_per_point
+                )
+                .is_ok(),
+                "{view:?}"
+            );
+            for pressed in [true, false] {
+                let output = snapshot_frame(
+                    &mut app,
+                    &context,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                assert!(
+                    !output.viewport_output.values().any(|viewport| viewport
+                        .commands
+                        .iter()
+                        .any(|command| matches!(command, egui::ViewportCommand::Screenshot))),
+                    "{view:?}: pending request must disable Snapshot"
+                );
+            }
+        }
+    }
+
     #[test]
     fn scope_child_tabs_switch_plots_without_switching_workspace() {
         use crate::{egui, CaptureSettingsDocument, ScopePlotTab, WaveCraftApp, WaveformTab};

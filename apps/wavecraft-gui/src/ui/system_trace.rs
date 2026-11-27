@@ -397,84 +397,95 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
-        let settings_clicked = view_toolbar(context, "System and RTOS trace", |ui| {
-            actions.refresh_clicked = ui
-                .add_enabled(
-                    !self.is_busy() && self.system_trace_connection.is_disconnected(),
-                    toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
-                )
-                .on_hover_text("Scan for debug probes, DSLogic, DSCope, and radio devices")
-                .clicked();
-            ui.separator();
-            let can_record = !self.is_busy()
-                && matches!(
-                    self.system_trace_connection,
-                    SystemTraceConnectionState::Attached {
-                        systemview_enabled: true,
-                        ..
-                    }
-                );
-            if ui
-                .add_enabled(
-                    can_record,
-                    toolbar_action_button("● Record…", egui::Color32::from_rgb(245, 96, 96)),
-                )
-                .on_hover_text("Record the raw SystemView stream to an .SVDat file")
-                .clicked()
-            {
-                actions.system_trace_action = Some(SystemTraceAction::Record);
-            }
-            if ui
-                .add_enabled(
-                    !self.is_busy() && self.system_trace_connection.is_disconnected(),
-                    toolbar_action_button("📂 Open", TEXT_MUTED),
-                )
-                .on_hover_text("Open a raw SEGGER SystemView event stream")
-                .clicked()
-            {
-                actions.system_trace_action = Some(SystemTraceAction::Open);
-            }
-            let can_save_history = !self.is_busy()
-                && self.system_trace.history_is_temporary()
-                && matches!(
-                    self.system_trace_connection,
-                    SystemTraceConnectionState::Disconnected
-                        | SystemTraceConnectionState::Error(_)
-                        | SystemTraceConnectionState::Attached { .. }
-                );
-            if ui
-                .add_enabled(
-                    can_save_history,
-                    toolbar_action_button("💾 Save", TEXT_MUTED),
-                )
-                .on_hover_text("Save the complete temporary trace history as .SVDat")
-                .clicked()
-            {
-                actions.system_trace_action = Some(SystemTraceAction::Save);
-            }
-            ui.separator();
-            paint_connection_control(
-                ui,
-                &self.system_trace_connection,
-                self.system_trace_settings.probe_connection_id.is_some(),
-                actions,
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                paint_trace_run_control(ui, &self.system_trace_connection, self.is_busy(), actions);
+        let toolbar = view_toolbar(
+            context,
+            "System and RTOS trace",
+            self.pending_snapshot.is_none(),
+            |ui| {
+                actions.refresh_clicked = ui
+                    .add_enabled(
+                        !self.is_busy() && self.system_trace_connection.is_disconnected(),
+                        toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
+                    )
+                    .on_hover_text("Scan for debug probes, DSLogic, DSCope, and radio devices")
+                    .clicked();
+                ui.separator();
+                let can_record = !self.is_busy()
+                    && matches!(
+                        self.system_trace_connection,
+                        SystemTraceConnectionState::Attached {
+                            systemview_enabled: true,
+                            ..
+                        }
+                    );
                 if ui
                     .add_enabled(
-                        !self.system_trace.events().is_empty()
-                            || !self.system_trace.terminal_lines().is_empty(),
-                        toolbar_action_button("Clear", TEXT_MUTED),
+                        can_record,
+                        toolbar_action_button("● Record…", egui::Color32::from_rgb(245, 96, 96)),
                     )
-                    .on_hover_text("Clear trace events and RTT terminal output")
+                    .on_hover_text("Record the raw SystemView stream to an .SVDat file")
                     .clicked()
                 {
-                    self.system_trace.clear();
+                    actions.system_trace_action = Some(SystemTraceAction::Record);
                 }
-            });
-        });
-        self.settings_open |= settings_clicked;
+                if ui
+                    .add_enabled(
+                        !self.is_busy() && self.system_trace_connection.is_disconnected(),
+                        toolbar_action_button("📂 Open", TEXT_MUTED),
+                    )
+                    .on_hover_text("Open a raw SEGGER SystemView event stream")
+                    .clicked()
+                {
+                    actions.system_trace_action = Some(SystemTraceAction::Open);
+                }
+                let can_save_history = !self.is_busy()
+                    && self.system_trace.history_is_temporary()
+                    && matches!(
+                        self.system_trace_connection,
+                        SystemTraceConnectionState::Disconnected
+                            | SystemTraceConnectionState::Error(_)
+                            | SystemTraceConnectionState::Attached { .. }
+                    );
+                if ui
+                    .add_enabled(
+                        can_save_history,
+                        toolbar_action_button("💾 Save", TEXT_MUTED),
+                    )
+                    .on_hover_text("Save the complete temporary trace history as .SVDat")
+                    .clicked()
+                {
+                    actions.system_trace_action = Some(SystemTraceAction::Save);
+                }
+                ui.separator();
+                paint_connection_control(
+                    ui,
+                    &self.system_trace_connection,
+                    self.system_trace_settings.probe_connection_id.is_some(),
+                    actions,
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    paint_trace_run_control(
+                        ui,
+                        &self.system_trace_connection,
+                        self.is_busy(),
+                        actions,
+                    );
+                    if ui
+                        .add_enabled(
+                            !self.system_trace.events().is_empty()
+                                || !self.system_trace.terminal_lines().is_empty(),
+                            toolbar_action_button("Clear", TEXT_MUTED),
+                        )
+                        .on_hover_text("Clear trace events and RTT terminal output")
+                        .clicked()
+                    {
+                        self.system_trace.clear();
+                    }
+                });
+            },
+        );
+        self.settings_open |= toolbar.settings_clicked;
+        actions.snapshot_clicked |= toolbar.snapshot_clicked;
     }
 
     pub(crate) fn paint_system_trace_setup_panel(

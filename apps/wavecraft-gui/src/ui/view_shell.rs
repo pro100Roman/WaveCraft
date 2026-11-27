@@ -20,14 +20,21 @@ fn panel_frame(fill: Color32, margin: f32) -> egui::Frame {
         .inner_margin(egui::Margin::same(margin))
 }
 
-/// The same application menu and toolbar row in every workspace. The returned
-/// flag requests App > Settings, without borrowing a view's application state.
+#[derive(Default)]
+pub(crate) struct ViewToolbarResponse {
+    pub settings_clicked: bool,
+    pub snapshot_clicked: bool,
+}
+
+/// Every workspace receives the same App menu and Snapshot control. Views
+/// provide availability and apply the returned requests through orchestration.
 pub(crate) fn view_toolbar(
     context: &egui::Context,
     subtitle: &str,
+    snapshot_enabled: bool,
     controls: impl FnOnce(&mut egui::Ui),
-) -> bool {
-    let mut settings_clicked = false;
+) -> ViewToolbarResponse {
+    let mut response = ViewToolbarResponse::default();
     egui::TopBottomPanel::top("toolbar")
         .frame(panel_frame(PANEL, 12.0))
         .show(context, |ui| {
@@ -36,7 +43,7 @@ pub(crate) fn view_toolbar(
                 ui.separator();
                 ui.menu_button("App", |ui| {
                     if ui.button("Settings…").clicked() {
-                        settings_clicked = true;
+                        response.settings_clicked = true;
                         ui.close_menu();
                     }
                 });
@@ -45,10 +52,18 @@ pub(crate) fn view_toolbar(
                     ui.label(RichText::new(subtitle).color(TEXT_MUTED));
                     ui.separator();
                 }
+                response.snapshot_clicked = ui
+                    .add_enabled(
+                        snapshot_enabled,
+                        toolbar_action_button("📷 Snapshot", TEXT_MUTED),
+                    )
+                    .on_hover_text("Save the visible view content as a PNG snapshot")
+                    .clicked();
+                ui.separator();
                 controls(ui);
             });
         });
-    settings_clicked
+    response
 }
 
 /// Left settings panel. A stable ID keeps scroll state isolated per workspace.

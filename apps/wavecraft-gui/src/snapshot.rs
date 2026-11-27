@@ -40,7 +40,7 @@ pub(crate) fn crop_snapshot_image(
     let left = left.min(image_width);
     let top = top.min(image_height);
     if right <= left || bottom <= top {
-        return Err("the waveform plot is outside the captured image".to_owned());
+        return Err("the view content is outside the captured image".to_owned());
     }
 
     let width = right - left;

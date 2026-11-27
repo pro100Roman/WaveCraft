@@ -3,10 +3,10 @@
 use super::view_shell::{settings_card, view_card, view_toolbar, workspace_panel};
 
 use crate::{
-    egui, toolbar_action_button, CalibrationStandard, Color32, FontId, FrameActions,
-    PendingSnapshot, Pos2, Rect, RichText, SelectableHoverText, Sense, Stroke, Vec2,
-    VnaMatchingNetwork, VnaPoint, WaveCraftApp, WorkspaceView, ACCENT, GRID, ORANGE, SCOPE_COLORS,
-    TEXT_MUTED, VNA_MATCHING_Q_MAX, VNA_MATCHING_Q_MIN,
+    egui, toolbar_action_button, CalibrationStandard, Color32, FontId, FrameActions, Pos2, Rect,
+    RichText, SelectableHoverText, Sense, Stroke, Vec2, VnaMatchingNetwork, VnaPoint, WaveCraftApp,
+    WorkspaceView, ACCENT, GRID, ORANGE, SCOPE_COLORS, TEXT_MUTED, VNA_MATCHING_Q_MAX,
+    VNA_MATCHING_Q_MIN,
 };
 
 const SMITH_GRID: Color32 = Color32::from_rgb(54, 68, 81);
@@ -243,50 +243,47 @@ impl WaveCraftApp {
         context: &egui::Context,
         actions: &mut FrameActions,
     ) {
-        let settings_clicked = view_toolbar(context, "Vector network analyzer", |ui| {
-            actions.refresh_clicked = ui
-                .add_enabled(
-                    !self.is_busy() && self.vna_session.is_none(),
-                    toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
-                )
-                .clicked();
-            ui.separator();
-            if ui
-                .add_enabled(
-                    self.snapshot_plot_rect.is_some() && self.pending_snapshot.is_none(),
-                    toolbar_action_button("📷", TEXT_MUTED),
-                )
-                .clicked()
-            {
-                actions.snapshot_clicked = true;
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let can_start = self.vna_session.is_some() && !self.is_busy();
-                if ui
+        let toolbar = view_toolbar(
+            context,
+            "Vector network analyzer",
+            self.pending_snapshot.is_none(),
+            |ui| {
+                actions.refresh_clicked = ui
                     .add_enabled(
-                        (self.vna_run_active && !self.vna_run_stop_requested) || can_start,
-                        if self.vna_run_active {
-                            toolbar_action_button("■ Stop", Color32::LIGHT_RED)
-                        } else {
-                            toolbar_action_button("▶ Run", ACCENT)
-                        },
+                        !self.is_busy() && self.vna_session.is_none(),
+                        toolbar_action_button("↻ Refresh", SCOPE_COLORS[1]),
                     )
-                    .clicked()
-                {
-                    actions.vna_run_stop_clicked = true;
-                }
-                if ui
-                    .add_enabled(
-                        can_start,
-                        toolbar_action_button("▶ Single", SCOPE_COLORS[0]),
-                    )
-                    .clicked()
-                {
-                    actions.vna_sweep_clicked = true;
-                }
-            });
-        });
-        self.settings_open |= settings_clicked;
+                    .clicked();
+                ui.separator();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can_start = self.vna_session.is_some() && !self.is_busy();
+                    if ui
+                        .add_enabled(
+                            (self.vna_run_active && !self.vna_run_stop_requested) || can_start,
+                            if self.vna_run_active {
+                                toolbar_action_button("■ Stop", Color32::LIGHT_RED)
+                            } else {
+                                toolbar_action_button("▶ Run", ACCENT)
+                            },
+                        )
+                        .clicked()
+                    {
+                        actions.vna_run_stop_clicked = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            can_start,
+                            toolbar_action_button("▶ Single", SCOPE_COLORS[0]),
+                        )
+                        .clicked()
+                    {
+                        actions.vna_sweep_clicked = true;
+                    }
+                });
+            },
+        );
+        self.settings_open |= toolbar.settings_clicked;
+        actions.snapshot_clicked |= toolbar.snapshot_clicked;
     }
 
     pub(crate) fn paint_vna_setup_panel(
@@ -357,11 +354,7 @@ impl WaveCraftApp {
         });
     }
 
-    pub(crate) fn paint_vna_central_panel(
-        &mut self,
-        context: &egui::Context,
-        snapshot_clicked: bool,
-    ) {
+    pub(crate) fn paint_vna_central_panel(&mut self, context: &egui::Context) {
         let mut plot_rect = None;
         workspace_panel(context, |ui| {
             view_card(ui, |ui| {
@@ -467,16 +460,6 @@ impl WaveCraftApp {
             });
         });
         self.snapshot_plot_rect = plot_rect;
-        if snapshot_clicked {
-            if let Some(plot_rect) = plot_rect {
-                self.pending_snapshot = Some(PendingSnapshot {
-                    plot_rect,
-                    pixels_per_point: context.pixels_per_point(),
-                });
-                self.status = "Preparing VNA snapshot…".to_owned();
-                context.send_viewport_cmd(egui::ViewportCommand::Screenshot);
-            }
-        }
     }
 }
 
@@ -2308,7 +2291,7 @@ mod tests {
                 .unwrap()
         };
         assert!(position("▶ Single").x < position("▶ Run").x);
-        assert!(position("↻ Refresh").x < position("📷").x);
+        assert!(position("📷 Snapshot").x < position("↻ Refresh").x);
         assert!(!texts
             .iter()
             .any(|(text, _)| text == "LiteVNA ready" || text == "No LiteVNA"));
@@ -2319,7 +2302,7 @@ mod tests {
         let context = egui::Context::default();
         let mut app = app();
         let texts = painted_text(&context, |context| {
-            app.paint_vna_central_panel(context, false);
+            app.paint_vna_central_panel(context);
         });
         assert!(texts.iter().any(|(text, _)| text == "SMITH CHART"));
         assert!(texts.iter().any(|(text, _)| text == "LOG MAG / PHASE"));
@@ -2327,7 +2310,7 @@ mod tests {
         app.vna_plot_tab = VnaPlotTab::LogMagnitudePhase;
         app.vna_plot_channel = VnaChannel::S21;
         let texts = painted_text(&context, |context| {
-            app.paint_vna_central_panel(context, false);
+            app.paint_vna_central_panel(context);
         });
         assert!(texts.iter().any(|(text, _)| text == "Source"));
         assert!(texts.iter().any(|(text, _)| text == "S21"));
@@ -2347,7 +2330,7 @@ mod tests {
         });
 
         let texts = painted_text(&context, |context| {
-            app.paint_vna_central_panel(context, false);
+            app.paint_vna_central_panel(context);
         });
 
         assert!(texts

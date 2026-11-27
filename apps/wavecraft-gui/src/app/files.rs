@@ -10,6 +10,11 @@ use crate::{
 use crate::WaveCraftApp;
 
 impl WaveCraftApp {
+    pub(crate) fn report_snapshot_status(&mut self, message: String) {
+        self.snapshot_message = Some(message.clone());
+        self.status = message;
+    }
+
     pub(crate) fn finish_pending_snapshot(&mut self, context: &egui::Context) {
         if self.pending_snapshot.is_none() {
             return;
@@ -33,7 +38,7 @@ impl WaveCraftApp {
         ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.status = "Snapshot failed".to_owned();
+                self.report_snapshot_status("Snapshot failed".to_owned());
                 self.last_error = Some(format!("Snapshot failed: {error}"));
                 return;
             }
@@ -43,16 +48,16 @@ impl WaveCraftApp {
             .set_title("Select snapshot directory")
             .pick_folder()
         else {
-            self.status = "Snapshot canceled".to_owned();
+            self.report_snapshot_status("Snapshot canceled".to_owned());
             return;
         };
         match save_snapshot_image(&directory, &snapshot) {
             Ok(path) => {
-                self.status = format!("Snapshot saved to {}", path.display());
+                self.report_snapshot_status(format!("Snapshot saved to {}", path.display()));
                 self.last_error = None;
             }
             Err(error) => {
-                self.status = "Snapshot failed".to_owned();
+                self.report_snapshot_status("Snapshot failed".to_owned());
                 self.last_error = Some(format!("Snapshot failed: {error}"));
             }
         }
