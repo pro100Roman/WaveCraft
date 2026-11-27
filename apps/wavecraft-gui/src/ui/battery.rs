@@ -497,39 +497,41 @@ fn paint_graph(ui: &mut egui::Ui, rect: egui::Rect, state: &mut BatteryState) {
             [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
             egui::Stroke::new(1.0_f32, GRID),
         );
-        // Real labels keep axes selectable and copyable, like other UI text.
+        // Keep axis widgets inside the allocated plot surface. ui.put expands
+        // its parent's minimum rectangle, so an overflowing tick widens the card.
+        let time_label = format!("{:.3} h", left + f64::from(fraction) * (right - left));
+        let label_left = (x - 37.5).clamp(rect.left(), rect.right() - 75.0);
         ui.put(
-            egui::Rect::from_center_size(
-                egui::pos2(x, plot.bottom() + 16.0),
+            egui::Rect::from_min_size(
+                egui::pos2(label_left, plot.bottom() + 6.0),
                 egui::vec2(75.0, 20.0),
             ),
             egui::Label::new(
-                RichText::new(format!(
-                    "{:.3} h",
-                    left + f64::from(fraction) * (right - left)
-                ))
-                .monospace()
-                .size(10.0)
-                .color(TEXT_MUTED),
+                RichText::new(&time_label)
+                    .monospace()
+                    .size(10.0)
+                    .color(TEXT_MUTED),
             )
+            .truncate()
             .selectable(true),
-        );
+        )
+        .on_hover_selectable_text(time_label);
+        let voltage_label = format!("{:.3} V", top - f64::from(fraction) * (top - bottom));
         ui.put(
             egui::Rect::from_min_size(
                 egui::pos2(rect.left() + 2.0, y - 8.0),
                 egui::vec2(62.0, 18.0),
             ),
             egui::Label::new(
-                RichText::new(format!(
-                    "{:.3} V",
-                    top - f64::from(fraction) * (top - bottom)
-                ))
-                .monospace()
-                .size(10.0)
-                .color(TEXT_MUTED),
+                RichText::new(&voltage_label)
+                    .monospace()
+                    .size(10.0)
+                    .color(TEXT_MUTED),
             )
+            .truncate()
             .selectable(true),
-        );
+        )
+        .on_hover_selectable_text(voltage_label);
     }
     let map = |p: [f64; 2]| {
         egui::pos2(
@@ -657,6 +659,67 @@ mod tests {
         let error = label(&labels, "Capacity must be finite and greater than 0 mAh");
         assert!(error.y > 800.0);
         assert!(app.battery.is_stale());
+    }
+
+    #[test]
+    fn discharge_card_keeps_workspace_margins_after_calculation_and_zoom() {
+        fn cards(shape: &egui::Shape, rects: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(shape)
+                    if shape.fill == crate::PANEL
+                        && shape.stroke.color == GRID
+                        && shape.rect.height() > 300.0
+                        && shape.rect.left() >= 300.0 =>
+                {
+                    rects.push(shape.rect)
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        cards(shape, rects);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for width in [800.0, 1400.0] {
+            for calculated in [false, true] {
+                let mut app = app();
+                app.select_battery_view();
+                if calculated {
+                    app.battery.calculate();
+                }
+                let ctx = egui::Context::default();
+                crate::configure_style(&ctx);
+                for zoomed in [false, true] {
+                    if zoomed && calculated {
+                        app.battery.bounds = Some([0.0, 1e20, 2.0, 5.0]);
+                    }
+                    for _ in 0..2 {
+                        let output = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(width, 900.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ctx| app.run_frame(ctx),
+                        );
+                        let mut rects = Vec::new();
+                        for shape in output.shapes {
+                            cards(&shape.shape, &mut rects);
+                        }
+                        assert_eq!(rects.len(), 1);
+                        let card = rects[0];
+                        assert!(
+                            card.right() <= width - 15.0,
+                            "width={width}, calculated={calculated}, zoomed={zoomed}: {card:?}"
+                        );
+                        assert!(card.left() >= 315.0);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
