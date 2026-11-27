@@ -1,6 +1,8 @@
 //! UART transport and bounded, incremental telemetry decoding, independent of UI.
 
+mod csv;
 mod protocol;
+pub use csv::{CsvDelimiter, CsvReader};
 pub use protocol::*;
 pub use serialport::{DataBits, FlowControl, Parity, StopBits};
 use std::io::{ErrorKind, Read};

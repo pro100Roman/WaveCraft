@@ -3,7 +3,7 @@
 Select **Serial / UART**, choose a discovered port from the dropdown,
 set the baud rate, data bits, parity, stop bits and flow control, and press
 **Start**. **Stop** releases the port; **Clear** resets the displayed history and
-partial decoder state. Port and decoding changes apply on the next Start, Open raw or Plot;
+partial decoder state. Port and decoding changes apply on the next Start, Open or Plot;
 color edits apply immediately.
 The workspace can receive alongside the other instruments. PORT and DATA FORMAT
 can be collapsed independently. Baud rate uses an editable field with a dropdown,
@@ -36,7 +36,7 @@ graph does not repeat the field list.
 
 With **no text fields** or **no binary schema**, Start still reads the port and
 shows only raw data in the lower pane. A schema is never required for receiving.
-**Open raw…** also displays file bytes without fields or a schema. Incomplete or
+**Open…** also displays file bytes without fields or a schema. Incomplete or
 invalid decoding settings do not block raw imports; they disable plotting for
 that import and report the decoding problem in the common message area.
 The status shows the opened file's name. While a file is open, **Plot** appears
@@ -50,7 +50,7 @@ Binary renders byte offsets, hexadecimal bytes and printable ASCII. Select text
 and use Cmd+C / Ctrl+C to copy it; Save raw writes the retained bytes unchanged.
 
 History is bounded to the latest 64 KiB of raw bytes and 10,000 points per field.
-Save raw exports that retained window, not an unlimited recording. Open raw
+Save raw exports that retained window, not an unlimited recording. Open
 accepts up to 8 MiB and processes it using the current decoding settings.
 
 ## X axis
@@ -123,7 +123,7 @@ temperature->23.5 rpm::1200
 ```
 
 Separators are saved with the field settings. Apply edits with **Plot** for an
-opened file, or on the next **Start** / **Open raw…**. Existing saved fields
+opened file, or on the next **Start** / **Open…**. Existing saved fields
 without a separator retain automatic matching.
 
 ## Binary schema
@@ -191,3 +191,32 @@ Protocol decoders and CRC have no dependency on the GUI. Hardware-free tests
 exercise two sources, ordering, cancellation, read failures, CRC reference
 vectors, fragmentation, resynchronization and bounded history. Physical UART
 adapters and device firmware still require hardware validation.
+
+## CSV files
+
+Use **Open…** to open a `.csv` file. The workspace automatically selects **CSV**
+and lists the columns from the first row under **PLOTTED FIELDS**, initially
+selecting up to ten columns. Use each field's dropdown, **+ Add field**, or **×**
+to choose which columns to plot, then press **Plot**. Colors and line styles work
+as in ASCII mode; CSV columns do not use ASCII field/value separators.
+
+The column separator defaults to **Auto**, detecting comma, semicolon or tab
+outside quoted fields. You can select it explicitly. Quoted fields, escaped
+quotes, UTF-8 headers (including BOM), CRLF/LF and quoted multiline cells are
+supported. For files without a header, disable **First row contains column names**
+and press **Plot**; columns are named `Column 1`, `Column 2`, etc., and the first
+row is kept as data. A CSV can contain up to 128 columns, with up to ten selected
+fields. Column names must be unique.
+
+Numeric cells use decimal points and support scientific notation. Empty,
+non-numeric or nonfinite cells produce no point for that column. Rows with a
+wrong column count are rejected and reported in the common message area; their
+bytes remain visible in **RAW DATA ASCII**. Original CSV bytes are retained for
+**Plot** and **Save raw…**, subject to the same import/history limits as raw files.
+CSV mode is for files; select ASCII or Binary for live UART capture.
+
+Timestamp columns are never selected automatically. Use **X AXIS** to choose one
+explicitly, including its shared time unit and multiplier. Otherwise X uses
+sample numbers, or time from the shared sample rate. Try
+[serial-samples.csv](examples/serial-samples.csv): select `timestamp`, seconds,
+and multiplier `1` to show its 0–5.11 second timeline.

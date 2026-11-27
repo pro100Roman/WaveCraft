@@ -1,7 +1,9 @@
-//! Generates matching ASCII and binary UART samples for `docs/examples`.
+//! Generates matching ASCII, binary and CSV UART samples for `docs/examples`.
 
 use std::{error::Error, fs, io, path::PathBuf};
-use wavecraft_serial::{BinaryDecoder, BinarySchema, ByteOrder, CrcConfiguration, TextDecoder};
+use wavecraft_serial::{
+    BinaryDecoder, BinarySchema, ByteOrder, CrcConfiguration, CsvDelimiter, CsvReader, TextDecoder,
+};
 
 const SCHEMA: &str = include_str!("../../../docs/examples/serial-schema.json");
 const RECORDS: usize = 512;
@@ -30,6 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         include_start_word: false,
     };
     let mut ascii = String::new();
+    let mut csv = String::from("timestamp,temperature,speed,enabled,fault,mode\n");
     let mut binary = Vec::new();
     let mut expected = Vec::new();
     for index in 0..RECORDS {
@@ -40,6 +43,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mode = ((index / 128) % 4) as u8;
         ascii.push_str(&format!(
             "temperature={temperature:.2} speed={speed} enabled={enabled} fault={fault} mode={mode}\r\n"
+        ));
+        csv.push_str(&format!(
+            "{:.2},{temperature:.2},{speed},{enabled},{fault},{mode}\n",
+            index as f64 / 100.0
         ));
         let mut payload = temperature.to_le_bytes().to_vec();
         payload.extend_from_slice(&speed.to_le_bytes());
@@ -73,8 +80,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .iter()
         .map(|record| record.iter().copied().map(Some).collect())
         .collect();
+    let decoded_csv: Vec<_> = CsvReader::new(csv.as_bytes(), CsvDelimiter::Auto, true)?
+        .records(&fields)?
+        .collect::<Result<_, _>>()?;
     if decoded_binary != expected
         || decoded_ascii != expected_ascii
+        || decoded_csv != expected_ascii
         || binary_decoder.rejected_frames != 0
         || binary_decoder.discarded_bytes != 0
     {
@@ -84,11 +95,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&output)?;
     fs::write(output.join("serial-ascii.txt"), &ascii)?;
     fs::write(output.join("serial-binary.bin"), &binary)?;
+    fs::write(output.join("serial-samples.csv"), &csv)?;
     fs::write(output.join("serial-schema.json"), SCHEMA)?;
     println!(
-        "Wrote and verified {RECORDS} matching records: {} ASCII bytes, {} binary bytes in {}",
+        "Wrote and verified {RECORDS} matching records: {} ASCII bytes, {} binary bytes, {} CSV bytes in {}",
         ascii.len(),
         binary.len(),
+        csv.len(),
         output.display()
     );
     Ok(())

@@ -48,7 +48,8 @@ impl WaveCraftApp {
             }
             ui.separator();
             if ui
-                .add_enabled(!running, toolbar_action_button("📂 Open raw…", TEXT_MUTED))
+                .add_enabled(!running, toolbar_action_button("📂 Open…", TEXT_MUTED))
+                .on_hover_text("Open raw serial bytes or a CSV file")
                 .clicked()
             {
                 self.open_serial_raw();
@@ -82,14 +83,16 @@ impl WaveCraftApp {
                     {
                         self.serial.stop();
                     }
-                } else if ui.add(toolbar_action_button("▶ Start", ACCENT)).clicked() {
+                } else if ui.add_enabled(self.serial.settings.mode != SerialMode::Csv, toolbar_action_button("▶ Start", ACCENT))
+                    .on_hover_text("Live UART capture is available in ASCII or Binary mode")
+                    .clicked() {
                     if let Err(error) = self.serial.start() {
                         self.serial.error = Some(error.to_string());
                     }
                 }
                 if self.serial.imported_file.is_some() && ui
                     .add_enabled(!running, toolbar_action_button("Plot", ACCENT))
-                    .on_hover_text("Plot the opened file using the current fields, schema and UART timing settings")
+                    .on_hover_text("Plot the opened file using the current fields, columns and X-axis settings")
                     .clicked()
                 {
                     if let Err(error) = self.serial.plot_imported() {
@@ -103,13 +106,17 @@ impl WaveCraftApp {
 
     fn open_serial_raw(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Open raw serial bytes")
+            .set_title("Open serial data or CSV")
+            .add_filter("Serial data and CSV", &["bin", "txt", "csv", "raw"])
+            .add_filter("All files", &["*"])
             .pick_file()
         else {
             return;
         };
         if let Err(error) = self.serial.import_raw(&path) {
             self.serial.error = Some(error.to_string());
+        } else {
+            self.save_global_settings();
         }
     }
 
@@ -155,9 +162,16 @@ impl WaveCraftApp {
                                 SerialMode::Binary,
                                 "Binary",
                             );
+                            ui.selectable_value(
+                                &mut app.serial.settings.mode,
+                                SerialMode::Csv,
+                                "CSV",
+                            );
                         });
                         if app.serial.settings.mode == SerialMode::Text {
-                            text_settings(ui, &mut app.serial.settings);
+                            text_settings(ui, &mut app.serial.settings, None);
+                        } else if app.serial.settings.mode == SerialMode::Csv {
+                            csv_settings(ui, &mut app.serial);
                         } else {
                             binary_settings(ui, &mut app.serial);
                         }
@@ -187,7 +201,7 @@ impl WaveCraftApp {
         if before != self.serial.settings {
             self.apply_serial_axis_changes(&before);
             for series in &mut self.serial.series {
-                let color = if self.serial.settings.mode == SerialMode::Text {
+                let color = if self.serial.settings.mode != SerialMode::Binary {
                     self.serial
                         .settings
                         .fields
@@ -505,11 +519,11 @@ fn string_combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[&str
         });
 }
 
-fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
+fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings, csv_columns: Option<&[String]>) {
     ui.add_space(8.0);
     ui.label(RichText::new("PLOTTED FIELDS").small().color(TEXT_MUTED));
     ui.label(
-        RichText::new("Set a separator after each name, or leave it empty for automatic matching. Records end at CR or LF.")
+        RichText::new(if csv_columns.is_some() { "Select CSV columns to plot. Choose a timestamp explicitly in X AXIS." } else { "Set a separator after each name, or leave it empty for automatic matching. Records end at CR or LF." })
             .small()
             .color(TEXT_MUTED),
     );
@@ -521,24 +535,21 @@ fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
                 let name_width = (ui.available_width()
                     - LINE_STYLE_PICKER_WIDTH
                     - 24.0
-                    - 40.0
+                    - if csv_columns.is_some() { 0.0 } else { 40.0 }
                     - ui.spacing().item_spacing.x * 3.0)
                     .max(32.0);
-                ui.add_sized(
-                    [name_width, 20.0],
-                    egui::TextEdit::singleline(&mut field.name)
-                        .char_limit(64)
-                        .hint_text("e.g. temperature"),
-                );
-                let separator = ui.add_sized(
-                    [40.0, 20.0],
-                    egui::TextEdit::singleline(&mut field.separator)
-                        .char_limit(wavecraft_serial::MAX_TEXT_SEPARATOR_BYTES)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("auto"),
-                );
-                if separator.changed() { field.separator.retain(|character| character.is_ascii()); }
-                separator.on_hover_text("Field/value separator: up to 3 ASCII characters, matched literally after the name. Empty uses automatic matching (=, :, whitespace or JSON). Spaces are significant.");
+                if let Some(columns) = csv_columns {
+                    egui::ComboBox::from_id_salt("csv_column")
+                        .width(name_width)
+                        .selected_text(&field.name)
+                        .show_ui(ui, |ui| {
+                            for column in columns {
+                                ui.selectable_value(&mut field.name, column.clone(), column);
+                            }
+                        });
+                } else {
+                    ascii_field_inputs(ui, field, name_width);
+                }
                 line_style_picker(ui, &mut field.line_style, field.color);
                 if ui.small_button("×").on_hover_text("Remove field").clicked() {
                     remove = Some(index);
@@ -551,23 +562,81 @@ fn text_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
     }
     if ui
         .add_enabled(
-            settings.fields.len() < 10,
+            settings.fields.len() < 10
+                && csv_columns.map_or(true, |columns| {
+                    columns
+                        .iter()
+                        .any(|column| !settings.fields.iter().any(|field| &field.name == column))
+                }),
             egui::Button::new(format!("+ Add field ({}/10)", settings.fields.len())),
         )
         .clicked()
     {
         settings.fields.push(TextField {
             separator: String::new(),
-            name: String::new(),
+            name: csv_columns
+                .and_then(|columns| {
+                    columns
+                        .iter()
+                        .find(|column| !settings.fields.iter().any(|field| &field.name == *column))
+                })
+                .cloned()
+                .unwrap_or_default(),
             color: COLORS[settings.fields.len() % COLORS.len()],
             line_style: Default::default(),
         });
     }
 }
 
+fn ascii_field_inputs(ui: &mut egui::Ui, field: &mut TextField, name_width: f32) {
+    ui.add_sized(
+        [name_width, 20.0],
+        egui::TextEdit::singleline(&mut field.name)
+            .char_limit(64)
+            .hint_text("e.g. temperature"),
+    );
+    let separator = ui.add_sized(
+        [40.0, 20.0],
+        egui::TextEdit::singleline(&mut field.separator)
+            .char_limit(wavecraft_serial::MAX_TEXT_SEPARATOR_BYTES)
+            .font(egui::TextStyle::Monospace)
+            .hint_text("auto"),
+    );
+    if separator.changed() {
+        field.separator.retain(|character| character.is_ascii());
+    }
+    separator.on_hover_text("Field/value separator: up to 3 ASCII characters, matched literally after the name. Empty uses automatic matching (=, :, whitespace or JSON). Spaces are significant.");
+}
+
+fn csv_settings(ui: &mut egui::Ui, state: &mut SerialState) {
+    ui.label("Column separator");
+    egui::ComboBox::from_id_salt("serial_csv_delimiter")
+        .selected_text(match state.settings.csv_delimiter {
+            wavecraft_serial::CsvDelimiter::Auto => "Auto",
+            wavecraft_serial::CsvDelimiter::Comma => "Comma (,)",
+            wavecraft_serial::CsvDelimiter::Semicolon => "Semicolon (;)",
+            wavecraft_serial::CsvDelimiter::Tab => "Tab",
+        })
+        .show_ui(ui, |ui| {
+            for (value, label) in [
+                (wavecraft_serial::CsvDelimiter::Auto, "Auto"),
+                (wavecraft_serial::CsvDelimiter::Comma, "Comma (,)"),
+                (wavecraft_serial::CsvDelimiter::Semicolon, "Semicolon (;)"),
+                (wavecraft_serial::CsvDelimiter::Tab, "Tab"),
+            ] {
+                ui.selectable_value(&mut state.settings.csv_delimiter, value, label);
+            }
+        });
+    ui.checkbox(
+        &mut state.settings.csv_has_headers,
+        "First row contains column names",
+    );
+    text_settings(ui, &mut state.settings, Some(&state.csv_columns));
+}
+
 fn x_axis_settings(ui: &mut egui::Ui, settings: &mut SerialSettings) {
     let names: Vec<String> = match settings.mode {
-        SerialMode::Text => settings
+        SerialMode::Text | SerialMode::Csv => settings
             .fields
             .iter()
             .map(|field| field.name.trim().to_owned())
@@ -829,7 +898,7 @@ fn paint_raw(ui: &mut egui::Ui, state: &mut SerialState) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("RAW DATA").strong().color(TEXT_MUTED));
             ui.label(
-                RichText::new(if state.settings.mode == SerialMode::Text {
+                RichText::new(if state.settings.mode != SerialMode::Binary {
                     "ASCII"
                 } else {
                     "HEX + ASCII"
@@ -866,6 +935,34 @@ fn paint_raw(ui: &mut egui::Ui, state: &mut SerialState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csv_import_paints_graph_raw_ascii_and_column_settings() {
+        let mut app = crate::app::test_support::app();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/examples/serial-samples.csv");
+        app.serial.import_raw(&path).unwrap();
+        let last_line = app.serial.raw_lines().last().unwrap().clone();
+        let context = egui::Context::default();
+        let _ = render(&mut app, &context, vec![]);
+        let labels = texts(&render(&mut app, &context, vec![]).shapes);
+        assert!(labels.iter().any(|label| label == "RAW DATA"));
+        assert!(labels.iter().any(|label| label == "ASCII"));
+        assert!(labels.contains(&last_line));
+        assert!(labels.iter().any(|label| label == "X: Sample"));
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.set_width(300.0);
+                csv_settings(ui, &mut app.serial);
+            });
+        });
+        let labels = texts(&output.shapes);
+        assert!(labels
+            .iter()
+            .any(|label| label == "First row contains column names"));
+        assert!(labels.iter().any(|label| label == "timestamp"));
+        assert!(labels.iter().any(|label| label == "temperature"));
+    }
 
     #[test]
     fn removing_timestamp_and_rate_rebuilds_opened_files_with_sample_labels() {

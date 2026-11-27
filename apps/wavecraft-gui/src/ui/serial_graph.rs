@@ -114,7 +114,9 @@ pub(super) fn paint_graph(ui: &mut egui::Ui, state: &mut SerialState) {
             painter.text(
                 plot.center(),
                 egui::Align2::CENTER_CENTER,
-                if state.imported_file.is_some() && state.series.is_empty() {
+                if state.settings.mode == SerialMode::Csv && state.series.is_empty() {
+                    "Open a CSV file and select columns to plot"
+                } else if state.imported_file.is_some() && state.series.is_empty() {
                     "Add text fields or load a schema, then press Plot to graph the opened file"
                 } else if state.series.is_empty()
                     && (state.settings.mode == SerialMode::Text && state.settings.fields.is_empty()

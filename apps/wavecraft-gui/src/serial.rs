@@ -7,8 +7,8 @@ use wavecraft_core::{
 };
 use wavecraft_serial::{
     parse_hex_bytes, parse_hex_u32, validate_text_separator, BinaryDecoder, BinarySchema,
-    ByteOrder, CrcConfiguration, DataBits, FlowControl, Parity, SerialConfiguration, SerialSource,
-    StopBits, TextDecoder, TextFieldSpec,
+    ByteOrder, CrcConfiguration, CsvDelimiter, CsvReader, DataBits, FlowControl, Parity,
+    SerialConfiguration, SerialSource, StopBits, TextDecoder, TextFieldSpec,
 };
 
 pub(crate) const RAW_CAPACITY: usize = 65_536;
@@ -32,6 +32,7 @@ pub(crate) enum SerialMode {
     #[default]
     Text,
     Binary,
+    Csv,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +139,8 @@ pub(crate) struct SerialSettings {
     pub timestamp_unit: SerialTimestampUnit,
     pub timestamp_multiplier: String,
     pub sample_rate: String,
+    pub csv_delimiter: CsvDelimiter,
+    pub csv_has_headers: bool,
     pub fields: Vec<TextField>,
     pub schema_json: String,
     pub schema_name: String,
@@ -170,6 +173,8 @@ impl Default for SerialSettings {
             timestamp_unit: SerialTimestampUnit::default(),
             timestamp_multiplier: "1".into(),
             sample_rate: String::new(),
+            csv_delimiter: CsvDelimiter::Auto,
+            csv_has_headers: true,
             fields: Vec::new(),
             schema_json: String::new(),
             schema_name: String::new(),
@@ -231,7 +236,7 @@ impl SerialSettings {
     }
     pub fn line_style(&self, name: &str) -> SerialLineStyle {
         match self.mode {
-            SerialMode::Text => self
+            SerialMode::Text | SerialMode::Csv => self
                 .fields
                 .iter()
                 .find(|field| field.name.trim() == name)
@@ -332,6 +337,7 @@ pub(crate) struct SerialState {
     pub series: Vec<Series>,
     pub raw: VecDeque<u8>,
     pub imported_file: Option<ImportedSerialFile>,
+    pub csv_columns: Vec<String>,
     pub received_bytes: u64,
     pub decoded_records: u64,
     pub rejected_frames: u64,
@@ -366,6 +372,7 @@ impl Default for SerialState {
             series: Vec::new(),
             raw: VecDeque::new(),
             imported_file: None,
+            csv_columns: Vec::new(),
             received_bytes: 0,
             decoded_records: 0,
             rejected_frames: 0,
@@ -473,7 +480,7 @@ impl SerialState {
             .iter()
             .map(|field| field.name.trim())
             .collect();
-        if self.settings.mode == SerialMode::Text
+        if self.settings.mode != SerialMode::Binary
             && names
                 .iter()
                 .enumerate()
@@ -488,8 +495,19 @@ impl SerialState {
                 })?;
             }
         }
+        if self.settings.mode == SerialMode::Csv {
+            for name in &names {
+                if !self.csv_columns.iter().any(|column| column == name) {
+                    return Err(CaptureError::new(format!(
+                        "CSV column '{name}' does not exist"
+                    )));
+                }
+            }
+        }
         let channel_names: Vec<String> = match self.settings.mode {
-            SerialMode::Text => names.iter().map(|name| (*name).to_owned()).collect(),
+            SerialMode::Text | SerialMode::Csv => {
+                names.iter().map(|name| (*name).to_owned()).collect()
+            }
             SerialMode::Binary if binary.is_some() => {
                 BinarySchema::from_json(&self.settings.schema_json)?.channel_names()
             }
@@ -500,7 +518,7 @@ impl SerialState {
         self.x_axis = x_axis;
         self.binary = binary;
         self.series = match self.settings.mode {
-            SerialMode::Text => self
+            SerialMode::Text | SerialMode::Csv => self
                 .settings
                 .fields
                 .iter()
@@ -534,6 +552,12 @@ impl SerialState {
     }
 
     pub fn start(&mut self) -> Result<(), CaptureError> {
+        if self.settings.mode == SerialMode::Csv {
+            return Err(
+                "Open a CSV file to plot CSV data; select ASCII or Binary for live UART capture"
+                    .into(),
+            );
+        }
         self.apply_baud_draft()?;
         let configuration = self.settings.configuration()?;
         self.prepare()?;
@@ -601,6 +625,19 @@ impl SerialState {
         if bytes.len() > MAX_IMPORT_BYTES {
             return Err("Raw imports are limited to 8 MiB".into());
         }
+        let is_csv = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("csv"))
+            || self.settings.mode == SerialMode::Csv;
+        let csv_error = if is_csv {
+            self.settings.mode = SerialMode::Csv;
+            self.configure_csv_columns(&bytes).err()
+        } else {
+            None
+        };
+        if csv_error.is_some() {
+            self.csv_columns.clear();
+        }
         if let Err(error) = self.prepare() {
             self.clear_data();
             self.binary = None;
@@ -614,6 +651,12 @@ impl SerialState {
             path: path.to_owned(),
             bytes: bytes.into(),
         });
+        if let Some(error) = csv_error {
+            self.error = Some(error.to_string());
+        }
+        if is_csv {
+            self.fit_graph();
+        }
         Ok(())
     }
 
@@ -621,7 +664,7 @@ impl SerialState {
         if self.imported_file.is_none() {
             return Err("Open a raw file before plotting".into());
         }
-        if self.settings.mode == SerialMode::Text && self.settings.fields.is_empty() {
+        if self.settings.mode != SerialMode::Binary && self.settings.fields.is_empty() {
             return Err("Add text fields before plotting the opened file".into());
         }
         if self.settings.mode == SerialMode::Binary && self.settings.schema_json.is_empty() {
@@ -635,6 +678,9 @@ impl SerialState {
             .imported_file
             .clone()
             .ok_or_else(|| CaptureError::new("Open a raw file before plotting"))?;
+        if self.settings.mode == SerialMode::Csv {
+            self.configure_csv_columns(&file.bytes)?;
+        }
         self.prepare()?;
         self.ingest_file(file);
         self.time_window = self.time_window.max(self.x_axis.minimum_span());
@@ -646,12 +692,82 @@ impl SerialState {
         for chunk in file.bytes.chunks(4096) {
             self.ingest(0.0, chunk);
         }
+        if self.settings.mode == SerialMode::Csv {
+            if let Err(error) = self.decode_csv(&file.bytes) {
+                self.error = Some(error.to_string());
+            }
+        }
         let name = file.path.file_name().map_or_else(
             || file.path.to_string_lossy(),
             |name| name.to_string_lossy(),
         );
         self.status = format!("Imported · {name}");
         self.imported_file = Some(file);
+    }
+
+    fn configure_csv_columns(&mut self, bytes: &[u8]) -> Result<(), CaptureError> {
+        let reader = CsvReader::new(
+            bytes,
+            self.settings.csv_delimiter,
+            self.settings.csv_has_headers,
+        )?;
+        let columns_changed = self.csv_columns != reader.columns();
+        self.csv_columns = reader.columns().to_vec();
+        self.settings
+            .fields
+            .retain(|field| self.csv_columns.contains(&field.name));
+        if self.settings.fields.is_empty() && columns_changed {
+            self.settings.fields = self
+                .csv_columns
+                .iter()
+                .take(wavecraft_serial::MAX_TEXT_FIELDS)
+                .enumerate()
+                .map(|(index, name)| TextField {
+                    name: name.clone(),
+                    separator: String::new(),
+                    color: COLORS[index % COLORS.len()],
+                    line_style: Default::default(),
+                })
+                .collect();
+        }
+        if !self
+            .settings
+            .fields
+            .iter()
+            .any(|field| field.name == self.settings.timestamp_field)
+        {
+            self.settings.timestamp_field.clear();
+        }
+        Ok(())
+    }
+
+    fn decode_csv(&mut self, bytes: &[u8]) -> Result<(), CaptureError> {
+        let reader = CsvReader::new(
+            bytes,
+            self.settings.csv_delimiter,
+            self.settings.csv_has_headers,
+        )?;
+        if self.series.is_empty() {
+            return Ok(());
+        }
+        let fields: Vec<_> = self
+            .series
+            .iter()
+            .map(|series| series.name.clone())
+            .collect();
+        for record in reader.records(&fields)? {
+            match record {
+                Ok(values) => self.push_record(values),
+                Err(error) => {
+                    self.rejected_frames += 1;
+                    if self.error.is_none() {
+                        self.error = Some(error.to_string());
+                    }
+                }
+            }
+        }
+        self.rejected_frames += self.invalid_x_records;
+        Ok(())
     }
 
     /// Transport receive time does not define X; decoded records use the
@@ -772,7 +888,7 @@ impl SerialState {
     pub fn raw_lines(&mut self) -> &[String] {
         if self.raw_dirty {
             self.raw_lines = match self.settings.mode {
-                SerialMode::Text => {
+                SerialMode::Text | SerialMode::Csv => {
                     let mut text = String::new();
                     for (index, byte) in self.raw.iter().enumerate() {
                         match byte {
@@ -866,6 +982,79 @@ impl SerialState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csv_import_selects_columns_and_uses_explicit_shared_axis_settings() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/examples/serial-samples.csv");
+        let mut state = SerialState::default();
+        state.settings.mode = SerialMode::Binary;
+        state.import_raw(&path).unwrap();
+        assert_eq!(state.settings.mode, SerialMode::Csv);
+        assert_eq!(state.decoded_records, 512);
+        assert_eq!(
+            state.csv_columns,
+            [
+                "timestamp",
+                "temperature",
+                "speed",
+                "enabled",
+                "fault",
+                "mode"
+            ]
+        );
+        assert!(state.settings.timestamp_field.is_empty());
+        assert_eq!(state.x_axis, SerialXAxis::Samples);
+        assert_eq!(state.graph_latest_time(), 511.0);
+        let raw = state.raw.clone();
+        assert_eq!(
+            raw.iter().copied().collect::<Vec<_>>(),
+            std::fs::read(&path).unwrap()
+        );
+        state.settings.sample_rate = "1000".into();
+        state.plot_imported().unwrap();
+        assert!((state.graph_latest_time() - 0.511).abs() < 1e-12);
+        state.settings.timestamp_field = "timestamp".into();
+        state.plot_imported().unwrap();
+        assert!((state.graph_latest_time() - 5.11).abs() < 1e-12);
+        assert!(state.series[0].points.is_empty());
+        assert_eq!(state.raw, raw);
+        assert!(state.status.contains("serial-samples.csv"));
+        assert!(state.error.is_none());
+        assert!(state.start().is_err());
+        state.settings.csv_has_headers = false;
+        state.plot_imported().unwrap();
+        assert_eq!(state.csv_columns[0], "Column 1");
+        assert_eq!(state.decoded_records, 512);
+        assert!(state.settings.timestamp_field.is_empty());
+    }
+
+    #[test]
+    fn csv_row_errors_and_invalid_timestamps_keep_original_raw_bytes() {
+        let bytes = b"t,v\r\n0,1\r\n,2\r\n2,3\r\n4\r\n5,6\r\n";
+        let mut state = SerialState::default();
+        state.settings.mode = SerialMode::Csv;
+        state.configure_csv_columns(bytes).unwrap();
+        state.settings.timestamp_field = "t".into();
+        state.prepare().unwrap();
+        state.ingest_file(ImportedSerialFile {
+            path: "rows.csv".into(),
+            bytes: bytes.to_vec().into(),
+        });
+        assert_eq!(state.decoded_records, 3);
+        assert_eq!(state.invalid_x_records, 1);
+        assert_eq!(state.rejected_frames, 2);
+        assert_eq!(state.raw.iter().copied().collect::<Vec<_>>(), bytes);
+        assert!(state.error.as_ref().unwrap().contains("CSV"));
+        assert_eq!(
+            state.series[1]
+                .points
+                .iter()
+                .map(|point| point[0])
+                .collect::<Vec<_>>(),
+            vec![0.0, 2.0, 5.0]
+        );
+    }
 
     fn axis_state(mode: SerialMode) -> SerialState {
         let mut state = SerialState::default();
