@@ -351,6 +351,84 @@ restarts. Legacy single-view settings migrate to the first slot, with additional
 slots initially hidden. Load, Save file, and Calc requests target the slot where
 they were issued, even when the active tab changes before actions are applied.
 
+### Deferred temperature and voltage-sag model
+
+This is a design note, not implemented behavior. Revisit the model after real
+discharge measurements are available; the parameterization and solver changes
+remain open pending that data.
+
+The proposed starting point is a constant **battery temperature** for each run
+and an effective internal resistance selected from a measured temperature table.
+Cold-temperature voltage sag can cause the device to reach its cutoff while
+charge remains. A capacity multiplier alone cannot describe the interaction
+between temperature, load pulses, and cutoff. Temperature- and charge-dependent
+resistance is illustrated in the
+[Molicel P50S characterization](https://www.molicel.com/wp-content/uploads/Product-Data-Sheet-of-INR-21700-P50S-80XXX-1.1-1.pdf).
+
+Separate the base voltage curve from the voltage delivered to the load:
+
+```text
+V_terminal(x, T, I) = V_oc(x, T) - I × R(x, T)
+```
+
+`V_oc` is the open-circuit voltage, `T` is battery temperature, and `R` is an
+effective internal resistance. Use amperes and ohms in this expression. Initially,
+`R(T)` could be constant across charge state; later measurements may justify
+`R(x,T)` and temperature-dependent base voltage curves. Keep the existing
+definition of `x` explicit when fitting data: discharged charge divided by the
+reference rated capacity.
+
+For illustration only, an open-circuit voltage of 3.3 V at 1 A produces 3.2 V
+with 0.1 ohm resistance, but 2.9 V with 0.4 ohm. A 3.0 V device cutoff would
+stop the second case earlier. These are hypothetical values, not cell presets.
+
+Cutoff remains a property of the device/protection configuration, compared
+against **terminal voltage under the current load**. A lower cutoff may allow
+more energy to be delivered if the cell specifications, protection, and device
+permit it. Temperature alone does not establish a lower permissible discharge
+limit. Do not automatically lower cutoff as temperature falls; compare candidate
+thresholds using the measured cell limits and the device's actual operating
+range. Manufacturer conditions are model-specific; see, for example, the
+[Molicel ICP103450CA discharge characterization](https://www.molicel.com/wp-content/uploads/ICP103450CA-V7-800578007680094.pdf).
+
+Potential implementation steps, to review against measurements:
+
+1. Add battery temperature and a `Temperature -> Internal resistance` table,
+   with linear interpolation and explicit handling outside the measured range.
+2. Evaluate sag for each Active/Sleep pattern. Constant-current patterns use
+   their specified current; constant-power patterns must solve
+   `P = I × (V_oc - I × R)` for a physically valid operating point and handle
+   loads that cannot be supplied. Delivered energy uses terminal voltage;
+   internal `I²R` losses are separate.
+3. Resolve cutoff within the actual pattern, including the load step at pattern
+   entry. Decide how cutoff delay, filtering, and latching match the real device.
+   The current load-independent cutoff bisection cannot represent this behavior.
+4. Preserve monotonicity checks for base discharge curves. Terminal voltage may
+   rise when switching to Sleep because the resistive drop decreases; this does
+   not imply recharging. Slower electrochemical relaxation would require a
+   separate dynamic model.
+5. Add temperature-dependent capacity or base curves only when the data supports
+   them. A measured loaded-voltage curve must not be treated as open-circuit
+   voltage and have sag subtracted again. Likewise, capacity measured to a fixed
+   cutoff may already include the apparent loss caused by sag; avoid counting
+   it twice through both a capacity multiplier and resistance.
+
+Before choosing coefficients, collect raw time, terminal voltage, current, and
+battery temperature for discharge runs at several temperatures. Retain the cell
+model, age/cycle history, charge preparation, rated-capacity reference, actual
+cutoff and its timing, and the load pattern. Rest periods and current steps are
+particularly useful for separating the base curve, immediate sag, and slower
+relaxation. Record ambient temperature separately if available. Characterizing
+the same cell under representative active and standby loads is also the approach
+described by
+[Analog Devices](https://www.analog.com/en/resources/technical-articles/characterizing-a-li-cell-for-use-with-a-fuel-gauge.html).
+
+Use those measurements to decide whether a static resistance model is adequate
+or a dynamic equivalent circuit is warranted, and how temperature corrections
+should interact with the existing table/polynomial curves, aging, and
+self-discharge. Thermal self-heating and temperature-dependent aging rates are
+separate possible extensions, not assumptions of this initial proposal.
+
 ## WeAct PD Power Mini workspace
 
 PD Power uses the common toolbar, setup adapter, pinned Save settings footer,
